@@ -298,6 +298,40 @@ pub const SqlBulkIoAuditSink = struct {
     }
 };
 
+pub const PublicSqlAuditOutcome = enum {
+    applied,
+    denied,
+    failed,
+};
+
+pub const PublicSqlNativeRoute = enum {
+    rows_batch,
+    mutation_source,
+    table_emptying_barrier,
+};
+
+pub const PublicSqlAuditRecord = struct {
+    timestamp_ns: u64,
+    outcome: PublicSqlAuditOutcome,
+    statement_kind: sql_adapter.SqlWriteStatementKind,
+    native_route: PublicSqlNativeRoute,
+    target: catalog_resources.TableTarget,
+    required_resource_type: usermgr.ResourceType,
+    required_permission: usermgr.PermissionType,
+    authenticated_subject: ?[]const u8 = null,
+    row_count: usize = 0,
+    error_name: ?[]const u8 = null,
+};
+
+pub const PublicSqlAuditSink = struct {
+    ptr: *anyopaque,
+    record: *const fn (ptr: *anyopaque, record: PublicSqlAuditRecord) anyerror!void,
+
+    pub fn recordEvent(self: @This(), event: PublicSqlAuditRecord) !void {
+        return try self.record(self.ptr, event);
+    }
+};
+
 pub const SqlBulkIoFileIo = struct {
     ptr: *anyopaque,
     read_import: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, path: []const u8) anyerror![]u8,
@@ -391,6 +425,10 @@ pub const ApiHttpServerConfig = struct {
     /// Optional structured audit sink for SQL bulk I/O. If omitted, successful
     /// operations still emit the legacy structured log line.
     sql_bulk_io_audit_sink: ?SqlBulkIoAuditSink = null,
+    /// Optional structured audit sink for public SQL write and DDL statements.
+    /// This is separate from SQL bulk I/O because normal statements have SQL
+    /// statement kinds and native execution routes instead of COPY streams/codecs.
+    public_sql_audit_sink: ?PublicSqlAuditSink = null,
     /// Optional SQL COPY file adapter. SQL file endpoints are unsupported unless
     /// the embedding process installs an explicit adapter with its own path
     /// policy.
@@ -6043,6 +6081,50 @@ pub const ApiHttpServer = struct {
         return null;
     }
 
+    fn publicSqlRowsBatchRowCount(rows_batch: relational_rows_api.OwnedRowsBatchRequest) usize {
+        return @as(usize, @intCast(rows_batch.inserted)) +
+            @as(usize, @intCast(rows_batch.deleted)) +
+            @as(usize, @intCast(rows_batch.transformed));
+    }
+
+    fn publicSqlRowsBatchAuditFailureName(response: http_common.HttpResponse) []const u8 {
+        if (response.status == 403 and std.mem.eql(u8, response.body, "row filter rejected sql write")) return "PermissionDenied";
+        if (response.status == 409 and std.mem.eql(u8, response.body, "version conflict")) return "VersionConflict";
+        return "PublicSqlRowsBatchFailed";
+    }
+
+    fn applyLoweredPublicSqlDocumentMergeRowsBatchWithAudit(
+        self: *ApiHttpServer,
+        target: catalog_resources.TableTarget,
+        schema: runtime_schema_mod.TableSchema,
+        rows_batch: *relational_rows_api.OwnedRowsBatchRequest,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !?http_common.HttpResponse {
+        if (try self.applyLoweredPublicSqlRowsBatch(target.table_name, schema, rows_batch, authenticated_identity)) |failure| {
+            const outcome: PublicSqlAuditOutcome = if (failure.status == 403) .denied else .failed;
+            self.recordPublicSqlAuditOutcome(
+                .merge,
+                .rows_batch,
+                target,
+                0,
+                authenticated_identity,
+                outcome,
+                publicSqlRowsBatchAuditFailureName(failure),
+            );
+            return failure;
+        }
+        self.recordPublicSqlAuditOutcome(
+            .merge,
+            .rows_batch,
+            target,
+            publicSqlRowsBatchRowCount(rows_batch.*),
+            authenticated_identity,
+            .applied,
+            null,
+        );
+        return null;
+    }
+
     fn takePublicSqlRowsBatchFromDocumentBatch(document_batch: *sql_adapter.plan.OwnedDocumentBatchRequest) relational_rows_api.OwnedRowsBatchRequest {
         const rows_batch = relational_rows_api.OwnedRowsBatchRequest{
             .writes = document_batch.writes,
@@ -6050,6 +6132,9 @@ pub const ApiHttpServer = struct {
             .transforms = document_batch.transforms,
             .predicates = document_batch.predicates,
             .returning_rows = document_batch.returning_rows,
+            .returning_version_keys = document_batch.returning_version_keys,
+            .returning_version_prewrite = document_batch.returning_version_prewrite,
+            .returning_version_outputs = document_batch.returning_version_outputs,
             .req = document_batch.req,
             .inserted = document_batch.inserted,
             .deleted = document_batch.deleted,
@@ -6060,11 +6145,63 @@ pub const ApiHttpServer = struct {
         document_batch.transforms = &.{};
         document_batch.predicates = &.{};
         document_batch.returning_rows = &.{};
+        document_batch.returning_version_keys = &.{};
+        document_batch.returning_version_prewrite = &.{};
+        document_batch.returning_version_outputs = &.{};
         document_batch.req = .{};
         document_batch.inserted = 0;
         document_batch.deleted = 0;
         document_batch.transformed = 0;
         return rows_batch;
+    }
+
+    fn finalizePublicSqlDocumentReturningVersions(
+        self: *ApiHttpServer,
+        target: catalog_resources.TableTarget,
+        rows_batch: *relational_rows_api.OwnedRowsBatchRequest,
+    ) !void {
+        if (rows_batch.returning_version_keys.len == 0) return;
+        if (rows_batch.returning_version_keys.len != rows_batch.returning_rows.len or
+            rows_batch.returning_version_prewrite.len != rows_batch.returning_rows.len or
+            rows_batch.returning_version_outputs.len == 0)
+        {
+            return error.InvalidRowsRequest;
+        }
+
+        const read_source = self.effectivePublicTableReads() orelse return error.TableNotFound;
+        const native_table_name = try catalog_resources.storageTableNameForTargetAlloc(self.alloc, .{
+            .database_name = target.database_name,
+            .namespace_name = target.namespace_name,
+            .table_name = target.table_name,
+        });
+        defer self.alloc.free(native_table_name);
+
+        for (rows_batch.returning_rows, 0..) |row_json, i| {
+            const version = if (rows_batch.returning_version_prewrite[i] != 0)
+                rows_batch.returning_version_prewrite[i]
+            else blk: {
+                var lookup = (try read_source.lookup(self.alloc, native_table_name, rows_batch.returning_version_keys[i], .{}, .read_index)) orelse return error.InvalidRowsRequest;
+                defer lookup.deinit(self.alloc);
+                break :blk lookup.version;
+            };
+
+            var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, row_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidRowsRequest;
+            for (rows_batch.returning_version_outputs) |output| {
+                if (parsed.value.object.getPtr(output)) |slot| {
+                    json_helpers.deinitJsonValue(self.alloc, slot);
+                    slot.* = .{ .integer = @intCast(version) };
+                } else {
+                    const owned_output = try self.alloc.dupe(u8, output);
+                    errdefer self.alloc.free(owned_output);
+                    try parsed.value.object.put(self.alloc, owned_output, .{ .integer = @intCast(version) });
+                }
+            }
+            const finalized = try std.json.Stringify.valueAlloc(self.alloc, parsed.value, .{});
+            self.alloc.free(@constCast(rows_batch.returning_rows[i]));
+            rows_batch.returning_rows[i] = finalized;
+        }
     }
 
     fn applyLoweredPublicSqlRowsBatchBeforeTriggers(
@@ -6330,12 +6467,74 @@ pub const ApiHttpServer = struct {
         return true;
     }
 
+    fn publicSqlAuditTargetForSession(session: catalog_resources.SqlCatalogSession, table_name: []const u8) catalog_resources.TableTarget {
+        return .{
+            .database_name = session.currentDatabase(),
+            .namespace_name = session.primarySearchPathNamespace(),
+            .table_name = table_name,
+        };
+    }
+
+    fn recordPublicSqlAuditOutcome(
+        self: *ApiHttpServer,
+        statement_kind: sql_adapter.SqlWriteStatementKind,
+        native_route: PublicSqlNativeRoute,
+        target: catalog_resources.TableTarget,
+        row_count: usize,
+        authenticated_identity: ?AuthenticatedIdentity,
+        outcome: PublicSqlAuditOutcome,
+        error_name: ?[]const u8,
+    ) void {
+        const subject = if (authenticated_identity) |identity| identity.username else null;
+        const record = PublicSqlAuditRecord{
+            .timestamp_ns = sqlDdlTimestampNs(),
+            .outcome = outcome,
+            .statement_kind = statement_kind,
+            .native_route = native_route,
+            .target = target,
+            .required_resource_type = .table,
+            .required_permission = .write,
+            .authenticated_subject = subject,
+            .row_count = row_count,
+            .error_name = error_name,
+        };
+        if (self.cfg.public_sql_audit_sink) |sink| {
+            sink.recordEvent(record) catch |audit_err| {
+                std.log.warn("failed to record public SQL audit err={s} outcome={s} statement={s} table={s}.{s}.{s}", .{
+                    @errorName(audit_err),
+                    @tagName(outcome),
+                    @tagName(statement_kind),
+                    target.database_name,
+                    target.namespace_name,
+                    target.table_name,
+                });
+            };
+            return;
+        }
+        std.log.info("public sql {s} statement={s} table={s}.{s}.{s} rows={d} subject={s} route={s} err={s}", .{
+            @tagName(outcome),
+            @tagName(statement_kind),
+            target.database_name,
+            target.namespace_name,
+            target.table_name,
+            row_count,
+            subject orelse "",
+            @tagName(native_route),
+            error_name orelse "",
+        });
+    }
+
+    const PublicSqlTableEmptyingAdmission = struct {
+        applied: tables_api.AppliedRelationalSqlDdlRecord,
+        scheduled_jobs: usize,
+    };
+
     fn schedulePublicSqlTableEmptyingJobsWithSession(
         self: *ApiHttpServer,
         target_table_name: []const u8,
         lowered: sql_adapter.LoweredMutationSource,
         session: catalog_resources.SqlCatalogSession,
-    ) !tables_api.AppliedRelationalSqlDdlRecord {
+    ) !PublicSqlTableEmptyingAdmission {
         const catalog = self.catalogSource();
         var admission = try catalog_jobs.scheduleTableEmptyingBarrierForTargetsOnServiceWithSessionAlloc(
             self.alloc,
@@ -6348,7 +6547,10 @@ pub const ApiHttpServer = struct {
         );
         defer admission.deinitAffectedTables(self.alloc);
         try self.scheduleTableEmptyingRuntimeHintsForTables(admission.affected_tables);
-        return admission.applied;
+        return .{
+            .applied = admission.applied,
+            .scheduled_jobs = admission.scheduled_jobs,
+        };
     }
 
     fn publicSqlReadRequestRowClaimMissingNativeModel(
@@ -7005,37 +7207,66 @@ pub const ApiHttpServer = struct {
         result: db_mod.types.RelationalRowsMutationSourceResult,
         accepted: tables_api.AppliedRelationalSqlDdlRecord,
     } {
+        const audit_target = publicSqlAuditTargetForSession(session, target_table_name);
+        const needs_catalog_barrier = publicSqlTableEmptyingRequiresCatalogBarrier(lowered.*);
+        const audit_route: PublicSqlNativeRoute = if (needs_catalog_barrier) .table_emptying_barrier else .mutation_source;
+
         self.ensureNoPublicSqlMutationSourceTrigger(target_table_name, lowered.mutation.req.kind) catch |err| switch (err) {
-            error.RoutineNotFound => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
-            error.UnsupportedOperation => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
+            error.RoutineNotFound => {
+                self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .failed, @errorName(err));
+                return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") };
+            },
+            error.UnsupportedOperation => {
+                self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .failed, @errorName(err));
+                return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") };
+            },
             else => return err,
         };
 
-        const needs_catalog_barrier = publicSqlTableEmptyingRequiresCatalogBarrier(lowered.*);
         var filter = self.rowsAuthFilterPlanForIdentity(target_table_name, authenticated_identity, target_schema) catch |err| switch (err) {
-            error.UnsupportedRowsFilter, error.InvalidRowsFilter => return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") },
+            error.UnsupportedRowsFilter, error.InvalidRowsFilter => {
+                self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .denied, @errorName(err));
+                return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") };
+            },
             else => return err,
         };
         defer if (filter) |*value| value.deinit(self.alloc);
-        if (needs_catalog_barrier and filter != null) return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") };
+        if (needs_catalog_barrier and filter != null) {
+            self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .denied, "RowFilterPushdownRequired");
+            return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") };
+        }
         if (filter) |active| {
             try self.applyRowsAuthFilterToQuery(target_schema, active, &lowered.mutation.req.source);
         }
 
         if (needs_catalog_barrier) {
-            const applied = self.schedulePublicSqlTableEmptyingJobsWithSession(target_table_name, lowered.*, session) catch |err| switch (err) {
-                error.UnsupportedOperation => return .{ .failure = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, publicSqlUnsupportedTruncateSourceDiagnostic(lowered.*)) },
-                error.InvalidArgument, error.InvalidQueryRequest => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
-                error.TableNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
+            const admission = self.schedulePublicSqlTableEmptyingJobsWithSession(target_table_name, lowered.*, session) catch |err| switch (err) {
+                error.UnsupportedOperation => {
+                    self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .failed, @errorName(err));
+                    return .{ .failure = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, publicSqlUnsupportedTruncateSourceDiagnostic(lowered.*)) };
+                },
+                error.InvalidArgument, error.InvalidQueryRequest => {
+                    self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .failed, @errorName(err));
+                    return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") };
+                },
+                error.TableNotFound => {
+                    self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .failed, @errorName(err));
+                    return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+                },
                 else => {
+                    self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .failed, @errorName(err));
                     std.log.err("public sql table emptying admission failed table={s} err={}", .{ target_table_name, err });
                     return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
                 },
             };
-            return .{ .accepted = applied };
+            self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, admission.scheduled_jobs, authenticated_identity, .applied, null);
+            return .{ .accepted = admission.applied };
         }
 
-        const source = self.table_writes orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+        const source = self.table_writes orelse {
+            self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .failed, "TableWriteSourceUnavailable");
+            return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+        };
         const result = (source.tableEmptying(self.alloc, .{
             .primary_table_name = target_table_name,
             .additional_table_names = lowered.additional_table_names,
@@ -7045,19 +7276,48 @@ pub const ApiHttpServer = struct {
             .restart_identity = lowered.restart_identity,
             .cascade = lowered.truncate_cascade,
         }) catch |err| switch (err) {
-            error.UnsupportedOperation, error.UnsupportedQueryRequest => return .{ .failure = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, publicSqlUnsupportedTruncateSourceDiagnostic(lowered.*)) },
-            error.InvalidArgument, error.InvalidQueryRequest => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
-            error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return .{ .failure = try textResponse(self.alloc, 409, "version conflict") },
-            error.TopologyChanged => return .{ .failure = try textResponse(self.alloc, 503, "topology changed") },
-            error.LeaderUnavailable, error.WriteUnavailable => return .{ .failure = try textResponse(self.alloc, 503, "write unavailable") },
-            error.TableNotFound, error.UnknownGroup => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
-            error.DocIdentityNamespaceMismatch => return .{ .failure = try textResponse(self.alloc, 503, "doc identity unavailable") },
-            error.EnrichmentRetryInProgress => return .{ .failure = try textResponse(self.alloc, 429, "table backpressured") },
+            error.UnsupportedOperation, error.UnsupportedQueryRequest => {
+                self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .failed, @errorName(err));
+                return .{ .failure = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, publicSqlUnsupportedTruncateSourceDiagnostic(lowered.*)) };
+            },
+            error.InvalidArgument, error.InvalidQueryRequest => {
+                self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .failed, @errorName(err));
+                return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") };
+            },
+            error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => {
+                self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .failed, @errorName(err));
+                return .{ .failure = try textResponse(self.alloc, 409, "version conflict") };
+            },
+            error.TopologyChanged => {
+                self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .failed, @errorName(err));
+                return .{ .failure = try textResponse(self.alloc, 503, "topology changed") };
+            },
+            error.LeaderUnavailable, error.WriteUnavailable => {
+                self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .failed, @errorName(err));
+                return .{ .failure = try textResponse(self.alloc, 503, "write unavailable") };
+            },
+            error.TableNotFound, error.UnknownGroup => {
+                self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .failed, @errorName(err));
+                return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+            },
+            error.DocIdentityNamespaceMismatch => {
+                self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .failed, @errorName(err));
+                return .{ .failure = try textResponse(self.alloc, 503, "doc identity unavailable") };
+            },
+            error.EnrichmentRetryInProgress => {
+                self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .failed, @errorName(err));
+                return .{ .failure = try textResponse(self.alloc, 429, "table backpressured") };
+            },
             else => {
+                self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .failed, @errorName(err));
                 std.log.err("public sql table emptying failed table={s} err={}", .{ target_table_name, err });
                 return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
             },
-        }) orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+        }) orelse {
+            self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .failed, "TableNotFound");
+            return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+        };
+        self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, @intCast(result.matched), authenticated_identity, .applied, null);
         return .{ .result = result };
     }
 
@@ -7407,6 +7667,11 @@ pub const ApiHttpServer = struct {
         }
         const target_binding = write_catalog.target_binding orelse return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.bind, .table_not_found)) };
         const target = target_binding.target();
+        const audit_target = catalog_resources.TableTarget{
+            .database_name = target.database_name,
+            .namespace_name = target.namespace_name,
+            .table_name = target.table_name,
+        };
         const target_table = try self.alloc.dupe(u8, target.table_name);
         defer self.alloc.free(target_table);
         const schema = try clonePublicSqlRuntimeSchemaAlloc(self.alloc, target_binding.schema());
@@ -7441,6 +7706,7 @@ pub const ApiHttpServer = struct {
             error.DocumentSqlWriteJoinOrderedIndexProof,
             error.DocumentSqlWriteJoinPartialIndexProof,
             error.DocumentSqlWriteJoinStaleIndexProof,
+            error.DocumentSqlMergeRequiresNativeProducer,
             error.DocumentSqlWriteSourceAssignmentAlias,
             error.DocumentSqlWriteSourceAssignmentAmbiguousReference,
             error.DocumentSqlWriteSourceAssignmentGeneratedField,
@@ -7666,14 +7932,14 @@ pub const ApiHttpServer = struct {
             } };
         }
 
-        if (lowered == .document_write or lowered == .document_producer_mutation or lowered == .document_joined_mutation) {
+        if (lowered == .document_write or lowered == .document_conflict_write or lowered == .document_source_insert or lowered == .document_producer_mutation or lowered == .document_joined_mutation or lowered == .document_merge_mutation) {
             var document_batch = switch (lowered) {
                 .document_write => |*document_write| blk: {
                     const batch = document_write.batch;
                     document_write.batch = .{};
                     break :blk batch;
                 },
-                .document_producer_mutation, .document_joined_mutation => blk: {
+                .document_conflict_write, .document_source_insert, .document_producer_mutation, .document_joined_mutation, .document_merge_mutation => blk: {
                     const read_source = self.effectivePublicTableReads() orelse return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.bind, .table_not_found)) };
                     const native_table_name = try catalog_resources.storageTableNameForTargetAlloc(self.alloc, .{
                         .database_name = target.database_name,
@@ -7692,6 +7958,18 @@ pub const ApiHttpServer = struct {
                         .public_table_name = target.table_name,
                     };
                     break :blk switch (lowered) {
+                        .document_conflict_write => |document_write| sql_adapter.document_runtime.materializeDocumentConflictWriteBatchAlloc(
+                            self.alloc,
+                            adapter.runtimeSource(),
+                            document_write,
+                            .read_index,
+                        ),
+                        .document_source_insert => |document_write| sql_adapter.document_runtime.materializeDocumentSourceInsertBatchAlloc(
+                            self.alloc,
+                            adapter.runtimeSource(),
+                            document_write,
+                            .read_index,
+                        ),
                         .document_producer_mutation => |document_mutation| sql_adapter.document_runtime.materializeProducerMutationBatchAlloc(
                             self.alloc,
                             adapter.runtimeSource(),
@@ -7704,20 +7982,31 @@ pub const ApiHttpServer = struct {
                             document_mutation,
                             .read_index,
                         ),
+                        .document_merge_mutation => |document_mutation| sql_adapter.document_runtime.materializeDocumentMergeMutationBatchAlloc(
+                            self.alloc,
+                            adapter.runtimeSource(),
+                            document_mutation,
+                            .read_index,
+                        ),
                         else => unreachable,
-                    } catch |err| switch (err) {
-                        error.DocumentSqlWriteDuplicateSource,
-                        error.DocumentSqlBoundedScanRowCapExceeded,
-                        error.DocumentSqlBoundedScanByteCapExceeded,
-                        error.DocumentSqlIndexUnavailable,
-                        => return .{ .response = try self.publicSqlDiagnosticResponse(400, (sql_adapter.diagnostics.knownErrorDiagnostic(.execute, err) orelse .init(.execute, .invalid_sql_request))) },
-                        error.DocumentSqlWriteUnsupported => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.execute, .document_sql_write_unsupported)) },
-                        error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.execute, .invalid_sql_request)) },
-                        error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.execute, .unsupported_sql_statement)) },
-                        error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.execute, .table_not_found)) },
-                        error.TopologyChanged => return .{ .response = try self.publicSqlDiagnosticResponse(503, .init(.execute, .topology_changed)) },
-                        error.LeaderUnavailable, error.ReadUnavailable => return .{ .response = try self.publicSqlDiagnosticResponse(503, .init(.execute, .read_unavailable)) },
-                        else => return err,
+                    } catch |err| {
+                        if (lowered == .document_merge_mutation) {
+                            self.recordPublicSqlAuditOutcome(.merge, .rows_batch, audit_target, 0, authenticated_identity, .failed, @errorName(err));
+                        }
+                        switch (err) {
+                            error.DocumentSqlWriteDuplicateSource,
+                            error.DocumentSqlBoundedScanRowCapExceeded,
+                            error.DocumentSqlBoundedScanByteCapExceeded,
+                            error.DocumentSqlIndexUnavailable,
+                            => return .{ .response = try self.publicSqlDiagnosticResponse(400, (sql_adapter.diagnostics.knownErrorDiagnostic(.execute, err) orelse .init(.execute, .invalid_sql_request))) },
+                            error.DocumentSqlWriteUnsupported => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.execute, .document_sql_write_unsupported)) },
+                            error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.execute, .invalid_sql_request)) },
+                            error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.execute, .unsupported_sql_statement)) },
+                            error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.execute, .table_not_found)) },
+                            error.TopologyChanged => return .{ .response = try self.publicSqlDiagnosticResponse(503, .init(.execute, .topology_changed)) },
+                            error.LeaderUnavailable, error.ReadUnavailable => return .{ .response = try self.publicSqlDiagnosticResponse(503, .init(.execute, .read_unavailable)) },
+                            else => return err,
+                        }
                     };
                 },
                 else => unreachable,
@@ -7727,7 +8016,16 @@ pub const ApiHttpServer = struct {
             var rows_batch = takePublicSqlRowsBatchFromDocumentBatch(&document_batch);
             var rows_batch_owned = true;
             defer if (rows_batch_owned) rows_batch.deinit(self.alloc);
-            if (try self.applyLoweredPublicSqlRowsBatch(target_table, schema, &rows_batch, authenticated_identity)) |failure| return .{ .response = failure };
+            if (lowered == .document_merge_mutation) {
+                if (try self.applyLoweredPublicSqlDocumentMergeRowsBatchWithAudit(audit_target, schema, &rows_batch, authenticated_identity)) |failure| return .{ .response = failure };
+            } else if (try self.applyLoweredPublicSqlRowsBatch(target_table, schema, &rows_batch, authenticated_identity)) |failure| return .{ .response = failure };
+            self.finalizePublicSqlDocumentReturningVersions(audit_target, &rows_batch) catch |err| switch (err) {
+                error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.execute, .invalid_sql_request)) },
+                error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.execute, .table_not_found)) },
+                error.TopologyChanged => return .{ .response = try self.publicSqlDiagnosticResponse(503, .init(.execute, .topology_changed)) },
+                error.LeaderUnavailable, error.ReadUnavailable => return .{ .response = try self.publicSqlDiagnosticResponse(503, .init(.execute, .read_unavailable)) },
+                else => return err,
+            };
             try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
 
             const owned_rows_batch = rows_batch;

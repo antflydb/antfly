@@ -57,6 +57,7 @@ pub const DocumentSqlReadPlanCaseJson = struct {
 
 pub const DocumentSqlWritePlanExpectationJson = struct {
     plan: ?[]const u8 = null,
+    action: ?[]const u8 = null,
     operation: ?[]const u8 = null,
     table_name: ?[]const u8 = null,
     producer: ?[]const u8 = null,
@@ -67,9 +68,19 @@ pub const DocumentSqlWritePlanExpectationJson = struct {
     transforms: ?usize = null,
     deletes: ?usize = null,
     ops: ?usize = null,
+    returning: ?usize = null,
     join_keys: ?usize = null,
     source_assignments: ?usize = null,
+    generated_target_id: bool = false,
+    expression_assignments: ?usize = null,
+    where_expression: ?usize = null,
+    where_expressions: ?usize = null,
+    where_any: ?usize = null,
+    where_not: ?usize = null,
+    matched_arms: ?usize = null,
+    not_matched_arms: ?usize = null,
     max_candidate_rows: ?u32 = null,
+    source_limit: ?u32 = null,
     max_scan_rows: ?u32 = null,
     max_scan_bytes: ?u64 = null,
     max_target_rows: ?u32 = null,
@@ -117,6 +128,13 @@ pub const ExpectedError = enum {
     DocumentSqlWriteJoinOrderedIndexProof,
     DocumentSqlWriteJoinPartialIndexProof,
     DocumentSqlWriteJoinStaleIndexProof,
+    DocumentSqlMergeRequiresNativeProducer,
+    DocumentSqlWriteReturningAllUnsupported,
+    DocumentSqlWriteReturningDuplicateOutput,
+    DocumentSqlWriteReturningExpressionUnsupported,
+    DocumentSqlWriteReturningGeneratedField,
+    DocumentSqlWriteReturningVersionUnsupported,
+    DocumentSqlWriteReturningVirtualFieldUnsupported,
     DocumentSqlWriteUnsupported,
 };
 
@@ -135,6 +153,13 @@ pub fn errorFromName(name: []const u8) !ExpectedError {
     if (std.mem.eql(u8, name, "DocumentSqlWriteJoinOrderedIndexProof")) return .DocumentSqlWriteJoinOrderedIndexProof;
     if (std.mem.eql(u8, name, "DocumentSqlWriteJoinPartialIndexProof")) return .DocumentSqlWriteJoinPartialIndexProof;
     if (std.mem.eql(u8, name, "DocumentSqlWriteJoinStaleIndexProof")) return .DocumentSqlWriteJoinStaleIndexProof;
+    if (std.mem.eql(u8, name, "DocumentSqlMergeRequiresNativeProducer")) return .DocumentSqlMergeRequiresNativeProducer;
+    if (std.mem.eql(u8, name, "DocumentSqlWriteReturningAllUnsupported")) return .DocumentSqlWriteReturningAllUnsupported;
+    if (std.mem.eql(u8, name, "DocumentSqlWriteReturningDuplicateOutput")) return .DocumentSqlWriteReturningDuplicateOutput;
+    if (std.mem.eql(u8, name, "DocumentSqlWriteReturningExpressionUnsupported")) return .DocumentSqlWriteReturningExpressionUnsupported;
+    if (std.mem.eql(u8, name, "DocumentSqlWriteReturningGeneratedField")) return .DocumentSqlWriteReturningGeneratedField;
+    if (std.mem.eql(u8, name, "DocumentSqlWriteReturningVersionUnsupported")) return .DocumentSqlWriteReturningVersionUnsupported;
+    if (std.mem.eql(u8, name, "DocumentSqlWriteReturningVirtualFieldUnsupported")) return .DocumentSqlWriteReturningVirtualFieldUnsupported;
     if (std.mem.eql(u8, name, "DocumentSqlWriteUnsupported")) return .DocumentSqlWriteUnsupported;
     return error.InvalidSqlCorpusFixture;
 }
@@ -155,6 +180,13 @@ pub fn errorValue(expected: ExpectedError) anyerror {
         .DocumentSqlWriteJoinOrderedIndexProof => error.DocumentSqlWriteJoinOrderedIndexProof,
         .DocumentSqlWriteJoinPartialIndexProof => error.DocumentSqlWriteJoinPartialIndexProof,
         .DocumentSqlWriteJoinStaleIndexProof => error.DocumentSqlWriteJoinStaleIndexProof,
+        .DocumentSqlMergeRequiresNativeProducer => error.DocumentSqlMergeRequiresNativeProducer,
+        .DocumentSqlWriteReturningAllUnsupported => error.DocumentSqlWriteReturningAllUnsupported,
+        .DocumentSqlWriteReturningDuplicateOutput => error.DocumentSqlWriteReturningDuplicateOutput,
+        .DocumentSqlWriteReturningExpressionUnsupported => error.DocumentSqlWriteReturningExpressionUnsupported,
+        .DocumentSqlWriteReturningGeneratedField => error.DocumentSqlWriteReturningGeneratedField,
+        .DocumentSqlWriteReturningVersionUnsupported => error.DocumentSqlWriteReturningVersionUnsupported,
+        .DocumentSqlWriteReturningVirtualFieldUnsupported => error.DocumentSqlWriteReturningVirtualFieldUnsupported,
         .DocumentSqlWriteUnsupported => error.DocumentSqlWriteUnsupported,
     };
 }

@@ -67,7 +67,7 @@
       "generated_ast_entry_point": "ddl_plan.planGeneratedLogicalDdlAstAlloc",
       "entrypoints": ["http", "pgwire", "sql_adapter", "tokenized"],
       "parser_status": "generated_gated_unsupported",
-      "retained_ast_corruption_test": "sql adapter logical ddl plan rejects generated unsupported maintenance before legacy reparsing",
+      "retained_ast_corruption_test": "sql adapter logical ddl plan accepts validated generated unsupported maintenance without vacuum analyze wrapper fallback",
       "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
       "removal_gate": "VACUUM, ANALYZE, REINDEX, CLUSTER, cursor, prepared statement, and transaction maintenance commands have generated-AST fixtures and app-parity coverage."
     },

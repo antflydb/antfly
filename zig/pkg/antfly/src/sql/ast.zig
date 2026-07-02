@@ -21,6 +21,7 @@ pub const SelectOutputKind = enum {
     coalesce,
     field_alias,
     expression,
+    scalar_subquery,
 };
 
 pub const SelectOutputRef = struct {

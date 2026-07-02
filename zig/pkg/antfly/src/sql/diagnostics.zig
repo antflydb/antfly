@@ -55,6 +55,13 @@ pub const SqlDiagnosticCode = enum {
     document_sql_write_join_ordered_index_proof,
     document_sql_write_join_partial_index_proof,
     document_sql_write_join_stale_index_proof,
+    document_sql_write_merge_requires_native_producer,
+    document_sql_write_returning_all_unsupported,
+    document_sql_write_returning_duplicate_output,
+    document_sql_write_returning_expression_unsupported,
+    document_sql_write_returning_generated_field,
+    document_sql_write_returning_version_unsupported,
+    document_sql_write_returning_virtual_field_unsupported,
     document_sql_write_source_assignment_alias,
     document_sql_write_source_assignment_ambiguous_reference,
     document_sql_write_source_assignment_generated_field,
@@ -157,6 +164,13 @@ pub fn diagnosticCodeDefaultMessage(code: SqlDiagnosticCode) []const u8 {
         .document_sql_write_join_ordered_index_proof => "document SQL joined write cannot use ordered or composite join indexes",
         .document_sql_write_join_partial_index_proof => "document SQL joined write cannot use partial join indexes",
         .document_sql_write_join_stale_index_proof => "document SQL joined write cannot use stale or rebuilding join indexes",
+        .document_sql_write_merge_requires_native_producer => "document SQL MERGE requires a bounded native document producer contract",
+        .document_sql_write_returning_all_unsupported => "document SQL write RETURNING * is not supported",
+        .document_sql_write_returning_duplicate_output => "document SQL write RETURNING has duplicate output names",
+        .document_sql_write_returning_expression_unsupported => "document SQL write RETURNING expression is not supported",
+        .document_sql_write_returning_generated_field => "document SQL write RETURNING cannot read a generated field",
+        .document_sql_write_returning_version_unsupported => "document SQL write RETURNING _version is not supported",
+        .document_sql_write_returning_virtual_field_unsupported => "document SQL write RETURNING virtual field is not supported",
         .document_sql_write_source_assignment_alias => "document SQL source assignment requires the joined source alias",
         .document_sql_write_source_assignment_ambiguous_reference => "document SQL source assignment has an ambiguous target/source reference",
         .document_sql_write_source_assignment_generated_field => "document SQL source assignment cannot read a generated source field",
@@ -220,6 +234,12 @@ pub fn diagnosticCodeMissingNativeModel(code: SqlDiagnosticCode) ?[]const u8 {
         .document_sql_write_join_partial_index_proof,
         .document_sql_write_join_stale_index_proof,
         .document_sql_write_unsupported,
+        .document_sql_write_returning_all_unsupported,
+        .document_sql_write_returning_duplicate_output,
+        .document_sql_write_returning_expression_unsupported,
+        .document_sql_write_returning_generated_field,
+        .document_sql_write_returning_version_unsupported,
+        .document_sql_write_returning_virtual_field_unsupported,
         => "document SQL write execution",
         .document_sql_view_mapping_unsupported => "document-to-SQL view mapping execution",
         .unsupported_sql_statement => "typed Antfly logical plan for this SQL shape",
@@ -248,6 +268,13 @@ pub fn knownErrorDiagnostic(phase: SqlDiagnosticPhase, err: anyerror) ?SqlDiagno
         error.DocumentSqlWriteJoinOrderedIndexProof => .document_sql_write_join_ordered_index_proof,
         error.DocumentSqlWriteJoinPartialIndexProof => .document_sql_write_join_partial_index_proof,
         error.DocumentSqlWriteJoinStaleIndexProof => .document_sql_write_join_stale_index_proof,
+        error.DocumentSqlMergeRequiresNativeProducer => .document_sql_write_merge_requires_native_producer,
+        error.DocumentSqlWriteReturningAllUnsupported => .document_sql_write_returning_all_unsupported,
+        error.DocumentSqlWriteReturningDuplicateOutput => .document_sql_write_returning_duplicate_output,
+        error.DocumentSqlWriteReturningExpressionUnsupported => .document_sql_write_returning_expression_unsupported,
+        error.DocumentSqlWriteReturningGeneratedField => .document_sql_write_returning_generated_field,
+        error.DocumentSqlWriteReturningVersionUnsupported => .document_sql_write_returning_version_unsupported,
+        error.DocumentSqlWriteReturningVirtualFieldUnsupported => .document_sql_write_returning_virtual_field_unsupported,
         error.DocumentSqlWriteSourceAssignmentAlias => .document_sql_write_source_assignment_alias,
         error.DocumentSqlWriteSourceAssignmentAmbiguousReference => .document_sql_write_source_assignment_ambiguous_reference,
         error.DocumentSqlWriteSourceAssignmentGeneratedField => .document_sql_write_source_assignment_generated_field,
@@ -304,6 +331,13 @@ pub fn knownErrorDiagnostic(phase: SqlDiagnosticPhase, err: anyerror) ?SqlDiagno
         .document_sql_write_join_ordered_index_proof => diagnostic.withHint("Use an unordered single-field equality index for each document join field."),
         .document_sql_write_join_partial_index_proof => diagnostic.withHint("Use full join-field indexes or prove the partial predicates cover the joined write."),
         .document_sql_write_join_stale_index_proof => diagnostic.withHint("Wait for join-field indexes to become ready before admitting this joined write."),
+        .document_sql_write_merge_requires_native_producer => diagnostic.withHint("Admit MERGE only after the lowerer and runtime prove a bounded deterministic native document producer."),
+        .document_sql_write_returning_all_unsupported => diagnostic.withHint("List admitted document projection fields explicitly instead of using RETURNING *."),
+        .document_sql_write_returning_duplicate_output => diagnostic.withHint("Give each document RETURNING item a unique output alias."),
+        .document_sql_write_returning_expression_unsupported => diagnostic.withHint("Return _id, _doc, or declared document projection fields until expression rows are proven."),
+        .document_sql_write_returning_generated_field => diagnostic.withHint("Return the generated field source data, or wait for native generated-field readback parity."),
+        .document_sql_write_returning_version_unsupported => diagnostic.withHint("Wait for native document writes to expose deterministic post-write versions before returning _version."),
+        .document_sql_write_returning_virtual_field_unsupported => diagnostic.withHint("Return only declared document projection fields with native readback semantics."),
         else => diagnostic,
     };
 }
@@ -326,6 +360,13 @@ pub const SqlAdapterClassificationReason = enum {
     document_sql_write_join_ordered_index_proof,
     document_sql_write_join_partial_index_proof,
     document_sql_write_join_stale_index_proof,
+    document_sql_write_merge_requires_native_producer,
+    document_sql_write_returning_all_unsupported,
+    document_sql_write_returning_duplicate_output,
+    document_sql_write_returning_expression_unsupported,
+    document_sql_write_returning_generated_field,
+    document_sql_write_returning_version_unsupported,
+    document_sql_write_returning_virtual_field_unsupported,
     document_sql_write_source_assignment_alias,
     document_sql_write_source_assignment_ambiguous_reference,
     document_sql_write_source_assignment_generated_field,
@@ -407,6 +448,21 @@ pub fn classificationReasonToken(reason: SqlAdapterClassificationReason) []const
     return @tagName(reason);
 }
 
+pub fn classificationReasonIsExpressionStructural(reason: SqlAdapterClassificationReason) bool {
+    return switch (reason) {
+        .document_sql_bounded_scan_unsupported_residual,
+        .document_sql_write_returning_expression_unsupported,
+        .invalid_expression_conflict_target,
+        .row_rewrite_expression_plan,
+        .subquery_expression_plan,
+        .subquery_quantified_plan,
+        .subquery_scalar_plan,
+        .subquery_semijoin_plan,
+        => true,
+        else => false,
+    };
+}
+
 pub fn classificationReasonIsAdapterNoop(reason: SqlAdapterClassificationReason) bool {
     return switch (reason) {
         .extension,
@@ -468,6 +524,13 @@ pub fn nativeExecutionRequirement(reason: SqlAdapterClassificationReason) Native
         .document_sql_write_join_ordered_index_proof,
         .document_sql_write_join_partial_index_proof,
         .document_sql_write_join_stale_index_proof,
+        .document_sql_write_merge_requires_native_producer,
+        .document_sql_write_returning_all_unsupported,
+        .document_sql_write_returning_duplicate_output,
+        .document_sql_write_returning_expression_unsupported,
+        .document_sql_write_returning_generated_field,
+        .document_sql_write_returning_version_unsupported,
+        .document_sql_write_returning_virtual_field_unsupported,
         => .{ .category = .stream_materialization },
         .document_sql_write_source_assignment_alias,
         .document_sql_write_source_assignment_ambiguous_reference,
@@ -576,6 +639,13 @@ test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_join_ordered_index_proof, classificationReasonFromToken("document_sql_write_join_ordered_index_proof").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_join_partial_index_proof, classificationReasonFromToken("document_sql_write_join_partial_index_proof").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_join_stale_index_proof, classificationReasonFromToken("document_sql_write_join_stale_index_proof").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_merge_requires_native_producer, classificationReasonFromToken("document_sql_write_merge_requires_native_producer").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_returning_all_unsupported, classificationReasonFromToken("document_sql_write_returning_all_unsupported").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_returning_duplicate_output, classificationReasonFromToken("document_sql_write_returning_duplicate_output").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_returning_expression_unsupported, classificationReasonFromToken("document_sql_write_returning_expression_unsupported").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_returning_generated_field, classificationReasonFromToken("document_sql_write_returning_generated_field").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_returning_version_unsupported, classificationReasonFromToken("document_sql_write_returning_version_unsupported").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_returning_virtual_field_unsupported, classificationReasonFromToken("document_sql_write_returning_virtual_field_unsupported").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_source_assignment_alias, classificationReasonFromToken("document_sql_write_source_assignment_alias").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_source_assignment_ambiguous_reference, classificationReasonFromToken("document_sql_write_source_assignment_ambiguous_reference").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_source_assignment_generated_field, classificationReasonFromToken("document_sql_write_source_assignment_generated_field").?);
@@ -623,6 +693,33 @@ test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expect(!classificationReasonTokenIsKnown("set operation plan"));
     try std.testing.expect(!classificationReasonTokenIsKnown("future_reason"));
     try std.testing.expect(!classificationReasonTokenIsKnown(""));
+}
+
+test "sql adapter diagnostics keep unsupported expression classifications structural" {
+    const reasons = [_]SqlAdapterClassificationReason{
+        .document_sql_bounded_scan_unsupported_residual,
+        .document_sql_write_returning_expression_unsupported,
+        .invalid_expression_conflict_target,
+        .row_rewrite_expression_plan,
+        .subquery_expression_plan,
+        .subquery_quantified_plan,
+        .subquery_scalar_plan,
+        .subquery_semijoin_plan,
+    };
+
+    for (reasons) |reason| {
+        try std.testing.expect(classificationReasonIsExpressionStructural(reason));
+        const token = classificationReasonToken(reason);
+        try std.testing.expect(token.len > 0);
+        try std.testing.expectEqual(reason, classificationReasonFromToken(token).?);
+        const requirement = nativeExecutionRequirement(reason);
+        try std.testing.expect(requirement.category == .stream_materialization or
+            requirement.category == .conflict_target_validation or
+            requirement.category == .schema_rewrite_backfill);
+    }
+
+    try std.testing.expect(!classificationReasonIsExpressionStructural(.session_setting));
+    try std.testing.expect(!classificationReasonIsExpressionStructural(.duplicate_output_name));
 }
 
 test "sql adapter diagnostics map unsupported classifications to native requirements" {
@@ -777,6 +874,36 @@ test "sql diagnostics expose stable phase code and native model fields" {
     const join_ordered_index = knownErrorDiagnostic(.plan, error.DocumentSqlWriteJoinOrderedIndexProof) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(SqlDiagnosticCode.document_sql_write_join_ordered_index_proof, join_ordered_index.code);
     try std.testing.expectEqualStrings("document SQL joined write cannot use ordered or composite join indexes", join_ordered_index.message);
+
+    const document_merge = knownErrorDiagnostic(.plan, error.DocumentSqlMergeRequiresNativeProducer) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_write_merge_requires_native_producer, document_merge.code);
+    try std.testing.expectEqualStrings("document SQL MERGE requires a bounded native document producer contract", document_merge.message);
+    try std.testing.expectEqualStrings("Admit MERGE only after the lowerer and runtime prove a bounded deterministic native document producer.", document_merge.hint.?);
+
+    const returning_all = knownErrorDiagnostic(.plan, error.DocumentSqlWriteReturningAllUnsupported) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_write_returning_all_unsupported, returning_all.code);
+    try std.testing.expectEqualStrings("document SQL write RETURNING * is not supported", returning_all.message);
+    try std.testing.expectEqualStrings("List admitted document projection fields explicitly instead of using RETURNING *.", returning_all.hint.?);
+
+    const returning_duplicate = knownErrorDiagnostic(.plan, error.DocumentSqlWriteReturningDuplicateOutput) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_write_returning_duplicate_output, returning_duplicate.code);
+    try std.testing.expectEqualStrings("Give each document RETURNING item a unique output alias.", returning_duplicate.hint.?);
+
+    const returning_expression = knownErrorDiagnostic(.plan, error.DocumentSqlWriteReturningExpressionUnsupported) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_write_returning_expression_unsupported, returning_expression.code);
+    try std.testing.expectEqualStrings("Return _id, _doc, or declared document projection fields until expression rows are proven.", returning_expression.hint.?);
+
+    const returning_generated = knownErrorDiagnostic(.plan, error.DocumentSqlWriteReturningGeneratedField) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_write_returning_generated_field, returning_generated.code);
+    try std.testing.expectEqualStrings("document SQL write RETURNING cannot read a generated field", returning_generated.message);
+
+    const returning_version = knownErrorDiagnostic(.plan, error.DocumentSqlWriteReturningVersionUnsupported) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_write_returning_version_unsupported, returning_version.code);
+    try std.testing.expectEqualStrings("Wait for native document writes to expose deterministic post-write versions before returning _version.", returning_version.hint.?);
+
+    const returning_virtual = knownErrorDiagnostic(.plan, error.DocumentSqlWriteReturningVirtualFieldUnsupported) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_write_returning_virtual_field_unsupported, returning_virtual.code);
+    try std.testing.expectEqualStrings("Return only declared document projection fields with native readback semantics.", returning_virtual.hint.?);
 
     const byte_cap = knownErrorDiagnostic(.execute, error.DocumentSqlBoundedScanByteCapExceeded) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(SqlDiagnosticCode.document_sql_bounded_scan_byte_cap_exceeded, byte_cap.code);

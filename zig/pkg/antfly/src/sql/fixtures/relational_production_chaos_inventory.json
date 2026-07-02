@@ -5,12 +5,12 @@
       "id": "fk-action-page-chaos",
       "relational_slices_section": "Release parity and production chaos gate",
       "scope": "fk_action_page",
-      "status": "partial_release_gated",
+      "status": "release_evidence",
       "required_behavior": "Remote ref-owner unavailability, partial page progress, concurrent parent updates/deletes, concurrent child writes, lease handoff, and idempotent replay after resume must converge without duplicate action effects.",
-      "current_evidence": "Release-gated action page, owner routing, transaction-id stability, repair, and durable action job resume tests cover stable routing and retry primitives.",
-      "missing_evidence": "One production chaos harness must combine remote unavailability, partial progress, concurrent parent/child writes, lease handoff, and resume replay in a single scenario.",
-      "evidence_file": "zig/pkg/antfly/src/api/table_writes/integrity.zig",
-      "evidence_symbol": "foreign key action page transaction id is stable for durable page retry",
+      "current_evidence": "Release-gated provisioned FK action-page chaos now combines remote ref-owner unavailability, partial page progress, concurrent parent and child writes, owner-local lease handoff, writable reopen/resume, completed-job replay, and final child-row convergence without duplicate set-null effects.",
+      "missing_evidence": "",
+      "evidence_file": "zig/pkg/antfly/src/api/table_writes/sources.zig",
+      "evidence_symbol": "api.table_writes.docid provisioned foreign key action page chaos converges after owner outage and reopen",
       "release_gate": "relational-release-gate"
     },
     {
@@ -19,10 +19,10 @@
       "scope": "insert_source_upsert_owner_movement",
       "status": "missing_native_harness",
       "required_behavior": "Hosted/provisioned insert-source upsert must handle unique owner movement between source read, conflict lookup, grouped conflict guard evaluation, staging, and commit without duplicate unique entries, stale owner writes, or SQL versus typed-plan divergence.",
-      "current_evidence": "Release-gated local insert-source conflict/upsert parity and hosted mutation-source topology retry exist, but insert-source upsert has no hosted/provisioned native stage protocol equivalent to mutation-source staging.",
+      "current_evidence": "Release-gated local insert-source conflict/upsert parity, hosted mutation-source topology retry, and typed insert-source planner fail-closed coverage for ordinary unique and temporal-overlap owner topology errors exist, but insert-source upsert has no hosted/provisioned native stage protocol equivalent to mutation-source staging.",
       "missing_evidence": "Add a production chaos harness or explicit native insert-source staging protocol that revalidates unique owners after topology movement before grouped conflict updates commit.",
-      "evidence_file": "zig/pkg/antfly/src/api/http_server.zig",
-      "evidence_symbol": "applyLoweredPublicSqlInsertSource",
+      "evidence_file": "zig/pkg/antfly/src/sql/relational_rows.zig",
+      "evidence_symbol": "relational rows insert source conflict owner topology changes fail closed",
       "release_gate": "relational-release-gate"
     },
     {

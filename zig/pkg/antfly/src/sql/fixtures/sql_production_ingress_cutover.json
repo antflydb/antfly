@@ -33,13 +33,6 @@
       "requirement_id": "generated-ast-dispatch",
       "legacy_admission": "compatibility_contract",
       "public_boundary_corruption_required": false
-    },
-    {
-      "wrapper_id": "grammar-maintenance-tail-token-parsers",
-      "family": "maintenance",
-      "requirement_id": "generated-ast-dispatch",
-      "legacy_admission": "compatibility_contract",
-      "public_boundary_corruption_required": false
     }
   ],
   "families": [

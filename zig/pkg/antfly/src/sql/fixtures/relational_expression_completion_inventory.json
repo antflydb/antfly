@@ -16,9 +16,9 @@
       "id": "optimizer-expression-pushdown",
       "relational_slices_section": "Shared scalar expression AST completion",
       "surface": "optimizer_expression_pushdown",
-      "status": "partial_release_gated",
-      "current_evidence": "Expression partial-predicate implication already honors source-column collation and fail-closed semantic implication rows track unsafe predicate and stale-artifact cases.",
-      "missing_evidence": "Expression pushdown still needs to be an optimizer decision over typed expression properties, with negative tests for unsafe collation, null, volatility, and type-coercion cases instead of parser spelling.",
+      "status": "release_evidence",
+      "current_evidence": "Expression pushdown decisions use typed predicate implication over stored expression metadata. Release-gated storage tests prove positive implication with source-column collation, fail-closed behavior for unsafe collation, null predicate values, type-mismatched equality values, and volatile expression nodes, while stale-artifact inventory keeps unready derived paths invisible.",
+      "missing_evidence": "",
       "evidence_file": "zig/pkg/antfly/src/storage/db/relational_rows.zig",
       "evidence_symbol": "relational rows expression partial predicate implication honors source column collation",
       "release_gate": "relational-release-gate"

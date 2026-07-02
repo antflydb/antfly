@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "028f26e682576532ee99c35119166d05d7f0d9ee4b7216823edc36aec4a698bb",
-  "source_entry_count": 1405,
-  "entry_count": 1405,
+  "source_sha256": "840d58bbc6845999d0c5530052aa90474624535242c12960d9674a178651b5ec",
+  "source_entry_count": 1435,
+  "entry_count": 1435,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -9370,15 +9370,26 @@
       "sql": "INSERT INTO docs (_id, _doc) VALUES ('doc:a', '{}')"
     },
     {
-      "name": "unsupported document sql full document insert returning",
-      "family": "unsupported_write",
+      "name": "document sql full document insert returning",
+      "family": "document_write",
       "summary": {
-        "table_name": "docs"
+        "table_name": "docs",
+        "operations": 1
       },
-      "plan": "unsupported:write:requires=document_sql_write_unsupported",
-      "classification_reason": "document_sql_write_unsupported",
+      "plan": "document_write:table=docs:operation=full_document_insert:writes=1:transforms=0:deletes=0:write_mode=native_upsert:returning_rows=1",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
       "sql": "INSERT INTO docs (_id, _doc) VALUES ('doc:a', '{}') RETURNING _id"
+    },
+    {
+      "name": "document sql full document insert returning version",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=full_document_insert:writes=1:transforms=0:deletes=0:write_mode=native_upsert:returning_rows=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, _doc) VALUES ('doc:a', '{}') RETURNING _id, _version"
     },
     {
       "name": "unsupported document sql full document insert on conflict",
@@ -9814,6 +9825,66 @@
       "sql": "INSERT INTO docs (_id, extra) VALUES ('doc:a', 'blocked')"
     },
     {
+      "name": "document sql projection on conflict",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 0,
+        "source_assignments": 1
+      },
+      "plan": "document_conflict_write:table=docs:action=update:writes=1:ops=0:source_assignments=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch') ON CONFLICT (_id) DO UPDATE SET title = EXCLUDED.title"
+    },
+    {
+      "name": "document sql projection on conflict do nothing",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 0
+      },
+      "plan": "document_conflict_write:table=docs:action=nothing:writes=1:ops=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch') ON CONFLICT (_id) DO NOTHING"
+    },
+    {
+      "name": "document sql projection on conflict do update returning",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 0,
+        "source_assignments": 1,
+        "returning": 2
+      },
+      "plan": "document_conflict_write:table=docs:action=update:writes=1:ops=0:source_assignments=1:returning=2",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch') ON CONFLICT (_id) DO UPDATE SET title = EXCLUDED.title RETURNING _id, title"
+    },
+    {
+      "name": "document sql projection on conflict do nothing returning",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 0,
+        "returning": 1
+      },
+      "plan": "document_conflict_write:table=docs:action=nothing:writes=1:ops=0:returning=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch') ON CONFLICT (_id) DO NOTHING RETURNING _id"
+    },
+    {
+      "name": "document sql projection on conflict returning version",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 0,
+        "returning": 1
+      },
+      "plan": "document_conflict_write:table=docs:action=nothing:writes=1:ops=0:returning=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch') ON CONFLICT (_id) DO NOTHING RETURNING _version"
+    },
+    {
       "name": "unsupported document sql projection on conflict",
       "family": "unsupported_write",
       "summary": {
@@ -9822,7 +9893,7 @@
       "plan": "unsupported:write:requires=document_sql_write_unsupported",
       "classification_reason": "document_sql_write_unsupported",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
-      "sql": "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch') ON CONFLICT (_id) DO UPDATE SET title = EXCLUDED.title"
+      "sql": "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch') ON CONFLICT (title) DO UPDATE SET title = EXCLUDED.title"
     },
     {
       "name": "unsupported document sql projection on conflict do nothing",
@@ -9833,7 +9904,181 @@
       "plan": "unsupported:write:requires=document_sql_write_unsupported",
       "classification_reason": "document_sql_write_unsupported",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
-      "sql": "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch') ON CONFLICT (_id) DO NOTHING"
+      "sql": "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch') ON CONFLICT (title) DO NOTHING"
+    },
+    {
+      "name": "document sql exact source projection insert",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "source_assignments": 2,
+        "document_source_table": "docs"
+      },
+      "plan": "document_source_insert:table=docs:source_table=docs:source_producer=id_lookup:source_assignments=2",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, title) SELECT _id, title FROM docs WHERE _id = 'doc:a'"
+    },
+    {
+      "name": "document sql generated id source projection insert",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "source_assignments": 1,
+        "document_source_table": "docs"
+      },
+      "plan": "document_source_insert:table=docs:source_table=docs:source_producer=id_lookup:generated_target_id=1:source_assignments=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (title) SELECT title FROM docs WHERE _id = 'doc:a'"
+    },
+    {
+      "name": "document sql indexed source projection insert",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "source_assignments": 2,
+        "document_source_table": "docs"
+      },
+      "plan": "document_source_insert:table=docs:source_table=docs:source_producer=indexed_query:source_assignments=2",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, title) SELECT _id, title FROM docs WHERE status = 'draft'"
+    },
+    {
+      "name": "document sql bounded source projection insert",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "source_assignments": 2,
+        "document_source_table": "docs"
+      },
+      "plan": "document_source_insert:table=docs:source_table=docs:source_producer=bounded_scan:source_assignments=2",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"category\":{\"type\":\"keyword\",\"x-antfly-index\":false}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, title) SELECT _id, title FROM docs WHERE category = 'release'"
+    },
+    {
+      "name": "document sql limited source projection insert",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "source_assignments": 2,
+        "document_source_table": "docs"
+      },
+      "plan": "document_source_insert:table=docs:source_table=docs:source_producer=bounded_scan:source_limit=1:source_assignments=2",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"category\":{\"type\":\"keyword\",\"x-antfly-index\":false}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, title) SELECT _id, title FROM docs WHERE category = 'release' LIMIT 1"
+    },
+    {
+      "name": "document sql source projection insert returning",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "source_assignments": 2,
+        "returning": 4,
+        "document_source_table": "docs"
+      },
+      "plan": "document_source_insert:table=docs:source_table=docs:source_producer=id_lookup:source_assignments=2:returning=4",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, title) SELECT _id, title FROM docs WHERE _id = 'doc:a' RETURNING _id, title, _doc, _version"
+    },
+    {
+      "name": "document sql generated id indexed source projection insert",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "source_assignments": 1,
+        "document_source_table": "docs"
+      },
+      "plan": "document_source_insert:table=docs:source_table=docs:source_producer=indexed_query:generated_target_id=1:source_assignments=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (title) SELECT title FROM docs WHERE status = 'draft'"
+    },
+    {
+      "name": "document sql generated id bounded source projection insert",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "source_assignments": 1,
+        "document_source_table": "docs"
+      },
+      "plan": "document_source_insert:table=docs:source_table=docs:source_producer=bounded_scan:generated_target_id=1:source_assignments=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"category\":{\"type\":\"keyword\",\"x-antfly-index\":false}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (title) SELECT title FROM docs WHERE category = 'release'"
+    },
+    {
+      "name": "unsupported ordered document sql projection source insert",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"category\":{\"type\":\"keyword\",\"x-antfly-index\":false}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, title) SELECT _id, title FROM docs WHERE category = 'release' ORDER BY _id LIMIT 1"
+    },
+    {
+      "name": "unsupported document sql projection source insert on conflict",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, title) SELECT _id, title FROM docs WHERE _id = 'doc:a' ON CONFLICT (_id) DO NOTHING"
+    },
+    {
+      "name": "unsupported document sql projection source insert nested target",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, metadata.profile) SELECT _id, metadata FROM docs WHERE _id = 'doc:a'"
+    },
+    {
+      "name": "unsupported document sql projection source insert doc target",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, _doc) SELECT _id, _doc FROM docs WHERE _id = 'doc:a'"
+    },
+    {
+      "name": "unsupported document sql projection source insert version target",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, _version) SELECT _id, _version FROM docs WHERE _id = 'doc:a'"
+    },
+    {
+      "name": "unsupported document sql projection source insert doc source",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, title) SELECT _id, _doc FROM docs WHERE _id = 'doc:a'"
+    },
+    {
+      "name": "unsupported document sql projection source insert version source",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, title) SELECT _id, _version FROM docs WHERE _id = 'doc:a'"
     },
     {
       "name": "unsupported document sql projection source insert",
@@ -11558,12 +11803,11 @@
     },
     {
       "name": "unsupported document sql projection returning",
-      "family": "unsupported_write",
+      "family": "document_write",
       "summary": {
         "table_name": "docs"
       },
-      "plan": "unsupported:write:requires=document_sql_write_unsupported",
-      "classification_reason": "document_sql_write_unsupported",
+      "plan": "document_write:table=docs:operation=projection_write:producer=id_lookup:producer_ids=1:template=transform:ops=1",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
       "sql": "UPDATE docs SET title = 'Launch' WHERE _id = 'doc:a' RETURNING _id, title"
     },
@@ -11611,15 +11855,24 @@
       "sql": "TRUNCATE docs CASCADE"
     },
     {
-      "name": "unsupported document sql merge matched delete",
-      "family": "unsupported_write",
+      "name": "document sql merge matched delete",
+      "family": "document_write",
       "summary": {
         "table_name": "docs"
       },
-      "plan": "unsupported:write:requires=document_sql_write_unsupported",
-      "classification_reason": "document_sql_write_unsupported",
+      "plan": "document_merge_write:table=docs:source_table=docs:target_producer=bounded_scan:source_producer=bounded_scan:join_keys=1:matched_arms=1:max_target_rows=10000:max_source_rows=10000",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
-      "sql": "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN MATCHED THEN DELETE"
+      "sql": "MERGE INTO docs USING docs AS source ON docs.title = source.title WHEN MATCHED THEN DELETE"
+    },
+    {
+      "name": "document sql merge matched version predicate",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "document_merge_write:table=docs:source_table=docs:target_producer=bounded_scan:source_producer=bounded_scan:join_keys=1:matched_arms=2:max_target_rows=10000:max_source_rows=10000",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":true}}}}",
+      "sql": "MERGE INTO docs USING docs AS source ON docs.title = source.title WHEN MATCHED AND docs.status = 'ready' AND docs._version = 42 THEN UPDATE SET title = source.title WHEN MATCHED THEN DO NOTHING"
     },
     {
       "name": "unsupported create event trigger",
@@ -12817,122 +13070,183 @@
     },
     {
       "name": "read scalar subquery predicate",
-      "family": "unsupported_read",
+      "family": "read",
       "summary": {
         "table_name": "usage_records"
       },
-      "plan": "unsupported:read:requires=subquery_scalar_plan",
-      "classification_reason": "subquery_scalar_plan",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:subquery_pred=1",
       "sql": "SELECT id FROM usage_records WHERE status = (SELECT status FROM usage_records)"
     },
     {
       "name": "read scalar subquery projection",
-      "family": "unsupported_read",
+      "family": "read",
       "summary": {
         "table_name": "usage_records"
       },
-      "plan": "unsupported:read:requires=subquery_expression_plan",
-      "classification_reason": "subquery_expression_plan",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:scalar_subquery=1",
       "sql": "SELECT (SELECT status FROM usage_records WHERE id = 'u1') AS first_status FROM usage_records"
     },
     {
       "name": "read exists subquery predicate",
-      "family": "unsupported_read",
+      "family": "read",
       "summary": {
         "table_name": "usage_records"
       },
-      "plan": "unsupported:read:requires=subquery_semijoin_plan",
-      "classification_reason": "subquery_semijoin_plan",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:subquery_pred=1",
       "sql": "SELECT id FROM usage_records WHERE EXISTS (SELECT 1 FROM usage_records WHERE enabled IS TRUE)"
     },
     {
       "name": "read not exists subquery predicate",
-      "family": "unsupported_read",
+      "family": "read",
       "summary": {
         "table_name": "usage_records"
       },
-      "plan": "unsupported:read:requires=subquery_semijoin_plan",
-      "classification_reason": "subquery_semijoin_plan",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:subquery_pred=1",
       "sql": "SELECT id FROM usage_records WHERE NOT EXISTS (SELECT 1 FROM usage_records WHERE enabled IS TRUE)"
     },
     {
       "name": "read in subquery predicate",
-      "family": "unsupported_read",
+      "family": "read",
       "summary": {
         "table_name": "usage_records"
       },
-      "plan": "unsupported:read:requires=subquery_semijoin_plan",
-      "classification_reason": "subquery_semijoin_plan",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:subquery_pred=1",
       "sql": "SELECT id FROM usage_records WHERE status IN (SELECT status FROM usage_records)"
     },
     {
       "name": "read not in subquery predicate",
-      "family": "unsupported_read",
+      "family": "read",
       "summary": {
         "table_name": "usage_records"
       },
-      "plan": "unsupported:read:requires=subquery_semijoin_plan",
-      "classification_reason": "subquery_semijoin_plan",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:subquery_pred=1",
       "sql": "SELECT id FROM usage_records WHERE status NOT IN (SELECT status FROM usage_records)"
     },
     {
       "name": "read quantified subquery predicate",
-      "family": "unsupported_read",
+      "family": "read",
       "summary": {
         "table_name": "usage_records"
       },
-      "plan": "unsupported:read:requires=subquery_quantified_plan",
-      "classification_reason": "subquery_quantified_plan",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:subquery_pred=1",
       "sql": "SELECT id FROM usage_records WHERE status = ANY (SELECT status FROM usage_records)"
     },
     {
-      "name": "read like any subquery predicate",
-      "family": "unsupported_read",
+      "name": "read some subquery predicate",
+      "family": "read",
       "summary": {
         "table_name": "usage_records"
       },
-      "plan": "unsupported:read:requires=subquery_quantified_plan",
-      "classification_reason": "subquery_quantified_plan",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:subquery_pred=1",
+      "sql": "SELECT id FROM usage_records WHERE status = SOME (SELECT status FROM usage_records)"
+    },
+    {
+      "name": "read greater than any subquery predicate",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:subquery_pred=1",
+      "sql": "SELECT id FROM usage_records WHERE amount > ANY (SELECT amount FROM usage_records)"
+    },
+    {
+      "name": "read greater equal some subquery predicate",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:subquery_pred=1",
+      "sql": "SELECT id FROM usage_records WHERE amount >= SOME (SELECT amount FROM usage_records)"
+    },
+    {
+      "name": "read less than all subquery predicate",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:subquery_pred=1",
+      "sql": "SELECT id FROM usage_records WHERE amount < ALL (SELECT amount FROM usage_records)"
+    },
+    {
+      "name": "read less equal all subquery predicate",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:subquery_pred=1",
+      "sql": "SELECT id FROM usage_records WHERE amount <= ALL (SELECT amount FROM usage_records)"
+    },
+    {
+      "name": "read like any subquery predicate",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:subquery_pred=1",
       "sql": "SELECT id FROM usage_records WHERE status LIKE ANY (SELECT status FROM usage_records)"
     },
     {
-      "name": "read not ilike all subquery predicate",
-      "family": "unsupported_read",
+      "name": "read ilike any subquery predicate",
+      "family": "read",
       "summary": {
         "table_name": "usage_records"
       },
-      "plan": "unsupported:read:requires=subquery_quantified_plan",
-      "classification_reason": "subquery_quantified_plan",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:subquery_pred=1",
+      "sql": "SELECT id FROM usage_records WHERE status ILIKE ANY (SELECT status FROM usage_records)"
+    },
+    {
+      "name": "read like all subquery predicate",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:subquery_pred=1",
+      "sql": "SELECT id FROM usage_records WHERE status LIKE ALL (SELECT status FROM usage_records)"
+    },
+    {
+      "name": "read not like all subquery predicate",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:subquery_pred=1",
+      "sql": "SELECT id FROM usage_records WHERE status NOT LIKE ALL (SELECT status FROM usage_records)"
+    },
+    {
+      "name": "read not ilike all subquery predicate",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:subquery_pred=1",
       "sql": "SELECT id FROM usage_records WHERE status NOT ILIKE ALL (SELECT status FROM usage_records)"
     },
     {
       "name": "read correlated subquery predicate",
-      "family": "unsupported_read",
+      "family": "read",
       "summary": {
         "table_name": "usage_records"
       },
-      "plan": "unsupported:read:requires=subquery_semijoin_plan",
-      "classification_reason": "subquery_semijoin_plan",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:subquery_pred=1",
       "sql": "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id)"
     },
     {
       "name": "read nested subquery predicate",
-      "family": "unsupported_read",
+      "family": "read",
       "summary": {
         "table_name": "usage_records"
       },
-      "plan": "unsupported:read:requires=subquery_semijoin_plan",
-      "classification_reason": "subquery_semijoin_plan",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:subquery_pred=1",
       "sql": "SELECT id FROM usage_records WHERE status IN (SELECT status FROM usage_records WHERE customer_id IN (SELECT customer_id FROM usage_records WHERE enabled IS TRUE))"
     },
     {
       "name": "read cte contained subquery predicate",
-      "family": "unsupported_read",
+      "family": "read",
       "summary": {
-        "table_name": "usage_records"
+        "table_name": "usage_records",
+        "ctes": 1
       },
-      "plan": "unsupported:read:requires=subquery_semijoin_plan",
-      "classification_reason": "subquery_semijoin_plan",
+      "plan": "read:query:query:table=usage_records:ctes=1:source_cte=0:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none:subquery_pred=1",
       "sql": "WITH open_usage AS (SELECT id, status FROM usage_records WHERE status = 'open') SELECT id FROM usage_records WHERE status IN (SELECT status FROM open_usage)"
     },
     {

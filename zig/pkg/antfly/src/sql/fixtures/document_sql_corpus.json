@@ -284,6 +284,20 @@
       }
     },
     {
+      "name": "projection update by exact document id returning version lowers to transform batch",
+      "schema": "write_rich",
+      "sql": "UPDATE docs SET title = 'Launch' WHERE _id = 'doc:a' RETURNING _id, _version",
+      "expected": {
+        "plan": "document_write",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "writes": 0,
+        "transforms": 1,
+        "deletes": 0,
+        "returning": 2
+      }
+    },
+    {
       "name": "indexed projection update lowers to indexed producer mutation",
       "schema": "write_rich",
       "sql": "UPDATE docs SET title = 'Launch' WHERE status = 'draft'",
@@ -299,6 +313,38 @@
       }
     },
     {
+      "name": "indexed projection update returning lowers to indexed producer mutation",
+      "schema": "write_rich",
+      "sql": "UPDATE docs SET title = 'Launch' WHERE status = 'draft' RETURNING _id, title, _doc",
+      "expected": {
+        "plan": "document_producer_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "producer": "indexed_query",
+        "template": "transform",
+        "ops": 1,
+        "max_candidate_rows": 10000,
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"draft\"}}",
+        "returning": 3
+      }
+    },
+    {
+      "name": "indexed projection update returning version lowers to indexed producer mutation",
+      "schema": "write_rich",
+      "sql": "UPDATE docs SET title = 'Launch' WHERE status = 'draft' RETURNING _id, _version",
+      "expected": {
+        "plan": "document_producer_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "producer": "indexed_query",
+        "template": "transform",
+        "ops": 1,
+        "max_candidate_rows": 10000,
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"draft\"}}",
+        "returning": 2
+      }
+    },
+    {
       "name": "bounded delete lowers to bounded residual producer mutation",
       "schema": "write_rich",
       "sql": "DELETE FROM docs WHERE category = 'release'",
@@ -311,6 +357,38 @@
         "max_scan_rows": 10000,
         "max_scan_bytes": 8388608,
         "residual_filter_json": "{\"term\":{\"path\":\"/category\",\"value\":\"release\"}}"
+      }
+    },
+    {
+      "name": "bounded delete returning lowers to bounded residual producer mutation",
+      "schema": "write_rich",
+      "sql": "DELETE FROM docs WHERE category = 'release' RETURNING _id, title",
+      "expected": {
+        "plan": "document_producer_mutation",
+        "operation": "non_identity_delete",
+        "table_name": "docs",
+        "producer": "bounded_scan",
+        "template": "delete",
+        "max_scan_rows": 10000,
+        "max_scan_bytes": 8388608,
+        "residual_filter_json": "{\"term\":{\"path\":\"/category\",\"value\":\"release\"}}",
+        "returning": 2
+      }
+    },
+    {
+      "name": "bounded delete returning version lowers to bounded residual producer mutation",
+      "schema": "write_rich",
+      "sql": "DELETE FROM docs WHERE category = 'release' RETURNING _id, _version",
+      "expected": {
+        "plan": "document_producer_mutation",
+        "operation": "non_identity_delete",
+        "table_name": "docs",
+        "producer": "bounded_scan",
+        "template": "delete",
+        "max_scan_rows": 10000,
+        "max_scan_bytes": 8388608,
+        "residual_filter_json": "{\"term\":{\"path\":\"/category\",\"value\":\"release\"}}",
+        "returning": 2
       }
     },
     {
@@ -352,6 +430,27 @@
       }
     },
     {
+      "name": "non-identity joined projection update returning lowers to parameterized source lookup",
+      "schema": "write_join_cardinality_proof",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.category = 'release' RETURNING _id, title, _doc",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "bounded_scan",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_scan_rows": 10000,
+        "max_scan_bytes": 8388608,
+        "max_target_rows": 10000,
+        "max_source_rows": 1,
+        "residual_filter_json": "{\"term\":{\"path\":\"/category\",\"value\":\"release\"}}",
+        "returning": 3
+      }
+    },
+    {
       "name": "non-identity joined delete with bounded target lowers to parameterized source lookup",
       "schema": "write_join_cardinality_proof",
       "sql": "DELETE FROM docs USING docs AS source WHERE docs.status = source.status AND docs.category = 'release'",
@@ -369,6 +468,27 @@
         "max_target_rows": 10000,
         "max_source_rows": 1,
         "residual_filter_json": "{\"term\":{\"path\":\"/category\",\"value\":\"release\"}}"
+      }
+    },
+    {
+      "name": "non-identity joined delete returning lowers to parameterized source lookup",
+      "schema": "write_join_cardinality_proof",
+      "sql": "DELETE FROM docs USING docs AS source WHERE docs.status = source.status AND docs.category = 'release' RETURNING _id, title",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "non_identity_delete",
+        "table_name": "docs",
+        "target_producer": "bounded_scan",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "delete",
+        "ops": 0,
+        "join_keys": 1,
+        "max_scan_rows": 10000,
+        "max_scan_bytes": 8388608,
+        "max_target_rows": 10000,
+        "max_source_rows": 1,
+        "residual_filter_json": "{\"term\":{\"path\":\"/category\",\"value\":\"release\"}}",
+        "returning": 2
       }
     },
     {
@@ -407,6 +527,473 @@
       "name": "document truncate rejects cascade variant",
       "schema": "write_rich",
       "sql": "TRUNCATE docs CASCADE",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "document projection insert on conflict do nothing lowers to conflict write",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title, status) VALUES ('doc:a', 'Launch', 'draft') ON CONFLICT (_id) DO NOTHING",
+      "expected": {
+        "plan": "document_conflict_write",
+        "action": "nothing",
+        "table_name": "docs",
+        "writes": 1,
+        "ops": 0,
+        "source_assignments": 0
+      }
+    },
+    {
+      "name": "document projection insert on conflict do update lowers to conflict write",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title, status) VALUES ('doc:a', 'Launch', 'draft') ON CONFLICT (_id) DO UPDATE SET title = excluded.title, status = 'published'",
+      "expected": {
+        "plan": "document_conflict_write",
+        "action": "update",
+        "table_name": "docs",
+        "writes": 1,
+        "ops": 1,
+        "source_assignments": 1
+      }
+    },
+    {
+      "name": "document projection insert on conflict rejects duplicate proposed keys",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title) VALUES ('doc:a', 'First'), ('doc:a', 'Second') ON CONFLICT (_id) DO UPDATE SET title = excluded.title",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "document projection insert on conflict do nothing returning lowers to conflict write",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch') ON CONFLICT (_id) DO NOTHING RETURNING _id",
+      "expected": {
+        "plan": "document_conflict_write",
+        "action": "nothing",
+        "table_name": "docs",
+        "writes": 1,
+        "ops": 0,
+        "source_assignments": 0,
+        "returning": 1
+      }
+    },
+    {
+      "name": "document projection insert on conflict do update returning lowers to conflict write",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title, status) VALUES ('doc:a', 'Launch', 'draft') ON CONFLICT (_id) DO UPDATE SET title = excluded.title RETURNING _id, title, _doc",
+      "expected": {
+        "plan": "document_conflict_write",
+        "action": "update",
+        "table_name": "docs",
+        "writes": 1,
+        "ops": 0,
+        "source_assignments": 1,
+        "returning": 3
+      }
+    },
+    {
+      "name": "document projection insert on conflict nested alias returning lowers to conflict write",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title, metadata) VALUES ('doc:a', 'Launch', '{\"profile\":{\"name\":\"Ada\"}}'::jsonb) ON CONFLICT (_id) DO UPDATE SET title = excluded.title, metadata = excluded.metadata RETURNING _id, metadata AS returned_metadata, _doc",
+      "expected": {
+        "plan": "document_conflict_write",
+        "action": "update",
+        "table_name": "docs",
+        "writes": 1,
+        "ops": 0,
+        "source_assignments": 2,
+        "returning": 3
+      }
+    },
+    {
+      "name": "document projection insert on conflict guarded update lowers to conflict write",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title, status) VALUES ('doc:a', 'Launch', 'published') ON CONFLICT (_id) DO UPDATE SET title = excluded.title WHERE excluded.status = 'published' AND title = 'Old'",
+      "expected": {
+        "plan": "document_conflict_write",
+        "action": "update",
+        "table_name": "docs",
+        "writes": 1,
+        "ops": 0,
+        "source_assignments": 1,
+        "where_expressions": 2
+      }
+    },
+    {
+      "name": "document projection insert on conflict expression assignment lowers to conflict write",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title, status) VALUES ('doc:a', 'Launch', 'PUBLISHED') ON CONFLICT (_id) DO UPDATE SET title = lower(excluded.status) WHERE NOT (status = 'archived')",
+      "expected": {
+        "plan": "document_conflict_write",
+        "action": "update",
+        "table_name": "docs",
+        "writes": 1,
+        "ops": 0,
+        "source_assignments": 0,
+        "expression_assignments": 1,
+        "where_not": 1
+      }
+    },
+    {
+      "name": "document projection insert on conflict returning star stays unsupported",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch') ON CONFLICT (_id) DO NOTHING RETURNING *",
+      "expected": {
+        "expected_error": "DocumentSqlWriteReturningAllUnsupported"
+      }
+    },
+    {
+      "name": "document projection insert on conflict returning version lowers to conflict write",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch') ON CONFLICT (_id) DO NOTHING RETURNING _version",
+      "expected": {
+        "plan": "document_conflict_write",
+        "action": "nothing",
+        "table_name": "docs",
+        "writes": 1,
+        "ops": 0,
+        "source_assignments": 0,
+        "returning": 1
+      }
+    },
+    {
+      "name": "document projection insert on conflict returning duplicate output stays unsupported",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title, status) VALUES ('doc:a', 'Launch', 'draft') ON CONFLICT (_id) DO UPDATE SET title = excluded.title RETURNING title, status AS title",
+      "expected": {
+        "expected_error": "DocumentSqlWriteReturningDuplicateOutput"
+      }
+    },
+    {
+      "name": "document projection insert on conflict returning expression stays unsupported",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch') ON CONFLICT (_id) DO UPDATE SET title = excluded.title RETURNING lower(title)",
+      "expected": {
+        "expected_error": "DocumentSqlWriteReturningExpressionUnsupported"
+      }
+    },
+    {
+      "name": "document projection insert on conflict returning generated field stays unsupported",
+      "schema": "write_join_generated_target",
+      "sql": "INSERT INTO docs (_id, status) VALUES ('doc:a', 'Draft') ON CONFLICT (_id) DO UPDATE SET status = excluded.status RETURNING status_lower",
+      "expected": {
+        "expected_error": "DocumentSqlWriteReturningGeneratedField"
+      }
+    },
+    {
+      "name": "document projection insert on conflict returning unsupported virtual field stays unsupported",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch') ON CONFLICT (_id) DO UPDATE SET title = excluded.title RETURNING unknown_virtual",
+      "expected": {
+        "expected_error": "DocumentSqlWriteReturningVirtualFieldUnsupported"
+      }
+    },
+    {
+      "name": "document projection insert on conflict non-identity target stays unsupported",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch') ON CONFLICT (title) DO NOTHING",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "document projection insert on unique conflict target lowers to conflict write",
+      "schema": "write_join_cardinality_proof",
+      "sql": "INSERT INTO docs (_id, title, status) VALUES ('doc:new', 'Launch', 'active') ON CONFLICT (status) DO UPDATE SET title = excluded.title",
+      "expected": {
+        "plan": "document_conflict_write",
+        "action": "update",
+        "table_name": "docs",
+        "writes": 1,
+        "ops": 0,
+        "source_assignments": 1
+      }
+    },
+    {
+      "name": "document projection insert on unique conflict target rejects duplicate proposed target values",
+      "schema": "write_join_cardinality_proof",
+      "sql": "INSERT INTO docs (_id, title, status) VALUES ('doc:a', 'First', 'active'), ('doc:b', 'Second', 'active') ON CONFLICT (status) DO NOTHING",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "document projection insert on conflict generated field update stays unsupported",
+      "schema": "write_join_generated_target",
+      "sql": "INSERT INTO docs (_id, status) VALUES ('doc:a', 'draft') ON CONFLICT (_id) DO UPDATE SET status_lower = excluded.status",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "document projection source insert with exact id source lowers to source insert",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title) SELECT _id, title FROM docs WHERE _id IN ('doc:a', 'doc:b')",
+      "expected": {
+        "plan": "document_source_insert",
+        "table_name": "docs",
+        "source_producer": "id_lookup",
+        "source_assignments": 2
+      }
+    },
+    {
+      "name": "document projection source insert generated id lowers to source insert",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (title) SELECT title FROM docs WHERE _id = 'doc:a'",
+      "expected": {
+        "plan": "document_source_insert",
+        "table_name": "docs",
+        "source_producer": "id_lookup",
+        "source_assignments": 1,
+        "generated_target_id": true
+      }
+    },
+    {
+      "name": "document projection source insert generated id indexed source lowers to source insert",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (title) SELECT title FROM docs WHERE status = 'draft'",
+      "expected": {
+        "plan": "document_source_insert",
+        "table_name": "docs",
+        "source_producer": "indexed_query",
+        "source_assignments": 1,
+        "generated_target_id": true,
+        "max_candidate_rows": 10000,
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"draft\"}}"
+      }
+    },
+    {
+      "name": "document projection source insert generated id bounded source lowers to source insert",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (title) SELECT title FROM docs WHERE category = 'release'",
+      "expected": {
+        "plan": "document_source_insert",
+        "table_name": "docs",
+        "source_producer": "bounded_scan",
+        "source_assignments": 1,
+        "generated_target_id": true,
+        "max_scan_rows": 10000,
+        "max_scan_bytes": 8388608,
+        "residual_filter_json": "{\"term\":{\"path\":\"/category\",\"value\":\"release\"}}"
+      }
+    },
+    {
+      "name": "document projection source insert indexed source lowers to source insert",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title) SELECT _id, title FROM docs WHERE status = 'draft'",
+      "expected": {
+        "plan": "document_source_insert",
+        "table_name": "docs",
+        "source_producer": "indexed_query",
+        "source_assignments": 2,
+        "max_candidate_rows": 10000,
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"draft\"}}"
+      }
+    },
+    {
+      "name": "document projection source insert bounded source lowers to source insert",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title) SELECT _id, title FROM docs WHERE category = 'release'",
+      "expected": {
+        "plan": "document_source_insert",
+        "table_name": "docs",
+        "source_producer": "bounded_scan",
+        "source_assignments": 2,
+        "max_scan_rows": 10000,
+        "max_scan_bytes": 8388608,
+        "residual_filter_json": "{\"term\":{\"path\":\"/category\",\"value\":\"release\"}}"
+      }
+    },
+    {
+      "name": "document projection source insert source limit lowers to source insert",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title) SELECT _id, title FROM docs WHERE status = 'draft' LIMIT 1",
+      "expected": {
+        "plan": "document_source_insert",
+        "table_name": "docs",
+        "source_producer": "indexed_query",
+        "source_assignments": 2,
+        "source_limit": 1,
+        "max_candidate_rows": 10000,
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"draft\"}}"
+      }
+    },
+    {
+      "name": "document projection source insert ordered source stays unsupported",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title) SELECT _id, title FROM docs WHERE status = 'draft' ORDER BY _id LIMIT 1",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "document projection source insert returning lowers to source insert",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title) SELECT _id, title FROM docs WHERE _id = 'doc:a' RETURNING _id, title, _doc, _version",
+      "expected": {
+        "plan": "document_source_insert",
+        "table_name": "docs",
+        "source_producer": "id_lookup",
+        "source_assignments": 2,
+        "returning": 4
+      }
+    },
+    {
+      "name": "document projection source insert on conflict stays unsupported",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title) SELECT _id, title FROM docs WHERE _id = 'doc:a' ON CONFLICT (_id) DO NOTHING",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "document projection source insert nested target path stays unsupported",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, metadata.profile) SELECT _id, metadata FROM docs WHERE _id = 'doc:a'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "document projection source insert doc target stays unsupported",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, _doc) SELECT _id, _doc FROM docs WHERE _id = 'doc:a'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "document projection source insert version target stays unsupported",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, _version) SELECT _id, _version FROM docs WHERE _id = 'doc:a'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "document projection source insert doc source stays unsupported",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title) SELECT _id, _doc FROM docs WHERE _id = 'doc:a'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "document projection source insert version source stays unsupported",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title) SELECT _id, _version FROM docs WHERE _id = 'doc:a'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "document merge matched delete lowers to bounded native producer",
+      "schema": "write_rich",
+      "sql": "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN MATCHED THEN DELETE",
+      "expected": {
+        "plan": "document_merge_mutation",
+        "table_name": "docs",
+        "target_producer": "bounded_scan",
+        "source_producer": "bounded_scan",
+        "join_keys": 1,
+        "matched_arms": 1,
+        "not_matched_arms": 0,
+        "source_assignments": 0,
+        "max_target_rows": 10000,
+        "max_source_rows": 10000
+      }
+    },
+    {
+      "name": "document merge matched update lowers to bounded native producer",
+      "schema": "write_rich",
+      "sql": "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN MATCHED THEN UPDATE SET title = source.title",
+      "expected": {
+        "plan": "document_merge_mutation",
+        "table_name": "docs",
+        "target_producer": "bounded_scan",
+        "source_producer": "bounded_scan",
+        "join_keys": 1,
+        "matched_arms": 1,
+        "not_matched_arms": 0,
+        "source_assignments": 1,
+        "max_target_rows": 10000,
+        "max_source_rows": 10000
+      }
+    },
+    {
+      "name": "document merge matched no-op lowers to bounded native producer",
+      "schema": "write_rich",
+      "sql": "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN MATCHED THEN DO NOTHING",
+      "expected": {
+        "plan": "document_merge_mutation",
+        "table_name": "docs",
+        "target_producer": "bounded_scan",
+        "source_producer": "bounded_scan",
+        "join_keys": 1,
+        "matched_arms": 1,
+        "not_matched_arms": 0,
+        "source_assignments": 0,
+        "max_target_rows": 10000,
+        "max_source_rows": 10000
+      }
+    },
+    {
+      "name": "document merge not matched insert lowers to bounded native producer",
+      "schema": "write_rich",
+      "sql": "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN NOT MATCHED THEN INSERT (_id, _doc) VALUES (source._id, source._doc)",
+      "expected": {
+        "plan": "document_merge_mutation",
+        "table_name": "docs",
+        "target_producer": "bounded_scan",
+        "source_producer": "bounded_scan",
+        "join_keys": 1,
+        "matched_arms": 0,
+        "not_matched_arms": 1,
+        "source_assignments": 0,
+        "max_target_rows": 10000,
+        "max_source_rows": 10000
+      }
+    },
+    {
+      "name": "document merge branch predicate lowers to bounded native producer",
+      "schema": "write_rich",
+      "sql": "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN MATCHED AND source.status = 'ready' THEN UPDATE SET title = source.title WHEN MATCHED THEN DO NOTHING",
+      "expected": {
+        "plan": "document_merge_mutation",
+        "table_name": "docs",
+        "target_producer": "bounded_scan",
+        "source_producer": "bounded_scan",
+        "join_keys": 1,
+        "matched_arms": 2,
+        "not_matched_arms": 0,
+        "source_assignments": 1,
+        "max_target_rows": 10000,
+        "max_source_rows": 10000
+      }
+    },
+    {
+      "name": "document merge target version predicate lowers to bounded native producer",
+      "schema": "write_rich",
+      "sql": "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN MATCHED AND docs.status = 'ready' AND docs._version = 42 THEN UPDATE SET title = source.title WHEN MATCHED THEN DO NOTHING",
+      "expected": {
+        "plan": "document_merge_mutation",
+        "table_name": "docs",
+        "target_producer": "bounded_scan",
+        "source_producer": "bounded_scan",
+        "join_keys": 1,
+        "matched_arms": 2,
+        "not_matched_arms": 0,
+        "source_assignments": 1,
+        "max_target_rows": 10000,
+        "max_source_rows": 10000
+      }
+    },
+    {
+      "name": "document merge returning waits for native producer contract",
+      "schema": "write_rich",
+      "sql": "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN MATCHED THEN DELETE RETURNING docs._id",
       "expected": {
         "expected_error": "DocumentSqlWriteUnsupported"
       }

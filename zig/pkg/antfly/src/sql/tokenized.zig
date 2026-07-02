@@ -375,7 +375,7 @@ pub const ParsedSql = struct {
             if (generated_statement.kind() == .read) {
                 const generated_kind = self.generatedReadStatementKind() orelse return null;
                 return switch (self.statement) {
-                    .read => |statement| if (statement.kind == generated_kind) generated_kind else null,
+                    .read => |statement| if (statement.kind == generated_kind or statement.kind == .query) generated_kind else null,
                     else => null,
                 };
             }
@@ -6086,7 +6086,11 @@ fn generatedReadExpressionChildPayloadsAreValid(
     end: usize,
     expression: generated_parser.GeneratedSqlExpressionAst,
 ) bool {
-    if (!generatedReadExpressionOptionalChildPayloadIsValid(tokens, end, expression.inner_expression_kind, expression.inner_tokens, expression.inner_expression)) return false;
+    if (expression.kind != .subquery and
+        !generatedReadExpressionOptionalChildPayloadIsValid(tokens, end, expression.inner_expression_kind, expression.inner_tokens, expression.inner_expression))
+    {
+        return false;
+    }
     if (!generatedReadExpressionOptionalChildPayloadIsValid(tokens, end, expression.subquery_where_expression_kind, expression.subquery_where_tokens, expression.subquery_where_expression)) return false;
     if (!generatedReadExpressionOptionalChildPayloadIsValid(tokens, end, expression.filter_expression_kind, expression.filter_predicate_tokens, expression.filter_expression)) return false;
     if (!generatedReadExpressionEscapePayloadIsValid(tokens, end, expression.escape_tokens, expression.escape_expression_kind, expression.escape_expression)) return false;
@@ -6229,7 +6233,7 @@ fn generatedReadSubqueryExpressionPayloadIsValid(
     if (!std.meta.eql(select_tokens, generated_parser.GeneratedSqlTokenRange{ .start = select_tokens.start, .end = select_tokens.start + 1 })) return false;
     if (!tokens[select_tokens.start].matchesKeywordTag(.select)) return false;
     if (!generatedReadSubqueryProjectionStartIsValid(tokens, end, select_tokens, projection_tokens)) return false;
-    if (!generatedReadListPayloadIsValid(tokens, end, projection_tokens, expression.subquery_projection_items, .{
+    if (!generatedReadDelimitedListIsValid(tokens, end, projection_tokens, expression.subquery_projection_items, .{
         .allow_aliases = true,
         .reject_order_modifiers = true,
     })) return false;
@@ -10131,6 +10135,25 @@ test "sql adapter parsed sql rejects malformed generated classification payloads
         std.meta.activeTag(parseStatement(malformed_subquery_projection_list_read.raw_statement, malformed_subquery_projection_list_generated, &malformed_subquery_projection_list_read.tokenized_sql)),
     );
 
+    var malformed_scalar_projection_subquery_read = try ParsedSql.initAlloc(alloc, "SELECT (SELECT status FROM usage_records WHERE id = 'u1') AS first_status FROM usage_records");
+    defer malformed_scalar_projection_subquery_read.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, malformed_scalar_projection_subquery_read.readStatementKindIncludingGeneratedAst().?);
+    var malformed_scalar_projection_subquery_generated = malformed_scalar_projection_subquery_read.generated_statement.?;
+    if (malformed_scalar_projection_subquery_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.subquery, read_ast.projection_items.expressions[0].kind);
+                try std.testing.expect(read_ast.projection_items.expressions[0].subquery_projection_items.count != 0);
+                read_ast.projection_items.expressions[0].subquery_projection_items.count = 0;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(malformed_scalar_projection_subquery_read.raw_statement, malformed_scalar_projection_subquery_generated, &malformed_scalar_projection_subquery_read.tokenized_sql)),
+    );
+
     var malformed_case_condition_list_read = try ParsedSql.initAlloc(alloc, "SELECT CASE WHEN status IS NULL THEN 'missing' ELSE status END AS status_key FROM usage_records WHERE kind = 'order'");
     defer malformed_case_condition_list_read.deinit(alloc);
     try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, malformed_case_condition_list_read.readStatementKindIncludingGeneratedAst().?);
@@ -12025,6 +12048,7 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
         .{ .sql = "SELECT id FROM usage_records WHERE status = ANY(ARRAY['active','pending']::text[])", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE score = ANY (SELECT score FROM thresholds WHERE active IS TRUE)", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE score <> ALL (SELECT score FROM archived_thresholds)", .generated = .query, .read = .query },
+        .{ .sql = "SELECT (SELECT status FROM usage_records WHERE id = 'u1') AS first_status FROM usage_records", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE tags @> ARRAY['hot','new']", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE tags && ARRAY['hot','new']", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE metadata ? 'flags'", .generated = .query, .read = .query },
@@ -12967,8 +12991,21 @@ test "sql adapter parsed sql read statement kind can come from generated AST" {
     var generated_document_unnest = try ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag = 'urgent' LIMIT 10;");
     defer generated_document_unnest.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_document_unnest.generatedStatementKind().?);
-    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.join, generated_document_unnest.readStatementKind().?);
-    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.join, generated_document_unnest.readStatementKindIncludingGeneratedAst().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, generated_document_unnest.readStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, generated_document_unnest.readStatementKindIncludingGeneratedAst().?);
+
+    var generated_scalar_subquery_projection = try ParsedSql.initAlloc(alloc, "SELECT (SELECT status FROM usage_records WHERE id = 'u1') AS first_status FROM usage_records");
+    defer generated_scalar_subquery_projection.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_scalar_subquery_projection.generatedStatementKind().?);
+    const scalar_subquery_read_ast = switch (generated_scalar_subquery_projection.generated_statement.?.ast.?) {
+        .read => |read_ast| read_ast,
+        else => return error.TestUnexpectedResult,
+    };
+    const scalar_subquery_tokens = generated_scalar_subquery_projection.items();
+    _ = generatedReadStatementEnd(scalar_subquery_tokens, scalar_subquery_read_ast.statement_span) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(generatedReadAstHasValidClassificationPayload(scalar_subquery_tokens, scalar_subquery_read_ast));
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, generated_scalar_subquery_projection.generatedReadStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, generated_scalar_subquery_projection.readStatementKindIncludingGeneratedAst().?);
 }
 
 test "sql adapter parsed sql read statement kind is generated-owned for covered reads" {

@@ -784,6 +784,13 @@ test "relational embedded json search intersects with top-level relational filte
         .kind = .full_text,
         .config_json = "{}",
     });
+    try std.testing.expectError(error.InvalidDocumentForSchema, db.batch(.{
+        .writes = &.{.{
+            .key = "row:invalid",
+            .value = "{\"status\":7,\"attrs\":{\"title\":\"nebula invalid\",\"plan\":\"pro\"},\"unexpected\":\"bypass\"}",
+        }},
+        .sync_level = .full_index,
+    }));
     try db.batch(.{
         .writes = &.{
             .{
@@ -830,6 +837,30 @@ test "relational embedded json search intersects with top-level relational filte
     });
     defer mismatched.deinit();
     try std.testing.expectEqual(@as(u32, 0), mismatched.total_hits);
+
+    const locker_txn = try db.beginTransaction(2_000);
+    defer db.abortTransaction(locker_txn, 2_100) catch {};
+    try db.claimRowsForTransaction(locker_txn, &.{"row:archived"}, .{
+        .mode = .for_update,
+        .owner_id = "session:embedded-json-locker",
+        .txn_id = locker_txn,
+    });
+
+    const reader_txn = try db.beginTransaction(2_010);
+    defer db.abortTransaction(reader_txn, 2_110) catch {};
+    var claimed = try db.search(alloc, .{
+        .index_name = "ft_json",
+        .query = .{ .match = .{ .field = "attrs.title", .text = "nebula" } },
+        .row_claim = .{
+            .mode = .for_update_skip_locked,
+            .owner_id = "session:embedded-json-reader",
+            .txn_id = reader_txn,
+        },
+        .limit = 10,
+    });
+    defer claimed.deinit();
+    try std.testing.expectEqual(@as(u32, 1), claimed.total_hits);
+    try std.testing.expectEqualStrings("row:active", claimed.hits[0].id);
 }
 
 test "relational text backfill ignores generic primary rows" {

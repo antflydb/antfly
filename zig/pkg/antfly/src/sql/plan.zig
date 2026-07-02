@@ -206,6 +206,7 @@ pub const SelectList = struct {
     coalesce: []const db_mod.types.RelationalRowsCoalesceProjection = &.{},
     field_aliases: []const db_mod.types.RelationalRowsFieldAliasProjection = &.{},
     expressions: []const db_mod.types.RelationalRowsExpressionProjection = &.{},
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection = &.{},
     outputs: []const SelectOutputRef = &.{},
     select_all: bool = false,
 };
@@ -217,6 +218,7 @@ pub const SelectItem = union(enum) {
     coalesce: db_mod.types.RelationalRowsCoalesceProjection,
     expression: db_mod.types.RelationalRowsExpressionProjection,
     field_alias: db_mod.types.RelationalRowsFieldAliasProjection,
+    scalar_subquery: db_mod.types.RelationalRowsScalarSubqueryProjection,
 };
 
 pub fn selectOutputName(select: SelectList, output: SelectOutputRef) ?[]const u8 {
@@ -227,6 +229,7 @@ pub fn selectOutputName(select: SelectList, output: SelectOutputRef) ?[]const u8
         .coalesce => if (output.index < select.coalesce.len) select.coalesce[output.index].output else null,
         .field_alias => if (output.index < select.field_aliases.len) select.field_aliases[output.index].output else null,
         .expression => if (output.index < select.expressions.len) select.expressions[output.index].output else null,
+        .scalar_subquery => if (output.index < select.scalar_subqueries.len) select.scalar_subqueries[output.index].output else null,
     };
 }
 
@@ -394,6 +397,10 @@ fn renameCteSelectOutputAlloc(
             if (output.index >= lowered.query.expressions.len) return error.UnsupportedSqlShape;
             try replaceOwnedStringAlloc(alloc, &lowered.query.expressions[output.index].output, alias);
         },
+        .scalar_subquery => {
+            if (output.index >= lowered.query.scalar_subqueries.len) return error.UnsupportedSqlShape;
+            try replaceOwnedStringAlloc(alloc, &lowered.query.scalar_subqueries[output.index].output, alias);
+        },
     }
 }
 
@@ -545,6 +552,9 @@ pub const OwnedDocumentBatchRequest = struct {
     transforms: []db_mod.types.DocumentTransform = &.{},
     predicates: []db_mod.types.TransactionVersionPredicate = &.{},
     returning_rows: [][]const u8 = &.{},
+    returning_version_keys: [][]const u8 = &.{},
+    returning_version_prewrite: []u64 = &.{},
+    returning_version_outputs: [][]const u8 = &.{},
     req: db_mod.types.BatchRequest = .{},
     inserted: u32 = 0,
     deleted: u32 = 0,
@@ -571,6 +581,11 @@ pub const OwnedDocumentBatchRequest = struct {
         if (self.predicates.len > 0) alloc.free(self.predicates);
         for (self.returning_rows) |row| alloc.free(@constCast(row));
         if (self.returning_rows.len > 0) alloc.free(self.returning_rows);
+        for (self.returning_version_keys) |key| alloc.free(key);
+        if (self.returning_version_keys.len > 0) alloc.free(self.returning_version_keys);
+        if (self.returning_version_prewrite.len > 0) alloc.free(self.returning_version_prewrite);
+        for (self.returning_version_outputs) |output| alloc.free(output);
+        if (self.returning_version_outputs.len > 0) alloc.free(self.returning_version_outputs);
         self.* = undefined;
     }
 };
@@ -607,18 +622,169 @@ pub const LoweredDocumentWrite = struct {
     }
 };
 
+pub const DocumentConflictAction = enum {
+    nothing,
+    update,
+};
+
+pub const DocumentWriteReturningFieldKind = enum {
+    identity,
+    document,
+    version,
+    projection,
+};
+
+pub const DocumentWriteReturningField = struct {
+    kind: DocumentWriteReturningFieldKind,
+    path: []const u8,
+    output: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.path.len > 0) alloc.free(@constCast(self.path));
+        alloc.free(@constCast(self.output));
+        self.* = undefined;
+    }
+};
+
+pub const DocumentConflictSourceAssignment = struct {
+    target_path: []const u8,
+    source_path: []const u8,
+    field_type: runtime_schema.AntflyType,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.target_path.len > 0) alloc.free(@constCast(self.target_path));
+        if (self.source_path.len > 0) alloc.free(@constCast(self.source_path));
+        self.* = undefined;
+    }
+};
+
+pub const DocumentConflictUniqueTarget = struct {
+    path: []const u8,
+    field_type: runtime_schema.AntflyType,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.path));
+        self.* = undefined;
+    }
+};
+
+pub const DocumentConflictTarget = union(enum) {
+    identity,
+    unique_field: DocumentConflictUniqueTarget,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .identity => {},
+            .unique_field => |*target| target.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const LoweredDocumentConflictWrite = struct {
+    table_name: []const u8,
+    proposed_writes: []db_mod.types.BatchWrite = &.{},
+    target: DocumentConflictTarget = .identity,
+    action: DocumentConflictAction = .nothing,
+    operations: []db_mod.types.TransformOp = &.{},
+    source_assignments: []DocumentConflictSourceAssignment = &.{},
+    expression_assignments: []const db_mod.types.RelationalRowsExpressionAssignment = &.{},
+    where_expression: ?db_mod.types.RelationalRowsExpressionCondition = null,
+    where_expressions: []const db_mod.types.RelationalRowsExpressionCondition = &.{},
+    where_any: []const db_mod.types.RelationalRowsExpressionPredicateGroup = &.{},
+    where_not: []const db_mod.types.RelationalRowsExpressionPredicateGroup = &.{},
+    returning_fields: []DocumentWriteReturningField = &.{},
+    sync_level: db_mod.types.SyncLevel = .write,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        for (self.proposed_writes) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        if (self.proposed_writes.len > 0) alloc.free(self.proposed_writes);
+        self.target.deinit(alloc);
+        for (self.operations) |op| {
+            alloc.free(@constCast(op.path));
+            if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+        }
+        if (self.operations.len > 0) alloc.free(@constCast(self.operations));
+        for (self.source_assignments) |*assignment| assignment.deinit(alloc);
+        if (self.source_assignments.len > 0) alloc.free(self.source_assignments);
+        freeExpressionAssignments(alloc, self.expression_assignments);
+        if (self.where_expression) |condition| freeExpressionCondition(alloc, condition);
+        freeExpressionConditions(alloc, self.where_expressions);
+        if (self.where_expressions.len > 0) alloc.free(self.where_expressions);
+        freeExpressionPredicateGroups(alloc, self.where_any);
+        if (self.where_any.len > 0) alloc.free(self.where_any);
+        freeExpressionPredicateGroups(alloc, self.where_not);
+        if (self.where_not.len > 0) alloc.free(self.where_not);
+        for (self.returning_fields) |*field| field.deinit(alloc);
+        if (self.returning_fields.len > 0) alloc.free(self.returning_fields);
+        self.* = undefined;
+    }
+};
+
 pub const LoweredDocumentProducerMutation = struct {
     table_name: []const u8,
     producer: document_plan.DocumentProducer,
     operation: db_mod.document_write.DocumentWriteOperation,
     template: DocumentProducerMutationTemplate,
     expected_version: ?u64 = null,
+    returning_fields: []DocumentWriteReturningField = &.{},
     sync_level: db_mod.types.SyncLevel = .write,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
         self.producer.deinit(alloc);
         self.template.deinit(alloc);
+        for (self.returning_fields) |*field| field.deinit(alloc);
+        if (self.returning_fields.len > 0) alloc.free(self.returning_fields);
+        self.* = undefined;
+    }
+};
+
+pub const DocumentSourceInsertAssignmentKind = enum {
+    identity,
+    projection,
+};
+
+pub const DocumentSourceInsertTargetIdMode = enum {
+    source_identity,
+    generated_document_id,
+};
+
+pub const DocumentSourceInsertAssignment = struct {
+    kind: DocumentSourceInsertAssignmentKind,
+    target_path: []const u8 = "",
+    source_path: []const u8 = "",
+    field_type: runtime_schema.AntflyType,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.target_path.len > 0) alloc.free(@constCast(self.target_path));
+        if (self.source_path.len > 0) alloc.free(@constCast(self.source_path));
+        self.* = undefined;
+    }
+};
+
+pub const LoweredDocumentSourceInsert = struct {
+    table_name: []const u8,
+    source_table_name: []const u8,
+    source_producer: document_plan.DocumentProducer,
+    source_limit: ?u32 = null,
+    target_id_mode: DocumentSourceInsertTargetIdMode = .source_identity,
+    assignments: []DocumentSourceInsertAssignment = &.{},
+    returning_fields: []DocumentWriteReturningField = &.{},
+    sync_level: db_mod.types.SyncLevel = .write,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        alloc.free(self.source_table_name);
+        self.source_producer.deinit(alloc);
+        for (self.assignments) |*assignment| assignment.deinit(alloc);
+        if (self.assignments.len > 0) alloc.free(self.assignments);
+        for (self.returning_fields) |*field| field.deinit(alloc);
+        if (self.returning_fields.len > 0) alloc.free(self.returning_fields);
         self.* = undefined;
     }
 };
@@ -677,6 +843,7 @@ pub const LoweredDocumentJoinedMutation = struct {
     max_source_rows: ?u32 = null,
     max_source_bytes: ?u64 = null,
     duplicate_source_policy: DocumentJoinedMutationDuplicateSourcePolicy = .reject,
+    returning_fields: []DocumentWriteReturningField = &.{},
     sync_level: db_mod.types.SyncLevel = .write,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -689,6 +856,63 @@ pub const LoweredDocumentJoinedMutation = struct {
         for (self.source_assignments) |*assignment| assignment.deinit(alloc);
         if (self.source_assignments.len > 0) alloc.free(self.source_assignments);
         self.template.deinit(alloc);
+        for (self.returning_fields) |*field| field.deinit(alloc);
+        if (self.returning_fields.len > 0) alloc.free(self.returning_fields);
+        self.* = undefined;
+    }
+};
+
+pub const DocumentMergeMatchedArm = struct {
+    predicates: []const MergeArmPredicate = &.{},
+    source_assignments: []DocumentJoinedMutationSourceAssignment = &.{},
+    template: DocumentProducerMutationTemplate = .delete,
+    do_nothing: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeMergeArmPredicateValues(alloc, self.predicates);
+        if (self.predicates.len > 0) alloc.free(self.predicates);
+        for (self.source_assignments) |*assignment| assignment.deinit(alloc);
+        if (self.source_assignments.len > 0) alloc.free(self.source_assignments);
+        self.template.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const DocumentMergeNotMatchedArm = struct {
+    predicates: []const MergeArmPredicate = &.{},
+    insert_source_document: bool = false,
+    do_nothing: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeMergeArmPredicateValues(alloc, self.predicates);
+        if (self.predicates.len > 0) alloc.free(self.predicates);
+        self.* = undefined;
+    }
+};
+
+pub const LoweredDocumentMergeMutation = struct {
+    table_name: []const u8,
+    source_table_name: []const u8,
+    target_producer: document_plan.DocumentProducer,
+    source_producer: document_plan.DocumentProducer,
+    join_keys: []DocumentJoinedMutationJoinKey = &.{},
+    matched_arms: []DocumentMergeMatchedArm = &.{},
+    not_matched_arms: []DocumentMergeNotMatchedArm = &.{},
+    max_target_rows: ?u32 = null,
+    max_source_rows: ?u32 = null,
+    sync_level: db_mod.types.SyncLevel = .write,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        alloc.free(self.source_table_name);
+        self.target_producer.deinit(alloc);
+        self.source_producer.deinit(alloc);
+        for (self.join_keys) |*join_key| join_key.deinit(alloc);
+        if (self.join_keys.len > 0) alloc.free(self.join_keys);
+        for (self.matched_arms) |*arm| arm.deinit(alloc);
+        if (self.matched_arms.len > 0) alloc.free(self.matched_arms);
+        for (self.not_matched_arms) |*arm| arm.deinit(alloc);
+        if (self.not_matched_arms.len > 0) alloc.free(self.not_matched_arms);
         self.* = undefined;
     }
 };
@@ -915,8 +1139,11 @@ pub const LoweredRecursiveMergeMutation = struct {
 pub const LoweredWritePlan = union(enum) {
     insert: LoweredInsert,
     document_write: LoweredDocumentWrite,
+    document_conflict_write: LoweredDocumentConflictWrite,
+    document_source_insert: LoweredDocumentSourceInsert,
     document_producer_mutation: LoweredDocumentProducerMutation,
     document_joined_mutation: LoweredDocumentJoinedMutation,
+    document_merge_mutation: LoweredDocumentMergeMutation,
     insert_source: LoweredInsertSource,
     recursive_insert_source: LoweredRecursiveInsertSource,
     update: LoweredMutation,
@@ -935,8 +1162,11 @@ pub const LoweredWritePlan = union(enum) {
         switch (self.*) {
             .insert => |*insert| insert.deinit(alloc),
             .document_write => |*document_write| document_write.deinit(alloc),
+            .document_conflict_write => |*document_conflict_write| document_conflict_write.deinit(alloc),
+            .document_source_insert => |*document_source_insert| document_source_insert.deinit(alloc),
             .document_producer_mutation => |*document_producer_mutation| document_producer_mutation.deinit(alloc),
             .document_joined_mutation => |*document_joined_mutation| document_joined_mutation.deinit(alloc),
+            .document_merge_mutation => |*document_merge_mutation| document_merge_mutation.deinit(alloc),
             .insert_source => |*insert_source| insert_source.deinit(alloc),
             .recursive_insert_source => |*recursive_insert_source| recursive_insert_source.deinit(alloc),
             .update => |*update| update.deinit(alloc),
@@ -969,11 +1199,20 @@ fn applyLoweredWritePlanSyncLevel(plan: *LoweredWritePlan, sync_level: db_mod.ty
             document_write.sync_level = sync_level;
             document_write.batch.req.sync_level = sync_level;
         },
+        .document_conflict_write => |*document_conflict_write| {
+            document_conflict_write.sync_level = sync_level;
+        },
+        .document_source_insert => |*document_source_insert| {
+            document_source_insert.sync_level = sync_level;
+        },
         .document_producer_mutation => |*document_producer_mutation| {
             document_producer_mutation.sync_level = sync_level;
         },
         .document_joined_mutation => |*document_joined_mutation| {
             document_joined_mutation.sync_level = sync_level;
+        },
+        .document_merge_mutation => |*document_merge_mutation| {
+            document_merge_mutation.sync_level = sync_level;
         },
         .insert_source => |*insert_source| insert_source.sync_level = sync_level,
         .recursive_insert_source => |*recursive_insert_source| recursive_insert_source.insert_source.sync_level = sync_level,
@@ -3259,6 +3498,7 @@ pub fn parseSimpleSelectSetResultTailAlloc(
         .coalesce = lowered.query.coalesce,
         .field_aliases = lowered.query.field_aliases,
         .expressions = lowered.query.expressions,
+        .scalar_subqueries = lowered.query.scalar_subqueries,
         .outputs = lowered.select_outputs,
         .select_all = lowered.query.select_all,
     };
@@ -3318,6 +3558,7 @@ pub fn parseSetOperationResultTailAlloc(
         .coalesce = lowered.query.coalesce,
         .field_aliases = lowered.query.field_aliases,
         .expressions = lowered.query.expressions,
+        .scalar_subqueries = lowered.query.scalar_subqueries,
         .outputs = lowered.select_outputs,
         .select_all = lowered.query.select_all,
     };
@@ -5533,6 +5774,18 @@ pub fn freeExpressionProjections(alloc: std.mem.Allocator, values: []const db_mo
     if (values.len > 0) alloc.free(values);
 }
 
+pub fn freeScalarSubqueryProjection(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsScalarSubqueryProjection) void {
+    alloc.free(value.output);
+    var query = value.query;
+    query.deinit(alloc);
+    if (value.output_field.len > 0) alloc.free(value.output_field);
+}
+
+pub fn freeScalarSubqueryProjections(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsScalarSubqueryProjection) void {
+    for (values) |value| freeScalarSubqueryProjection(alloc, value);
+    if (values.len > 0) alloc.free(values);
+}
+
 pub fn freeExpressionAssignments(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsExpressionAssignment) void {
     for (values) |value| {
         alloc.free(@constCast(value.field));
@@ -6368,6 +6621,7 @@ pub fn freeSelectItem(alloc: std.mem.Allocator, item: SelectItem) void {
             alloc.free(projection.output);
             alloc.free(projection.field);
         },
+        .scalar_subquery => |projection| freeScalarSubqueryProjection(alloc, projection),
     }
 }
 

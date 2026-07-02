@@ -2009,20 +2009,23 @@ The meaningful remaining work is:
    barriers need range-movement chaos coverage, cancellation/abort semantics,
    progress reporting, backpressure, and storage-specific identity allocator
    reset state behind the `TRUNCATE ... RESTART IDENTITY` boundary.
-2. **Routed reads and distributed query execution.** Define row-version
-   visibility across remote owners during live writes and range movement. Add
-   routed owner-stream strategy planning from cardinality/index hints, streaming
-   and backpressure over durable CTE spill, routed/window spill for workloads
-   beyond current bounded caps, and topology-change hardening for hosted remote
-   lateral, join, and window stages.
+2. **Routed reads and distributed query execution.** Extend row-version
+   visibility beyond paginated routed row-query plans into the remaining remote
+   join, lateral, window, and CTE stages during live writes and range movement.
+   Add streaming and backpressure over durable CTE spill, routed/window spill
+   for workloads beyond current bounded caps, and topology-change hardening for
+   hosted remote lateral, join, and window stages.
 3. **Planner and index trust.** Grow expression-implication proofs for partial
    and expression indexes plus partial unique constraints; route
    expression-derived rebuild/promotion through the same generation-aware
    catalog compare-and-swap lifecycle as ordinary indexes; and add durable
    ordered-composite access-path metadata with explicit collation/null semantics
    instead of treating accepted ordered clauses as membership-only metadata.
-4. **DML, conflict, and queue hardening.** Add range-movement chaos coverage
-   around routed insert-source conflict lookup/staging and MERGE
+4. **DML, conflict, and queue hardening.** Typed insert-source planning now
+   fails closed when ordinary unique or temporal-overlap owner lookup reports
+   topology movement before any write batch is staged; still add
+   hosted/provisioned range-movement chaos coverage around routed insert-source
+   conflict lookup, conflict guard evaluation, staged commit revalidation, and MERGE
    target/source collection. Harden mutation-source row claims with owner/lease
    retry behavior across range movement. Non-unique selector mutations now stay
    on explicit claimed mutation-source paths: SQL lowering injects row-claim
@@ -4937,7 +4940,45 @@ scalar/JSON/array expressions, lockable row streams, routed stream composition,
 and parity evidence. Keep this document focused on those contracts. Current
 per-feature status and remaining gaps live in the release-gated SQL and
 relational fixture inventories, which are checked by `relational-release-gate`
-and the SQL parity fixture gates.
+and the SQL parity fixture gates. As of the current inventory, 11 rows still
+carry `gap_tracked`, `missing_native_harness`, or `partial_release_gated`
+status; optimizer expression pushdown, expression-derived rebuild/promotion,
+stale derived-artifact safety, and aggregate expression pushdown capability have
+moved to release evidence because the gate covers typed expression implication
+with fail-closed unsafe cases, generated expression index rebuild/promotion
+through the ordinary secondary-index lifecycle, base-row fallback for incomplete
+indexes, stale rebuild-generation rejection, unvalidated unique-owner rejection
+for upsert selection, unvalidated FK non-enforcement, explicit aggregate
+pushdown/local-evaluation capability classification, and routed stable-scan
+fallback for aggregate expression execution. Durable ordered-composite metadata
+is also release evidence because catalog DDL now proves ordered index element
+clauses, shared index generation, include columns, building lifecycle, stale
+promotion rejection, and ready lifecycle promotion all survive through schema
+JSON and runtime-schema derivation. Concurrent conflict-action state is also
+release evidence because typed row-batch execution now proves proposed/existing
+row reads, defaults, generated columns, sequence values, committed-image
+`RETURNING`, and stale-version rejection through the DB write path. Aggregate
+resource metrics are also release evidence because aggregate results now expose
+input rows, output groups, metric slots, estimated group/metric memory, distinct
+spill bytes and writes, reload count, and resource-budget failure counters
+through typed diagnostics and aggregate response JSON. Embedded document-index
+bypass is also release evidence because embedded JSON search now proves base-row
+stored-data consistency, top-level relational filter intersection, typed
+top-level write rejection, and row-claim `SKIP LOCKED` filtering over embedded
+index hits. Live-write pagination over routed row queries is also release
+evidence because paginated routed reads now lookup-revalidate scanned
+key/version/json rows, rescan the routed ranges before global
+order/distinct/limit/offset is applied, and fail closed with `TopologyChanged`
+when the rescan observes inserted, missing, duplicated, or changed rows.
+Embedded JSON schema rebuild is also release evidence because algebraic schema
+reload now has a packed-relational-row test that persists embedded JSON domain
+rebuild state after an injected bounded failure, completes the pending rebuild
+on writable reopen, removes stale subdocument facts, promotes the domain back to
+`current`, and clears the durable resume key. Foreign-key action-page chaos is
+also release evidence because the provisioned owner-local harness now combines
+remote ref-owner outage, partial page progress, concurrent parent and child
+writes, lease handoff, writable reopen/resume, completed-job replay, and final
+child-row convergence without duplicate set-null effects.
 Adapter-only transaction-control coverage includes `BEGIN`, `BEGIN WORK`, bare
 `START TRANSACTION`, `COMMIT`, `COMMIT TRANSACTION`, `ROLLBACK`, and `ROLLBACK
 WORK` as explicit no-op classifications, so migration wrappers and client
@@ -5803,9 +5844,9 @@ PostgreSQL-shaped SQL coverage should be divided into three buckets:
    should land as typed Antfly APIs first, then be exposed by the SQL adapter.
 
 Remaining SQL/API parity gaps are tracked in release-gated fixture inventories
-rather than repeated here as prose tables. Each inventory row names the model
-surface, current evidence, missing evidence, and release gate that must pass
-before the gap can be removed.
+rather than repeated here as prose tables. The current unresolved inventory has
+11 rows; each row names the model surface, current evidence, missing evidence,
+and release gate that must pass before the gap can be removed.
 
 The read-join and bounded-lateral SQL lowerers have separate source-schema
 entrypoints for cross-table planning. The remaining routed-read work is

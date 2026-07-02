@@ -3762,6 +3762,15 @@ fn selectMergeScanRowsAlloc(
     return try out.toOwnedSlice(alloc);
 }
 
+fn rowJsonsFromCollectedRowsAlloc(
+    alloc: std.mem.Allocator,
+    scanned: []const db_mod.types.RelationalRowsCollectedRow,
+) ![]const []const u8 {
+    const rows = try alloc.alloc([]const u8, scanned.len);
+    for (scanned, 0..) |row, i| rows[i] = row.json;
+    return rows;
+}
+
 fn collectStableRowsFromRoutedScansAlloc(
     alloc: std.mem.Allocator,
     source: core.TableReadSource,
@@ -3846,6 +3855,83 @@ fn verifyRoutedScanRowsStillCurrentAlloc(
     }
 }
 
+fn routedRowsQueryRequestNeedsLivePaginationFence(req: db_mod.types.RelationalRowsQueryRequest) bool {
+    return req.distinct_on.len != 0 or
+        req.distinct_on_expressions.len != 0 or
+        req.order_by.len != 0 or
+        req.limit != null or
+        req.offset != 0;
+}
+
+fn routedRowsQueryPlanNeedsLivePaginationFence(plan: db_mod.types.RelationalRowsQueryPlan) bool {
+    if (routedRowsQueryRequestNeedsLivePaginationFence(plan.query)) return true;
+    for (plan.ctes) |cte| {
+        if (routedRowsQueryRequestNeedsLivePaginationFence(cte.query)) return true;
+    }
+    return false;
+}
+
+fn routedScanRowKeyInRange(row_key: []const u8, from_key: []const u8, to_key: []const u8) bool {
+    if (from_key.len != 0 and std.mem.order(u8, row_key, from_key) == .lt) return false;
+    if (to_key.len != 0 and std.mem.order(u8, row_key, to_key) != .lt) return false;
+    return true;
+}
+
+fn verifyRoutedScanRangeUnchangedAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    from_key: []const u8,
+    to_key: []const u8,
+    expected_rows: []const db_mod.types.RelationalRowsCollectedRow,
+    consistency: raft_mod.ReadConsistency,
+) !void {
+    var current_rows = std.ArrayListUnmanaged(db_mod.types.RelationalRowsCollectedRow).empty;
+    defer {
+        for (current_rows.items) |row_value| {
+            var row = row_value;
+            row.deinit(alloc);
+        }
+        current_rows.deinit(alloc);
+    }
+    var materialization = row_spill.JsonRowsMaterializationTracker.initDefault("routed-scan");
+    const saw_source = try appendMergeScanRowsFromRoutedScanAlloc(alloc, source, table_name, from_key, to_key, &current_rows, &materialization, consistency);
+    if (!saw_source) return error.TopologyChanged;
+
+    var expected_count: usize = 0;
+    for (expected_rows) |row| {
+        if (routedScanRowKeyInRange(row.key, from_key, to_key)) expected_count += 1;
+    }
+    if (current_rows.items.len != expected_count) return error.TopologyChanged;
+
+    var expected_index: usize = 0;
+    for (expected_rows) |expected| {
+        if (!routedScanRowKeyInRange(expected.key, from_key, to_key)) continue;
+        const current = current_rows.items[expected_index];
+        if (!std.mem.eql(u8, current.key, expected.key)) return error.TopologyChanged;
+        if (current.version != expected.version) return error.TopologyChanged;
+        if (!std.mem.eql(u8, current.json, expected.json)) return error.TopologyChanged;
+        expected_index += 1;
+    }
+}
+
+fn verifyRoutedScanRangesUnchangedAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    expected_rows: []const db_mod.types.RelationalRowsCollectedRow,
+    consistency: raft_mod.ReadConsistency,
+) !void {
+    if (ranges.len == 0) {
+        try verifyRoutedScanRangeUnchangedAlloc(alloc, source, table_name, "", "", expected_rows, consistency);
+        return;
+    }
+    for (ranges) |range| {
+        try verifyRoutedScanRangeUnchangedAlloc(alloc, source, table_name, range.start, range.end, expected_rows, consistency);
+    }
+}
+
 pub fn rowsQueryPlanFromRoutedScansAlloc(
     alloc: std.mem.Allocator,
     source: core.TableReadSource,
@@ -3858,12 +3944,17 @@ pub fn rowsQueryPlanFromRoutedScansAlloc(
     try rejectRoutedRowsQueryPlanDocKeyRanges(plan);
     if (!scanPayloadCanStripSyntheticKey(runtime_schema)) return error.UnsupportedRowsQuery;
 
-    var scanned_rows = (try collectStableRowsFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, plan.ranges, consistency)) orelse return null;
+    var scanned_rows = (try collectStableMergeScanRowsFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, plan.ranges, consistency)) orelse return null;
     defer scanned_rows.deinit(alloc);
+    if (routedRowsQueryPlanNeedsLivePaginationFence(plan)) {
+        try verifyRoutedScanRangesUnchangedAlloc(alloc, source, table_name, plan.ranges, scanned_rows.rows, consistency);
+    }
+    const row_jsons = try rowJsonsFromCollectedRowsAlloc(alloc, scanned_rows.rows);
+    defer alloc.free(row_jsons);
 
     var local_plan = plan;
     local_plan.ranges = &.{};
-    return try relational_rows_api.executeRowsQueryPlanOnJsonRowsAlloc(alloc, runtime_schema, local_plan, scanned_rows.rows);
+    return try relational_rows_api.executeRowsQueryPlanOnJsonRowsAlloc(alloc, runtime_schema, local_plan, row_jsons);
 }
 
 pub fn rowsAggregatePlanFromRoutedScansAlloc(
@@ -4407,7 +4498,7 @@ test "routed rows query plan executes over scanned owner rows with ctes" {
     };
 
     const FakeRoutedSource = struct {
-        const LookupMode = enum { stable, missing, changed, first_range_changed, version_changed, missing_version, zero_scan_version };
+        const LookupMode = enum { stable, missing, changed, first_range_changed, version_changed, missing_version, zero_scan_version, rescan_inserted_first_range };
 
         scan_calls: usize = 0,
         lookup_calls: usize = 0,
@@ -4493,7 +4584,10 @@ test "routed rows query plan executes over scanned owner rows with ctes" {
             self.scan_calls += 1;
             const ndjson = if (std.mem.eql(u8, table_name, "orders"))
                 if (std.mem.eql(u8, from_key, "") and std.mem.eql(u8, to_key, "n"))
-                    "{\"key\":\"a\",\"version\":1,\"id\":\"a\",\"status\":\"open\",\"amount\":1}\n{\"key\":\"b\",\"version\":1,\"id\":\"b\",\"status\":\"closed\",\"amount\":9}\n"
+                    if (self.lookup_mode == .rescan_inserted_first_range and self.scan_calls > 2)
+                        "{\"key\":\"a\",\"version\":1,\"id\":\"a\",\"status\":\"open\",\"amount\":1}\n{\"key\":\"b\",\"version\":1,\"id\":\"b\",\"status\":\"closed\",\"amount\":9}\n{\"key\":\"c\",\"version\":1,\"id\":\"c\",\"status\":\"open\",\"amount\":5}\n"
+                    else
+                        "{\"key\":\"a\",\"version\":1,\"id\":\"a\",\"status\":\"open\",\"amount\":1}\n{\"key\":\"b\",\"version\":1,\"id\":\"b\",\"status\":\"closed\",\"amount\":9}\n"
                 else if (std.mem.eql(u8, from_key, "n") and std.mem.eql(u8, to_key, ""))
                     if (self.lookup_mode == .missing_version)
                         "{\"key\":\"z\",\"id\":\"z\",\"status\":\"open\",\"amount\":7}\n"
@@ -4647,16 +4741,50 @@ test "routed rows query plan executes over scanned owner rows with ctes" {
     }, .read_index)).?;
     defer result.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 2), fake.scan_calls);
+    try std.testing.expectEqual(@as(usize, 4), fake.scan_calls);
     try std.testing.expectEqual(@as(u32, 2), result.total);
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
     try std.testing.expectEqualStrings("{\"id\":\"z\"}", result.rows[0]);
 
+    var inserted_during_pagination_fake = FakeRoutedSource{ .lookup_mode = .rescan_inserted_first_range };
+    var inserted_during_pagination_source = inserted_during_pagination_fake.source();
+    try std.testing.expectError(error.TopologyChanged, inserted_during_pagination_source.rowsQueryPlan(alloc, "orders", schema, .{
+        .ranges = ranges[0..],
+        .query = .{
+            .select = &.{"id"},
+            .select_all = false,
+            .order_by = &.{.{ .field = "amount", .direction = .desc }},
+            .limit = 1,
+        },
+    }, .read_index));
+    try std.testing.expectEqual(@as(usize, 3), inserted_during_pagination_fake.scan_calls);
+    try std.testing.expectEqual(@as(usize, 3), inserted_during_pagination_fake.lookup_calls);
+
     const aggregate_group_by = [_][]const u8{"status"};
+    const aggregate_expression_operands = [_]db_mod.types.RelationalRowsExpression{
+        .{ .kind = .field, .field = "amount" },
+        .{ .kind = .value, .value_json = "1" },
+    };
     const aggregate_specs = [_]db_mod.types.RelationalRowsAggregateSpec{
         .{ .name = "order_count", .op = .count },
         .{ .name = "amount_sum", .op = .sum, .field = "amount" },
+        .{
+            .name = "amount_plus_one_sum",
+            .op = .sum,
+            .expression = .{
+                .kind = .add,
+                .operands = aggregate_expression_operands[0..],
+            },
+        },
     };
+    try std.testing.expectEqual(
+        db_mod.types.RelationalRowsAggregatePushdownCapability.local_expression_evaluation_required,
+        db_mod.types.relationalRowsAggregatePushdownCapability(.{
+            .source = .{ .source_cte = "open_rows" },
+            .group_by = aggregate_group_by[0..],
+            .aggregations = aggregate_specs[0..],
+        }),
+    );
     var aggregate_result = (try source.rowsAggregatePlan(alloc, "orders", schema, .{
         .ctes = ctes[0..],
         .ranges = ranges[0..],
@@ -4668,7 +4796,7 @@ test "routed rows query plan executes over scanned owner rows with ctes" {
     }, .read_index)).?;
     defer aggregate_result.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 1), aggregate_result.total_groups);
-    try std.testing.expectEqualStrings("{\"status\":\"open\",\"order_count\":2,\"amount_sum\":8}", aggregate_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"status\":\"open\",\"order_count\":2,\"amount_sum\":8,\"amount_plus_one_sum\":10}", aggregate_result.rows[0]);
 
     const window_specs = [_]db_mod.types.RelationalRowsWindowSpec{.{
         .output = "rn",

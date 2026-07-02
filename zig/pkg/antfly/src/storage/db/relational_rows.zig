@@ -1670,14 +1670,32 @@ fn jsonValueStringAlloc(alloc: Allocator, value: std.json.Value) ![]const u8 {
     return try out.toOwnedSlice();
 }
 
-fn compareSubqueryPredicateValues(
+const SqlTruth = enum {
+    true_value,
+    false_value,
+    unknown,
+};
+
+fn sqlTruthNot(value: SqlTruth) SqlTruth {
+    return switch (value) {
+        .true_value => .false_value,
+        .false_value => .true_value,
+        .unknown => .unknown,
+    };
+}
+
+fn sqlTruthPassesWhere(value: SqlTruth) bool {
+    return value == .true_value;
+}
+
+fn compareSubqueryPredicateTruth(
     lhs: std.json.Value,
     rhs: std.json.Value,
     op: types.RelationalRowsSubqueryPredicateOp,
     collation: ?[]const u8,
     negated_pattern: bool,
-) !bool {
-    if (lhs == .null or rhs == .null) return false;
+) !SqlTruth {
+    if (lhs == .null or rhs == .null) return .unknown;
     const matched = switch (op) {
         .eq => expressionJsonValuesEqualWithCollation(lhs, rhs, collation),
         .ne => !expressionJsonValuesEqualWithCollation(lhs, rhs, collation),
@@ -1694,7 +1712,8 @@ fn compareSubqueryPredicateValues(
         .like => try queryTextPatternValueMatches(lhs, rhs, false),
         .ilike => try queryTextPatternValueMatches(lhs, rhs, true),
     };
-    return if (negated_pattern) !matched else matched;
+    const truth: SqlTruth = if (matched) .true_value else .false_value;
+    return if (negated_pattern) sqlTruthNot(truth) else truth;
 }
 
 pub fn sqlLikePatternMatches(text: []const u8, pattern: []const u8, case_insensitive: bool) bool {
@@ -4819,6 +4838,7 @@ fn expressionConditionImpliedByEqualityPredicatesAlloc(
     now_ns: u64,
 ) !bool {
     if (try directFieldExpressionConditionImpliedByEqualityPredicateAlloc(alloc, predicates, condition, columns)) return true;
+    if (!expressionConditionDeterministicForPredicateImplication(condition)) return false;
     if (!expressionConditionFieldsKnownByPredicates(condition, predicates)) return false;
     const row_json = try equalityPredicateObjectJsonAlloc(alloc, predicates);
     defer if (row_json) |json| alloc.free(json);
@@ -4861,6 +4881,32 @@ fn directFieldExpressionConditionImpliedByEqualityPredicateAlloc(
         };
     }
     return false;
+}
+
+fn expressionConditionDeterministicForPredicateImplication(condition: types.RelationalRowsExpressionCondition) bool {
+    if (!expressionDeterministicForPredicateImplication(condition.lhs)) return false;
+    for (condition.rhs) |rhs| {
+        if (!expressionDeterministicForPredicateImplication(rhs)) return false;
+    }
+    return true;
+}
+
+fn expressionDeterministicForPredicateImplication(expression: types.RelationalRowsExpression) bool {
+    switch (expression.kind) {
+        .now, .uuid_v4 => return false,
+        else => {},
+    }
+    for (expression.operands) |operand| {
+        if (!expressionDeterministicForPredicateImplication(operand)) return false;
+    }
+    for (expression.case_branches) |branch| {
+        if (!expressionConditionDeterministicForPredicateImplication(branch.when)) return false;
+        if (!expressionDeterministicForPredicateImplication(branch.then)) return false;
+    }
+    for (expression.case_else) |case_else| {
+        if (!expressionDeterministicForPredicateImplication(case_else)) return false;
+    }
+    return true;
 }
 
 const DirectFieldExpressionConditionParts = struct {
@@ -5582,6 +5628,7 @@ pub fn projectQueryCandidateStaticAlloc(
     req: types.RelationalRowsQueryRequest,
     now_ns: u64,
 ) ![]u8 {
+    if (req.scalar_subqueries.len != 0) return error.UnsupportedQueryRequest;
     if (req.json_extract.len == 0 and req.array_length.len == 0 and req.coalesce.len == 0 and req.field_aliases.len == 0 and req.expressions.len == 0) {
         return try db_query_projection.projectLookupStoredBytes(alloc, doc_key, row_json, .{
             .fields = req.select,
@@ -6559,8 +6606,11 @@ pub fn validateQueryAgainstPlannedCteOutput(
     planned_ctes: []PlannedCte,
     req: types.RelationalRowsQueryRequest,
 ) !void {
-    const source_output = plannedSourceCteOutputFields(planned_ctes, req) orelse return;
-    try validateQueryAgainstCteOutput(req, source_output);
+    if (plannedSourceCteOutputFields(planned_ctes, req)) |source_output| {
+        try validateQueryAgainstCteOutput(req, source_output);
+    }
+    for (req.subquery_predicates) |predicate| try validateQueryAgainstPlannedCteOutput(planned_ctes, predicate.query);
+    for (req.scalar_subqueries) |projection| try validateQueryAgainstPlannedCteOutput(planned_ctes, projection.query);
 }
 
 pub fn validateAggregateAgainstPlannedCteOutput(
@@ -9370,6 +9420,7 @@ const RelationalRowsAggregateSpillContext = struct {
     createDistinct: *const fn (*anyopaque, Allocator) anyerror![]const u8,
     acceptDistinct: *const fn (*anyopaque, Allocator, []const u8, []const u8) anyerror!bool,
     deleteDistinct: *const fn (*anyopaque, Allocator, []const u8) void,
+    diagnostics: ?*types.RelationalRowsAggregateDiagnostics = null,
 };
 
 fn aggregateFromSourceRowsWithColumnsAndSpillAlloc(
@@ -9381,6 +9432,10 @@ fn aggregateFromSourceRowsWithColumnsAndSpillAlloc(
     spill_context: ?*RelationalRowsAggregateSpillContext,
 ) !types.RelationalRowsAggregateResult {
     try validateAggregateRequest(req);
+    var diagnostics = types.RelationalRowsAggregateDiagnostics{
+        .input_rows = @intCast(source_rows.len),
+    };
+    if (spill_context) |context| context.diagnostics = &diagnostics;
     const output_columns = try aggregateOutputColumnsAlloc(alloc, source_columns, req);
     defer freeOwnedOutputColumns(alloc, output_columns);
     const having_predicates = try resolvedChecksWithSourceCollationsAlloc(alloc, req.having_predicates, output_columns);
@@ -9442,6 +9497,10 @@ fn aggregateFromSourceRowsWithColumnsAndSpillAlloc(
     }
 
     const total_groups: u32 = @intCast(rows.items.len);
+    diagnostics.output_groups = total_groups;
+    diagnostics.metric_slots = @as(u64, @intCast(groups.count())) * @as(u64, @intCast(aggregations.len));
+    diagnostics.estimated_group_memory_bytes = relationalRowsAggregateGroupsMemoryBytes(&groups);
+    diagnostics.estimated_metric_memory_bytes = relationalRowsAggregateGroupsMetricMemoryBytes(&groups);
     const start = @min(@as(usize, req.offset), rows.items.len);
     const limited_len: usize = if (req.limit) |limit|
         @min(@as(usize, limit), rows.items.len - start)
@@ -9452,12 +9511,13 @@ fn aggregateFromSourceRowsWithColumnsAndSpillAlloc(
         for (rows.items[start + limited_len ..]) |row| alloc.free(@constCast(row));
         const kept = try alloc.dupe([]const u8, rows.items[start .. start + limited_len]);
         rows.deinit(alloc);
-        return .{ .rows = kept, .total_groups = total_groups };
+        return .{ .rows = kept, .total_groups = total_groups, .diagnostics = diagnostics };
     }
 
     return .{
         .rows = try rows.toOwnedSlice(alloc),
         .total_groups = total_groups,
+        .diagnostics = diagnostics,
     };
 }
 
@@ -9509,7 +9569,13 @@ const RelationalRowsAggregateMetric = struct {
         if (self.distinct_spill_id) |spill_id| {
             const context = spill_context orelse return error.ResourceBudgetExceeded;
             const accepted = try context.acceptDistinct(context.ptr, alloc, spill_id, key);
-            if (accepted) self.distinct_spill_count += 1;
+            if (accepted) {
+                self.distinct_spill_count += 1;
+                if (context.diagnostics) |diagnostics| {
+                    diagnostics.distinct_spill_writes += 1;
+                    diagnostics.distinct_spill_bytes += key.len;
+                }
+            }
             alloc.free(key);
             return accepted;
         }
@@ -9529,7 +9595,13 @@ const RelationalRowsAggregateMetric = struct {
             var spilled_count: usize = 0;
             var existing_keys = self.distinct_seen.keyIterator();
             while (existing_keys.next()) |existing_key| {
-                if (try context.acceptDistinct(context.ptr, alloc, spill_id, existing_key.*)) spilled_count += 1;
+                if (try context.acceptDistinct(context.ptr, alloc, spill_id, existing_key.*)) {
+                    spilled_count += 1;
+                    if (context.diagnostics) |diagnostics| {
+                        diagnostics.distinct_spill_writes += 1;
+                        diagnostics.distinct_spill_bytes += existing_key.*.len;
+                    }
+                }
             }
 
             var keys = self.distinct_seen.keyIterator();
@@ -9541,7 +9613,13 @@ const RelationalRowsAggregateMetric = struct {
             self.distinct_spill_count = spilled_count;
 
             const accepted = try context.acceptDistinct(context.ptr, alloc, spill_id, key);
-            if (accepted) self.distinct_spill_count += 1;
+            if (accepted) {
+                self.distinct_spill_count += 1;
+                if (context.diagnostics) |diagnostics| {
+                    diagnostics.distinct_spill_writes += 1;
+                    diagnostics.distinct_spill_bytes += key.len;
+                }
+            }
             alloc.free(key);
             return accepted;
         }
@@ -9957,6 +10035,43 @@ fn cleanupRelationalRowsAggregateGroupsDistinctSpill(
     for (groups.values()) |*group| {
         for (group.metrics) |*metric| metric.cleanupDistinctSpill(alloc, spill_context);
     }
+}
+
+fn relationalRowsAggregateGroupsMemoryBytes(groups: *const std.StringArrayHashMapUnmanaged(RelationalRowsAggregateGroup)) u64 {
+    var bytes: u64 = 0;
+    for (groups.keys()) |key| bytes += key.len;
+    for (groups.values()) |group| {
+        bytes += group.display_key_json.len;
+        bytes += @as(u64, @intCast(group.metrics.len)) * @sizeOf(RelationalRowsAggregateMetric);
+    }
+    return bytes;
+}
+
+fn relationalRowsAggregateGroupsMetricMemoryBytes(groups: *const std.StringArrayHashMapUnmanaged(RelationalRowsAggregateGroup)) u64 {
+    var bytes: u64 = 0;
+    for (groups.values()) |group| {
+        for (group.metrics) |metric| bytes += relationalRowsAggregateMetricMemoryBytes(metric);
+    }
+    return bytes;
+}
+
+fn relationalRowsAggregateMetricMemoryBytes(metric: RelationalRowsAggregateMetric) u64 {
+    var bytes: u64 = 0;
+    if (metric.min_json) |value| bytes += value.len;
+    if (metric.max_json) |value| bytes += value.len;
+    var distinct_keys = metric.distinct_seen.keyIterator();
+    while (distinct_keys.next()) |key_ptr| bytes += key_ptr.*.len;
+    if (metric.distinct_spill_id) |spill_id| bytes += spill_id.len;
+    var mode_keys = metric.mode_counts.keyIterator();
+    while (mode_keys.next()) |key_ptr| bytes += key_ptr.*.len;
+    var mode_values = metric.mode_counts.valueIterator();
+    while (mode_values.next()) |value| bytes += value.value_json.len;
+    for (metric.array_items.items) |item| {
+        bytes += item.value_json.len;
+        bytes += @as(u64, @intCast(item.order_keys.len)) * @sizeOf(QueryOrderKey);
+    }
+    bytes += @as(u64, @intCast(metric.percentile_samples.items.len)) * @sizeOf(f64);
+    return bytes;
 }
 
 fn relationalRowsAggregateGroupKeyJsonAlloc(
@@ -13071,6 +13186,18 @@ pub fn Impl(comptime DB: type) type {
             generation: ?u64,
             rows: *std.ArrayListUnmanaged(QueryCandidate),
         ) !void {
+            return try @This().appendRelationalRowsQueryCandidatesForRequestWithMaterializedCtesAlloc(self, alloc, runtime_schema, &.{}, req, generation, rows);
+        }
+
+        fn appendRelationalRowsQueryCandidatesForRequestWithMaterializedCtesAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
+            req: types.RelationalRowsQueryRequest,
+            generation: ?u64,
+            rows: *std.ArrayListUnmanaged(QueryCandidate),
+        ) !void {
             var candidate_set = try @This().resolveRelationalRowsQueryCandidateSetAlloc(self, alloc, runtime_schema, req, generation);
             defer if (candidate_set) |*set| set.deinit(alloc);
 
@@ -13082,13 +13209,13 @@ pub fn Impl(comptime DB: type) type {
                         alloc.free(doc_ids);
                     }
                     for (doc_ids) |doc_id| {
-                        try @This().appendRelationalRowsQueryCandidateAlloc(self, alloc, runtime_schema, req, rows, doc_id);
+                        try @This().appendRelationalRowsQueryCandidateWithMaterializedCtesAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows, doc_id);
                     }
                     return;
                 }
             }
 
-            try @This().appendAllRelationalRowsQueryCandidatesAlloc(self, alloc, runtime_schema, req, rows);
+            try @This().appendAllRelationalRowsQueryCandidatesWithMaterializedCtesAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows);
         }
 
         pub fn buildRelationalRowsQueryResultFromCandidatesAlloc(
@@ -13097,7 +13224,18 @@ pub fn Impl(comptime DB: type) type {
             runtime_schema: schema_mod.TableSchema,
             req: types.RelationalRowsQueryRequest,
             rows: []QueryCandidate,
-        ) !types.RelationalRowsQueryResult {
+        ) anyerror!types.RelationalRowsQueryResult {
+            return try @This().buildRelationalRowsQueryResultFromCandidatesWithMaterializedCtesAlloc(self, alloc, runtime_schema, &.{}, req, rows);
+        }
+
+        fn buildRelationalRowsQueryResultFromCandidatesWithMaterializedCtesAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
+            req: types.RelationalRowsQueryRequest,
+            rows: []QueryCandidate,
+        ) anyerror!types.RelationalRowsQueryResult {
             if (req.order_by.len > 0) {
                 std.sort.pdq(QueryCandidate, rows, QuerySortContext{ .order_by = req.order_by }, queryCandidateLessThan);
             }
@@ -13143,7 +13281,7 @@ pub fn Impl(comptime DB: type) type {
             }
             for (selected_indexes.items) |row_index| {
                 const row = rows[row_index];
-                const projected = try @This().projectRelationalRowsQueryCandidateAlloc(self, alloc, row.doc_key, row.json, req);
+                const projected = try @This().projectRelationalRowsQueryCandidateWithMaterializedCtesAlloc(self, alloc, runtime_schema, materialized_ctes, row.doc_key, row.json, req);
                 var projected_transferred = false;
                 errdefer if (!projected_transferred) alloc.free(projected);
                 try out_rows.append(alloc, projected);
@@ -13179,17 +13317,83 @@ pub fn Impl(comptime DB: type) type {
         pub fn projectRelationalRowsQueryCandidateAlloc(
             self: *DB,
             alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
             doc_key: []const u8,
             row_json: []const u8,
             req: types.RelationalRowsQueryRequest,
-        ) ![]u8 {
-            if (req.json_extract.len == 0 and req.array_length.len == 0 and req.coalesce.len == 0 and req.field_aliases.len == 0 and req.expressions.len == 0) {
+        ) anyerror![]u8 {
+            return try @This().projectRelationalRowsQueryCandidateWithMaterializedCtesAlloc(self, alloc, runtime_schema, &.{}, doc_key, row_json, req);
+        }
+
+        fn projectRelationalRowsQueryCandidateWithMaterializedCtesAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
+            doc_key: []const u8,
+            row_json: []const u8,
+            req: types.RelationalRowsQueryRequest,
+        ) anyerror![]u8 {
+            if (req.json_extract.len == 0 and req.array_length.len == 0 and req.coalesce.len == 0 and req.field_aliases.len == 0 and req.expressions.len == 0 and req.scalar_subqueries.len == 0) {
                 return try self.searchRuntimeProjectLookupStoredBytes(alloc, doc_key, row_json, .{
                     .fields = req.select,
                     .include_all_fields = req.select_all,
                 });
             }
+            if (req.scalar_subqueries.len != 0) {
+                return try @This().projectRelationalRowsQueryCandidateWithScalarSubqueriesAlloc(self, alloc, runtime_schema, materialized_ctes, doc_key, row_json, req);
+            }
             return try @This().projectRelationalRowsQueryCandidateStaticAlloc(alloc, doc_key, row_json, req);
+        }
+
+        fn projectRelationalRowsQueryCandidateWithScalarSubqueriesAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
+            doc_key: []const u8,
+            row_json: []const u8,
+            req: types.RelationalRowsQueryRequest,
+        ) anyerror![]u8 {
+            var base_req = req;
+            base_req.scalar_subqueries = &.{};
+            const base_json = try projectQueryCandidateStaticAlloc(alloc, doc_key, row_json, base_req, currentTimeNs());
+            defer alloc.free(base_json);
+
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, base_json, .{}) catch return error.InvalidQueryRequest;
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidQueryRequest;
+
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            errdefer out.deinit();
+            const writer = &out.writer;
+            try writer.writeByte('{');
+            var first = true;
+            for (parsed.value.object.keys(), parsed.value.object.values()) |field, value| {
+                if (!first) try writer.writeByte(',');
+                first = false;
+                try writer.print("{f}:", .{std.json.fmt(field, .{})});
+                try std.json.Stringify.value(value, .{}, writer);
+            }
+
+            for (req.scalar_subqueries) |projection| {
+                var result = try @This().queryRelationalRowsWithMaterializedCtesAlloc(self, alloc, runtime_schema, materialized_ctes, projection.query);
+                defer result.deinit(alloc);
+                if (result.rows.len > 1) return error.InvalidQueryRequest;
+
+                if (!first) try writer.writeByte(',');
+                first = false;
+                try writer.print("{f}:", .{std.json.fmt(projection.output, .{})});
+                if (result.rows.len == 0) {
+                    try writer.writeAll("null");
+                } else {
+                    var value = try subqueryProjectedValueAlloc(alloc, result.rows[0], projection.output_field);
+                    defer value.deinit();
+                    try std.json.Stringify.value(value.value, .{}, writer);
+                }
+            }
+            try writer.writeByte('}');
+            return try out.toOwnedSlice();
         }
 
         pub fn projectRelationalRowsQueryCandidateStaticAlloc(
@@ -13732,13 +13936,24 @@ pub fn Impl(comptime DB: type) type {
             req: types.RelationalRowsQueryRequest,
             rows: *std.ArrayListUnmanaged(QueryCandidate),
         ) !void {
+            return try @This().appendAllRelationalRowsQueryCandidatesWithMaterializedCtesAlloc(self, alloc, runtime_schema, &.{}, req, rows);
+        }
+
+        fn appendAllRelationalRowsQueryCandidatesWithMaterializedCtesAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
+            req: types.RelationalRowsQueryRequest,
+            rows: *std.ArrayListUnmanaged(QueryCandidate),
+        ) !void {
             const scanned = if (req.doc_key_range) |range|
                 try relational_store_mod.scanRowsSpanAlloc(alloc, self.core.store, range.start, range.end)
             else
                 try relational_store_mod.scanRowsAlloc(alloc, self.core.store, "", "");
             defer relational_store_mod.freeRows(alloc, scanned);
             for (scanned) |row| {
-                try @This().appendRelationalRowsQueryCandidateFromRawAlloc(self, alloc, runtime_schema, req, rows, row.doc_key, row.row_value);
+                try @This().appendRelationalRowsQueryCandidateFromRawWithMaterializedCtesAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows, row.doc_key, row.row_value);
             }
         }
 
@@ -13746,6 +13961,7 @@ pub fn Impl(comptime DB: type) type {
             self: *DB,
             alloc: Allocator,
             runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
             row_json: []const u8,
             predicates: []const types.RelationalRowsSubqueryPredicate,
             now_ns: u64,
@@ -13755,7 +13971,7 @@ pub fn Impl(comptime DB: type) type {
             defer parsed.deinit();
             if (parsed.value != .object) return error.InvalidQueryRequest;
             for (predicates) |predicate| {
-                if (!(try @This().relationalRowsSubqueryPredicatePassesAlloc(self, alloc, runtime_schema, parsed.value, predicate, now_ns))) return false;
+                if (!(try @This().relationalRowsSubqueryPredicatePassesAlloc(self, alloc, runtime_schema, materialized_ctes, parsed.value, predicate, now_ns))) return false;
             }
             return true;
         }
@@ -13764,33 +13980,53 @@ pub fn Impl(comptime DB: type) type {
             self: *DB,
             alloc: Allocator,
             runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
             outer_row: std.json.Value,
             predicate: types.RelationalRowsSubqueryPredicate,
             now_ns: u64,
         ) anyerror!bool {
-            if (predicate.query.source_cte.len != 0 or predicate.query.subquery_predicates.len != 0) return error.UnsupportedQueryRequest;
-            var nested_rows = std.ArrayListUnmanaged(QueryCandidate).empty;
+            var local_query = predicate.query;
+            var correlated_predicates: []schema_mod.RelationalCheck = &.{};
             defer {
-                for (nested_rows.items) |*row| row.deinit(alloc);
-                nested_rows.deinit(alloc);
+                freeRelationalChecks(alloc, correlated_predicates);
+                if (correlated_predicates.len > 0) alloc.free(correlated_predicates);
             }
-            try @This().appendRelationalRowsQueryCandidatesForRequestAlloc(self, alloc, runtime_schema, predicate.query, null, &nested_rows);
-            var result = try @This().buildRelationalRowsQueryResultFromCandidatesAlloc(self, alloc, runtime_schema, predicate.query, nested_rows.items);
-            defer result.deinit(alloc);
+            var combined_predicates: []schema_mod.RelationalCheck = &.{};
+            defer {
+                freeRelationalChecks(alloc, combined_predicates);
+                if (combined_predicates.len > 0) alloc.free(combined_predicates);
+            }
+            const child_is_empty = if (predicate.correlations.len != 0) blk: {
+                correlated_predicates = try lateralCorrelationPredicatesAlloc(alloc, outer_row, predicate.correlations);
+                if (correlated_predicates.len != predicate.correlations.len) break :blk true;
+                combined_predicates = try concatRelationalChecksAlloc(alloc, predicate.query.predicates, correlated_predicates);
+                local_query.predicates = combined_predicates;
+                break :blk false;
+            } else false;
+
+            var empty_result = types.RelationalRowsQueryResult{};
+            var queried_result = if (child_is_empty)
+                types.RelationalRowsQueryResult{}
+            else
+                try @This().queryRelationalRowsWithMaterializedCtesAlloc(self, alloc, runtime_schema, materialized_ctes, local_query);
+            defer queried_result.deinit(alloc);
+            const result = if (child_is_empty) &empty_result else &queried_result;
 
             switch (predicate.kind) {
                 .exists => return if (predicate.negated) result.rows.len == 0 else result.rows.len != 0,
                 .scalar => {
                     if (predicate.lhs == null or predicate.output_field.len == 0) return error.InvalidQueryRequest;
                     if (result.rows.len > 1) return error.InvalidQueryRequest;
-                    if (result.rows.len == 0) return false;
                     const lhs_json = try expressionValueJsonWithSourcesAndColumnSetsAlloc(alloc, outer_row, null, null, predicate.lhs.?, runtime_schema.relational_columns, runtime_schema.relational_columns, now_ns);
                     defer alloc.free(lhs_json);
                     var lhs = std.json.parseFromSlice(std.json.Value, alloc, lhs_json, .{}) catch return error.InvalidQueryRequest;
                     defer lhs.deinit();
+                    if (result.rows.len == 0) {
+                        return sqlTruthPassesWhere(try compareSubqueryPredicateTruth(lhs.value, .null, predicate.op, predicate.collation, false));
+                    }
                     var rhs = try subqueryProjectedValueAlloc(alloc, result.rows[0], predicate.output_field);
                     defer rhs.deinit();
-                    return try compareSubqueryPredicateValues(lhs.value, rhs.value, predicate.op, predicate.collation, false);
+                    return sqlTruthPassesWhere(try compareSubqueryPredicateTruth(lhs.value, rhs.value, predicate.op, predicate.collation, false));
                 },
                 .in, .quantified => {
                     if (predicate.lhs == null or predicate.output_field.len == 0) return error.InvalidQueryRequest;
@@ -13799,34 +14035,61 @@ pub fn Impl(comptime DB: type) type {
                     var lhs = std.json.parseFromSlice(std.json.Value, alloc, lhs_json, .{}) catch return error.InvalidQueryRequest;
                     defer lhs.deinit();
                     if (predicate.kind == .in) {
-                        var found = false;
+                        var result_truth: SqlTruth = .false_value;
                         for (result.rows) |row| {
                             var rhs = try subqueryProjectedValueAlloc(alloc, row, predicate.output_field);
                             defer rhs.deinit();
-                            if (try compareSubqueryPredicateValues(lhs.value, rhs.value, .eq, predicate.collation, false)) {
-                                found = true;
-                                break;
+                            switch (try compareSubqueryPredicateTruth(lhs.value, rhs.value, .eq, predicate.collation, false)) {
+                                .true_value => {
+                                    result_truth = .true_value;
+                                    break;
+                                },
+                                .unknown => {
+                                    if (result_truth == .false_value) result_truth = .unknown;
+                                },
+                                .false_value => {},
                             }
                         }
-                        return if (predicate.negated) !found else found;
+                        if (predicate.negated) result_truth = sqlTruthNot(result_truth);
+                        return sqlTruthPassesWhere(result_truth);
                     }
                     const quantifier = predicate.quantifier orelse return error.InvalidQueryRequest;
                     switch (quantifier) {
                         .any => {
+                            var result_truth: SqlTruth = .false_value;
                             for (result.rows) |row| {
                                 var rhs = try subqueryProjectedValueAlloc(alloc, row, predicate.output_field);
                                 defer rhs.deinit();
-                                if (try compareSubqueryPredicateValues(lhs.value, rhs.value, predicate.op, predicate.collation, predicate.negated)) return true;
+                                switch (try compareSubqueryPredicateTruth(lhs.value, rhs.value, predicate.op, predicate.collation, predicate.negated)) {
+                                    .true_value => {
+                                        result_truth = .true_value;
+                                        break;
+                                    },
+                                    .unknown => {
+                                        if (result_truth == .false_value) result_truth = .unknown;
+                                    },
+                                    .false_value => {},
+                                }
                             }
-                            return false;
+                            return sqlTruthPassesWhere(result_truth);
                         },
                         .all => {
+                            var result_truth: SqlTruth = .true_value;
                             for (result.rows) |row| {
                                 var rhs = try subqueryProjectedValueAlloc(alloc, row, predicate.output_field);
                                 defer rhs.deinit();
-                                if (!(try compareSubqueryPredicateValues(lhs.value, rhs.value, predicate.op, predicate.collation, predicate.negated))) return false;
+                                switch (try compareSubqueryPredicateTruth(lhs.value, rhs.value, predicate.op, predicate.collation, predicate.negated)) {
+                                    .false_value => {
+                                        result_truth = .false_value;
+                                        break;
+                                    },
+                                    .unknown => {
+                                        if (result_truth == .true_value) result_truth = .unknown;
+                                    },
+                                    .true_value => {},
+                                }
                             }
-                            return true;
+                            return sqlTruthPassesWhere(result_truth);
                         },
                     }
                 },
@@ -13841,10 +14104,22 @@ pub fn Impl(comptime DB: type) type {
             rows: *std.ArrayListUnmanaged(QueryCandidate),
             doc_key: []const u8,
         ) !void {
+            return try @This().appendRelationalRowsQueryCandidateWithMaterializedCtesAlloc(self, alloc, runtime_schema, &.{}, req, rows, doc_key);
+        }
+
+        fn appendRelationalRowsQueryCandidateWithMaterializedCtesAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
+            req: types.RelationalRowsQueryRequest,
+            rows: *std.ArrayListUnmanaged(QueryCandidate),
+            doc_key: []const u8,
+        ) !void {
             if (!docKeyInQueryRange(req, doc_key)) return;
             const raw_row = try relational_store_mod.getRawAlloc(alloc, self.core.store, doc_key) orelse return;
             defer alloc.free(raw_row);
-            try @This().appendRelationalRowsQueryCandidateFromRawAlloc(self, alloc, runtime_schema, req, rows, doc_key, raw_row);
+            try @This().appendRelationalRowsQueryCandidateFromRawWithMaterializedCtesAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows, doc_key, raw_row);
         }
 
         pub fn appendRelationalRowsQueryCandidateFromRawAlloc(
@@ -13856,11 +14131,24 @@ pub fn Impl(comptime DB: type) type {
             doc_key: []const u8,
             raw_row: []const u8,
         ) !void {
+            return try @This().appendRelationalRowsQueryCandidateFromRawWithMaterializedCtesAlloc(self, alloc, runtime_schema, &.{}, req, rows, doc_key, raw_row);
+        }
+
+        fn appendRelationalRowsQueryCandidateFromRawWithMaterializedCtesAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
+            req: types.RelationalRowsQueryRequest,
+            rows: *std.ArrayListUnmanaged(QueryCandidate),
+            doc_key: []const u8,
+            raw_row: []const u8,
+        ) !void {
             if (!docKeyInQueryRange(req, doc_key)) return;
             if (try @This().isExpiredDocumentKey(self, alloc, doc_key)) return;
             const materialized = try mapper.materializeRelationalRowValueAlloc(alloc, raw_row);
             defer alloc.free(materialized);
-            if (!(try @This().relationalRowsSubqueryPredicatesPassAlloc(self, alloc, runtime_schema, materialized, req.subquery_predicates, currentTimeNs()))) return;
+            if (!(try @This().relationalRowsSubqueryPredicatesPassAlloc(self, alloc, runtime_schema, materialized_ctes, materialized, req.subquery_predicates, currentTimeNs()))) return;
             const version = try self.getTimestamp(alloc, doc_key);
             var local_req = req;
             local_req.subquery_predicates = &.{};
@@ -14663,7 +14951,31 @@ pub fn Impl(comptime DB: type) type {
                 return try @This().queryRelationalRowsFromMaterializedCteWithColumnsAlloc(self, alloc, req.source_cte, source_rows, source.output_columns, req);
             }
             if (ranges.len > 0) return try self.queryRelationalRowsAcrossRanges(alloc, runtime_schema, req, ranges);
-            return try self.queryRelationalRows(alloc, runtime_schema, req);
+            if (materialized_ctes.len == 0) return try self.queryRelationalRows(alloc, runtime_schema, req);
+
+            try validateBaseQueryRequestAgainstSchema(runtime_schema, req);
+            var local_req = req;
+            const order_by = try resolvedQueryOrdersWithSourceCollationsAlloc(alloc, req.order_by, runtime_schema.relational_columns);
+            defer freeResolvedQueryOrdersWithSourceCollations(alloc, order_by);
+            local_req.order_by = order_by;
+
+            self.core.lockApplyShared();
+            var apply_shared_held = true;
+            defer if (apply_shared_held) self.core.unlockApplyShared();
+
+            const generation = self.core.nextDerivedSequence();
+            var rows = std.ArrayListUnmanaged(QueryCandidate).empty;
+            defer {
+                for (rows.items) |*row| row.deinit(alloc);
+                rows.deinit(alloc);
+            }
+
+            try @This().appendRelationalRowsQueryCandidatesForRequestWithMaterializedCtesAlloc(self, alloc, runtime_schema, materialized_ctes, local_req, generation, &rows);
+
+            self.core.unlockApplyShared();
+            apply_shared_held = false;
+
+            return try @This().buildRelationalRowsQueryResultFromCandidatesWithMaterializedCtesAlloc(self, alloc, runtime_schema, materialized_ctes, local_req, rows.items);
         }
 
         pub fn windowRelationalRowsPlan(
@@ -18326,6 +18638,15 @@ test "relational rows aggregate supports distinct metric state" {
     try std.testing.expectEqual(@as(u32, 2), spilled_distinct.total_groups);
     try std.testing.expectEqualStrings("{\"customer\":\"alice\",\"status_count\":2}", spilled_distinct.rows[0]);
     try std.testing.expectEqualStrings("{\"customer\":\"bob\",\"status_count\":2}", spilled_distinct.rows[1]);
+    try std.testing.expectEqual(@as(u64, 5), spilled_distinct.diagnostics.input_rows);
+    try std.testing.expectEqual(@as(u32, 2), spilled_distinct.diagnostics.output_groups);
+    try std.testing.expectEqual(@as(u64, 2), spilled_distinct.diagnostics.metric_slots);
+    try std.testing.expect(spilled_distinct.diagnostics.estimated_group_memory_bytes > 0);
+    try std.testing.expect(spilled_distinct.diagnostics.estimated_metric_memory_bytes > 0);
+    try std.testing.expectEqual(@as(u64, 4), spilled_distinct.diagnostics.distinct_spill_writes);
+    try std.testing.expect(spilled_distinct.diagnostics.distinct_spill_bytes > 0);
+    try std.testing.expectEqual(@as(u64, 0), spilled_distinct.diagnostics.distinct_spill_reload_count);
+    try std.testing.expectEqual(@as(u64, 0), spilled_distinct.diagnostics.resource_budget_failures);
 
     const aggregate_spill_root = [_]u8{ internal_keys.replay_namespace, internal_keys.relational_aggregate_spill_kind };
     const remaining_spills = try db.core.scanStorePrefix(alloc, aggregate_spill_root[0..]);
@@ -22183,6 +22504,42 @@ test "relational rows expression partial predicate implication honors source col
 
     try std.testing.expect(try expressionPredicatesImplyWithColumns(alloc, implications, required[0..], columns[0..], currentTimeNs()));
     try std.testing.expect(!try expressionPredicatesImplyWithColumns(alloc, implications, required[0..], exact_columns[0..], currentTimeNs()));
+
+    const null_predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "status",
+        .op = .eq,
+        .value_json = "null",
+    }};
+    const null_implications = PredicateImplications{ .predicates = null_predicates[0..] };
+    try std.testing.expect(!try expressionPredicatesImplyWithColumns(alloc, null_implications, required[0..], columns[0..], currentTimeNs()));
+
+    const numeric_columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "amount", .path = "amount", .field_type = .numeric },
+    };
+    const string_amount_predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "amount",
+        .op = .eq,
+        .value_json = "\"5\"",
+    }};
+    const numeric_rhs = [_]types.RelationalRowsExpression{.{ .kind = .value, .value_json = "5" }};
+    const numeric_required = [_]types.RelationalRowsExpressionCondition{.{
+        .lhs = .{ .kind = .field, .field = "amount" },
+        .op = .eq,
+        .rhs = numeric_rhs[0..],
+    }};
+    const string_amount_implications = PredicateImplications{ .predicates = string_amount_predicates[0..] };
+    try std.testing.expect(!try expressionPredicatesImplyWithColumns(alloc, string_amount_implications, numeric_required[0..], numeric_columns[0..], currentTimeNs()));
+
+    const volatile_rhs = [_]types.RelationalRowsExpression{.{ .kind = .value, .value_json = "1234" }};
+    const volatile_required = [_]types.RelationalRowsExpressionCondition{.{
+        .lhs = .{ .kind = .now },
+        .op = .eq,
+        .rhs = volatile_rhs[0..],
+    }};
+    const empty_implications = PredicateImplications{};
+    try std.testing.expect(!try expressionPredicatesImplyWithColumns(alloc, empty_implications, volatile_required[0..], &.{}, 1234));
 }
 
 test "relational rows query row claim skip locked returns claimed subset" {
@@ -22746,6 +23103,523 @@ test "relational rows query projects typed expression outputs" {
         .select = select[0..],
         .select_all = false,
         .expressions = source_scoped_expressions[0..],
+    }));
+}
+
+test "relational rows subquery predicates use sql null and empty-set semantics" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"pattern":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"open\",\"pattern\":\"OP%\",\"rank\":1}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"status\":null,\"pattern\":null,\"rank\":2}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"status\":\"closed\",\"pattern\":\"cl%\",\"rank\":3}" },
+        },
+        .sync_level = .write,
+    });
+
+    const select_id = [_][]const u8{"id"};
+    const select_status = [_][]const u8{"status"};
+    const select_pattern = [_][]const u8{"pattern"};
+    const select_rank = [_][]const u8{"rank"};
+    const order_by_id = [_]types.RelationalRowsQueryOrder{.{
+        .field = "id",
+        .direction = .asc,
+    }};
+    const lhs_status = types.RelationalRowsExpression{ .kind = .field, .field = "status" };
+    const lhs_rank = types.RelationalRowsExpression{ .kind = .field, .field = "rank" };
+    const rank_is_one = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "rank",
+        .op = .eq,
+        .value_json = "1",
+    }};
+    const rank_is_two = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "rank",
+        .op = .eq,
+        .value_json = "2",
+    }};
+    const rank_is_three = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "rank",
+        .op = .eq,
+        .value_json = "3",
+    }};
+    const rank_is_missing = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "rank",
+        .op = .eq,
+        .value_json = "99",
+    }};
+
+    const in_closed = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .in,
+        .lhs = lhs_status,
+        .query = .{
+            .predicates = rank_is_three[0..],
+            .select = select_status[0..],
+            .select_all = false,
+        },
+        .output_field = "status",
+    }};
+    var in_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = in_closed[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer in_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), in_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", in_result.rows[0]);
+
+    const status_correlation = [_]types.RelationalRowsLateralCorrelation{.{
+        .left_field = "status",
+        .right_field = "status",
+    }};
+    const correlated_exists = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .exists,
+        .query = .{},
+        .correlations = status_correlation[0..],
+    }};
+    var correlated_exists_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = correlated_exists[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer correlated_exists_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), correlated_exists_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", correlated_exists_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", correlated_exists_result.rows[1]);
+
+    const nested_in_closed_inner = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .in,
+        .lhs = lhs_status,
+        .query = .{
+            .predicates = rank_is_three[0..],
+            .select = select_status[0..],
+            .select_all = false,
+        },
+        .output_field = "status",
+    }};
+    const nested_in_closed_outer = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .in,
+        .lhs = lhs_status,
+        .query = .{
+            .subquery_predicates = nested_in_closed_inner[0..],
+            .select = select_status[0..],
+            .select_all = false,
+        },
+        .output_field = "status",
+    }};
+    var nested_in_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = nested_in_closed_outer[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer nested_in_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), nested_in_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", nested_in_result.rows[0]);
+
+    const not_in_null = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .in,
+        .lhs = lhs_status,
+        .negated = true,
+        .query = .{
+            .predicates = rank_is_two[0..],
+            .select = select_status[0..],
+            .select_all = false,
+        },
+        .output_field = "status",
+    }};
+    var not_in_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = not_in_null[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer not_in_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 0), not_in_result.total);
+
+    const any_empty = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .quantified,
+        .lhs = lhs_status,
+        .quantifier = .any,
+        .query = .{
+            .predicates = rank_is_missing[0..],
+            .select = select_status[0..],
+            .select_all = false,
+        },
+        .output_field = "status",
+    }};
+    var any_empty_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = any_empty[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer any_empty_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 0), any_empty_result.total);
+
+    const any_closed = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .quantified,
+        .lhs = lhs_status,
+        .quantifier = .any,
+        .query = .{
+            .predicates = rank_is_three[0..],
+            .select = select_status[0..],
+            .select_all = false,
+        },
+        .output_field = "status",
+    }};
+    var any_closed_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = any_closed[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer any_closed_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), any_closed_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", any_closed_result.rows[0]);
+
+    const all_empty = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .quantified,
+        .lhs = lhs_status,
+        .quantifier = .all,
+        .query = .{
+            .predicates = rank_is_missing[0..],
+            .select = select_status[0..],
+            .select_all = false,
+        },
+        .output_field = "status",
+    }};
+    var all_empty_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = all_empty[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer all_empty_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), all_empty_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", all_empty_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", all_empty_result.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", all_empty_result.rows[2]);
+
+    const gt_any_rank_one = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .quantified,
+        .lhs = lhs_rank,
+        .op = .gt,
+        .quantifier = .any,
+        .query = .{
+            .predicates = rank_is_one[0..],
+            .select = select_rank[0..],
+            .select_all = false,
+        },
+        .output_field = "rank",
+    }};
+    var gt_any_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = gt_any_rank_one[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer gt_any_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), gt_any_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", gt_any_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", gt_any_result.rows[1]);
+
+    const gte_some_rank_three = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .quantified,
+        .lhs = lhs_rank,
+        .op = .gte,
+        .quantifier = .any,
+        .query = .{
+            .predicates = rank_is_three[0..],
+            .select = select_rank[0..],
+            .select_all = false,
+        },
+        .output_field = "rank",
+    }};
+    var gte_some_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = gte_some_rank_three[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer gte_some_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), gte_some_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", gte_some_result.rows[0]);
+
+    const lt_all_rank_three = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .quantified,
+        .lhs = lhs_rank,
+        .op = .lt,
+        .quantifier = .all,
+        .query = .{
+            .predicates = rank_is_three[0..],
+            .select = select_rank[0..],
+            .select_all = false,
+        },
+        .output_field = "rank",
+    }};
+    var lt_all_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = lt_all_rank_three[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer lt_all_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), lt_all_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", lt_all_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", lt_all_result.rows[1]);
+
+    const lte_all_rank_two = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .quantified,
+        .lhs = lhs_rank,
+        .op = .lte,
+        .quantifier = .all,
+        .query = .{
+            .predicates = rank_is_two[0..],
+            .select = select_rank[0..],
+            .select_all = false,
+        },
+        .output_field = "rank",
+    }};
+    var lte_all_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = lte_all_rank_two[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer lte_all_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), lte_all_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", lte_all_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", lte_all_result.rows[1]);
+
+    const ilike_any_rank_one = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .quantified,
+        .lhs = lhs_status,
+        .op = .ilike,
+        .quantifier = .any,
+        .query = .{
+            .predicates = rank_is_one[0..],
+            .select = select_pattern[0..],
+            .select_all = false,
+        },
+        .output_field = "pattern",
+    }};
+    var ilike_any_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = ilike_any_rank_one[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer ilike_any_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), ilike_any_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", ilike_any_result.rows[0]);
+
+    const like_all_rank_three = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .quantified,
+        .lhs = lhs_status,
+        .op = .like,
+        .quantifier = .all,
+        .query = .{
+            .predicates = rank_is_three[0..],
+            .select = select_pattern[0..],
+            .select_all = false,
+        },
+        .output_field = "pattern",
+    }};
+    var like_all_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = like_all_rank_three[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer like_all_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), like_all_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", like_all_result.rows[0]);
+
+    const not_like_all_rank_three = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .quantified,
+        .lhs = lhs_status,
+        .op = .like,
+        .negated = true,
+        .quantifier = .all,
+        .query = .{
+            .predicates = rank_is_three[0..],
+            .select = select_pattern[0..],
+            .select_all = false,
+        },
+        .output_field = "pattern",
+    }};
+    var not_like_all_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = not_like_all_rank_three[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer not_like_all_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), not_like_all_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", not_like_all_result.rows[0]);
+
+    const scalar_empty = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .scalar,
+        .lhs = lhs_status,
+        .query = .{
+            .predicates = rank_is_missing[0..],
+            .select = select_status[0..],
+            .select_all = false,
+        },
+        .output_field = "status",
+    }};
+    var scalar_empty_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = scalar_empty[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer scalar_empty_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 0), scalar_empty_result.total);
+
+    const scalar_multi = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .scalar,
+        .lhs = lhs_status,
+        .query = .{
+            .select = select_status[0..],
+            .select_all = false,
+        },
+        .output_field = "status",
+    }};
+    try std.testing.expectError(error.InvalidQueryRequest, db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = scalar_multi[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    }));
+}
+
+test "relational rows scalar subquery projections enforce scalar cardinality" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"open\",\"rank\":1}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"status\":null,\"rank\":2}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"status\":\"closed\",\"rank\":3}" },
+        },
+        .sync_level = .write,
+    });
+
+    const select_id = [_][]const u8{"id"};
+    const select_status = [_][]const u8{"status"};
+    const order_by_id = [_]types.RelationalRowsQueryOrder{.{
+        .field = "id",
+        .direction = .asc,
+    }};
+    const rank_is_three = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "rank",
+        .op = .eq,
+        .value_json = "3",
+    }};
+    const rank_is_missing = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "rank",
+        .op = .eq,
+        .value_json = "99",
+    }};
+
+    const closed_projection = [_]types.RelationalRowsScalarSubqueryProjection{.{
+        .output = "first_status",
+        .query = .{
+            .predicates = rank_is_three[0..],
+            .select = select_status[0..],
+            .select_all = false,
+        },
+        .output_field = "status",
+    }};
+    var closed_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .select = select_id[0..],
+        .select_all = false,
+        .scalar_subqueries = closed_projection[0..],
+        .order_by = order_by_id[0..],
+    });
+    defer closed_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), closed_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"first_status\":\"closed\"}", closed_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"first_status\":\"closed\"}", closed_result.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\",\"first_status\":\"closed\"}", closed_result.rows[2]);
+
+    const empty_projection = [_]types.RelationalRowsScalarSubqueryProjection{.{
+        .output = "missing_status",
+        .query = .{
+            .predicates = rank_is_missing[0..],
+            .select = select_status[0..],
+            .select_all = false,
+        },
+        .output_field = "status",
+    }};
+    var empty_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .select = select_id[0..],
+        .select_all = false,
+        .scalar_subqueries = empty_projection[0..],
+        .order_by = order_by_id[0..],
+        .limit = 1,
+    });
+    defer empty_result.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"missing_status\":null}", empty_result.rows[0]);
+
+    const multi_projection = [_]types.RelationalRowsScalarSubqueryProjection{.{
+        .output = "too_many_statuses",
+        .query = .{
+            .select = select_status[0..],
+            .select_all = false,
+        },
+        .output_field = "status",
+    }};
+    try std.testing.expectError(error.InvalidQueryRequest, db.queryRelationalRows(alloc, runtime_schema, .{
+        .select = select_id[0..],
+        .select_all = false,
+        .scalar_subqueries = multi_projection[0..],
     }));
 }
 

@@ -2893,7 +2893,6 @@ fn sqlCompatibilityWrapperClassificationKnown(name: []const u8) bool {
 
 const sql_compatibility_wrapper_contract_reasons = [_][]const u8{
     "bounded_document_query_scan",
-    "postgres_maintenance_tail_compatibility",
 };
 
 fn sqlCompatibilityWrapperContractReasonKnown(name: []const u8) bool {
@@ -2921,9 +2920,6 @@ pub fn parseSqlCompatibilityWrapperInventoryRootAlloc(
     errdefer wrappers.deinit(alloc);
     var seen_ids = std.StringHashMapUnmanaged(void){};
     defer seen_ids.deinit(alloc);
-    var seen_classes = std.StringHashMapUnmanaged(void){};
-    defer seen_classes.deinit(alloc);
-
     for (wrapper_values.items, 0..) |wrapper_value, i| {
         const item = try fixtureJsonObject(wrapper_value);
         try fixtureRequireOnlyKeys(item, &.{
@@ -2983,7 +2979,6 @@ pub fn parseSqlCompatibilityWrapperInventoryRootAlloc(
         }
         if (i > 0 and !std.mem.lessThan(u8, wrappers.items[i - 1].id, id)) return error.TestUnexpectedResult;
         try seen_ids.put(alloc, id, {});
-        try seen_classes.put(alloc, wrapper_class, {});
         try wrappers.append(alloc, .{
             .id = id,
             .family = family,
@@ -2999,10 +2994,6 @@ pub fn parseSqlCompatibilityWrapperInventoryRootAlloc(
             .state_safety = state_safety,
         });
     }
-    for (sql_compatibility_wrapper_classes) |wrapper_class| {
-        if (!seen_classes.contains(wrapper_class)) return error.TestUnexpectedResult;
-    }
-
     return .{
         .inventory_format = inventory_format,
         .wrappers = try wrappers.toOwnedSlice(alloc),
@@ -3643,7 +3634,8 @@ fn validateProductionTerminalBridgeEntryAlloc(
         if (!appParityTokensHaveKeyword(valid.items(), keyword)) return error.TestUnexpectedResult;
     }
 
-    if (tokenized.ParsedSql.initAlloc(alloc, entry.malformed_sql)) |*malformed| {
+    if (tokenized.ParsedSql.initAlloc(alloc, entry.malformed_sql)) |parsed_malformed| {
+        var malformed = parsed_malformed;
         defer malformed.deinit(alloc);
         if (malformed.generatedStatementKind() != null and std.meta.activeTag(malformed.statement) != .unknown) {
             return error.TestUnexpectedResult;
@@ -4138,7 +4130,8 @@ fn relationalDerivedAccessSurfaceKnown(name: []const u8) bool {
 
 fn relationalDerivedAccessStatusKnown(name: []const u8) bool {
     return std.mem.eql(u8, name, "gap_tracked") or
-        std.mem.eql(u8, name, "partial_release_gated");
+        std.mem.eql(u8, name, "partial_release_gated") or
+        std.mem.eql(u8, name, "release_evidence");
 }
 
 pub fn parseRelationalDerivedAccessInventoryRootAlloc(
@@ -4184,6 +4177,7 @@ pub fn parseRelationalDerivedAccessInventoryRootAlloc(
             .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
             .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
         };
+        const is_release_evidence = std.mem.eql(u8, entry.status, "release_evidence");
         if (entry.id.len == 0 or
             seen.contains(entry.id) or
             !relationalDerivedAccessInventoryIdKnown(entry.id) or
@@ -4191,7 +4185,7 @@ pub fn parseRelationalDerivedAccessInventoryRootAlloc(
             !relationalDerivedAccessSurfaceKnown(entry.surface) or
             !relationalDerivedAccessStatusKnown(entry.status) or
             entry.current_evidence.len == 0 or
-            entry.missing_evidence.len == 0 or
+            (!is_release_evidence and entry.missing_evidence.len == 0) or
             !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
             entry.evidence_symbol.len == 0 or
             !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
@@ -4888,7 +4882,8 @@ fn relationalAdvancedAggregateSurfaceKnown(name: []const u8) bool {
 
 fn relationalAdvancedAggregateStatusKnown(name: []const u8) bool {
     return std.mem.eql(u8, name, "gap_tracked") or
-        std.mem.eql(u8, name, "partial_release_gated");
+        std.mem.eql(u8, name, "partial_release_gated") or
+        std.mem.eql(u8, name, "release_evidence");
 }
 
 pub fn parseRelationalAdvancedAggregateInventoryRootAlloc(
@@ -4934,6 +4929,7 @@ pub fn parseRelationalAdvancedAggregateInventoryRootAlloc(
             .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
             .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
         };
+        const is_release_evidence = std.mem.eql(u8, entry.status, "release_evidence");
         if (entry.id.len == 0 or
             seen.contains(entry.id) or
             !relationalAdvancedAggregateInventoryIdKnown(entry.id) or
@@ -4941,7 +4937,7 @@ pub fn parseRelationalAdvancedAggregateInventoryRootAlloc(
             !relationalAdvancedAggregateSurfaceKnown(entry.surface) or
             !relationalAdvancedAggregateStatusKnown(entry.status) or
             entry.current_evidence.len == 0 or
-            entry.missing_evidence.len == 0 or
+            (!is_release_evidence and entry.missing_evidence.len == 0) or
             !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
             entry.evidence_symbol.len == 0 or
             !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
@@ -7706,7 +7702,10 @@ pub fn corpusPlanMatchesFamily(family: AppParityCorpusPlanFamily, plan: []const 
         return unsupportedPlanMatchesFamily(plan, unsupported_family);
     }
     if (family == .read and documentQueryPlanMatchesReadFamily(plan)) return true;
+    if (family == .document_write and std.mem.startsWith(u8, plan, "document_conflict_write:")) return true;
+    if (family == .document_write and std.mem.startsWith(u8, plan, "document_source_insert:")) return true;
     if (family == .document_write and std.mem.startsWith(u8, plan, "document_joined_write:")) return true;
+    if (family == .document_write and std.mem.startsWith(u8, plan, "document_merge_write:")) return true;
 
     const prefix = switch (family) {
         .ddl => "ddl:",
@@ -7970,6 +7969,22 @@ fn documentNativeRequestMatchesPlan(plan: []const u8, expected: []const u8) bool
 
 fn corpusFixtureDocumentReadSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
     if (!corpusFixtureHasDocumentReadSummary(entry.summary)) return true;
+    if (entry.family == .document_write and std.mem.startsWith(u8, entry.plan, "document_source_insert:")) {
+        if (entry.summary.document_view_mapping != null or
+            entry.summary.document_native_request != null or
+            entry.summary.document_projections != null or
+            entry.summary.document_residual != null or
+            entry.summary.document_order != null or
+            entry.summary.document_unnest != null or
+            entry.summary.document_limit != null)
+        {
+            return false;
+        }
+        if (entry.summary.document_source_table) |source_table| {
+            return planHasExactStringToken(entry.plan, ":source_table=", source_table);
+        }
+        return true;
+    }
     if (entry.family != .read or !documentQueryPlanMatchesReadFamily(entry.plan)) return false;
     if (entry.summary.document_source_table) |source_table| {
         if (!planHasExactStringToken(entry.plan, ":source_table=", source_table)) return false;
@@ -8651,6 +8666,7 @@ pub fn corpusFixtureAllowsReturningSummary(entry: AppParityCorpusEntry) bool {
         .delete_joined_source,
         .merge_mutation,
         => true,
+        .document_write => true,
         .explain => explainPlanHasKind(entry.plan, "write"),
         else => false,
     };
@@ -8670,6 +8686,11 @@ pub fn corpusFixtureReturningSummaryMatchesPlan(entry: AppParityCorpusEntry, exp
         .delete_joined_source,
         .merge_mutation,
         => planHasExactUsizeToken(entry.plan, ":returning=", expected),
+        .document_write => if (std.mem.startsWith(u8, entry.plan, "document_conflict_write:") or
+            std.mem.startsWith(u8, entry.plan, "document_source_insert:"))
+            planHasExactUsizeToken(entry.plan, ":returning=", expected)
+        else
+            planHasExactUsizeToken(entry.plan, ":returning_rows=", expected),
         .explain => planHasExactUsizeToken(entry.plan, ":returning_rows=", expected) or
             planHasExactUsizeToken(entry.plan, ":returning=", expected),
         else => false,
@@ -8711,7 +8732,9 @@ pub fn corpusFixtureAllowsMutationTransformSummary(entry: AppParityCorpusEntry) 
 pub fn corpusFixtureAllowsSourceAssignmentsSummary(entry: AppParityCorpusEntry) bool {
     return switch (entry.family) {
         .update_joined_source => true,
-        .document_write => std.mem.startsWith(u8, entry.plan, "document_joined_write:"),
+        .document_write => std.mem.startsWith(u8, entry.plan, "document_conflict_write:") or
+            std.mem.startsWith(u8, entry.plan, "document_source_insert:") or
+            std.mem.startsWith(u8, entry.plan, "document_joined_write:"),
         .explain => corpusExplainWriteInnerHasPrefix(entry, ":inner=update_joined_source:"),
         else => false,
     };
@@ -8719,7 +8742,9 @@ pub fn corpusFixtureAllowsSourceAssignmentsSummary(entry: AppParityCorpusEntry) 
 
 pub fn corpusFixtureSourceAssignmentsSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: usize) bool {
     return switch (entry.family) {
-        .document_write => if (std.mem.startsWith(u8, entry.plan, "document_joined_write:"))
+        .document_write => if (std.mem.startsWith(u8, entry.plan, "document_conflict_write:") or
+            std.mem.startsWith(u8, entry.plan, "document_source_insert:") or
+            std.mem.startsWith(u8, entry.plan, "document_joined_write:"))
             planHasExactUsizeToken(entry.plan, ":source_assignments=", expected)
         else
             false,
@@ -9708,6 +9733,7 @@ pub fn appendQueryAccessPathFingerprintAlloc(
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "access_or", query.access_or_predicates.len);
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "access_not", query.access_not_predicates.len);
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "subquery_pred", query.subquery_predicates.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "scalar_subquery", query.scalar_subqueries.len);
     return fingerprint;
 }
 
@@ -11366,8 +11392,9 @@ test "sql adapter corpus validates compatibility wrapper inventory" {
     defer inventory.deinit(alloc);
     try std.testing.expectEqual(sql_compatibility_wrapper_inventory_format, inventory.root.inventory_format);
     try std.testing.expect(inventory.root.wrappers.len > 0);
+    try std.testing.expectEqual(@as(usize, 1), inventory.root.wrappers.len);
     try std.testing.expectEqualStrings("document-query-bounded-scan-runtime", inventory.root.wrappers[0].id);
-    try std.testing.expectEqualStrings("grammar-maintenance-tail-token-parsers", inventory.root.wrappers[inventory.root.wrappers.len - 1].id);
+    try std.testing.expectEqualStrings("runtime", inventory.root.wrappers[0].wrapper_class);
     try std.testing.expectEqualStrings(
         "Generated read ASTs identify document source, projection, predicate, ordering, aggregate, and UNNEST shapes.",
         inventory.root.wrappers[0].deletion_evidence.typed_parser,
@@ -11760,7 +11787,7 @@ test "sql adapter corpus validates production ingress cutover manifest" {
     try std.testing.expectEqualStrings("fixture_enforced", cutover.root.gates[0].status);
     try std.testing.expectEqualStrings("complete", cutover.root.gates[1].status);
     try std.testing.expectEqualStrings("complete", cutover.root.gates[2].status);
-    try std.testing.expectEqualStrings("grammar-maintenance-tail-token-parsers", cutover.root.wrappers[cutover.root.wrappers.len - 1].wrapper_id);
+    try std.testing.expectEqualStrings("document-query-bounded-scan-runtime", cutover.root.wrappers[cutover.root.wrappers.len - 1].wrapper_id);
     try std.testing.expectEqualStrings("roles", cutover.root.families[cutover.root.families.len - 1].family);
 
     var wrappers = try parseSqlCompatibilityWrapperInventoryAlloc(alloc);
@@ -12440,7 +12467,8 @@ test "sql adapter corpus validates relational expression completion inventory ma
     try std.testing.expectEqualStrings("adapter-boundary-string-path-deletion", inventory.root.entries[0].id);
     try std.testing.expectEqualStrings("adapter_boundary_string_path_deletion", inventory.root.entries[0].surface);
     try std.testing.expectEqualStrings("optimizer-expression-pushdown", inventory.root.entries[1].id);
-    try std.testing.expectEqualStrings("partial_release_gated", inventory.root.entries[1].status);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[1].status);
+    try std.testing.expectEqualStrings("", inventory.root.entries[1].missing_evidence);
     try std.testing.expectEqualStrings("rest-sdk-expression-exposure", inventory.root.entries[2].id);
 
     const unknown_surface_json =
@@ -12518,8 +12546,14 @@ test "sql adapter corpus validates relational advanced aggregate inventory manif
     try std.testing.expectEqual(relational_advanced_aggregate_inventory_ids.len, inventory.root.entries.len);
     try std.testing.expectEqualStrings("aggregate-expression-pushdown-capability", inventory.root.entries[0].id);
     try std.testing.expectEqualStrings("aggregate_expression_pushdown", inventory.root.entries[0].surface);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[0].status);
+    try std.testing.expectEqualStrings("", inventory.root.entries[0].missing_evidence);
+    try std.testing.expectEqualStrings("aggregate-resource-metrics", inventory.root.entries[1].id);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[1].status);
+    try std.testing.expectEqualStrings("", inventory.root.entries[1].missing_evidence);
     try std.testing.expectEqualStrings("domain-rollup-execution-fixtures", inventory.root.entries[2].id);
-    try std.testing.expectEqualStrings("gap_tracked", inventory.root.entries[2].status);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[2].status);
+    try std.testing.expectEqualStrings("", inventory.root.entries[2].missing_evidence);
     try std.testing.expectEqualStrings("spill-backed-window-execution", inventory.root.entries[3].id);
 
     const unknown_surface_json =
@@ -12597,6 +12631,9 @@ test "sql adapter corpus validates relational point CRUD inventory manifest" {
     try std.testing.expectEqual(relational_point_crud_inventory_ids.len, inventory.root.entries.len);
     try std.testing.expectEqualStrings("committed-returning-parity", inventory.root.entries[0].id);
     try std.testing.expectEqualStrings("committed_returning", inventory.root.entries[0].surface);
+    try std.testing.expectEqualStrings("concurrent-conflict-action-state", inventory.root.entries[1].id);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[1].status);
+    try std.testing.expectEqualStrings("", inventory.root.entries[1].missing_evidence);
     try std.testing.expectEqualStrings("non-unique-point-claim-safety", inventory.root.entries[2].id);
     try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[2].status);
     try std.testing.expectEqualStrings("routed-conflict-range-movement-chaos", inventory.root.entries[3].id);
@@ -12757,6 +12794,11 @@ test "sql adapter corpus validates relational JSON array inventory manifest" {
     try std.testing.expectEqual(relational_json_array_inventory_ids.len, inventory.root.entries.len);
     try std.testing.expectEqualStrings("embedded-document-index-bypass", inventory.root.entries[0].id);
     try std.testing.expectEqualStrings("embedded_document_index_bypass", inventory.root.entries[0].surface);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[0].status);
+    try std.testing.expectEqualStrings("", inventory.root.entries[0].missing_evidence);
+    try std.testing.expectEqualStrings("embedded-json-schema-durable-rebuild", inventory.root.entries[1].id);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[1].status);
+    try std.testing.expectEqualStrings("", inventory.root.entries[1].missing_evidence);
     try std.testing.expectEqualStrings("json-array-rest-sdk-typed-plan-exposure", inventory.root.entries[2].id);
     try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[2].status);
     try std.testing.expectEqualStrings("unsupported-json-array-operator-fixtures", inventory.root.entries[3].id);
@@ -12837,8 +12879,11 @@ test "sql adapter corpus validates relational routed execution inventory manifes
     try std.testing.expectEqualStrings("cte-stream-spill-resumability", inventory.root.entries[0].id);
     try std.testing.expectEqualStrings("cte_stream_spill", inventory.root.entries[0].surface);
     try std.testing.expectEqualStrings("live-write-pagination-range-movement", inventory.root.entries[1].id);
-    try std.testing.expectEqualStrings("gap_tracked", inventory.root.entries[1].status);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[1].status);
+    try std.testing.expectEqualStrings("", inventory.root.entries[1].missing_evidence);
     try std.testing.expectEqualStrings("owner-stream-join-strategy-planning", inventory.root.entries[2].id);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[2].status);
+    try std.testing.expectEqualStrings("", inventory.root.entries[2].missing_evidence);
     try std.testing.expectEqualStrings("routed-merge-join-order-proof", inventory.root.entries[3].id);
     try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[3].status);
     try std.testing.expectEqualStrings("", inventory.root.entries[3].missing_evidence);
@@ -12918,9 +12963,14 @@ test "sql adapter corpus validates relational derived access inventory manifest"
     try std.testing.expectEqual(relational_derived_access_inventory_ids.len, inventory.root.entries.len);
     try std.testing.expectEqualStrings("durable-ordered-composite-metadata", inventory.root.entries[0].id);
     try std.testing.expectEqualStrings("durable_ordered_composite_metadata", inventory.root.entries[0].surface);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[0].status);
+    try std.testing.expectEqualStrings("", inventory.root.entries[0].missing_evidence);
     try std.testing.expectEqualStrings("expression-derived-rebuild-promotion", inventory.root.entries[1].id);
-    try std.testing.expectEqualStrings("partial_release_gated", inventory.root.entries[1].status);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[1].status);
+    try std.testing.expectEqualStrings("", inventory.root.entries[1].missing_evidence);
     try std.testing.expectEqualStrings("stale-derived-artifact-safety", inventory.root.entries[2].id);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[2].status);
+    try std.testing.expectEqualStrings("", inventory.root.entries[2].missing_evidence);
 
     const unknown_surface_json =
         \\{
@@ -13160,7 +13210,7 @@ test "sql adapter corpus validates relational production chaos inventory manifes
     try std.testing.expectEqual(relational_production_chaos_inventory_format, inventory.root.inventory_format);
     try std.testing.expectEqual(relational_production_chaos_inventory_ids.len, inventory.root.entries.len);
     try std.testing.expectEqualStrings("fk-action-page-chaos", inventory.root.entries[0].id);
-    try std.testing.expectEqualStrings("partial_release_gated", inventory.root.entries[0].status);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[0].status);
     try std.testing.expectEqualStrings("insert-source-upsert-owner-chaos", inventory.root.entries[1].id);
     try std.testing.expectEqualStrings("missing_native_harness", inventory.root.entries[1].status);
     try std.testing.expectEqualStrings("table-emptying-secondary-index-chaos", inventory.root.entries[2].id);
@@ -15640,11 +15690,17 @@ pub const AppParityCorpusCoverage = struct {
     document_write_document_sql_joined_delete: bool = false,
     document_write_document_sql_joined_projection_update: bool = false,
     document_write_document_sql_joined_source_assignment_update: bool = false,
+    document_write_document_sql_merge_delete: bool = false,
+    document_write_document_sql_merge_version_predicate: bool = false,
     document_write_document_sql_projection_array_update: bool = false,
     document_write_document_sql_projection_nested_alias_insert: bool = false,
     document_write_document_sql_projection_nested_alias_update: bool = false,
     document_write_document_sql_projection_null_default_insert: bool = false,
     document_write_document_sql_projection_null_update: bool = false,
+    document_write_document_sql_projection_on_conflict_do_nothing: bool = false,
+    document_write_document_sql_projection_on_conflict_do_nothing_returning: bool = false,
+    document_write_document_sql_projection_on_conflict_do_update: bool = false,
+    document_write_document_sql_projection_on_conflict_do_update_returning: bool = false,
     document_write_document_sql_projection_update: bool = false,
     document_write_document_sql_projection_version_in_update: bool = false,
     document_write_document_sql_projection_version_update: bool = false,
@@ -15660,14 +15716,12 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_write_document_sql_json_patch_versioned_in: bool = false,
     unsupported_write_document_sql_non_identity_delete: bool = false,
     unsupported_write_document_sql_mixed_identity_delete: bool = false,
-    unsupported_write_document_sql_merge_delete: bool = false,
     unsupported_write_document_sql_ordered_delete: bool = false,
     unsupported_write_document_sql_projection_additional_properties: bool = false,
     unsupported_write_document_sql_projection_generated_field_insert: bool = false,
     unsupported_write_document_sql_projection_generated_field_update: bool = false,
     unsupported_write_document_sql_projection_on_conflict_do_nothing: bool = false,
     unsupported_write_document_sql_projection_on_conflict: bool = false,
-    unsupported_write_document_sql_projection_returning: bool = false,
     unsupported_write_document_sql_projection_source_assignment_update: bool = false,
     unsupported_write_document_sql_projection_source_insert: bool = false,
     unsupported_write_document_sql_projection_transient_alias_insert: bool = false,
@@ -15726,17 +15780,9 @@ pub const AppParityCorpusCoverage = struct {
     read_set_operation_right_cross_table_multi_join: bool = false,
     read_set_operation_right_lateral_join: bool = false,
     read_set_operation_right_multi_join: bool = false,
-    unsupported_read_cte_contained_subquery_predicate: bool = false,
     unsupported_read_correlated_subquery_predicate: bool = false,
-    unsupported_read_in_subquery_predicate: bool = false,
-    unsupported_read_nested_subquery_predicate: bool = false,
-    unsupported_read_not_exists_subquery_predicate: bool = false,
-    unsupported_read_not_in_subquery_predicate: bool = false,
-    unsupported_read_scalar_subquery_predicate: bool = false,
-    unsupported_read_scalar_subquery_projection: bool = false,
     unsupported_read_set_operation_output_shape: bool = false,
     unsupported_read_subquery_predicate: bool = false,
-    unsupported_read_quantified_subquery_predicate: bool = false,
     read_row_lock_nowait: bool = false,
     read_row_lock_share: bool = false,
     read_row_lock_key_share: bool = false,
@@ -16182,31 +16228,6 @@ pub const AppParityCorpusCoverage = struct {
         self.unsupported_read_correlated_subquery_predicate = self.unsupported_read_correlated_subquery_predicate or
             (sourceCorpusEntryHasClassificationReason(entry, "subquery_semijoin_plan") and
                 std.mem.eql(u8, entry.name, "read correlated subquery predicate"));
-        self.unsupported_read_nested_subquery_predicate = self.unsupported_read_nested_subquery_predicate or
-            (sourceCorpusEntryHasClassificationReason(entry, "subquery_semijoin_plan") and
-                std.mem.eql(u8, entry.name, "read nested subquery predicate"));
-        self.unsupported_read_cte_contained_subquery_predicate = self.unsupported_read_cte_contained_subquery_predicate or
-            (sourceCorpusEntryHasClassificationReason(entry, "subquery_semijoin_plan") and
-                std.mem.eql(u8, entry.name, "read cte contained subquery predicate"));
-        self.unsupported_read_quantified_subquery_predicate = self.unsupported_read_quantified_subquery_predicate or
-            (sourceCorpusEntryHasClassificationReason(entry, "subquery_quantified_plan") and
-                std.mem.indexOf(u8, entry.sql, " ANY ") != null);
-        self.unsupported_read_in_subquery_predicate = self.unsupported_read_in_subquery_predicate or
-            (sourceCorpusEntryHasClassificationReason(entry, "subquery_semijoin_plan") and
-                std.mem.indexOf(u8, entry.sql, " IN (SELECT ") != null and
-                std.mem.indexOf(u8, entry.sql, " NOT IN (SELECT ") == null);
-        self.unsupported_read_not_exists_subquery_predicate = self.unsupported_read_not_exists_subquery_predicate or
-            (sourceCorpusEntryHasClassificationReason(entry, "subquery_semijoin_plan") and
-                std.mem.indexOf(u8, entry.sql, " NOT EXISTS (SELECT ") != null);
-        self.unsupported_read_not_in_subquery_predicate = self.unsupported_read_not_in_subquery_predicate or
-            (sourceCorpusEntryHasClassificationReason(entry, "subquery_semijoin_plan") and
-                std.mem.indexOf(u8, entry.sql, " NOT IN (SELECT ") != null);
-        self.unsupported_read_scalar_subquery_predicate = self.unsupported_read_scalar_subquery_predicate or
-            (sourceCorpusEntryHasClassificationReason(entry, "subquery_scalar_plan") and
-                std.mem.indexOf(u8, entry.sql, " = (SELECT ") != null);
-        self.unsupported_read_scalar_subquery_projection = self.unsupported_read_scalar_subquery_projection or
-            (sourceCorpusEntryHasClassificationReason(entry, "subquery_expression_plan") and
-                std.mem.indexOf(u8, entry.sql, "SELECT (SELECT ") != null);
         return true;
     }
 
@@ -17485,6 +17506,58 @@ pub const AppParityCorpusCoverage = struct {
                         structured_summary.parser.default_keyword and
                         structured_summary.parser.underscore_id_identifier and
                         !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_projection_on_conflict_do_update = self.document_write_document_sql_projection_on_conflict_do_update or
+                    (std.mem.eql(u8, entry.name, "document sql projection on conflict") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_conflict_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":action=", "update") and
+                        planHasExactUsizeToken(entry.plan, ":writes=", 1) and
+                        planHasExactUsizeToken(entry.plan, ":ops=", 0) and
+                        planHasExactUsizeToken(entry.plan, ":source_assignments=", 1) and
+                        structured_summary.parser.insert_into and
+                        structured_summary.parser.conflict_do_update and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_projection_on_conflict_do_nothing = self.document_write_document_sql_projection_on_conflict_do_nothing or
+                    (std.mem.eql(u8, entry.name, "document sql projection on conflict do nothing") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_conflict_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":action=", "nothing") and
+                        planHasExactUsizeToken(entry.plan, ":writes=", 1) and
+                        planHasExactUsizeToken(entry.plan, ":ops=", 0) and
+                        structured_summary.parser.insert_into and
+                        structured_summary.parser.conflict_do_nothing and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_projection_on_conflict_do_update_returning = self.document_write_document_sql_projection_on_conflict_do_update_returning or
+                    (std.mem.eql(u8, entry.name, "document sql projection on conflict do update returning") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_conflict_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":action=", "update") and
+                        planHasExactUsizeToken(entry.plan, ":writes=", 1) and
+                        planHasExactUsizeToken(entry.plan, ":source_assignments=", 1) and
+                        planHasExactUsizeToken(entry.plan, ":returning=", 2) and
+                        structured_summary.parser.insert_into and
+                        structured_summary.parser.conflict_do_update and
+                        structured_summary.parser.returning_keyword and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_projection_on_conflict_do_nothing_returning = self.document_write_document_sql_projection_on_conflict_do_nothing_returning or
+                    (std.mem.eql(u8, entry.name, "document sql projection on conflict do nothing returning") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_conflict_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":action=", "nothing") and
+                        planHasExactUsizeToken(entry.plan, ":writes=", 1) and
+                        planHasExactUsizeToken(entry.plan, ":returning=", 1) and
+                        structured_summary.parser.insert_into and
+                        structured_summary.parser.conflict_do_nothing and
+                        structured_summary.parser.returning_keyword and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
                 self.document_write_document_sql_projection_update = self.document_write_document_sql_projection_update or
                     (std.mem.eql(u8, entry.name, "document sql projection update") and
                         corpusPlanMatchesFamily(.document_write, entry.plan) and
@@ -17782,6 +17855,14 @@ pub const AppParityCorpusCoverage = struct {
                         structured_summary.parser.where_keyword and
                         structured_summary.parser.underscore_id_identifier and
                         !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_merge_delete = self.document_write_document_sql_merge_delete or
+                    (std.mem.startsWith(u8, entry.plan, "document_merge_write:") and
+                        structured_summary.parser.starts_with_merge and
+                        structured_summary.parser.merge_when_matched_delete);
+                self.document_write_document_sql_merge_version_predicate = self.document_write_document_sql_merge_version_predicate or
+                    (std.mem.startsWith(u8, entry.plan, "document_merge_write:") and
+                        ((structured_summary.parser.starts_with_merge and structured_summary.parser.underscore_version_identifier) or
+                            std.mem.eql(u8, entry.name, "document sql merge matched version predicate")));
             },
             .unsupported_ddl => self.unsupported_ddl = true,
             .unsupported_write => {
@@ -17900,12 +17981,6 @@ pub const AppParityCorpusCoverage = struct {
                         structured_summary.parser.starts_with_delete and
                         structured_summary.parser.where_keyword and
                         (structured_summary.parser.lt_or_lte_operator or structured_summary.parser.gt_or_gte_operator));
-                self.unsupported_write_document_sql_merge_delete = self.unsupported_write_document_sql_merge_delete or
-                    (structured_summary.hasReason("document_sql_write_unsupported") and
-                        structured_summary.parser.starts_with_merge and
-                        structured_summary.parser.merge_when_matched_delete and
-                        structured_summary.parser.docs_underscore_id_identifier and
-                        structured_summary.parser.source_underscore_id_identifier);
                 self.unsupported_write_document_sql_projection_additional_properties = self.unsupported_write_document_sql_projection_additional_properties or
                     (std.mem.eql(u8, entry.name, "unsupported document sql additional properties projection insert") and
                         is_document_sql_write_unsupported and
@@ -17957,15 +18032,6 @@ pub const AppParityCorpusCoverage = struct {
                         structured_summary.parser.set_keyword and
                         structured_summary.parser.where_keyword and
                         structured_summary.parser.title_lc_identifier and
-                        structured_summary.parser.underscore_id_identifier and
-                        !structured_summary.parser.underscore_doc_identifier);
-                self.unsupported_write_document_sql_projection_returning = self.unsupported_write_document_sql_projection_returning or
-                    (std.mem.eql(u8, entry.name, "unsupported document sql projection returning") and
-                        is_document_sql_write_unsupported and
-                        structured_summary.parser.starts_with_update and
-                        structured_summary.parser.set_keyword and
-                        structured_summary.parser.returning_keyword and
-                        structured_summary.parser.title_identifier and
                         structured_summary.parser.underscore_id_identifier and
                         !structured_summary.parser.underscore_doc_identifier);
                 self.unsupported_write_document_sql_versioned_projection_insert = self.unsupported_write_document_sql_versioned_projection_insert or
@@ -18132,32 +18198,6 @@ pub const AppParityCorpusCoverage = struct {
             self.unsupported_read_correlated_subquery_predicate = self.unsupported_read_correlated_subquery_predicate or
                 (structured_summary.hasReason("subquery_semijoin_plan") and
                     std.mem.eql(u8, entry.name, "read correlated subquery predicate"));
-            self.unsupported_read_nested_subquery_predicate = self.unsupported_read_nested_subquery_predicate or
-                (structured_summary.hasReason("subquery_semijoin_plan") and
-                    std.mem.eql(u8, entry.name, "read nested subquery predicate"));
-            self.unsupported_read_cte_contained_subquery_predicate = self.unsupported_read_cte_contained_subquery_predicate or
-                (structured_summary.hasReason("subquery_semijoin_plan") and
-                    std.mem.eql(u8, entry.name, "read cte contained subquery predicate") and
-                    structured_summary.parser.starts_with_with);
-            self.unsupported_read_quantified_subquery_predicate = self.unsupported_read_quantified_subquery_predicate or
-                (structured_summary.hasReason("subquery_quantified_plan") and
-                    std.mem.indexOf(u8, entry.sql, " = ANY (SELECT ") != null);
-            self.unsupported_read_in_subquery_predicate = self.unsupported_read_in_subquery_predicate or
-                (structured_summary.hasReason("subquery_semijoin_plan") and
-                    std.mem.indexOf(u8, entry.sql, " IN (SELECT ") != null and
-                    std.mem.indexOf(u8, entry.sql, " NOT IN (SELECT ") == null);
-            self.unsupported_read_not_exists_subquery_predicate = self.unsupported_read_not_exists_subquery_predicate or
-                (structured_summary.hasReason("subquery_semijoin_plan") and
-                    std.mem.indexOf(u8, entry.sql, " NOT EXISTS (SELECT ") != null);
-            self.unsupported_read_not_in_subquery_predicate = self.unsupported_read_not_in_subquery_predicate or
-                (structured_summary.hasReason("subquery_semijoin_plan") and
-                    std.mem.indexOf(u8, entry.sql, " NOT IN (SELECT ") != null);
-            self.unsupported_read_scalar_subquery_predicate = self.unsupported_read_scalar_subquery_predicate or
-                (structured_summary.hasReason("subquery_scalar_plan") and
-                    std.mem.indexOf(u8, entry.sql, " = (SELECT ") != null);
-            self.unsupported_read_scalar_subquery_projection = self.unsupported_read_scalar_subquery_projection or
-                (structured_summary.hasReason("subquery_expression_plan") and
-                    std.mem.indexOf(u8, entry.sql, "SELECT (SELECT ") != null);
             self.unsupported_read_document_view_mapping_projection_expression = self.unsupported_read_document_view_mapping_projection_expression or
                 (structured_summary.hasReason("document_sql_view_mapping_unsupported") and
                     structured_summary.parser.support_view_identifier and
@@ -19843,11 +19883,10 @@ test "sql adapter corpus emits structured fixture summaries" {
     var document_merge_sql = try tokenized.ParsedSql.initAlloc(alloc, "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN MATCHED THEN DELETE");
     defer document_merge_sql.deinit(alloc);
     const document_merge = appParityStructuredFixtureSummary(.{
-        .name = "unsupported document sql merge matched delete",
+        .name = "document sql merge matched delete",
         .sql = "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN MATCHED THEN DELETE",
-        .family = .unsupported_write,
-        .classification_reason = "document_sql_write_unsupported",
-        .plan = "unsupported:write:requires=document_sql_write_unsupported",
+        .family = .document_write,
+        .plan = "document_merge_write:table=docs:source_table=docs:target_producer=bounded_scan:source_producer=bounded_scan:join_keys=1:matched_arms=1:max_target_rows=10000:max_source_rows=10000",
     }, &document_merge_sql);
     try std.testing.expect(document_merge.parser.starts_with_merge);
     try std.testing.expect(document_merge.parser.merge_when_matched_delete);

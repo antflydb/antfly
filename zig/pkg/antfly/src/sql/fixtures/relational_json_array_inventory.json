@@ -5,9 +5,9 @@
       "id": "embedded-document-index-bypass",
       "relational_slices_section": "JSONB, arrays, and embedded document fields",
       "surface": "embedded_document_index_bypass",
-      "status": "partial_release_gated",
-      "current_evidence": "Embedded relational JSON search intersects embedded index hits with top-level relational filters, and algebraic indexes can serve embedded relational JSON subdocument fields.",
-      "missing_evidence": "Embedded document-index bypass tests still need JSON/array query coverage proving relational row-store consistency, visibility, row claims, and typed-column enforcement cannot be bypassed by embedded document indexes.",
+      "status": "release_evidence",
+      "current_evidence": "Embedded relational JSON search intersects embedded index hits with top-level relational filters, algebraic indexes can serve embedded relational JSON subdocument fields, and the search runtime now proves embedded-index matches cannot bypass relational row-store consistency. The storage test rejects invalid top-level relational writes before indexing, verifies stored data comes from the relational base row, proves mismatched top-level relational filters remove embedded-index hits, and checks row-claim SKIP LOCKED filtering over embedded JSON search results.",
+      "missing_evidence": "",
       "evidence_file": "zig/pkg/antfly/src/storage/db/search_runtime.zig",
       "evidence_symbol": "relational embedded json search intersects with top-level relational filters",
       "release_gate": "relational-release-gate"
@@ -16,11 +16,11 @@
       "id": "embedded-json-schema-durable-rebuild",
       "relational_slices_section": "JSONB, arrays, and embedded document fields",
       "surface": "embedded_json_schema_rebuild",
-      "status": "partial_release_gated",
-      "current_evidence": "Algebraic schema reload marks changed JSON subdocument domains pending, and schema capability planning treats relational JSON schema as an embedded subdocument domain.",
-      "missing_evidence": "Embedded JSON schema/template changes still need durable catalog rebuild or rewrite coverage with generation ownership, retry, abort, promotion, and reopen evidence.",
+      "status": "release_evidence",
+      "current_evidence": "Algebraic schema reload marks changed JSON subdocument domains pending, withholds pending embedded fields until rebuild, rebuilds from packed relational base rows, persists resume state after injected bounded rebuild failure, and completes the pending embedded JSON schema rebuild on writable reopen. Completion clears stale subdocument facts, promotes the JSON subdocument domain lifecycle to current, clears rebuild_required markers, and removes the resume key.",
+      "missing_evidence": "",
       "evidence_file": "zig/pkg/antfly/src/storage/db/catalog/index_manager.zig",
-      "evidence_symbol": "index manager algebraic schema reload marks changed json subdocument domains pending",
+      "evidence_symbol": "index manager embedded json schema rebuild resumes after failure and reopen",
       "release_gate": "relational-release-gate"
     },
     {

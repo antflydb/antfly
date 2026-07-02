@@ -18,6 +18,7 @@ const metadata_api = @import("../../metadata/api.zig");
 const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const schema_mod = @import("../../schema/mod.zig");
+const relational_rows_api = @import("../../sql/relational_rows.zig");
 const storage_schema = @import("../../storage/schema.zig");
 const table_catalog = @import("../../metadata/catalog/routing.zig");
 const tables_api = @import("../../metadata/catalog/table_ddl.zig");
@@ -1053,6 +1054,150 @@ test "secondary index rebuild worker helper claims repairs and finishes range" {
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, inactive_amount_key));
 }
 
+test "secondary index rebuild worker rebuilds and promotes expression generated index" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/secondary-index-expression-rebuild-worker", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"users_lower_email_idx":{"type":"keyword","generated":{"op":"lower","field":"email"},"x-antfly-index":true,"x-antfly-index-lifecycle":"building","x-antfly-index-generation":9,"x-antfly-index-name":"users_lower_email_idx"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+    var parsed_schema = try schema_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+    var rows_batch = try relational_rows_api.parseRowsBatchRequest(
+        alloc,
+        "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"a\",\"email\":\"Ada@Example.Test\"}},{\"op\":\"insert\",\"row\":{\"id\":\"b\",\"email\":\"Grace@Example.Test\"}}]}",
+        runtime_schema,
+    );
+    defer rows_batch.deinit(alloc);
+    const row_a_key = try alloc.dupe(u8, rows_batch.req.writes[0].key);
+    defer alloc.free(row_a_key);
+    try db.batch(rows_batch.req);
+
+    const valid_generated_key = try db_mod.internal_keys.relationalColumnIndexKeyAlloc(alloc, "users_lower_email_idx", row_a_key);
+    defer alloc.free(valid_generated_key);
+    const stale_generated_key = try db_mod.internal_keys.relationalColumnIndexKeyAlloc(alloc, "users_lower_email_idx", "row:stale");
+    defer alloc.free(stale_generated_key);
+    try db.core.store.put(stale_generated_key, "");
+    const stale_before = try db.core.store.get(alloc, stale_generated_key);
+    defer alloc.free(stale_before);
+
+    var manager = metadata_table_manager.TableManager.init(alloc);
+    defer manager.deinit();
+    const table = metadata_table_manager.TableRecord{
+        .table_id = 77,
+        .name = "users",
+        .schema_json = schema_json,
+    };
+    const range = metadata_table_manager.RangeRecord{
+        .group_id = 9001,
+        .range_id = 9101,
+        .table_id = table.table_id,
+        .start_key = "",
+        .end_key = null,
+    };
+    try manager.upsertTable(table);
+    try manager.upsertSecondaryIndexRebuildRange(.{
+        .table_id = table.table_id,
+        .index_name = "users_lower_email_idx",
+        .index_generation = 9,
+        .start_row_key = range.start_key,
+        .end_row_key = range.end_key,
+        .group_id = range.group_id,
+        .range_id = 0,
+    });
+
+    const records = try manager.listSecondaryIndexRebuildRanges(alloc);
+    defer manager.freeSecondaryIndexRebuildRanges(alloc, records);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+
+    const rebuilt = try runSecondaryIndexRebuildRangeGroupLocal(&db, &manager, records[0], "worker-a", 1000, 500);
+    try std.testing.expect(rebuilt.claimed);
+    try std.testing.expect(rebuilt.completed);
+    try std.testing.expect(!rebuilt.invalidated);
+    try std.testing.expectEqual(@as(u64, 2), rebuilt.report.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 2), rebuilt.report.indexed_rows);
+    try std.testing.expect(rebuilt.report.written_entries >= 2);
+    try std.testing.expect(rebuilt.report.deleted_entries >= 1);
+
+    const valid_after = try db.core.store.get(alloc, valid_generated_key);
+    defer alloc.free(valid_after);
+    try std.testing.expect(valid_after.len > 0);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stale_generated_key));
+
+    const final_records = try manager.listSecondaryIndexRebuildRanges(alloc);
+    defer manager.freeSecondaryIndexRebuildRanges(alloc, final_records);
+    try std.testing.expectEqual(@as(usize, 1), final_records.len);
+    try std.testing.expectEqualStrings(metadata_table_manager.secondary_index_rebuild_ready, final_records[0].state);
+
+    const Catalog = struct {
+        table: metadata_table_manager.TableRecord,
+        range: metadata_table_manager.RangeRecord,
+        rebuild: metadata_table_manager.SecondaryIndexRebuildRangeRecord,
+        promoted: bool = false,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .promote_secondary_index_ready = promoteSecondaryIndexReady,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = @as([*]metadata_table_manager.RangeRecord, @ptrCast(&self.range))[0..1],
+                .secondary_index_rebuild_ranges = @as([*]metadata_table_manager.SecondaryIndexRebuildRangeRecord, @ptrCast(&self.rebuild))[0..1],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn promoteSecondaryIndexReady(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            expected_generation: u64,
+        ) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("users", table_name);
+            try std.testing.expectEqualStrings("users_lower_email_idx", index_name);
+            try std.testing.expectEqual(@as(u64, 9), expected_generation);
+            self.promoted = true;
+            return true;
+        }
+    };
+
+    var catalog = Catalog{
+        .table = table,
+        .range = range,
+        .rebuild = final_records[0],
+    };
+    try std.testing.expectEqual(@as(u64, 1), try promoteReadySecondaryIndexesForCatalog(alloc, catalog.iface(), "users"));
+    try std.testing.expect(catalog.promoted);
+}
+
 test "secondary index rebuild worker invalidates stale range before rebuilding index" {
     const alloc = std.testing.allocator;
 
@@ -1427,6 +1572,52 @@ test "table emptying worker helper deletes populated and empty document tables" 
     try std.testing.expectEqual(@as(u32, 0), empty_result.result.matched);
     try std.testing.expectEqual(@as(u32, 0), empty_result.result.staged);
 
+    const large_count: usize = 96;
+    const large_writes = try alloc.alloc(db_mod.types.BatchWrite, large_count);
+    defer alloc.free(large_writes);
+    for (large_writes, 0..) |*write, i| {
+        write.* = .{
+            .key = try std.fmt.allocPrint(alloc, "doc:large-{d:0>3}", .{i}),
+            .value = try std.fmt.allocPrint(alloc, "{{\"title\":\"large {d}\",\"status\":\"drop\"}}", .{i}),
+        };
+    }
+    defer for (large_writes) |write| {
+        alloc.free(@constCast(write.key));
+        alloc.free(@constCast(write.value));
+    };
+    try db.batch(.{ .writes = large_writes });
+
+    var large_job = metadata_table_manager.TableEmptyingJobRecord{
+        .job_id = 0,
+        .table_id = 77,
+        .group_id = 9003,
+        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_json),
+        .start_row_key = "doc:large-",
+        .end_row_key = "doc:large;",
+        .affected_table_ids = &.{77},
+    };
+    large_job.job_id = metadata_table_manager.stableTableEmptyingJobId(large_job);
+    try manager.upsertTableEmptyingJob(large_job);
+
+    const large_records = try manager.listTableEmptyingJobs(alloc);
+    defer manager.freeTableEmptyingJobs(alloc, large_records);
+    var large_record: ?metadata_table_manager.TableEmptyingJobRecord = null;
+    for (large_records) |record| {
+        if (record.job_id == large_job.job_id) {
+            large_record = record;
+            break;
+        }
+    }
+    var large_result = try runTableEmptyingJobGroupLocal(alloc, &db, catalog.iface(), table, large_record orelse return error.TestUnexpectedResult, "worker-docs-c", 3000, 500);
+    defer large_result.deinit(alloc);
+    try std.testing.expect(large_result.claimed);
+    try std.testing.expect(large_result.completed);
+    try std.testing.expect(!large_result.invalidated);
+    try std.testing.expectEqual(@as(u32, @intCast(large_count)), large_result.result.matched);
+    try std.testing.expectEqual(@as(u32, @intCast(large_count)), large_result.result.staged);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, "doc:large-000"));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, "doc:large-095"));
+
     const final_jobs = try manager.listTableEmptyingJobs(alloc);
     defer manager.freeTableEmptyingJobs(alloc, final_jobs);
     for (final_jobs) |record| {
@@ -1436,6 +1627,9 @@ test "table emptying worker helper deletes populated and empty document tables" 
         } else if (record.job_id == empty_job.job_id) {
             try std.testing.expectEqualStrings(metadata_table_manager.table_emptying_ready, record.state);
             try std.testing.expectEqual(@as(u64, 0), record.completed_row_count);
+        } else if (record.job_id == large_job.job_id) {
+            try std.testing.expectEqualStrings(metadata_table_manager.table_emptying_ready, record.state);
+            try std.testing.expectEqual(@as(u64, @intCast(large_count)), record.completed_row_count);
         }
     }
 }

@@ -37,52 +37,27 @@ document SQL implementation gates.
 - [ ] **Admit document writes through SQL**
   Admit each document-write shape only after it lowers to the typed native
   document request model and has SQL/native parity evidence. Keep
-  `ON CONFLICT`, `RETURNING`, source-query projection inserts, broad
-  projection updates, broad insert/update/delete, remaining truncate variants,
-  and merge rejected until the specific slice below admits that shape with
-  corpus and runtime proof.
+  broad source-query projection inserts, broad projection updates, broad
+  insert/update/delete, and non-admitted conflict, returning, or merge variants
+  rejected until the specific slice below admits that shape with corpus and
+  runtime proof.
 
-  - [ ] Admit projection-write `ON CONFLICT`.
-        Land `INSERT INTO docs (...) ... ON CONFLICT` only when `DO NOTHING`
-        and `DO UPDATE` lower to native document write semantics. Required
-        proof: conflict-target validation, duplicate-key behavior, no-op row
-        reporting, `_version` behavior, generated-field rejection, nested-path
-        assignment behavior, schema-validation failures, document-write
-        lowering fixtures, required SQL/API coverage buckets, and executable
-        runtime parity.
-  - [ ] Admit projection-write `RETURNING`.
-        Land `RETURNING` for document projection inserts, projection updates,
-        producer mutations, and admitted conflict actions only when result rows
-        match the native/API write response shape. Required proof: `_id`,
-        `_doc`, `_version`, virtual fields, projection aliases, generated
-        columns, conflict/no-op rows, deleted-row behavior, unsupported
-        expression diagnostics, document-write lowering fixtures, required
-        SQL/API coverage buckets, and executable runtime parity.
-    - [ ] Admit `_version` only after the native document write path exposes a
-          post-write version value that can be returned deterministically.
-    - [ ] Admit projection-update, producer-mutation, joined-mutation,
-          conflict/no-op, and delete `RETURNING` only with executable native/API
-          parity for returned row shape and row-count semantics.
-    - [ ] Add stable diagnostics for unsupported document `RETURNING`
-          expressions, duplicate outputs, generated columns, and unsupported
-          virtual fields.
   - [ ] Admit source-query projection writes.
-        Land `INSERT INTO docs (...) SELECT ...` only when the source has
-        deterministic ordering plus bounded cardinality, or an explicit native
-        producer contract. Required proof: source ordering, source `LIMIT`
-        semantics, duplicate-key handling, conflict behavior, schema
-        validation, generated-id behavior, rejection of unbounded or
-        nondeterministic sources, rejection of relational mutation-source
-        plans, document-write lowering fixtures, required SQL/API coverage
-        buckets, and executable runtime parity.
-  - [ ] Finish document `TRUNCATE` variant hardening.
-    - [ ] Add row-filter/audit interaction coverage before exposing truncate
-          through guarded document tables.
-    - [ ] Add bounded-delete/native-truncate selection coverage for large
-          document ranges.
-    - [ ] Define future identity-reset semantics before admitting
-          `RESTART IDENTITY`.
-  - [ ] Admit `MERGE INTO docs ...`.
+        Current baseline: same-table `INSERT INTO docs (_id, ...) SELECT _id,
+        ... FROM docs WHERE ...` lowers to a native document source-insert
+        batch when the source producer is an exact `_id` lookup, ready indexed
+        scalar producer, or bounded residual scan with row and byte caps;
+        assignments are flat declared projection fields; duplicate source ids
+        are rejected; optional source `LIMIT` caps materialized rows;
+        `RETURNING` rows may include `_id`, `_doc`, `_version`, and declared
+        projection fields; source producers may omit the target `_id` and
+        allocate target ids through the native generated document id helper in
+        canonical source-id order; and no ordering or conflict action is
+        present.
+    - [ ] Admit source-query projection writes with `ON CONFLICT` only after
+          conflict actions compose with source materialization, duplicate-key
+          handling, no-op row reporting, and native write responses.
+  - [ ] Harden admitted `MERGE INTO docs ...`.
         Land only merge shapes that can be expressed as deterministic native
         document insert/update/delete requests. Required proof: matched insert,
         update, delete, and no-op branches, branch ordering, duplicate-source
@@ -91,6 +66,13 @@ document SQL implementation gates.
         failures, no-match ordering semantics, document-write lowering
         fixtures, required SQL/API coverage buckets, and executable runtime
         parity.
+        Current baseline: bounded document-table `MERGE` admits matched update,
+        matched delete, matched no-op, and not-matched `_id`/`_doc` copy insert
+        plans through native document batch materialization.
+    - [ ] Add projection not-matched inserts after conflict/create-only
+          behavior is proven for non-`_doc` payload construction.
+    - [ ] Add `RETURNING` once document merge response rows match native/API
+          write response shape.
 
 - [ ] **Finish document query and view-mapping hardening**
   Keep the tracking manifests
@@ -158,24 +140,6 @@ document SQL implementation gates.
         table families: DDL, DML, query, roles, extensions, backups, lakes,
         functions, and maintenance commands.
 
-- [ ] **Expand shared typed expression coverage**
-  - [ ] Publish one shared typed-expression contract for text, JSON, array,
-        regex, datetime, numeric, boolean, and query-function expressions.
-  - [ ] Route `CHECK` constraints through the shared expression binder,
-        lowerer, dependency tracker, and diagnostics path.
-  - [ ] Route generated columns through the shared expression path, including
-        dependency tracking and write-time evaluation/rejection.
-  - [ ] Route partial-index predicates and expression-index elements through
-        the shared expression path.
-  - [ ] Route `ON CONFLICT` actions and `UPDATE` transforms through the shared
-        expression path.
-  - [ ] Route aggregate filters, `HAVING`, order keys, windows, and
-        `RETURNING` expressions through the shared expression path.
-  - [ ] Route `ALTER TABLE ... ALTER COLUMN ... TYPE ... USING` clauses through
-        the shared expression path.
-  - [ ] Add diagnostics tests proving unsupported expression classifications
-        remain structural and allocation-light.
-
 - [ ] **Prove cross-surface parity**
   - [ ] Define a canonical native-equivalence summary for SQL plans and
         native/API requests, covering catalog mutations, row writes, document
@@ -196,22 +160,3 @@ document SQL implementation gates.
         unsupported with stable diagnostics.
   - [ ] Gate each supported SQL feature on lowering to the same native model as
         the equivalent Antfly-native API call.
-
-- [ ] **Remove compatibility wrappers**
-  - [ ] Pick one wrapper entry from
-        `zig/pkg/antfly/src/sql/fixtures/sql_compatibility_wrappers.json` whose
-        deletion gate is fully satisfied, then delete that wrapper and its
-        fallback call sites in one focused patch.
-  - [ ] Add regression tests proving the deleted compatibility path now uses
-        the typed parser, binder, plan, runtime, and parity route named by its
-        inventory entry.
-  - [ ] Update the compatibility-wrapper inventory in the same patch that
-        deletes a wrapper, either removing the entry or narrowing it to the
-        remaining compatibility contract.
-  - [ ] Keep only wrappers with a named compatibility reason that cannot change
-        durable catalog, document, or row state.
-    - [ ] For any kept compatibility contract, keep its `contract_reason` in the
-          validator allowlist and preserve the durable-state proof that it is
-          read-only or no-op.
-    - [ ] For any remaining migration blocker, keep explicit typed parser,
-          binder, plan, runtime, and parity deletion evidence in the inventory.

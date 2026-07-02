@@ -82,7 +82,6 @@
         "unsupported_write_document_sql_doc_update",
         "unsupported_write_document_sql_json_patch_invalid_shape",
         "unsupported_write_document_sql_json_path_delete",
-        "unsupported_write_document_sql_merge_delete",
         "unsupported_write_document_sql_mixed_identity_delete",
         "unsupported_write_document_sql_non_identity_delete",
         "unsupported_write_document_sql_ordered_delete",

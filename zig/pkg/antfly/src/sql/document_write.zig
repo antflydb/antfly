@@ -31,7 +31,8 @@ pub fn enforceSqlDocumentWritePreflight(req: DocumentWritePreflight) !void {
     if (documentWritePreflightRejection(req) != null) return error.DocumentSqlWriteUnsupported;
 }
 
-pub fn rejectUnadmittedSqlDocumentWrite(operation: DocumentWriteOperation) error{DocumentSqlWriteUnsupported}!void {
+pub fn rejectUnadmittedSqlDocumentWrite(operation: DocumentWriteOperation) error{ DocumentSqlWriteUnsupported, DocumentSqlMergeRequiresNativeProducer }!void {
+    if (operation == .merge) return error.DocumentSqlMergeRequiresNativeProducer;
     enforceSqlDocumentWritePreflight(.{
         .surface = .sql_adapter,
         .operation = operation,
@@ -97,6 +98,7 @@ test "document SQL write preflight uses shared rejection order" {
 
 test "document SQL write preflight keeps unadmitted SQL writes rejected" {
     try std.testing.expectError(error.DocumentSqlWriteUnsupported, rejectUnadmittedSqlDocumentWrite(.full_document_insert));
+    try std.testing.expectError(error.DocumentSqlMergeRequiresNativeProducer, rejectUnadmittedSqlDocumentWrite(.merge));
 }
 
 test "document SQL write preflight accepts only admitted SQL operations" {

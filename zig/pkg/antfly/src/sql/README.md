@@ -106,6 +106,9 @@ these helpers through `lower_expr.zig` or old `expr_*` aliases in `mod.zig`.
 
 Current expression modules:
 
+- `expr/contract.zig`: shared typed-expression contract aliases, published
+  expression families, and the SQL surfaces that must use the shared expression
+  path.
 - `expr/token.zig`: expression keyword, function-name, operator, start-token,
   and tail-boundary classification.
 - `expr/operator.zig`: operator matching, comparison parsing, JSON extraction

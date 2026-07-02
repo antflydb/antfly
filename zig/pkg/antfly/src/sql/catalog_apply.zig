@@ -2467,6 +2467,59 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     var created = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, "", create);
     defer created.deinit(alloc);
 
+    var ordered_composite_index = try logicalDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_tenant_status_updated_idx ON users (tenant_id ASC, status DESC NULLS LAST, updated_at_ns ASC NULLS FIRST) INCLUDE (email);",
+    );
+    defer ordered_composite_index.deinit(alloc);
+    var ordered_composite_indexed = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, created.schema_json, ordered_composite_index);
+    defer ordered_composite_indexed.deinit(alloc);
+    try std.testing.expect(ordered_composite_indexed.requires_rebuild);
+    try std.testing.expect(!ordered_composite_indexed.validation_required);
+    const ordered_building_runtime = try schema_json.runtimeSchemaFromSchemaJsonAlloc(alloc, ordered_composite_indexed.schema_json);
+    defer runtime_schema.freeSchema(alloc, ordered_building_runtime);
+    const ordered_tenant = binder.relationalColumnForField(ordered_building_runtime, "tenant_id", null) orelse return error.TestUnexpectedResult;
+    const ordered_status = binder.relationalColumnForField(ordered_building_runtime, "status", null) orelse return error.TestUnexpectedResult;
+    const ordered_updated = binder.relationalColumnForField(ordered_building_runtime, "updated_at_ns", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.building, ordered_tenant.index_lifecycle);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.building, ordered_status.index_lifecycle);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.building, ordered_updated.index_lifecycle);
+    try std.testing.expect(ordered_tenant.index_generation != 0);
+    try std.testing.expectEqual(ordered_tenant.index_generation, ordered_status.index_generation);
+    try std.testing.expectEqual(ordered_tenant.index_generation, ordered_updated.index_generation);
+    try std.testing.expectEqualStrings("users_tenant_status_updated_idx", ordered_tenant.index_name.?);
+    try std.testing.expectEqualStrings("users_tenant_status_updated_idx", ordered_status.index_name.?);
+    try std.testing.expectEqualStrings("users_tenant_status_updated_idx", ordered_updated.index_name.?);
+    try std.testing.expectEqual(@as(usize, 3), ordered_tenant.index_keys.len);
+    try std.testing.expectEqualStrings("tenant_id", ordered_tenant.index_keys[0].column);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexKeyDirection.asc, ordered_tenant.index_keys[0].direction);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexKeyNulls.default, ordered_tenant.index_keys[0].nulls);
+    try std.testing.expectEqualStrings("status", ordered_tenant.index_keys[1].column);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexKeyDirection.desc, ordered_tenant.index_keys[1].direction);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexKeyNulls.last, ordered_tenant.index_keys[1].nulls);
+    try std.testing.expectEqualStrings("updated_at_ns", ordered_tenant.index_keys[2].column);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexKeyDirection.asc, ordered_tenant.index_keys[2].direction);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexKeyNulls.first, ordered_tenant.index_keys[2].nulls);
+    try std.testing.expectEqual(@as(usize, 1), ordered_tenant.index_include_columns.len);
+    try std.testing.expectEqualStrings("email", ordered_tenant.index_include_columns[0]);
+
+    try std.testing.expectError(
+        error.SecondaryIndexGenerationMismatch,
+        schema_mutation.schemaWithSecondaryIndexReadyAlloc(alloc, ordered_composite_indexed.schema_json, "users_tenant_status_updated_idx", ordered_tenant.index_generation + 1),
+    );
+    const ordered_ready_json = try schema_mutation.schemaWithSecondaryIndexReadyAlloc(alloc, ordered_composite_indexed.schema_json, "users_tenant_status_updated_idx", ordered_tenant.index_generation);
+    defer alloc.free(ordered_ready_json);
+    const ordered_ready_runtime = try schema_json.runtimeSchemaFromSchemaJsonAlloc(alloc, ordered_ready_json);
+    defer runtime_schema.freeSchema(alloc, ordered_ready_runtime);
+    const ready_ordered_tenant = binder.relationalColumnForField(ordered_ready_runtime, "tenant_id", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.ready, ready_ordered_tenant.index_lifecycle);
+    try std.testing.expectEqual(ordered_tenant.index_generation, ready_ordered_tenant.index_generation);
+    try std.testing.expectEqual(@as(usize, 3), ready_ordered_tenant.index_keys.len);
+    try std.testing.expectEqualStrings("status", ready_ordered_tenant.index_keys[1].column);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexKeyDirection.desc, ready_ordered_tenant.index_keys[1].direction);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexKeyNulls.last, ready_ordered_tenant.index_keys[1].nulls);
+    try std.testing.expectEqualStrings("email", ready_ordered_tenant.index_include_columns[0]);
+
     var multi_column_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_account_email_idx ON users (account_id, email);",

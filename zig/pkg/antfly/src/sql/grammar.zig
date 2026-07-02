@@ -221,30 +221,6 @@ pub const AdvisoryLockSyntax = struct {
     key2: ?i64 = null,
 };
 
-pub const VacuumMaintenanceSyntax = struct {
-    table_name: []const u8,
-    full: bool = false,
-    freeze: bool = false,
-    verbose: bool = false,
-    analyze: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(@constCast(self.table_name));
-        self.* = undefined;
-    }
-};
-
-pub const AnalyzeMaintenanceSyntax = struct {
-    table_name: []const u8,
-    verbose: bool = false,
-    column_count: usize = 0,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(@constCast(self.table_name));
-        self.* = undefined;
-    }
-};
-
 pub const ReindexMaintenanceTargetSyntax = enum {
     index,
     table,
@@ -2542,58 +2518,6 @@ pub fn parseAdvisoryLockTail(tokens: []const Token, pos: *usize) !AdvisoryLockSy
         .key1 = key1,
         .key2 = key2,
     };
-}
-
-pub fn parseVacuumMaintenanceTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-) !VacuumMaintenanceSyntax {
-    var cursor = parser.Cursor.init(tokens, pos);
-    var full = false;
-    var freeze = false;
-    var verbose = false;
-    var analyze = false;
-    if (cursor.matchToken(.lparen) != null) {
-        while (true) {
-            try parseVacuumMaintenanceOption(cursor, &full, &freeze, &verbose, &analyze);
-            if (cursor.matchToken(.comma) == null) break;
-        }
-        try cursor.expectToken(.rparen);
-    } else {
-        while (parseOptionalVacuumMaintenanceOption(cursor, &full, &freeze, &verbose, &analyze)) {}
-    }
-    const table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
-    var table_transferred = false;
-    errdefer if (!table_transferred) alloc.free(table_name);
-    if (cursor.matchToken(.lparen) != null) return error.UnsupportedSqlShape;
-    try adapterNoopStatementEnd(cursor);
-    table_transferred = true;
-    return .{ .table_name = table_name, .full = full, .freeze = freeze, .verbose = verbose, .analyze = analyze };
-}
-
-pub fn parseAnalyzeMaintenanceTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-) !AnalyzeMaintenanceSyntax {
-    var cursor = parser.Cursor.init(tokens, pos);
-    const verbose = cursor.matchKeyword("verbose");
-    const table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
-    var table_transferred = false;
-    errdefer if (!table_transferred) alloc.free(table_name);
-    var column_count: usize = 0;
-    if (cursor.matchToken(.lparen) != null) {
-        while (true) {
-            _ = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
-            column_count += 1;
-            if (cursor.matchToken(.comma) == null) break;
-        }
-        try cursor.expectToken(.rparen);
-    }
-    try adapterNoopStatementEnd(cursor);
-    table_transferred = true;
-    return .{ .table_name = table_name, .verbose = verbose, .column_count = column_count };
 }
 
 pub fn parseReindexMaintenanceTailAlloc(
@@ -8179,37 +8103,6 @@ fn parseTransactionIsolationLevel(cursor: parser.Cursor) !TransactionIsolationLe
     return error.UnsupportedSqlShape;
 }
 
-fn parseOptionalVacuumMaintenanceOption(
-    cursor: parser.Cursor,
-    full: *bool,
-    freeze: *bool,
-    verbose: *bool,
-    analyze: *bool,
-) bool {
-    parseVacuumMaintenanceOption(cursor, full, freeze, verbose, analyze) catch return false;
-    return true;
-}
-
-fn parseVacuumMaintenanceOption(
-    cursor: parser.Cursor,
-    full: *bool,
-    freeze: *bool,
-    verbose: *bool,
-    analyze: *bool,
-) !void {
-    if (cursor.matchKeyword("full")) {
-        full.* = true;
-    } else if (cursor.matchKeyword("freeze")) {
-        freeze.* = true;
-    } else if (cursor.matchKeyword("verbose")) {
-        verbose.* = true;
-    } else if (cursor.matchKeyword("analyze")) {
-        analyze.* = true;
-    } else {
-        return error.UnsupportedSqlShape;
-    }
-}
-
 fn parseOptionalCursorFetchCount(cursor: parser.Cursor) !?i64 {
     if (cursor.peekKeyword("from") or cursor.peekKeyword("in")) return null;
     if (cursor.matchKeyword("all")) return null;
@@ -9308,42 +9201,8 @@ test "sql adapter grammar parses transaction control tails" {
     try std.testing.expectError(error.UnsupportedSqlShape, parseAdvisoryLockTail(fractional_key_tokens.items, &fractional_key_pos));
 }
 
-test "sql adapter grammar parses maintenance job tails" {
+test "sql adapter grammar parses generated-owned maintenance job tails" {
     const alloc = std.testing.allocator;
-
-    var vacuum_tokens = try lexer.tokenizeAlloc(alloc, "(FULL, VERBOSE, ANALYZE) public.usage_records;");
-    defer lexer.freeTokens(alloc, &vacuum_tokens);
-    var vacuum_pos: usize = 0;
-    var vacuum = try parseVacuumMaintenanceTailAlloc(alloc, vacuum_tokens.items, &vacuum_pos);
-    defer vacuum.deinit(alloc);
-    try std.testing.expectEqual(vacuum_tokens.items.len, vacuum_pos);
-    try std.testing.expectEqualStrings("usage_records", vacuum.table_name);
-    try std.testing.expect(vacuum.full);
-    try std.testing.expect(!vacuum.freeze);
-    try std.testing.expect(vacuum.verbose);
-    try std.testing.expect(vacuum.analyze);
-
-    var vacuum_legacy_tokens = try lexer.tokenizeAlloc(alloc, "FULL FREEZE VERBOSE usage_records;");
-    defer lexer.freeTokens(alloc, &vacuum_legacy_tokens);
-    var vacuum_legacy_pos: usize = 0;
-    var vacuum_legacy = try parseVacuumMaintenanceTailAlloc(alloc, vacuum_legacy_tokens.items, &vacuum_legacy_pos);
-    defer vacuum_legacy.deinit(alloc);
-    try std.testing.expectEqual(vacuum_legacy_tokens.items.len, vacuum_legacy_pos);
-    try std.testing.expectEqualStrings("usage_records", vacuum_legacy.table_name);
-    try std.testing.expect(vacuum_legacy.full);
-    try std.testing.expect(vacuum_legacy.freeze);
-    try std.testing.expect(vacuum_legacy.verbose);
-    try std.testing.expect(!vacuum_legacy.analyze);
-
-    var analyze_tokens = try lexer.tokenizeAlloc(alloc, "VERBOSE public.usage_records (status, amount);");
-    defer lexer.freeTokens(alloc, &analyze_tokens);
-    var analyze_pos: usize = 0;
-    var analyze = try parseAnalyzeMaintenanceTailAlloc(alloc, analyze_tokens.items, &analyze_pos);
-    defer analyze.deinit(alloc);
-    try std.testing.expectEqual(analyze_tokens.items.len, analyze_pos);
-    try std.testing.expectEqualStrings("usage_records", analyze.table_name);
-    try std.testing.expect(analyze.verbose);
-    try std.testing.expectEqual(@as(usize, 2), analyze.column_count);
 
     var reindex_tokens = try lexer.tokenizeAlloc(alloc, "INDEX CONCURRENTLY public.usage_status_idx;");
     defer lexer.freeTokens(alloc, &reindex_tokens);
@@ -9365,10 +9224,10 @@ test "sql adapter grammar parses maintenance job tails" {
     try std.testing.expectEqualStrings("usage_status_idx", cluster.index_name.?);
     try std.testing.expect(cluster.verbose);
 
-    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "usage_records (status);");
-    defer lexer.freeTokens(alloc, &unsupported_tokens);
-    var unsupported_pos: usize = 0;
-    try std.testing.expectError(error.UnsupportedSqlShape, parseVacuumMaintenanceTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
+    var unsupported_cluster_tokens = try lexer.tokenizeAlloc(alloc, "public.usage_records (status);");
+    defer lexer.freeTokens(alloc, &unsupported_cluster_tokens);
+    var unsupported_cluster_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseClusterMaintenanceTailAlloc(alloc, unsupported_cluster_tokens.items, &unsupported_cluster_pos));
 }
 
 test "sql adapter grammar parses database and tablespace catalog tails" {

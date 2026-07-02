@@ -14513,6 +14513,103 @@ test "index manager algebraic schema reload marks changed json subdocument domai
     try std.testing.expect(std.mem.indexOf(u8, manager.algebraic_indexes.items[0].config.config_json, "\"capability_lifecycle_status\":\"rebuild_required\"") == null);
 }
 
+test "index manager embedded json schema rebuild resumes after failure and reopen" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path_z = indexManagerTmpPathWithSuffix(&path_buf, "json-domain-rebuild-resume");
+    defer cleanupIndexManagerDir(path_z);
+
+    const previous_batch_size = test_algebraic_backfill_batch_size;
+    const previous_abort = test_abort_algebraic_backfill_after_batches;
+    defer {
+        test_algebraic_backfill_batch_size = previous_batch_size;
+        test_abort_algebraic_backfill_after_batches = previous_abort;
+    }
+
+    const schema_v1 =
+        \\{"version":11,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"old_field":{"type":"keyword"},"new_field":{"type":"keyword"}},"additionalProperties":true}}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const schema_v2 =
+        \\{"version":12,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"new_field":{"type":"keyword"}},"additionalProperties":true}}},"required":["id"],"additionalProperties":false}}}}
+    ;
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    {
+        var manager = try IndexManager.init(alloc, std.mem.span(path_z));
+        defer manager.deinit();
+        manager.setRelationalBaseRows(true);
+
+        try saveRuntimeSchemaJsonForIndexManagerTest(alloc, &store, schema_v1);
+        var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_v1);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+
+        const config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "rows", schema_v1);
+        defer alloc.free(config_json);
+        try manager.add(&store, .{
+            .name = "alg",
+            .kind = .algebraic,
+            .config_json = config_json,
+        });
+
+        const docs = [_]struct { key: []const u8, value: []const u8 }{
+            .{ .key = "row:1", .value = "{\"id\":\"1\",\"attrs\":{\"old_field\":\"legacy1\",\"new_field\":\"fresh1\"}}" },
+            .{ .key = "row:2", .value = "{\"id\":\"2\",\"attrs\":{\"old_field\":\"legacy2\",\"new_field\":\"fresh2\"}}" },
+        };
+        for (docs) |doc| {
+            const stored_key = try relational_store_mod.rowKeyAlloc(alloc, doc.key);
+            defer alloc.free(stored_key);
+            const packed_row = try mapper.buildRelationalRowValueAlloc(alloc, doc.value, runtime_schema.relational_columns);
+            defer alloc.free(packed_row);
+            try store.put(stored_key, packed_row);
+        }
+        try manager.applyAlgebraicBatchByNameWithOptions(&store, "alg", .{
+            .documents = &.{
+                .{ .key = docs[0].key, .cleaned_value = docs[0].value },
+                .{ .key = docs[1].key, .cleaned_value = docs[1].value },
+            },
+        }, .{ .mode = .bulk_ingest });
+        try std.testing.expectEqual(@as(usize, 2), try countDocFactScalarKeysContaining(alloc, &store, "old_field"));
+
+        try saveRuntimeSchemaJsonForIndexManagerTest(alloc, &store, schema_v2);
+        test_algebraic_backfill_batch_size = 1;
+        test_abort_algebraic_backfill_after_batches = 1;
+        try std.testing.expectError(error.TestInjectedBackfillFailure, manager.reloadAlgebraicSchemaConfigs(&store, schema_v2));
+
+        const rebuild_state = backfill_state_mod.RebuildState.init(manager.algebraic_indexes.items[0].rebuild_root_path);
+        const resume_key = try rebuild_state.check(alloc);
+        defer if (resume_key) |key| alloc.free(key);
+        try std.testing.expect(resume_key != null);
+        try std.testing.expectEqual(@as(usize, 1), try countDocFactScalarKeysContaining(alloc, &store, "new_field"));
+    }
+
+    test_abort_algebraic_backfill_after_batches = null;
+    {
+        var reopened = try IndexManager.init(alloc, std.mem.span(path_z));
+        defer reopened.deinit();
+        reopened.setRelationalBaseRows(true);
+        try reopened.load(&store);
+
+        const reloaded = reopened.algebraic_indexes.items[0].index.config();
+        try std.testing.expectEqualStrings("current", reloaded.capability_lifecycle_status);
+        try std.testing.expectEqual(@as(usize, 1), reloaded.json_subdocument_domains.len);
+        try std.testing.expectEqualStrings("attrs", reloaded.json_subdocument_domains[0].path);
+        try std.testing.expectEqualStrings("current", reloaded.json_subdocument_domains[0].lifecycle_status);
+        try std.testing.expectEqual(@as(usize, 0), try countDocFactScalarKeysContaining(alloc, &store, "old_field"));
+        try std.testing.expectEqual(@as(usize, 2), try countDocFactScalarKeysContaining(alloc, &store, "new_field"));
+
+        const rebuild_state = backfill_state_mod.RebuildState.init(reopened.algebraic_indexes.items[0].rebuild_root_path);
+        const cleared_resume_key = try rebuild_state.check(alloc);
+        defer if (cleared_resume_key) |key| alloc.free(key);
+        try std.testing.expect(cleared_resume_key == null);
+        try std.testing.expect(std.mem.indexOf(u8, reopened.algebraic_indexes.items[0].config.config_json, "\"lifecycle_status\":\"rebuild_required\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, reopened.algebraic_indexes.items[0].config.config_json, "\"capability_lifecycle_status\":\"rebuild_required\"") == null);
+    }
+}
+
 test "index manager algebraic schema reload rebuilds stale persisted rows" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;

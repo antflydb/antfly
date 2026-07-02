@@ -788,6 +788,159 @@ test "local mutation source staged claims recover after reopen before commit" {
     try std.testing.expect(std.mem.indexOf(u8, final_row.json, "\"status\":\"stale\"") == null);
 }
 
+test "typed row batch conflict update enforces committed versions with defaults generated columns and sequence values" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/typed-conflict-update-version-gate", .{tmp.sub_path});
+    defer alloc.free(path);
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"numeric","x-antfly-default":{"op":"sequence_next","sequence":"usage_id_seq","database":"tenant","schema":"billing"}},"email":{"type":"keyword"},"email_key":{"type":"keyword","generated":{"op":"lower","field":"email"}},"status":{"type":"keyword","default":"pending"},"status_key":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"status"}]}}},"next_status":{"type":"keyword"},"amount":{"type":"numeric","default":2},"proposal_id":{"type":"keyword"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"usage_records_email_key","columns":["email"]}]}
+    ;
+    const schema = try parseTestRuntimeSchema(alloc, schema_json);
+    defer storage_schema.freeSchema(alloc, schema);
+    try db.setSchema(schema);
+
+    const existing_json =
+        "{\"id\":100,\"email\":\"a@example.test\",\"status\":\"old\",\"next_status\":null,\"amount\":5,\"email_key\":\"a@example.test\",\"status_key\":\"old\"}";
+    const existing_key = try relational_rows_api.physicalPrimaryKeyFromRowJsonAlloc(alloc, schema, existing_json);
+    defer alloc.free(existing_key);
+    try db.batch(.{
+        .writes = &.{.{ .key = existing_key, .value = existing_json }},
+        .timestamp_ns = 1_000,
+    });
+
+    const Resolver = struct {
+        db: *db_mod.DB,
+        existing_key: []const u8,
+        next_sequence: i64 = 101,
+
+        fn unique(self: *@This()) relational_rows_api.UniqueSelectorResolver {
+            return .{
+                .ptr = self,
+                .resolve = resolveUnique,
+                .lookup_primary = lookupPrimary,
+            };
+        }
+
+        fn defaults(self: *@This()) relational_rows_api.DefaultValueContext {
+            return .{ .sequence_resolver = .{
+                .ptr = self,
+                .next_value_json_alloc = nextValueJsonAlloc,
+            } };
+        }
+
+        fn resolveUnique(
+            ptr: *anyopaque,
+            alloc_inner: std.mem.Allocator,
+            table_name: []const u8,
+            constraint_name: []const u8,
+            encoded_value: []const u8,
+        ) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("usage_records", table_name);
+            try std.testing.expectEqualStrings("usage_records_email_key", constraint_name);
+            try std.testing.expect(encoded_value.len > 0);
+            return try alloc_inner.dupe(u8, self.existing_key);
+        }
+
+        fn lookupPrimary(
+            ptr: *anyopaque,
+            alloc_inner: std.mem.Allocator,
+            table_name: []const u8,
+            physical_key: []const u8,
+        ) !?relational_rows_api.ResolvedPrimaryRow {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("usage_records", table_name);
+            try std.testing.expectEqualStrings(self.existing_key, physical_key);
+            var found = (try self.db.lookup(alloc_inner, physical_key, .{})) orelse return null;
+            defer found.deinit(alloc_inner);
+            return .{
+                .json = try alloc_inner.dupe(u8, found.json),
+                .version = try self.db.getTimestamp(alloc_inner, physical_key),
+            };
+        }
+
+        fn nextValueJsonAlloc(
+            ptr: *anyopaque,
+            alloc_inner: std.mem.Allocator,
+            request: relational_rows_api.SequenceDefaultRequest,
+        ) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("tenant", request.database);
+            try std.testing.expectEqualStrings("billing", request.schema);
+            try std.testing.expectEqualStrings("usage_id_seq", request.sequence);
+            const value = self.next_sequence;
+            self.next_sequence += 1;
+            return try std.fmt.allocPrint(alloc_inner, "{d}", .{value});
+        }
+    };
+
+    var resolver = Resolver{ .db = &db, .existing_key = existing_key };
+    var conflict = try relational_rows_api.parseRowsBatchRequestWithResolverAndDefaultContext(
+        alloc,
+        "usage_records",
+        "{\"operations\":[{\"op\":\"insert\",\"row\":{\"email\":\"a@example.test\",\"next_status\":\"READY\"},\"on_conflict\":{\"target\":{\"unique\":{\"name\":\"usage_records_email_key\"}},\"action\":\"update\",\"patch_expr\":{\"status\":{\"field\":\"next_status\",\"source\":\"proposed\"},\"proposal_id\":{\"op\":\"concat\",\"args\":[{\"value\":\"seq:\"},{\"field\":\"id\",\"source\":\"proposed\"}]}},\"increment_expr\":{\"amount\":{\"field\":\"amount\",\"source\":\"proposed\"}},\"where_expressions\":[{\"lhs\":{\"field\":\"status\",\"source\":\"existing\"},\"op\":\"eq\",\"rhs\":{\"value\":\"old\"}},{\"lhs\":{\"field\":\"id\",\"source\":\"proposed\"},\"op\":\"is_not_null\"}]},\"returning\":[\"id\",\"email\",\"status\",\"status_key\",\"amount\",\"proposal_id\"]}]}",
+        schema,
+        resolver.unique(),
+        resolver.defaults(),
+    );
+    defer conflict.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), conflict.req.writes.len);
+    try std.testing.expectEqual(@as(usize, 1), conflict.req.transforms.len);
+    try std.testing.expectEqual(@as(usize, 1), conflict.req.predicates.len);
+    try std.testing.expectEqual(@as(u64, 1_000), conflict.req.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":100,\"email\":\"a@example.test\",\"status\":\"READY\",\"status_key\":\"ready\",\"amount\":7,\"proposal_id\":\"seq:101\"}", conflict.returning_rows[0]);
+
+    conflict.req.timestamp_ns = 2_000;
+    try db.batch(conflict.req);
+    var committed = (try db.lookup(alloc, existing_key, .{})) orelse return error.TestUnexpectedResult;
+    defer committed.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, committed.json, "\"status\":\"READY\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, committed.json, "\"status_key\":\"ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, committed.json, "\"amount\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, committed.json, "\"proposal_id\":\"seq:101\"") != null);
+
+    var stale = try relational_rows_api.parseRowsBatchRequestWithResolverAndDefaultContext(
+        alloc,
+        "usage_records",
+        "{\"operations\":[{\"op\":\"insert\",\"row\":{\"email\":\"a@example.test\",\"next_status\":\"STALE\"},\"on_conflict\":{\"target\":{\"unique\":{\"name\":\"usage_records_email_key\"}},\"action\":\"update\",\"patch_expr\":{\"status\":{\"field\":\"next_status\",\"source\":\"proposed\"},\"proposal_id\":{\"op\":\"concat\",\"args\":[{\"value\":\"seq:\"},{\"field\":\"id\",\"source\":\"proposed\"}]}},\"increment_expr\":{\"amount\":{\"field\":\"amount\",\"source\":\"proposed\"}},\"where_expression\":{\"lhs\":{\"field\":\"status\",\"source\":\"existing\"},\"op\":\"eq\",\"rhs\":{\"value\":\"READY\"}}},\"returning\":[\"id\",\"status\",\"amount\",\"proposal_id\"]}]}",
+        schema,
+        resolver.unique(),
+        resolver.defaults(),
+    );
+    defer stale.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2_000), stale.req.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":100,\"status\":\"STALE\",\"amount\":9,\"proposal_id\":\"seq:102\"}", stale.returning_rows[0]);
+
+    try db.batch(.{
+        .transforms = &.{.{ .key = existing_key, .operations = &.{.{
+            .op = .set,
+            .path = "status",
+            .value_json = "\"fresh\"",
+        }} }},
+        .timestamp_ns = 2_500,
+    });
+    stale.req.timestamp_ns = 3_000;
+    try std.testing.expectError(error.VersionConflict, db.batch(stale.req));
+
+    var final_row = (try db.lookup(alloc, existing_key, .{})) orelse return error.TestUnexpectedResult;
+    defer final_row.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, final_row.json, "\"status\":\"fresh\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_row.json, "\"proposal_id\":\"seq:102\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, final_row.json, "\"amount\":9") == null);
+}
+
 test "bound table write source stages joined mutation from materialized source rows" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

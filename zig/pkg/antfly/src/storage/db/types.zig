@@ -1065,7 +1065,14 @@ pub const RelationalRowsSubqueryPredicate = struct {
     quantifier: ?RelationalRowsSubqueryQuantifier = null,
     query: RelationalRowsQueryRequest = .{},
     output_field: []const u8 = "",
+    correlations: []const RelationalRowsLateralCorrelation = &.{},
     collation: ?[]const u8 = null,
+};
+
+pub const RelationalRowsScalarSubqueryProjection = struct {
+    output: []const u8,
+    query: RelationalRowsQueryRequest = .{},
+    output_field: []const u8 = "",
 };
 
 pub const RelationalRowsJsonContainsPredicate = struct {
@@ -1159,7 +1166,19 @@ fn freeRelationalRowsSubqueryPredicate(alloc: Allocator, predicate: RelationalRo
     var query = predicate.query;
     query.deinit(alloc);
     if (predicate.output_field.len > 0) alloc.free(predicate.output_field);
+    for (predicate.correlations) |correlation| {
+        alloc.free(correlation.left_field);
+        alloc.free(correlation.right_field);
+    }
+    if (predicate.correlations.len > 0) alloc.free(predicate.correlations);
     if (predicate.collation) |collation| alloc.free(collation);
+}
+
+fn freeRelationalRowsScalarSubqueryProjection(alloc: Allocator, projection: RelationalRowsScalarSubqueryProjection) void {
+    alloc.free(projection.output);
+    var query = projection.query;
+    query.deinit(alloc);
+    if (projection.output_field.len > 0) alloc.free(projection.output_field);
 }
 
 fn freeRelationalRowsQueryOrder(alloc: Allocator, order: RelationalRowsQueryOrder) void {
@@ -1275,6 +1294,7 @@ pub const RelationalRowsQueryRequest = struct {
     coalesce: []const RelationalRowsCoalesceProjection = &.{},
     field_aliases: []const RelationalRowsFieldAliasProjection = &.{},
     expressions: []const RelationalRowsExpressionProjection = &.{},
+    scalar_subqueries: []const RelationalRowsScalarSubqueryProjection = &.{},
     select_all: bool = true,
     distinct_on: []const []const u8 = &.{},
     distinct_on_expressions: []const RelationalRowsExpression = &.{},
@@ -1399,6 +1419,8 @@ pub const RelationalRowsQueryRequest = struct {
             freeRelationalRowsExpression(alloc, projection.expression);
         }
         if (self.expressions.len > 0) alloc.free(self.expressions);
+        for (self.scalar_subqueries) |projection| freeRelationalRowsScalarSubqueryProjection(alloc, projection);
+        if (self.scalar_subqueries.len > 0) alloc.free(self.scalar_subqueries);
         for (self.distinct_on_expressions) |expression| freeRelationalRowsExpression(alloc, expression);
         if (self.distinct_on_expressions.len > 0) alloc.free(self.distinct_on_expressions);
         freeRelationalRowsQueryOrders(alloc, self.order_by);
@@ -2303,6 +2325,177 @@ pub const RelationalRowsAggregateRequest = struct {
     }
 };
 
+pub const RelationalRowsAggregatePushdownCapability = enum {
+    direct_field_pushdown_safe,
+    local_expression_evaluation_required,
+};
+
+fn relationalRowsQueryOrdersRequireLocalExpressionEvaluation(order_by: []const RelationalRowsQueryOrder) bool {
+    for (order_by) |order| {
+        if (order.expression != null) return true;
+    }
+    return false;
+}
+
+pub fn relationalRowsQueryRequiresLocalExpressionEvaluation(req: RelationalRowsQueryRequest) bool {
+    return req.expression_predicates.len > 0 or
+        req.expression_or_predicates.len > 0 or
+        req.expression_not_predicates.len > 0 or
+        req.expression_array_contains.len > 0 or
+        req.expressions.len > 0 or
+        req.scalar_subqueries.len > 0 or
+        req.distinct_on_expressions.len > 0 or
+        relationalRowsQueryOrdersRequireLocalExpressionEvaluation(req.order_by);
+}
+
+pub fn relationalRowsAggregatePushdownCapability(req: RelationalRowsAggregateRequest) RelationalRowsAggregatePushdownCapability {
+    if (relationalRowsQueryRequiresLocalExpressionEvaluation(req.source)) return .local_expression_evaluation_required;
+    if (req.group_expressions.len > 0) return .local_expression_evaluation_required;
+    for (req.aggregations) |aggregation| {
+        if (aggregation.expression != null or
+            aggregation.filter_expressions.len > 0 or
+            aggregation.filter_expression_array_contains.len > 0 or
+            aggregation.filter_any.len > 0 or
+            aggregation.filter_not.len > 0 or
+            relationalRowsQueryOrdersRequireLocalExpressionEvaluation(aggregation.array_order_by))
+        {
+            return .local_expression_evaluation_required;
+        }
+    }
+    if (req.having_expressions.len > 0 or
+        req.having_any.len > 0 or
+        req.having_not.len > 0 or
+        relationalRowsQueryOrdersRequireLocalExpressionEvaluation(req.order_by))
+    {
+        return .local_expression_evaluation_required;
+    }
+    return .direct_field_pushdown_safe;
+}
+
+test "relational rows aggregate pushdown capability gates expression evaluation locally" {
+    const direct_aggregations = [_]RelationalRowsAggregateSpec{
+        .{ .name = "row_count", .op = .count },
+        .{ .name = "amount_sum", .op = .sum, .field = "amount" },
+    };
+    const direct_order = [_]RelationalRowsQueryOrder{.{
+        .field = "amount_sum",
+        .direction = .desc,
+    }};
+    try std.testing.expectEqual(
+        RelationalRowsAggregatePushdownCapability.direct_field_pushdown_safe,
+        relationalRowsAggregatePushdownCapability(.{
+            .group_by = &.{"status"},
+            .aggregations = direct_aggregations[0..],
+            .order_by = direct_order[0..],
+        }),
+    );
+
+    const source_expression_projection = [_]RelationalRowsExpressionProjection{.{
+        .output = "net_amount",
+        .expression = .{
+            .kind = .field,
+            .field = "amount",
+        },
+    }};
+    try std.testing.expectEqual(
+        RelationalRowsAggregatePushdownCapability.local_expression_evaluation_required,
+        relationalRowsAggregatePushdownCapability(.{
+            .source = .{
+                .expressions = source_expression_projection[0..],
+                .select_all = false,
+            },
+            .aggregations = direct_aggregations[0..],
+        }),
+    );
+
+    const group_expressions = [_]RelationalRowsExpressionProjection{.{
+        .output = "status_key",
+        .expression = .{
+            .kind = .lower,
+            .operands = &.{.{ .kind = .field, .field = "status" }},
+        },
+    }};
+    try std.testing.expectEqual(
+        RelationalRowsAggregatePushdownCapability.local_expression_evaluation_required,
+        relationalRowsAggregatePushdownCapability(.{
+            .group_expressions = group_expressions[0..],
+            .aggregations = direct_aggregations[0..],
+        }),
+    );
+
+    const aggregate_operands = [_]RelationalRowsExpression{
+        .{ .kind = .field, .field = "amount" },
+        .{ .kind = .field, .field = "discount" },
+    };
+    const expression_aggregations = [_]RelationalRowsAggregateSpec{.{
+        .name = "net_amount",
+        .op = .sum,
+        .expression = .{
+            .kind = .sub,
+            .operands = aggregate_operands[0..],
+        },
+    }};
+    try std.testing.expectEqual(
+        RelationalRowsAggregatePushdownCapability.local_expression_evaluation_required,
+        relationalRowsAggregatePushdownCapability(.{
+            .aggregations = expression_aggregations[0..],
+        }),
+    );
+
+    const filter_rhs = [_]RelationalRowsExpression{.{
+        .kind = .value,
+        .value_json = "\"open\"",
+    }};
+    const filter_expressions = [_]RelationalRowsExpressionCondition{.{
+        .lhs = .{ .kind = .lower, .operands = &.{.{ .kind = .field, .field = "status" }} },
+        .op = .eq,
+        .rhs = filter_rhs[0..],
+    }};
+    const filtered_aggregations = [_]RelationalRowsAggregateSpec{.{
+        .name = "amount_sum",
+        .op = .sum,
+        .field = "amount",
+        .filter_expressions = filter_expressions[0..],
+    }};
+    try std.testing.expectEqual(
+        RelationalRowsAggregatePushdownCapability.local_expression_evaluation_required,
+        relationalRowsAggregatePushdownCapability(.{
+            .aggregations = filtered_aggregations[0..],
+        }),
+    );
+
+    const having_expressions = [_]RelationalRowsExpressionCondition{.{
+        .lhs = .{ .kind = .field, .field = "amount_sum" },
+        .op = .gt,
+        .rhs = &.{.{ .kind = .value, .value_json = "0" }},
+    }};
+    try std.testing.expectEqual(
+        RelationalRowsAggregatePushdownCapability.local_expression_evaluation_required,
+        relationalRowsAggregatePushdownCapability(.{
+            .aggregations = direct_aggregations[0..],
+            .having_expressions = having_expressions[0..],
+        }),
+    );
+
+    const expression_order = [_]RelationalRowsQueryOrder{.{
+        .expression = .{
+            .kind = .sub,
+            .operands = &.{
+                .{ .kind = .field, .field = "amount_sum" },
+                .{ .kind = .field, .field = "row_count" },
+            },
+        },
+        .direction = .desc,
+    }};
+    try std.testing.expectEqual(
+        RelationalRowsAggregatePushdownCapability.local_expression_evaluation_required,
+        relationalRowsAggregatePushdownCapability(.{
+            .aggregations = direct_aggregations[0..],
+            .order_by = expression_order[0..],
+        }),
+    );
+}
+
 pub const RelationalRowsAggregatePlan = struct {
     ctes: []const RelationalRowsCte = &.{},
     ranges: []const RelationalRowsDocKeyRange = &.{},
@@ -2323,12 +2516,25 @@ pub const RelationalRowsAggregatePlan = struct {
 pub const RelationalRowsAggregateResult = struct {
     rows: [][]const u8 = &.{},
     total_groups: u32 = 0,
+    diagnostics: RelationalRowsAggregateDiagnostics = .{},
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.rows) |row| alloc.free(@constCast(row));
         if (self.rows.len > 0) alloc.free(self.rows);
         self.* = undefined;
     }
+};
+
+pub const RelationalRowsAggregateDiagnostics = struct {
+    input_rows: u64 = 0,
+    output_groups: u32 = 0,
+    metric_slots: u64 = 0,
+    estimated_group_memory_bytes: u64 = 0,
+    estimated_metric_memory_bytes: u64 = 0,
+    distinct_spill_writes: u64 = 0,
+    distinct_spill_bytes: u64 = 0,
+    distinct_spill_reload_count: u64 = 0,
+    resource_budget_failures: u64 = 0,
 };
 
 pub const RelationalRowsJoinType = enum {
@@ -2346,9 +2552,28 @@ pub const RelationalRowsJoinStrategy = enum {
 
 pub const default_relational_rows_lookup_join_max_build_rows: usize = 256;
 
+pub const RelationalRowsJoinLookupIndexHint = enum {
+    unknown,
+    available,
+    unavailable,
+};
+
+pub const RelationalRowsJoinSidePlanningHints = struct {
+    estimated_cardinality: ?usize = null,
+};
+
+pub const RelationalRowsJoinPlanningHints = struct {
+    left: RelationalRowsJoinSidePlanningHints = .{},
+    right: RelationalRowsJoinSidePlanningHints = .{},
+    right_lookup_index: RelationalRowsJoinLookupIndexHint = .unknown,
+};
+
 pub const RelationalRowsJoinStrategySelection = struct {
     requested: RelationalRowsJoinStrategy,
     selected: RelationalRowsJoinStrategy,
+    left_rows: usize = 0,
+    right_rows: usize = 0,
+    right_lookup_index: RelationalRowsJoinLookupIndexHint = .unknown,
 };
 
 pub const RelationalRowsJoinOn = struct {
@@ -2387,6 +2612,7 @@ pub const RelationalRowsJoinRequest = struct {
     match_expression_array_contains: []const RelationalRowsExpressionArrayContainsPredicate = &.{},
     join_type: RelationalRowsJoinType = .inner,
     strategy: RelationalRowsJoinStrategy = .auto,
+    planning_hints: RelationalRowsJoinPlanningHints = .{},
     select: []const RelationalRowsJoinProjection = &.{},
     order_by: []const RelationalRowsQueryOrder = &.{},
     limit: ?u32 = null,
@@ -2450,24 +2676,30 @@ pub fn relationalRowsSelectJoinStrategy(
     right_rows: usize,
     inputs_sorted_on_join_keys: bool,
 ) ?RelationalRowsJoinStrategySelection {
+    const effective_left_rows = req.planning_hints.left.estimated_cardinality orelse left_rows;
+    const effective_right_rows = req.planning_hints.right.estimated_cardinality orelse right_rows;
+    const right_lookup_available = req.planning_hints.right_lookup_index != .unavailable;
     if (req.on.len == 0) {
         const selected: RelationalRowsJoinStrategy = switch (req.strategy) {
             .merge => return null,
-            .lookup => .lookup,
+            .lookup => if (right_lookup_available) .lookup else return null,
             .hash, .auto => .hash,
         };
         return .{
             .requested = req.strategy,
             .selected = selected,
+            .left_rows = effective_left_rows,
+            .right_rows = effective_right_rows,
+            .right_lookup_index = req.planning_hints.right_lookup_index,
         };
     }
     const selected: RelationalRowsJoinStrategy = switch (req.strategy) {
-        .lookup => .lookup,
+        .lookup => if (right_lookup_available) .lookup else return null,
         .hash => .hash,
         .merge => if (req.join_type != .full and inputs_sorted_on_join_keys) .merge else return null,
-        .auto => if (req.join_type != .full and inputs_sorted_on_join_keys and left_rows > default_relational_rows_lookup_join_max_build_rows and right_rows > default_relational_rows_lookup_join_max_build_rows)
+        .auto => if (req.join_type != .full and inputs_sorted_on_join_keys and effective_left_rows > default_relational_rows_lookup_join_max_build_rows and effective_right_rows > default_relational_rows_lookup_join_max_build_rows)
             .merge
-        else if (right_rows <= default_relational_rows_lookup_join_max_build_rows)
+        else if (right_lookup_available and effective_right_rows <= default_relational_rows_lookup_join_max_build_rows)
             .lookup
         else
             .hash,
@@ -2475,6 +2707,9 @@ pub fn relationalRowsSelectJoinStrategy(
     return .{
         .requested = req.strategy,
         .selected = selected,
+        .left_rows = effective_left_rows,
+        .right_rows = effective_right_rows,
+        .right_lookup_index = req.planning_hints.right_lookup_index,
     };
 }
 
@@ -2524,6 +2759,26 @@ test "relational rows join strategy selection is explicit and fail closed for un
     const explicit_merge = RelationalRowsJoinRequest{ .on = join_on[0..], .strategy = .merge };
     try std.testing.expect(relationalRowsSelectJoinStrategy(explicit_merge, 1, 1, false) == null);
     try std.testing.expectEqual(RelationalRowsJoinStrategy.merge, relationalRowsSelectJoinStrategy(explicit_merge, 1, 1, true).?.selected);
+
+    const hinted_hash = RelationalRowsJoinRequest{
+        .on = join_on[0..],
+        .planning_hints = .{
+            .left = .{ .estimated_cardinality = 1000 },
+            .right = .{ .estimated_cardinality = 16 },
+            .right_lookup_index = .unavailable,
+        },
+    };
+    const hinted_hash_selection = relationalRowsSelectJoinStrategy(hinted_hash, 1, 1, false).?;
+    try std.testing.expectEqual(RelationalRowsJoinStrategy.hash, hinted_hash_selection.selected);
+    try std.testing.expectEqual(@as(usize, 1000), hinted_hash_selection.left_rows);
+    try std.testing.expectEqual(@as(usize, 16), hinted_hash_selection.right_rows);
+    try std.testing.expectEqual(RelationalRowsJoinLookupIndexHint.unavailable, hinted_hash_selection.right_lookup_index);
+
+    const missing_stats_fallback = RelationalRowsJoinRequest{ .on = join_on[0..] };
+    const fallback_selection = relationalRowsSelectJoinStrategy(missing_stats_fallback, 32, 32, false).?;
+    try std.testing.expectEqual(RelationalRowsJoinStrategy.lookup, fallback_selection.selected);
+    try std.testing.expectEqual(@as(usize, 32), fallback_selection.left_rows);
+    try std.testing.expectEqual(@as(usize, 32), fallback_selection.right_rows);
 }
 
 test "relational rows join sorted input proof requires leading ascending join key order" {

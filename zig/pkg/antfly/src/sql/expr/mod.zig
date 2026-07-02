@@ -15,6 +15,7 @@
 pub const aggregate = @import("aggregate.zig");
 pub const build = @import("build.zig");
 pub const condition = @import("condition.zig");
+pub const contract = @import("contract.zig");
 pub const disjoint = @import("disjoint.zig");
 pub const equal = @import("equal.zig");
 pub const generated = @import("generated.zig");
@@ -37,6 +38,7 @@ pub const window = @import("window.zig");
 test {
     _ = aggregate;
     _ = condition;
+    _ = contract;
     _ = generated_validate;
     _ = order;
     _ = projection;

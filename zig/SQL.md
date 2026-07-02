@@ -387,9 +387,57 @@ fields, observed fields, statistical fields, and index-only paths are read-only.
 The admitted projection subset is `INSERT ... VALUES` over declared fields,
 with either an explicit `_id` column or a generated document id. It materializes
 a JSON document and lowers to the same native document insert request as `_doc`
-inserts. Projection updates, projection source-query inserts, projection
-`ON CONFLICT`, and projection `RETURNING` remain fail-closed until their native
-semantics are separately proven.
+inserts. Projection `INSERT ... VALUES` with an explicit `_id` may use
+`ON CONFLICT (_id) DO NOTHING` or `ON CONFLICT (_id) DO UPDATE SET ...` when
+the update action lowers to native document transform semantics: literal
+declared-field assignments become transform operations, and `excluded.field`
+assignments are materialized from the proposed document after a native lookup
+selects insert, no-op, or version-predicated update behavior. A single
+declared-field conflict target such as `ON CONFLICT (status)` is also admitted
+when that field is a ready indexed scalar projection with unique cardinality
+proof; runtime resolves the conflict row through a bounded native indexed
+lookup and rejects duplicate matches. Guarded `DO UPDATE ... WHERE ...` actions
+and deterministic expression assignments share the relational conflict
+expression lowerer, then execute as native document transforms; a false guard
+produces zero writes and no returned row.
+Direct projection inserts may return `_id`, `_doc`, `_version`, and declared
+projection fields. The admitted projection conflict subset may also return
+`_id`, `_doc`, `_version`, and declared projection fields for inserted and
+updated rows, including aliased JSON projection fields. Conflict update parity
+covers insert-vs-update row counts, nested JSON projection returns, guarded
+apply/skip behavior, expression assignment results, unique-field conflict
+targets, schema validation failure mapping, and stale lookup version conflicts;
+`DO NOTHING` conflicts that do not write return no row. Projection updates,
+producer mutations, joined target/source mutations, and deletes may return
+`_id`, `_doc`, `_version`, and declared projection fields once their target set
+lowers to an admitted native producer. Insert, update, producer, joined, and
+conflict `_version` rows are finalized from the committed document timestamp
+after the write succeeds; delete `_version` rows report the pre-delete document
+timestamp. Transform `RETURNING` rows reflect the post-transform document;
+delete `RETURNING` rows reflect the pre-delete document.
+Projection source-query inserts are admitted for same-table document sources
+when the source producer lowers to an exact `_id` lookup, a ready indexed
+scalar producer, or a bounded residual scan with row and byte caps:
+`INSERT INTO docs (_id, ...) SELECT _id, ... FROM docs WHERE ...` lowers to a
+native document source-insert batch when each assignment is a flat declared
+projection field and no conflict action is present. An optional source `LIMIT`
+caps materialized rows after residual filtering. Source producers reject
+duplicate source ids instead of applying the same target twice. Source-query
+projection inserts may return `_id`, `_doc`, `_version`, and declared
+projection fields for materialized rows; `_version` is finalized from the
+committed document timestamp after the batch write succeeds. Source-query
+projection inserts without an `_id` target allocate target ids through the same
+native generated document id helper used by direct generated-id document
+inserts; runtime sorts materialized source ids before allocating generated
+target ids so allocation order is deterministic for exact, indexed, and bounded
+source producers. Ordered sources, nondeterministic sources, nested target
+paths, `_doc`/`_version` source projection writes, and conflict actions remain
+fail-closed until their native semantics are separately proven. Document
+`MERGE` `RETURNING`, compound or expression conflict targets, partial unique
+targets, and named non-primary constraints also remain fail-closed. Unsupported
+document `RETURNING` shapes report specific stable diagnostics for `*`,
+duplicate output names, expressions, generated fields, and unsupported
+virtual/projection fields.
 
 Projection writes must preserve native document semantics for missing fields,
 JSON null, generated/defaulted fields, nested object construction, array paths,
@@ -397,9 +445,35 @@ type validation, `additionalProperties`, conflict/no-match/stale-version
 reporting, authorization, row filters, audit-required ordering, and write
 conflicts.
 
-All other document-table `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `MERGE`,
-view-target writes, and data-modifying CTE shapes remain fail-closed until they
-have a typed native document request, diagnostics, and SQL/native parity.
+Plain `TRUNCATE docs` is admitted for document tables through the catalog-owned
+table-emptying barrier. It schedules native document range deletion and rejects
+guarded row-filtered identities before a table-emptying job is created. Public
+SQL emits structured audit records for both applied table-emptying scheduling
+and denied guarded truncate attempts.
+Document `TRUNCATE` variants that require catalog expansion or allocator
+mutation remain rejected: multi-table truncate, `CASCADE`, and
+`RESTART IDENTITY`. `RESTART IDENTITY` stays unsupported until the catalog
+barrier and document-id allocator can prove no id reuse across in-flight jobs,
+replication, stale clients, and generated-id namespaces.
+
+Document-table `MERGE` is admitted for bounded document-table producers whose
+branches lower to native document writes. The admitted subset evaluates
+`WHEN MATCHED` and `WHEN NOT MATCHED` branches in SQL order, rejects duplicate
+source join values, materializes matched `UPDATE`, matched `DELETE`, matched
+`DO NOTHING`, not-matched `_id`/`_doc` copy inserts, and not-matched
+`DO NOTHING`, and emits native document batch writes, transforms, and deletes.
+Matched update/delete branches attach lookup-backed target version predicates
+to the native batch, and target/source `_version` branch predicates compare
+against lookup metadata rather than document JSON. Public SQL records
+MERGE-specific audit outcomes for applied rows-batch writes, denied row-filter
+attempts, and failed write conflicts.
+Expression assignments, expression predicates, unsupported projection inserts,
+`RETURNING`, relational/data-modifying source plans, and unbounded producers
+remain fail-closed.
+
+All other document-table `INSERT`, `UPDATE`, `DELETE`, view-target writes, and
+data-modifying CTE shapes remain fail-closed until they have a typed native
+document request, diagnostics, and SQL/native parity.
 
 ## Expressions
 
@@ -408,6 +482,11 @@ Checks, generated columns, partial predicates, expression indexes, conflict
 actions, update transforms, aggregate filters and inputs, `HAVING`, order keys,
 window inputs, `RETURNING`, document residual predicates, and row-rewrite
 `USING` expressions should converge on one typed AST.
+The executable contract is `sql/expr/contract.zig`: it names the durable
+`RelationalRowsExpression` and `RelationalRowsExpressionCondition` types, the
+published text, JSON, array, regex, datetime, numeric, boolean, and
+query-function expression families, and the SQL surfaces that must bind through
+that shared path.
 
 PostgreSQL JSON syntax such as:
 

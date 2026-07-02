@@ -1028,6 +1028,7 @@ pub fn selectListOutputCount(
     coalesce: []const db_mod.types.RelationalRowsCoalesceProjection,
     field_aliases: []const db_mod.types.RelationalRowsFieldAliasProjection,
     expressions: []const db_mod.types.RelationalRowsExpressionProjection,
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
     output: []const u8,
 ) usize {
     var count: usize = 0;
@@ -1049,6 +1050,9 @@ pub fn selectListOutputCount(
     for (expressions) |projection| {
         if (std.mem.eql(u8, projection.output, output)) count += 1;
     }
+    for (scalar_subqueries) |projection| {
+        if (std.mem.eql(u8, projection.output, output)) count += 1;
+    }
     return count;
 }
 
@@ -1061,10 +1065,11 @@ fn selectProjectionOutputCollision(
     coalesce: []const db_mod.types.RelationalRowsCoalesceProjection,
     field_aliases: []const db_mod.types.RelationalRowsFieldAliasProjection,
     expressions: []const db_mod.types.RelationalRowsExpressionProjection,
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
     output: []const u8,
 ) bool {
     if (select_all and binder.relationalColumnForField(schema, output, null) != null) return true;
-    return selectListOutputCount(fields, json_extract, array_length, coalesce, field_aliases, expressions, output) > 0;
+    return selectListOutputCount(fields, json_extract, array_length, coalesce, field_aliases, expressions, scalar_subqueries, output) > 0;
 }
 
 fn allocateDisambiguatedSelectProjectionOutputAlloc(
@@ -1077,15 +1082,16 @@ fn allocateDisambiguatedSelectProjectionOutputAlloc(
     coalesce: []const db_mod.types.RelationalRowsCoalesceProjection,
     field_aliases: []const db_mod.types.RelationalRowsFieldAliasProjection,
     expressions: []const db_mod.types.RelationalRowsExpressionProjection,
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
     output: []const u8,
 ) !?[]const u8 {
     if (!select_all) return null;
-    if (!selectProjectionOutputCollision(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, output)) return null;
+    if (!selectProjectionOutputCollision(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, scalar_subqueries, output)) return null;
 
     var suffix: usize = 2;
     while (true) : (suffix += 1) {
         const candidate = try std.fmt.allocPrint(alloc, "{s}_{d}", .{ output, suffix });
-        if (!selectProjectionOutputCollision(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, candidate)) return candidate;
+        if (!selectProjectionOutputCollision(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, scalar_subqueries, candidate)) return candidate;
         alloc.free(candidate);
     }
 }
@@ -1100,6 +1106,7 @@ pub fn disambiguateSelectProjectionOutputIfNeededAlloc(
     coalesce: []const db_mod.types.RelationalRowsCoalesceProjection,
     field_aliases: []const db_mod.types.RelationalRowsFieldAliasProjection,
     expressions: []const db_mod.types.RelationalRowsExpressionProjection,
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
     output: *[]const u8,
 ) !void {
     const disambiguated = try allocateDisambiguatedSelectProjectionOutputAlloc(
@@ -1112,6 +1119,7 @@ pub fn disambiguateSelectProjectionOutputIfNeededAlloc(
         coalesce,
         field_aliases,
         expressions,
+        scalar_subqueries,
         output.*,
     ) orelse return;
     alloc.free(output.*);
@@ -1127,18 +1135,20 @@ pub fn validateSelectListOutputs(
     coalesce: []const db_mod.types.RelationalRowsCoalesceProjection,
     field_aliases: []const db_mod.types.RelationalRowsFieldAliasProjection,
     expressions: []const db_mod.types.RelationalRowsExpressionProjection,
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
 ) !void {
     if (!select_all) {
         for (fields) |field| {
             if (field.len == 0) return error.UnsupportedSqlShape;
-            if (selectListOutputCount(fields, json_extract, array_length, coalesce, field_aliases, expressions, field) > 1) return error.UnsupportedSqlShape;
+            if (selectListOutputCount(fields, json_extract, array_length, coalesce, field_aliases, expressions, scalar_subqueries, field) > 1) return error.UnsupportedSqlShape;
         }
     }
-    for (json_extract) |projection| try validateSelectProjectionOutput(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, projection.output);
-    for (array_length) |projection| try validateSelectProjectionOutput(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, projection.output);
-    for (coalesce) |projection| try validateSelectProjectionOutput(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, projection.output);
-    for (field_aliases) |projection| try validateSelectProjectionOutput(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, projection.output);
-    for (expressions) |projection| try validateSelectProjectionOutput(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, projection.output);
+    for (json_extract) |projection| try validateSelectProjectionOutput(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, scalar_subqueries, projection.output);
+    for (array_length) |projection| try validateSelectProjectionOutput(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, scalar_subqueries, projection.output);
+    for (coalesce) |projection| try validateSelectProjectionOutput(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, scalar_subqueries, projection.output);
+    for (field_aliases) |projection| try validateSelectProjectionOutput(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, scalar_subqueries, projection.output);
+    for (expressions) |projection| try validateSelectProjectionOutput(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, scalar_subqueries, projection.output);
+    for (scalar_subqueries) |projection| try validateSelectProjectionOutput(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, scalar_subqueries, projection.output);
 }
 
 fn validateSelectProjectionOutput(
@@ -1150,11 +1160,12 @@ fn validateSelectProjectionOutput(
     coalesce: []const db_mod.types.RelationalRowsCoalesceProjection,
     field_aliases: []const db_mod.types.RelationalRowsFieldAliasProjection,
     expressions: []const db_mod.types.RelationalRowsExpressionProjection,
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
     output: []const u8,
 ) !void {
     if (output.len == 0) return error.UnsupportedSqlShape;
     if (select_all and binder.relationalColumnForField(schema, output, null) != null) return error.UnsupportedSqlShape;
-    if (selectListOutputCount(fields, json_extract, array_length, coalesce, field_aliases, expressions, output) > 1) return error.UnsupportedSqlShape;
+    if (selectListOutputCount(fields, json_extract, array_length, coalesce, field_aliases, expressions, scalar_subqueries, output) > 1) return error.UnsupportedSqlShape;
 }
 
 pub fn projectedColumnAlloc(
@@ -1259,6 +1270,7 @@ pub fn loweredSelectOutputColumnsAlloc(
         .coalesce = lowered.query.coalesce,
         .field_aliases = lowered.query.field_aliases,
         .expressions = lowered.query.expressions,
+        .scalar_subqueries = lowered.query.scalar_subqueries,
         .outputs = lowered.select_outputs,
         .select_all = lowered.query.select_all,
     });
@@ -1304,6 +1316,13 @@ fn selectOutputColumnAlloc(
             if (output.index >= select.expressions.len) return error.UnsupportedSqlShape;
             const projection = select.expressions[output.index];
             break :blk try projectedExpressionColumnAlloc(alloc, type_context, projection.output, projection.expression);
+        },
+        .scalar_subquery => blk: {
+            if (output.index >= select.scalar_subqueries.len) return error.UnsupportedSqlShape;
+            const projection = select.scalar_subqueries[output.index];
+            const source = binder.relationalColumnForField(type_context.schema, projection.output_field, null);
+            if (source) |column| break :blk try projectedColumnAlloc(alloc, projection.output, column.field_type, column.array_item_type, true);
+            break :blk try projectedColumnAlloc(alloc, projection.output, .json, null, true);
         },
     };
 }
@@ -1593,6 +1612,7 @@ pub fn selectOutputOrderByRefAlloc(
             if (expression.kind == .field) break :blk try orderForOwnedOutputFieldAlloc(alloc, schema, try alloc.dupe(u8, expression.field));
             break :blk .{ .expression = try cloneExpressionAlloc(alloc, expression) };
         },
+        .scalar_subquery => return error.UnsupportedSqlShape,
     };
 }
 
@@ -1955,6 +1975,11 @@ fn consumeGeneratedProjectionAliasAlloc(
             output_owned = false;
         },
         .field_alias => |*projection| {
+            alloc.free(projection.output);
+            projection.output = output;
+            output_owned = false;
+        },
+        .scalar_subquery => |*projection| {
             alloc.free(projection.output);
             projection.output = output;
             output_owned = false;
@@ -2705,6 +2730,11 @@ pub fn parseSelectListAlloc(
         for (expressions.items) |projection| freeExpressionProjection(alloc, projection);
         expressions.deinit(alloc);
     }
+    var scalar_subqueries = std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection).empty;
+    errdefer {
+        for (scalar_subqueries.items) |projection| plan_mod.freeScalarSubqueryProjection(alloc, projection);
+        scalar_subqueries.deinit(alloc);
+    }
     var field_aliases = std.ArrayListUnmanaged(db_mod.types.RelationalRowsFieldAliasProjection).empty;
     errdefer {
         for (field_aliases.items) |projection| {
@@ -2724,7 +2754,8 @@ pub fn parseSelectListAlloc(
                 array_length.items.len != 0 or
                 coalesce.items.len != 0 or
                 field_aliases.items.len != 0 or
-                expressions.items.len != 0) return error.UnsupportedSqlShape;
+                expressions.items.len != 0 or
+                scalar_subqueries.items.len != 0) return error.UnsupportedSqlShape;
             select_all = true;
             if (parser.matchToken(tokens, pos, .comma) == null) break;
             continue;
@@ -2774,6 +2805,7 @@ pub fn parseSelectListAlloc(
                         coalesce.items,
                         field_aliases.items,
                         expressions.items,
+                        scalar_subqueries.items,
                         &output,
                     );
                     try outputs.append(alloc, .{ .kind = .field_alias, .index = field_aliases.items.len });
@@ -2805,6 +2837,7 @@ pub fn parseSelectListAlloc(
                     coalesce.items,
                     field_aliases.items,
                     expressions.items,
+                    scalar_subqueries.items,
                     &projection.output,
                 );
                 try outputs.append(alloc, .{ .kind = .json_extract, .index = json_extract.items.len });
@@ -2829,6 +2862,7 @@ pub fn parseSelectListAlloc(
                     coalesce.items,
                     field_aliases.items,
                     expressions.items,
+                    scalar_subqueries.items,
                     &projection.output,
                 );
                 try outputs.append(alloc, .{ .kind = .array_length, .index = array_length.items.len });
@@ -2850,6 +2884,7 @@ pub fn parseSelectListAlloc(
                     coalesce.items,
                     field_aliases.items,
                     expressions.items,
+                    scalar_subqueries.items,
                     &projection.output,
                 );
                 const expression_projection = try plan_mod.expressionProjectionFromCoalesceAlloc(alloc, projection);
@@ -2876,6 +2911,7 @@ pub fn parseSelectListAlloc(
                     coalesce.items,
                     field_aliases.items,
                     expressions.items,
+                    scalar_subqueries.items,
                     &projection.output,
                 );
                 try outputs.append(alloc, .{ .kind = .expression, .index = expressions.items.len });
@@ -2900,10 +2936,33 @@ pub fn parseSelectListAlloc(
                     coalesce.items,
                     field_aliases.items,
                     expressions.items,
+                    scalar_subqueries.items,
                     &projection.output,
                 );
                 try outputs.append(alloc, .{ .kind = .field_alias, .index = field_aliases.items.len });
                 try field_aliases.append(alloc, projection);
+                projection_transferred = true;
+            },
+            .scalar_subquery => |projection_value| {
+                item_transferred = true;
+                var projection = projection_value;
+                var projection_transferred = false;
+                errdefer if (!projection_transferred) plan_mod.freeScalarSubqueryProjection(alloc, projection);
+                try disambiguateSelectProjectionOutputIfNeededAlloc(
+                    alloc,
+                    options.output_schema,
+                    select_all,
+                    fields.items,
+                    json_extract.items,
+                    array_length.items,
+                    coalesce.items,
+                    field_aliases.items,
+                    expressions.items,
+                    scalar_subqueries.items,
+                    &projection.output,
+                );
+                try outputs.append(alloc, .{ .kind = .scalar_subquery, .index = scalar_subqueries.items.len });
+                try scalar_subqueries.append(alloc, projection);
                 projection_transferred = true;
             },
         }
@@ -2921,6 +2980,7 @@ pub fn parseSelectListAlloc(
         coalesce.items,
         field_aliases.items,
         expressions.items,
+        scalar_subqueries.items,
     );
 
     const owned_fields = try fields.toOwnedSlice(alloc);
@@ -2941,6 +3001,9 @@ pub fn parseSelectListAlloc(
     const owned_expressions = try expressions.toOwnedSlice(alloc);
     var expressions_transferred = false;
     errdefer if (!expressions_transferred) freeExpressionProjections(alloc, owned_expressions);
+    const owned_scalar_subqueries = try scalar_subqueries.toOwnedSlice(alloc);
+    var scalar_subqueries_transferred = false;
+    errdefer if (!scalar_subqueries_transferred) plan_mod.freeScalarSubqueryProjections(alloc, owned_scalar_subqueries);
     const owned_outputs = try outputs.toOwnedSlice(alloc);
 
     fields_transferred = true;
@@ -2949,6 +3012,7 @@ pub fn parseSelectListAlloc(
     coalesce_transferred = true;
     field_aliases_transferred = true;
     expressions_transferred = true;
+    scalar_subqueries_transferred = true;
     return .{
         .fields = owned_fields,
         .json_extract = owned_json_extract,
@@ -2956,6 +3020,7 @@ pub fn parseSelectListAlloc(
         .coalesce = owned_coalesce,
         .field_aliases = owned_field_aliases,
         .expressions = owned_expressions,
+        .scalar_subqueries = owned_scalar_subqueries,
         .outputs = owned_outputs,
         .select_all = select_all,
     };

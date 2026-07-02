@@ -1161,12 +1161,27 @@ fn expectAppParityWritePlanEntry(
                 defer alloc.free(fingerprint);
                 try expectAppParityPlan(entry.plan, fingerprint);
             },
+            .document_conflict_write => {
+                const fingerprint = try writePlanFingerprintAlloc(alloc, lowered);
+                defer alloc.free(fingerprint);
+                try expectAppParityPlan(entry.plan, fingerprint);
+            },
+            .document_source_insert => {
+                const fingerprint = try writePlanFingerprintAlloc(alloc, lowered);
+                defer alloc.free(fingerprint);
+                try expectAppParityPlan(entry.plan, fingerprint);
+            },
             .document_producer_mutation => {
                 const fingerprint = try writePlanFingerprintAlloc(alloc, lowered);
                 defer alloc.free(fingerprint);
                 try expectAppParityPlan(entry.plan, fingerprint);
             },
             .document_joined_mutation => {
+                const fingerprint = try writePlanFingerprintAlloc(alloc, lowered);
+                defer alloc.free(fingerprint);
+                try expectAppParityPlan(entry.plan, fingerprint);
+            },
+            .document_merge_mutation => {
                 const fingerprint = try writePlanFingerprintAlloc(alloc, lowered);
                 defer alloc.free(fingerprint);
                 try expectAppParityPlan(entry.plan, fingerprint);

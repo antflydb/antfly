@@ -57,6 +57,7 @@ pub fn expectFailClosedUnsupported(result: anytype) !void {
     } else |err| switch (err) {
         error.UnsupportedSqlShape,
         error.InvalidSqlCatalog,
+        error.DocumentSqlMergeRequiresNativeProducer,
         error.DocumentSqlWriteUnsupported,
         error.DocumentSqlBoundedScanIncompleteTopK,
         error.DocumentSqlBoundedScanMissingExactProducer,
@@ -340,6 +341,20 @@ pub fn expectAppParityWriteSummary(summary: corpus.AppParityPlanSummary, lowered
             );
             try expectOptionalUsize(summary.predicates, document_write.batch.predicates.len);
         },
+        .document_conflict_write => |document_conflict| {
+            try expectOptionalTableName(summary.table_name, document_conflict.table_name);
+            try expectOptionalUsize(summary.operations, document_conflict.operations.len);
+            try expectOptionalUsize(summary.source_assignments, document_conflict.source_assignments.len);
+            try expectOptionalUsize(summary.returning, document_conflict.returning_fields.len);
+        },
+        .document_source_insert => |document_source_insert| {
+            try expectOptionalTableName(summary.table_name, document_source_insert.table_name);
+            if (summary.document_source_table) |expected| {
+                try std.testing.expectEqualStrings(expected, document_source_insert.source_table_name);
+            }
+            try expectOptionalUsize(summary.source_assignments, document_source_insert.assignments.len);
+            try expectOptionalUsize(summary.returning, document_source_insert.returning_fields.len);
+        },
         .document_producer_mutation => |document_mutation| {
             try expectOptionalTableName(summary.table_name, document_mutation.table_name);
             const operation_count: usize = switch (document_mutation.template) {
@@ -359,6 +374,10 @@ pub fn expectAppParityWriteSummary(summary: corpus.AppParityPlanSummary, lowered
             try expectOptionalUsize(summary.source_assignments, document_mutation.source_assignments.len);
             try expectOptionalUsize(summary.predicates, if (document_mutation.expected_version != null) 1 else 0);
             try expectOptionalUsize(summary.join_on, document_mutation.join_keys.len);
+        },
+        .document_merge_mutation => |document_merge| {
+            try expectOptionalTableName(summary.table_name, document_merge.table_name);
+            try expectOptionalUsize(summary.join_on, document_merge.join_keys.len);
         },
         .insert_source => |insert_source| {
             try expectOptionalTableName(summary.table_name, insert_source.table_name);

@@ -1801,6 +1801,7 @@ pub const APITestFilters = struct {
         "table emptying worker invalidates stale range job before deleting rows",
         "table emptying worker invalidates malformed affected table metadata before deleting rows",
         "table emptying worker completes restart identity range delete before catalog reset",
+        "table emptying and secondary index rebuild converge across chaos and reopen",
         "table emptying worker pass can select same-name table by table id",
         "api session maintenance repairs table emptying topology jobs and wakes table",
         "schema rewrite worker invalidates stale range job before rewriting rows",

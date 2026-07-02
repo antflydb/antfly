@@ -22080,6 +22080,389 @@ test "api.table_writes.docid provisioned same-table foreign key action job route
     try std.testing.expectEqualStrings("{\"status\":\"open\"}", child);
 }
 
+test "api.table_writes.docid provisioned foreign key action page chaos converges after owner outage and reopen" {
+    const alloc = std.testing.allocator;
+    const replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-fk-action-job-chaos-owner-reopen");
+    defer alloc.free(replica_root_dir);
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root_dir) catch {};
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"customer_id":{"type":"keyword"},"status":{"type":"keyword"}},"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"set_null","validation_state":"enforced"}]}
+    ;
+    const group_one_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(group_one_path);
+    const group_two_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7002);
+    defer alloc.free(group_two_path);
+
+    {
+        var db = try db_mod.DB.open(alloc, group_one_path, .{
+            .identity_namespace = .{
+                .table_id = 42,
+                .shard_id = 7001,
+                .range_id = 7101,
+            },
+        });
+        defer db.close();
+        try db.applyTableSchemaJson(alloc, schema_json, .{});
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "customer:chaos", .value = "{\"_type\":\"customers\"}" },
+                .{ .key = "order:chaos:1", .value = "{\"customer_id\":\"customer:chaos\",\"status\":\"open\"}" },
+                .{ .key = "order:chaos:2", .value = "{\"customer_id\":\"customer:chaos\",\"status\":\"open\"}" },
+            },
+            .sync_level = .write,
+        });
+        _ = try db.repairForeignKeyRefsInRange("", "");
+    }
+    {
+        var db = try db_mod.DB.open(alloc, group_two_path, .{
+            .identity_namespace = .{
+                .table_id = 99,
+                .shard_id = 7002,
+                .range_id = 7199,
+            },
+        });
+        defer db.close();
+    }
+
+    const ChaosCatalog = struct {
+        active_group: u64,
+        fail_active_group: bool,
+        tables: [2]metadata_table_manager.TableRecord,
+        group_one_ranges: [1]metadata_table_manager.RangeRecord,
+        group_two_ranges: [1]metadata_table_manager.RangeRecord,
+        group_one_fk_ranges: [1]metadata_table_manager.ForeignKeyReferenceRangeRecord,
+        group_two_fk_ranges: [1]metadata_table_manager.ForeignKeyReferenceRangeRecord,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail_active_group) return error.RemoteOwnerUnavailable;
+            const ranges = if (self.active_group == 7001) self.group_one_ranges[0..] else self.group_two_ranges[0..];
+            const fk_ranges = if (self.active_group == 7001) self.group_one_fk_ranges[0..] else self.group_two_fk_ranges[0..];
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tables[0..],
+                .ranges = ranges,
+                .foreign_key_ref_ranges = fk_ranges,
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    var catalog = ChaosCatalog{
+        .active_group = 7001,
+        .fail_active_group = false,
+        .tables = .{
+            .{
+                .table_id = 42,
+                .name = "orders",
+                .placement_role = "data",
+                .schema_json = schema_json,
+            },
+            .{
+                .table_id = 43,
+                .name = "customers",
+                .placement_role = "data",
+            },
+        },
+        .group_one_ranges = .{.{
+            .group_id = 7001,
+            .range_id = 7101,
+            .table_id = 42,
+            .start_key = "",
+            .end_key = null,
+        }},
+        .group_two_ranges = .{.{
+            .group_id = 7002,
+            .range_id = 7102,
+            .table_id = 42,
+            .start_key = "",
+            .end_key = null,
+        }},
+        .group_one_fk_ranges = .{.{
+            .child_table_id = 42,
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table_id = 43,
+            .start_parent_key = "",
+            .end_parent_key = null,
+            .group_id = 7001,
+        }},
+        .group_two_fk_ranges = .{.{
+            .child_table_id = 42,
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table_id = 43,
+            .start_parent_key = "",
+            .end_parent_key = null,
+            .group_id = 7002,
+        }},
+    };
+
+    {
+        var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
+        defer source.deinit();
+        catalog.active_group = 7001;
+        var first = (try source.source().foreignKeyActionJobGroupLocal(
+            alloc,
+            7001,
+            "orders",
+            "fk-action:set-null:chaos-owner-reopen",
+            "set_null",
+            "worker:fk-action:first",
+            "orders_customer_id_fkey",
+            "customers",
+            "customer:chaos",
+            null,
+            1,
+            1,
+            0,
+            64,
+        )) orelse return error.TestUnexpectedResult;
+        defer first.deinit(alloc);
+        try std.testing.expectEqualStrings("pending", first.status);
+        try std.testing.expectEqual(@as(u64, 1), first.applied_children);
+        catalog.active_group = 7002;
+        catalog.fail_active_group = true;
+        try std.testing.expectError(error.RemoteOwnerUnavailable, source.source().foreignKeyActionJobGroupLocal(
+            alloc,
+            7002,
+            "orders",
+            "fk-action:set-null:chaos-owner-reopen",
+            "set_null",
+            "worker:fk-action:first",
+            "orders_customer_id_fkey",
+            "customers",
+            "customer:chaos",
+            null,
+            1,
+            1,
+            0,
+            64,
+        ));
+        catalog.fail_active_group = false;
+    }
+    {
+        var db = try db_mod.DB.open(alloc, group_one_path, .{ .start_index_workers = false });
+        defer db.close();
+        const first = (try db.get(alloc, "order:chaos:1")) orelse return error.TestUnexpectedResult;
+        defer alloc.free(first);
+        const second = (try db.get(alloc, "order:chaos:2")) orelse return error.TestUnexpectedResult;
+        defer alloc.free(second);
+        try std.testing.expectEqualStrings("{\"status\":\"open\"}", first);
+        try std.testing.expectEqualStrings("{\"customer_id\":\"customer:chaos\",\"status\":\"open\"}", second);
+
+        const pending = (try db.loadForeignKeyActionJobRecord("fk-action:set-null:chaos-owner-reopen")) orelse return error.TestUnexpectedResult;
+        defer db.freeForeignKeyActionJobRecord(pending);
+        try std.testing.expectEqualStrings("pending", pending.status);
+        try std.testing.expectEqualStrings("worker:fk-action:first", pending.worker_id);
+        try std.testing.expectEqual(@as(u64, 1), pending.applied_children);
+        try std.testing.expect(pending.next_child_key != null);
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "customer:chaos", .value = "{\"_type\":\"customers\",\"status\":\"parent-updated-during-action\"}" },
+                .{ .key = "order:chaos:3", .value = "{\"customer_id\":\"customer:chaos\",\"status\":\"late\"}" },
+            },
+            .sync_level = .write,
+        });
+    }
+
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), group_two_path) catch {};
+    {
+        var db = try db_mod.DB.open(alloc, group_two_path, .{
+            .identity_namespace = .{
+                .table_id = 42,
+                .shard_id = 7002,
+                .range_id = 7102,
+            },
+        });
+        defer db.close();
+        try db.applyTableSchemaJson(alloc, schema_json, .{});
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "customer:chaos", .value = "{\"_type\":\"customers\"}" },
+                .{ .key = "order:remote:1", .value = "{\"customer_id\":\"customer:chaos\",\"status\":\"remote\"}" },
+            },
+            .sync_level = .write,
+        });
+        _ = try db.repairForeignKeyRefsInRange("", "");
+    }
+
+    {
+        var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
+        defer source.deinit();
+        catalog.active_group = 7001;
+        var resumed_group_one = (try source.source().foreignKeyActionJobGroupLocal(
+            alloc,
+            7001,
+            "orders",
+            "fk-action:set-null:chaos-owner-reopen",
+            "set_null",
+            "worker:fk-action:handoff",
+            "orders_customer_id_fkey",
+            "customers",
+            "customer:chaos",
+            null,
+            1,
+            1,
+            0,
+            64,
+        )) orelse return error.TestUnexpectedResult;
+        defer resumed_group_one.deinit(alloc);
+        catalog.active_group = 7002;
+        var resumed_group_two = (try source.source().foreignKeyActionJobGroupLocal(
+            alloc,
+            7002,
+            "orders",
+            "fk-action:set-null:chaos-owner-reopen",
+            "set_null",
+            "worker:fk-action:handoff",
+            "orders_customer_id_fkey",
+            "customers",
+            "customer:chaos",
+            null,
+            1,
+            1,
+            0,
+            64,
+        )) orelse return error.TestUnexpectedResult;
+        defer resumed_group_two.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 7001), resumed_group_one.group_id);
+        try std.testing.expectEqualStrings("pending", resumed_group_one.status);
+        try std.testing.expectEqualStrings("worker:fk-action:handoff", resumed_group_one.worker_id);
+        try std.testing.expectEqual(@as(u64, 2), resumed_group_one.applied_children);
+        try std.testing.expectEqual(@as(u64, 7002), resumed_group_two.group_id);
+        try std.testing.expectEqualStrings("complete", resumed_group_two.status);
+        try std.testing.expectEqual(@as(u64, 1), resumed_group_two.applied_children);
+    }
+    {
+        var db = try db_mod.DB.open(alloc, group_one_path, .{ .start_index_workers = false });
+        defer db.close();
+        const second = (try db.get(alloc, "order:chaos:2")) orelse return error.TestUnexpectedResult;
+        defer alloc.free(second);
+        const late = (try db.get(alloc, "order:chaos:3")) orelse return error.TestUnexpectedResult;
+        defer alloc.free(late);
+        try std.testing.expectEqualStrings("{\"status\":\"open\"}", second);
+        try std.testing.expectEqualStrings("{\"customer_id\":\"customer:chaos\",\"status\":\"late\"}", late);
+    }
+
+    {
+        var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
+        defer source.deinit();
+        catalog.active_group = 7001;
+        var completed_group_one = (try source.source().foreignKeyActionJobGroupLocal(
+            alloc,
+            7001,
+            "orders",
+            "fk-action:set-null:chaos-owner-reopen",
+            "set_null",
+            "worker:fk-action:reopen",
+            "orders_customer_id_fkey",
+            "customers",
+            "customer:chaos",
+            null,
+            8,
+            1,
+            0,
+            64,
+        )) orelse return error.TestUnexpectedResult;
+        defer completed_group_one.deinit(alloc);
+        catalog.active_group = 7002;
+        var completed_group_two = (try source.source().foreignKeyActionJobGroupLocal(
+            alloc,
+            7002,
+            "orders",
+            "fk-action:set-null:chaos-owner-reopen",
+            "set_null",
+            "worker:fk-action:reopen",
+            "orders_customer_id_fkey",
+            "customers",
+            "customer:chaos",
+            null,
+            8,
+            1,
+            0,
+            64,
+        )) orelse return error.TestUnexpectedResult;
+        defer completed_group_two.deinit(alloc);
+        try std.testing.expectEqualStrings("complete", completed_group_one.status);
+        try std.testing.expect(completed_group_one.completed);
+        try std.testing.expectEqual(@as(u64, 3), completed_group_one.applied_children);
+        try std.testing.expectEqualStrings("complete", completed_group_two.status);
+        try std.testing.expectEqual(@as(u64, 1), completed_group_two.applied_children);
+
+        catalog.active_group = 7001;
+        var duplicate_group_one = (try source.source().foreignKeyActionJobGroupLocal(
+            alloc,
+            7001,
+            "orders",
+            "fk-action:set-null:chaos-owner-reopen",
+            "set_null",
+            "worker:fk-action:duplicate",
+            "orders_customer_id_fkey",
+            "customers",
+            "customer:chaos",
+            null,
+            8,
+            1,
+            0,
+            64,
+        )) orelse return error.TestUnexpectedResult;
+        defer duplicate_group_one.deinit(alloc);
+        catalog.active_group = 7002;
+        var duplicate_group_two = (try source.source().foreignKeyActionJobGroupLocal(
+            alloc,
+            7002,
+            "orders",
+            "fk-action:set-null:chaos-owner-reopen",
+            "set_null",
+            "worker:fk-action:duplicate",
+            "orders_customer_id_fkey",
+            "customers",
+            "customer:chaos",
+            null,
+            8,
+            1,
+            0,
+            64,
+        )) orelse return error.TestUnexpectedResult;
+        defer duplicate_group_two.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 3), duplicate_group_one.applied_children);
+        try std.testing.expectEqual(@as(u64, 1), duplicate_group_two.applied_children);
+        try std.testing.expectEqualStrings("worker:fk-action:reopen", duplicate_group_one.worker_id);
+    }
+    {
+        var db = try db_mod.DB.open(alloc, group_one_path, .{ .start_index_workers = false });
+        defer db.close();
+        const late = (try db.get(alloc, "order:chaos:3")) orelse return error.TestUnexpectedResult;
+        defer alloc.free(late);
+        try std.testing.expectEqualStrings("{\"status\":\"late\"}", late);
+    }
+    {
+        var db = try db_mod.DB.open(alloc, group_two_path, .{ .start_index_workers = false });
+        defer db.close();
+        const remote = (try db.get(alloc, "order:remote:1")) orelse return error.TestUnexpectedResult;
+        defer alloc.free(remote);
+        try std.testing.expectEqualStrings("{\"status\":\"remote\"}", remote);
+    }
+}
+
 test "managed startup catch-up uses provided indexes json without catalog fetch" {
     const alloc = std.testing.allocator;
 

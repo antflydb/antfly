@@ -2903,6 +2903,7 @@ pub fn insertSourceExpressionFromSelectOutputAlloc(
             if (output.index >= source_query.expressions.len) return error.UnsupportedSqlShape;
             break :blk try cloneExpressionAlloc(alloc, source_query.expressions[output.index].expression);
         },
+        .scalar_subquery => return error.UnsupportedSqlShape,
     };
     errdefer freeExpression(alloc, expression);
     plan_mod.rewriteExpressionFieldsToSource(&expression);
@@ -2916,12 +2917,14 @@ pub fn clearInsertSourceQueryProjection(alloc: std.mem.Allocator, query: *db_mod
     freeCoalesceProjections(alloc, query.coalesce);
     freeFieldAliasProjections(alloc, query.field_aliases);
     freeExpressionProjections(alloc, query.expressions);
+    plan_mod.freeScalarSubqueryProjections(alloc, query.scalar_subqueries);
     query.select = &.{};
     query.json_extract = &.{};
     query.array_length = &.{};
     query.coalesce = &.{};
     query.field_aliases = &.{};
     query.expressions = &.{};
+    query.scalar_subqueries = &.{};
     query.select_all = true;
 }
 
@@ -4799,7 +4802,7 @@ fn notePrimaryKeyAssignment(
     field: []const u8,
     policy: PrimaryKeyAssignmentPolicy,
 ) !void {
-    const primary_key = schema.primary_key orelse return error.InvalidSqlCatalog;
+    const primary_key = schema.primary_key orelse return;
     if (!binder.primaryKeyContains(primary_key, field)) return;
     switch (policy) {
         .none => {},
@@ -5631,15 +5634,17 @@ pub fn parseMergeArmPredicateAlloc(
     defer plan_mod.freeQualifiedField(alloc, lhs);
     const lhs_is_target = grammar.rowClaimTargetAllowed(alloc, lhs.qualifier, &.{ target_table.name, target_table.alias });
     const lhs_is_source = grammar.rowClaimTargetAllowed(alloc, lhs.qualifier, &.{ source_table.name, source_table.alias });
-    if (lhs_is_target == lhs_is_source) return error.UnsupportedSqlShape;
+    if (!lhs_is_target and !lhs_is_source) return error.UnsupportedSqlShape;
     const side: MergePredicateSide = if (lhs_is_target) .target else .source;
     if (side == .target and !allow_target) return error.UnsupportedSqlShape;
 
     const column = switch (side) {
-        .target => binder.relationalColumnForField(schema, lhs.field, null) orelse return error.InvalidSqlCatalog,
+        .target => documentMergePredicateColumnForField(schema, target_table, lhs.field) orelse
+            binder.relationalColumnForField(schema, lhs.field, null) orelse return error.InvalidSqlCatalog,
         .source => blk: {
             const source_schema = joined_source_schema orelse schema;
-            break :blk binder.relationalColumnForField(source_schema, lhs.field, null) orelse return error.InvalidSqlCatalog;
+            break :blk documentMergePredicateColumnForField(source_schema, source_table, lhs.field) orelse
+                binder.relationalColumnForField(source_schema, lhs.field, null) orelse return error.InvalidSqlCatalog;
         },
     };
 
@@ -5694,6 +5699,30 @@ pub fn parseMergeArmPredicateAlloc(
         .field = field,
         .op = op,
         .value_json = value_json,
+    };
+}
+
+fn documentMergePredicateColumnForField(
+    schema: runtime_schema.TableSchema,
+    table: TableAlias,
+    field: []const u8,
+) ?runtime_schema.RelationalColumn {
+    if (schema.storage_mode != .document) return null;
+    if (documentVirtualFieldMatches(field, table, "_version")) {
+        return .{
+            .name = "_version",
+            .path = "_version",
+            .field_type = .numeric,
+            .nullable = false,
+        };
+    }
+    const unqualified = documentProjectionUnqualifiedField(field, table) orelse return null;
+    if (unqualified.len == 0 or unqualified[0] == '_') return null;
+    return .{
+        .name = unqualified,
+        .path = unqualified,
+        .field_type = .keyword,
+        .nullable = true,
     };
 }
 
@@ -8333,10 +8362,11 @@ fn parseGeneratedMergeArmPredicateAlloc(
     if (predicate_tokens.start == 0 or predicate_tokens.start >= predicate_tokens.end or predicate_tokens.end > tokens.len) return error.UnsupportedSqlShape;
     if (pos.* != predicate_tokens.start - 1 or !tokens[pos.*].matchesKeywordTag(.@"and")) return error.UnsupportedSqlShape;
     pos.* = predicate_tokens.start;
-    var options_with_generated = options;
-    options_with_generated.generated_expression_ast = &generated_arm.predicate_expression;
-    options_with_generated.expression_predicates_options.generated_expression_ast = &generated_arm.predicate_expression;
     while (pos.* < predicate_tokens.end) {
+        const generated_predicate_atom = try expr_generated_validate.generatedPredicateExpressionAtStart(tokens, pos.*, &generated_arm.predicate_expression);
+        var options_with_generated = options;
+        options_with_generated.generated_expression_ast = generated_predicate_atom;
+        options_with_generated.expression_predicates_options.generated_expression_ast = generated_predicate_atom;
         try parseMergeArmConditionAlloc(
             alloc,
             tokens[0..predicate_tokens.end],
@@ -11055,6 +11085,8 @@ fn freeSubqueryPredicates(alloc: std.mem.Allocator, values: []const db_mod.types
         var query = value.query;
         query.deinit(alloc);
         if (value.output_field.len > 0) alloc.free(value.output_field);
+        plan_mod.freeLateralCorrelations(alloc, value.correlations);
+        if (value.correlations.len > 0) alloc.free(value.correlations);
         if (value.collation) |collation| alloc.free(collation);
     }
 }
@@ -11278,6 +11310,7 @@ pub fn parseSemiJoinSourceQueryAlloc(
                 options.bare_boolean_hooks,
                 options.expression_alternatives_hooks,
                 options.expression_condition_hooks,
+                &.{},
                 generated_source_where_expression,
             );
         }
@@ -12047,6 +12080,7 @@ pub fn parseMutationSourceQueryTailAlloc(
                 bare_boolean_hooks,
                 expression_alternatives_hooks,
                 expression_condition_hooks,
+                &.{},
                 generated_where_expression,
             );
             if (generated_where_expression) |expression| {
@@ -15553,6 +15587,37 @@ fn expectDocumentSqlWriteCorpusCase(
         try expectOptionalUsizeEqualForDmlTest(expected.writes, document_mutation.batch.writes.len);
         try expectOptionalUsizeEqualForDmlTest(expected.transforms, document_mutation.batch.transforms.len);
         try expectOptionalUsizeEqualForDmlTest(expected.deletes, document_mutation.batch.deletes.len);
+    } else if (std.mem.eql(u8, expected_plan, "document_source_insert")) {
+        const document_insert = switch (lowered) {
+            .document_source_insert => |document_write_plan| document_write_plan,
+            else => return error.TestUnexpectedResult,
+        };
+        try expectOptionalStringEqualForDmlTest(expected.table_name, document_insert.table_name);
+        try expectOptionalStringEqualForDmlTest(expected.source_producer, documentSqlCorpusWriteProducerName(document_insert.source_producer));
+        try expectOptionalUsizeEqualForDmlTest(expected.source_assignments, document_insert.assignments.len);
+        try expectOptionalU32EqualForDmlTest(expected.source_limit, document_insert.source_limit);
+        try expectOptionalUsizeEqualForDmlTest(expected.returning, document_insert.returning_fields.len);
+        try std.testing.expectEqual(expected.generated_target_id, document_insert.target_id_mode == .generated_document_id);
+        switch (document_insert.source_producer) {
+            .id_lookup => {},
+            .indexed_query => |query| {
+                try expectOptionalU32EqualForDmlTest(expected.max_candidate_rows, query.max_candidate_rows);
+                if (expected.filter_query_json) |filter_query_json| {
+                    try std.testing.expectEqualStrings(filter_query_json, query.filter_query_json orelse return error.TestUnexpectedResult);
+                }
+                if (expected.residual_filter_json) |residual_filter_json| {
+                    try std.testing.expectEqualStrings(residual_filter_json, query.residual_filter_json orelse return error.TestUnexpectedResult);
+                }
+                if (expected.no_residual_filter) try std.testing.expect(query.residual_filter_json == null);
+            },
+            .bounded_scan => |scan| {
+                if (expected.max_scan_rows) |max_scan_rows| try std.testing.expectEqual(max_scan_rows, scan.max_rows);
+                try expectOptionalU64EqualForDmlTest(expected.max_scan_bytes, scan.max_bytes);
+                if (expected.residual_filter_json) |residual_filter_json| {
+                    try std.testing.expectEqualStrings(residual_filter_json, scan.residual_filter_json orelse return error.TestUnexpectedResult);
+                }
+            },
+        }
     } else if (std.mem.eql(u8, expected_plan, "document_producer_mutation")) {
         const document_mutation = switch (lowered) {
             .document_producer_mutation => |document_write_plan| document_write_plan,
@@ -15586,6 +15651,7 @@ fn expectDocumentSqlWriteCorpusCase(
                 }
             },
         }
+        try expectOptionalUsizeEqualForDmlTest(expected.returning, document_mutation.returning_fields.len);
     } else if (std.mem.eql(u8, expected_plan, "document_joined_mutation")) {
         const document_mutation = switch (lowered) {
             .document_joined_mutation => |document_write_plan| document_write_plan,
@@ -15603,6 +15669,39 @@ fn expectDocumentSqlWriteCorpusCase(
         }
         try expectOptionalUsizeEqualForDmlTest(expected.join_keys, document_mutation.join_keys.len);
         try expectOptionalUsizeEqualForDmlTest(expected.source_assignments, document_mutation.source_assignments.len);
+        try expectOptionalU32EqualForDmlTest(expected.max_target_rows, document_mutation.max_target_rows);
+        try expectOptionalU32EqualForDmlTest(expected.max_source_rows, document_mutation.max_source_rows);
+        try expectOptionalUsizeEqualForDmlTest(expected.returning, document_mutation.returning_fields.len);
+    } else if (std.mem.eql(u8, expected_plan, "document_conflict_write")) {
+        const conflict_write = switch (lowered) {
+            .document_conflict_write => |document_write_plan| document_write_plan,
+            else => return error.TestUnexpectedResult,
+        };
+        try expectOptionalStringEqualForDmlTest(expected.table_name, conflict_write.table_name);
+        try expectOptionalStringEqualForDmlTest(expected.action, @tagName(conflict_write.action));
+        try expectOptionalUsizeEqualForDmlTest(expected.writes, conflict_write.proposed_writes.len);
+        try expectOptionalUsizeEqualForDmlTest(expected.ops, conflict_write.operations.len);
+        try expectOptionalUsizeEqualForDmlTest(expected.source_assignments, conflict_write.source_assignments.len);
+        try expectOptionalUsizeEqualForDmlTest(expected.expression_assignments, conflict_write.expression_assignments.len);
+        try expectOptionalUsizeEqualForDmlTest(expected.where_expression, if (conflict_write.where_expression == null) 0 else 1);
+        try expectOptionalUsizeEqualForDmlTest(expected.where_expressions, conflict_write.where_expressions.len);
+        try expectOptionalUsizeEqualForDmlTest(expected.where_any, conflict_write.where_any.len);
+        try expectOptionalUsizeEqualForDmlTest(expected.where_not, conflict_write.where_not.len);
+        try expectOptionalUsizeEqualForDmlTest(expected.returning, conflict_write.returning_fields.len);
+    } else if (std.mem.eql(u8, expected_plan, "document_merge_mutation")) {
+        const document_mutation = switch (lowered) {
+            .document_merge_mutation => |document_write_plan| document_write_plan,
+            else => return error.TestUnexpectedResult,
+        };
+        try expectOptionalStringEqualForDmlTest(expected.table_name, document_mutation.table_name);
+        try expectOptionalStringEqualForDmlTest(expected.target_producer, documentSqlCorpusWriteProducerName(document_mutation.target_producer));
+        try expectOptionalStringEqualForDmlTest(expected.source_producer, documentSqlCorpusWriteProducerName(document_mutation.source_producer));
+        try expectOptionalUsizeEqualForDmlTest(expected.join_keys, document_mutation.join_keys.len);
+        try expectOptionalUsizeEqualForDmlTest(expected.matched_arms, document_mutation.matched_arms.len);
+        try expectOptionalUsizeEqualForDmlTest(expected.not_matched_arms, document_mutation.not_matched_arms.len);
+        var source_assignments: usize = 0;
+        for (document_mutation.matched_arms) |arm| source_assignments += arm.source_assignments.len;
+        try expectOptionalUsizeEqualForDmlTest(expected.source_assignments, source_assignments);
         try expectOptionalU32EqualForDmlTest(expected.max_target_rows, document_mutation.max_target_rows);
         try expectOptionalU32EqualForDmlTest(expected.max_source_rows, document_mutation.max_source_rows);
     } else {
@@ -20071,13 +20170,6 @@ fn lowerDocumentWritePlanParsedSqlAlloc(
     if (schema.storage_mode != .document) return error.InvalidSqlCatalog;
     const statement_kind = parsed_sql.writeStatementKindIncludingGeneratedAst() orelse parsed_sql.writeStatementKind() orelse .update;
     const operation = documentWriteOperationForParsedSql(parsed_sql);
-    switch (operation) {
-        .full_document_insert, .generated_id_insert, .exact_id_delete, .non_identity_delete, .document_patch, .projection_write, .truncate_table => {},
-        else => {
-            try document_write.rejectUnadmittedSqlDocumentWrite(operation);
-            unreachable;
-        },
-    }
     var preflight = options.document_preflight orelse document_write.DocumentWritePreflight{
         .surface = .sql_adapter,
         .operation = operation,
@@ -20087,7 +20179,7 @@ fn lowerDocumentWritePlanParsedSqlAlloc(
     preflight.operation = operation;
     try document_write.enforceSqlDocumentWritePreflight(preflight);
     return switch (operation) {
-        .full_document_insert, .generated_id_insert => .{ .document_write = try parseDocumentInsertAlloc(alloc, parsed_sql.items(), schema, params, options.sync_level) },
+        .full_document_insert, .generated_id_insert => try parseDocumentInsertAlloc(alloc, parsed_sql.items(), schema, params, options.sync_level),
         .exact_id_delete => .{ .document_write = try parseExactKeyDocumentDeleteAlloc(alloc, parsed_sql.items(), params, options.sync_level) },
         .non_identity_delete => if (statement_kind == .delete_joined_source)
             try parseDocumentJoinedDeleteAlloc(alloc, parsed_sql.items(), schema, options.joined_source_schema orelse schema, params, options.sync_level)
@@ -20099,7 +20191,7 @@ fn lowerDocumentWritePlanParsedSqlAlloc(
         else
             try parseDocumentProjectionUpdateAlloc(alloc, parsed_sql.items(), schema, params, options.sync_level),
         .truncate_table => .{ .truncate_source = try parseDocumentTruncateAlloc(alloc, parsed_sql.items(), schema, options.row_claim, options.sync_level) },
-        else => unreachable,
+        .merge => .{ .document_merge_mutation = try parseDocumentMergeMutationAlloc(alloc, parsed_sql, schema, options.joined_source_schema orelse schema, params, options.sync_level) },
     };
 }
 
@@ -20322,24 +20414,81 @@ const DocumentProjectionInsertValue = struct {
     value_json: []const u8,
 };
 
-const DocumentReturningFieldKind = enum {
-    identity,
-    document,
-    projection,
-};
+const DocumentReturningField = plan_mod.DocumentWriteReturningField;
 
-const DocumentReturningField = struct {
-    kind: DocumentReturningFieldKind,
-    path: []const u8,
-    output: []const u8,
-};
-
-fn freeDocumentReturningFields(alloc: std.mem.Allocator, fields: []const DocumentReturningField) void {
+fn freeDocumentReturningFields(alloc: std.mem.Allocator, fields: []DocumentReturningField) void {
     for (fields) |field| {
-        if (field.path.len > 0) alloc.free(@constCast(field.path));
-        alloc.free(@constCast(field.output));
+        var owned = field;
+        owned.deinit(alloc);
     }
     if (fields.len > 0) alloc.free(fields);
+}
+
+fn documentReturningItemContinuesExpression(tokens: []const Token, pos: usize) bool {
+    if (pos >= tokens.len) return false;
+    return switch (tokens[pos].kind) {
+        .comma, .semicolon => false,
+        .lparen,
+        .rparen,
+        .lbracket,
+        .rbracket,
+        .colon,
+        .star,
+        .eq,
+        .neq,
+        .gt,
+        .gte,
+        .lt,
+        .lte,
+        .plus,
+        .minus,
+        .slash,
+        .percent,
+        .at_contains,
+        .range_overlap,
+        .pipe_concat,
+        .question,
+        .question_any,
+        .question_all,
+        .arrow_json,
+        .arrow_text,
+        .path_arrow_json,
+        .path_arrow_text,
+        .regex_match,
+        .regex_imatch,
+        .regex_not_match,
+        .regex_not_imatch,
+        .string,
+        .number,
+        .placeholder,
+        => true,
+        .identifier => false,
+    };
+}
+
+fn documentReturningProjectionColumnForUnqualified(
+    schema: runtime_schema.TableSchema,
+    unqualified: []const u8,
+) !runtime_schema.RelationalColumn {
+    if (binder.relationalColumnForField(schema, unqualified, null)) |column| {
+        if (column.generated != null) return error.DocumentSqlWriteReturningGeneratedField;
+        if (column.path.len == 0) return error.DocumentSqlWriteReturningVirtualFieldUnsupported;
+        return column;
+    }
+    const dot = std.mem.indexOfScalar(u8, unqualified, '.') orelse return error.DocumentSqlWriteReturningVirtualFieldUnsupported;
+    if (dot == 0 or dot + 1 >= unqualified.len) return error.DocumentSqlWriteReturningVirtualFieldUnsupported;
+    const root_name = unqualified[0..dot];
+    const root = binder.relationalColumnForField(schema, root_name, null) orelse return error.DocumentSqlWriteReturningVirtualFieldUnsupported;
+    if (root.generated != null) return error.DocumentSqlWriteReturningGeneratedField;
+    if (root.field_type != .json) return error.DocumentSqlWriteReturningVirtualFieldUnsupported;
+    _ = try documentProjectionPathSegmentCount(unqualified);
+    return .{
+        .name = root.name,
+        .path = unqualified,
+        .field_type = .json,
+        .nullable = root.nullable,
+        .indexed = root.indexed,
+    };
 }
 
 fn parseDocumentReturningFieldsAlloc(
@@ -20359,13 +20508,15 @@ fn parseDocumentReturningFieldsAlloc(
     }
 
     while (true) {
-        if (parser.peekKind(tokens, pos.*, .star)) return error.DocumentSqlWriteUnsupported;
+        if (parser.peekKind(tokens, pos.*, .star)) return error.DocumentSqlWriteReturningAllUnsupported;
         const field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
         var field_transferred = false;
         errdefer if (!field_transferred) alloc.free(field);
-        const unqualified = documentProjectionUnqualifiedField(field, target_table) orelse return error.DocumentSqlWriteUnsupported;
+        if (documentReturningItemContinuesExpression(tokens, pos.*)) return error.DocumentSqlWriteReturningExpressionUnsupported;
+        const unqualified = documentProjectionUnqualifiedField(field, target_table) orelse return error.DocumentSqlWriteReturningVirtualFieldUnsupported;
+        if (std.mem.eql(u8, unqualified, "*")) return error.DocumentSqlWriteReturningAllUnsupported;
 
-        var kind: DocumentReturningFieldKind = undefined;
+        var kind: plan_mod.DocumentWriteReturningFieldKind = undefined;
         var path: []const u8 = "";
         var path_transferred = true;
         errdefer if (!path_transferred) alloc.free(@constCast(path));
@@ -20374,9 +20525,9 @@ fn parseDocumentReturningFieldsAlloc(
         } else if (std.ascii.eqlIgnoreCase(unqualified, "_doc")) {
             kind = .document;
         } else if (std.ascii.eqlIgnoreCase(unqualified, "_version")) {
-            return error.DocumentSqlWriteUnsupported;
+            kind = .version;
         } else {
-            const column = try documentProjectionColumnForField(schema, target_table, field);
+            const column = try documentReturningProjectionColumnForUnqualified(schema, unqualified);
             path = try alloc.dupe(u8, column.path);
             path_transferred = false;
             kind = .projection;
@@ -20391,7 +20542,7 @@ fn parseDocumentReturningFieldsAlloc(
         if (alias != null) alias_transferred = true;
 
         for (fields.items) |existing| {
-            if (std.ascii.eqlIgnoreCase(existing.output, output)) return error.DocumentSqlWriteUnsupported;
+            if (std.ascii.eqlIgnoreCase(existing.output, output)) return error.DocumentSqlWriteReturningDuplicateOutput;
         }
         try fields.append(alloc, .{
             .kind = kind,
@@ -20409,6 +20560,174 @@ fn parseDocumentReturningFieldsAlloc(
     return try fields.toOwnedSlice(alloc);
 }
 
+fn parseDocumentSourceInsertSelectFieldAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    source_table: plan_mod.TableAlias,
+) ![]const u8 {
+    const field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    const unqualified = documentProjectionUnqualifiedField(field, source_table) orelse return error.DocumentSqlWriteUnsupported;
+    if (std.mem.indexOfScalar(u8, unqualified, '.') != null) return error.DocumentSqlWriteUnsupported;
+    if (unqualified.ptr == field.ptr and unqualified.len == field.len) {
+        field_transferred = true;
+        return field;
+    }
+    return try alloc.dupe(u8, unqualified);
+}
+
+fn freeDocumentSourceInsertAssignments(
+    alloc: std.mem.Allocator,
+    assignments: []plan_mod.DocumentSourceInsertAssignment,
+) void {
+    for (assignments) |*assignment| assignment.deinit(alloc);
+    if (assignments.len > 0) alloc.free(assignments);
+}
+
+fn parseDocumentSourceProjectionInsertAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    columns: []const []const u8,
+    column_mode: DocumentInsertColumnMode,
+    params: []const sql_value.SqlValue,
+    sync_level: db_mod.types.SyncLevel,
+) !plan_mod.LoweredWritePlan {
+    if (column_mode != .projection_explicit_id and column_mode != .projection_generated_id) return error.DocumentSqlWriteUnsupported;
+    const target_id_mode: plan_mod.DocumentSourceInsertTargetIdMode = if (column_mode == .projection_generated_id) .generated_document_id else .source_identity;
+    try parser.expectKeywordTag(tokens, pos, .select);
+
+    var source_fields = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (source_fields.items) |field| alloc.free(field);
+        source_fields.deinit(alloc);
+    }
+    while (true) {
+        if (parser.peekKeywordTag(tokens, pos.*, .from)) return error.DocumentSqlWriteUnsupported;
+        const field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        try source_fields.append(alloc, field);
+        field_transferred = true;
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+    if (source_fields.items.len != columns.len) return error.DocumentSqlWriteUnsupported;
+
+    try parser.expectKeywordTag(tokens, pos, .from);
+    const source_table = try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
+    errdefer plan_mod.freeTableAlias(alloc, source_table);
+    if (!std.ascii.eqlIgnoreCase(source_table.name, target_table.name)) return error.DocumentSqlWriteUnsupported;
+
+    var assignments = std.ArrayListUnmanaged(plan_mod.DocumentSourceInsertAssignment).empty;
+    errdefer {
+        freeDocumentSourceInsertAssignments(alloc, assignments.items);
+        assignments.deinit(alloc);
+    }
+    var has_identity = false;
+    for (columns, source_fields.items) |target_column, raw_source_field| {
+        var parsed_source_field = try tokenized.ParsedSql.initAlloc(alloc, raw_source_field);
+        defer parsed_source_field.deinit(alloc);
+        var source_pos: usize = 0;
+        const source_field = try parseDocumentSourceInsertSelectFieldAlloc(alloc, parsed_source_field.items(), &source_pos, source_table);
+        var source_field_transferred = false;
+        errdefer if (!source_field_transferred) alloc.free(source_field);
+        if (!parser.atEnd(parsed_source_field.items(), source_pos)) return error.DocumentSqlWriteUnsupported;
+
+        if (documentIdentityFieldMatches(target_column, target_table)) {
+            if (!std.ascii.eqlIgnoreCase(source_field, "_id")) return error.DocumentSqlWriteUnsupported;
+            has_identity = true;
+            try assignments.append(alloc, .{
+                .kind = .identity,
+                .field_type = .keyword,
+            });
+            alloc.free(source_field);
+            source_field_transferred = true;
+            continue;
+        }
+        if (documentVersionFieldMatches(target_column, target_table) or documentDocFieldMatches(target_column, target_table)) return error.DocumentSqlWriteUnsupported;
+        const target_projection = try documentProjectionColumnForField(schema, target_table, target_column);
+        if (target_projection.path.len == 0 or std.mem.indexOfAny(u8, target_projection.path, "./") != null) return error.DocumentSqlWriteUnsupported;
+        const source_projection = try documentProjectionColumnForField(schema, source_table, source_field);
+        if (source_projection.field_type != target_projection.field_type) return error.DocumentSqlWriteUnsupported;
+        if (source_projection.generated != null or target_projection.generated != null) return error.DocumentSqlWriteUnsupported;
+        const target_path = try alloc.dupe(u8, target_projection.path);
+        var target_path_transferred = false;
+        errdefer if (!target_path_transferred) alloc.free(target_path);
+        try assignments.append(alloc, .{
+            .kind = .projection,
+            .target_path = target_path,
+            .source_path = source_field,
+            .field_type = target_projection.field_type,
+        });
+        target_path_transferred = true;
+        source_field_transferred = true;
+    }
+    if (target_id_mode == .source_identity and !has_identity) return error.DocumentSqlWriteUnsupported;
+    if (target_id_mode == .generated_document_id and has_identity) return error.DocumentSqlWriteUnsupported;
+    for (source_fields.items) |field| alloc.free(field);
+    source_fields.deinit(alloc);
+    source_fields = .empty;
+
+    const where_start = pos.*;
+    const statement_end = if (tokens.len > 0 and tokens[tokens.len - 1].kind == .semicolon) tokens.len - 1 else tokens.len;
+    if (!parser.peekKeywordTag(tokens, where_start, .where)) return error.DocumentSqlWriteUnsupported;
+    const returning_index = parser.findTopLevelKeywordTagFromIndex(tokens[0..statement_end], where_start, .returning);
+    const source_end = returning_index orelse statement_end;
+    const order_index = parser.findTopLevelKeywordTagFromIndex(tokens[0..source_end], where_start, .order);
+    if (order_index != null) return error.DocumentSqlWriteUnsupported;
+    const limit_index = parser.findTopLevelKeywordTagFromIndex(tokens[0..source_end], where_start, .limit);
+    const producer_end = limit_index orelse source_end;
+    var source_limit: ?u32 = null;
+    if (limit_index) |idx| {
+        var limit_pos = idx + 1;
+        source_limit = try sql_value.parseLimitValue(tokens, &limit_pos, params);
+        if (limit_pos != source_end) return error.DocumentSqlWriteUnsupported;
+    }
+    var producer = try lowerDocumentWriteProducerFromWhereAlloc(alloc, tokens, where_start, producer_end, schema, source_table);
+    var producer_transferred = false;
+    errdefer if (!producer_transferred) producer.deinit(alloc);
+
+    var returning_fields: []DocumentReturningField = &.{};
+    var returning_transferred = false;
+    defer if (!returning_transferred) freeDocumentReturningFields(alloc, returning_fields);
+    if (returning_index) |index| {
+        var returning_pos = index + 1;
+        returning_fields = try parseDocumentReturningFieldsAlloc(alloc, tokens, &returning_pos, schema, target_table);
+        if (returning_pos != statement_end) return error.DocumentSqlWriteUnsupported;
+    }
+
+    pos.* = statement_end;
+    if (parser.matchToken(tokens, pos, .semicolon) != null and !parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
+    if (!parser.atEnd(tokens, pos.*)) return error.DocumentSqlWriteUnsupported;
+
+    const assignments_slice = try assignments.toOwnedSlice(alloc);
+    var assignments_transferred = false;
+    errdefer if (!assignments_transferred) freeDocumentSourceInsertAssignments(alloc, assignments_slice);
+    assignments = .empty;
+
+    alloc.free(target_table.alias);
+    const table_name = target_table.name;
+    const source_table_name = source_table.name;
+    alloc.free(source_table.alias);
+    producer_transferred = true;
+    assignments_transferred = true;
+    returning_transferred = true;
+    return .{ .document_source_insert = .{
+        .table_name = table_name,
+        .source_table_name = source_table_name,
+        .source_producer = producer,
+        .source_limit = source_limit,
+        .target_id_mode = target_id_mode,
+        .assignments = assignments_slice,
+        .returning_fields = returning_fields,
+        .sync_level = sync_level,
+    } };
+}
+
 fn documentJsonProjectedValue(doc: std.json.Value, path: []const u8) !?std.json.Value {
     var current = doc;
     const count = try documentProjectionPathSegmentCount(path);
@@ -20419,6 +20738,19 @@ fn documentJsonProjectedValue(doc: std.json.Value, path: []const u8) !?std.json.
         current = current.object.get(segment) orelse return null;
     }
     return current;
+}
+
+fn documentProjectedRequiredValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    doc_json: []const u8,
+    path: []const u8,
+) ![]const u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{ .allocate = .alloc_always }) catch return error.DocumentSqlWriteUnsupported;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.DocumentSqlWriteUnsupported;
+    const value = (try documentJsonProjectedValue(parsed.value, path)) orelse return error.DocumentSqlWriteUnsupported;
+    if (value == .null) return error.DocumentSqlWriteUnsupported;
+    return try std.json.Stringify.valueAlloc(alloc, value, .{});
 }
 
 fn documentReturningRowsForWritesAlloc(
@@ -20448,6 +20780,7 @@ fn documentReturningRowsForWritesAlloc(
             switch (field.kind) {
                 .identity => try writer.print("{f}", .{std.json.fmt(write.key, .{})}),
                 .document => try writer.writeAll(write.value),
+                .version => try writer.writeAll("null"),
                 .projection => {
                     if (try documentJsonProjectedValue(parsed.value, field.path)) |value| {
                         try writer.print("{f}", .{std.json.fmt(value, .{})});
@@ -20463,6 +20796,48 @@ fn documentReturningRowsForWritesAlloc(
     }
 
     return try rows.toOwnedSlice(alloc);
+}
+
+fn documentReturningVersionOutputsAlloc(
+    alloc: std.mem.Allocator,
+    fields: []const DocumentReturningField,
+) ![][]const u8 {
+    var outputs = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (outputs.items) |output| alloc.free(@constCast(output));
+        outputs.deinit(alloc);
+    }
+    for (fields) |field| {
+        if (field.kind != .version) continue;
+        try outputs.append(alloc, try alloc.dupe(u8, field.output));
+    }
+    return try outputs.toOwnedSlice(alloc);
+}
+
+fn documentReturningVersionKeysForWritesAlloc(
+    alloc: std.mem.Allocator,
+    writes: []const db_mod.types.BatchWrite,
+    fields: []const DocumentReturningField,
+) ![][]const u8 {
+    var has_version = false;
+    for (fields) |field| {
+        if (field.kind == .version) {
+            has_version = true;
+            break;
+        }
+    }
+    if (!has_version or writes.len == 0) return &.{};
+    const keys = try alloc.alloc([]const u8, writes.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (keys[0..initialized]) |key| alloc.free(key);
+        alloc.free(keys);
+    }
+    for (writes) |write| {
+        keys[initialized] = try alloc.dupe(u8, write.key);
+        initialized += 1;
+    }
+    return keys;
 }
 
 fn documentProjectionPathSameAtDepth(a: []const u8, b: []const u8, depth: usize) !bool {
@@ -20535,13 +20910,488 @@ fn documentProjectionJsonAlloc(
     return try out.toOwnedSlice();
 }
 
+fn documentProjectionColumnWasInserted(
+    columns: []const []const u8,
+    target_table: plan_mod.TableAlias,
+    field: []const u8,
+) bool {
+    const wanted = documentProjectionUnqualifiedField(field, target_table) orelse return false;
+    for (columns) |column| {
+        const unqualified = documentProjectionUnqualifiedField(column, target_table) orelse continue;
+        if (std.ascii.eqlIgnoreCase(unqualified, wanted)) return true;
+    }
+    return false;
+}
+
+fn documentConflictTargetColumnAllowed(column: runtime_schema.RelationalColumn) bool {
+    if (column.generated != null) return false;
+    if (!column.indexed or column.index_lifecycle != .ready) return false;
+    if (column.index_where.len != 0 or column.index_where_expressions.len != 0) return false;
+    if (column.cardinality_proof != .unique) return false;
+    return switch (column.field_type) {
+        .json, .array => false,
+        else => true,
+    };
+}
+
+fn parseDocumentConflictTarget(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+) !plan_mod.DocumentConflictTarget {
+    if (parser.matchToken(tokens, pos, .lparen) != null) {
+        const field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        defer alloc.free(field);
+        try parser.expectToken(tokens, pos, .rparen);
+        if (documentIdentityFieldMatches(field, target_table)) return .identity;
+
+        const column = try documentProjectionColumnForField(schema, target_table, field);
+        if (!documentConflictTargetColumnAllowed(column)) return error.DocumentSqlWriteUnsupported;
+        const path = try alloc.dupe(u8, column.path);
+        errdefer alloc.free(path);
+        return .{ .unique_field = .{
+            .path = path,
+            .field_type = column.field_type,
+        } };
+    }
+    if (parser.matchKeywordTag(tokens, pos, .on)) {
+        try parser.expectKeywordTag(tokens, pos, .constraint);
+        const constraint_name = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        defer alloc.free(constraint_name);
+        var name_buf: [256]u8 = undefined;
+        const default_primary = std.fmt.bufPrint(&name_buf, "{s}_pkey", .{target_table.name}) catch return error.DocumentSqlWriteUnsupported;
+        if (!std.ascii.eqlIgnoreCase(constraint_name, default_primary)) return error.DocumentSqlWriteUnsupported;
+        return .identity;
+    }
+    return error.DocumentSqlWriteUnsupported;
+}
+
+fn documentConflictAssignmentSourceField(field: []const u8) ?[]const u8 {
+    const dot = std.mem.indexOfScalar(u8, field, '.') orelse return null;
+    if (!std.ascii.eqlIgnoreCase(field[0..dot], "excluded")) return null;
+    const unqualified = field[dot + 1 ..];
+    if (unqualified.len == 0) return null;
+    return unqualified;
+}
+
+fn parseDocumentConflictSourceAssignmentAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    insert_columns: []const []const u8,
+    source_assignments: *std.ArrayListUnmanaged(plan_mod.DocumentConflictSourceAssignment),
+) !bool {
+    const start = pos.*;
+    const target_field = grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos) catch |err| switch (err) {
+        error.UnsupportedSqlShape => {
+            pos.* = start;
+            return false;
+        },
+        else => |other| return other,
+    };
+    defer alloc.free(target_field);
+
+    if (parser.matchToken(tokens, pos, .eq) == null) {
+        pos.* = start;
+        return false;
+    }
+    if (!parser.peekKind(tokens, pos.*, .identifier) or
+        std.mem.indexOfScalar(u8, tokens[pos.*].text, '.') == null)
+    {
+        pos.* = start;
+        return false;
+    }
+
+    const source = plan_mod.parseQualifiedFieldAlloc(alloc, tokens, pos) catch |err| switch (err) {
+        error.UnsupportedSqlShape => {
+            pos.* = start;
+            return false;
+        },
+        else => |other| return other,
+    };
+    defer plan_mod.freeQualifiedField(alloc, source);
+
+    if (!std.ascii.eqlIgnoreCase(source.qualifier, "excluded")) {
+        pos.* = start;
+        return false;
+    }
+    if (!documentProjectionColumnWasInserted(insert_columns, target_table, source.field)) return error.DocumentSqlWriteUnsupported;
+
+    const target_column = try documentProjectionColumnForField(schema, target_table, target_field);
+    const source_column = try documentProjectionColumnForField(schema, target_table, source.field);
+    if (source_column.field_type != target_column.field_type) return error.DocumentSqlWriteUnsupported;
+
+    const target_path = try alloc.dupe(u8, target_column.path);
+    errdefer alloc.free(target_path);
+    const source_path = try alloc.dupe(u8, source_column.path);
+    errdefer alloc.free(source_path);
+    try source_assignments.append(alloc, .{
+        .target_path = target_path,
+        .source_path = source_path,
+        .field_type = target_column.field_type,
+    });
+    return true;
+}
+
+fn parseDocumentConflictUpdateAssignmentAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    insert_columns: []const []const u8,
+    params: []const sql_value.SqlValue,
+    conflict_existing_qualifiers: []const []const u8,
+    assignment_hooks: ConflictUpdateSetAssignmentParserOptions,
+    operations: *std.ArrayListUnmanaged(db_mod.types.TransformOp),
+    source_assignments: *std.ArrayListUnmanaged(plan_mod.DocumentConflictSourceAssignment),
+    expression_assignments: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionAssignment),
+) !void {
+    var patch = std.ArrayListUnmanaged(FieldJsonValue).empty;
+    defer patch.deinit(alloc);
+    errdefer freeFieldJsonValues(alloc, patch.items);
+    var patch_expr = std.ArrayListUnmanaged(FieldExpressionValue).empty;
+    defer patch_expr.deinit(alloc);
+    errdefer {
+        for (patch_expr.items) |item| {
+            if (item.field.len > 0) alloc.free(item.field);
+            freeExpression(alloc, item.expression);
+        }
+    }
+    var increment = std.ArrayListUnmanaged(FieldJsonValue).empty;
+    defer increment.deinit(alloc);
+    errdefer freeFieldJsonValues(alloc, increment.items);
+    var increment_expr = std.ArrayListUnmanaged(FieldExpressionValue).empty;
+    defer increment_expr.deinit(alloc);
+    errdefer freeFieldExpressionValues(alloc, increment_expr.items);
+    var json_set = std.ArrayListUnmanaged(JsonSetValue).empty;
+    defer json_set.deinit(alloc);
+    errdefer freeJsonSetValues(alloc, json_set.items);
+    var array_update = std.ArrayListUnmanaged(ArrayTransformValue).empty;
+    defer array_update.deinit(alloc);
+    errdefer freeArrayTransformValues(alloc, array_update.items);
+
+    if (try parseDocumentConflictSourceAssignmentAlloc(
+        alloc,
+        tokens,
+        pos,
+        schema,
+        target_table,
+        insert_columns,
+        source_assignments,
+    )) return;
+
+    try parseConflictUpdateSetAssignmentAlloc(
+        alloc,
+        tokens,
+        pos,
+        schema,
+        params,
+        conflict_existing_qualifiers,
+        insert_columns,
+        &.{},
+        &patch,
+        &patch_expr,
+        &increment,
+        &increment_expr,
+        &json_set,
+        &array_update,
+        assignment_hooks,
+    );
+    if (increment.items.len != 0 or increment_expr.items.len != 0 or json_set.items.len != 0 or array_update.items.len != 0) return error.DocumentSqlWriteUnsupported;
+
+    for (patch.items) |item| {
+        const target_column = try documentProjectionColumnForField(schema, target_table, item.field);
+        const path = try alloc.dupe(u8, target_column.path);
+        errdefer alloc.free(path);
+        const value_json = try alloc.dupe(u8, item.value_json);
+        errdefer alloc.free(value_json);
+        try operations.append(alloc, .{
+            .op = .set,
+            .path = path,
+            .value_json = value_json,
+        });
+    }
+    freeFieldJsonValues(alloc, patch.items);
+    patch.clearRetainingCapacity();
+
+    for (patch_expr.items) |*item| {
+        const target_column = try documentProjectionColumnForField(schema, target_table, item.field);
+        if (item.expression.kind == .field and item.expression.field_source == .proposed) {
+            const source_field = item.expression.field;
+            if (!documentProjectionColumnWasInserted(insert_columns, target_table, source_field)) return error.DocumentSqlWriteUnsupported;
+            const source_column = try documentProjectionColumnForField(schema, target_table, source_field);
+            if (source_column.field_type != target_column.field_type) return error.DocumentSqlWriteUnsupported;
+            const target_path = try alloc.dupe(u8, target_column.path);
+            errdefer alloc.free(target_path);
+            const source_path = try alloc.dupe(u8, source_column.path);
+            errdefer alloc.free(source_path);
+            try source_assignments.append(alloc, .{
+                .target_path = target_path,
+                .source_path = source_path,
+                .field_type = target_column.field_type,
+            });
+            alloc.free(item.field);
+            freeExpression(alloc, item.expression);
+            item.* = .{
+                .field = "",
+                .expression = .{ .kind = .value },
+            };
+            continue;
+        }
+
+        if (!std.mem.eql(u8, target_column.name, item.field)) return error.DocumentSqlWriteUnsupported;
+        const owned_field = try alloc.dupe(u8, target_column.path);
+        errdefer alloc.free(owned_field);
+        const owned_expression = item.expression;
+        alloc.free(item.field);
+        try expression_assignments.append(alloc, .{
+            .field = owned_field,
+            .expression = owned_expression,
+        });
+        item.* = .{
+            .field = "",
+            .expression = .{ .kind = .value },
+        };
+    }
+    for (patch_expr.items) |item| {
+        if (item.field.len > 0) alloc.free(item.field);
+        freeExpression(alloc, item.expression);
+    }
+    patch_expr.clearRetainingCapacity();
+}
+
+fn parseDocumentInsertConflictWriteAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    columns: []const []const u8,
+    proposed_writes: []db_mod.types.BatchWrite,
+    params: []const sql_value.SqlValue,
+    sync_level: db_mod.types.SyncLevel,
+) !plan_mod.LoweredDocumentConflictWrite {
+    try parser.expectKeywordTag(tokens, pos, .on);
+    try parser.expectKeywordTag(tokens, pos, .conflict);
+    var conflict_target = try parseDocumentConflictTarget(alloc, tokens, pos, schema, target_table);
+    errdefer conflict_target.deinit(alloc);
+    switch (conflict_target) {
+        .identity => {},
+        .unique_field => |target| {
+            if (!documentProjectionColumnWasInserted(columns, target_table, target.path)) return error.DocumentSqlWriteUnsupported;
+        },
+    }
+    try parser.expectKeywordTag(tokens, pos, .do);
+
+    var action: plan_mod.DocumentConflictAction = undefined;
+    var operations = std.ArrayListUnmanaged(db_mod.types.TransformOp).empty;
+    errdefer {
+        for (operations.items) |op| {
+            alloc.free(@constCast(op.path));
+            if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+        }
+        operations.deinit(alloc);
+    }
+    var source_assignments = std.ArrayListUnmanaged(plan_mod.DocumentConflictSourceAssignment).empty;
+    errdefer {
+        for (source_assignments.items) |*assignment| assignment.deinit(alloc);
+        source_assignments.deinit(alloc);
+    }
+    var expression_assignments = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionAssignment).empty;
+    errdefer {
+        for (expression_assignments.items) |assignment| {
+            alloc.free(@constCast(assignment.field));
+            freeExpression(alloc, assignment.expression);
+        }
+        expression_assignments.deinit(alloc);
+    }
+    var where_expression: ?db_mod.types.RelationalRowsExpressionCondition = null;
+    errdefer if (where_expression) |condition| freeExpressionCondition(alloc, condition);
+    var where_expressions = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition).empty;
+    errdefer {
+        freeExpressionConditions(alloc, where_expressions.items);
+        where_expressions.deinit(alloc);
+    }
+    var where_any = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+    errdefer {
+        freeExpressionPredicateGroups(alloc, where_any.items);
+        where_any.deinit(alloc);
+    }
+    var where_not = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+    errdefer {
+        freeExpressionPredicateGroups(alloc, where_not.items);
+        where_not.deinit(alloc);
+    }
+
+    const parser_context = @import("parser_context.zig");
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens,
+        .schema = schema,
+        .params = params,
+    };
+    const existing_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
+    const value_hooks = parser_context.ParserState.ContextAccessors.conflictUpdateAssignmentValueParserOptions(&parser_state, columns, &.{});
+    const assignment_hooks = conflictUpdateSetAssignmentOptionsWithExistingQualifiers(
+        insertConflictUpdateSetAssignmentOptions(value_hooks),
+        &existing_qualifiers,
+    );
+    const condition_options = conflictAssignmentExpressionOptionsWithExistingQualifiers(
+        parser_context.ParserState.ContextAccessors.conflictAssignmentExpressionParserOptions(&parser_state),
+        &existing_qualifiers,
+    );
+    const dispatch_options = conflictDispatchOptionsWithExistingQualifiers(
+        parser_context.ParserState.ContextAccessors.conflictExpressionDispatchOptions(&parser_state),
+        &existing_qualifiers,
+    );
+
+    if (parser.matchKeywordTag(tokens, pos, .nothing)) {
+        action = .nothing;
+    } else {
+        try parser.expectKeywordTag(tokens, pos, .update);
+        try parser.expectKeywordTag(tokens, pos, .set);
+        action = .update;
+        while (true) {
+            try parseDocumentConflictUpdateAssignmentAlloc(
+                alloc,
+                tokens,
+                pos,
+                schema,
+                target_table,
+                columns,
+                params,
+                &existing_qualifiers,
+                assignment_hooks,
+                &operations,
+                &source_assignments,
+                &expression_assignments,
+            );
+            if (parser.matchToken(tokens, pos, .comma) == null) break;
+        }
+        if (operations.items.len == 0 and source_assignments.items.len == 0 and expression_assignments.items.len == 0) return error.DocumentSqlWriteUnsupported;
+        if (parser.matchKeywordTag(tokens, pos, .where)) {
+            try parseConflictActionWhereClause(
+                alloc,
+                tokens,
+                pos,
+                params,
+                schema,
+                &existing_qualifiers,
+                columns,
+                parser_context.ParserState.ContextAccessors.rowExpressionTypeContext(&parser_state),
+                false,
+                &where_expression,
+                &where_expressions,
+                &where_any,
+                &where_not,
+                condition_options,
+                dispatch_options,
+            );
+        }
+    }
+    for (proposed_writes, 0..) |write, i| {
+        for (proposed_writes[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.key, write.key)) return error.DocumentSqlWriteUnsupported;
+        }
+    }
+    switch (conflict_target) {
+        .identity => {},
+        .unique_field => |target| {
+            for (proposed_writes, 0..) |write, i| {
+                const value_json = try documentProjectedRequiredValueJsonAlloc(alloc, write.value, target.path);
+                defer alloc.free(value_json);
+                for (proposed_writes[0..i]) |previous| {
+                    const previous_value_json = try documentProjectedRequiredValueJsonAlloc(alloc, previous.value, target.path);
+                    defer alloc.free(previous_value_json);
+                    if (std.mem.eql(u8, previous_value_json, value_json)) return error.DocumentSqlWriteUnsupported;
+                }
+            }
+        },
+    }
+
+    const operations_slice = try operations.toOwnedSlice(alloc);
+    operations = .empty;
+    errdefer {
+        for (operations_slice) |op| {
+            alloc.free(@constCast(op.path));
+            if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+        }
+        if (operations_slice.len > 0) alloc.free(@constCast(operations_slice));
+    }
+    const assignments_slice = try source_assignments.toOwnedSlice(alloc);
+    source_assignments = .empty;
+    errdefer {
+        for (assignments_slice) |*assignment| assignment.deinit(alloc);
+        if (assignments_slice.len > 0) alloc.free(assignments_slice);
+    }
+    const expression_assignments_slice = try expression_assignments.toOwnedSlice(alloc);
+    expression_assignments = .empty;
+    errdefer freeExpressionAssignments(alloc, expression_assignments_slice);
+    const where_expressions_slice = try where_expressions.toOwnedSlice(alloc);
+    where_expressions = .empty;
+    errdefer {
+        freeExpressionConditions(alloc, where_expressions_slice);
+        if (where_expressions_slice.len > 0) alloc.free(where_expressions_slice);
+    }
+    const where_any_slice = try where_any.toOwnedSlice(alloc);
+    where_any = .empty;
+    errdefer {
+        freeExpressionPredicateGroups(alloc, where_any_slice);
+        if (where_any_slice.len > 0) alloc.free(where_any_slice);
+    }
+    const where_not_slice = try where_not.toOwnedSlice(alloc);
+    where_not = .empty;
+    errdefer {
+        freeExpressionPredicateGroups(alloc, where_not_slice);
+        if (where_not_slice.len > 0) alloc.free(where_not_slice);
+    }
+    const table_name = try alloc.dupe(u8, target_table.name);
+    errdefer alloc.free(table_name);
+    const proposed_slice = try alloc.alloc(db_mod.types.BatchWrite, proposed_writes.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (proposed_slice[0..initialized]) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        if (proposed_slice.len > 0) alloc.free(proposed_slice);
+    }
+    for (proposed_writes, 0..) |write, i| {
+        proposed_slice[i] = .{
+            .key = try alloc.dupe(u8, write.key),
+            .value = try alloc.dupe(u8, write.value),
+        };
+        initialized += 1;
+    }
+
+    return .{
+        .table_name = table_name,
+        .proposed_writes = proposed_slice,
+        .target = conflict_target,
+        .action = action,
+        .operations = operations_slice,
+        .source_assignments = assignments_slice,
+        .expression_assignments = expression_assignments_slice,
+        .where_expression = where_expression,
+        .where_expressions = where_expressions_slice,
+        .where_any = where_any_slice,
+        .where_not = where_not_slice,
+        .sync_level = sync_level,
+    };
+}
+
 fn parseDocumentInsertAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     sync_level: db_mod.types.SyncLevel,
-) !plan_mod.LoweredDocumentWrite {
+) !plan_mod.LoweredWritePlan {
     var pos: usize = 0;
     try parser.expectKeywordTag(tokens, &pos, .insert);
     try parser.expectKeywordTag(tokens, &pos, .into);
@@ -20555,7 +21405,17 @@ fn parseDocumentInsertAlloc(
     const column_mode = try documentInsertColumnMode(columns, schema, target_table);
 
     if (!parser.matchKeywordTag(tokens, &pos, .values)) {
-        if (parser.peekKeywordTag(tokens, pos, .select)) return error.DocumentSqlWriteUnsupported;
+        if (parser.peekKeywordTag(tokens, pos, .select)) return try parseDocumentSourceProjectionInsertAlloc(
+            alloc,
+            tokens,
+            &pos,
+            schema,
+            target_table,
+            columns,
+            column_mode,
+            params,
+            sync_level,
+        );
         return error.UnsupportedSqlShape;
     }
 
@@ -20684,6 +21544,17 @@ fn parseDocumentInsertAlloc(
         if (!parser.peekKind(tokens, pos, .lparen)) return error.UnsupportedSqlShape;
     }
 
+    var conflict_write: ?plan_mod.LoweredDocumentConflictWrite = null;
+    errdefer if (conflict_write) |*value| value.deinit(alloc);
+    if (parser.peekKeywordTag(tokens, pos, .on)) {
+        if (create_only_insert) return error.DocumentSqlWriteUnsupported;
+        switch (column_mode) {
+            .projection_explicit_id, .projection_generated_id => {},
+            else => return error.DocumentSqlWriteUnsupported,
+        }
+        conflict_write = try parseDocumentInsertConflictWriteAlloc(alloc, tokens, &pos, schema, target_table, columns, writes.items, params, sync_level);
+    }
+
     var returning_fields: []DocumentReturningField = &.{};
     defer freeDocumentReturningFields(alloc, returning_fields);
     if (parser.matchKeywordTag(tokens, &pos, .returning)) {
@@ -20692,8 +21563,26 @@ fn parseDocumentInsertAlloc(
 
     if (parser.matchToken(tokens, &pos, .semicolon) != null and !parser.atEnd(tokens, pos)) return error.UnsupportedSqlShape;
     if (!parser.atEnd(tokens, pos)) {
-        if (parser.peekKeywordTag(tokens, pos, .on)) return error.DocumentSqlWriteUnsupported;
         return error.UnsupportedSqlShape;
+    }
+
+    if (conflict_write) |*value| {
+        value.returning_fields = returning_fields;
+        returning_fields = &.{};
+        for (writes.items) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        writes.deinit(alloc);
+        writes = .empty;
+        for (predicates.items) |predicate| alloc.free(@constCast(predicate.key));
+        predicates.deinit(alloc);
+        predicates = .empty;
+        alloc.free(target_table.name);
+        alloc.free(target_table.alias);
+        const out = value.*;
+        conflict_write = null;
+        return .{ .document_conflict_write = out };
     }
 
     const writes_slice = try writes.toOwnedSlice(alloc);
@@ -20719,18 +21608,43 @@ fn parseDocumentInsertAlloc(
         for (returning_rows) |row| alloc.free(@constCast(row));
         if (returning_rows.len > 0) alloc.free(returning_rows);
     };
+    const returning_version_keys = try documentReturningVersionKeysForWritesAlloc(alloc, writes_slice, returning_fields);
+    var returning_version_keys_transferred = false;
+    errdefer if (!returning_version_keys_transferred) {
+        for (returning_version_keys) |key| alloc.free(key);
+        if (returning_version_keys.len > 0) alloc.free(returning_version_keys);
+    };
+    var returning_version_prewrite: []u64 = &.{};
+    if (returning_version_keys.len != 0) {
+        returning_version_prewrite = try alloc.alloc(u64, returning_version_keys.len);
+        @memset(returning_version_prewrite, 0);
+    }
+    var returning_version_prewrite_transferred = false;
+    errdefer if (!returning_version_prewrite_transferred and returning_version_prewrite.len > 0) alloc.free(returning_version_prewrite);
+    const returning_version_outputs = try documentReturningVersionOutputsAlloc(alloc, returning_fields);
+    var returning_version_outputs_transferred = false;
+    errdefer if (!returning_version_outputs_transferred) {
+        for (returning_version_outputs) |output| alloc.free(output);
+        if (returning_version_outputs.len > 0) alloc.free(returning_version_outputs);
+    };
 
     alloc.free(target_table.alias);
     const table_name = target_table.name;
     writes_transferred = true;
     predicates_transferred = true;
     returning_rows_transferred = true;
-    return .{
+    returning_version_keys_transferred = true;
+    returning_version_prewrite_transferred = true;
+    returning_version_outputs_transferred = true;
+    return .{ .document_write = .{
         .table_name = table_name,
         .batch = .{
             .writes = writes_slice,
             .predicates = predicates_slice,
             .returning_rows = returning_rows,
+            .returning_version_keys = returning_version_keys,
+            .returning_version_prewrite = returning_version_prewrite,
+            .returning_version_outputs = returning_version_outputs,
             .req = .{
                 .writes = writes_slice,
                 .predicates = predicates_slice,
@@ -20744,7 +21658,7 @@ fn parseDocumentInsertAlloc(
             .generated_doc, .projection_generated_id, .projection_generated_id_create_only => .generated_id_insert,
         },
         .sync_level = sync_level,
-    };
+    } };
 }
 
 fn parseDocumentTruncateAlloc(
@@ -22366,6 +23280,12 @@ fn parseDocumentJoinedProjectionUpdateAlloc(
     var predicates = try parseDocumentJoinedPredicateSetAlloc(alloc, tokens, &pos, schema, source_schema, target_table, source_table, params);
     var predicates_transferred = false;
     defer if (!predicates_transferred) predicates.deinit(alloc);
+    var returning_fields: []DocumentReturningField = &.{};
+    var returning_transferred = false;
+    defer if (!returning_transferred) freeDocumentReturningFields(alloc, returning_fields);
+    if (parser.matchKeywordTag(tokens, &pos, .returning)) {
+        returning_fields = try parseDocumentReturningFieldsAlloc(alloc, tokens, &pos, schema, target_table);
+    }
     if (parser.matchToken(tokens, &pos, .semicolon) != null and !parser.atEnd(tokens, pos)) return error.UnsupportedSqlShape;
     if (!parser.atEnd(tokens, pos)) return error.DocumentSqlWriteUnsupported;
 
@@ -22406,6 +23326,7 @@ fn parseDocumentJoinedProjectionUpdateAlloc(
     source_assignments_transferred = true;
     target_producer_transferred = true;
     joined_source_producer_transferred = true;
+    returning_transferred = true;
     return .{ .document_joined_mutation = .{
         .table_name = table_name,
         .source_table_name = source_table_name,
@@ -22419,6 +23340,7 @@ fn parseDocumentJoinedProjectionUpdateAlloc(
         .max_target_rows = max_target_rows,
         .max_source_rows = 1,
         .duplicate_source_policy = .reject,
+        .returning_fields = returning_fields,
         .sync_level = sync_level,
     } };
 }
@@ -22533,23 +23455,35 @@ fn parseDocumentProjectionUpdateAlloc(
         }
     }
 
-    const producer_end = if (tokens.len > 0 and tokens[tokens.len - 1].kind == .semicolon) tokens.len - 1 else tokens.len;
+    const returning_index = parser.findTopLevelKeywordTagFromIndex(tokens, filter_start, .returning);
+    const producer_end = returning_index orelse if (tokens.len > 0 and tokens[tokens.len - 1].kind == .semicolon) tokens.len - 1 else tokens.len;
     const producer = try lowerDocumentWriteProducerFromWhereAlloc(alloc, tokens, filter_start, producer_end, schema, target_table);
     var producer_transferred = false;
     errdefer if (!producer_transferred) {
         var mutable_producer = producer;
         mutable_producer.deinit(alloc);
     };
+    var returning_fields: []DocumentReturningField = &.{};
+    var returning_transferred = false;
+    defer if (!returning_transferred) freeDocumentReturningFields(alloc, returning_fields);
+    if (returning_index) |index| {
+        var returning_pos = index + 1;
+        returning_fields = try parseDocumentReturningFieldsAlloc(alloc, tokens, &returning_pos, schema, target_table);
+        if (parser.matchToken(tokens, &returning_pos, .semicolon) != null and !parser.atEnd(tokens, returning_pos)) return error.UnsupportedSqlShape;
+        if (!parser.atEnd(tokens, returning_pos)) return error.DocumentSqlWriteUnsupported;
+    }
 
     alloc.free(target_table.alias);
     const table_name = target_table.name;
     operations_template_transferred = true;
     producer_transferred = true;
+    returning_transferred = true;
     return .{ .document_producer_mutation = .{
         .table_name = table_name,
         .producer = producer,
         .operation = .projection_write,
         .template = .{ .transform = operations_template },
+        .returning_fields = returning_fields,
         .sync_level = sync_level,
     } };
 }
@@ -22577,6 +23511,12 @@ fn parseDocumentJoinedDeleteAlloc(
     var predicates = try parseDocumentJoinedPredicateSetAlloc(alloc, tokens, &pos, schema, source_schema, target_table, source_table, params);
     var predicates_transferred = false;
     defer if (!predicates_transferred) predicates.deinit(alloc);
+    var returning_fields: []DocumentReturningField = &.{};
+    var returning_transferred = false;
+    defer if (!returning_transferred) freeDocumentReturningFields(alloc, returning_fields);
+    if (parser.matchKeywordTag(tokens, &pos, .returning)) {
+        returning_fields = try parseDocumentReturningFieldsAlloc(alloc, tokens, &pos, schema, target_table);
+    }
     if (parser.matchToken(tokens, &pos, .semicolon) != null and !parser.atEnd(tokens, pos)) return error.UnsupportedSqlShape;
     if (!parser.atEnd(tokens, pos)) return error.DocumentSqlWriteUnsupported;
 
@@ -22603,6 +23543,7 @@ fn parseDocumentJoinedDeleteAlloc(
     predicates_transferred = true;
     target_producer_transferred = true;
     joined_source_producer_transferred = true;
+    returning_transferred = true;
     return .{ .document_joined_mutation = .{
         .table_name = table_name,
         .source_table_name = source_table_name,
@@ -22615,6 +23556,7 @@ fn parseDocumentJoinedDeleteAlloc(
         .max_target_rows = max_target_rows,
         .max_source_rows = 1,
         .duplicate_source_policy = .reject,
+        .returning_fields = returning_fields,
         .sync_level = sync_level,
     } };
 }
@@ -22635,24 +23577,373 @@ fn parseDocumentProducerDeleteAlloc(
     errdefer plan_mod.freeTableAlias(alloc, target_table);
     if (!std.mem.eql(u8, target_table.name, target_table.alias)) return error.DocumentSqlWriteUnsupported;
 
-    const producer_end = if (tokens.len > 0 and tokens[tokens.len - 1].kind == .semicolon) tokens.len - 1 else tokens.len;
+    const returning_index = parser.findTopLevelKeywordTagFromIndex(tokens, pos, .returning);
+    const producer_end = returning_index orelse if (tokens.len > 0 and tokens[tokens.len - 1].kind == .semicolon) tokens.len - 1 else tokens.len;
     const producer = try lowerDocumentWriteProducerFromWhereAlloc(alloc, tokens, pos, producer_end, schema, target_table);
     var producer_transferred = false;
     errdefer if (!producer_transferred) {
         var mutable_producer = producer;
         mutable_producer.deinit(alloc);
     };
+    var returning_fields: []DocumentReturningField = &.{};
+    var returning_transferred = false;
+    defer if (!returning_transferred) freeDocumentReturningFields(alloc, returning_fields);
+    if (returning_index) |index| {
+        var returning_pos = index + 1;
+        returning_fields = try parseDocumentReturningFieldsAlloc(alloc, tokens, &returning_pos, schema, target_table);
+        if (parser.matchToken(tokens, &returning_pos, .semicolon) != null and !parser.atEnd(tokens, returning_pos)) return error.UnsupportedSqlShape;
+        if (!parser.atEnd(tokens, returning_pos)) return error.DocumentSqlWriteUnsupported;
+    }
 
     alloc.free(target_table.alias);
     const table_name = target_table.name;
     producer_transferred = true;
+    returning_transferred = true;
     return .{ .document_producer_mutation = .{
         .table_name = table_name,
         .producer = producer,
         .operation = .non_identity_delete,
         .template = .delete,
+        .returning_fields = returning_fields,
         .sync_level = sync_level,
     } };
+}
+
+fn documentMergeAllTableProducer() document_plan.DocumentProducer {
+    return .{ .bounded_scan = .{
+        .max_rows = source_binding.default_document_sql_bounded_scan_rows,
+        .max_bytes = source_binding.default_document_sql_bounded_scan_bytes,
+    } };
+}
+
+fn validateDocumentMergeSimplePredicates(predicates: []const plan_mod.MergeArmPredicate) !void {
+    for (predicates) |predicate| {
+        switch (predicate.op) {
+            .eq, .ne, .is_null, .is_not_null => {},
+            else => return error.DocumentSqlWriteUnsupported,
+        }
+    }
+}
+
+fn documentMergeRejectExpressionPredicates(
+    expression_or_predicates: []const db_mod.types.RelationalRowsExpressionPredicateGroup,
+    expression_not_predicates: []const db_mod.types.RelationalRowsExpressionPredicateGroup,
+) !void {
+    if (expression_or_predicates.len != 0 or expression_not_predicates.len != 0) {
+        return error.DocumentSqlWriteUnsupported;
+    }
+}
+
+fn documentMergeExpressionPredicateAlloc(
+    alloc: std.mem.Allocator,
+    condition: db_mod.types.RelationalRowsExpressionCondition,
+) !plan_mod.MergeArmPredicate {
+    if (condition.lhs.kind != .field) return error.DocumentSqlWriteUnsupported;
+    const side: plan_mod.MergePredicateSide = switch (condition.lhs.field_source) {
+        .row => .target,
+        .source => .source,
+        else => return error.DocumentSqlWriteUnsupported,
+    };
+    switch (condition.op) {
+        .eq, .ne, .is_null, .is_not_null => {},
+        else => return error.DocumentSqlWriteUnsupported,
+    }
+    const value_json: ?[]const u8 = switch (condition.op) {
+        .is_null, .is_not_null => null,
+        else => value: {
+            if (condition.rhs.len != 1 or condition.rhs[0].kind != .value) return error.DocumentSqlWriteUnsupported;
+            break :value try alloc.dupe(u8, condition.rhs[0].value_json);
+        },
+    };
+    errdefer if (value_json) |value| alloc.free(value);
+    const field = try alloc.dupe(u8, condition.lhs.field);
+    return .{
+        .side = side,
+        .field = field,
+        .op = condition.op,
+        .value_json = value_json,
+    };
+}
+
+fn cloneDocumentMergeArmPredicatesAlloc(
+    alloc: std.mem.Allocator,
+    predicates: []const plan_mod.MergeArmPredicate,
+    expression_predicates: []const db_mod.types.RelationalRowsExpressionCondition,
+) ![]plan_mod.MergeArmPredicate {
+    var out = try alloc.alloc(plan_mod.MergeArmPredicate, predicates.len + expression_predicates.len);
+    var initialized: usize = 0;
+    errdefer {
+        plan_mod.freeMergeArmPredicateValues(alloc, out[0..initialized]);
+        if (out.len > 0) alloc.free(out);
+    }
+    for (predicates) |predicate| {
+        const field = try alloc.dupe(u8, predicate.field);
+        errdefer alloc.free(field);
+        const value_json = if (predicate.value_json) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (value_json) |value| alloc.free(value);
+        out[initialized] = .{
+            .side = predicate.side,
+            .field = field,
+            .op = predicate.op,
+            .value_json = value_json,
+        };
+        initialized += 1;
+    }
+    for (expression_predicates) |condition| {
+        out[initialized] = try documentMergeExpressionPredicateAlloc(alloc, condition);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn documentMergeSourceAssignmentForMappingAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    mapping: plan_mod.MergeFieldMapping,
+) !plan_mod.DocumentJoinedMutationSourceAssignment {
+    const target_column = try documentSourceAssignmentTargetColumnForField(schema, target_table, mapping.target_field);
+    if (std.ascii.eqlIgnoreCase(mapping.source_field, "_doc") or
+        std.ascii.eqlIgnoreCase(mapping.source_field, "_id") or
+        std.ascii.eqlIgnoreCase(mapping.source_field, "_version"))
+    {
+        return error.DocumentSqlWriteSourceAssignmentReservedField;
+    }
+    const source_column = binder.relationalColumnForField(source_schema, mapping.source_field, null) orelse return error.DocumentSqlWriteSourceAssignmentMissingField;
+    if (source_column.generated != null) return error.DocumentSqlWriteSourceAssignmentGeneratedField;
+    if (source_column.field_type != target_column.field_type) return error.DocumentSqlWriteSourceAssignmentTypeMismatch;
+    const target_path = try alloc.dupe(u8, target_column.path);
+    errdefer alloc.free(target_path);
+    const source_field = try alloc.dupe(u8, mapping.source_field);
+    return .{
+        .target_path = target_path,
+        .source_field = source_field,
+        .field_type = target_column.field_type,
+    };
+}
+
+fn documentMergeMatchedArmAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    arm: plan_mod.MergeMatchedArm,
+) !plan_mod.DocumentMergeMatchedArm {
+    try validateDocumentMergeSimplePredicates(arm.predicates);
+    try documentMergeRejectExpressionPredicates(arm.expression_or_predicates, arm.expression_not_predicates);
+    if (arm.update_expressions.len != 0) return error.DocumentSqlWriteUnsupported;
+
+    const predicates = try cloneDocumentMergeArmPredicatesAlloc(alloc, arm.predicates, arm.expression_predicates);
+    errdefer {
+        plan_mod.freeMergeArmPredicateValues(alloc, predicates);
+        if (predicates.len > 0) alloc.free(predicates);
+    }
+    if (arm.do_nothing) return .{ .predicates = predicates, .do_nothing = true };
+    if (arm.delete) return .{ .predicates = predicates, .template = .delete };
+    if (arm.update.len == 0) return error.DocumentSqlWriteUnsupported;
+
+    var assignments = try alloc.alloc(plan_mod.DocumentJoinedMutationSourceAssignment, arm.update.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (assignments[0..initialized]) |*assignment| assignment.deinit(alloc);
+        if (assignments.len > 0) alloc.free(assignments);
+    }
+    for (arm.update) |mapping| {
+        assignments[initialized] = try documentMergeSourceAssignmentForMappingAlloc(alloc, schema, source_schema, target_table, mapping);
+        initialized += 1;
+    }
+    return .{
+        .predicates = predicates,
+        .source_assignments = assignments,
+        .template = .{ .transform = &.{} },
+    };
+}
+
+fn documentMergeNotMatchedArmAlloc(
+    alloc: std.mem.Allocator,
+    arm: plan_mod.MergeNotMatchedArm,
+) !plan_mod.DocumentMergeNotMatchedArm {
+    try validateDocumentMergeSimplePredicates(arm.predicates);
+    if (arm.expression_predicates.len != 0) return error.DocumentSqlWriteUnsupported;
+    try documentMergeRejectExpressionPredicates(arm.expression_or_predicates, arm.expression_not_predicates);
+    if (arm.insert_expressions.len != 0) return error.DocumentSqlWriteUnsupported;
+
+    const predicates = try cloneDocumentMergeArmPredicatesAlloc(alloc, arm.predicates, &.{});
+    errdefer {
+        plan_mod.freeMergeArmPredicateValues(alloc, predicates);
+        if (predicates.len > 0) alloc.free(predicates);
+    }
+    if (arm.do_nothing) return .{ .predicates = predicates, .do_nothing = true };
+    if (arm.insert.len != 2) return error.DocumentSqlWriteUnsupported;
+    var saw_id = false;
+    var saw_doc = false;
+    for (arm.insert) |mapping| {
+        if (std.ascii.eqlIgnoreCase(mapping.target_field, "_id") and std.ascii.eqlIgnoreCase(mapping.source_field, "_id")) {
+            saw_id = true;
+        } else if (std.ascii.eqlIgnoreCase(mapping.target_field, "_doc") and std.ascii.eqlIgnoreCase(mapping.source_field, "_doc")) {
+            saw_doc = true;
+        } else {
+            return error.DocumentSqlWriteUnsupported;
+        }
+    }
+    if (!saw_id or !saw_doc) return error.DocumentSqlWriteUnsupported;
+    return .{ .predicates = predicates, .insert_source_document = true };
+}
+
+fn documentMergeJoinKeysAlloc(
+    alloc: std.mem.Allocator,
+    match_fields: []const plan_mod.MergeFieldMapping,
+) ![]plan_mod.DocumentJoinedMutationJoinKey {
+    if (match_fields.len != 1) return error.DocumentSqlWriteUnsupported;
+    var join_keys = try alloc.alloc(plan_mod.DocumentJoinedMutationJoinKey, 1);
+    errdefer alloc.free(join_keys);
+    const target_field = try alloc.dupe(u8, match_fields[0].target_field);
+    errdefer alloc.free(target_field);
+    const source_field = try alloc.dupe(u8, match_fields[0].source_field);
+    join_keys[0] = .{
+        .target_field = target_field,
+        .source_field = source_field,
+    };
+    return join_keys;
+}
+
+fn documentMergeExpressionSchemaAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    tokens: []const Token,
+) !runtime_schema.TableSchema {
+    var columns = std.ArrayListUnmanaged(runtime_schema.RelationalColumn).empty;
+    errdefer columns.deinit(alloc);
+    try columns.appendSlice(alloc, schema.relational_columns);
+    try appendDocumentMergeExpressionColumnIfMissing(alloc, &columns, .{
+        .name = "_id",
+        .path = "_id",
+        .field_type = .keyword,
+        .nullable = false,
+    });
+    try appendDocumentMergeExpressionColumnIfMissing(alloc, &columns, .{
+        .name = "_doc",
+        .path = "_doc",
+        .field_type = .json,
+        .nullable = false,
+    });
+    try appendDocumentMergeExpressionColumnIfMissing(alloc, &columns, .{
+        .name = "_version",
+        .path = "_version",
+        .field_type = .numeric,
+        .nullable = false,
+    });
+    for (tokens) |token| {
+        if (token.kind != .identifier) continue;
+        const dot = std.mem.indexOfScalar(u8, token.text, '.') orelse continue;
+        const field = token.text[dot + 1 ..];
+        if (field.len == 0) continue;
+        try appendDocumentMergeExpressionColumnIfMissing(alloc, &columns, .{
+            .name = field,
+            .path = field,
+            .field_type = if (std.ascii.eqlIgnoreCase(field, "_version")) .numeric else .keyword,
+            .nullable = !std.ascii.eqlIgnoreCase(field, "_version"),
+        });
+    }
+    var expression_schema = schema;
+    expression_schema.relational_columns = try columns.toOwnedSlice(alloc);
+    return expression_schema;
+}
+
+fn appendDocumentMergeExpressionColumnIfMissing(
+    alloc: std.mem.Allocator,
+    columns: *std.ArrayListUnmanaged(runtime_schema.RelationalColumn),
+    column: runtime_schema.RelationalColumn,
+) !void {
+    for (columns.items) |existing| {
+        if (std.ascii.eqlIgnoreCase(existing.name, column.name)) return;
+    }
+    try columns.append(alloc, column);
+}
+
+fn freeDocumentMergeExpressionSchema(alloc: std.mem.Allocator, schema: runtime_schema.TableSchema) void {
+    if (schema.relational_columns.len > 0) alloc.free(schema.relational_columns);
+}
+
+fn parseDocumentMergeMutationAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    sync_level: db_mod.types.SyncLevel,
+) !plan_mod.LoweredDocumentMergeMutation {
+    const parser_context = @import("parser_context.zig");
+    if (schema.storage_mode != .document or source_schema.storage_mode != .document) return error.InvalidSqlCatalog;
+    const expression_schema = try documentMergeExpressionSchemaAlloc(alloc, schema, parsed_sql.items());
+    defer freeDocumentMergeExpressionSchema(alloc, expression_schema);
+    const expression_source_schema = try documentMergeExpressionSchemaAlloc(alloc, source_schema, parsed_sql.items());
+    defer freeDocumentMergeExpressionSchema(alloc, expression_source_schema);
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = parsed_sql.items(),
+        .schema = expression_schema,
+        .joined_source_schema = expression_source_schema,
+        .params = params,
+    };
+    var merge = try parseMergeMutationPlanAlloc(
+        alloc,
+        parsed_sql.items(),
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.mergeMutationParserOptions(&parser_state),
+    );
+    defer merge.deinit(alloc);
+    if (merge.ctes.len != 0 or merge.data_modifying_ctes.len != 0 or merge.source.source_cte.len != 0) return error.DocumentSqlWriteUnsupported;
+    if (merge.returning.hasProjection()) return error.DocumentSqlWriteUnsupported;
+
+    const target_table = plan_mod.TableAlias{ .name = merge.target_table_name, .alias = merge.target_table_name };
+    var matched_arms = try alloc.alloc(plan_mod.DocumentMergeMatchedArm, merge.matched_arms.len);
+    var matched_initialized: usize = 0;
+    errdefer {
+        for (matched_arms[0..matched_initialized]) |*arm| arm.deinit(alloc);
+        if (matched_arms.len > 0) alloc.free(matched_arms);
+    }
+    for (merge.matched_arms) |arm| {
+        matched_arms[matched_initialized] = try documentMergeMatchedArmAlloc(alloc, schema, source_schema, target_table, arm);
+        matched_initialized += 1;
+    }
+
+    var not_matched_arms = try alloc.alloc(plan_mod.DocumentMergeNotMatchedArm, merge.not_matched_arms.len);
+    var not_matched_initialized: usize = 0;
+    errdefer {
+        for (not_matched_arms[0..not_matched_initialized]) |*arm| arm.deinit(alloc);
+        if (not_matched_arms.len > 0) alloc.free(not_matched_arms);
+    }
+    for (merge.not_matched_arms) |arm| {
+        not_matched_arms[not_matched_initialized] = try documentMergeNotMatchedArmAlloc(alloc, arm);
+        not_matched_initialized += 1;
+    }
+
+    const join_keys = try documentMergeJoinKeysAlloc(alloc, merge.match_fields);
+    errdefer {
+        for (join_keys) |*join_key| join_key.deinit(alloc);
+        alloc.free(join_keys);
+    }
+
+    const table_name = try alloc.dupe(u8, merge.target_table_name);
+    errdefer alloc.free(table_name);
+    const source_table_name = try alloc.dupe(u8, merge.source_table_name);
+    errdefer alloc.free(source_table_name);
+
+    return .{
+        .table_name = table_name,
+        .source_table_name = source_table_name,
+        .target_producer = documentMergeAllTableProducer(),
+        .source_producer = documentMergeAllTableProducer(),
+        .join_keys = join_keys,
+        .matched_arms = matched_arms,
+        .not_matched_arms = not_matched_arms,
+        .max_target_rows = source_binding.default_document_sql_bounded_scan_rows,
+        .max_source_rows = source_binding.default_document_sql_bounded_scan_rows,
+        .sync_level = sync_level,
+    };
 }
 
 fn tokenIdentifierMatches(token: Token, identifier: []const u8) bool {

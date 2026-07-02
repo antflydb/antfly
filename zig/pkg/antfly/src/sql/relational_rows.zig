@@ -36,6 +36,9 @@ pub const OwnedRowsBatchRequest = struct {
     transforms: []db_mod.types.DocumentTransform = &.{},
     predicates: []db_mod.types.TransactionVersionPredicate = &.{},
     returning_rows: [][]const u8 = &.{},
+    returning_version_keys: [][]const u8 = &.{},
+    returning_version_prewrite: []u64 = &.{},
+    returning_version_outputs: [][]const u8 = &.{},
     req: db_mod.types.BatchRequest = .{},
     inserted: u32 = 0,
     deleted: u32 = 0,
@@ -68,6 +71,11 @@ pub const OwnedRowsBatchRequest = struct {
         if (self.predicates.len > 0) alloc.free(self.predicates);
         for (self.returning_rows) |row| alloc.free(@constCast(row));
         if (self.returning_rows.len > 0) alloc.free(self.returning_rows);
+        for (self.returning_version_keys) |key| alloc.free(key);
+        if (self.returning_version_keys.len > 0) alloc.free(self.returning_version_keys);
+        if (self.returning_version_prewrite.len > 0) alloc.free(self.returning_version_prewrite);
+        for (self.returning_version_outputs) |output| alloc.free(output);
+        if (self.returning_version_outputs.len > 0) alloc.free(self.returning_version_outputs);
         self.* = undefined;
     }
 };
@@ -3300,7 +3308,7 @@ fn parseRowsJoinRequestWithSchemas(
     }) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidRowsRequest;
-    try requireJsonObjectOnlyKeys(parsed.value.object, &.{ "left", "right", "on", "on_expression_where", "on_expression_any", "on_expression_not", "on_expression_array_contains", "match_expression_where", "match_expression_any", "match_expression_not", "match_expression_array_contains", "join_type", "strategy", "select", "order_by", "limit", "offset" });
+    try requireJsonObjectOnlyKeys(parsed.value.object, &.{ "left", "right", "on", "on_expression_where", "on_expression_any", "on_expression_not", "on_expression_array_contains", "match_expression_where", "match_expression_any", "match_expression_not", "match_expression_array_contains", "join_type", "strategy", "planning_hints", "select", "order_by", "limit", "offset" });
 
     var left = try parseRowsJoinSourceAlloc(alloc, left_schema, parsed.value.object.get("left") orelse return error.InvalidRowsRequest);
     errdefer left.deinit(alloc);
@@ -3351,6 +3359,7 @@ fn parseRowsJoinRequestWithSchemas(
         .match_expression_array_contains = match_expression_array_contains,
         .join_type = try parseRowsJoinType(parsed.value.object.get("join_type")),
         .strategy = try parseRowsJoinStrategy(parsed.value.object.get("strategy")),
+        .planning_hints = try parseRowsJoinPlanningHints(parsed.value.object.get("planning_hints")),
         .select = select,
         .order_by = order_by,
         .limit = try parseOptionalU32(parsed.value.object.get("limit")),
@@ -7520,15 +7529,47 @@ pub fn encodeRowsAggregateResponseWithSchemaAlloc(
     result: db_mod.types.RelationalRowsAggregateResult,
     result_schema: []const runtime_schema.RelationalColumn,
 ) ![]u8 {
-    return try encodeRowsResultWithTotalFieldAlloc(alloc, "total_groups", result.total_groups, result.rows, result_schema);
+    return try encodeRowsAggregateResponseWithResultSchemaAlloc(alloc, result, result_schema);
 }
 
 pub fn encodeRowsAggregateResponseWithResultSchemaAlloc(
     alloc: std.mem.Allocator,
     result: db_mod.types.RelationalRowsAggregateResult,
-    result_schema: []const RowsResultColumn,
+    result_schema: anytype,
 ) ![]u8 {
-    return try encodeRowsResultWithTotalFieldAndResultSchemaAlloc(alloc, "total_groups", result.total_groups, result.rows, result_schema);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.print("{{\"total_groups\":{d}", .{result.total_groups});
+    try appendRowsAggregateDiagnosticsJson(writer, result.diagnostics);
+    try appendRowsResultColumnsJson(writer, result_schema);
+    try writer.writeAll(",\"rows\":[");
+    for (result.rows, 0..) |row, i| {
+        if (i != 0) try writer.writeByte(',');
+        try writer.writeAll(row);
+    }
+    try writer.writeAll("]}");
+    return try out.toOwnedSlice();
+}
+
+fn appendRowsAggregateDiagnosticsJson(
+    writer: *std.Io.Writer,
+    diagnostics: db_mod.types.RelationalRowsAggregateDiagnostics,
+) !void {
+    try writer.print(
+        ",\"aggregate_diagnostics\":{{\"input_rows\":{d},\"output_groups\":{d},\"metric_slots\":{d},\"estimated_group_memory_bytes\":{d},\"estimated_metric_memory_bytes\":{d},\"distinct_spill_writes\":{d},\"distinct_spill_bytes\":{d},\"distinct_spill_reload_count\":{d},\"resource_budget_failures\":{d}}}",
+        .{
+            diagnostics.input_rows,
+            diagnostics.output_groups,
+            diagnostics.metric_slots,
+            diagnostics.estimated_group_memory_bytes,
+            diagnostics.estimated_metric_memory_bytes,
+            diagnostics.distinct_spill_writes,
+            diagnostics.distinct_spill_bytes,
+            diagnostics.distinct_spill_reload_count,
+            diagnostics.resource_budget_failures,
+        },
+    );
 }
 
 pub fn encodeRowsWindowResponseAlloc(
@@ -7580,10 +7621,13 @@ pub fn encodeRowsJoinResponseWithResultSchemaAlloc(
     try writer.print("{{\"total_rows\":{d}", .{result.total_rows});
     if (result.strategy_selection) |selection| {
         try writer.print(
-            ",\"join_strategy\":{{\"requested\":{f},\"selected\":{f}}}",
+            ",\"join_strategy\":{{\"requested\":{f},\"selected\":{f},\"left_rows\":{d},\"right_rows\":{d},\"right_lookup_index\":{f}}}",
             .{
                 std.json.fmt(@tagName(selection.requested), .{}),
                 std.json.fmt(@tagName(selection.selected), .{}),
+                selection.left_rows,
+                selection.right_rows,
+                std.json.fmt(@tagName(selection.right_lookup_index), .{}),
             },
         );
     }
@@ -10028,6 +10072,38 @@ fn parseRowsJoinStrategy(maybe_strategy: ?std.json.Value) !db_mod.types.Relation
     if (std.mem.eql(u8, strategy_value.string, "hash")) return .hash;
     if (std.mem.eql(u8, strategy_value.string, "merge")) return .merge;
     return error.InvalidRowsRequest;
+}
+
+fn parseRowsJoinLookupIndexHint(maybe_hint: ?std.json.Value) !db_mod.types.RelationalRowsJoinLookupIndexHint {
+    const hint_value = maybe_hint orelse return .unknown;
+    if (hint_value != .string) return error.InvalidRowsRequest;
+    if (std.mem.eql(u8, hint_value.string, "unknown")) return .unknown;
+    if (std.mem.eql(u8, hint_value.string, "available")) return .available;
+    if (std.mem.eql(u8, hint_value.string, "unavailable")) return .unavailable;
+    return error.InvalidRowsRequest;
+}
+
+fn parseRowsJoinPlanningSideHints(maybe_value: ?std.json.Value) !db_mod.types.RelationalRowsJoinSidePlanningHints {
+    const value = maybe_value orelse return .{};
+    if (value != .object) return error.InvalidRowsRequest;
+    try requireJsonObjectOnlyKeys(value.object, &.{"estimated_cardinality"});
+    const estimated_cardinality_raw = try parseOptionalU64(value.object.get("estimated_cardinality"));
+    const estimated_cardinality = if (estimated_cardinality_raw) |raw| blk: {
+        if (raw > std.math.maxInt(usize)) return error.InvalidRowsRequest;
+        break :blk @as(usize, @intCast(raw));
+    } else null;
+    return .{ .estimated_cardinality = estimated_cardinality };
+}
+
+fn parseRowsJoinPlanningHints(maybe_value: ?std.json.Value) !db_mod.types.RelationalRowsJoinPlanningHints {
+    const value = maybe_value orelse return .{};
+    if (value != .object) return error.InvalidRowsRequest;
+    try requireJsonObjectOnlyKeys(value.object, &.{ "left", "right", "right_lookup_index" });
+    return .{
+        .left = try parseRowsJoinPlanningSideHints(value.object.get("left")),
+        .right = try parseRowsJoinPlanningSideHints(value.object.get("right")),
+        .right_lookup_index = try parseRowsJoinLookupIndexHint(value.object.get("right_lookup_index")),
+    };
 }
 
 fn parseRowsJoinSide(value: std.json.Value) !db_mod.types.RelationalRowsJoinProjectionSide {
@@ -22128,6 +22204,29 @@ test "relational rows lake bridge folds projected rows as aggregate result" {
     }
 }
 
+test "relational rows aggregate response exposes resource diagnostics" {
+    const alloc = std.testing.allocator;
+    var rows = [_][]const u8{"{\"tenant\":\"t1\",\"row_count\":2}"};
+    const result = db_mod.types.RelationalRowsAggregateResult{
+        .rows = rows[0..],
+        .total_groups = 1,
+        .diagnostics = .{
+            .input_rows = 3,
+            .output_groups = 1,
+            .metric_slots = 2,
+            .estimated_group_memory_bytes = 64,
+            .estimated_metric_memory_bytes = 48,
+            .distinct_spill_writes = 4,
+            .distinct_spill_bytes = 96,
+            .distinct_spill_reload_count = 0,
+            .resource_budget_failures = 0,
+        },
+    };
+    const response = try encodeRowsAggregateResponseAlloc(alloc, result);
+    defer alloc.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"aggregate_diagnostics\":{\"input_rows\":3,\"output_groups\":1,\"metric_slots\":2,\"estimated_group_memory_bytes\":64,\"estimated_metric_memory_bytes\":48,\"distinct_spill_writes\":4,\"distinct_spill_bytes\":96,\"distinct_spill_reload_count\":0,\"resource_budget_failures\":0}") != null);
+}
+
 test "relational rows lake bridge folds projected rows as grouped aggregate result" {
     const alloc = std.testing.allocator;
     const tenant_name_0 = @constCast("tenant"[0..]);
@@ -26452,14 +26551,34 @@ test "relational rows cte plan contract executes derived outputs across read sta
     try std.testing.expectEqual(@as(u32, 2), join_result.total_rows);
     try std.testing.expectEqual(db_mod.types.RelationalRowsJoinStrategy.auto, join_result.strategy_selection.?.requested);
     try std.testing.expectEqual(db_mod.types.RelationalRowsJoinStrategy.lookup, join_result.strategy_selection.?.selected);
+    try std.testing.expectEqual(@as(usize, 3), join_result.strategy_selection.?.left_rows);
+    try std.testing.expectEqual(@as(usize, 1), join_result.strategy_selection.?.right_rows);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinLookupIndexHint.unknown, join_result.strategy_selection.?.right_lookup_index);
     const encoded_join_result = try encodeRowsJoinResponseAlloc(alloc, join_result);
     defer alloc.free(encoded_join_result);
     var parsed_join_response = try std.json.parseFromSlice(std.json.Value, alloc, encoded_join_result, .{ .allocate = .alloc_always });
     defer parsed_join_response.deinit();
     try std.testing.expectEqualStrings("auto", parsed_join_response.value.object.get("join_strategy").?.object.get("requested").?.string);
     try std.testing.expectEqualStrings("lookup", parsed_join_response.value.object.get("join_strategy").?.object.get("selected").?.string);
+    try std.testing.expectEqual(@as(i64, 3), parsed_join_response.value.object.get("join_strategy").?.object.get("left_rows").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), parsed_join_response.value.object.get("join_strategy").?.object.get("right_rows").?.integer);
+    try std.testing.expectEqualStrings("unknown", parsed_join_response.value.object.get("join_strategy").?.object.get("right_lookup_index").?.string);
     try std.testing.expectEqualStrings("{\"left_id\":\"a\",\"right_id\":\"b\"}", join_result.rows[0]);
     try std.testing.expectEqualStrings("{\"left_id\":\"b\",\"right_id\":\"b\"}", join_result.rows[1]);
+
+    var hinted_hash_join_plan = try parseRowsJoinPlanRequest(
+        alloc,
+        "{\"join\":{\"left\":{},\"right\":{},\"planning_hints\":{\"left\":{\"estimated_cardinality\":1000},\"right\":{\"estimated_cardinality\":16},\"right_lookup_index\":\"unavailable\"},\"on\":[{\"left_field\":\"tenant\",\"right_field\":\"tenant\"}],\"select\":[{\"as\":\"left_id\",\"side\":\"left\",\"field\":\"id\"},{\"as\":\"right_id\",\"side\":\"right\",\"field\":\"id\"}],\"order_by\":[{\"field\":\"left_id\"},{\"field\":\"right_id\"}]}}",
+        schema,
+    );
+    defer hinted_hash_join_plan.deinit(alloc);
+    var hinted_hash_join_result = try executeRowsJoinPlanOnJsonRowsAlloc(alloc, schema, hinted_hash_join_plan, rows[0..], rows[0..], rows[0..]);
+    defer hinted_hash_join_result.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinStrategy.auto, hinted_hash_join_result.strategy_selection.?.requested);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinStrategy.hash, hinted_hash_join_result.strategy_selection.?.selected);
+    try std.testing.expectEqual(@as(usize, 1000), hinted_hash_join_result.strategy_selection.?.left_rows);
+    try std.testing.expectEqual(@as(usize, 16), hinted_hash_join_result.strategy_selection.?.right_rows);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinLookupIndexHint.unavailable, hinted_hash_join_result.strategy_selection.?.right_lookup_index);
 
     var ranged_join_plan = try parseRowsJoinPlanRequest(
         alloc,
@@ -26503,6 +26622,20 @@ test "relational rows cte plan contract executes derived outputs across read sta
     try std.testing.expectEqualStrings("{\"left_id\":\"a\",\"right_id\":\"a\"}", sorted_merge_join_result.rows[0]);
     try std.testing.expectEqualStrings("{\"left_id\":\"b\",\"right_id\":\"b\"}", sorted_merge_join_result.rows[3]);
     try std.testing.expectEqualStrings("{\"left_id\":\"d\",\"right_id\":\"d\"}", sorted_merge_join_result.rows[7]);
+
+    var hinted_auto_merge_join_plan = try parseRowsJoinPlanRequest(
+        alloc,
+        "{\"join\":{\"left\":{\"order_by\":[{\"field\":\"tenant\"},{\"field\":\"id\"}]},\"right\":{\"order_by\":[{\"field\":\"tenant\"},{\"field\":\"id\"}]},\"planning_hints\":{\"left\":{\"estimated_cardinality\":1000},\"right\":{\"estimated_cardinality\":1000},\"right_lookup_index\":\"available\"},\"on\":[{\"left_field\":\"tenant\",\"right_field\":\"tenant\"}],\"select\":[{\"as\":\"left_id\",\"side\":\"left\",\"field\":\"id\"},{\"as\":\"right_id\",\"side\":\"right\",\"field\":\"id\"}],\"order_by\":[{\"field\":\"left_id\"},{\"field\":\"right_id\"}]}}",
+        schema,
+    );
+    defer hinted_auto_merge_join_plan.deinit(alloc);
+    var hinted_auto_merge_join_result = try executeRowsJoinPlanOnJsonRowsAlloc(alloc, schema, hinted_auto_merge_join_plan, rows[0..], rows[0..], rows[0..]);
+    defer hinted_auto_merge_join_result.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinStrategy.auto, hinted_auto_merge_join_result.strategy_selection.?.requested);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinStrategy.merge, hinted_auto_merge_join_result.strategy_selection.?.selected);
+    try std.testing.expectEqual(@as(usize, 1000), hinted_auto_merge_join_result.strategy_selection.?.left_rows);
+    try std.testing.expectEqual(@as(usize, 1000), hinted_auto_merge_join_result.strategy_selection.?.right_rows);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinLookupIndexHint.available, hinted_auto_merge_join_result.strategy_selection.?.right_lookup_index);
 
     var lateral_plan = try parseRowsLateralPlanRequest(
         alloc,
@@ -29523,6 +29656,146 @@ test "relational rows insert source contract parses typed source assignments" {
         "{\"ctes\":[{\"name\":\"ready_sources\",\"query\":{\"select\":[\"source_id\"]}}],\"insert_source\":{\"op\":\"insert\",\"source\":{\"source_cte\":\"ready_sources\",\"doc_key_range\":{\"start\":\"row:a\",\"end\":\"row:z\"}},\"assignments\":[{\"target_field\":\"id\",\"expr\":{\"field\":\"source_id\"}}]}}",
         schema,
     ));
+}
+
+test "relational rows insert source conflict owner topology changes fail closed" {
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"source_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id","source_id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"rows_source_id_key","columns":["source_id"]}]}
+    ;
+    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(std.testing.allocator, schema_json);
+    defer parsed.deinit(std.testing.allocator);
+    const schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(std.testing.allocator, parsed);
+    defer runtime_schema.freeSchema(std.testing.allocator, schema);
+
+    const assignments = [_]db_mod.types.RelationalRowsExpressionAssignment{
+        .{ .field = "id", .expression = .{ .kind = .field, .field = "id", .field_source = .row } },
+        .{ .field = "source_id", .expression = .{ .kind = .field, .field = "source_id", .field_source = .row } },
+        .{ .field = "status", .expression = .{ .kind = .field, .field = "status", .field_source = .row } },
+    };
+    const req: db_mod.types.RelationalRowsInsertSourceRequest = .{
+        .assignments = assignments[0..],
+        .on_conflict = .{
+            .target = .{ .kind = .unique, .unique_name = "rows_source_id_key" },
+            .action = .nothing,
+        },
+    };
+    const source_rows = [_][]const u8{
+        "{\"id\":\"row-1\",\"source_id\":\"source-1\",\"status\":\"ready\"}",
+    };
+
+    const UniqueTopologyResolver = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) UniqueSelectorResolver {
+            return .{ .ptr = self, .resolve = resolve };
+        }
+
+        fn resolve(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            constraint_name: []const u8,
+            encoded_value: []const u8,
+        ) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("usage_records", table_name);
+            try std.testing.expectEqualStrings("rows_source_id_key", constraint_name);
+            try std.testing.expect(encoded_value.len > 0);
+            self.calls += 1;
+            return error.TopologyChanged;
+        }
+    };
+
+    var unique_resolver = UniqueTopologyResolver{};
+    try std.testing.expectError(
+        error.TopologyChanged,
+        buildRowsInsertSourceBatchAlloc(
+            std.testing.allocator,
+            "usage_records",
+            schema,
+            req,
+            source_rows[0..],
+            unique_resolver.iface(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), unique_resolver.calls);
+
+    const temporal_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"sku":{"type":"keyword"},"valid_from":{"type":"numeric"},"valid_to":{"type":"numeric"},"price":{"type":"numeric"}},"required":["id","sku","valid_from","valid_to"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"unique_constraints":[{"name":"prices_sku_time_key","columns":["sku"],"without_overlaps_period":"valid_time"}]}
+    ;
+    var temporal_parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(std.testing.allocator, temporal_schema_json);
+    defer temporal_parsed.deinit(std.testing.allocator);
+    const temporal_schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(std.testing.allocator, temporal_parsed);
+    defer runtime_schema.freeSchema(std.testing.allocator, temporal_schema);
+
+    const temporal_assignments = [_]db_mod.types.RelationalRowsExpressionAssignment{
+        .{ .field = "id", .expression = .{ .kind = .field, .field = "id", .field_source = .row } },
+        .{ .field = "sku", .expression = .{ .kind = .field, .field = "sku", .field_source = .row } },
+        .{ .field = "valid_from", .expression = .{ .kind = .field, .field = "valid_from", .field_source = .row } },
+        .{ .field = "valid_to", .expression = .{ .kind = .field, .field = "valid_to", .field_source = .row } },
+        .{ .field = "price", .expression = .{ .kind = .field, .field = "price", .field_source = .row } },
+    };
+    const temporal_req: db_mod.types.RelationalRowsInsertSourceRequest = .{
+        .assignments = temporal_assignments[0..],
+        .on_conflict = .{
+            .target = .{ .kind = .unique, .unique_name = "prices_sku_time_key" },
+            .action = .nothing,
+        },
+    };
+    const temporal_source_rows = [_][]const u8{
+        "{\"id\":\"price-1\",\"sku\":\"sku-1\",\"valid_from\":0,\"valid_to\":10,\"price\":12}",
+    };
+
+    const TemporalTopologyResolver = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) UniqueSelectorResolver {
+            return .{ .ptr = self, .resolve = resolve, .resolve_temporal_overlap = resolveTemporalOverlap };
+        }
+
+        fn resolve(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+        ) !?[]u8 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn resolveTemporalOverlap(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            constraint_name: []const u8,
+            encoded_value: []const u8,
+            encoded_start: []const u8,
+            encoded_end: []const u8,
+        ) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("prices", table_name);
+            try std.testing.expectEqualStrings("prices_sku_time_key", constraint_name);
+            try std.testing.expect(encoded_value.len > 0);
+            try std.testing.expect(encoded_start.len > 0);
+            try std.testing.expect(encoded_end.len > 0);
+            self.calls += 1;
+            return error.UniqueOwnerTopologyUnavailable;
+        }
+    };
+
+    var temporal_resolver = TemporalTopologyResolver{};
+    try std.testing.expectError(
+        error.UniqueOwnerTopologyUnavailable,
+        buildRowsInsertSourceBatchAlloc(
+            std.testing.allocator,
+            "prices",
+            temporal_schema,
+            temporal_req,
+            temporal_source_rows[0..],
+            temporal_resolver.iface(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), temporal_resolver.calls);
 }
 
 test "relational rows joined mutation source contract parses lockable join plans" {

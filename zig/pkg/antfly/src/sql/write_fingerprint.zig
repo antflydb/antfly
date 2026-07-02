@@ -605,6 +605,44 @@ pub fn writePlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredWrite
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "returning_rows", document_write.batch.returning_rows.len);
             break :blk fingerprint;
         },
+        .document_conflict_write => |document_conflict| blk: {
+            var fingerprint = try std.fmt.allocPrint(
+                alloc,
+                "document_conflict_write:table={s}:action={s}:writes={d}:ops={d}",
+                .{
+                    document_conflict.table_name,
+                    @tagName(document_conflict.action),
+                    document_conflict.proposed_writes.len,
+                    document_conflict.operations.len,
+                },
+            );
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_assignments", document_conflict.source_assignments.len);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "expression_assignments", document_conflict.expression_assignments.len);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "where_expression", if (document_conflict.where_expression == null) 0 else 1);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "where_expressions", document_conflict.where_expressions.len);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "where_any", document_conflict.where_any.len);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "where_not", document_conflict.where_not.len);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "returning", document_conflict.returning_fields.len);
+            break :blk fingerprint;
+        },
+        .document_source_insert => |document_source_insert| blk: {
+            var fingerprint = try std.fmt.allocPrint(
+                alloc,
+                "document_source_insert:table={s}:source_table={s}",
+                .{
+                    document_source_insert.table_name,
+                    document_source_insert.source_table_name,
+                },
+            );
+            fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "source_producer", documentProducerName(document_source_insert.source_producer));
+            if (document_source_insert.source_limit) |source_limit| {
+                fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "source_limit", source_limit);
+            }
+            fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "generated_target_id", document_source_insert.target_id_mode == .generated_document_id);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_assignments", document_source_insert.assignments.len);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "returning", document_source_insert.returning_fields.len);
+            break :blk fingerprint;
+        },
         .document_producer_mutation => |document_mutation| blk: {
             var fingerprint = try std.fmt.allocPrint(
                 alloc,
@@ -668,6 +706,28 @@ pub fn writePlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredWrite
                 "duplicate_source",
                 documentJoinedMutationDuplicateSourcePolicyName(document_mutation.duplicate_source_policy),
             );
+            break :blk fingerprint;
+        },
+        .document_merge_mutation => |document_mutation| blk: {
+            var fingerprint = try std.fmt.allocPrint(
+                alloc,
+                "document_merge_write:table={s}:source_table={s}",
+                .{
+                    document_mutation.table_name,
+                    document_mutation.source_table_name,
+                },
+            );
+            fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "target_producer", documentProducerName(document_mutation.target_producer));
+            fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "source_producer", documentProducerName(document_mutation.source_producer));
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "join_keys", document_mutation.join_keys.len);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "matched_arms", document_mutation.matched_arms.len);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "not_matched_arms", document_mutation.not_matched_arms.len);
+            if (document_mutation.max_target_rows) |max_target_rows| {
+                fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "max_target_rows", max_target_rows);
+            }
+            if (document_mutation.max_source_rows) |max_source_rows| {
+                fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "max_source_rows", max_source_rows);
+            }
             break :blk fingerprint;
         },
         .insert_source => |insert_source| blk: {

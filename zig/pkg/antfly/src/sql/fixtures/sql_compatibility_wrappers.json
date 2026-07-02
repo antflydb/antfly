@@ -25,31 +25,6 @@
         "durable_row": "none",
         "proof": "Bounded document query scan fallbacks are read-only query plans and cannot issue document writes or catalog mutations."
       }
-    },
-    {
-      "id": "grammar-maintenance-tail-token-parsers",
-      "family": "maintenance",
-      "wrapper_class": "parser",
-      "classification": "compatibility_contract",
-      "file": "zig/pkg/antfly/src/sql/grammar.zig",
-      "symbol": "parseVacuumMaintenanceTailAlloc / parseAnalyzeMaintenanceTailAlloc",
-      "contract_reason": "postgres_maintenance_tail_compatibility",
-      "compatibility_reason": "PostgreSQL dump and admin compatibility commands keep focused token-tail parsers for maintenance statements outside core generated execution paths.",
-      "typed_replacement": "Generated maintenance statement ASTs with command, option, target, and unsupported-shape diagnostics.",
-      "deletion_gate": "VACUUM, ANALYZE, REINDEX, CLUSTER, cursor, prepared statement, and transaction maintenance fixtures prove generated AST coverage or explicit no-op/unsupported classifications.",
-      "deletion_evidence": {
-        "typed_parser": "Generated maintenance ASTs carry command, option, relation, cursor, prepared statement, and transaction spans.",
-        "typed_binder": "Maintenance commands with catalog targets resolve generated relation or statement identities without token-tail reparsing.",
-        "typed_plan": "Generated maintenance planners emit explicit no-op, unsupported, or typed maintenance plans.",
-        "typed_runtime": "Runtime executes admitted no-op or typed maintenance actions without changing durable state through token-only paths.",
-        "parity": "Maintenance fixtures compare generated plans with compatibility behavior and unsupported/no-op diagnostics."
-      },
-      "state_safety": {
-        "durable_catalog": "read_only",
-        "durable_document": "none",
-        "durable_row": "read_only",
-        "proof": "Maintenance tail parsers currently admit no-op, unsupported, or read-only maintenance plans; durable mutations remain gated by typed maintenance planning."
-      }
     }
   ]
 }

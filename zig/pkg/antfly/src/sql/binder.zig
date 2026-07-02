@@ -371,6 +371,15 @@ pub fn resolveRowExpressionFieldAlloc(
     defer_row_expression_field_validation: bool,
     default_source: db_mod.types.RelationalRowsExpressionFieldSource,
 ) !ResolvedRowExpressionField {
+    if (joined_target_expression_qualifiers.len != 0) {
+        if (try normalizeQualifiedRowExpressionFieldAlloc(alloc, field, joined_target_expression_qualifiers, schema)) |target_field| {
+            return .{
+                .field = target_field,
+                .source = .row,
+                .schema = schema,
+            };
+        }
+    }
     if (joined_source_expression_qualifiers.len != 0) {
         const source_schema = joined_source_schema orelse schema;
         if (try normalizeQualifiedRowExpressionFieldAlloc(alloc, field, joined_source_expression_qualifiers, source_schema)) |source_field| {
@@ -378,15 +387,6 @@ pub fn resolveRowExpressionFieldAlloc(
                 .field = source_field,
                 .source = .source,
                 .schema = source_schema,
-            };
-        }
-    }
-    if (joined_target_expression_qualifiers.len != 0) {
-        if (try normalizeQualifiedRowExpressionFieldAlloc(alloc, field, joined_target_expression_qualifiers, schema)) |target_field| {
-            return .{
-                .field = target_field,
-                .source = .row,
-                .schema = schema,
             };
         }
     }
@@ -5473,6 +5473,52 @@ test "sql adapter binder rejects ambiguous physical cte read source tables" {
         error.UnsupportedSqlShape,
         readSourceTableNamesFromParsedSqlAlloc(alloc, &parsed_sql),
     );
+}
+
+test "sql adapter binder resolves self merge table qualifier as target before source alias" {
+    const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "title", .path = "title", .field_type = .keyword },
+        .{ .name = "status", .path = "status", .field_type = .keyword },
+    };
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = &columns,
+    };
+
+    const target_qualifiers = [_][]const u8{ "docs", "docs" };
+    const source_qualifiers = [_][]const u8{ "docs", "source" };
+    const target = try resolveRowExpressionFieldAlloc(
+        alloc,
+        schema,
+        schema,
+        "docs.status",
+        &.{},
+        &.{},
+        source_qualifiers[0..],
+        target_qualifiers[0..],
+        false,
+        .row,
+    );
+    defer alloc.free(target.field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.row, target.source);
+    try std.testing.expectEqualStrings("status", target.field);
+
+    const source = try resolveRowExpressionFieldAlloc(
+        alloc,
+        schema,
+        schema,
+        "source.title",
+        &.{},
+        &.{},
+        source_qualifiers[0..],
+        target_qualifiers[0..],
+        false,
+        .row,
+    );
+    defer alloc.free(source.field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, source.source);
+    try std.testing.expectEqualStrings("title", source.field);
 }
 
 test "sql adapter binder validates relational catalog lookups" {
