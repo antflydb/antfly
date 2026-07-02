@@ -1677,7 +1677,7 @@ pub fn buildQueryBuilderResponseWithContext(
         return try buildRecursiveQueryBuilderResponseWithContext(alloc, request, table_context, generation_runner);
     }
 
-    return try buildPipelineQueryBuilderResponseWithContext(alloc, request, table_context, generation_runner);
+    return try buildPipelineQueryBuilderResponseWithContext(alloc, request, table_context, generation_runner, false);
 }
 
 fn buildPipelineQueryBuilderResponseWithContext(
@@ -1685,6 +1685,7 @@ fn buildPipelineQueryBuilderResponseWithContext(
     request: metadata_openapi.QueryBuilderRequest,
     table_context: QueryBuilderTableContext,
     generation_runner: ?GenerationRunner,
+    preserve_generation_timeout_errors: bool,
 ) !metadata_openapi.QueryBuilderResult {
     const session_id = try ensureQueryBuilderSessionId(alloc, request.session_id);
     const effective_intent = try appendDecisionContext(alloc, request.intent, request.decisions orelse &.{});
@@ -1713,6 +1714,7 @@ fn buildPipelineQueryBuilderResponseWithContext(
         table_context.graph_index_metadata,
         table_context.plan_validator,
         generation_runner,
+        preserve_generation_timeout_errors,
         &warnings,
     ) catch |err| switch (err) {
         error.UnsupportedQueryBuilderGeneration, error.InvalidQueryBuilderGeneration => blk: {
@@ -1970,6 +1972,7 @@ const RecursiveQueryBuilderCandidateStepDetails = struct {
     score: f64 = 0,
     specialist: ?[]const u8 = null,
     artifact: ?[]const u8 = null,
+    @"error": ?[]const u8 = null,
 };
 
 const RecursiveQueryBuilderDecompositionDetails = struct {
@@ -1990,11 +1993,12 @@ const RecursiveQueryBuilderDecompositionDetails = struct {
 };
 
 const RecursiveQueryBuilderMergeDetails = struct {
-    selected_candidate_id: []const u8,
+    selected_candidate_id: ?[]const u8,
     candidate_count: usize,
     selected_specialist: ?[]const u8 = null,
     selected_artifact: ?[]const u8 = null,
     incomplete_reason: ?[]const u8 = null,
+    failure_reason: ?[]const u8 = null,
     wall_time_exhausted: bool = false,
     elapsed_ms: i64 = 0,
 };
@@ -2068,6 +2072,7 @@ fn buildRecursiveQueryBuilderResponseWithContext(
     var selected_score: f64 = -1;
     var selected_candidate_id: ?[]const u8 = null;
     var selected_artifact: ?[]const u8 = null;
+    var candidate_error_count: usize = 0;
     var scheduled: usize = 0;
     var truncated_by_subcalls = false;
     var wall_time_exhausted = false;
@@ -2097,8 +2102,10 @@ fn buildRecursiveQueryBuilderResponseWithContext(
         else
             null;
 
-        const candidate_result = buildPipelineQueryBuilderResponseWithContext(alloc, candidate_request, table_context, candidate_generation_runner) catch |err| {
+        const candidate_result = buildPipelineQueryBuilderResponseWithContext(alloc, candidate_request, table_context, candidate_generation_runner, true) catch |err| {
+            const timed_out = recursive_agent.isGenerationTimeoutError(err) or budget.expired();
             const message = try std.fmt.allocPrint(alloc, "{s}", .{@errorName(err)});
+            candidate_error_count += 1;
             try candidate_plans.append(try recursiveQueryBuilderCandidatePlanValue(alloc, .{
                 .id = candidate_id,
                 .mode = mode,
@@ -2113,8 +2120,13 @@ fn buildRecursiveQueryBuilderResponseWithContext(
                 .details = try jsonValueFromStruct(alloc, RecursiveQueryBuilderCandidateStepDetails{
                     .candidate_id = candidate_id,
                     .mode = mode,
+                    .@"error" = message,
                 }),
             });
+            if (timed_out) {
+                wall_time_exhausted = true;
+                break;
+            }
             continue;
         };
 
@@ -2209,8 +2221,6 @@ fn buildRecursiveQueryBuilderResponseWithContext(
         }
     }
 
-    var result = selected_result orelse return error.InvalidQueryBuilderRequest;
-    const selected_id = selected_candidate_id orelse return error.InvalidQueryBuilderRequest;
     if (scheduled < candidate_modes.len and scheduled >= max_subcalls) truncated_by_subcalls = true;
     const incomplete_reason = recursive_agent.incompleteReason(truncated_by_subcalls, 0, wall_time_exhausted);
     const budget_summary = RecursiveQueryBuilderBudgetSummary{
@@ -2224,6 +2234,17 @@ fn buildRecursiveQueryBuilderResponseWithContext(
         .elapsed_ms = budget.elapsedMs(),
         .incomplete_reason = incomplete_reason,
     };
+    var result = selected_result orelse return try buildFailedRecursiveQueryBuilderResponse(
+        alloc,
+        request,
+        cfg,
+        candidate_modes[0..scheduled],
+        candidate_steps.items,
+        .{ .array = candidate_plans },
+        budget_summary,
+        candidate_error_count,
+    );
+    const selected_id = selected_candidate_id orelse return error.InvalidQueryBuilderRequest;
     result.plan = try buildRecursiveQueryBuilderPlan(alloc, result.plan, cfg, selected_id, .{ .array = candidate_plans }, budget_summary);
     result.steps = try buildRecursiveQueryBuilderSteps(
         alloc,
@@ -2235,6 +2256,8 @@ fn buildRecursiveQueryBuilderResponseWithContext(
         result.specialist,
         selected_artifact,
         budget_summary,
+        .success,
+        null,
     );
     if (incomplete_reason) |reason| {
         result.status = .incomplete;
@@ -2248,6 +2271,55 @@ fn buildRecursiveQueryBuilderResponseWithContext(
     result.iteration = 1 + @as(i64, @intCast(scheduled));
     result.remaining_internal_iterations = @max(@as(i64, 0), (request.max_internal_iterations orelse 0) - result.iteration.?);
     return result;
+}
+
+fn buildFailedRecursiveQueryBuilderResponse(
+    alloc: std.mem.Allocator,
+    request: metadata_openapi.QueryBuilderRequest,
+    cfg: recursive_agent.RecursiveConfig,
+    scheduled_modes: []const []const u8,
+    candidate_steps: []const metadata_openapi.AgentStep,
+    candidate_plans: std.json.Value,
+    budget: RecursiveQueryBuilderBudgetSummary,
+    candidate_error_count: usize,
+) !metadata_openapi.QueryBuilderResult {
+    const failure_reason: []const u8 = if (budget.incomplete_reason) |reason| reason else "all_candidates_failed";
+    const status: AgentStatus = if (budget.incomplete_reason != null) .incomplete else .failed;
+    const warning = if (budget.incomplete_reason != null)
+        "Recursive query-builder mode exhausted its wall-time budget before producing an executable candidate."
+    else
+        "Recursive query-builder mode did not produce an executable candidate.";
+    return .{
+        .session_id = try ensureQueryBuilderSessionId(alloc, request.session_id),
+        .iteration = 1 + @as(i64, @intCast(budget.scheduled_candidate_count)),
+        .clarification_count = if (request.decisions) |decisions| @intCast(decisions.len) else 0,
+        .status = status,
+        .incomplete_details = if (budget.incomplete_reason) |reason| .{ .reason = reason } else null,
+        .steps = try buildRecursiveQueryBuilderSteps(
+            alloc,
+            cfg,
+            null,
+            scheduled_modes,
+            candidate_steps,
+            &.{},
+            null,
+            null,
+            budget,
+            .@"error",
+            failure_reason,
+        ),
+        .remaining_internal_iterations = @max(@as(i64, 0), (request.max_internal_iterations orelse 0) - (1 + @as(i64, @intCast(budget.scheduled_candidate_count)))),
+        .remaining_user_clarifications = @max(
+            @as(i64, 0),
+            (request.max_user_clarifications orelse 0) - if (request.decisions) |decisions| @as(i64, @intCast(decisions.len)) else 0,
+        ),
+        .query = try buildQueryBuilderMatchNoneQuery(alloc),
+        .specialist = "recursive",
+        .plan = try buildRecursiveQueryBuilderPlan(alloc, null, cfg, null, candidate_plans, budget),
+        .explanation = try std.fmt.allocPrint(alloc, "Recursive query-builder failed after {d} candidate error(s).", .{candidate_error_count}),
+        .confidence = 0,
+        .warnings = try alloc.dupe([]const u8, &[_][]const u8{warning}),
+    };
 }
 
 fn recursiveQueryBuilderCandidateModes(
@@ -3434,14 +3506,14 @@ fn buildRecursiveQueryBuilderPlan(
     alloc: std.mem.Allocator,
     base_plan: ?std.json.Value,
     cfg: recursive_agent.RecursiveConfig,
-    selected_candidate_id: []const u8,
+    selected_candidate_id: ?[]const u8,
     candidate_plans: std.json.Value,
     budget: RecursiveQueryBuilderBudgetSummary,
 ) !std.json.Value {
     var plan = base_plan orelse std.json.Value{ .object = std.json.ObjectMap.empty };
     if (plan != .object) plan = std.json.Value{ .object = std.json.ObjectMap.empty };
     try plan.object.put(alloc, try alloc.dupe(u8, "execution_mode"), .{ .string = "recursive" });
-    try plan.object.put(alloc, try alloc.dupe(u8, "selected_candidate_id"), .{ .string = selected_candidate_id });
+    try plan.object.put(alloc, try alloc.dupe(u8, "selected_candidate_id"), if (selected_candidate_id) |id| .{ .string = id } else .null);
     try plan.object.put(alloc, try alloc.dupe(u8, "candidate_plans"), candidate_plans);
     try plan.object.put(alloc, try alloc.dupe(u8, "recursive"), try jsonValueFromStruct(alloc, .{
         .max_depth = cfg.max_depth,
@@ -3468,13 +3540,15 @@ fn buildRecursiveQueryBuilderPlan(
 fn buildRecursiveQueryBuilderSteps(
     alloc: std.mem.Allocator,
     cfg: recursive_agent.RecursiveConfig,
-    selected_candidate_id: []const u8,
+    selected_candidate_id: ?[]const u8,
     candidate_modes: []const []const u8,
     candidate_steps: []const metadata_openapi.AgentStep,
     selected_steps: []const metadata_openapi.AgentStep,
     selected_specialist: ?[]const u8,
     selected_artifact: ?[]const u8,
     budget: RecursiveQueryBuilderBudgetSummary,
+    merge_status: metadata_openapi.AgentStepStatus,
+    failure_reason: ?[]const u8,
 ) ![]const metadata_openapi.AgentStep {
     var out = std.ArrayListUnmanaged(metadata_openapi.AgentStep).empty;
     defer out.deinit(alloc);
@@ -3505,14 +3579,15 @@ fn buildRecursiveQueryBuilderSteps(
     try out.append(alloc, .{
         .kind = .recursive_merge,
         .name = "query_builder_recursive_merge",
-        .action = "Selected the highest-scoring executable query-builder candidate",
-        .status = .success,
+        .action = if (merge_status == .success) "Selected the highest-scoring executable query-builder candidate" else "Failed to select an executable query-builder candidate",
+        .status = merge_status,
         .details = try jsonValueFromStruct(alloc, RecursiveQueryBuilderMergeDetails{
             .selected_candidate_id = selected_candidate_id,
             .candidate_count = candidate_steps.len,
             .selected_specialist = selected_specialist,
             .selected_artifact = selected_artifact,
             .incomplete_reason = budget.incomplete_reason,
+            .failure_reason = failure_reason,
             .wall_time_exhausted = budget.wall_time_exhausted,
             .elapsed_ms = budget.elapsed_ms,
         }),
@@ -3537,6 +3612,10 @@ fn jsonValueFromStruct(alloc: std.mem.Allocator, value: anytype) !std.json.Value
     const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
     defer alloc.free(encoded);
     return try std.json.parseFromSliceLeaky(std.json.Value, alloc, encoded, .{ .allocate = .alloc_always });
+}
+
+fn buildQueryBuilderMatchNoneQuery(alloc: std.mem.Allocator) !std.json.Value {
+    return try std.json.parseFromSliceLeaky(std.json.Value, alloc, "{\"match_none\":{}}", .{});
 }
 
 pub fn executeQueryBuilder(
@@ -3719,11 +3798,13 @@ fn buildQueryBuilderSpecialist(
     graph_index_metadata: []const QueryBuilderGraphIndex,
     plan_validator: ?QueryBuilderPlanValidator,
     generation_runner: ?GenerationRunner,
+    preserve_generation_timeout_errors: bool,
     warnings: *std.ArrayListUnmanaged([]const u8),
 ) !BuiltQueryBuilderQuery {
     const effective_mode = try queryBuilderEffectiveMode(alloc, request, fields, semantic_indexes);
     if (shouldUseGeneratedSemanticBuilder(request, effective_mode, generation_runner)) {
-        return buildGeneratedSemanticOrHybridQueryBuilder(alloc, request, effective_mode.?, intent, fields, full_text_index_metadata, embedding_index_metadata, semantic_indexes, plan_validator, generation_runner.?, warnings) catch {
+        return buildGeneratedSemanticOrHybridQueryBuilder(alloc, request, effective_mode.?, intent, fields, full_text_index_metadata, embedding_index_metadata, semantic_indexes, plan_validator, generation_runner.?, preserve_generation_timeout_errors, warnings) catch |err| {
+            if (preserve_generation_timeout_errors and recursive_agent.isGenerationTimeoutError(err)) return err;
             try warnings.append(alloc, "Generator-backed semantic or hybrid query building failed, so the deterministic semantic or hybrid builder was used.");
             if (try buildSemanticOrHybridQueryBuilder(alloc, request, effective_mode, intent, fields, semantic_indexes, warnings)) |built| {
                 return built;
@@ -3735,10 +3816,10 @@ fn buildQueryBuilderSpecialist(
         return built;
     }
     if (shouldUseGeneratedGraphBuilder(request, effective_mode, generation_runner)) {
-        return buildGeneratedGraphQueryBuilder(alloc, request, intent, fields, graph_indexes, graph_index_metadata, plan_validator, generation_runner.?, warnings);
+        return buildGeneratedGraphQueryBuilder(alloc, request, intent, fields, graph_indexes, graph_index_metadata, plan_validator, generation_runner.?, preserve_generation_timeout_errors, warnings);
     }
     if (shouldUseGeneratedFullTextBuilder(request, effective_mode, generation_runner)) {
-        return buildGeneratedFullTextQueryBuilder(alloc, request, intent, fields, full_text_index_metadata, plan_validator, generation_runner.?);
+        return buildGeneratedFullTextQueryBuilder(alloc, request, intent, fields, full_text_index_metadata, plan_validator, generation_runner.?, preserve_generation_timeout_errors);
     }
     return try buildQueryBuilderQuery(alloc, request, intent, fields, warnings);
 }
@@ -3885,6 +3966,7 @@ fn buildGeneratedSemanticOrHybridQueryBuilder(
     semantic_indexes: []const []const u8,
     plan_validator: ?QueryBuilderPlanValidator,
     generation_runner: GenerationRunner,
+    preserve_generation_timeout_errors: bool,
     warnings: *std.ArrayListUnmanaged([]const u8),
 ) !BuiltQueryBuilderQuery {
     var base = try buildQueryBuilderQuery(alloc, request, intent, fields, warnings);
@@ -3899,6 +3981,7 @@ fn buildGeneratedSemanticOrHybridQueryBuilder(
         semantic_indexes,
         plan_validator,
         generation_runner,
+        preserve_generation_timeout_errors,
     );
     const hybrid_mode = std.ascii.eqlIgnoreCase(mode, "hybrid");
     base.query_kind = if (hybrid_mode) .hybrid else .semantic;
@@ -3925,6 +4008,7 @@ fn buildGeneratedSemanticOrHybridQueryBuilderPlan(
     semantic_indexes: []const []const u8,
     plan_validator: ?QueryBuilderPlanValidator,
     generation_runner: GenerationRunner,
+    preserve_generation_timeout_errors: bool,
 ) !GeneratedSemanticQueryBuilderPlan {
     const generator_cfg = request.generator orelse return error.UnsupportedQueryBuilderGeneration;
     const chain = try buildQueryBuilderGenerationChain(alloc, generator_cfg);
@@ -3932,10 +4016,10 @@ fn buildGeneratedSemanticOrHybridQueryBuilderPlan(
     const source_indexes = try queryBuilderGeneratedSemanticIndexNames(alloc, embedding_index_metadata, semantic_indexes, preferred_indexes);
     if (source_indexes.len == 0) return error.InvalidQueryBuilderGeneration;
     const messages = try buildSemanticQueryBuilderMessages(alloc, intent, mode, fields, full_text_index_metadata, embedding_index_metadata, source_indexes, request.example_documents);
-    const first_attempt = buildGeneratedSemanticQueryBuilderAttemptFromMessages(alloc, request, mode, fields, source_indexes, plan_validator, generation_runner, chain, messages) catch |first_err| switch (first_err) {
+    const first_attempt = buildGeneratedSemanticQueryBuilderAttemptFromMessages(alloc, request, mode, fields, source_indexes, plan_validator, generation_runner, chain, messages, preserve_generation_timeout_errors) catch |first_err| switch (first_err) {
         error.InvalidQueryBuilderGeneration => {
             const repair_messages = try buildSemanticQueryBuilderRepairMessages(alloc, messages, null);
-            const second_attempt = buildGeneratedSemanticQueryBuilderAttemptFromMessages(alloc, request, mode, fields, source_indexes, plan_validator, generation_runner, chain, repair_messages) catch |second_err| return switch (second_err) {
+            const second_attempt = buildGeneratedSemanticQueryBuilderAttemptFromMessages(alloc, request, mode, fields, source_indexes, plan_validator, generation_runner, chain, repair_messages, preserve_generation_timeout_errors) catch |second_err| return switch (second_err) {
                 error.InvalidQueryBuilderGeneration => first_err,
                 else => second_err,
             };
@@ -3950,7 +4034,7 @@ fn buildGeneratedSemanticOrHybridQueryBuilderPlan(
         .valid => |plan| plan,
         .feedback => |feedback| blk: {
             const repair_messages = try buildSemanticQueryBuilderRepairMessages(alloc, messages, feedback);
-            const second_attempt = buildGeneratedSemanticQueryBuilderAttemptFromMessages(alloc, request, mode, fields, source_indexes, plan_validator, generation_runner, chain, repair_messages) catch |second_err| return switch (second_err) {
+            const second_attempt = buildGeneratedSemanticQueryBuilderAttemptFromMessages(alloc, request, mode, fields, source_indexes, plan_validator, generation_runner, chain, repair_messages, preserve_generation_timeout_errors) catch |second_err| return switch (second_err) {
                 error.InvalidQueryBuilderGeneration => error.InvalidQueryBuilderGeneration,
                 else => second_err,
             };
@@ -3993,8 +4077,12 @@ fn buildGeneratedSemanticQueryBuilderAttemptFromMessages(
     generation_runner: GenerationRunner,
     chain: []const generating.ChainLink,
     messages: []const generating.ChatMessage,
+    preserve_generation_timeout_errors: bool,
 ) !GeneratedSemanticQueryBuilderAttempt {
-    var result = generation_runner.executeChain(alloc, chain, messages) catch return error.UnsupportedQueryBuilderGeneration;
+    var result = generation_runner.executeChain(alloc, chain, messages) catch |err| {
+        if (preserve_generation_timeout_errors and recursive_agent.isGenerationTimeoutError(err)) return err;
+        return error.UnsupportedQueryBuilderGeneration;
+    };
     defer result.deinit();
 
     const json_text = extractJsonObjectSlice(result.content) orelse return error.InvalidQueryBuilderGeneration;
@@ -4064,8 +4152,9 @@ fn buildGeneratedFullTextQueryBuilder(
     full_text_index_metadata: []const QueryBuilderFullTextIndex,
     plan_validator: ?QueryBuilderPlanValidator,
     generation_runner: GenerationRunner,
+    preserve_generation_timeout_errors: bool,
 ) !BuiltQueryBuilderQuery {
-    const generated = try buildGeneratedFullTextQueryBuilderPlan(alloc, request, intent, fields, full_text_index_metadata, plan_validator, generation_runner);
+    const generated = try buildGeneratedFullTextQueryBuilderPlan(alloc, request, intent, fields, full_text_index_metadata, plan_validator, generation_runner, preserve_generation_timeout_errors);
     return .{
         .query = generated.query,
         .temporal_hint = detectTemporalHint(intent),
@@ -4085,14 +4174,15 @@ fn buildGeneratedFullTextQueryBuilderPlan(
     full_text_index_metadata: []const QueryBuilderFullTextIndex,
     plan_validator: ?QueryBuilderPlanValidator,
     generation_runner: GenerationRunner,
+    preserve_generation_timeout_errors: bool,
 ) !GeneratedFullTextQueryBuilderPlan {
     const generator_cfg = request.generator orelse return error.UnsupportedQueryBuilderGeneration;
     const chain = try buildQueryBuilderGenerationChain(alloc, generator_cfg);
     const messages = try buildBleveQueryBuilderMessages(alloc, intent, fields, full_text_index_metadata, request.example_documents);
-    const first_attempt = buildGeneratedFullTextQueryBuilderAttemptFromMessages(alloc, request, fields, plan_validator, generation_runner, chain, messages) catch |first_err| switch (first_err) {
+    const first_attempt = buildGeneratedFullTextQueryBuilderAttemptFromMessages(alloc, request, fields, plan_validator, generation_runner, chain, messages, preserve_generation_timeout_errors) catch |first_err| switch (first_err) {
         error.InvalidQueryBuilderGeneration => {
             const repair_messages = try buildBleveQueryBuilderRepairMessages(alloc, messages, null);
-            const second_attempt = buildGeneratedFullTextQueryBuilderAttemptFromMessages(alloc, request, fields, plan_validator, generation_runner, chain, repair_messages) catch |second_err| return switch (second_err) {
+            const second_attempt = buildGeneratedFullTextQueryBuilderAttemptFromMessages(alloc, request, fields, plan_validator, generation_runner, chain, repair_messages, preserve_generation_timeout_errors) catch |second_err| return switch (second_err) {
                 error.InvalidQueryBuilderGeneration => first_err,
                 else => second_err,
             };
@@ -4107,7 +4197,7 @@ fn buildGeneratedFullTextQueryBuilderPlan(
         .valid => |plan| plan,
         .feedback => |feedback| blk: {
             const repair_messages = try buildBleveQueryBuilderRepairMessages(alloc, messages, feedback);
-            const second_attempt = buildGeneratedFullTextQueryBuilderAttemptFromMessages(alloc, request, fields, plan_validator, generation_runner, chain, repair_messages) catch |second_err| return switch (second_err) {
+            const second_attempt = buildGeneratedFullTextQueryBuilderAttemptFromMessages(alloc, request, fields, plan_validator, generation_runner, chain, repair_messages, preserve_generation_timeout_errors) catch |second_err| return switch (second_err) {
                 error.InvalidQueryBuilderGeneration => error.InvalidQueryBuilderGeneration,
                 else => second_err,
             };
@@ -4127,8 +4217,12 @@ fn buildGeneratedFullTextQueryBuilderAttemptFromMessages(
     generation_runner: GenerationRunner,
     chain: []const generating.ChainLink,
     messages: []const generating.ChatMessage,
+    preserve_generation_timeout_errors: bool,
 ) !GeneratedFullTextQueryBuilderAttempt {
-    var result = generation_runner.executeChain(alloc, chain, messages) catch return error.UnsupportedQueryBuilderGeneration;
+    var result = generation_runner.executeChain(alloc, chain, messages) catch |err| {
+        if (preserve_generation_timeout_errors and recursive_agent.isGenerationTimeoutError(err)) return err;
+        return error.UnsupportedQueryBuilderGeneration;
+    };
     defer result.deinit();
 
     const json_text = extractJsonObjectSlice(result.content) orelse return error.InvalidQueryBuilderGeneration;
@@ -4161,10 +4255,12 @@ fn buildGeneratedGraphQueryBuilder(
     graph_index_metadata: []const QueryBuilderGraphIndex,
     plan_validator: ?QueryBuilderPlanValidator,
     generation_runner: GenerationRunner,
+    preserve_generation_timeout_errors: bool,
     warnings: *std.ArrayListUnmanaged([]const u8),
 ) !BuiltQueryBuilderQuery {
     var base = try buildQueryBuilderQuery(alloc, request, intent, fields, warnings);
-    const generated = buildGeneratedGraphQueryBuilderPlan(alloc, request, intent, fields, graph_indexes, graph_index_metadata, base, plan_validator, generation_runner) catch {
+    const generated = buildGeneratedGraphQueryBuilderPlan(alloc, request, intent, fields, graph_indexes, graph_index_metadata, base, plan_validator, generation_runner, preserve_generation_timeout_errors) catch |err| {
+        if (preserve_generation_timeout_errors and recursive_agent.isGenerationTimeoutError(err)) return err;
         try warnings.append(alloc, "Generator-backed graph query building failed, so the deterministic graph builder was used.");
         return base;
     };
@@ -4185,15 +4281,16 @@ fn buildGeneratedGraphQueryBuilderPlan(
     base: BuiltQueryBuilderQuery,
     plan_validator: ?QueryBuilderPlanValidator,
     generation_runner: GenerationRunner,
+    preserve_generation_timeout_errors: bool,
 ) !GeneratedGraphQueryBuilderPlan {
     const generator_cfg = request.generator orelse return error.UnsupportedQueryBuilderGeneration;
     const chain = try buildQueryBuilderGenerationChain(alloc, generator_cfg);
     const messages = try buildGraphQueryBuilderMessages(alloc, intent, fields, graph_indexes, graph_index_metadata, request.example_documents);
     const seed_query_request = try buildQueryBuilderGraphSeedQueryRequest(alloc, request, base, fields);
-    const first_attempt = buildGeneratedGraphQueryBuilderAttemptFromMessages(alloc, request, fields, graph_indexes, seed_query_request, plan_validator, generation_runner, chain, messages) catch |first_err| switch (first_err) {
+    const first_attempt = buildGeneratedGraphQueryBuilderAttemptFromMessages(alloc, request, fields, graph_indexes, seed_query_request, plan_validator, generation_runner, chain, messages, preserve_generation_timeout_errors) catch |first_err| switch (first_err) {
         error.InvalidQueryBuilderGeneration => {
             const repair_messages = try buildGraphQueryBuilderRepairMessages(alloc, messages, null);
-            const second_attempt = buildGeneratedGraphQueryBuilderAttemptFromMessages(alloc, request, fields, graph_indexes, seed_query_request, plan_validator, generation_runner, chain, repair_messages) catch |second_err| return switch (second_err) {
+            const second_attempt = buildGeneratedGraphQueryBuilderAttemptFromMessages(alloc, request, fields, graph_indexes, seed_query_request, plan_validator, generation_runner, chain, repair_messages, preserve_generation_timeout_errors) catch |second_err| return switch (second_err) {
                 error.InvalidQueryBuilderGeneration => first_err,
                 else => second_err,
             };
@@ -4208,7 +4305,7 @@ fn buildGeneratedGraphQueryBuilderPlan(
         .valid => |plan| plan,
         .feedback => |feedback| blk: {
             const repair_messages = try buildGraphQueryBuilderRepairMessages(alloc, messages, feedback);
-            const second_attempt = buildGeneratedGraphQueryBuilderAttemptFromMessages(alloc, request, fields, graph_indexes, seed_query_request, plan_validator, generation_runner, chain, repair_messages) catch |second_err| return switch (second_err) {
+            const second_attempt = buildGeneratedGraphQueryBuilderAttemptFromMessages(alloc, request, fields, graph_indexes, seed_query_request, plan_validator, generation_runner, chain, repair_messages, preserve_generation_timeout_errors) catch |second_err| return switch (second_err) {
                 error.InvalidQueryBuilderGeneration => error.InvalidQueryBuilderGeneration,
                 else => second_err,
             };
@@ -4230,8 +4327,12 @@ fn buildGeneratedGraphQueryBuilderAttemptFromMessages(
     generation_runner: GenerationRunner,
     chain: []const generating.ChainLink,
     messages: []const generating.ChatMessage,
+    preserve_generation_timeout_errors: bool,
 ) !GeneratedGraphQueryBuilderAttempt {
-    var result = generation_runner.executeChain(alloc, chain, messages) catch return error.UnsupportedQueryBuilderGeneration;
+    var result = generation_runner.executeChain(alloc, chain, messages) catch |err| {
+        if (preserve_generation_timeout_errors and recursive_agent.isGenerationTimeoutError(err)) return err;
+        return error.UnsupportedQueryBuilderGeneration;
+    };
     defer result.deinit();
 
     const json_text = extractJsonObjectSlice(result.content) orelse return error.InvalidQueryBuilderGeneration;

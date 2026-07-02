@@ -2799,6 +2799,10 @@ pub fn build(b: *std.Build) void {
         "api query builder recursive join inference uses related table catalog metadata",
         "api query builder require executable rejects inferred join until runtime support lands",
         "api query builder require executable accepts runtime validated join",
+        "api query builder recursive mode returns failed result when every candidate fails",
+        "api query builder recursive mode returns incomplete when candidate generation deadline expires",
+        "api query builder pipeline mode falls back when generated full-text candidate times out",
+        "api retrieval agent recursive mode returns incomplete when merge deadline expires",
     };
     const lib_unit_tests = b.addTest(.{
         .root_module = lib_test_mod,

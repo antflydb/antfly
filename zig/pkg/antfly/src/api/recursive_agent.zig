@@ -168,6 +168,10 @@ pub fn incompleteReason(
     return null;
 }
 
+pub fn isGenerationTimeoutError(err: anyerror) bool {
+    return err == error.DeadlineExceeded or err == error.Timeout or err == error.ConnectionTimedOut;
+}
+
 pub fn traceContextObjectFromContextObject(context_object: ContextObject) metadata_openapi.RecursiveTraceContextObject {
     return .{
         .kind = context_object.kind,
@@ -274,4 +278,11 @@ test "recursive agent shared budget helpers fail closed" {
     try std.testing.expectEqualStrings("max_subcalls", incompleteReason(true, 1, false).?);
     try std.testing.expectEqualStrings("max_child_context_tokens", incompleteReason(false, 1, false).?);
     try std.testing.expect(incompleteReason(false, 0, false) == null);
+}
+
+test "recursive agent classifies generation timeout errors" {
+    try std.testing.expect(isGenerationTimeoutError(error.DeadlineExceeded));
+    try std.testing.expect(isGenerationTimeoutError(error.Timeout));
+    try std.testing.expect(isGenerationTimeoutError(error.ConnectionTimedOut));
+    try std.testing.expect(!isGenerationTimeoutError(error.InvalidRecursiveAgentConfig));
 }

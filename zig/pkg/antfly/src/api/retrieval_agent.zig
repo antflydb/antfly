@@ -2877,7 +2877,14 @@ fn executeRecursiveRetrievalGeneration(
             merge_executed = false;
             break :blk try buildRecursiveBudgetFallbackContent(arena, summaries.items, "max_wall_time_ms");
         };
-        var merge_result = try exec.executeChainWithTimeoutMs(alloc, cfg.chain, merge_messages, merge_timeout_ms);
+        var merge_result = exec.executeChainWithTimeoutMs(alloc, cfg.chain, merge_messages, merge_timeout_ms) catch |err| {
+            if (recursive_agent.isGenerationTimeoutError(err) or budget.expired()) {
+                wall_time_exhausted = true;
+                merge_executed = false;
+                break :blk try buildRecursiveBudgetFallbackContent(arena, summaries.items, "max_wall_time_ms");
+            }
+            return err;
+        };
         defer merge_result.deinit();
         break :blk try arena.dupe(u8, merge_result.content);
     };

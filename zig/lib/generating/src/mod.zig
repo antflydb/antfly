@@ -445,7 +445,7 @@ pub fn executeChainWithTimeoutMs(
     messages: []const ChatMessage,
     timeout_ms: u64,
 ) !GenerateResult {
-    return try executeChainWithDeadline(alloc, chain, factory, messages, Deadline.start(timeout_ms));
+    return try executeChainWithDeadline(alloc, chain, factory, messages, try Deadline.start(timeout_ms));
 }
 
 fn executeChainWithDeadline(
@@ -526,18 +526,19 @@ fn executeWithRetry(
 const Deadline = struct {
     deadline_ns: u64,
 
-    fn start(timeout_ms: u64) Deadline {
-        const now_ns = monotonicNowNs();
+    fn start(timeout_ms: u64) !Deadline {
+        const now_ns = monotonicNowNs() orelse return error.DeadlineExceeded;
         const timeout_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
         return .{ .deadline_ns = std.math.add(u64, now_ns, timeout_ns) catch std.math.maxInt(u64) };
     }
 
     fn expired(self: Deadline) bool {
-        return monotonicNowNs() >= self.deadline_ns;
+        const now_ns = monotonicNowNs() orelse return true;
+        return now_ns >= self.deadline_ns;
     }
 
     fn remainingMsOrDeadline(self: Deadline) !u64 {
-        const now_ns = monotonicNowNs();
+        const now_ns = monotonicNowNs() orelse return error.DeadlineExceeded;
         if (now_ns >= self.deadline_ns) return error.DeadlineExceeded;
         const remaining_ns = self.deadline_ns - now_ns;
         const remaining_ms = (remaining_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
@@ -545,11 +546,11 @@ const Deadline = struct {
     }
 };
 
-fn monotonicNowNs() u64 {
+fn monotonicNowNs() ?u64 {
     var ts: std.posix.timespec = undefined;
     switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
         .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
-        else => return 0,
+        else => return null,
     }
 }
 

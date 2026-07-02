@@ -828,6 +828,202 @@ test "api query builder recursive auto mode reports candidate budget truncation"
     try std.testing.expectEqual(@as(i64, 1), decomposition.details.?.object.get("scheduled_candidate_count").?.integer);
 }
 
+test "api query builder recursive mode returns failed result when every candidate fails" {
+    const FakeQueryBuilderPlanValidator = struct {
+        fn iface() query_builder_agent.QueryBuilderPlanValidator {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .validate_query_request = validateQueryRequest },
+            };
+        }
+
+        fn validateQueryRequest(
+            _: *anyopaque,
+            alloc: std.mem.Allocator,
+            _: metadata_openapi.QueryBuilderRequest,
+            _: metadata_openapi.QueryRequest,
+            _: ?metadata_openapi.RetrievalQueryRequest,
+            _: []const u8,
+        ) !?[]const u8 {
+            return try alloc.dupe(u8, "query request validator rejected recursive candidate");
+        }
+    };
+
+    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"require_executable":true}
+    , .{});
+    defer constraints_tree.deinit();
+
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const result = try query_builder_agent.buildQueryBuilderResponseWithContext(arena, .{
+        .table = "docs",
+        .intent = "find raft architecture",
+        .schema_fields = &.{ "title", "body", "status" },
+        .mode = "full_text",
+        .execution_mode = .recursive,
+        .recursive = .{
+            .max_depth = 1,
+            .max_subcalls = 1,
+            .max_concurrency = 1,
+            .split_policy = .by_query,
+            .merge_policy = .verify,
+        },
+        .constraints = constraints_tree.value,
+    }, .{
+        .schema_fields = &.{ "title", "body", "status" },
+        .plan_validator = FakeQueryBuilderPlanValidator.iface(),
+    }, null);
+
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.failed, result.status.?);
+    try std.testing.expect(result.incomplete_details == null);
+    try std.testing.expectEqualStrings("recursive", result.specialist.?);
+    try std.testing.expectEqual(@as(f64, 0), result.confidence.?);
+    try std.testing.expectEqualStrings("recursive", result.plan.?.object.get("execution_mode").?.string);
+    try std.testing.expect(result.plan.?.object.get("selected_candidate_id").? == .null);
+    const candidate_plans = result.plan.?.object.get("candidate_plans").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), candidate_plans.len);
+    try std.testing.expectEqualStrings("InvalidQueryBuilderRequest", candidate_plans[0].object.get("error").?.string);
+
+    const merge = result.steps.?[result.steps.?.len - 1];
+    try std.testing.expectEqual(metadata_openapi.AgentStepKind.recursive_merge, merge.kind.?);
+    try std.testing.expectEqual(metadata_openapi.AgentStepStatus.@"error", merge.status.?);
+    try std.testing.expectEqualStrings("all_candidates_failed", merge.details.?.object.get("failure_reason").?.string);
+}
+
+test "api query builder recursive mode returns incomplete when candidate generation deadline expires" {
+    const FakeGeneration = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) query_builder_agent.GenerationRunner {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_chain = executeChain,
+                    .execute_chain_with_timeout_ms = executeChainWithTimeoutMs,
+                },
+            };
+        }
+
+        fn executeChainWithTimeoutMs(ptr: *anyopaque, _: std.mem.Allocator, _: []const generating.ChainLink, _: []const generating.ChatMessage, timeout_ms: u64) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(timeout_ms > 0);
+            return error.DeadlineExceeded;
+        }
+
+        fn executeChain(ptr: *anyopaque, alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            return try executeChainWithTimeoutMs(ptr, alloc, chain, messages, std.time.ms_per_s);
+        }
+    };
+
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const full_text_fields = [_][]const u8{ "title", "body" };
+    const full_text_metadata = [_]query_builder_agent.QueryBuilderFullTextIndex{.{
+        .name = "docs_text",
+        .fields = &full_text_fields,
+    }};
+    var fake_generation = FakeGeneration{};
+
+    const result = try query_builder_agent.buildQueryBuilderResponseWithContext(arena, .{
+        .table = "docs",
+        .intent = "find raft architecture",
+        .schema_fields = &.{ "title", "body", "status" },
+        .mode = "full_text",
+        .execution_mode = .recursive,
+        .recursive = .{
+            .max_depth = 1,
+            .max_subcalls = 1,
+            .max_concurrency = 1,
+            .max_wall_time_ms = 1000,
+            .split_policy = .by_query,
+            .merge_policy = .verify,
+        },
+        .generator = .{
+            .provider = .antfly,
+            .model = "local-generator",
+            .api_url = "http://127.0.0.1:8082",
+        },
+    }, .{
+        .schema_fields = &.{ "title", "body", "status" },
+        .full_text_index_metadata = &full_text_metadata,
+    }, fake_generation.iface());
+
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.incomplete, result.status.?);
+    try std.testing.expectEqualStrings("max_wall_time_ms", result.incomplete_details.?.reason);
+    try std.testing.expectEqualStrings("recursive", result.specialist.?);
+    try std.testing.expectEqual(@as(f64, 0), result.confidence.?);
+    try std.testing.expect(result.query.object.get("match_none") != null);
+    try std.testing.expectEqual(@as(usize, 1), fake_generation.calls);
+
+    const plan = result.plan.?.object;
+    try std.testing.expect(plan.get("selected_candidate_id").? == .null);
+    try std.testing.expect(plan.get("recursive").?.object.get("wall_time_exhausted").?.bool);
+    const candidate_plans = plan.get("candidate_plans").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), candidate_plans.len);
+    try std.testing.expectEqualStrings("DeadlineExceeded", candidate_plans[0].object.get("error").?.string);
+
+    const merge = result.steps.?[result.steps.?.len - 1];
+    try std.testing.expectEqual(metadata_openapi.AgentStepKind.recursive_merge, merge.kind.?);
+    try std.testing.expectEqual(metadata_openapi.AgentStepStatus.@"error", merge.status.?);
+    try std.testing.expectEqualStrings("max_wall_time_ms", merge.details.?.object.get("failure_reason").?.string);
+}
+
+test "api query builder pipeline mode falls back when generated full-text candidate times out" {
+    const FakeGeneration = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) query_builder_agent.GenerationRunner {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute_chain = executeChain },
+            };
+        }
+
+        fn executeChain(ptr: *anyopaque, _: std.mem.Allocator, _: []const generating.ChainLink, _: []const generating.ChatMessage) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.DeadlineExceeded;
+        }
+    };
+
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const full_text_fields = [_][]const u8{ "title", "body" };
+    const full_text_metadata = [_]query_builder_agent.QueryBuilderFullTextIndex{.{
+        .name = "docs_text",
+        .fields = &full_text_fields,
+    }};
+    var fake_generation = FakeGeneration{};
+
+    const result = try query_builder_agent.buildQueryBuilderResponseWithContext(arena, .{
+        .table = "docs",
+        .intent = "find raft architecture",
+        .schema_fields = &.{ "title", "body", "status" },
+        .mode = "full_text",
+        .generator = .{
+            .provider = .antfly,
+            .model = "local-generator",
+            .api_url = "http://127.0.0.1:8082",
+        },
+    }, .{
+        .schema_fields = &.{ "title", "body", "status" },
+        .full_text_index_metadata = &full_text_metadata,
+    }, fake_generation.iface());
+
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, result.status.?);
+    try std.testing.expectEqualStrings("full_text", result.specialist.?);
+    try std.testing.expect(result.query.object.get("match") != null);
+    try std.testing.expect(result.warnings != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.warnings.?[0], "Generator-backed full-text query building failed") != null);
+    try std.testing.expectEqual(@as(usize, 1), fake_generation.calls);
+}
+
 test "api query builder recursive join nonunique right key emits estimated key stats" {
     var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
         \\{
@@ -1459,6 +1655,77 @@ test "api retrieval agent recursive mode stops scheduling after wall time budget
     try std.testing.expectEqual(@as(i64, 2), merge.details.?.object.get("skipped_child_count").?.integer);
     try std.testing.expect(merge.details.?.object.get("wall_time_exhausted").?.bool);
     try std.testing.expect(merge.details.?.object.get("elapsed_ms").?.integer >= 1);
+}
+
+test "api retrieval agent recursive mode returns incomplete when merge deadline expires" {
+    const FakeRunner = struct {
+        fn iface() retrieval_agent.QueryRunner {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .run_query = runQuery },
+            };
+        }
+
+        fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, _: []const u8) !QueryResponse {
+            try std.testing.expectEqualStrings("docs", table_name);
+            return .{
+                .json = try alloc.dupe(u8,
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}}]}}]}
+                ),
+            };
+        }
+    };
+
+    const FakeGeneration = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) retrieval_agent.GenerationRunner {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_chain = executeChain,
+                    .execute_chain_with_timeout_ms = executeChainWithTimeoutMs,
+                },
+            };
+        }
+
+        fn executeChainWithTimeoutMs(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const generating.ChainLink, messages: []const generating.ChatMessage, timeout_ms: u64) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(timeout_ms > 0);
+            const is_merge = std.mem.indexOf(u8, messages[1].content.?.text, "Child outputs:") != null;
+            if (is_merge) return error.DeadlineExceeded;
+            return .{
+                .content = try alloc.dupe(u8, "child summary before merge timeout"),
+                .allocator = alloc,
+            };
+        }
+
+        fn executeChain(ptr: *anyopaque, alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            return try executeChainWithTimeoutMs(ptr, alloc, chain, messages, std.time.ms_per_s);
+        }
+    };
+
+    var fake_generation = FakeGeneration{};
+    const body =
+        \\{"query":"find alpha","stream":false,"execution_mode":"recursive","recursive":{"max_depth":1,"max_subcalls":1,"max_concurrency":1,"max_wall_time_ms":1000,"split_policy":"by_document","merge_policy":"verify","child_tool_policy":"inherit_narrowed","allowed_context_object_types":["document"]},"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true}},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+    ;
+    const encoded = try retrieval_agent.executeJson(std.testing.allocator, FakeRunner.iface(), fake_generation.iface(), body);
+    defer std.testing.allocator.free(encoded);
+
+    var parsed = try std.json.parseFromSlice(metadata_openapi.RetrievalAgentResult, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.incomplete, parsed.value.status);
+    try std.testing.expectEqualStrings("max_wall_time_ms", parsed.value.incomplete_details.?.reason);
+    try std.testing.expect(std.mem.startsWith(u8, parsed.value.generation.?, "Recursive execution stopped before merge: max_wall_time_ms"));
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.generation.?, "child summary before merge timeout") != null);
+    try std.testing.expectEqual(@as(usize, 2), fake_generation.calls);
+
+    const merge = for (parsed.value.steps.?) |step| {
+        if (step.kind != null and step.kind.? == .recursive_merge) break step;
+    } else return error.MissingRecursiveMergeStep;
+    try std.testing.expectEqual(metadata_openapi.AgentStepStatus.skipped, merge.status.?);
+    try std.testing.expect(merge.details.?.object.get("wall_time_exhausted").?.bool);
 }
 
 test "api retrieval agent recursive mode refreshes serial child timeout at launch" {
