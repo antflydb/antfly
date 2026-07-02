@@ -11571,13 +11571,55 @@ pub const DB = struct {
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        if (try self.allDocsVisibleAtGeneration(generation)) {
-            return try doc_set.cloneAlloc(alloc, set);
+        const duration_ns = ttlDurationNs(self);
+        var identity_visible = if (duration_ns != 0 and set.* == .all)
+            try doc_identity.visibleDocSetFromStoreAlloc(alloc, self.core.store, generation)
+        else if (try self.allDocsVisibleAtGeneration(generation))
+            try doc_set.cloneAlloc(alloc, set)
+        else if (set.* == .all)
+            try self.broadLiveDocSetCachedAlloc(alloc, generation)
+        else
+            try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, set, generation);
+        errdefer identity_visible.deinit(alloc);
+
+        if (duration_ns == 0) return identity_visible;
+        const ttl_visible = try self.ttlVisibleResolvedDocSetNoLockAlloc(alloc, &identity_visible, generation, duration_ns);
+        identity_visible.deinit(alloc);
+        return ttl_visible;
+    }
+
+    fn ttlVisibleResolvedDocSetNoLockAlloc(
+        self: *DB,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+        duration_ns: u64,
+    ) !doc_set.ResolvedDocSet {
+        if (set.* == .none) return .none;
+        if (duration_ns == 0) return try doc_set.cloneAlloc(alloc, set);
+
+        var materialized_all: ?doc_set.ResolvedDocSet = null;
+        defer if (materialized_all) |*owned| owned.deinit(alloc);
+        const materialized = if (set.* == .all) blk: {
+            materialized_all = try doc_identity.visibleDocSetFromStoreAlloc(alloc, self.core.store, generation);
+            break :blk &materialized_all.?;
+        } else set;
+
+        const doc_ids = (try self.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, materialized, generation)) orelse
+            return .none;
+        defer freeConstDocIds(alloc, doc_ids);
+
+        const timestamps = try loadDocumentTimestampsMany(self, alloc, doc_ids);
+        defer alloc.free(timestamps);
+
+        const expiry_now = currentTimeNs();
+        var kept = std.ArrayListUnmanaged([]const u8).empty;
+        defer kept.deinit(alloc);
+        for (doc_ids, timestamps) |doc_id, ts| {
+            if (ts != 0 and ttl_mod.isExpired(ts, duration_ns, expiry_now)) continue;
+            try kept.append(alloc, doc_id);
         }
-        if (set.* == .all) {
-            return try self.broadLiveDocSetCachedAlloc(alloc, generation);
-        }
-        return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, set, generation);
+        return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, kept.items, generation);
     }
 
     fn broadLiveDocSetCachedAlloc(self: *DB, alloc: Allocator, generation: ?u64) !doc_set.ResolvedDocSet {
@@ -13550,6 +13592,11 @@ fn dupeConstDocIdsAlloc(alloc: Allocator, doc_ids: []const []const u8) ![]const 
         initialized += 1;
     }
     return out;
+}
+
+fn freeConstDocIds(alloc: Allocator, doc_ids: []const []const u8) void {
+    for (doc_ids) |doc_id| alloc.free(@constCast(doc_id));
+    alloc.free(doc_ids);
 }
 
 fn docIdsForOrdinalsTxnAlloc(alloc: Allocator, txn: anytype, ordinals: []const doc_set.DocOrdinal) ![]const []const u8 {
