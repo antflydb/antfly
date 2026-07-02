@@ -1581,8 +1581,11 @@ pub const EmbeddingArtifactRepairReason = enum {
 pub const EmbeddingArtifactRepairIssue = struct {
     index_name: []const u8 = "",
     doc_key: []const u8 = "",
+    parent_doc_key: []const u8 = "",
+    source_artifact_name: []const u8 = "",
     artifact_name: []const u8 = "",
     artifact_key: []const u8 = "",
+    chunk_id: ?u32 = null,
     sequence: u64 = 0,
     reason: EmbeddingArtifactRepairReason = .missing_embedding_artifact,
     attempts: u64 = 0,
@@ -1593,6 +1596,8 @@ pub const EmbeddingArtifactRepairIssue = struct {
     pub fn deinit(self: *EmbeddingArtifactRepairIssue, alloc: Allocator) void {
         if (self.index_name.len > 0) alloc.free(@constCast(self.index_name));
         if (self.doc_key.len > 0) alloc.free(@constCast(self.doc_key));
+        if (self.parent_doc_key.len > 0) alloc.free(@constCast(self.parent_doc_key));
+        if (self.source_artifact_name.len > 0) alloc.free(@constCast(self.source_artifact_name));
         if (self.artifact_name.len > 0) alloc.free(@constCast(self.artifact_name));
         if (self.artifact_key.len > 0) alloc.free(@constCast(self.artifact_key));
         if (self.last_error.len > 0) alloc.free(@constCast(self.last_error));

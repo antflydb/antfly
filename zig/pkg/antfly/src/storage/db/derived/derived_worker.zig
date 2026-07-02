@@ -142,6 +142,7 @@ fn logCatchUpError(
 ) void {
     if (err == error.WriterLocked) return;
     if (err == error.ReplayDocumentNotVisible) return;
+    if (err == error.EmbeddingArtifactRepairRequired) return;
     if (index_ref.kind == .dense_vector and err == error.NotFound) return;
     std.log.err(
         "derived catch_up failed index={s} kind={s} phase={s} sequence={} scanned_entries={} applied_entries={} err={s}",
