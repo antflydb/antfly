@@ -476,6 +476,7 @@ fn statusStatsHaveRuntimeFacts(stats: db_mod.types.DBStats) bool {
     if (stats.text_merge.pending_segments > 0 or stats.text_merge.in_flight_merges > 0 or stats.text_merge.completed_merges > 0 or stats.text_merge.failed_merges > 0) return true;
     for (stats.indexes) |index| {
         if (indexHasArtifactVisibilityFacts(index)) return true;
+        if (index.repair_degraded or index.repair_issue_count != 0) return true;
         if (index.backfill_active or index.catch_up_active or index.replay_catch_up_required) return true;
         // A target-only replay/catch-up marker can be synthesized from topology
         // and accepted sequence. It is not enough to prove that a live runtime
@@ -957,6 +958,8 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .root_node = item.root_node,
             .backfill_active = item.backfill_active,
             .backfill_progress = item.backfill_progress,
+            .repair_degraded = item.repair_degraded,
+            .repair_issue_count = item.repair_issue_count,
             .replay_applied_sequence = item.replay_applied_sequence,
             .replay_target_sequence = item.replay_target_sequence,
             .replay_catch_up_required = item.replay_catch_up_required,

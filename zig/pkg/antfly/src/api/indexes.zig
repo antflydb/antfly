@@ -994,6 +994,8 @@ const AggregatedIndexStatus = struct {
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
     enrichment_failed: bool = false,
+    repair_degraded: bool = false,
+    repair_issue_count: u64 = 0,
     table_doc_count: u64 = 0,
     doc_count: u64 = 0,
     term_count: u64 = 0,
@@ -1133,6 +1135,8 @@ fn aggregateIndexStatus(
         aggregate.replay_target_sequence += item.replay_target_sequence;
         if (item.replay_catch_up_required) aggregate.replay_catch_up_required = true;
         if (item.enrichment_failed) aggregate.enrichment_failed = true;
+        if (item.repair_degraded) aggregate.repair_degraded = true;
+        aggregate.repair_issue_count += item.repair_issue_count;
         aggregate.catch_up_applied_sequence += item.catch_up_applied_sequence;
         aggregate.catch_up_target_sequence += item.catch_up_target_sequence;
         if (item.catch_up_active) aggregate.catch_up_active = true;
@@ -1719,6 +1723,14 @@ fn appendSingleIndexRuntimeStatus(
     try appendIntValue(alloc, out, replay_target_sequence);
     try out.appendSlice(alloc, ",\"replay_catch_up_required\":");
     try out.appendSlice(alloc, if (replay_catch_up_required) "true" else "false");
+    if (@hasField(@TypeOf(item), "repair_degraded")) {
+        try out.appendSlice(alloc, ",\"repair_degraded\":");
+        try out.appendSlice(alloc, if (item.repair_degraded) "true" else "false");
+    }
+    if (@hasField(@TypeOf(item), "repair_issue_count")) {
+        try out.appendSlice(alloc, ",\"repair_issue_count\":");
+        try appendIntValue(alloc, out, item.repair_issue_count);
+    }
     try out.appendSlice(alloc, ",\"runtime_present\":");
     try out.appendSlice(alloc, if (runtime_present) "true" else "false");
     const runtime_fresh = if (@hasField(@TypeOf(item), "runtime_fresh"))

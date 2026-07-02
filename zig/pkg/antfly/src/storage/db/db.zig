@@ -3016,7 +3016,10 @@ pub const DB = struct {
             db.recordStartupOpenStats(profile);
             if (opts.open_mode.allowsReplay()) {
                 const replay_started_ns = monotonicTimeNs();
-                try replayPendingDerivedBatches(&db, null, null);
+                replayPendingDerivedBatches(&db, null, null) catch |err| switch (err) {
+                    error.ReplayDocumentNotVisible => {},
+                    else => return err,
+                };
                 profile.replay_pending_derived_ns = elapsedSince(replay_started_ns);
             }
             if (optional_runtimes_enabled) {
@@ -5974,6 +5977,244 @@ pub const DB = struct {
             .force_generated_artifact_names = &force_artifacts,
         });
         return true;
+    }
+
+    pub fn reprocessDocumentEmbeddingArtifact(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !bool {
+        var cfg = (try self.getEnrichment(alloc, .embedding, artifact_name)) orelse return false;
+        defer cfg.deinit(alloc);
+
+        const value = try self.get(alloc, doc_key) orelse return false;
+        defer alloc.free(value);
+
+        const writes = [_]types.BatchWrite{.{ .key = doc_key, .value = value }};
+        const force_artifacts = [_][]const u8{artifact_name};
+        try self.batchInternal(.{
+            .writes = &writes,
+            .sync_level = .full_index,
+        }, null, .{
+            .force_generated_artifact_names = &force_artifacts,
+        });
+        return true;
+    }
+
+    fn repairIssueKeyForIssueAlloc(self: *DB, alloc: Allocator, issue: types.EmbeddingArtifactRepairIssue) ![]u8 {
+        _ = self;
+        return try internal_keys.embeddingArtifactRepairIssueKeyAlloc(alloc, issue.index_name, issue.doc_key, issue.artifact_name);
+    }
+
+    fn encodeEmbeddingArtifactRepairIssueAlloc(self: *DB, alloc: Allocator, issue: types.EmbeddingArtifactRepairIssue) ![]u8 {
+        _ = self;
+        return try std.json.Stringify.valueAlloc(alloc, issue, .{ .emit_null_optional_fields = false });
+    }
+
+    fn decodeEmbeddingArtifactRepairIssueAlloc(self: *DB, alloc: Allocator, raw: []const u8) !types.EmbeddingArtifactRepairIssue {
+        _ = self;
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidArtifactPayload;
+        const obj = parsed.value.object;
+        const Fields = struct {
+            fn string(object: std.json.ObjectMap, name: []const u8) []const u8 {
+                const value = object.get(name) orelse return "";
+                if (value != .string) return "";
+                return value.string;
+            }
+            fn u64Value(object: std.json.ObjectMap, name: []const u8) u64 {
+                const value = object.get(name) orelse return 0;
+                if (value != .integer or value.integer < 0) return 0;
+                return std.math.cast(u64, value.integer) orelse 0;
+            }
+        };
+        const reason = std.meta.stringToEnum(types.EmbeddingArtifactRepairReason, Fields.string(obj, "reason")) orelse .missing_embedding_artifact;
+        return .{
+            .index_name = try alloc.dupe(u8, Fields.string(obj, "index_name")),
+            .doc_key = try alloc.dupe(u8, Fields.string(obj, "doc_key")),
+            .artifact_name = try alloc.dupe(u8, Fields.string(obj, "artifact_name")),
+            .artifact_key = try alloc.dupe(u8, Fields.string(obj, "artifact_key")),
+            .sequence = Fields.u64Value(obj, "sequence"),
+            .reason = reason,
+            .attempts = Fields.u64Value(obj, "attempts"),
+            .first_seen_ns = Fields.u64Value(obj, "first_seen_ns"),
+            .last_seen_ns = Fields.u64Value(obj, "last_seen_ns"),
+            .last_error = try alloc.dupe(u8, Fields.string(obj, "last_error")),
+        };
+    }
+
+    fn loadEmbeddingArtifactRepairIssueByKey(self: *DB, alloc: Allocator, key: []const u8) !?types.EmbeddingArtifactRepairIssue {
+        const raw = self.core.store.get(alloc, key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer alloc.free(raw);
+        return try self.decodeEmbeddingArtifactRepairIssueAlloc(alloc, raw);
+    }
+
+    fn recordEmbeddingArtifactRepairIssue(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        artifact_key: []const u8,
+        sequence: u64,
+        reason: types.EmbeddingArtifactRepairReason,
+    ) !void {
+        var identity = (try artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key)) orelse return;
+        defer identity.deinit(alloc);
+
+        const key = try internal_keys.embeddingArtifactRepairIssueKeyAlloc(alloc, index_name, identity.doc_key, identity.embedding_name);
+        defer alloc.free(key);
+
+        const now_ns = currentTimeNs();
+        var issue = if (try self.loadEmbeddingArtifactRepairIssueByKey(alloc, key)) |existing|
+            existing
+        else
+            types.EmbeddingArtifactRepairIssue{
+                .index_name = try alloc.dupe(u8, index_name),
+                .doc_key = try alloc.dupe(u8, identity.doc_key),
+                .artifact_name = try alloc.dupe(u8, identity.embedding_name),
+                .artifact_key = try bytesToHexAlloc(alloc, artifact_key),
+                .first_seen_ns = now_ns,
+            };
+        defer issue.deinit(alloc);
+
+        issue.sequence = sequence;
+        issue.reason = reason;
+        issue.last_seen_ns = now_ns;
+        if (issue.artifact_key.len == 0) {
+            issue.artifact_key = try bytesToHexAlloc(alloc, artifact_key);
+        }
+
+        const encoded = try self.encodeEmbeddingArtifactRepairIssueAlloc(alloc, issue);
+        defer alloc.free(encoded);
+        try self.core.store.put(key, encoded);
+    }
+
+    pub fn listEmbeddingArtifactRepairIssues(
+        self: *DB,
+        alloc: Allocator,
+        index_name: ?[]const u8,
+        limit: usize,
+    ) ![]types.EmbeddingArtifactRepairIssue {
+        const prefix = if (index_name) |name|
+            try internal_keys.embeddingArtifactRepairIssueIndexPrefixAlloc(alloc, name)
+        else
+            try internal_keys.embeddingArtifactRepairIssueRootPrefixAlloc(alloc);
+        defer alloc.free(prefix);
+
+        const rows = try self.core.store.scanPrefix(alloc, prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, rows);
+
+        const max_items = if (limit == 0) rows.len else @min(rows.len, limit);
+        var issues = try alloc.alloc(types.EmbeddingArtifactRepairIssue, max_items);
+        var count: usize = 0;
+        errdefer {
+            for (issues[0..count]) |*issue| issue.deinit(alloc);
+            alloc.free(issues);
+        }
+
+        for (rows[0..max_items]) |row| {
+            issues[count] = try self.decodeEmbeddingArtifactRepairIssueAlloc(alloc, row.value);
+            count += 1;
+        }
+        return issues[0..count];
+    }
+
+    fn countEmbeddingArtifactRepairIssuesForIndex(self: *DB, alloc: Allocator, index_name: []const u8) !u64 {
+        const prefix = try internal_keys.embeddingArtifactRepairIssueIndexPrefixAlloc(alloc, index_name);
+        defer alloc.free(prefix);
+        const rows = try self.core.store.scanPrefix(alloc, prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, rows);
+        return @intCast(rows.len);
+    }
+
+    fn clearEmbeddingArtifactRepairIssue(self: *DB, alloc: Allocator, issue: types.EmbeddingArtifactRepairIssue) !void {
+        const key = try self.repairIssueKeyForIssueAlloc(alloc, issue);
+        defer alloc.free(key);
+        try self.core.store.putBatch(&.{}, &.{key});
+    }
+
+    fn embeddingArtifactNowReadable(self: *DB, alloc: Allocator, issue: types.EmbeddingArtifactRepairIssue) !bool {
+        const artifact_key = if (issue.artifact_key.len > 0)
+            try hexToBytesAlloc(alloc, issue.artifact_key)
+        else
+            try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, issue.doc_key, issue.artifact_name);
+        defer alloc.free(artifact_key);
+
+        const raw = self.core.store.get(alloc, artifact_key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        defer alloc.free(raw);
+
+        if (self.core.index_manager.denseIndex(issue.index_name)) |entry| {
+            const view = enrichment_artifact_codec.denseEmbeddingVectorView(raw) catch |err| {
+                if (isRecoverableEmbeddingArtifactError(err)) return false;
+                return err;
+            };
+            if (view) |vector| return vector.len == entry.dims;
+            const decoded = enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, raw) catch |err| {
+                if (isRecoverableEmbeddingArtifactError(err)) return false;
+                return err;
+            };
+            defer alloc.free(decoded);
+            return decoded.len == entry.dims;
+        }
+
+        if (self.core.index_manager.sparseIndex(issue.index_name) != null) {
+            if (enrichment_artifact_codec.sparseEmbeddingVectorView(raw)) |maybe_view| {
+                if (maybe_view != null) return true;
+            } else |err| {
+                if (isRecoverableEmbeddingArtifactError(err)) return false;
+                return err;
+            }
+            var decoded = enrichment_artifact_codec.decodeSparseEmbeddingAlloc(alloc, raw) catch |err| {
+                if (isRecoverableEmbeddingArtifactError(err)) return false;
+                return err;
+            };
+            decoded.deinit(alloc);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn repairEmbeddingArtifactIssues(self: *DB, alloc: Allocator, limit: usize) !types.EmbeddingArtifactRepairResult {
+        const issues = try self.listEmbeddingArtifactRepairIssues(alloc, null, limit);
+        defer types.freeEmbeddingArtifactRepairIssues(alloc, issues);
+
+        var result: types.EmbeddingArtifactRepairResult = .{};
+        for (issues) |issue| {
+            result.scanned += 1;
+            const reprocessed = self.reprocessDocumentEmbeddingArtifact(alloc, issue.doc_key, issue.artifact_name) catch |err| switch (err) {
+                error.NotFound => {
+                    result.missing_source_docs += 1;
+                    continue;
+                },
+                else => {
+                    result.failed += 1;
+                    continue;
+                },
+            };
+            if (!reprocessed) {
+                result.failed += 1;
+                continue;
+            }
+            result.reprocessed += 1;
+            if (try self.embeddingArtifactNowReadable(alloc, issue)) {
+                try self.clearEmbeddingArtifactRepairIssue(alloc, issue);
+                result.repaired += 1;
+            }
+        }
+        if (result.repaired != 0) {
+            self.runDerivedUntil(self.core.nextDerivedSequence()) catch |err| switch (err) {
+                error.ReplayDocumentNotVisible => {},
+                else => return err,
+            };
+        }
+        return result;
     }
 
     pub fn reprocessDocumentArtifactRange(
@@ -9134,7 +9375,6 @@ pub const DB = struct {
 
                 const vector = enrichment_artifact_codec.decodeDenseEmbeddingAlloc(state.alloc, value) catch |err| {
                     if (isRecoverableEmbeddingArtifactError(err)) {
-                        try state.db.core.store.putBatch(&.{}, &.{key});
                         return .@"continue";
                     }
                     return err;
@@ -10196,6 +10436,8 @@ pub const DB = struct {
                 item.backfill_active = false;
                 item.catch_up_active = false;
             }
+            item.repair_issue_count = try self.countEmbeddingArtifactRepairIssuesForIndex(alloc, cfg.name);
+            item.repair_degraded = item.repair_issue_count != 0;
 
             switch (cfg.kind) {
                 .full_text => {
@@ -10329,6 +10571,8 @@ pub const DB = struct {
                 item.catch_up_active = false;
                 break;
             }
+            item.repair_issue_count = try self.countEmbeddingArtifactRepairIssuesForIndex(alloc, cfg.name);
+            item.repair_degraded = item.repair_issue_count != 0;
             switch (cfg.kind) {
                 .full_text => {
                     if (self.core.textIndex(cfg.name)) |entry| {
@@ -10517,6 +10761,8 @@ pub const DB = struct {
                 applyIndexStatusSnapshot(&item, status_snapshot);
                 visible_doc_count = @max(visible_doc_count, item.doc_count);
             }
+            item.repair_issue_count = try self.countEmbeddingArtifactRepairIssuesForIndex(alloc, cfg.name);
+            item.repair_degraded = item.repair_issue_count != 0;
             if (cfg.kind == .full_text) {
                 item.text_merge = self.core.index_manager.textMergeStatsSnapshotForIndex(cfg.name);
             }
@@ -18172,6 +18418,25 @@ fn currentTimeNs() u64 {
     return platform_clock.Clock.real().nowRealtimeNs();
 }
 
+fn bytesToHexAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
+    const out = try alloc.alloc(u8, bytes.len * 2);
+    for (bytes, 0..) |byte, idx| {
+        out[idx * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+        out[idx * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+    }
+    return out;
+}
+
+fn hexToBytesAlloc(alloc: Allocator, hex: []const u8) ![]u8 {
+    if (hex.len % 2 != 0) return error.InvalidArtifactPayload;
+    const out = try alloc.alloc(u8, hex.len / 2);
+    errdefer alloc.free(out);
+    for (out, 0..) |*byte, i| {
+        byte.* = try std.fmt.parseInt(u8, hex[i * 2 .. i * 2 + 2], 16);
+    }
+    return out;
+}
+
 fn makeTxnId(self: *DB) transactions_mod.TxnId {
     var txn_id: transactions_mod.TxnId = undefined;
     const now = currentTimeNs();
@@ -20377,6 +20642,120 @@ fn applyDerivedBatchToIndexContext(ctx: *const AsyncContext, batch: derived_type
     try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, null);
 }
 
+fn recordEmbeddingArtifactRepairIssueContext(
+    ctx: *const AsyncContext,
+    index_name: []const u8,
+    artifact_key: []const u8,
+    sequence: u64,
+    reason: types.EmbeddingArtifactRepairReason,
+) !void {
+    var identity = (try artifact_ids.decodeEmbeddingArtifactIdentityAlloc(ctx.alloc, artifact_key)) orelse return;
+    defer identity.deinit(ctx.alloc);
+
+    const issue_key = try internal_keys.embeddingArtifactRepairIssueKeyAlloc(ctx.alloc, index_name, identity.doc_key, identity.embedding_name);
+    defer ctx.alloc.free(issue_key);
+
+    const now_ns = currentTimeNs();
+    var issue = types.EmbeddingArtifactRepairIssue{
+        .index_name = try ctx.alloc.dupe(u8, index_name),
+        .doc_key = try ctx.alloc.dupe(u8, identity.doc_key),
+        .artifact_name = try ctx.alloc.dupe(u8, identity.embedding_name),
+        .artifact_key = try bytesToHexAlloc(ctx.alloc, artifact_key),
+        .sequence = sequence,
+        .reason = reason,
+        .first_seen_ns = now_ns,
+        .last_seen_ns = now_ns,
+    };
+    defer issue.deinit(ctx.alloc);
+
+    const encoded = try std.json.Stringify.valueAlloc(ctx.alloc, issue, .{ .emit_null_optional_fields = false });
+    defer ctx.alloc.free(encoded);
+    try ctx.store.put(issue_key, encoded);
+}
+
+fn denseEmbeddingArtifactRepairReason(
+    ctx: *const AsyncContext,
+    dims: u32,
+    artifact_key: []const u8,
+) !?types.EmbeddingArtifactRepairReason {
+    const raw = ctx.store.get(ctx.alloc, artifact_key) catch |err| switch (err) {
+        error.NotFound => return .missing_embedding_artifact,
+        else => return err,
+    };
+    defer ctx.alloc.free(raw);
+
+    const dims_usize: usize = @intCast(dims);
+    if (enrichment_artifact_codec.denseEmbeddingVectorView(raw)) |maybe_view| {
+        if (maybe_view) |view| {
+            return if (view.len == dims_usize) null else .corrupt_embedding_artifact;
+        }
+    } else |err| {
+        if (DB.isRecoverableEmbeddingArtifactError(err)) return .corrupt_embedding_artifact;
+        return err;
+    }
+
+    const decoded = enrichment_artifact_codec.decodeDenseEmbeddingAlloc(ctx.alloc, raw) catch |err| {
+        if (DB.isRecoverableEmbeddingArtifactError(err)) return .corrupt_embedding_artifact;
+        return err;
+    };
+    defer ctx.alloc.free(decoded);
+    return if (decoded.len == dims_usize) null else .corrupt_embedding_artifact;
+}
+
+fn sparseEmbeddingArtifactRepairReason(
+    ctx: *const AsyncContext,
+    artifact_key: []const u8,
+) !?types.EmbeddingArtifactRepairReason {
+    const raw = ctx.store.get(ctx.alloc, artifact_key) catch |err| switch (err) {
+        error.NotFound => return .missing_embedding_artifact,
+        else => return err,
+    };
+    defer ctx.alloc.free(raw);
+
+    if (enrichment_artifact_codec.sparseEmbeddingVectorView(raw)) |maybe_view| {
+        if (maybe_view != null) return null;
+    } else |err| {
+        if (DB.isRecoverableEmbeddingArtifactError(err)) return .corrupt_embedding_artifact;
+        return err;
+    }
+
+    var decoded = enrichment_artifact_codec.decodeSparseEmbeddingAlloc(ctx.alloc, raw) catch |err| {
+        if (DB.isRecoverableEmbeddingArtifactError(err)) return .corrupt_embedding_artifact;
+        return err;
+    };
+    decoded.deinit(ctx.alloc);
+    return null;
+}
+
+fn recordDenseEmbeddingArtifactRepairIssuesForReplay(
+    ctx: *const AsyncContext,
+    index_name: []const u8,
+    dims: u32,
+    writes: []const mapper.DenseEmbeddingWrite,
+    sequence: u64,
+) !void {
+    for (writes) |write| {
+        const artifact_key = write.artifact_key orelse continue;
+        if (try denseEmbeddingArtifactRepairReason(ctx, dims, artifact_key)) |reason| {
+            try recordEmbeddingArtifactRepairIssueContext(ctx, index_name, artifact_key, sequence, reason);
+        }
+    }
+}
+
+fn recordSparseEmbeddingArtifactRepairIssuesForReplay(
+    ctx: *const AsyncContext,
+    index_name: []const u8,
+    writes: []const mapper.SparseEmbeddingWrite,
+    sequence: u64,
+) !void {
+    for (writes) |write| {
+        const artifact_key = write.artifact_key orelse continue;
+        if (try sparseEmbeddingArtifactRepairReason(ctx, artifact_key)) |reason| {
+            try recordEmbeddingArtifactRepairIssueContext(ctx, index_name, artifact_key, sequence, reason);
+        }
+    }
+}
+
 fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, profile: ?*BatchProfile) !void {
     var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
     defer index_apply_guard.unlock();
@@ -20417,11 +20796,6 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             }
             const before_hbc_profile = if (profile != null) ctx.index_manager.denseWriteProfileByName(index_ref.name) else null;
             const batch_options: backend_types.BatchOptions = .{ .mode = .bulk_ingest };
-            const dense_delete_start_ns = monotonicTimeNs();
-            try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, batch.deleted_keys, batch_options);
-            try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, batch.overwritten_doc_keys, batch_options);
-            if (profile) |active_profile| recordProfileNs(profile, &active_profile.dense_delete_ns, dense_delete_start_ns);
-
             var dense_embeddings = try collectDenseEmbeddingWritesForBatch(
                 ctx.alloc,
                 ctx.index_manager,
@@ -20430,6 +20804,15 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 index_ref.name,
             );
             defer dense_embeddings.deinit();
+            if (ctx.index_manager.denseIndex(index_ref.name)) |entry| {
+                try recordDenseEmbeddingArtifactRepairIssuesForReplay(ctx, index_ref.name, entry.dims, dense_embeddings.writes, batch.sequence);
+            }
+            try ctx.index_manager.validateDenseEmbeddingArtifactsByName(ctx.store, index_ref.name, dense_embeddings.writes);
+
+            const dense_delete_start_ns = monotonicTimeNs();
+            try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, batch.deleted_keys, batch_options);
+            try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, batch.overwritten_doc_keys, batch_options);
+            if (profile) |active_profile| recordProfileNs(profile, &active_profile.dense_delete_ns, dense_delete_start_ns);
 
             var dense_embedding_doc_keys = try denseEmbeddingDocKeySet(ctx.alloc, dense_embeddings.writes);
             defer dense_embedding_doc_keys.deinit(ctx.alloc);
@@ -20475,11 +20858,6 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             var sparse_doc_index_ns: u64 = 0;
             var sparse_collect_embedding_ns: u64 = 0;
             var sparse_embedding_apply_ns: u64 = 0;
-            const sparse_delete_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
-            try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.deleted_keys, batch_options);
-            try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.overwritten_doc_keys, batch_options);
-            if (emit_sparse_write_profile) sparse_delete_ns = monotonicTimeNs() - sparse_delete_start_ns;
-
             const sparse_collect_embedding_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
             var sparse_embeddings = try collectSparseEmbeddingWritesForBatch(
                 ctx.alloc,
@@ -20490,6 +20868,13 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             );
             defer sparse_embeddings.deinit();
             if (emit_sparse_write_profile) sparse_collect_embedding_ns = monotonicTimeNs() - sparse_collect_embedding_start_ns;
+            try recordSparseEmbeddingArtifactRepairIssuesForReplay(ctx, index_ref.name, sparse_embeddings.writes, batch.sequence);
+            try ctx.index_manager.validateSparseEmbeddingArtifactsByName(ctx.store, index_ref.name, sparse_embeddings.writes);
+
+            const sparse_delete_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
+            try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.deleted_keys, batch_options);
+            try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.overwritten_doc_keys, batch_options);
+            if (emit_sparse_write_profile) sparse_delete_ns = monotonicTimeNs() - sparse_delete_start_ns;
 
             var sparse_embedding_doc_keys = try sparseEmbeddingDocKeySet(ctx.alloc, sparse_embeddings.writes);
             defer sparse_embedding_doc_keys.deinit(ctx.alloc);
@@ -40828,7 +41213,7 @@ test "db replay applies dense embeddings from artifact payloads" {
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 }
 
-test "db replay skips dense embedding writes when artifact payload is missing" {
+test "db replay blocks dense embedding writes when artifact payload is missing" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -40867,8 +41252,23 @@ test "db replay skips dense embedding writes when artifact payload is missing" {
         appended_sequence = try appendDerivedBatchRecord(&db, derived_batch);
     }
 
-    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
     defer reopened.close();
+
+    const issues = try reopened.listEmbeddingArtifactRepairIssues(alloc, "dv_v1", 0);
+    defer types.freeEmbeddingArtifactRepairIssues(alloc, issues);
+    try std.testing.expectEqual(@as(usize, 1), issues.len);
+    try std.testing.expectEqual(.missing_embedding_artifact, issues[0].reason);
+    try std.testing.expectEqualStrings("doc:a", issues[0].doc_key);
+    try std.testing.expectEqualStrings("dv_v1", issues[0].artifact_name);
+
+    const degraded_stats = try reopened.stats(alloc);
+    defer types.freeDBStats(alloc, degraded_stats);
+    try std.testing.expect(degraded_stats.indexes[0].repair_degraded);
+    try std.testing.expectEqual(@as(u64, 1), degraded_stats.indexes[0].repair_issue_count);
 
     var result = try reopened.search(alloc, .{
         .index_name = "dv_v1",
@@ -40883,10 +41283,11 @@ test "db replay skips dense embedding writes when artifact payload is missing" {
     try std.testing.expectEqual(@as(u32, 0), result.total_hits);
 
     const dense_applied = try reopened.core.loadAppliedSequence(alloc, "dv_v1");
-    try std.testing.expectEqual(appended_sequence, dense_applied);
+    try std.testing.expectEqual(@as(u64, 0), dense_applied);
+    try std.testing.expect(appended_sequence > dense_applied);
 }
 
-test "db replay skips and deletes corrupt dense embedding artifacts" {
+test "db replay blocks and preserves corrupt dense embedding artifacts" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -40926,8 +41327,18 @@ test "db replay skips and deletes corrupt dense embedding artifacts" {
         appended_sequence = try appendDerivedBatchRecord(&db, derived_batch);
     }
 
-    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
     defer reopened.close();
+
+    const issues = try reopened.listEmbeddingArtifactRepairIssues(alloc, "dv_v1", 0);
+    defer types.freeEmbeddingArtifactRepairIssues(alloc, issues);
+    try std.testing.expectEqual(@as(usize, 1), issues.len);
+    try std.testing.expectEqual(.corrupt_embedding_artifact, issues[0].reason);
+    try std.testing.expectEqualStrings("doc:a", issues[0].doc_key);
+    try std.testing.expectEqualStrings("dv_v1", issues[0].artifact_name);
 
     var result = try reopened.search(alloc, .{
         .index_name = "dv_v1",
@@ -40943,10 +41354,93 @@ test "db replay skips and deletes corrupt dense embedding artifacts" {
 
     const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
     defer alloc.free(artifact_key);
-    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, artifact_key));
+    const artifact_value = try reopened.core.store.get(alloc, artifact_key);
+    defer alloc.free(artifact_value);
+    try std.testing.expectEqualStrings("bad-artifact", artifact_value);
 
     const dense_applied = try reopened.core.loadAppliedSequence(alloc, "dv_v1");
-    try std.testing.expectEqual(appended_sequence, dense_applied);
+    try std.testing.expectEqual(@as(u64, 0), dense_applied);
+    try std.testing.expect(appended_sequence > dense_applied);
+}
+
+test "db repair queue reprocesses corrupt generated dense embedding artifacts" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    const opts = OpenOptions{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{
+            .owner_id = "repair-worker",
+            .dense_embedder = deterministic.interface(),
+        },
+    };
+
+    var appended_sequence: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), opts);
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"dv_v1\"}}",
+        });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"repair target text\"}" }},
+            .sync_level = .full_index,
+        });
+
+        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+        defer alloc.free(artifact_key);
+        try db.core.store.put(artifact_key, "bad-artifact");
+
+        const derived_batch = derived_types.DerivedBatch{
+            .dense_embeddings = &.{
+                .{
+                    .index_name = "dv_v1",
+                    .doc_key = "doc:a",
+                    .artifact_key = artifact_key,
+                    .vector = &.{},
+                },
+            },
+        };
+        appended_sequence = try appendDerivedBatchRecord(&db, derived_batch);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), opts);
+    defer reopened.close();
+
+    {
+        const issues = try reopened.listEmbeddingArtifactRepairIssues(alloc, "dv_v1", 0);
+        defer types.freeEmbeddingArtifactRepairIssues(alloc, issues);
+        try std.testing.expectEqual(@as(usize, 1), issues.len);
+        try std.testing.expectEqual(.corrupt_embedding_artifact, issues[0].reason);
+        try std.testing.expectEqualStrings("doc:a", issues[0].doc_key);
+    }
+
+    const repair = try reopened.repairEmbeddingArtifactIssues(alloc, 10);
+    try std.testing.expectEqual(@as(u64, 1), repair.scanned);
+    try std.testing.expectEqual(@as(u64, 1), repair.reprocessed);
+    try std.testing.expectEqual(@as(u64, 1), repair.repaired);
+    try std.testing.expectEqual(@as(u64, 0), repair.failed);
+
+    const issues_after = try reopened.listEmbeddingArtifactRepairIssues(alloc, "dv_v1", 0);
+    defer types.freeEmbeddingArtifactRepairIssues(alloc, issues_after);
+    try std.testing.expectEqual(@as(usize, 0), issues_after.len);
+
+    const dense_applied = try reopened.core.loadAppliedSequence(alloc, "dv_v1");
+    try std.testing.expect(dense_applied >= appended_sequence);
+
+    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+    defer alloc.free(artifact_key);
+    const artifact_value = try reopened.core.store.get(alloc, artifact_key);
+    defer alloc.free(artifact_value);
+    try expectDenseEmbeddingArtifactValue(alloc, artifact_value, enrichment_artifact_codec.hashSource("repair target text"), 3);
 }
 
 test "db replay applies sparse embeddings from artifact payloads" {
@@ -40997,7 +41491,7 @@ test "db replay applies sparse embeddings from artifact payloads" {
     try std.testing.expectEqual(@as(u64, 1), stats.doc_count);
 }
 
-test "db replay skips and deletes corrupt sparse embedding artifacts" {
+test "db replay blocks and preserves corrupt sparse embedding artifacts" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -41038,8 +41532,18 @@ test "db replay skips and deletes corrupt sparse embedding artifacts" {
         appended_sequence = try appendDerivedBatchRecord(&db, derived_batch);
     }
 
-    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
     defer reopened.close();
+
+    const issues = try reopened.listEmbeddingArtifactRepairIssues(alloc, "sp_v1", 0);
+    defer types.freeEmbeddingArtifactRepairIssues(alloc, issues);
+    try std.testing.expectEqual(@as(usize, 1), issues.len);
+    try std.testing.expectEqual(.corrupt_embedding_artifact, issues[0].reason);
+    try std.testing.expectEqualStrings("doc:a", issues[0].doc_key);
+    try std.testing.expectEqualStrings("sp_v1", issues[0].artifact_name);
 
     var sparse_index = reopened.core.index_manager.sparseIndex("sp_v1").?.index;
     const stats = sparse_index.stats();
@@ -41047,10 +41551,13 @@ test "db replay skips and deletes corrupt sparse embedding artifacts" {
 
     const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "sp_v1");
     defer alloc.free(artifact_key);
-    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, artifact_key));
+    const artifact_value = try reopened.core.store.get(alloc, artifact_key);
+    defer alloc.free(artifact_value);
+    try std.testing.expectEqualStrings("bad-artifact", artifact_value);
 
     const sparse_applied = try reopened.core.loadAppliedSequence(alloc, "sp_v1");
-    try std.testing.expectEqual(appended_sequence, sparse_applied);
+    try std.testing.expectEqual(@as(u64, 0), sparse_applied);
+    try std.testing.expect(appended_sequence > sparse_applied);
 }
 
 test "db buildDerivedBatch stores thin document and embedding replay records" {
@@ -52553,7 +53060,7 @@ test "db incomplete deferred restore import recovers before runtime repair" {
     }
 }
 
-test "db rebuild dense indexes deletes corrupt stored embedding artifacts" {
+test "db rebuild dense indexes preserves corrupt stored embedding artifacts" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -52575,7 +53082,9 @@ test "db rebuild dense indexes deletes corrupt stored embedding artifacts" {
 
     const rebuilt = try db.rebuildDenseIndexesFromStoredEmbeddingArtifacts(alloc);
     try std.testing.expectEqual(@as(usize, 0), rebuilt);
-    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, artifact_key));
+    const artifact_value = try db.core.store.get(alloc, artifact_key);
+    defer alloc.free(artifact_value);
+    try std.testing.expectEqualStrings("bad-artifact", artifact_value);
 }
 
 test "db dense artifact rebuild write cleanup tolerates artifact-backed empty vectors" {

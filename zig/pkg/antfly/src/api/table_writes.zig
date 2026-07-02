@@ -5649,7 +5649,8 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn indexHasVisibilityFactsForStatus(item: db_mod.types.DBIndexStats) bool {
-        return item.doc_count > 0 or item.term_count > 0 or item.edge_count > 0 or item.node_count > 0 or item.root_node > 0;
+        return item.doc_count > 0 or item.term_count > 0 or item.edge_count > 0 or item.node_count > 0 or item.root_node > 0 or
+            item.repair_degraded or item.repair_issue_count != 0;
     }
 
     fn runtimeStatusNeedsColdVisibilityRefresh(status: runtime_status.LocalTableRuntimeStatus) bool {

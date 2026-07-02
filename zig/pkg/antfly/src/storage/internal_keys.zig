@@ -38,6 +38,7 @@ pub const ha_applied_lsn_key = [_]u8{ replay_namespace, 0xff, 0x04 };
 pub const artifact_presence_key = [_]u8{ replay_namespace, 0xff, 0x20 };
 pub const asset_artifact_source_index_kind: u8 = 0x21;
 pub const document_child_range_outbox_kind: u8 = 0x22;
+pub const embedding_artifact_repair_issue_kind: u8 = 0x23;
 pub const identity_doc_to_ordinal_kind: u8 = 0x01;
 pub const identity_ordinal_to_doc_kind: u8 = 0x02;
 pub const identity_ordinal_state_kind: u8 = 0x03;
@@ -280,6 +281,36 @@ pub fn documentChildRangeOutboxKeyAlloc(alloc: Allocator, sequence: u64, ordinal
     try list.appendSlice(alloc, std.mem.asBytes(&sequence_be));
     const ordinal_be = std.mem.nativeToBig(u32, ordinal);
     try list.appendSlice(alloc, std.mem.asBytes(&ordinal_be));
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn embeddingArtifactRepairIssueRootPrefixAlloc(alloc: Allocator) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, embedding_artifact_repair_issue_kind });
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn embeddingArtifactRepairIssueIndexPrefixAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, embedding_artifact_repair_issue_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn embeddingArtifactRepairIssueKeyAlloc(
+    alloc: Allocator,
+    index_name: []const u8,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, embedding_artifact_repair_issue_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    try appendEncodedComponent(&list, alloc, doc_key);
+    try appendEncodedComponent(&list, alloc, artifact_name);
     return try list.toOwnedSlice(alloc);
 }
 

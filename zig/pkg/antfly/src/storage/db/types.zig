@@ -1573,6 +1573,46 @@ pub const DBStats = struct {
     async_indexing: AsyncIndexingStats = .{},
 };
 
+pub const EmbeddingArtifactRepairReason = enum {
+    missing_embedding_artifact,
+    corrupt_embedding_artifact,
+};
+
+pub const EmbeddingArtifactRepairIssue = struct {
+    index_name: []const u8 = "",
+    doc_key: []const u8 = "",
+    artifact_name: []const u8 = "",
+    artifact_key: []const u8 = "",
+    sequence: u64 = 0,
+    reason: EmbeddingArtifactRepairReason = .missing_embedding_artifact,
+    attempts: u64 = 0,
+    first_seen_ns: u64 = 0,
+    last_seen_ns: u64 = 0,
+    last_error: []const u8 = "",
+
+    pub fn deinit(self: *EmbeddingArtifactRepairIssue, alloc: Allocator) void {
+        if (self.index_name.len > 0) alloc.free(@constCast(self.index_name));
+        if (self.doc_key.len > 0) alloc.free(@constCast(self.doc_key));
+        if (self.artifact_name.len > 0) alloc.free(@constCast(self.artifact_name));
+        if (self.artifact_key.len > 0) alloc.free(@constCast(self.artifact_key));
+        if (self.last_error.len > 0) alloc.free(@constCast(self.last_error));
+        self.* = undefined;
+    }
+};
+
+pub fn freeEmbeddingArtifactRepairIssues(alloc: Allocator, issues: []EmbeddingArtifactRepairIssue) void {
+    for (issues) |*issue| issue.deinit(alloc);
+    if (issues.len > 0) alloc.free(issues);
+}
+
+pub const EmbeddingArtifactRepairResult = struct {
+    scanned: u64 = 0,
+    reprocessed: u64 = 0,
+    repaired: u64 = 0,
+    missing_source_docs: u64 = 0,
+    failed: u64 = 0,
+};
+
 pub const AlgebraicCandidateStatus = struct {
     recommendation: []const u8,
     materialization_id: []const u8,
@@ -1628,6 +1668,8 @@ pub const DBIndexStats = struct {
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
     enrichment_failed: bool = false,
+    repair_degraded: bool = false,
+    repair_issue_count: u64 = 0,
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
     replay_catch_up_required: bool = false,

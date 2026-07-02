@@ -5673,6 +5673,39 @@ pub const IndexManager = struct {
         try self.applyDenseEmbeddingWritesEntry(store, entry, writes, batch_options);
     }
 
+    pub fn validateDenseEmbeddingArtifactsByName(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8, writes: []const mapper.DenseEmbeddingWrite) !void {
+        if (writes.len == 0) return;
+        const entry = self.denseIndex(index_name) orelse return error.IndexNotFound;
+
+        const keep_write = try self.alloc.alloc(bool, writes.len);
+        defer self.alloc.free(keep_write);
+        try computeDenseReplayKeepMask(self.alloc, writes, keep_write);
+
+        const out_vectors = try self.alloc.alloc(?[]const f32, writes.len);
+        defer self.alloc.free(out_vectors);
+        for (out_vectors) |*slot| slot.* = null;
+
+        var fallback_scratch = std.ArrayListUnmanaged(f32).empty;
+        defer fallback_scratch.deinit(self.alloc);
+        var unreadable_artifact_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer unreadable_artifact_keys.deinit(self.alloc);
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+
+        if (try self.preloadDenseEmbeddingArtifactVectorsFromTxn(
+            index_name,
+            entry.dims,
+            writes,
+            keep_write,
+            &txn,
+            out_vectors,
+            &fallback_scratch,
+            &unreadable_artifact_keys,
+        )) {
+            if (unreadable_artifact_keys.items.len > 0) return error.ReplayDocumentNotVisible;
+        }
+    }
+
     pub fn applySparseEmbeddingWritesByName(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8, writes: []const mapper.SparseEmbeddingWrite) !void {
         return try self.applySparseEmbeddingWritesByNameWithOptions(store, index_name, writes, .{});
     }
@@ -5687,6 +5720,58 @@ pub const IndexManager = struct {
         if (writes.len == 0) return;
         const entry = self.sparseIndex(index_name) orelse return error.IndexNotFound;
         try self.applySparseEmbeddingWritesEntry(store, entry, writes, batch_options);
+    }
+
+    pub fn validateSparseEmbeddingArtifactsByName(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8, writes: []const mapper.SparseEmbeddingWrite) !void {
+        if (writes.len == 0) return;
+
+        const PendingSparseArtifactValidationLoad = struct {
+            doc_key: []const u8,
+            artifact_key: []const u8,
+        };
+        var pending_artifact_loads = std.ArrayListUnmanaged(PendingSparseArtifactValidationLoad).empty;
+        defer pending_artifact_loads.deinit(self.alloc);
+        for (writes) |write| {
+            if (!std.mem.eql(u8, write.index_name, index_name)) continue;
+            if (write.artifact_key != null and write.indices.len == 0) {
+                try pending_artifact_loads.append(self.alloc, .{
+                    .doc_key = write.doc_key,
+                    .artifact_key = write.artifact_key.?,
+                });
+            }
+        }
+        if (pending_artifact_loads.items.len == 0) return;
+
+        std.mem.sort(PendingSparseArtifactValidationLoad, pending_artifact_loads.items, {}, struct {
+            fn lessThan(_: void, a: PendingSparseArtifactValidationLoad, b: PendingSparseArtifactValidationLoad) bool {
+                return std.mem.order(u8, a.artifact_key, b.artifact_key) == .lt;
+            }
+        }.lessThan);
+
+        const read_keys = try self.alloc.alloc([]const u8, pending_artifact_loads.items.len);
+        defer self.alloc.free(read_keys);
+        const read_values = try self.alloc.alloc(?[]const u8, pending_artifact_loads.items.len);
+        defer self.alloc.free(read_values);
+        for (pending_artifact_loads.items, 0..) |item, i| read_keys[i] = item.artifact_key;
+
+        var artifact_read_txn = try store.beginProbeTxn();
+        defer artifact_read_txn.abort();
+        try artifact_read_txn.getManySorted(read_keys, read_values);
+
+        for (read_values) |maybe_raw| {
+            const raw = maybe_raw orelse return error.ReplayDocumentNotVisible;
+            const maybe_view = enrichment_artifact_codec.sparseEmbeddingVectorView(raw) catch |err| {
+                if (isRecoverableEmbeddingArtifactError(err)) return error.ReplayDocumentNotVisible;
+                return err;
+            };
+            if (maybe_view != null) continue;
+
+            var decoded = enrichment_artifact_codec.decodeSparseEmbeddingAlloc(self.alloc, raw) catch |err| {
+                if (isRecoverableEmbeddingArtifactError(err)) return error.ReplayDocumentNotVisible;
+                return err;
+            };
+            decoded.deinit(self.alloc);
+        }
     }
 
     fn backfillTextIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *TextIndex, resume_from: ?[]const u8) !void {
@@ -8946,8 +9031,8 @@ pub const IndexManager = struct {
         for (preloaded_artifact_vectors) |*slot| slot.* = null;
         var preloaded_artifact_vector_scratch = std.ArrayListUnmanaged(f32).empty;
         defer preloaded_artifact_vector_scratch.deinit(self.alloc);
-        var corrupt_artifact_deletes = std.ArrayListUnmanaged([]const u8).empty;
-        defer corrupt_artifact_deletes.deinit(self.alloc);
+        var unreadable_artifact_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer unreadable_artifact_keys.deinit(self.alloc);
 
         var items: OwnedDenseInsertItems = .{};
         defer items.deinit(self.alloc);
@@ -8975,11 +9060,9 @@ pub const IndexManager = struct {
             &store_txn,
             preloaded_artifact_vectors,
             &preloaded_artifact_vector_scratch,
-            &corrupt_artifact_deletes,
+            &unreadable_artifact_keys,
         )) {
-            for (corrupt_artifact_deletes.items) |artifact_key| {
-                try store_txn.delete(artifact_key);
-            }
+            if (unreadable_artifact_keys.items.len > 0) return error.ReplayDocumentNotVisible;
         }
         for (preloaded_artifact_vectors) |maybe_vector| {
             if (maybe_vector) |vector| preloaded_vector_bytes += @as(u64, @intCast(vector.len * @sizeOf(f32)));
@@ -9109,7 +9192,7 @@ pub const IndexManager = struct {
         store_txn: anytype,
         out_vectors: []?[]const f32,
         fallback_scratch: *std.ArrayListUnmanaged(f32),
-        corrupt_artifact_deletes: *std.ArrayListUnmanaged([]const u8),
+        unreadable_artifact_keys: *std.ArrayListUnmanaged([]const u8),
     ) !bool {
         return try self.preloadDenseEmbeddingArtifactVectorsFromTxn(
             index_name,
@@ -9119,7 +9202,7 @@ pub const IndexManager = struct {
             store_txn,
             out_vectors,
             fallback_scratch,
-            corrupt_artifact_deletes,
+            unreadable_artifact_keys,
         );
     }
 
@@ -9133,7 +9216,7 @@ pub const IndexManager = struct {
         session: *DenseVectorLoadSession,
         out_vectors: []?[]const f32,
         fallback_scratch: *std.ArrayListUnmanaged(f32),
-        corrupt_artifact_deletes: *std.ArrayListUnmanaged([]const u8),
+        unreadable_artifact_keys: *std.ArrayListUnmanaged([]const u8),
     ) !bool {
         const dims_usize: usize = @intCast(dims);
         var pending = std.ArrayListUnmanaged(PendingDenseArtifactLoad).empty;
@@ -9167,7 +9250,10 @@ pub const IndexManager = struct {
 
         var fallback_count: usize = 0;
         for (pending.items, 0..) |item, i| {
-            const raw = read_values[i] orelse continue;
+            const raw = read_values[i] orelse {
+                try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
+                continue;
+            };
             if (enrichment_artifact_codec.denseEmbeddingVectorView(raw)) |maybe_view| {
                 if (maybe_view) |view| {
                     if (view.len != dims_usize) return error.InvalidVectorDimensions;
@@ -9176,7 +9262,7 @@ pub const IndexManager = struct {
                 fallback_count += 1;
             } else |err| {
                 if (isRecoverableEmbeddingArtifactError(err)) {
-                    try corrupt_artifact_deletes.append(self.alloc, item.artifact_key);
+                    try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
                     continue;
                 }
                 return err;
@@ -9187,7 +9273,10 @@ pub const IndexManager = struct {
         if (fallback_count > 0) try fallback_scratch.resize(self.alloc, fallback_start + fallback_count * dims_usize);
         var fallback_index: usize = 0;
         for (pending.items, 0..) |item, i| {
-            const raw = read_values[i] orelse continue;
+            const raw = read_values[i] orelse {
+                try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
+                continue;
+            };
             if (enrichment_artifact_codec.denseEmbeddingVectorView(raw)) |maybe_view| {
                 if (maybe_view) |view| {
                     out_vectors[item.write_index] = view;
@@ -9195,7 +9284,7 @@ pub const IndexManager = struct {
                 }
             } else |err| {
                 if (isRecoverableEmbeddingArtifactError(err)) {
-                    try corrupt_artifact_deletes.append(self.alloc, item.artifact_key);
+                    try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
                     continue;
                 }
                 return err;
@@ -9204,7 +9293,7 @@ pub const IndexManager = struct {
             fallback_index += 1;
             _ = enrichment_artifact_codec.decodeDenseEmbeddingInto(raw, vector) catch |err| {
                 if (isRecoverableEmbeddingArtifactError(err)) {
-                    try corrupt_artifact_deletes.append(self.alloc, item.artifact_key);
+                    try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
                     continue;
                 }
                 return err;
@@ -9226,7 +9315,7 @@ pub const IndexManager = struct {
         txn: anytype,
         out_vectors: []?[]const f32,
         fallback_scratch: *std.ArrayListUnmanaged(f32),
-        corrupt_artifact_deletes: *std.ArrayListUnmanaged([]const u8),
+        unreadable_artifact_keys: *std.ArrayListUnmanaged([]const u8),
     ) !bool {
         const dims_usize: usize = @intCast(dims);
         var pending = std.ArrayListUnmanaged(PendingDenseArtifactLoad).empty;
@@ -9260,7 +9349,10 @@ pub const IndexManager = struct {
 
         var fallback_count: usize = 0;
         for (pending.items, 0..) |item, i| {
-            const raw = read_values[i] orelse continue;
+            const raw = read_values[i] orelse {
+                try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
+                continue;
+            };
             if (enrichment_artifact_codec.denseEmbeddingVectorView(raw)) |maybe_view| {
                 if (maybe_view) |view| {
                     if (view.len != dims_usize) return error.InvalidVectorDimensions;
@@ -9269,7 +9361,7 @@ pub const IndexManager = struct {
                 fallback_count += 1;
             } else |err| {
                 if (isRecoverableEmbeddingArtifactError(err)) {
-                    try corrupt_artifact_deletes.append(self.alloc, item.artifact_key);
+                    try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
                     continue;
                 }
                 return err;
@@ -9280,7 +9372,10 @@ pub const IndexManager = struct {
         if (fallback_count > 0) try fallback_scratch.resize(self.alloc, fallback_start + fallback_count * dims_usize);
         var fallback_index: usize = 0;
         for (pending.items, 0..) |item, i| {
-            const raw = read_values[i] orelse continue;
+            const raw = read_values[i] orelse {
+                try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
+                continue;
+            };
             if (enrichment_artifact_codec.denseEmbeddingVectorView(raw)) |maybe_view| {
                 if (maybe_view) |view| {
                     out_vectors[item.write_index] = view;
@@ -9288,7 +9383,7 @@ pub const IndexManager = struct {
                 }
             } else |err| {
                 if (isRecoverableEmbeddingArtifactError(err)) {
-                    try corrupt_artifact_deletes.append(self.alloc, item.artifact_key);
+                    try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
                     continue;
                 }
                 return err;
@@ -9297,7 +9392,7 @@ pub const IndexManager = struct {
             fallback_index += 1;
             _ = enrichment_artifact_codec.decodeDenseEmbeddingInto(raw, vector) catch |err| {
                 if (isRecoverableEmbeddingArtifactError(err)) {
-                    try corrupt_artifact_deletes.append(self.alloc, item.artifact_key);
+                    try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
                     continue;
                 }
                 return err;
@@ -10860,7 +10955,6 @@ pub const IndexManager = struct {
             artifact_copy_count: u64 = 0,
             delete_batch_ns: u64 = 0,
             sparse_batch_ns: u64 = 0,
-            corrupt_delete_ns: u64 = 0,
         };
         const profile_enabled = sparseReplayProfileEnabled();
         const total_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
@@ -10879,8 +10973,8 @@ pub const IndexManager = struct {
         }
         var delete_keys = std.ArrayListUnmanaged([]const u8).empty;
         defer delete_keys.deinit(self.alloc);
-        var corrupt_artifact_deletes = std.ArrayListUnmanaged([]const u8).empty;
-        defer corrupt_artifact_deletes.deinit(self.alloc);
+        var unreadable_artifact_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer unreadable_artifact_keys.deinit(self.alloc);
 
         const scan_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         for (writes) |write| {
@@ -10928,10 +11022,13 @@ pub const IndexManager = struct {
 
             const decode_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
             for (pending_artifact_loads.items, 0..) |item, i| {
-                const raw = read_values[i] orelse continue;
+                const raw = read_values[i] orelse {
+                    try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
+                    continue;
+                };
                 const maybe_view = enrichment_artifact_codec.sparseEmbeddingVectorView(raw) catch |err| {
                     if (isRecoverableEmbeddingArtifactError(err)) {
-                        try corrupt_artifact_deletes.append(self.alloc, item.artifact_key);
+                        try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
                         continue;
                     }
                     return err;
@@ -10952,7 +11049,7 @@ pub const IndexManager = struct {
                 if (profile_enabled) profile.artifact_copy_count += 1;
                 var decoded = enrichment_artifact_codec.decodeSparseEmbeddingAlloc(self.alloc, raw) catch |err| {
                     if (isRecoverableEmbeddingArtifactError(err)) {
-                        try corrupt_artifact_deletes.append(self.alloc, item.artifact_key);
+                        try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
                         continue;
                     }
                     return err;
@@ -10977,6 +11074,7 @@ pub const IndexManager = struct {
                 });
             }
             if (profile_enabled) profile.artifact_decode_ns = platform_time.monotonicNs() - decode_start_ns;
+            if (unreadable_artifact_keys.items.len > 0) return error.ReplayDocumentNotVisible;
 
             if (delete_keys.items.len > 0) {
                 const delete_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
@@ -11018,14 +11116,9 @@ pub const IndexManager = struct {
             });
             if (profile_enabled) profile.sparse_batch_ns = platform_time.monotonicNs() - sparse_start_ns;
         }
-        if (corrupt_artifact_deletes.items.len > 0) {
-            const corrupt_delete_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-            try store.putBatch(&.{}, corrupt_artifact_deletes.items);
-            if (profile_enabled) profile.corrupt_delete_ns = platform_time.monotonicNs() - corrupt_delete_start_ns;
-        }
         if (profile_enabled and (pending_artifact_loads.items.len > 0 or sparse_writes.items.len > 0 or delete_keys.items.len > 0)) {
             std.log.info(
-                "antfly_bench_sparse_replay index={s} mode={s} input_writes={d} pending_artifacts={d} sparse_writes={d} delete_keys={d} corrupt_artifacts={d} total_ms={d} scan_ms={d} sort_ms={d} artifact_read_ms={d} artifact_decode_ms={d} artifact_views={d} artifact_copies={d} delete_batch_ms={d} sparse_batch_ms={d} corrupt_delete_ms={d}",
+                "antfly_bench_sparse_replay index={s} mode={s} input_writes={d} pending_artifacts={d} sparse_writes={d} delete_keys={d} unreadable_artifacts={d} total_ms={d} scan_ms={d} sort_ms={d} artifact_read_ms={d} artifact_decode_ms={d} artifact_views={d} artifact_copies={d} delete_batch_ms={d} sparse_batch_ms={d}",
                 .{
                     entry.config.name,
                     @tagName(batch_options.mode),
@@ -11033,7 +11126,7 @@ pub const IndexManager = struct {
                     pending_artifact_loads.items.len,
                     sparse_writes.items.len,
                     delete_keys.items.len,
-                    corrupt_artifact_deletes.items.len,
+                    unreadable_artifact_keys.items.len,
                     nsToMs(platform_time.monotonicNs() - total_start_ns),
                     nsToMs(profile.scan_ns),
                     nsToMs(profile.sort_ns),
@@ -11043,7 +11136,6 @@ pub const IndexManager = struct {
                     profile.artifact_copy_count,
                     nsToMs(profile.delete_batch_ns),
                     nsToMs(profile.sparse_batch_ns),
-                    nsToMs(profile.corrupt_delete_ns),
                 },
             );
         }
