@@ -85,7 +85,7 @@ pub fn invokeExtensionWithOptions(
 }
 
 fn resolveArtifactPathAlloc(alloc: std.mem.Allocator, binding: RuntimeBinding, package_store_root: ?[]const u8) InvokeError![]u8 {
-    if (std.fs.path.isAbsolute(binding.artifact)) return try alloc.dupe(u8, binding.artifact);
+    if (!safeRelativeArtifactPath(binding.artifact)) return error.InvalidArtifactPath;
 
     const root = package_store_root orelse getenv(package_store_env) orelse return error.WasmtimePackageStoreUnavailable;
 
@@ -95,7 +95,7 @@ fn resolveArtifactPathAlloc(alloc: std.mem.Allocator, binding: RuntimeBinding, p
         candidates.deinit(alloc);
     }
 
-    if (contentAddressedDigest(binding.package_digest)) |digest| {
+    if (try contentAddressedDigest(binding.package_digest)) |digest| {
         try candidates.append(alloc, try std.fs.path.join(alloc, &.{ root, "sha256", digest, binding.artifact }));
     }
     try candidates.append(alloc, try std.fs.path.join(alloc, &.{ root, binding.package_name, binding.artifact }));
@@ -113,10 +113,36 @@ fn resolveArtifactPathAlloc(alloc: std.mem.Allocator, binding: RuntimeBinding, p
     return try alloc.dupe(u8, candidates.items[candidates.items.len - 1]);
 }
 
-fn contentAddressedDigest(digest: []const u8) ?[]const u8 {
+fn contentAddressedDigest(digest: []const u8) !?[]const u8 {
     if (!std.mem.startsWith(u8, digest, "sha256:")) return null;
     const value = digest["sha256:".len..];
-    return if (value.len == 0) null else value;
+    if (!safePathSegment(value)) return error.InvalidPackageDigest;
+    return value;
+}
+
+fn safePathSegment(value: []const u8) bool {
+    if (value.len == 0) return false;
+    if (std.mem.eql(u8, value, ".") or std.mem.eql(u8, value, "..")) return false;
+    for (value) |c| {
+        const valid =
+            (c >= 'a' and c <= 'z') or
+            (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or
+            c == '_' or
+            c == '-' or
+            c == '.';
+        if (!valid) return false;
+    }
+    return true;
+}
+
+fn safeRelativeArtifactPath(path: []const u8) bool {
+    if (path.len == 0 or std.fs.path.isAbsolute(path)) return false;
+    var parts = std.mem.splitScalar(u8, path, '/');
+    while (parts.next()) |part| {
+        if (!safePathSegment(part)) return false;
+    }
+    return true;
 }
 
 fn artifactPathExists(path: []const u8) !void {
@@ -176,6 +202,39 @@ test "wasmtime runtime resolves content-addressed package store artifacts first"
     defer std.testing.allocator.free(path);
 
     try std.testing.expect(std.mem.indexOf(u8, path, "extensions/sha256/abc123/") != null);
+}
+
+test "wasmtime runtime rejects unsafe content-addressed package digests" {
+    try std.testing.expectError(error.InvalidPackageDigest, contentAddressedDigest("sha256:../escape"));
+    try std.testing.expectError(error.InvalidPackageDigest, contentAddressedDigest("sha256:nested/path"));
+    try std.testing.expectError(error.InvalidPackageDigest, contentAddressedDigest("sha256:"));
+    try std.testing.expectEqualStrings("memoryaf-0.0.1-reference", (try contentAddressedDigest("sha256:memoryaf-0.0.1-reference")).?);
+}
+
+test "wasmtime runtime rejects unsafe relative artifact paths" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/extensions", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_path);
+
+    try std.testing.expectError(error.InvalidArtifactPath, resolveArtifactPathAlloc(std.testing.allocator, .{
+        .package_name = "memoryaf",
+        .package_version = "0.0.1",
+        .runtime_name = "memoryaf_wasm",
+        .artifact = "../escape.wasm",
+    }, root_path));
+    try std.testing.expectError(error.InvalidArtifactPath, resolveArtifactPathAlloc(std.testing.allocator, .{
+        .package_name = "memoryaf",
+        .package_version = "0.0.1",
+        .runtime_name = "memoryaf_wasm",
+        .artifact = "target//memoryaf_extension.wasm",
+    }, root_path));
+    try std.testing.expectError(error.InvalidArtifactPath, resolveArtifactPathAlloc(std.testing.allocator, .{
+        .package_name = "memoryaf",
+        .package_version = "0.0.1",
+        .runtime_name = "memoryaf_wasm",
+        .artifact = "/tmp/memoryaf_extension.wasm",
+    }, root_path));
 }
 
 test "wasmtime runtime preserves legacy versioned artifact layout" {

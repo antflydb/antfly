@@ -799,7 +799,7 @@ fn freeExtensionCapabilities(alloc: std.mem.Allocator, capabilities: []const ext
 fn extensionRuntimeBindingAlloc(alloc: std.mem.Allocator, member: *const extension_domain.ExtensionMember, handler: []const u8, snapshot: anytype) !?ExtensionRuntimeBinding {
     const parsed = parseWasmHandler(handler) orelse return null;
     const installed = findInstalledExtension(snapshot.installed_extensions, member.extension_name) orelse return null;
-    const package = findExtensionPackage(snapshot.extension_packages, installed.package_name, installed.package_version) orelse return null;
+    const package = findExtensionPackage(snapshot.extension_packages, installed.package_name, installed.package_version, installed.package_digest) orelse return null;
     const runtime = findWasmRuntime(package.install.runtimes, parsed.runtime_name) orelse return null;
 
     var package_name: ?[]u8 = null;
@@ -859,11 +859,111 @@ fn findInstalledExtension(installed_extensions: []const extension_domain.Install
     return null;
 }
 
-fn findExtensionPackage(packages: []const extension_domain.PackageManifest, name: []const u8, version: []const u8) ?extension_domain.PackageManifest {
+fn findExtensionPackage(packages: []const extension_domain.PackageManifest, name: []const u8, version: []const u8, digest: []const u8) ?extension_domain.PackageManifest {
     for (packages) |package| {
-        if (std.mem.eql(u8, package.name, name) and std.mem.eql(u8, package.version, version)) return package;
+        if (std.mem.eql(u8, package.name, name) and
+            std.mem.eql(u8, package.version, version) and
+            std.mem.eql(u8, package.digest, digest))
+        {
+            return package;
+        }
     }
     return null;
+}
+
+pub fn testExtensionRuntimeBindingRequiresInstalledPackageDigestMatch() !void {
+    if (!@import("builtin").is_test) @compileError("test-only helper");
+    const alloc = std.testing.allocator;
+    const runtimes = [_]extension_domain.RuntimeDecl{.{
+        .name = "memoryaf_wasm",
+        .mode = .wasm,
+        .artifact = "target/wasm32-wasip2/release/memoryaf_extension.wasm",
+    }};
+    const packages = [_]extension_domain.PackageManifest{.{
+        .name = "memoryaf",
+        .version = "0.0.1",
+        .digest = "sha256:projected",
+        .install = .{
+            .scopes_supported = &.{.cluster},
+            .runtimes = &runtimes,
+        },
+    }};
+    const installed = [_]extension_domain.InstalledExtension{.{
+        .name = "memories",
+        .package_name = "memoryaf",
+        .package_version = "0.0.1",
+        .package_digest = "sha256:installed",
+        .scope = .{ .kind = .cluster },
+        .status = .ready,
+    }};
+    const snapshot = .{
+        .extension_packages = packages[0..],
+        .installed_extensions = installed[0..],
+    };
+    const member = extension_domain.ExtensionMember{
+        .extension_name = "memories",
+        .scope = .{ .kind = .cluster },
+        .object_kind = .mcp_tool,
+        .object_name = "store_memory",
+    };
+
+    try std.testing.expectEqual(@as(?ExtensionRuntimeBinding, null), try extensionRuntimeBindingAlloc(alloc, &member, "wasm:memoryaf_wasm/store_memory", snapshot));
+}
+
+test "extension runtime binding requires installed package digest to match projected package" {
+    try testExtensionRuntimeBindingRequiresInstalledPackageDigestMatch();
+}
+
+pub fn testExtensionRuntimeBindingCarriesMatchedInstalledPackageDigest() !void {
+    if (!@import("builtin").is_test) @compileError("test-only helper");
+    const alloc = std.testing.allocator;
+    const runtimes = [_]extension_domain.RuntimeDecl{.{
+        .name = "memoryaf_wasm",
+        .mode = .wasm,
+        .artifact = "target/wasm32-wasip2/release/memoryaf_extension.wasm",
+        .config_json = "{\"entrypoint\":\"run-tool\"}",
+    }};
+    const packages = [_]extension_domain.PackageManifest{.{
+        .name = "memoryaf",
+        .version = "0.0.1",
+        .digest = "sha256:projected",
+        .install = .{
+            .scopes_supported = &.{.cluster},
+            .runtimes = &runtimes,
+        },
+    }};
+    const installed = [_]extension_domain.InstalledExtension{.{
+        .name = "memories",
+        .package_name = "memoryaf",
+        .package_version = "0.0.1",
+        .package_digest = "sha256:projected",
+        .scope = .{ .kind = .cluster },
+        .status = .ready,
+    }};
+    const snapshot = .{
+        .extension_packages = packages[0..],
+        .installed_extensions = installed[0..],
+    };
+    const member = extension_domain.ExtensionMember{
+        .extension_name = "memories",
+        .scope = .{ .kind = .cluster },
+        .object_kind = .mcp_tool,
+        .object_name = "store_memory",
+    };
+
+    const binding = (try extensionRuntimeBindingAlloc(alloc, &member, "wasm:memoryaf_wasm/store_memory", snapshot)).?;
+    defer binding.deinit(alloc);
+
+    try std.testing.expectEqualStrings("memoryaf", binding.package_name);
+    try std.testing.expectEqualStrings("0.0.1", binding.package_version);
+    try std.testing.expectEqualStrings("sha256:projected", binding.package_digest);
+    try std.testing.expectEqualStrings("memoryaf_wasm", binding.runtime_name);
+    try std.testing.expectEqualStrings("target/wasm32-wasip2/release/memoryaf_extension.wasm", binding.artifact);
+    try std.testing.expectEqualStrings("run-tool", binding.entrypoint);
+}
+
+test "extension runtime binding carries matched installed package digest" {
+    try testExtensionRuntimeBindingCarriesMatchedInstalledPackageDigest();
 }
 
 fn findWasmRuntime(runtimes: []const extension_domain.RuntimeDecl, name: []const u8) ?extension_domain.RuntimeDecl {
