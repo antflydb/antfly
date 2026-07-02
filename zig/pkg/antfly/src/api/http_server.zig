@@ -272,7 +272,6 @@ pub const ApiHttpServerConfig = struct {
     user_manager: ?*usermgr.UserManager = null,
     session_router: ?table_router.HostedGroupRouter = null,
     session_executor: ?http_common.RequestExecutor = null,
-    metadata_mutation_forwarder: ?RequestForwarder = null,
     session_store: ?*transactions_api.DurableSessionStore = null,
     session_store_path: ?[]const u8 = null,
     ha_admin_executor: ?http_common.RequestExecutor = null,
@@ -287,19 +286,6 @@ pub const ApiHttpServerConfig = struct {
     session_owner_lease_ttl_ns: ?u64 = null,
     session_owner_lease_renew_interval_ns: ?u64 = null,
     session_savepoint_limit: ?usize = null,
-};
-
-pub const RequestForwarder = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        forward: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!?http_common.HttpResponse,
-    };
-
-    pub fn forward(self: RequestForwarder, alloc: std.mem.Allocator, req: http_common.HttpRequest) !?http_common.HttpResponse {
-        return try self.vtable.forward(self.ptr, alloc, req);
-    }
 };
 
 pub const trusted_principal_header = "X-Antfly-Trusted-Principal";
@@ -2049,7 +2035,7 @@ pub const ApiHttpServer = struct {
         if (try self.dispatchExtensionAgentRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         if (try self.dispatchProtocolRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         const extension_resp = self.dispatchExtensionRoutes(req, uri_parts) catch |err| switch (err) {
-            error.NotLeader => {
+            error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => {
                 if (publicExtensionRouteMutatesMetadata(req.method, uri_parts.path)) {
                     return try metadataNotLeaderResponse(self.alloc);
                 }
@@ -2065,7 +2051,7 @@ pub const ApiHttpServer = struct {
         if (try http_internal_routes.handle(self.internalRoutesContext(uri_parts), req)) |resp| return resp;
         const public_table_resp = self.dispatchPublicTableRoutes(req, uri_parts, authenticated_identity) catch |err| switch (err) {
             error.InvalidPathParameter => return try textResponse(self.alloc, 400, "invalid path parameter"),
-            error.NotLeader => {
+            error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => {
                 if (publicTableRouteMutatesMetadata(req.method, uri_parts.path)) {
                     return try metadataNotLeaderResponse(self.alloc);
                 }
@@ -2414,9 +2400,6 @@ pub const ApiHttpServer = struct {
 
     fn dispatchExtensionRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts) !?http_common.HttpResponse {
         if (!isExtensionPath(uri_parts.path)) return null;
-        if (publicExtensionRouteMutatesMetadata(req.method, uri_parts.path)) {
-            if (try self.forwardMetadataMutationToLeader(req)) |resp| return resp;
-        }
 
         if (req.method != .GET) {
             if (req.method == .POST) {
@@ -3873,9 +3856,6 @@ pub const ApiHttpServer = struct {
     }
 
     fn dispatchPublicTableRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
-        if (publicTableRouteMutatesMetadata(req.method, uri_parts.path)) {
-            if (try self.forwardMetadataMutationToLeader(req)) |resp| return resp;
-        }
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.backups)) {
             const params = parseListBackupsParams(uri_parts.query) catch return try textResponse(self.alloc, 400, "missing location");
             return try self.handlePublicClusterBackupList(params.location);
@@ -5481,12 +5461,6 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    fn forwardMetadataMutationToLeader(self: *ApiHttpServer, req: http_common.HttpRequest) !?http_common.HttpResponse {
-        if (req.metadata_leader_forwarded) return null;
-        const forwarder = self.cfg.metadata_mutation_forwarder orelse return null;
-        return try forwarder.forward(self.alloc, req);
-    }
-
     fn publicTableRouteMutatesMetadata(method: http_common.Method, path: []const u8) bool {
         return switch (method) {
             .POST => std.mem.eql(u8, path, routes.Routes.backup) or
@@ -6302,7 +6276,7 @@ pub const ApiHttpServer = struct {
 
         if (!self.cfg.swarm_mode) {
             if (self.source.restoreTable(self.alloc, table_name, location_uri, backup_id) catch |err| switch (err) {
-                error.NotLeader => return error.NotLeader,
+                error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
                 error.UnsupportedOperation => false,
                 error.InvalidBackupRequest => {
                     if (self.tableExists(table_name) catch |table_exists_err| return metadataAccessFailure(table_exists_err)) return error.TableAlreadyExists;
@@ -6315,7 +6289,7 @@ pub const ApiHttpServer = struct {
         }
 
         self.restoreOwnedTableWithRetry(table_name, location, backup_id) catch |err| switch (err) {
-            error.NotLeader => return error.NotLeader,
+            error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidBackupRequest => {
                 if (self.tableExists(table_name) catch |table_exists_err| return metadataAccessFailure(table_exists_err)) return error.TableAlreadyExists;
@@ -6327,7 +6301,7 @@ pub const ApiHttpServer = struct {
 
     fn mapExecuteRestoreError(err: anyerror) public_table_http.TableApi.ExecuteRestoreError {
         return switch (err) {
-            error.NotLeader => error.NotLeader,
+            error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => error.NotLeader,
             error.TableAlreadyExists => error.TableAlreadyExists,
             error.UnsupportedBackupMigrationState => error.UnsupportedBackupMigrationState,
             error.UnsupportedBackupFormat => error.UnsupportedBackupFormat,
@@ -6443,7 +6417,7 @@ pub const ApiHttpServer = struct {
         };
 
         self.source.createIndex(alloc, table_name, index_name, normalized_index_json) catch |err| switch (err) {
-            error.NotLeader => return error.NotLeader,
+            error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
@@ -6459,7 +6433,7 @@ pub const ApiHttpServer = struct {
         };
         defer alloc.free(expected_indexes_json);
         self.waitForMetadataProjection(table_name, null, expected_indexes_json) catch |err| {
-            if (err == error.NotLeader) return error.NotLeader;
+            if (isRetryableMetadataLeadershipError(err)) return error.NotLeader;
             std.log.err("public create index metadata projection wait failed table={s} index={s} err={}", .{ table_name, index_name, err });
             return error.InternalFailure;
         };
@@ -6484,7 +6458,7 @@ pub const ApiHttpServer = struct {
         const table_before = (self.loadOwnedTableRecord(table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
         defer metadata_table_manager.freeTable(alloc, table_before);
         self.source.dropIndex(alloc, table_name, index_name) catch |err| switch (err) {
-            error.NotLeader => return error.NotLeader,
+            error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound, error.IndexNotFound => return error.NotFound,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
@@ -6531,7 +6505,7 @@ pub const ApiHttpServer = struct {
         };
 
         self.source.putArtifactEnrichment(alloc, table_name, artifact_name, enrichment_json) catch |err| switch (err) {
-            error.NotLeader => return error.NotLeader,
+            error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
@@ -6542,7 +6516,7 @@ pub const ApiHttpServer = struct {
             },
         };
         self.waitForMetadataProjection(table_name, null, expected_indexes_json) catch |err| {
-            if (err == error.NotLeader) return error.NotLeader;
+            if (isRetryableMetadataLeadershipError(err)) return error.NotLeader;
             std.log.err("public artifact enrichment metadata projection wait failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
             return error.InternalFailure;
         };
@@ -6567,7 +6541,7 @@ pub const ApiHttpServer = struct {
         };
 
         self.source.deleteArtifactEnrichment(alloc, table_name, artifact_name) catch |err| switch (err) {
-            error.NotLeader => return error.NotLeader,
+            error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound, error.EnrichmentNotFound => return error.NotFound,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
@@ -6684,7 +6658,7 @@ pub const ApiHttpServer = struct {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
 
         self.source.ensureLinearizableRead() catch |err| {
-            if (err == error.NotLeader) return error.NotLeader;
+            if (isRetryableMetadataLeadershipError(err)) return error.NotLeader;
             std.log.warn("cluster backup metadata read barrier failed err={s}", .{@errorName(err)});
             return error.InternalFailure;
         };
@@ -6704,7 +6678,7 @@ pub const ApiHttpServer = struct {
             cluster_tables.deinit(alloc);
         }
         var extension_snapshot_opt = self.source.adminSnapshot() catch |err| switch (err) {
-            error.NotLeader => return error.NotLeader,
+            error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             else => null,
         };
         defer if (extension_snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
@@ -6713,7 +6687,7 @@ pub const ApiHttpServer = struct {
             statuses[i] = .{ .name = table_name, .status = "failed", .@"error" = null };
             const table_backup_id = backups_api.clusterTableBackupId(alloc, req.backup_id, table_name) catch return error.InternalFailure;
             self.backupOwnedTable(table_name, location, req.location, table_backup_id, .native) catch |err| {
-                if (err == error.NotLeader) {
+                if (isRetryableMetadataLeadershipError(err)) {
                     alloc.free(table_backup_id);
                     return error.NotLeader;
                 }
@@ -6762,7 +6736,7 @@ pub const ApiHttpServer = struct {
         defer manifest.deinit(alloc);
 
         preflightClusterRestoreExtensions(self, &manifest) catch |err| switch (err) {
-            error.NotLeader => return error.NotLeader,
+            error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             else => return error.InvalidRequest,
         };
 
@@ -6813,7 +6787,7 @@ pub const ApiHttpServer = struct {
                 }
 
                 self.source.dropTable(alloc, table_name) catch |err| {
-                    if (err == error.NotLeader) return error.NotLeader;
+                    if (isRetryableMetadataLeadershipError(err)) return error.NotLeader;
                     statuses[i].@"error" = switch (err) {
                         error.TableNotFound => null,
                         error.ExtensionOwnedObject => "method not allowed",
@@ -6833,7 +6807,7 @@ pub const ApiHttpServer = struct {
                     };
                 }
                 self.waitForTableVisibility(table_name, .absent) catch |err| {
-                    if (err == error.NotLeader) return error.NotLeader;
+                    if (isRetryableMetadataLeadershipError(err)) return error.NotLeader;
                     statuses[i].@"error" = "failed to remove existing table";
                     continue;
                 };
@@ -6850,7 +6824,7 @@ pub const ApiHttpServer = struct {
             // restore which creates the table and copies data synchronously.
             if (!is_overwrite and !self.cfg.swarm_mode) {
                 const restored_via_metadata = self.source.restoreTable(alloc, table_name, req.location, table_backup_id) catch |err| switch (err) {
-                    error.NotLeader => return error.NotLeader,
+                    error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
                     error.UnsupportedOperation => false,
                     else => {
                         std.log.err("cluster restore failed table={s} backup_id={s} err={}", .{
@@ -6876,7 +6850,7 @@ pub const ApiHttpServer = struct {
             }
 
             self.restoreOwnedTableWithRetry(table_name, location, table_backup_id) catch |err| {
-                if (err == error.NotLeader) return error.NotLeader;
+                if (isRetryableMetadataLeadershipError(err)) return error.NotLeader;
                 std.log.err("cluster restore failed table={s} backup_id={s} err={}", .{
                     table_name,
                     table_backup_id,
@@ -6903,7 +6877,7 @@ pub const ApiHttpServer = struct {
                 manifest.extension_members,
                 manifest.extension_dependencies,
             ) catch |err| switch (err) {
-                error.NotLeader => return error.NotLeader,
+                error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
                 error.UnsupportedOperation => {},
                 else => {
                     std.log.err("cluster restore extension metadata restore failed err={}", .{err});
@@ -9780,9 +9754,16 @@ fn metadataNotLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse
     };
 }
 
+fn isRetryableMetadataLeadershipError(err: anyerror) bool {
+    return switch (err) {
+        error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => true,
+        else => false,
+    };
+}
+
 fn metadataAccessFailure(err: anyerror) error{ NotLeader, InternalFailure } {
     return switch (err) {
-        error.NotLeader => error.NotLeader,
+        error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => error.NotLeader,
         else => error.InternalFailure,
     };
 }
@@ -20896,154 +20877,6 @@ test "api http server lists cluster backups through public route" {
     try std.testing.expect(parsed.value.backups[0].timestamp.len > 0);
 }
 
-test "api http server forwards public metadata mutations to metadata leader" {
-    const alloc = std.testing.allocator;
-    const FakeSource = struct {
-        fn iface(self: *@This()) StatusSource {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .status = status },
-            };
-        }
-
-        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
-            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
-        }
-    };
-    const CaptureForwarder = struct {
-        calls: usize = 0,
-        uri: []u8 = &.{},
-        body: []u8 = &.{},
-
-        fn iface(self: *@This()) RequestForwarder {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .forward = forward },
-            };
-        }
-
-        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-            if (self.uri.len > 0) allocator.free(self.uri);
-            if (self.body.len > 0) allocator.free(self.body);
-            self.* = .{};
-        }
-
-        fn forward(ptr: *anyopaque, allocator: std.mem.Allocator, req: http_common.HttpRequest) !?http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.calls += 1;
-            if (self.uri.len > 0) allocator.free(self.uri);
-            if (self.body.len > 0) allocator.free(self.body);
-            self.uri = try allocator.dupe(u8, req.uri);
-            self.body = try allocator.dupe(u8, req.body);
-            return .{
-                .status = 202,
-                .content_type = try allocator.dupe(u8, "text/plain"),
-                .body = try allocator.dupe(u8, "forwarded"),
-            };
-        }
-    };
-
-    var source = FakeSource{};
-    var forwarder = CaptureForwarder{};
-    defer forwarder.deinit(alloc);
-    var server = ApiHttpServer.init(alloc, .{
-        .metadata_mutation_forwarder = forwarder.iface(),
-    }, source.iface(), null, null);
-
-    const Case = struct {
-        method: http_common.Method,
-        uri: []const u8,
-        body: []const u8 = "{}",
-    };
-    const cases = [_]Case{
-        .{ .method = .POST, .uri = "/backup", .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/backups\"}" },
-        .{ .method = .POST, .uri = "/restore" },
-        .{ .method = .POST, .uri = "/tables/docs" },
-        .{ .method = .POST, .uri = "/tables/docs/restore" },
-        .{ .method = .POST, .uri = "/tables/docs/indexes/body" },
-        .{ .method = .PUT, .uri = "/tables/docs/schema" },
-        .{ .method = .PUT, .uri = "/tables/docs/artifacts/chunks/enrichment" },
-        .{ .method = .DELETE, .uri = "/tables/docs/artifacts/chunks/enrichment" },
-        .{ .method = .DELETE, .uri = "/tables/docs/indexes/body" },
-        .{ .method = .DELETE, .uri = "/tables/docs" },
-        .{ .method = .POST, .uri = "/extensions/v1/installed/memoryaf" },
-        .{ .method = .POST, .uri = "/extensions/v1/installed/memoryaf/update" },
-        .{ .method = .POST, .uri = "/extensions/v1/installed/memoryaf/drop" },
-        .{ .method = .POST, .uri = "/extensions/v1/installed/memoryaf/enable" },
-        .{ .method = .POST, .uri = "/extensions/v1/installed/memoryaf/disable" },
-        .{ .method = .PUT, .uri = "/extensions/v1/installed/memoryaf/config" },
-    };
-
-    for (cases, 1..) |case, expected_calls| {
-        var resp = try server.handle(.{
-            .method = case.method,
-            .uri = case.uri,
-            .content_type = "application/json",
-            .body = case.body,
-        });
-        defer resp.deinit(alloc);
-
-        try std.testing.expectEqual(@as(usize, expected_calls), forwarder.calls);
-        try std.testing.expectEqual(@as(u16, 202), resp.status);
-        try std.testing.expectEqualStrings("forwarded", resp.body);
-        try std.testing.expectEqualStrings(case.uri, forwarder.uri);
-        try std.testing.expectEqualStrings(case.body, forwarder.body);
-    }
-}
-
-test "api http server does not reforward already-forwarded metadata mutations" {
-    const alloc = std.testing.allocator;
-    const FakeSource = struct {
-        fn iface(self: *@This()) StatusSource {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .status = status },
-            };
-        }
-
-        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
-            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
-        }
-    };
-    const CaptureForwarder = struct {
-        calls: usize = 0,
-
-        fn iface(self: *@This()) RequestForwarder {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .forward = forward },
-            };
-        }
-
-        fn forward(ptr: *anyopaque, allocator: std.mem.Allocator, _: http_common.HttpRequest) !?http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.calls += 1;
-            return .{
-                .status = 500,
-                .content_type = try allocator.dupe(u8, "text/plain"),
-                .body = try allocator.dupe(u8, "unexpected reforward"),
-            };
-        }
-    };
-
-    var source = FakeSource{};
-    var forwarder = CaptureForwarder{};
-    var server = ApiHttpServer.init(alloc, .{
-        .metadata_mutation_forwarder = forwarder.iface(),
-    }, source.iface(), null, null);
-
-    var resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/backup",
-        .content_type = "application/json",
-        .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/backups\"}",
-        .metadata_leader_forwarded = true,
-    });
-    defer resp.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 0), forwarder.calls);
-}
-
 fn expectPublicMetadataNotLeaderResponse(resp: http_common.HttpResponse) !void {
     try std.testing.expectEqual(@as(u16, 503), resp.status);
     try std.testing.expectEqualStrings("text/plain", resp.content_type.?);
@@ -21109,7 +20942,7 @@ test "api http server returns retryable not leader for local public metadata mut
     try std.testing.expectEqual(@as(usize, 1), source.create_calls);
 }
 
-test "api http server returns retryable not leader when metadata forwarder has no target" {
+test "api http server returns retryable not leader when metadata proposal is dropped" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
         create_calls: usize = 0,
@@ -21132,33 +20965,12 @@ test "api http server returns retryable not leader when metadata forwarder has n
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             self.create_calls += 1;
-            return error.NotLeader;
-        }
-    };
-    const NullForwarder = struct {
-        calls: usize = 0,
-
-        fn iface(self: *@This()) RequestForwarder {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .forward = forward },
-            };
-        }
-
-        fn forward(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !?http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(.POST, req.method);
-            try std.testing.expectEqualStrings("/tables/docs", req.uri);
-            self.calls += 1;
-            return null;
+            return error.ProposalDropped;
         }
     };
 
     var source = FakeSource{};
-    var forwarder = NullForwarder{};
-    var server = ApiHttpServer.init(alloc, .{
-        .metadata_mutation_forwarder = forwarder.iface(),
-    }, source.iface(), null, null);
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
     const create_body = try test_contract_helpers.encodeCreateTableRequest(alloc, "docs table");
     defer alloc.free(create_body);
 
@@ -21171,7 +20983,6 @@ test "api http server returns retryable not leader when metadata forwarder has n
     defer resp.deinit(alloc);
 
     try expectPublicMetadataNotLeaderResponse(resp);
-    try std.testing.expectEqual(@as(usize, 1), forwarder.calls);
     try std.testing.expectEqual(@as(usize, 1), source.create_calls);
 }
 
@@ -21226,33 +21037,12 @@ test "api http server returns retryable not leader through public table adapter 
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqualStrings("body", index_name);
             self.create_index_calls += 1;
-            return error.NotLeader;
-        }
-    };
-    const NullForwarder = struct {
-        calls: usize = 0,
-
-        fn iface(self: *@This()) RequestForwarder {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .forward = forward },
-            };
-        }
-
-        fn forward(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !?http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(.POST, req.method);
-            try std.testing.expectEqualStrings("/tables/docs/indexes/body", req.uri);
-            self.calls += 1;
-            return null;
+            return error.LeaderTransferInProgress;
         }
     };
 
     var source = FakeSource{};
-    var forwarder = NullForwarder{};
-    var server = ApiHttpServer.init(alloc, .{
-        .metadata_mutation_forwarder = forwarder.iface(),
-    }, source.iface(), null, null);
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
     const create_index_body = try test_contract_helpers.encodeCreateIndexRequest(alloc, "body");
     defer alloc.free(create_index_body);
 
@@ -21265,7 +21055,6 @@ test "api http server returns retryable not leader through public table adapter 
     defer resp.deinit(alloc);
 
     try expectPublicMetadataNotLeaderResponse(resp);
-    try std.testing.expectEqual(@as(usize, 1), forwarder.calls);
     try std.testing.expectEqual(@as(usize, 1), source.create_index_calls);
 }
 
@@ -21291,33 +21080,12 @@ test "api http server returns retryable not leader through public cluster adapte
         fn ensureLinearizableRead(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.linearizable_read_calls += 1;
-            return error.NotLeader;
-        }
-    };
-    const NullForwarder = struct {
-        calls: usize = 0,
-
-        fn iface(self: *@This()) RequestForwarder {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .forward = forward },
-            };
-        }
-
-        fn forward(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !?http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(.POST, req.method);
-            try std.testing.expectEqualStrings("/backup", req.uri);
-            self.calls += 1;
-            return null;
+            return error.ProposalDropped;
         }
     };
 
     var source = FakeSource{};
-    var forwarder = NullForwarder{};
-    var server = ApiHttpServer.init(alloc, .{
-        .metadata_mutation_forwarder = forwarder.iface(),
-    }, source.iface(), null, null);
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
 
     var resp = try server.handle(.{
         .method = .POST,
@@ -21328,77 +21096,7 @@ test "api http server returns retryable not leader through public cluster adapte
     defer resp.deinit(alloc);
 
     try expectPublicMetadataNotLeaderResponse(resp);
-    try std.testing.expectEqual(@as(usize, 1), forwarder.calls);
     try std.testing.expectEqual(@as(usize, 1), source.linearizable_read_calls);
-}
-
-test "api http server keeps public data routes local when metadata forwarder is configured" {
-    const alloc = std.testing.allocator;
-    const FakeSource = struct {
-        fn iface(self: *@This()) StatusSource {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .status = status },
-            };
-        }
-
-        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
-            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
-        }
-    };
-    const CaptureForwarder = struct {
-        calls: usize = 0,
-
-        fn iface(self: *@This()) RequestForwarder {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .forward = forward },
-            };
-        }
-
-        fn forward(ptr: *anyopaque, allocator: std.mem.Allocator, _: http_common.HttpRequest) !?http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.calls += 1;
-            return .{
-                .status = 500,
-                .content_type = try allocator.dupe(u8, "text/plain"),
-                .body = try allocator.dupe(u8, "unexpected forward"),
-            };
-        }
-    };
-
-    var source = FakeSource{};
-    var forwarder = CaptureForwarder{};
-    var server = ApiHttpServer.init(alloc, .{
-        .metadata_mutation_forwarder = forwarder.iface(),
-    }, source.iface(), null, null);
-
-    const Case = struct {
-        method: http_common.Method,
-        uri: []const u8,
-        body: []const u8 = "{}",
-    };
-    const cases = [_]Case{
-        .{ .method = .POST, .uri = "/tables/docs/query" },
-        .{ .method = .POST, .uri = "/tables/docs/batch" },
-        .{ .method = .POST, .uri = "/tables/docs/merge" },
-        .{ .method = .POST, .uri = "/tables/docs/lookup" },
-        .{ .method = .POST, .uri = "/tables/docs/backup" },
-        .{ .method = .POST, .uri = "/tables/docs/artifacts/chunks/reprocess" },
-        .{ .method = .POST, .uri = "/tables/docs/artifacts/chunks/reprocess-jobs" },
-        .{ .method = .GET, .uri = "/extensions/v1/installed/memoryaf" },
-    };
-
-    for (cases) |case| {
-        var resp = try server.handle(.{
-            .method = case.method,
-            .uri = case.uri,
-            .content_type = "application/json",
-            .body = case.body,
-        });
-        defer resp.deinit(alloc);
-        try std.testing.expectEqual(@as(usize, 0), forwarder.calls);
-    }
 }
 
 test "api http server backs up and restores a table through public routes" {

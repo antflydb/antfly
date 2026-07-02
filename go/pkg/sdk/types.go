@@ -372,7 +372,6 @@ const (
 	SyncLevelPropose     = oapi.SyncLevelPropose
 	SyncLevelWrite       = oapi.SyncLevelWrite
 	SyncLevelFullText    = oapi.SyncLevelFullText
-	SyncLevelAknn        = oapi.SyncLevelAknn
 	SyncLevelFullIndex   = oapi.SyncLevelFullIndex
 	SyncLevelEnrichments = oapi.SyncLevelEnrichments
 
@@ -531,8 +530,8 @@ const (
 	TransformOpTypeRename      = oapi.TransformOpTypeRename
 	TransformOpTypeCurrentDate = oapi.TransformOpTypeCurrentDate
 
-	// SyncLevel embeddings (renamed from SyncLevelAknn)
-	SyncLevelEmbeddings = oapi.SyncLevelAknn
+	// SyncLevelEmbeddings is a compatibility alias for waiting on all managed index writes.
+	SyncLevelEmbeddings = oapi.SyncLevelFullIndex
 
 	// EdgeDirection values
 	EdgeDirectionBoth = oapi.EdgeDirectionBoth

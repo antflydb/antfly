@@ -14,13 +14,8 @@
 
 const std = @import("std");
 
-pub const metadata_leader_forwarded_header = "X-Antfly-Internal-Metadata-Leader-Forwarded";
 pub const metadata_not_leader_header = "X-Antfly-Metadata-Not-Leader";
 pub const metadata_not_leader_value = "true";
-
-pub fn isInternalRequestMetadataHeader(name: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(name, metadata_leader_forwarded_header);
-}
 
 pub const Method = enum {
     GET,
@@ -34,7 +29,6 @@ pub const HttpRequest = struct {
     uri: []const u8,
     headers: []const RequestHeader = &.{},
     source_node_id: ?u64 = null,
-    metadata_leader_forwarded: bool = false,
     authorization: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
     timeout_ms: ?u32 = null,

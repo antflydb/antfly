@@ -1446,7 +1446,7 @@ def serverless_api(serverless_runtime):
                 payload["transforms"] = transforms
             if sync_level is not None:
                 payload["sync_level"] = sync_level
-            timeout = 60 if sync_level in {"full_text", "enrichments", "aknn", "full_index"} else 10
+            timeout = 60 if sync_level in {"full_text", "enrichments", "full_index"} else 10
             return self._check(self.s.post(f"{self.url}/tables/{table_name}/batch", json=payload, timeout=timeout))
 
         def query_published(self, table_name: str) -> dict:

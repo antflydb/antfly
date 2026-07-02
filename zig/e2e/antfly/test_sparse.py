@@ -186,7 +186,7 @@ def test_sparse_import_and_hybrid_query_with_external_embeddings(backup_api):
     batch = backup_api.batch_write(
         table_name,
         inserts=docs,
-        sync_level="aknn",
+        sync_level="full_index",
     )
     assert batch["inserted"] == len(docs)
 

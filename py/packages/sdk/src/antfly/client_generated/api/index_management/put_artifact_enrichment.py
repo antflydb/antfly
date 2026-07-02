@@ -96,8 +96,8 @@ def sync_detailed(
     """Register or replace an artifact enrichment
 
      Registers a table-level generated artifact definition. Reusing the same
-    artifact name replaces the existing mapping. Chunk enrichments may set
-    `full_text_index: true` to map generated chunk text into the table's
+    artifact name replaces the existing mapping. Chunk or asset enrichments
+    may set `full_text_index: true` to map generated text into the table's
     default full-text index.
 
     Args:
@@ -138,8 +138,8 @@ def sync(
     """Register or replace an artifact enrichment
 
      Registers a table-level generated artifact definition. Reusing the same
-    artifact name replaces the existing mapping. Chunk enrichments may set
-    `full_text_index: true` to map generated chunk text into the table's
+    artifact name replaces the existing mapping. Chunk or asset enrichments
+    may set `full_text_index: true` to map generated text into the table's
     default full-text index.
 
     Args:
@@ -175,8 +175,8 @@ async def asyncio_detailed(
     """Register or replace an artifact enrichment
 
      Registers a table-level generated artifact definition. Reusing the same
-    artifact name replaces the existing mapping. Chunk enrichments may set
-    `full_text_index: true` to map generated chunk text into the table's
+    artifact name replaces the existing mapping. Chunk or asset enrichments
+    may set `full_text_index: true` to map generated text into the table's
     default full-text index.
 
     Args:
@@ -215,8 +215,8 @@ async def asyncio(
     """Register or replace an artifact enrichment
 
      Registers a table-level generated artifact definition. Reusing the same
-    artifact name replaces the existing mapping. Chunk enrichments may set
-    `full_text_index: true` to map generated chunk text into the table's
+    artifact name replaces the existing mapping. Chunk or asset enrichments
+    may set `full_text_index: true` to map generated text into the table's
     default full-text index.
 
     Args:

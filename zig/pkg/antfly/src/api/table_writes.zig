@@ -6665,7 +6665,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.predicates.len != 0) return false;
         return switch (req.sync_level) {
             .propose, .write => true,
-            .enrichments, .full_text, .aknn, .full_index => false,
+            .enrichments, .full_text, .full_index => false,
         };
     }
 
@@ -7397,7 +7397,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !void {
         switch (sync_level) {
             .propose, .write => return,
-            .enrichments, .full_text, .aknn, .full_index => {},
+            .enrichments, .full_text, .full_index => {},
         }
 
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
@@ -11892,7 +11892,7 @@ fn shouldDrainManagedDbAfterBatch(sync_level: db_mod.types.SyncLevel) bool {
     // explicit catch-up, or bulk-session finish.
     return switch (sync_level) {
         .propose, .write, .enrichments => false,
-        .full_text, .aknn, .full_index => false,
+        .full_text, .full_index => false,
     };
 }
 

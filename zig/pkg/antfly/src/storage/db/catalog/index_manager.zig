@@ -3428,6 +3428,7 @@ pub const IndexManager = struct {
                 .doc_key = try alloc.dupe(u8, doc_key),
                 .source_field = try alloc.dupe(u8, entry.source_field),
                 .source_template = if (entry.source_template.len > 0) try alloc.dupe(u8, entry.source_template) else "",
+                .full_text_index = entry.full_text_index,
                 .content_type = if (entry.content_type.len > 0) try alloc.dupe(u8, entry.content_type) else "",
                 .producer_json = if (entry.producer_json.len > 0) try alloc.dupe(u8, entry.producer_json) else "",
             });
@@ -4479,6 +4480,7 @@ pub const IndexManager = struct {
         if (resolved.chunk_name != null) return true;
 
         for (self.enrichments.items) |cfg| {
+            if (cfg.kind == .asset and cfg.full_text_index) return true;
             if (cfg.kind != .chunk) continue;
             if (cfg.full_text_index) return true;
             if (cfg.chunker_json.len == 0) continue;
@@ -6633,6 +6635,7 @@ pub const IndexManager = struct {
 
     fn validateEnrichmentConfig(self: *const IndexManager, cfg: enrichment_catalog.EnrichmentConfig) !void {
         if (cfg.name.len == 0 or (cfg.source_field.len == 0 and cfg.source_template.len == 0)) return error.InvalidEnrichmentConfig;
+        if (cfg.full_text_index and cfg.kind == .embedding) return error.InvalidEnrichmentConfig;
         switch (cfg.kind) {
             .chunk => {
                 if (cfg.chunk_size == 0 and cfg.chunker_json.len == 0) return error.InvalidEnrichmentConfig;

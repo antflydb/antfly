@@ -248,6 +248,18 @@ test "api module compiles" {
     _ = ApiHttpClient;
 }
 
+test "artifact enrichment request permits asset full text routing" {
+    const config_json = try table_contract.parseArtifactEnrichmentRequest(
+        std.testing.allocator,
+        "image_caption_v1",
+        "{\"kind\":\"asset\",\"field\":\"caption_json\",\"full_text_index\":true}",
+    );
+    defer std.testing.allocator.free(config_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"kind\":\"asset\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"full_text_index\":true") != null);
+}
+
 test "distributed graph result_ref fail-closed guards are covered" {
     try distributed_graph.testResultRefFailClosedGuards(std.testing.allocator);
 }

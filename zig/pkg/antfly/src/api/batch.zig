@@ -192,7 +192,6 @@ fn syncLevelName(sync_level: db_mod.types.SyncLevel) []const u8 {
         .write => "write",
         .full_text => "full_text",
         .enrichments => "enrichments",
-        .aknn => "aknn",
         .full_index => "full_index",
     };
 }
@@ -331,7 +330,6 @@ fn syncLevelFromValue(value: std.json.Value) !db_mod.types.SyncLevel {
     if (std.mem.eql(u8, level, "write")) return .write;
     if (std.mem.eql(u8, level, "full_text")) return .full_text;
     if (std.mem.eql(u8, level, "enrichments")) return .enrichments;
-    if (std.mem.eql(u8, level, "aknn")) return .full_index;
     if (std.mem.eql(u8, level, "full_index")) return .full_index;
     return error.InvalidBatchRequest;
 }
@@ -401,12 +399,10 @@ test "batch parser accepts raw payload value under public request cap" {
     try std.testing.expect(std.mem.indexOf(u8, owned.writes[0].value, "\"raw_payload\"") != null);
 }
 
-test "batch parser accepts go sync levels" {
-    var owned = try parseBatchRequest(std.testing.allocator,
+test "batch parser rejects removed aknn sync level" {
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(std.testing.allocator,
         \\{"inserts":{"doc:a":{"title":"alpha"}},"sync_level":"aknn"}
-    );
-    defer owned.deinit(std.testing.allocator);
-    try std.testing.expectEqual(db_mod.types.SyncLevel.full_index, owned.req.sync_level);
+    ));
 }
 
 test "batch parser accepts transforms" {

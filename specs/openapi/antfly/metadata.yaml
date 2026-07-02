@@ -18,7 +18,7 @@ info:
     - **Multi-Raft Design**: Separate consensus groups for metadata (single cluster) and storage (one per shard)
     - **Horizontal Sharding**: Data automatically partitioned across shards with configurable replication
     - **Distributed Transactions**: Atomic cross-shard writes using coordinator-based 2PC with intent-based locking
-    - **Fine-Grained Durability**: Control write consistency with sync levels (propose, write, full_text, enrichments, aknn)
+    - **Fine-Grained Durability**: Control write consistency with sync levels (propose, write, full_text, enrichments, full_index)
 
     ### AI-Native Features
     - **RAG**: Streaming retrieval-augmented generation with Server-Sent Events
@@ -2505,7 +2505,6 @@ components:
         - write
         - full_text
         - enrichments
-        - aknn
         - full_index
       default: propose
       description: |
@@ -2514,8 +2513,7 @@ components:
         - "write": Wait for Pebble KV write
         - "full_text": Wait for full-text index WAL write
         - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation)
-        - "aknn": Wait for vector index write with best-effort synchronous embedding (falls back to async on timeout, slowest, most durable)
-        - "full_index": Wait for all index writes to complete (full-text + enrichments + aknn)
+        - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
     ShardConfig: # Simplified from common.ShardInfo for brevity
       type: object
       required:
@@ -8184,8 +8182,8 @@ paths:
       summary: Register or replace an artifact enrichment
       description: |
         Registers a table-level generated artifact definition. Reusing the same
-        artifact name replaces the existing mapping. Chunk enrichments may set
-        `full_text_index: true` to map generated chunk text into the table's
+        artifact name replaces the existing mapping. Chunk or asset enrichments
+        may set `full_text_index: true` to map generated text into the table's
         default full-text index.
       tags:
         - index_management

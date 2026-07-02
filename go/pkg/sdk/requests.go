@@ -47,8 +47,9 @@ type BatchRequest struct {
 	// SyncLevel Synchronization level for the batch operation:
 	// - "propose": Wait for Raft proposal acceptance (fastest, default)
 	// - "write": Wait for Pebble KV write
-	// - "full_text": Wait for full-text index WAL write (slowest, most durable)
-	// - "aknn": Wait for vector index write with best-effort synchronous embedding (falls back to async on timeout)
+	// - "full_text": Wait for full-text index WAL write
+	// - "enrichments": Pre-compute enrichments before Raft proposal
+	// - "full_index": Wait for all index writes to complete
 	SyncLevel SyncLevel `json:"sync_level,omitempty"`
 }
 

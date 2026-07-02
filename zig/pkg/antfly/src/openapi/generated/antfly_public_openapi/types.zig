@@ -509,13 +509,12 @@ pub const SecretWriteRequest = struct {
 
 pub const ByteRange = []const []const u8;
 
-/// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for Pebble KV write - "full_text": Wait for full-text index WAL write - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation) - "aknn": Wait for vector index write with best-effort synchronous embedding (falls back to async on timeout, slowest, most durable) - "full_index": Wait for all index writes to complete (full-text + enrichments + aknn)
+/// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for Pebble KV write - "full_text": Wait for full-text index WAL write - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation) - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
 pub const SyncLevel = enum {
     propose,
     write,
     full_text,
     enrichments,
-    aknn,
     full_index,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -524,7 +523,6 @@ pub const SyncLevel = enum {
             .write => "write",
             .full_text => "full_text",
             .enrichments => "enrichments",
-            .aknn => "aknn",
             .full_index => "full_index",
         };
         try jw.write(s);
@@ -540,7 +538,6 @@ pub const SyncLevel = enum {
             .{ "write", .write },
             .{ "full_text", .full_text },
             .{ "enrichments", .enrichments },
-            .{ "aknn", .aknn },
             .{ "full_index", .full_index },
         });
         return map.get(s) orelse error.UnexpectedToken;

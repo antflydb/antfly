@@ -439,7 +439,6 @@ test "http frame driver posts batch frames to raft batch route" {
                 .method = req.method,
                 .uri = try self.alloc.dupe(u8, req.uri),
                 .source_node_id = req.source_node_id,
-                .metadata_leader_forwarded = req.metadata_leader_forwarded,
                 .content_type = if (req.content_type) |content_type| try self.alloc.dupe(u8, content_type) else null,
                 .timeout_ms = req.timeout_ms,
                 .body = try self.alloc.dupe(u8, req.body),

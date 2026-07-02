@@ -4926,7 +4926,6 @@ pub const DB = struct {
         const use_thin_replay_fast_path =
             effective_req.sync_level != .full_text and
             effective_req.sync_level != .enrichments and
-            effective_req.sync_level != .aknn and
             effective_req.sync_level != .full_index and
             !splitShadowRequiresMaterializedDerivedBatch(self);
         const include_generated_enrichment_hint = use_thin_replay_fast_path and
@@ -8418,7 +8417,7 @@ pub const DB = struct {
                         try appendUniqueOwnedName(self.alloc, &all_indexes, index_ref.name);
                     }
                 },
-                .aknn, .full_index => {
+                .full_index => {
                     try appendUniqueOwnedName(self.alloc, &all_indexes, index_ref.name);
                     if (index_ref.kind == .full_text) {
                         try appendUniqueOwnedName(self.alloc, &full_text_indexes, index_ref.name);
@@ -9404,17 +9403,17 @@ pub const DB = struct {
                 try self.runEnrichmentUntil(sequence);
             },
             .full_text => {
-                try self.runMaintenanceUntilTargets(sequence, sync_targets.full_text_indexes);
+                try self.runDerivedUntilTargets(sequence, sync_targets.full_text_indexes);
+                try waitForManagedIndexesApplied(self, sequence, sync_targets.full_text_indexes);
             },
-            .aknn, .full_index => try self.runMaintenanceUntil(sequence, sync_targets),
+            .full_index => try self.runMaintenanceUntil(sequence, sync_targets),
         }
     }
 
     fn generatedPrecomputeModeForSyncLevel(sync_level: types.SyncLevel) GeneratedPrecomputeMode {
         return switch (sync_level) {
-            .enrichments, .aknn, .full_index => .all,
-            .full_text => .full_text_only,
-            .propose, .write => .none,
+            .enrichments, .full_index => .all,
+            .propose, .write, .full_text => .none,
         };
     }
 
@@ -14357,9 +14356,16 @@ fn computeAssetRequestDerived(
     const key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", artifact_name);
     defer alloc.free(key);
 
+    const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, artifact_name, request.full_text_index);
+    defer {
+        for (text_indexes) |name| alloc.free(name);
+        alloc.free(text_indexes);
+    }
+
     const source_text = try extractAssetSourceValue(alloc, db, doc_value, request);
     if (source_text == null or source_text.?.len == 0) {
         if (source_text) |s| alloc.free(s);
+        try appendFullTextDeleteDocument(alloc, documents, key, text_indexes);
         if (producer_cfg.type == .document_extraction) {
             try appendDocumentExtractionDeleteKeys(alloc, db, request.doc_key, artifact_name, key, artifact_delete_keys);
             return;
@@ -14417,6 +14423,7 @@ fn computeAssetRequestDerived(
                     .key = try alloc.dupe(u8, key),
                     .value = try alloc.dupe(u8, value),
                 });
+                try appendInlineFullTextDocument(alloc, documents, key, value, text_indexes);
                 return;
             }
         }
@@ -14439,6 +14446,7 @@ fn computeAssetRequestDerived(
         .key = try alloc.dupe(u8, key),
         .value = try alloc.dupe(u8, value),
     });
+    try appendInlineFullTextDocument(alloc, documents, key, value, text_indexes);
 
     if (producer_cfg.type != .copy) {
         try artifact_writes.append(alloc, .{
@@ -14608,7 +14616,7 @@ fn computeDocumentExtractionAssetRequestDerived(
         }
     }
 
-    const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, artifact_name, false);
+    const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, artifact_name, request.full_text_index);
     defer {
         for (text_indexes) |name| alloc.free(name);
         alloc.free(text_indexes);
@@ -14996,6 +15004,62 @@ fn appendStoredFullTextDocument(
     text_indexes: []const []const u8,
 ) !void {
     if (text_indexes.len == 0) return;
+    const targets = try fullTextTargetRefsAlloc(alloc, text_indexes);
+    errdefer {
+        for (targets) |target| alloc.free(target.index_name);
+        alloc.free(targets);
+    }
+    try documents.append(alloc, .{
+        .key = try alloc.dupe(u8, key),
+        .action = .upsert,
+        .targets = targets,
+    });
+}
+
+fn appendInlineFullTextDocument(
+    alloc: Allocator,
+    documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+    key: []const u8,
+    value: []const u8,
+    text_indexes: []const []const u8,
+) !void {
+    if (text_indexes.len == 0) return;
+    const targets = try fullTextTargetRefsAlloc(alloc, text_indexes);
+    errdefer {
+        for (targets) |target| alloc.free(target.index_name);
+        alloc.free(targets);
+    }
+    try documents.append(alloc, .{
+        .key = try alloc.dupe(u8, key),
+        .action = .upsert,
+        .cleaned_value = try alloc.dupe(u8, value),
+        .targets = targets,
+    });
+}
+
+fn appendFullTextDeleteDocument(
+    alloc: Allocator,
+    documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+    key: []const u8,
+    text_indexes: []const []const u8,
+) !void {
+    if (text_indexes.len == 0) return;
+    const targets = try fullTextTargetRefsAlloc(alloc, text_indexes);
+    errdefer {
+        for (targets) |target| alloc.free(target.index_name);
+        alloc.free(targets);
+    }
+    try documents.append(alloc, .{
+        .key = try alloc.dupe(u8, key),
+        .action = .delete,
+        .targets = targets,
+    });
+}
+
+fn fullTextTargetRefsAlloc(
+    alloc: Allocator,
+    text_indexes: []const []const u8,
+) ![]derived_types.DerivedTargetRef {
     const targets = try alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
     errdefer {
         for (targets) |target| alloc.free(target.index_name);
@@ -15007,11 +15071,7 @@ fn appendStoredFullTextDocument(
             .index_name = try alloc.dupe(u8, index_name),
         };
     }
-    try documents.append(alloc, .{
-        .key = try alloc.dupe(u8, key),
-        .action = .upsert,
-        .targets = targets,
-    });
+    return targets;
 }
 
 fn appendDocumentUnitStoredFullTextDocuments(
@@ -17332,7 +17392,6 @@ const ChunkCacheEntry = struct {
 
 const GeneratedPrecomputeMode = enum {
     none,
-    full_text_only,
     all,
 };
 
@@ -18005,20 +18064,11 @@ fn shouldPrecomputeGeneratedRequest(
     mode: GeneratedPrecomputeMode,
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !bool {
+    _ = self;
+    _ = request;
     return switch (mode) {
         .none => false,
         .all => true,
-        .full_text_only => blk: {
-            if (request.kind != .chunk_text) break :blk false;
-            const include_default_full_text = request.full_text_index or
-                try chunking_types_mod.parseHasFullTextIndexFromSlice(self.alloc, request.chunker_json);
-            const text_indexes = try self.core.index_manager.textIndexesForChunk(self.alloc, request.artifact_name, include_default_full_text);
-            defer {
-                for (text_indexes) |name| self.alloc.free(name);
-                self.alloc.free(text_indexes);
-            }
-            break :blk text_indexes.len > 0;
-        },
     };
 }
 
@@ -18272,7 +18322,7 @@ fn filterVisibleSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.
     @memset(fallback_to_hit, false);
 
     for (hits, 0..) |hit, i| {
-        if (internal_keys.isChunkArtifactRecordKey(hit.id)) {
+        if (internal_keys.isChunkArtifactRecordKey(hit.id) or internal_keys.isAssetArtifactKey(hit.id)) {
             const parent = (try internal_keys.decodeDocumentComponentAlloc(alloc, hit.id)) orelse {
                 fallback_to_hit[i] = true;
                 parent_ids[i] = hit.id;
@@ -19203,7 +19253,7 @@ fn noteHAMirrorFailure(mirror: HAAsyncEffectMirror, comptime label: []const u8, 
 fn applyDerivedBacklogPressureContext(ctx: *const BatchExecutionContext, sequence: u64, sync_level: types.SyncLevel, sync_targets: ManagedSyncTargets) !void {
     switch (sync_level) {
         .propose, .write => return,
-        .enrichments, .full_text, .aknn, .full_index => {},
+        .enrichments, .full_text, .full_index => {},
     }
     if (!ctx.executor.shouldThrottleBacklog()) return;
     if (sync_level == .full_text) {
@@ -19223,7 +19273,7 @@ fn applyDerivedBacklogPressureContext(ctx: *const BatchExecutionContext, sequenc
 fn shouldDeferBacklogPressureForExternalDenseBulk(ctx: *const BatchExecutionContext, sync_level: types.SyncLevel) bool {
     switch (sync_level) {
         .propose, .write, .enrichments => {},
-        .full_text, .aknn, .full_index => return false,
+        .full_text, .full_index => return false,
     }
     const async_context = ctx.async_context orelse return false;
     return async_context.active_external_dense_bulk_sessions.load(.acquire) != 0;
@@ -19317,16 +19367,17 @@ fn waitForSyncLevelContext(ctx: *const BatchExecutionContext, sync_level: types.
             try runEnrichmentUntilContext(ctx, sequence);
         },
         .full_text => {
-            try runMaintenanceUntilTargetsContext(ctx, sequence, sync_targets.full_text_indexes);
+            try runDerivedUntilTargetsContext(ctx, sequence, sync_targets.full_text_indexes);
+            try waitForManagedIndexesAppliedContext(ctx, sequence, sync_targets.full_text_indexes);
         },
-        .aknn, .full_index => try runMaintenanceUntilContext(ctx, sequence, sync_targets),
+        .full_index => try runMaintenanceUntilContext(ctx, sequence, sync_targets),
     }
 }
 
 fn syncLevelRequiresDerivedVisibility(sync_level: types.SyncLevel) bool {
     return switch (sync_level) {
         .propose, .write, .enrichments => false,
-        .full_text, .aknn, .full_index => true,
+        .full_text, .full_index => true,
     };
 }
 
@@ -19574,7 +19625,7 @@ fn storeMaxAtomicU64(value: *AtomicU64, candidate: u64) void {
 fn deferExternalBulkExecutorNotification(ctx: *AsyncContext, sync_level: types.SyncLevel, sequence: u64) bool {
     switch (sync_level) {
         .propose, .write, .enrichments => {},
-        .full_text, .aknn, .full_index => return false,
+        .full_text, .full_index => return false,
     }
     if (ctx.active_external_dense_bulk_sessions.load(.acquire) == 0) return false;
     storeMaxAtomicU64(&ctx.deferred_external_bulk_notify_sequence, sequence);
@@ -19605,7 +19656,7 @@ fn notifyExecutorForSyncLevel(
 ) void {
     switch (sync_level) {
         .full_text => executor.notifyIndexes(sequence, sync_targets.full_text_indexes),
-        .propose, .write, .enrichments, .aknn, .full_index => executor.notifySequence(sequence),
+        .propose, .write, .enrichments, .full_index => executor.notifySequence(sequence),
     }
 }
 
@@ -19696,8 +19747,6 @@ test "async context dense catch-up session tracking suppresses local bulk sessio
     try std.testing.expect(deferExternalBulkExecutorNotification(&ctx, .enrichments, 13));
     try std.testing.expectEqual(@as(u64, 13), ctx.deferred_external_bulk_notify_sequence.load(.monotonic));
     try std.testing.expect(!deferExternalBulkExecutorNotification(&ctx, .full_text, 17));
-    try std.testing.expectEqual(@as(u64, 13), ctx.deferred_external_bulk_notify_sequence.load(.monotonic));
-    try std.testing.expect(!deferExternalBulkExecutorNotification(&ctx, .aknn, 19));
     try std.testing.expectEqual(@as(u64, 13), ctx.deferred_external_bulk_notify_sequence.load(.monotonic));
     try std.testing.expect(!deferExternalBulkExecutorNotification(&ctx, .full_index, 23));
     try std.testing.expectEqual(@as(u64, 13), ctx.deferred_external_bulk_notify_sequence.load(.monotonic));
@@ -27267,7 +27316,6 @@ test "db rejects new document writes at ordinal exhaustion for every sync level"
         .write,
         .full_text,
         .enrichments,
-        .aknn,
         .full_index,
     };
     for (levels, 0..) |level, i| {
@@ -35953,7 +36001,7 @@ test "db default full text index searches template chunk text when chunker full 
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"title\":\"Alpha routing only in template chunks\",\"body\":\"body text without the keyword\"}" },
         },
-        .sync_level = .full_text,
+        .sync_level = .full_index,
     });
 
     var result = try waitForSearchResult(alloc, &db, .{
@@ -35967,7 +36015,7 @@ test "db default full text index searches template chunk text when chunker full 
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 }
 
-test "db full_text sync level covers template chunk full text routing" {
+test "db full_text sync level does not run template chunk full text routing" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -36002,8 +36050,7 @@ test "db full_text sync level covers template chunk full text routing" {
     });
 
     const pending = db.pendingWorkStats();
-    try std.testing.expectEqual(pending.enrichment.target_sequence, pending.enrichment.applied_sequence);
-    try std.testing.expect(pending.enrichment.applied_sequence >= 1);
+    try std.testing.expect(pending.enrichment.target_sequence >= 1);
 
     var result = try db.search(alloc, .{
         .index_name = "full_text_index_v0",
@@ -36012,8 +36059,7 @@ test "db full_text sync level covers template chunk full text routing" {
     });
     defer result.deinit();
 
-    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
-    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 0), result.total_hits);
 }
 
 test "cloneManagedSyncTargetsAll duplicates names independently" {
@@ -37218,6 +37264,76 @@ test "db addEnrichment allows unrelated definitions after field sparse index" {
     });
 }
 
+test "db asset enrichment full_text_index feeds default full text index after full_index sync" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addEnrichment(.{
+        .name = "image_caption_v1",
+        .kind = .asset,
+        .field = "caption_json",
+        .content_type = "application/json",
+        .full_text_index = true,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "image:1",
+                .value = "{\"title\":\"row text\",\"caption_json\":{\"caption\":\"crimson sunset harbor\"}}",
+            },
+        },
+        .sync_level = .full_index,
+    });
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "image:1", "asset", "image_caption_v1");
+    defer alloc.free(asset_key);
+    const asset_value = try db.core.store.get(alloc, asset_key);
+    defer alloc.free(asset_value);
+    try std.testing.expect(std.mem.indexOf(u8, asset_value, "crimson sunset harbor") != null);
+    try std.testing.expect(db.core.index_manager.textIndex("full_text_index_v0").?.snapshot().global_doc_count > 0);
+
+    var results = try db.search(alloc, .{
+        .index_name = "full_text_index_v0",
+        .full_text = .{ .match = .{ .field = "_all", .text = "harbor" } },
+        .limit = 10,
+    });
+    defer results.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), results.total_hits);
+    try std.testing.expectEqualStrings("image:1", results.hits[0].id);
+
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "image:1",
+                .value = "{\"title\":\"row text\"}",
+            },
+        },
+        .sync_level = .full_index,
+    });
+
+    var after_delete = try db.search(alloc, .{
+        .index_name = "full_text_index_v0",
+        .full_text = .{ .match = .{ .field = "_all", .text = "harbor" } },
+        .limit = 10,
+    });
+    defer after_delete.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), after_delete.total_hits);
+}
+
 test "db dense index can reference existing whole-doc embedding enrichment" {
     const alloc = std.testing.allocator;
 
@@ -37565,7 +37681,7 @@ test "db full-text chunk consumer returns parent and chunk modes" {
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" },
         },
-        .sync_level = .full_text,
+        .sync_level = .full_index,
     });
 
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
@@ -37732,7 +37848,7 @@ test "db full-text chunk parent paging applies after grouping" {
             .{ .key = "doc:a", .value = "{\"body\":\"alpha alpha alpha alpha\"}" },
             .{ .key = "doc:b", .value = "{\"body\":\"alpha\"}" },
         },
-        .sync_level = .full_text,
+        .sync_level = .full_index,
     });
 
     var result = try waitForSearchResult(alloc, &db, .{

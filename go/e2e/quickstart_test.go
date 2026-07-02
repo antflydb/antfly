@@ -155,7 +155,7 @@ func TestE2E_Quickstart(t *testing.T) {
 
 	_, err = swarm.Client.Batch(ctx, tableName, antfly.BatchRequest{
 		Inserts:   docs,
-		SyncLevel: antfly.SyncLevelAknn,
+		SyncLevel: antfly.SyncLevelFullIndex,
 	})
 	require.NoError(t, err, "Failed to insert documents")
 	t.Logf("Inserted %d documents (4 with thumbnails, 1 without)", len(docs))

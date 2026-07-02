@@ -49,7 +49,7 @@ func TestE2E_BackupRestore_Embeddings(t *testing.T) {
 	// Step 3: Insert test documents
 	t.Log("Inserting test documents...")
 	testDocs := getTestDocuments()
-	insertTestDocuments(t, ctx, swarm.Client, tableName, testDocs, antfly.SyncLevelAknn)
+	insertTestDocuments(t, ctx, swarm.Client, tableName, testDocs, antfly.SyncLevelFullIndex)
 
 	// Step 4: Wait for embeddings to be generated
 	t.Log("Waiting for embeddings to be generated...")
