@@ -79,7 +79,7 @@ Tasks:
 - Remove generated TLC traces from source directories whenever TLC writes them.
 - Add `.gitignore` coverage for `specs/tla/*_TTrace_*`.
 - Add `make tla-clean` to remove TLC trace artifacts and temporary model output.
-- Add a `make tla-list` or `make` help entry that shows all TLA targets.
+- Add a `bash ../scripts/tla-check.sh list` or `make` help entry that shows all TLA targets.
 - Document local Java/TLC bootstrapping in one place and avoid hidden machine
   dependencies.
 
@@ -87,7 +87,7 @@ Validation:
 
 - `rg --files specs/tla | rg '_TTrace_'` returns no output after a clean run.
 - `make tla-tools` succeeds on a clean machine or fails with clear instructions.
-- `make tla-check-new-fast` remains green.
+- `make tla-check TIER=fast` remains green.
 
 ## Phase 1: Coverage Inventory
 
@@ -181,7 +181,7 @@ Validation:
 - Map invariants to replay tests in `db.zig` around thin replay, generated
   enrichment, graph materialization, reopen catch-up, and replay truncation.
 - Run:
-  - `make tla-check-derived-replay`
+  - `make tla-check CHECK=AntflyDerivedReplay`
   - focused `zig build lib-db-test -- --test-filter replay`
   - focused generated enrichment filters
 
@@ -235,9 +235,9 @@ Validation:
 - Map to tests for generated dense/sparse/chunk assets, asset producers,
   unchanged-source skip, retry/rate-limit behavior, and split range fencing.
 - Run:
-  - `make tla-check-enrichment-lease`
-  - `make tla-check-enrichment-lease-negative-stale-publish`
-  - `make tla-check-enrichment-lease-negative-empty-pending`
+  - `make tla-check CHECK=AntflyEnrichmentLease`
+  - `make tla-check CHECK=AntflyEnrichmentLeaseBadStalePublish`
+  - `make tla-check CHECK=AntflyEnrichmentLeaseBadEmptyPending`
   - focused `zig build lib-db-test -- --test-filter "generated enrichment"`
   - focused retry/isolation/restore enrichment runtime filters
 
@@ -277,7 +277,7 @@ Required invariants:
 
 Validation:
 
-- `make tla-check-lsm-wal-compaction` is green with the segment-aware model.
+- `make tla-check CHECK=AntflyLsmWalCompaction` is green with the segment-aware model.
 - Negative model: checkpoint includes unsynced entry fails via
   `AntflyLsmWalCompactionBadCheckpoint`.
 - Negative model: corrupt current tail rotates into retained history fails via
@@ -321,7 +321,7 @@ Required invariants:
 
 Validation:
 
-- `make tla-check-lmdb-commit` is green with the page/free-record model.
+- `make tla-check CHECK=AntflyLmdbCommit` is green with the page/free-record model.
 - Negative model: write meta before dirty page sync fails via
   `AntflyLmdbCommitBadMetaBeforeData`.
 - Negative model: reuse reader-visible free page fails via
@@ -501,7 +501,7 @@ Implemented:
 
 Validation:
 
-- `make tla-check-managed-host-lifecycle`: green, 288 distinct states.
+- `make tla-check CHECK=AntflyManagedHostLifecycle`: green, 288 distinct states.
 - Negative model: restore activates/routes before bootstrap success fails via
   `AntflyManagedHostLifecycleBadPrematureRestore`.
 - Negative model: metadata removal leaves stale route fails via
@@ -510,7 +510,7 @@ Validation:
   `AntflyManagedHostLifecycleBadReviveRemoved`.
 - Negative model: restore bootstrap is not cancelled on metadata removal fails
   via `AntflyManagedHostLifecycleBadRestoreCancel`.
-- `make tla-check-negative` and `make tla-check-new-fast` are green after the
+- `bash ../scripts/tla-check.sh negative` and `make tla-check TIER=fast` are green after the
   managed-host deepening.
 - Zig validation includes focused `raft-test` filters for backup-bootstrap
   catalog restart, route removal, and durable apply-store restart, plus a
@@ -571,7 +571,7 @@ Required invariants:
 
 Validation:
 
-- `make tla-check-transaction-session` is green with 1,946 distinct states.
+- `make tla-check CHECK=AntflyTransactionSession` is green with 1,946 distinct states.
 - Negative model: savepoint rollback leaves visible write fails via
   `AntflyTransactionSessionBadRollback`.
 - Negative model: recovery resolves participant with wrong decision fails via
@@ -580,8 +580,8 @@ Validation:
   `AntflyTransactionSessionBadCleanup`.
 - Trace refinement: checked-in savepoint, orphan recovery, and stale pending
   fixtures pass via `TraceAntflyTransactionSession.tla`; premature cleanup
-  fixture fails via `make tla-check-transaction-session-trace-negative-cleanup`.
-- `make tla-check-negative` and `make tla-check-new-fast` are green after the
+  fixture fails via `bash ../scripts/tla-check.sh negative`.
+- `bash ../scripts/tla-check.sh negative` and `make tla-check TIER=fast` are green after the
   transaction/session deepening.
 - Focused Zig validation includes transaction abort/version, explicit
   participant-style resolve, stale pending auto-abort, participant cleanup
@@ -637,7 +637,7 @@ Required invariants:
 
 Validation:
 
-- `make tla-check-document-identity` is green with 899 distinct states.
+- `make tla-check CHECK=AntflyDocumentIdentity` is green with 899 distinct states.
 - Negative model: reuse a tombstoned ordinal for a different logical document
   fails via `AntflyDocumentIdentityBadReuseOrdinal`.
 - Negative model: search accepts a resolved-doc-filter with stale identity
@@ -712,9 +712,9 @@ Current implementation status:
 - `TraceAntflySplitRefinementBridge.tla` now validates checked-in cutover and
   rollback fixtures against the bridge, with an expected-failure fixture for
   metadata routing before DB serving.
-- Validation completed with `make tla-check-db-split-visibility`,
-  `make tla-check-split-refinement-bridge`, `make tla-check-negative`,
-  `make tla-check-new-fast`, and focused split/merge root-test filters for
+- Validation completed with `make tla-check CHECK=AntflyDbSplitVisibility`,
+  `make tla-check CHECK=AntflySplitRefinementBridge`, `bash ../scripts/tla-check.sh negative`,
+  `make tla-check TIER=fast`, and focused split/merge root-test filters for
   split deltas, child artifact remote placement, shadow index backfill, parent
   trim/destination shard creation, split/merge enrichment fencing, durable
   text/sparse/graph routing, reopen/resume fencing, plus `db-split-vopr-test`
@@ -760,7 +760,7 @@ Required invariants:
 
 Validation:
 
-- `make tla-check-lite-publication` is green with 599 distinct states.
+- `make tla-check CHECK=AntflyLitePublication` is green with 599 distinct states.
 - Negative model: manifest published before segment fails via
   `AntflyLitePublicationBadManifestBeforeArtifacts`.
 - Negative model: failed publication advances visible HEAD fails via
@@ -769,7 +769,7 @@ Validation:
   `AntflyLitePublicationBadPinnedCleanup`.
 - Negative model: visible generation mixes segment refs across generations fails
   via `AntflyLitePublicationBadMixedGeneration`.
-- `make tla-check-negative` and `make tla-check-new-fast` are green after the
+- `bash ../scripts/tla-check.sh negative` and `make tla-check TIER=fast` are green after the
   Lite publication deepening.
 - Zig validation currently includes broad `serverless-test` runs, full
   `lite-cli-test`, and a serial full `lite-native-test`. Several of these
@@ -821,7 +821,7 @@ Required invariants:
 
 Validation:
 
-- `make tla-check-openapi-codegen` is green with 216,814 distinct states.
+- `make tla-check CHECK=AntflyOpenApiCodegen` is green with 216,814 distinct states.
 - Negative model: generated-check passes with a stale generated package fails
   via `AntflyOpenApiCodegenBadStalePackage`.
 - Negative model: generated-check passes with stale root `openapi.yaml` fails
@@ -830,7 +830,7 @@ Validation:
   via `AntflyOpenApiCodegenBadInternalLeak`.
 - Negative model: failed partial generation is committed fails via
   `AntflyOpenApiCodegenBadPartialCommit`.
-- `make tla-check-negative` and `make tla-check-new-fast` are green after the
+- `bash ../scripts/tla-check.sh negative` and `make tla-check TIER=fast` are green after the
   OpenAPI deepening.
 - Zig validation includes `zig build openapi-root-check`, standalone
   `lib/openapi` generator tests, `zig build antfly-client-test`, and a serial
@@ -895,7 +895,7 @@ Implemented:
   `AntflyMlGraphDagPassesBadCseNoConsumerRemap`,
   `AntflyMlGraphDagPassesBadDceDropReachable`, and
   `AntflyMlGraphDagPassesBadDceNonTopoMap`.
-- Wired all fourteen ML negative configs into `make tla-check-negative`.
+- Wired all fourteen ML negative configs into `bash ../scripts/tla-check.sh negative`.
 
 Tasks:
 
@@ -949,9 +949,9 @@ Required invariants:
 
 Validation:
 
-- `make tla-check-ml-graph-passes`: green, 36 distinct states.
-- `make tla-check-ml-compiler-publication`: green, 36 distinct states.
-- `make tla-check-ml-graph-dag-passes`: green, 9 distinct states over three
+- `make tla-check CHECK=AntflyMlGraphPasses`: green, 36 distinct states.
+- `make tla-check CHECK=AntflyMlCompilerPublication`: green, 36 distinct states.
+- `make tla-check CHECK=AntflyMlGraphDagPasses`: green, 9 distinct states over three
   bounded DAG shapes.
 - Negative model: stale CSE remap/dangling edge fails via
   `AntflyMlGraphPassesBadDanglingCse`.
@@ -981,7 +981,7 @@ Validation:
   `AntflyMlGraphDagPassesBadDceDropReachable`.
 - Negative model: DCE non-topological compact map fails via
   `AntflyMlGraphDagPassesBadDceNonTopoMap`.
-- `make tla-check-negative` and `make tla-check-new-fast` are green after the
+- `bash ../scripts/tla-check.sh negative` and `make tla-check TIER=fast` are green after the
   ML graph, DAG pass, and compiler-publication deepening.
 - Zig validation includes focused `lib/ml` graph root filters for default
   pipeline, unary/binary CSE, DCE `id_map`, cleanup DCE, fixed-point pipeline,
@@ -1051,7 +1051,7 @@ Tasks:
   - a `*-bad.cfg` that enables a bad action
   - a small `Bad*.tla` module extending the model
   - a commented known-bad action with documented TLC output
-- Add `make tla-check-negative` that expects failure for negative configs.
+- Add `bash ../scripts/tla-check.sh negative` that expects failure for negative configs.
 - Store only concise expected-failure descriptions, not generated traces.
 
 Current status: the aggregate harness now covers the original core models
@@ -1062,7 +1062,7 @@ per-invariant mutation coverage.
 
 Validation:
 
-- `make tla-check-negative` fails if a bad model unexpectedly passes.
+- `bash ../scripts/tla-check.sh negative` fails if a bad model unexpectedly passes.
 - Each semantic invariant has at least one negative validation entry.
 
 ## Phase 13: CI And Runtime Budgets
@@ -1074,7 +1074,7 @@ Targets:
 - `tla-check-smoke`: implemented; parses checked-in TLA specs with SANY. It
   intentionally skips legacy `occ-2pc.tla` because its top-level module is named
   `model`, which SANY rejects when invoked by filename.
-- `tla-check-fast`: implemented as an alias for `tla-check-new-fast`, the
+- `make tla-check TIER=fast`: the
   required developer check for focused lower-level specs.
 - `tla-check-heavy`: implemented as an alias for `tla-check-new-heavy`, the
   larger focused state spaces.
@@ -1084,10 +1084,10 @@ Targets:
 
 Validation:
 
-- `make tla-check-smoke`: green.
-- `make tla-list`: shows smoke, fast, heavy, trace, negative, and per-model
+- `bash ../scripts/tla-check.sh smoke`: green.
+- `bash ../scripts/tla-check.sh list`: shows smoke, fast, heavy, trace, negative, and per-model
   targets.
-- `make tla-check-negative` and `make tla-check-new-fast` are green after the
+- `bash ../scripts/tla-check.sh negative` and `make tla-check TIER=fast` are green after the
   latest model additions.
 - Every new or deepened model has a documented expected state count and focused
   validation note in `MODEL_COVERAGE.md`.
@@ -1182,8 +1182,8 @@ not more files.
 Use `MODEL_COVERAGE.md` as the model-to-code anchor table. Any change touching a
 listed anchor should update the corresponding row if the contract changed, and
 should run at least the focused target plus its negative mutant target. For
-larger changes, run `make tla-check-critical`; for release or merge gates, run
-`make tla-check-new-fast` and `make tla-check-negative`.
+larger changes, run `make tla-check TIER=fast`; for release or merge gates, run
+`make tla-check TIER=fast` and `bash ../scripts/tla-check.sh negative`.
 
 Most drift-prone TLA areas:
 

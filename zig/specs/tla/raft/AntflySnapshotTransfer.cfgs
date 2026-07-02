@@ -2,7 +2,7 @@
 \* Sections are verbatim TLC config syntax; the build extracts them
 \* (scripts/tla-cfg.sh). Section names match the make-target check ids.
 
-==== positive
+==== positive tier=manual spec=SnapshotTransferMC
 \* Copyright 2026 Antfly, Inc.
 \*
 \* Licensed under the Apache License, Version 2.0 (the "License");
@@ -48,7 +48,7 @@ PROPERTIES
     EventualTransferResolution
     EventualPermanentDetection
 
-==== BadApplyWithoutPut
+==== BadApplyWithoutPut spec=SnapshotTransferMC
 \* Expected-failure snapshot config: transfer reaches "done" before the
 \* snapshot archive exists in the local SnapStore.
 
@@ -71,7 +71,7 @@ INVARIANTS
     NoFetchingWithoutNeed
     SnapshotIDsMonotonic
 
-==== safety
+==== safety tier=core spec=SnapshotTransferMC
 \* Copyright 2026 Antfly, Inc.
 \*
 \* Licensed under the Apache License, Version 2.0 (the "License");

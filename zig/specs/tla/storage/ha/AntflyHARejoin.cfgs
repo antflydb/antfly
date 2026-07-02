@@ -2,7 +2,7 @@
 \* Sections are verbatim TLC config syntax; the build extracts them
 \* (scripts/tla-cfg.sh). Section names match the make-target check ids.
 
-==== positive
+==== positive tier=fast
 SPECIFICATION FairSpec
 
 CONSTANTS

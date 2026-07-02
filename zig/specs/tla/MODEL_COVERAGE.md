@@ -121,7 +121,7 @@ Not every model carries the same evidentiary weight. Tiers:
 | Sketch | `AntflyPromotionOwnerHandoff` — a focused authority/ownership guardrail (detach-before-transfer-before-attach), NOT deep implementation correspondence: its state space is tiny and it intentionally collapses raft leadership, group identity, and runtime hook detail into range ownership + an attachment bit. |
 | Routed | Distributed join leases (sim harness), owner-job gate composition (Zig race tests), merge rollback (no abort path exists) — see `TLA_CRITIQUE_REPAIR.md` for the concrete work items. |
 
-Negative-config pinning status (checked by `make tla-audit`): critic-response,
+Negative-config pinning status (checked by `bash ../scripts/tla-check.sh audit`): critic-response,
 new-coverage, and the six migrated priority groups (HA sync-wait /
 timeline-switch / standby-apply / rejoin, document identity range repair,
 managed host lifecycle, ML graph/DAG/compiler publication) pin named semantic
@@ -129,7 +129,7 @@ invariants; 25 older configs (DbSplitVisibility, DocumentIdentity, HAGates,
 LitePublication, LmdbCommit, LsmWalCompaction, LsmLifecycle, OpenApiCodegen,
 SplitRefinementBridge) still include the broad `Safety` conjunction and are
 tracked migration debt. Do NOT describe the suite as fully pinned until
-`make tla-audit` reports zero Safety-pinned configs.
+`bash ../scripts/tla-check.sh audit` reports zero Safety-pinned configs.
 
 Bounds backlog: a few of the newest models hardcode their bounds inside the
 spec (`AntflyBatcherCoalescing` 2 ops, `AntflyShardSplitSeq` 2 writes/no
@@ -282,69 +282,69 @@ Fast model validation:
 
 ```bash
 make tla-clean
-make tla-check-fast
+make tla-check TIER=fast
 ```
 
 Heavy model validation:
 
 ```bash
-make tla-check-heavy
+make tla-check TIER=heavy
 ```
 
 Negative model validation:
 
 ```bash
-make tla-check-negative
+bash ../scripts/tla-check.sh negative
 ```
 
 Core existing model validation:
 
 ```bash
-make tla-check
+make tla-check TIER=core
 ```
 
 Focused validation already run for the legacy/core expected-failure harness:
 
-- `make tla-check`: green after adding disabled bug flags to the core configs.
+- `make tla-check TIER=core`: green after adding disabled bug flags to the core configs.
   The run covered `AntflyTransaction`, `AntflyShardSplit`,
   `AntflySnapshotTransfer-safety`, and `AntflyLsmLifecycle`; the snapshot safety
   check remains the large core run at 27,361,379 distinct states.
-- `make tla-check-txn-negative-skip-intent-conflict`: pending-intent conflict
+- `make tla-check CHECK=AntflyTransactionBadSkipIntentConflict`: pending-intent conflict
   mutant fails on `OCCSerializationInvariant`.
-- `make tla-check-split-negative-premature-child-default`: child-default-before
+- `make tla-check CHECK=AntflyShardSplitBadPrematureChildDefault`: child-default-before
   cutover mutant fails on `NoPrematureCutover`.
-- `make tla-check-snap-negative-apply-without-put`: transfer-done-without-local
+- `make tla-check CHECK=AntflySnapshotTransferBadApplyWithoutPut`: transfer-done-without-local
   archive mutant fails on `AppliedSnapshotIsValid`.
-- `make tla-check-lsm-negative-index-temp-leak`: index temporary allocation
+- `make tla-check CHECK=AntflyLsmLifecycleBadIndexTempLeak`: index temporary allocation
   leak mutant fails through the lifecycle safety invariants.
-- `make tla-check-negative`: green after wiring the four legacy/core mutants
+- `bash ../scripts/tla-check.sh negative`: green after wiring the four legacy/core mutants
   into the aggregate expected-failure harness.
 - `make tla-clean && rg --files specs/tla | rg '_TTrace_' || true`: no trace
   artifacts remain after the expected-failure runs.
 
 Critic follow-up validation on 2026-07-01:
 
-- `make tla-check-critical`: green after repairing snapshot-content GC
+- `make tla-check TIER=fast`: green after repairing snapshot-content GC
   non-vacuity, CDC crash/resume, batcher bidirectional operation order, HA
   `former_primary` transitions, and query missing-doc coverage.
-- `make tla-check-new-fast`: green after wiring the critic-response models into
+- `make tla-check TIER=fast`: green after wiring the critic-response models into
   the fast focused tier.
-- `make tla-check-batcher-coalescing`: green, 27 distinct states, depth 6.
-- `make tla-check-cdc-cutover`: green, 9 distinct states, depth 6.
-- `make tla-check-query-completeness`: green, 8 distinct states, depth 5.
-- `make tla-check-snapshot-content-negative-gc-needed-content`: GC of needed
+- `make tla-check CHECK=AntflyBatcherCoalescing`: green, 27 distinct states, depth 6.
+- `make tla-check CHECK=AntflyCdcCutover`: green, 9 distinct states, depth 6.
+- `make tla-check CHECK=AntflyQueryCompleteness`: green, 8 distinct states, depth 5.
+- `make tla-check CHECK=AntflySnapshotContentBadGcNeededContent`: GC of needed
   fetched snapshot content fails on `TargetContentNotGcBeforeApply`.
-- `make tla-check-batcher-coalescing-negative-write-delete-inversion`:
+- `make tla-check CHECK=AntflyBatcherCoalescingBadWriteDeleteInversion`:
   write/delete inversion fails on `LastOperationWinsPerKey`.
-- `make tla-check-cdc-cutover-negative-resume-replay`: bad resume cursor fails
+- `make tla-check CHECK=AntflyCdcCutoverBadResumeReplay`: bad resume cursor fails
   on `ResumeCursorStartsAtCheckpoint`.
-- `make tla-check-query-completeness-negative-route-before-child-ready`: route
+- `make tla-check CHECK=AntflyQueryCompletenessBadRouteBeforeChildReady`: route
   before child serving fails on `RouteRequiresChildServing`.
-- `make tla-check-query-completeness-negative-double-serve`: parent/child
+- `make tla-check CHECK=AntflyQueryCompletenessBadDoubleServe`: parent/child
   double-serving fails on `NoDuplicateDocs`.
-- `make tla-check-query-completeness-negative-missing-doc`: child serving without
+- `make tla-check CHECK=AntflyQueryCompletenessBadMissingDoc`: child serving without
   the moved doc fails on `NoMissingDocs`.
-- `make tla-check-negative`: green after repinning critic-response bad cfgs to
+- `bash ../scripts/tla-check.sh negative`: green after repinning critic-response bad cfgs to
   named semantic invariants and adding the missing mutants.
 - Zig correspondence tests were added for replay co-write decode-failure
   fallback, provisioned coalescer same-key order, and DB split same-key latest
@@ -363,17 +363,17 @@ Critic follow-up validation on 2026-07-01:
 Smoke parsing validation:
 
 ```bash
-make tla-check-smoke
+bash ../scripts/tla-check.sh smoke
 ```
 
 Trace validation dispatch:
 
 ```bash
-make tla-check-trace TRACE=raft TRACE_FILES=/tmp/raft-trace.ndjson
-make tla-check-trace TRACE=txn TRACE_FILES=/tmp/txn-trace.ndjson
-make tla-check-trace TRACE=txn-session TRACE_FILES="specs/tla/traces/txn_session_*.ndjson"
-make tla-check-trace TRACE=ha TRACE_FILES="specs/tla/traces/ha_*.ndjson"
-make tla-check-trace TRACE=doc-identity-range-repair TRACE_FILES="specs/tla/traces/doc_identity_restore_*.ndjson"
+make tla-trace TRACE=raft TRACE_FILES=/tmp/raft-trace.ndjson
+make tla-trace TRACE=txn TRACE_FILES=/tmp/txn-trace.ndjson
+make tla-trace TRACE=txn-session TRACE_FILES="specs/tla/traces/txn_session_*.ndjson"
+make tla-trace TRACE=ha TRACE_FILES="specs/tla/traces/ha_*.ndjson"
+make tla-trace TRACE=doc-identity-range-repair TRACE_FILES="specs/tla/traces/doc_identity_restore_*.ndjson"
 ```
 
 ## Consolidated TLC Runtime Budget
@@ -390,48 +390,48 @@ external `TRACE_FILES`.
 | Core | `tla-check-split` | shard split spec | 824 | 166 | 16 | 00s |
 | Core | `tla-check-snap` | snapshot transfer safety | 228,587,191 | 27,361,379 | 45 | 01min 03s |
 | Core | `tla-check-lsm` | LSM lifecycle OOM safety | 3,626 | 625 | 13 | 00s |
-| Fast | `tla-check-ha-gates` | HA gate decision table | 64,800 | 64,800 | 1 | 00s |
-| Fast | `tla-check-ha-sync-wait` | HA sync wait target provenance | 3,214 | 1,080 | 16 | 00s |
-| Fast | `tla-check-ha-timeline-switch` | HA timeline switch boundary | 28 | 25 | 9 | 00s |
-| Fast | `tla-check-ha-standby-apply` | HA standby apply/replay suppression | 69 | 31 | 6 | 00s |
-| Fast | `tla-check-ha-rejoin` | HA former-primary rejoin/reseed | 42,613 | 35,651 | 6 | 00s |
-| Fast | `tla-check-ha-failover-safety` | HA acknowledged-write failover safety | 312 | 205 | 10 | 00s |
-| Fast | `tla-check-ha-partition-fence` | HA partition fence delivery | 60 | 30 | 7 | 00s |
-| Fast | `tla-check-ha-gate-transitions` | HA gate transition stale-decision safety | 12 | 5 | 4 | 00s |
-| Fast | `tla-check-batcher-coalescing` | batcher per-key coalescing order | 11 | 9 | 6 | 00s |
-| Fast | `tla-check-cdc-cutover` | CDC snapshot/stream cutover | 13 | 6 | 5 | 00s |
-| Fast | `tla-check-shard-split-seq` | shard split sequence-level delta safety | 32 | 19 | 7 | 00s |
-| Fast | `tla-check-snapshot-content` | snapshot content/index provenance | 57 | 28 | 10 | 00s |
-| Fast | `tla-check-lsm-reserve-cleanup` | LSM reserve/failure cleanup | 29 | 12 | 7 | 00s |
-| Fast | `tla-check-query-completeness` | split query routing completeness | 11 | 8 | 5 | 00s |
-| Fast | `tla-check-derived-replay` | derived replay hint lanes | 797 | 252 | 16 | 00s |
-| Fast | `tla-check-enrichment-lease` | enrichment lease publication | 106,576 | 36,302 | 22 | 00s |
-| Fast | `tla-check-lmdb-commit` | LMDB commit crash/readers | 193,752 | 36,967 | 35 | 00s |
-| Fast | `tla-check-lsm-wal-compaction` | LSM WAL checkpoint compaction | 53,332 | 10,026 | 19 | 00s |
-| Fast | `tla-check-db-split-visibility` | DB split visibility | 3,113 | 870 | 16 | 00s |
-| Fast | `tla-check-split-refinement-bridge` | split refinement bridge | 758 | 319 | 16 | 00s |
-| Fast | `tla-check-document-identity` | document identity uniqueness | 4,337 | 899 | 9 | 00s |
-| Fast | `tla-check-document-identity-range-repair` | document identity range repair | 742,048 | 95,040 | 9 | 00s |
-| Fast | `tla-check-transaction-session` | transaction session savepoints | 5,740 | 1,946 | 32 | 00s |
-| Fast | `tla-check-managed-host-lifecycle` | managed host lifecycle | 1,153 | 288 | 15 | 00s |
-| Fast | `tla-check-lite-publication` | Lite publication | 1,591 | 599 | 23 | 00s |
-| Fast | `tla-check-ml-graph-passes` | ML graph pass ordering | 61 | 36 | 9 | 00s |
-| Fast | `tla-check-ml-graph-dag-passes` | ML graph DAG CSE/DCE remapping | 9 | 9 | 3 | 00s |
-| Fast | `tla-check-ml-compiler-publication` | ML compiler publication | 67 | 36 | 7 | 00s |
-| Fast | `tla-check-openapi-codegen` | OpenAPI codegen publication | 2,631,870 | 216,814 | 24 | 01s |
-| Heavy | `tla-check-ha-replication` | HA replication slot/fence/promotion/rejoin | 1,195,393,777 | 36,781,728 | 25 | 04min 27s |
-| Heavy | `tla-check-derived-replay-heavy-depth` | derived replay MaxSeq=3 single-index bounds | 3,981 | 1,160 | 19 | 00s |
-| Heavy | `tla-check-derived-replay-heavy-multi-index` | derived replay MaxSeq=2 two-index bounds | 90,773 | 17,176 | 27 | 00s |
-| Manual | `tla-check-derived-replay-heavy-full` | derived replay MaxSeq=3/two-index bounds | 2,599,876,961 | 267,648,400 | 53 | 19min 14s |
+| Fast | `tla-check CHECK=AntflyHAGates` | HA gate decision table | 64,800 | 64,800 | 1 | 00s |
+| Fast | `tla-check CHECK=AntflyHASyncWait` | HA sync wait target provenance | 3,214 | 1,080 | 16 | 00s |
+| Fast | `tla-check CHECK=AntflyHATimelineSwitch` | HA timeline switch boundary | 28 | 25 | 9 | 00s |
+| Fast | `tla-check CHECK=AntflyHAStandbyApply` | HA standby apply/replay suppression | 69 | 31 | 6 | 00s |
+| Fast | `tla-check CHECK=AntflyHARejoin` | HA former-primary rejoin/reseed | 42,613 | 35,651 | 6 | 00s |
+| Fast | `tla-check CHECK=AntflyHAFailoverSafety` | HA acknowledged-write failover safety | 312 | 205 | 10 | 00s |
+| Fast | `tla-check CHECK=AntflyHAPartitionFence` | HA partition fence delivery | 60 | 30 | 7 | 00s |
+| Fast | `tla-check CHECK=AntflyHAGateTransitions` | HA gate transition stale-decision safety | 12 | 5 | 4 | 00s |
+| Fast | `tla-check CHECK=AntflyBatcherCoalescing` | batcher per-key coalescing order | 11 | 9 | 6 | 00s |
+| Fast | `tla-check CHECK=AntflyCdcCutover` | CDC snapshot/stream cutover | 13 | 6 | 5 | 00s |
+| Fast | `tla-check CHECK=AntflyShardSplitSeq` | shard split sequence-level delta safety | 32 | 19 | 7 | 00s |
+| Fast | `tla-check CHECK=AntflySnapshotContent` | snapshot content/index provenance | 57 | 28 | 10 | 00s |
+| Fast | `tla-check CHECK=AntflyLsmReserveCleanup` | LSM reserve/failure cleanup | 29 | 12 | 7 | 00s |
+| Fast | `tla-check CHECK=AntflyQueryCompleteness` | split query routing completeness | 11 | 8 | 5 | 00s |
+| Fast | `tla-check CHECK=AntflyDerivedReplay` | derived replay hint lanes | 797 | 252 | 16 | 00s |
+| Fast | `tla-check CHECK=AntflyEnrichmentLease` | enrichment lease publication | 106,576 | 36,302 | 22 | 00s |
+| Fast | `tla-check CHECK=AntflyLmdbCommit` | LMDB commit crash/readers | 193,752 | 36,967 | 35 | 00s |
+| Fast | `tla-check CHECK=AntflyLsmWalCompaction` | LSM WAL checkpoint compaction | 53,332 | 10,026 | 19 | 00s |
+| Fast | `tla-check CHECK=AntflyDbSplitVisibility` | DB split visibility | 3,113 | 870 | 16 | 00s |
+| Fast | `tla-check CHECK=AntflySplitRefinementBridge` | split refinement bridge | 758 | 319 | 16 | 00s |
+| Fast | `tla-check CHECK=AntflyDocumentIdentity` | document identity uniqueness | 4,337 | 899 | 9 | 00s |
+| Fast | `tla-check CHECK=AntflyDocumentIdentityRangeRepair` | document identity range repair | 742,048 | 95,040 | 9 | 00s |
+| Fast | `tla-check CHECK=AntflyTransactionSession` | transaction session savepoints | 5,740 | 1,946 | 32 | 00s |
+| Fast | `tla-check CHECK=AntflyManagedHostLifecycle` | managed host lifecycle | 1,153 | 288 | 15 | 00s |
+| Fast | `tla-check CHECK=AntflyLitePublication` | Lite publication | 1,591 | 599 | 23 | 00s |
+| Fast | `tla-check CHECK=AntflyMlGraphPasses` | ML graph pass ordering | 61 | 36 | 9 | 00s |
+| Fast | `tla-check CHECK=AntflyMlGraphDagPasses` | ML graph DAG CSE/DCE remapping | 9 | 9 | 3 | 00s |
+| Fast | `tla-check CHECK=AntflyMlCompilerPublication` | ML compiler publication | 67 | 36 | 7 | 00s |
+| Fast | `tla-check CHECK=AntflyOpenApiCodegen` | OpenAPI codegen publication | 2,631,870 | 216,814 | 24 | 01s |
+| Heavy | `tla-check CHECK=AntflyHAReplication` | HA replication slot/fence/promotion/rejoin | 1,195,393,777 | 36,781,728 | 25 | 04min 27s |
+| Heavy | `tla-check CHECK=AntflyDerivedReplay-heavy-depth` | derived replay MaxSeq=3 single-index bounds | 3,981 | 1,160 | 19 | 00s |
+| Heavy | `tla-check CHECK=AntflyDerivedReplay-heavy-multi-index` | derived replay MaxSeq=2 two-index bounds | 90,773 | 17,176 | 27 | 00s |
+| Manual | `tla-check CHECK=AntflyDerivedReplay-heavy` | derived replay MaxSeq=3/two-index bounds | 2,599,876,961 | 267,648,400 | 53 | 19min 14s |
 
 Runtime-budget notes:
 
 - `tla-check-smoke`, `tla-check-fast`, and `tla-check-negative` are suitable
   developer-facing gates; the fast positive tier is currently dominated by
   OpenAPI codegen at 216,814 distinct states.
-- `tla-check-snap` and `tla-check-ha-replication` are the positive scheduled
+- `tla-check-snap` and `tla-check CHECK=AntflyHAReplication` are the positive scheduled
   checks above one million distinct states.
-- `tla-check-derived-replay-heavy-full` preserves the old combined MaxSeq=3 /
+- `tla-check CHECK=AntflyDerivedReplay-heavy` preserves the old combined MaxSeq=3 /
   two-index run as a manual confidence target. It has a nontrivial TLC
   fingerprint collision estimate (`calculated .034`, `actual .0019`) at the
   current bound, so the scheduled heavy tier uses the split depth and
@@ -463,18 +463,18 @@ replay model is mature.
 
 Focused validation already run for the deepened replay model:
 
-- `make tla-check-derived-replay`: green after the code-alignment repair, 252
+- `make tla-check CHECK=AntflyDerivedReplay`: green after the code-alignment repair, 252
   distinct states.
-- `make tla-check-derived-replay-heavy`: green after the code-alignment repair;
+- `make tla-check TIER=heavy`: green after the code-alignment repair;
   depth-heavy checked 1,160 distinct states and multi-index-heavy checked
   17,176 distinct states.
-- `make tla-check-derived-replay-negative`: latest-metadata-without-hint-lane
+- `make tla-check CHECK=AntflyDerivedReplayBad`: latest-metadata-without-hint-lane
   mutant fails as expected.
-- `make tla-check-negative`: derived replay and enrichment mutants fail as
+- `bash ../scripts/tla-check.sh negative`: derived replay and enrichment mutants fail as
   expected.
-- `make tla-check-new-fast`: green with the bounded replay config.
-- `make tla-check-critical`: green after the critique repair pass.
-- `make tla-check-new-fast`: green after adding `AntflyHAFailoverSafety` to
+- `make tla-check TIER=fast`: green with the bounded replay config.
+- `make tla-check TIER=fast`: green after the critique repair pass.
+- `make tla-check TIER=fast`: green after adding `AntflyHAFailoverSafety` to
   the focused fast tier.
 - `zig build lib-db-test -- --test-filter "replay source primary store"`:
   green, 15 tests.
@@ -482,12 +482,12 @@ Focused validation already run for the deepened replay model:
 
 Focused validation already run for the deepened enrichment model:
 
-- `make tla-check-enrichment-lease`: green, 36,302 distinct states.
-- `make tla-check-enrichment-lease-negative-stale-publish`: stale lease publish
+- `make tla-check CHECK=AntflyEnrichmentLease`: green, 36,302 distinct states.
+- `make tla-check CHECK=AntflyEnrichmentLeaseBadStalePublish`: stale lease publish
   mutant fails as expected.
-- `make tla-check-enrichment-lease-negative-empty-pending`: hidden pending
+- `make tla-check CHECK=AntflyEnrichmentLeaseBadEmptyPending`: hidden pending
   advancement mutant fails as expected.
-- `make tla-check-new-fast`: green after the enrichment deepening.
+- `make tla-check TIER=fast`: green after the enrichment deepening.
 - `zig build lib-db-test -- --test-filter "isolated enrichment request error"`:
   green, 9 tests.
 - `zig build lib-db-test -- --test-filter "enrichment runtime restore"`: green,
@@ -502,16 +502,16 @@ Focused validation already run for the deepened enrichment model:
 Focused validation already run for the deepened LSM WAL/checkpoint/compaction
 model:
 
-- `make tla-check-lsm-wal-compaction`: green, 10,026 distinct states.
-- `make tla-check-lsm-wal-compaction-negative-checkpoint`: unsynced checkpoint
+- `make tla-check CHECK=AntflyLsmWalCompaction`: green, 10,026 distinct states.
+- `make tla-check CHECK=AntflyLsmWalCompactionBadCheckpoint`: unsynced checkpoint
   mutant fails as expected.
-- `make tla-check-lsm-wal-compaction-negative-corrupt-rotate`: corrupt-tail
+- `make tla-check CHECK=AntflyLsmWalCompactionBadCorruptRotate`: corrupt-tail
   rotation mutant fails as expected.
-- `make tla-check-lsm-wal-compaction-negative-pinned-retire`: reader-pinned
+- `make tla-check CHECK=AntflyLsmWalCompactionBadPinnedRetire`: reader-pinned
   retirement mutant fails as expected.
-- `make tla-check-negative`: green expected-failure harness after adding the LSM
+- `bash ../scripts/tla-check.sh negative`: green expected-failure harness after adding the LSM
   mutants.
-- `make tla-check-new-fast`: green after the LSM deepening.
+- `make tla-check TIER=fast`: green after the LSM deepening.
 - `zig build wal-test -- --test-filter "lsm wal rotates small segments and replays all records"`:
   green for the full `wal-test` target, 457 passed, 1 skipped. The filter did
   not narrow this target, but the relevant WAL segment/replay/corrupt-tail tests
@@ -528,14 +528,14 @@ expanded into a large aggregate target. It is not counted as full validation.
 
 Focused validation already run for the deepened LMDB commit/readers model:
 
-- `make tla-check-lmdb-commit`: green, 36,967 distinct states.
-- `make tla-check-lmdb-commit-negative-meta-before-data`: meta-before-data
+- `make tla-check CHECK=AntflyLmdbCommit`: green, 36,967 distinct states.
+- `make tla-check CHECK=AntflyLmdbCommitBadMetaBeforeData`: meta-before-data
   mutant fails as expected.
-- `make tla-check-lmdb-commit-negative-reader-reuse`: reader-visible page reuse
+- `make tla-check CHECK=AntflyLmdbCommitBadReaderReuse`: reader-visible page reuse
   mutant fails as expected.
-- `make tla-check-negative`: green expected-failure harness after adding the
+- `bash ../scripts/tla-check.sh negative`: green expected-failure harness after adding the
   LMDB mutants.
-- `make tla-check-new-fast`: green after the LMDB deepening.
+- `make tla-check TIER=fast`: green after the LMDB deepening.
 - `zig build lmdb-test -- --test-filter "active readers delay free-page reuse across environments"`:
   green.
 - `zig build lmdb-test -- --test-filter "oldest reader across multiple snapshots controls reclaim across reopen"`:
@@ -551,67 +551,67 @@ Focused validation already run for the deepened LMDB commit/readers model:
 
 Focused validation already run for the deepened HA replication/gates models:
 
-- `make tla-check-ha-gates`: green, 64,800 distinct states.
-- `make tla-check-ha-replication`: green, 36,781,728 distinct states, depth
+- `make tla-check CHECK=AntflyHAGates`: green, 64,800 distinct states.
+- `make tla-check CHECK=AntflyHAReplication`: green, 36,781,728 distinct states, depth
   24, 4m33s.
-- `make tla-check-ha-replication-negative-stale-timeline-ack`: stale timeline
+- `make tla-check CHECK=AntflyHAReplicationBadStaleTimelineAck`: stale timeline
   ack mutant fails on `SyncAckMatchesTargetTimeline`.
-- `make tla-check-ha-gates-negative-standby-runtime`: standby mutating runtime
+- `make tla-check CHECK=AntflyHAGatesBadStandbyRuntime`: standby mutating runtime
   mutant fails on `MutatingBackgroundRequiresWritablePrimary`.
-- `make tla-check-ha-sync-wait`: green, 1,080 distinct states.
-- `make tla-check-ha-sync-wait-negative-move-target`: promotion mutating a
+- `make tla-check CHECK=AntflyHASyncWait`: green, 1,080 distinct states.
+- `make tla-check CHECK=AntflyHASyncWaitBadMoveTarget`: promotion mutating a
   frozen target fails as expected.
-- `make tla-check-ha-sync-wait-negative-wrong-timeline-ack`: wrong-timeline ack
+- `make tla-check CHECK=AntflyHASyncWaitBadWrongTimelineAck`: wrong-timeline ack
   fails as expected.
-- `make tla-check-ha-sync-wait-negative-below-target-ack`: below-target ack
+- `make tla-check CHECK=AntflyHASyncWaitBadBelowTargetAck`: below-target ack
   fails as expected.
-- `make tla-check-ha-timeline-switch`: green, 25 distinct states.
-- `make tla-check-ha-timeline-switch-negative-before-applied`:
+- `make tla-check CHECK=AntflyHATimelineSwitch`: green, 25 distinct states.
+- `make tla-check CHECK=AntflyHATimelineSwitchBadBeforeApplied`:
   switch-before-parent-apply mutant fails as expected.
-- `make tla-check-ha-timeline-switch-negative-non-monotonic`:
+- `make tla-check CHECK=AntflyHATimelineSwitchBadNonMonotonic`:
   non-monotonic switch timeline/epoch mutant fails as expected.
-- `make tla-check-ha-timeline-switch-negative-old-timeline`: old-timeline
+- `make tla-check CHECK=AntflyHATimelineSwitchBadOldTimeline`: old-timeline
   record acceptance after switch fails as expected.
-- `make tla-check-ha-timeline-switch-negative-recovery-previous`: recovery from
+- `make tla-check CHECK=AntflyHATimelineSwitchBadRecoveryPrevious`: recovery from
   a switch whose `previous_lsn` mismatches recovered progress fails as expected.
-- `make tla-check-ha-standby-apply`: green, 31 distinct states.
-- `make tla-check-ha-standby-apply-negative-failure-advances`:
+- `make tla-check CHECK=AntflyHAStandbyApply`: green, 31 distinct states.
+- `make tla-check CHECK=AntflyHAStandbyApplyBadFailureAdvances`:
   failed-apply progress advancement mutant fails as expected.
-- `make tla-check-ha-standby-apply-negative-duplicate-effect`: duplicate replay
+- `make tla-check CHECK=AntflyHAStandbyApplyBadDuplicateEffect`: duplicate replay
   side-effect mutant fails as expected.
-- `make tla-check-ha-standby-apply-negative-crash-loses-receive`: crash losing a
+- `make tla-check CHECK=AntflyHAStandbyApplyBadCrashLosesReceive`: crash losing a
   durably received unapplied record fails as expected.
-- `make tla-check-ha-standby-apply-negative-client-write`: standby client write
+- `make tla-check CHECK=AntflyHAStandbyApplyBadClientWrite`: standby client write
   mutant fails as expected.
-- `make tla-check-ha-standby-apply-negative-background-runtime`: standby
+- `make tla-check CHECK=AntflyHAStandbyApplyBadBackgroundRuntime`: standby
   mutating-background-runtime mutant fails as expected.
-- `make tla-check-ha-rejoin`: green, 35,651 distinct states.
-- `make tla-check-ha-rejoin-negative-unfenced-rewind`: unfenced rewind mutant
+- `make tla-check CHECK=AntflyHARejoin`: green, 35,651 distinct states.
+- `make tla-check CHECK=AntflyHARejoinBadUnfencedRewind`: unfenced rewind mutant
   fails as expected.
-- `make tla-check-ha-rejoin-negative-expired-wal-rewind`: expired-WAL rewind
+- `make tla-check CHECK=AntflyHARejoinBadExpiredWalRewind`: expired-WAL rewind
   mutant fails as expected.
-- `make tla-check-ha-rejoin-negative-forced-rewind`: forced-promotion rewind
+- `make tla-check CHECK=AntflyHARejoinBadForcedRewind`: forced-promotion rewind
   without explicit policy mutant fails as expected.
-- `make tla-check-ha-rejoin-negative-identity-mismatch-rewind`: identity or
+- `make tla-check CHECK=AntflyHARejoinBadIdentityMismatchRewind`: identity or
   timeline mismatch rewind mutant fails as expected.
-- `make tla-check-ha-rejoin-negative-stale-assessment`: stale assessment
+- `make tla-check CHECK=AntflyHARejoinBadStaleAssessment`: stale assessment
   truncate mutant fails as expected.
-- `make tla-check-ha-rejoin-negative-fork-mismatch`: missing/mismatched fork
+- `make tla-check CHECK=AntflyHARejoinBadForkMismatch`: missing/mismatched fork
   record truncate mutant fails as expected.
 - `make tla-trace-ha TRACE_FILES="specs/tla/traces/ha_*.ndjson"`: green,
   3 checked-in HA trace fixtures validated.
-- `make tla-check-trace TRACE=ha TRACE_FILES="specs/tla/traces/ha_*.ndjson"`:
+- `make tla-trace TRACE=ha TRACE_FILES="specs/tla/traces/ha_*.ndjson"`:
   green, 3 checked-in HA trace fixtures validated through the dispatcher.
-- `make tla-check-negative`: green expected-failure harness after adding the HA
+- `bash ../scripts/tla-check.sh negative`: green expected-failure harness after adding the HA
   mutants.
-- `make tla-check-new-fast`: green after the HA gate/runtime, sync-wait, and
+- `make tla-check TIER=fast`: green after the HA gate/runtime, sync-wait, and
   timeline-switch, standby-apply, and rejoin deepening.
-- `make tla-check-new-heavy`: green after the HA replication deepening and
+- `make tla-check TIER=heavy`: green after the HA replication deepening and
   derived replay heavy split. HA replication checked 36,781,728 distinct states
   in 4m27s in the earlier HA pass. After the derived replay code-alignment
   repair, depth-heavy checked 1,160 distinct states and multi-index-heavy
   checked 17,176 distinct states.
-- `make tla-clean && make tla-check-negative && make tla-clean && make tla-check-new-fast && make tla-clean && rg --files specs/tla | rg '_TTrace_' || true`:
+- `make tla-clean && bash ../scripts/tla-check.sh negative && make tla-clean && make tla-check TIER=fast && make tla-clean && rg --files specs/tla | rg '_TTrace_' || true`:
   green after adding `AntflyHASyncWait`, `AntflyHATimelineSwitch`, and
   `AntflyHAStandbyApply`, and `AntflyHARejoin`; no generated TLC trace specs
   remained.
@@ -641,30 +641,30 @@ contract.
 
 Focused validation already run for the HA failover safety critique repair:
 
-- `make tla-check-ha-failover-safety`: green, 205 distinct states.
-- `make tla-check-ha-failover-negative-promote-missing-ack`: promoted-standby
+- `make tla-check CHECK=AntflyHAFailoverSafety`: green, 205 distinct states.
+- `make tla-check CHECK=AntflyHAFailoverSafetyBadPromoteMissingAck`: promoted-standby
   missing acknowledged write mutant fails as expected.
-- `make tla-check-ha-failover-negative-old-primary-write`: old-primary
+- `make tla-check CHECK=AntflyHAFailoverSafetyBadOldPrimaryWrite`: old-primary
   post-promotion write mutant fails as expected.
 
 Focused validation already run for the deepened transaction/session model:
 
-- `make tla-check-transaction-session`: green, 1,946 distinct states.
-- `make tla-check-transaction-session-negative-rollback`: rollback mutant fails
+- `make tla-check CHECK=AntflyTransactionSession`: green, 1,946 distinct states.
+- `make tla-check CHECK=AntflyTransactionSessionBadRollback`: rollback mutant fails
   on `NoVisibleUncommittedWrites`.
-- `make tla-check-transaction-session-negative-recovery-decision`: wrong
+- `make tla-check CHECK=AntflyTransactionSessionBadRecoveryDecision`: wrong
   recovery decision mutant fails on `NoVisibleUncommittedWrites`.
-- `make tla-check-transaction-session-negative-cleanup`: premature cleanup
+- `make tla-check CHECK=AntflyTransactionSessionBadCleanup`: premature cleanup
   mutant fails on `CleanupRequiresAllResolved`.
 - `make tla-trace-txn-session TRACE_FILES="specs/tla/traces/txn_session_*.ndjson"`:
   green, 3 checked-in session trace fixtures validated.
-- `make tla-check-trace TRACE=txn-session TRACE_FILES="specs/tla/traces/txn_session_*.ndjson"`:
+- `make tla-trace TRACE=txn-session TRACE_FILES="specs/tla/traces/txn_session_*.ndjson"`:
   green, 3 checked-in session trace fixtures validated through the dispatcher.
-- `make tla-check-transaction-session-trace-negative-cleanup`: premature
+- `bash ../scripts/tla-check.sh negative`: premature
   cleanup fixture rejected as expected.
-- `make tla-check-negative`: green expected-failure harness after adding the
+- `bash ../scripts/tla-check.sh negative`: green expected-failure harness after adding the
   transaction/session trace negative fixture.
-- `make tla-check-new-fast`: green after the transaction/session deepening.
+- `make tla-check TIER=fast`: green after the transaction/session deepening.
 - `zig build root-test -- --test-filter "db transaction abort leaves no visible document"`:
   green, 9 tests.
 - `zig build root-test -- --test-filter "db aborted transaction preserves prior committed state and version"`:
@@ -700,12 +700,12 @@ graph/replay failures appeared and is not counted as transaction validation.
 
 Focused validation already run for the deepened document identity model:
 
-- `make tla-check-document-identity`: green, 899 distinct states.
-- `make tla-check-document-identity-negative-reuse-ordinal`: tombstoned ordinal
+- `make tla-check CHECK=AntflyDocumentIdentity`: green, 899 distinct states.
+- `make tla-check CHECK=AntflyDocumentIdentityBadReuseOrdinal`: tombstoned ordinal
   reuse mutant fails on `AllocatedOrdinalsHaveStableOwner`.
-- `make tla-check-document-identity-negative-stale-filter`: stale filter mutant
+- `make tla-check CHECK=AntflyDocumentIdentityBadStaleFilter`: stale filter mutant
   fails on `ResolvedFilterMatchesCurrentContext`.
-- `make tla-check-document-identity-negative-namespace-mismatch`: strict-open
+- `make tla-check CHECK=AntflyDocumentIdentityBadNamespaceMismatch`: strict-open
   namespace mismatch mutant fails on `StrictOpenRejectsNamespaceMismatch`.
 - `zig build root-test -- --test-filter "db resolved doc-set projection honors identity read generation"`:
   green, 9 tests.
@@ -741,36 +741,36 @@ restore import ordering.
 Focused validation already run for the document identity range/restore repair
 model:
 
-- `make tla-check-document-identity-range-repair`: green, 95,040 distinct
+- `make tla-check CHECK=AntflyDocumentIdentityRangeRepair`: green, 95,040 distinct
   states.
-- `make tla-check-document-identity-range-repair-negative-split-unhealthy`:
+- `make tla-check CHECK=AntflyDocumentIdentityRangeRepairBadSplitUnhealthy`:
   unhealthy split source mutant fails on `SplitRequiresHealthySource`.
-- `make tla-check-document-identity-range-repair-negative-split-dest-namespace`:
+- `make tla-check CHECK=AntflyDocumentIdentityRangeRepairBadSplitDestNamespace`:
   stale split destination namespace mutant fails on
   `SplitDestinationStatusMatchesExpectedNamespace`.
-- `make tla-check-document-identity-range-repair-negative-merge-mismatch`:
+- `make tla-check CHECK=AntflyDocumentIdentityRangeRepairBadMergeMismatch`:
   merge namespace mismatch mutant fails on
   `MergeRequiresCompatibleIdentityStatus`.
-- `make tla-check-document-identity-range-repair-negative-merge-active-reassign`:
+- `make tla-check CHECK=AntflyDocumentIdentityRangeRepairBadMergeActiveReassign`:
   unapproved merge reassignment mutant fails on
   `MergeReassignmentRequiresOptInAndHealthyStatus`.
-- `make tla-check-document-identity-range-repair-negative-restore-namespace`:
+- `make tla-check CHECK=AntflyDocumentIdentityRangeRepairBadRestoreNamespace`:
   strict restore namespace mismatch mutant fails on
   `StrictRestoreRejectsNamespaceMismatch`.
-- `make tla-check-document-identity-range-repair-negative-restore-early-clear`:
+- `make tla-check CHECK=AntflyDocumentIdentityRangeRepairBadRestoreEarlyClear`:
   early restore-intent clear mutant fails on
   `RestoreIntentClearsOnlyAfterRepairComplete`.
 - `make tla-trace-doc-identity-range-repair TRACE_FILES="specs/tla/traces/doc_identity_restore_*.ndjson"`:
   green, 2 checked-in restore trace fixtures.
-- `make tla-check-trace TRACE=doc-identity-range-repair TRACE_FILES="specs/tla/traces/doc_identity_restore_*.ndjson"`:
+- `make tla-trace TRACE=doc-identity-range-repair TRACE_FILES="specs/tla/traces/doc_identity_restore_*.ndjson"`:
   green through the generic trace dispatcher.
-- `make tla-check-document-identity-range-repair-trace-negative-restore-mismatch`:
+- `bash ../scripts/tla-check.sh negative`:
   expected-failure trace rejected a mismatched strict deferred restore.
-- `make tla-check-document-identity-range-repair-trace-negative-restore-early-clear`:
+- `bash ../scripts/tla-check.sh negative`:
   expected-failure trace rejected restore-intent clear before runtime repair
   completion.
-- `make tla-check-smoke`, `make tla-check-new-fast`, and
-  `make tla-check-negative`: green after wiring this model into the aggregate
+- `bash ../scripts/tla-check.sh smoke`, `make tla-check TIER=fast`, and
+  `bash ../scripts/tla-check.sh negative`: green after wiring this model into the aggregate
   targets.
 - `zig build root-test -- --test-filter "metadata split request validation rejects stale doc identity namespace"`:
   green, 9 tests.
@@ -798,19 +798,19 @@ handoff opt-in tests passed.
 
 Focused validation already run for the deepened DB split visibility model:
 
-- `make tla-check-db-split-visibility`: green, 870 distinct states.
-- `make tla-check-db-split-visibility-negative-parent-write`: parent
+- `make tla-check CHECK=AntflyDbSplitVisibility`: green, 870 distinct states.
+- `make tla-check CHECK=AntflyDbSplitVisibilityBadParentWrite`: parent
   child-range write mutant fails on
   `ParentCannotAcceptChildRangeAfterCutover`.
-- `make tla-check-db-split-visibility-negative-child-serve`: premature child
+- `make tla-check CHECK=AntflyDbSplitVisibilityBadChildServe`: premature child
   serving mutant fails on `ChildServingRequiresReplayAndIndexes`.
-- `make tla-check-db-split-visibility-negative-merge-donor`: post-handoff
+- `make tla-check CHECK=AntflyDbSplitVisibilityBadMergeDonor`: post-handoff
   donor serving mutant fails on `MergeDonorDoesNotServeAfterHandoff`.
-- `make tla-check-db-split-visibility-negative-enrichment-owner`: stale
+- `make tla-check CHECK=AntflyDbSplitVisibilityBadEnrichmentOwner`: stale
   enrichment owner mutant fails on `EnrichmentOnlyForCurrentRightOwner`.
-- `make tla-check-negative`: green expected-failure harness after adding the DB
+- `bash ../scripts/tla-check.sh negative`: green expected-failure harness after adding the DB
   split/merge mutants.
-- `make tla-check-new-fast`: green after the DB split/merge deepening.
+- `make tla-check TIER=fast`: green after the DB split/merge deepening.
 - `zig build root-test -- --test-filter "db split state and split deltas are exposed through public api"`:
   green, 9 tests.
 - `zig build root-test -- --test-filter "db split finalization marks split-off document child ranges remote"`:
@@ -841,16 +841,16 @@ refinement relation to `AntflyShardSplit.tla`.
 
 Focused validation already run for the split refinement bridge model:
 
-- `make tla-check-split-refinement-bridge`: green, 319 distinct states.
-- `make tla-check-split-refinement-bridge-negative-route-before-db-serving`:
+- `make tla-check CHECK=AntflySplitRefinementBridge`: green, 319 distinct states.
+- `make tla-check CHECK=AntflySplitRefinementBridgeBadRouteBeforeDbServing`:
   metadata child-route-before-DB-serving mutant fails as expected.
-- `make tla-check-split-refinement-bridge-negative-db-serve-before-shard-cutover`:
+- `make tla-check CHECK=AntflySplitRefinementBridgeBadDbServeBeforeShardCutover`:
   DB child-serving-before-shard-cutover mutant fails as expected.
-- `make tla-check-split-refinement-bridge-negative-stale-fence-cutover`: stale
+- `make tla-check CHECK=AntflySplitRefinementBridgeBadStaleFenceCutover`: stale
   fence completion mutant fails as expected.
-- `make tla-check-smoke`: green after adding the bridge.
-- `make tla-check-new-fast`: green after adding the bridge to the fast tier.
-- `make tla-check-negative`: green expected-failure harness after adding the
+- `bash ../scripts/tla-check.sh smoke`: green after adding the bridge.
+- `make tla-check TIER=fast`: green after adding the bridge to the fast tier.
+- `bash ../scripts/tla-check.sh negative`: green expected-failure harness after adding the
   bridge mutants.
 - `zig build root-test -- --test-filter "db split state and split deltas are exposed through public api" --test-filter "db split finalization marks split-off document child ranges remote" --test-filter "db shadow index manager backfills split-off range and ignores parent-range live writes after split" --test-filter "db merge-style cutover fences enrichment to the merged receiver range" --test-filter "db merge-style cutover routes text sparse and graph indexes to the merged receiver range with durable lsm primary backend"`:
   green, 14 tests.
@@ -858,9 +858,9 @@ Focused validation already run for the split refinement bridge model:
 - `zig build db-split-sim-test`: green.
 - `make tla-trace-split-bridge TRACE_FILES="specs/tla/traces/split_bridge_*.ndjson"`:
   green, 2 checked-in traces.
-- `make tla-check-trace TRACE=split-bridge TRACE_FILES="specs/tla/traces/split_bridge_*.ndjson"`:
+- `make tla-trace TRACE=split-bridge TRACE_FILES="specs/tla/traces/split_bridge_*.ndjson"`:
   green through the generic trace dispatcher.
-- `make tla-check-split-refinement-bridge-trace-negative-route-before-db-serving`:
+- `bash ../scripts/tla-check.sh negative`:
   expected-failure trace rejected metadata child routing before DB serving.
 
 Current split refinement bridge validation note: this model is intentionally a
@@ -873,20 +873,20 @@ encodings, multiple child ranges, leader timing, or crash/reopen persistence.
 Focused validation already run for the deepened Lite/serverless publication
 model:
 
-- `make tla-check-lite-publication`: green, 599 distinct states.
-- `make tla-check-lite-publication-negative-manifest-before-artifacts`:
+- `make tla-check CHECK=AntflyLitePublication`: green, 599 distinct states.
+- `make tla-check CHECK=AntflyLitePublicationBadManifestBeforeArtifacts`:
   manifest-before-artifacts mutant fails on
   `ManifestReferencesPublishedArtifacts`.
-- `make tla-check-lite-publication-negative-failed-head`: failed-publication
+- `make tla-check CHECK=AntflyLitePublicationBadFailedHead`: failed-publication
   head advancement mutant fails on
   `FailedPublicationCannotAdvanceVisibleGeneration`.
-- `make tla-check-lite-publication-negative-pinned-cleanup`: reader-pinned
+- `make tla-check CHECK=AntflyLitePublicationBadPinnedCleanup`: reader-pinned
   cleanup mutant fails on `CleanupCannotDeleteReaderPinnedGeneration`.
-- `make tla-check-lite-publication-negative-mixed-generation`: mixed visible
+- `make tla-check CHECK=AntflyLitePublicationBadMixedGeneration`: mixed visible
   generation mutant fails on `VisibleManifestReferencesPublishedArtifacts`.
-- `make tla-check-negative`: green expected-failure harness after adding the
+- `bash ../scripts/tla-check.sh negative`: green expected-failure harness after adding the
   Lite publication mutants.
-- `make tla-check-new-fast`: green after the Lite publication deepening.
+- `make tla-check TIER=fast`: green after the Lite publication deepening.
 - `zig build serverless-test`: green in two complete broad runs, each with 330
   passed, 2 skipped, 0 failed, 0 leaked. This target ignored test filters, but
   the run included manifest CAS, manifest-write/no-head retry, vector/sparse/
@@ -907,19 +907,19 @@ targets because several build targets ignore `--test-filter`.
 Focused validation already run for the deepened OpenAPI/codegen publication
 model:
 
-- `make tla-check-openapi-codegen`: green, 216,814 distinct states.
-- `make tla-check-openapi-codegen-negative-stale-package`: stale generated
+- `make tla-check CHECK=AntflyOpenApiCodegen`: green, 216,814 distinct states.
+- `make tla-check CHECK=AntflyOpenApiCodegenBadStalePackage`: stale generated
   package check mutant fails on `GeneratedCheckOnlyPassesForCurrentState`.
-- `make tla-check-openapi-codegen-negative-stale-root`: stale root
+- `make tla-check CHECK=AntflyOpenApiCodegenBadStaleRoot`: stale root
   `openapi.yaml` check mutant fails on
   `GeneratedCheckOnlyPassesForCurrentState`.
-- `make tla-check-openapi-codegen-negative-internal-leak`: public client
+- `make tla-check CHECK=AntflyOpenApiCodegenBadInternalLeak`: public client
   internal import mutant fails on `CommittedPackageShapeValid`.
-- `make tla-check-openapi-codegen-negative-partial-commit`: failed partial
+- `make tla-check CHECK=AntflyOpenApiCodegenBadPartialCommit`: failed partial
   generation commit mutant fails on `NoCommittedPartialPackages`.
-- `make tla-check-negative`: green expected-failure harness after adding the
+- `bash ../scripts/tla-check.sh negative`: green expected-failure harness after adding the
   OpenAPI mutants.
-- `make tla-check-new-fast`: green after the OpenAPI model deepening.
+- `make tla-check TIER=fast`: green after the OpenAPI model deepening.
 - `zig build openapi-root-check`: green; `../openapi.yaml` is current relative
   to the modular public specs.
 - `cd lib/openapi && zig build test`: green for generator/parser/naming tests,
@@ -940,20 +940,20 @@ parallel failures are not counted as product evidence; the serial full
 
 Focused validation already run for the deepened managed host lifecycle model:
 
-- `make tla-check-managed-host-lifecycle`: green, 288 distinct states.
-- `make tla-check-managed-host-lifecycle-negative-premature-restore`: premature
+- `make tla-check CHECK=AntflyManagedHostLifecycle`: green, 288 distinct states.
+- `make tla-check CHECK=AntflyManagedHostLifecycleBadPrematureRestore`: premature
   restore activation mutant fails through
   `RestoreDoesNotActivateBeforeSuccess` / `DurableStoreForHostedReplica`.
-- `make tla-check-managed-host-lifecycle-negative-stale-route`: stale route
+- `make tla-check CHECK=AntflyManagedHostLifecycleBadStaleRoute`: stale route
   after metadata removal mutant fails through `RoutesOnlyForActiveReplicas` /
   `NoUndesiredRoute`.
-- `make tla-check-managed-host-lifecycle-negative-revive-removed`: removed
+- `make tla-check CHECK=AntflyManagedHostLifecycleBadReviveRemoved`: removed
   replica catalog revival mutant fails through `CatalogOnlyForDesiredReplica`.
-- `make tla-check-managed-host-lifecycle-negative-restore-cancel`: uncancelled
+- `make tla-check CHECK=AntflyManagedHostLifecycleBadRestoreCancel`: uncancelled
   restore bootstrap mutant fails through `RestoreBootstrapRequiresDesiredGroup`.
-- `make tla-check-negative`: green expected-failure harness after adding the
+- `bash ../scripts/tla-check.sh negative`: green expected-failure harness after adding the
   managed-host mutants.
-- `make tla-check-new-fast`: green after the managed-host deepening.
+- `make tla-check TIER=fast`: green after the managed-host deepening.
 - `zig build raft-test -- --test-filter "managed host restores backup bootstrap replicas from file-backed catalog on restart"`:
   green; this step is quiet on success.
 - `zig build raft-test -- --test-filter "managed host removes live peer routes on metadata removal"`:
@@ -971,22 +971,22 @@ election.
 
 Focused validation already run for the deepened ML graph/pass/runtime model:
 
-- `make tla-check-ml-graph-passes`: green, 36 distinct states.
-- `make tla-check-ml-graph-passes-negative-dangling-cse`: stale CSE remap
+- `make tla-check CHECK=AntflyMlGraphPasses`: green, 36 distinct states.
+- `make tla-check CHECK=AntflyMlGraphPassesBadDanglingCse`: stale CSE remap
   mutant fails through `CurrentGraphReferencesValid`.
-- `make tla-check-ml-graph-passes-negative-parameter-dedup`: parameter/constant
+- `make tla-check CHECK=AntflyMlGraphPassesBadParameterDedup`: parameter/constant
   identity collapse mutant fails through
   `ParameterAndConstantIdentityPreserved`.
-- `make tla-check-ml-graph-passes-negative-missing-lower-closure`: fused export
+- `make tla-check CHECK=AntflyMlGraphPassesBadMissingLowerClosure`: fused export
   without primitive lower closure mutant fails through
   `ExportedGraphReferencesValid`.
-- `make tla-check-ml-graph-passes-negative-fallback-runtime`: fallback
+- `make tla-check CHECK=AntflyMlGraphPassesBadFallbackRuntime`: fallback
   partition runtime publication mutant fails through `RuntimeGateFailsClosed`.
-- `make tla-check-ml-graph-passes-negative-partial-publish`: failed-pass
+- `make tla-check CHECK=AntflyMlGraphPassesBadPartialPublish`: failed-pass
   partial output mutant fails through `FailedPassOutputNotVisible`.
-- `make tla-check-negative`: green expected-failure harness after adding the ML
+- `bash ../scripts/tla-check.sh negative`: green expected-failure harness after adding the ML
   graph mutants.
-- `make tla-check-new-fast`: green after the ML graph/pass/runtime deepening.
+- `make tla-check TIER=fast`: green after the ML graph/pass/runtime deepening.
 - `cd lib/ml && zig test src/graph/root.zig --test-filter "default pipeline optimizes graph"`:
   green, 3 selected tests.
 - `cd lib/ml && zig test src/graph/root.zig --test-filter "DCE removes vjp_alternate subgraph"`:
@@ -1000,19 +1000,19 @@ Focused validation already run for the bounded arbitrary-DAG ML CSE/DCE model:
 
 - `source ../scripts/tla-tools.sh && cd specs/tla && "$TLA_JAVA" -cp "$TLA2TOOLS" tla2sany.SANY AntflyMlGraphDagPasses.tla`:
   green.
-- `make tla-check-ml-graph-dag-passes`: green, 9 distinct states over three
+- `make tla-check CHECK=AntflyMlGraphDagPasses`: green, 9 distinct states over three
   bounded DAG shapes.
-- `make tla-check-ml-graph-dag-passes-negative-cse-miss-duplicate`: missed
+- `make tla-check CHECK=AntflyMlGraphDagPassesBadCseMissDuplicate`: missed
   duplicate CSE mutant fails through `Safety`.
-- `make tla-check-ml-graph-dag-passes-negative-cse-no-consumer-remap`: stale
+- `make tla-check CHECK=AntflyMlGraphDagPassesBadCseNoConsumerRemap`: stale
   consumer/output/parameter remap mutant fails through `Safety`.
-- `make tla-check-ml-graph-dag-passes-negative-dce-drop-reachable`: dropped
+- `make tla-check CHECK=AntflyMlGraphDagPassesBadDceDropReachable`: dropped
   reachable-node DCE mutant fails through `Safety`.
-- `make tla-check-ml-graph-dag-passes-negative-dce-non-topo-map`: non-topological
+- `make tla-check CHECK=AntflyMlGraphDagPassesBadDceNonTopoMap`: non-topological
   compact `id_map` mutant fails through `Safety`.
-- `make tla-check-smoke`: green after adding the DAG model.
-- `make tla-check-new-fast`: green after adding the DAG model to the fast suite.
-- `make tla-check-negative`: green expected-failure harness after adding the
+- `bash ../scripts/tla-check.sh smoke`: green after adding the DAG model.
+- `make tla-check TIER=fast`: green after adding the DAG model to the fast suite.
+- `bash ../scripts/tla-check.sh negative`: green expected-failure harness after adding the
   four DAG mutants.
 - `cd lib/ml && zig test src/graph/root.zig --test-filter "eliminate duplicate unary ops"`:
   green, 3 selected tests.
@@ -1052,23 +1052,23 @@ failure is not fixed or counted here. Direct `zig test` filters through
 
 Focused validation already run for the ML compiler/runtime publication model:
 
-- `make tla-check-ml-compiler-publication`: green, 36 distinct states.
-- `make tla-check-ml-compiler-publication-negative-stale-compile`: stale
+- `make tla-check CHECK=AntflyMlCompilerPublication`: green, 36 distinct states.
+- `make tla-check CHECK=AntflyMlCompilerPublicationBadStaleCompile`: stale
   graph/export compiler publication mutant fails through
   `RuntimePublishesOnlyFreshCompleteArtifact`.
-- `make tla-check-ml-compiler-publication-negative-missing-input`: missing
+- `make tla-check CHECK=AntflyMlCompilerPublicationBadMissingInput`: missing
   parameter/cache runtime input mutant fails through
   `ExportMaterializesRequiredRuntimeInputs`.
-- `make tla-check-ml-compiler-publication-negative-output-selection`: semantic
+- `make tla-check CHECK=AntflyMlCompilerPublicationBadOutputSelection`: semantic
   KV side-output leak mutant fails through `RuntimeOutputSelectionIsExact`.
-- `make tla-check-ml-compiler-publication-negative-fallback-publish`: fallback
+- `make tla-check CHECK=AntflyMlCompilerPublicationBadFallbackPublish`: fallback
   partition executor publication mutant fails through `RuntimeGateFailsClosed`.
-- `make tla-check-ml-compiler-publication-negative-partial-artifact`: failed
+- `make tla-check CHECK=AntflyMlCompilerPublicationBadPartialArtifact`: failed
   compiler partial artifact mutant fails through
   `FailedCompileArtifactNotVisible`.
-- `make tla-check-negative`: green expected-failure harness after adding the ML
+- `bash ../scripts/tla-check.sh negative`: green expected-failure harness after adding the ML
   compiler publication mutants.
-- `make tla-check-new-fast`: green after adding the ML compiler publication
+- `make tla-check TIER=fast`: green after adding the ML compiler publication
   model.
 - `cd pkg/inference && zig build test -Dpjrt=true -- --test-filter "PJRT compiler can externalize graph parameters as inputs"`:
   green, 27 selected tests.
