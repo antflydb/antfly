@@ -37941,6 +37941,46 @@ test "db composed full-text ttl filters resolved text filters before pagination"
     try std.testing.expectEqualStrings("doc:fresh", limited.hits[0].id);
 }
 
+test "db full-text ttl uses lower-bound totals for non-exhaustive visible pages" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = 60 * std.time.ns_per_s,
+    });
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:high", .value = "{\"body\":\"alpha alpha alpha alpha alpha\"}" },
+            .{ .key = "doc:low", .value = "{\"body\":\"alpha\"}" },
+        },
+        .timestamp_ns = currentTimeNs(),
+        .sync_level = .full_text,
+    });
+
+    var limited = try waitForSearchResult(alloc, &db, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .limit = 1,
+    }, 1);
+    defer limited.deinit();
+    try std.testing.expectEqual(@as(u32, 1), limited.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, limited.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 1), limited.hits.len);
+    try std.testing.expectEqualStrings("doc:high", limited.hits[0].id);
+}
+
 test "db ttl broad live filter preserves all-doc sentinel" {
     const alloc = std.testing.allocator;
 

@@ -3643,50 +3643,91 @@ pub fn searchTextQuery(
         native_constraints.positive_filter,
         effective_req.identity_read_generation,
     );
-    const collect_full_candidates = group_chunk_parents or late_visibility_paginate;
     const full_candidate_limit: u32 = @intCast(@min(snapshot.global_doc_count, @as(u64, std.math.maxInt(u32))));
-    var postprocess_req = effective_req;
-    if (late_visibility_paginate) {
-        postprocess_req.offset = 0;
-        postprocess_req.limit = full_candidate_limit;
-    }
     const search_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints, effective_req.count_only);
     const load_stored_in_search_engine = effective_req.include_stored and !chunk_backed;
-
-    const execute_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-    var result = if (effective_req.count_only)
-        try search_mod.executeCountCandidates(alloc, snapshot, search_query)
+    const exact_late_visibility_totals = late_visibility_paginate and
+        (effective_req.count_only or
+            effective_req.limit == 0 or
+            effective_req.aggregations_json.len != 0 or
+            effective_req.graph_queries.len != 0 or
+            group_chunk_parents);
+    const adaptive_late_visibility = late_visibility_paginate and !exact_late_visibility_totals;
+    const requested_visible_end = effective_req.offset +| effective_req.limit;
+    const collect_window_candidates = group_chunk_parents or late_visibility_paginate;
+    var candidate_limit: u32 = if (collect_window_candidates)
+        if (adaptive_late_visibility)
+            @min(full_candidate_limit, @max(@as(u32, 1), @max(paging.limit, requested_visible_end)))
+        else
+            full_candidate_limit
     else
-        try search_mod.execute(alloc, snapshot, .{
-            .query = search_query,
-            .k = if (collect_full_candidates) full_candidate_limit else paging.limit,
-            .offset = if (collect_full_candidates) 0 else paging.offset,
-            .include_stored = load_stored_in_search_engine,
-            .distributed_text_stats = effective_req.distributed_text_stats,
-            .filter_doc_nums = native_constraints.filter_doc_nums,
-            .filter_doc_nums_positive = native_constraints.positive_filter,
-            .exclude_doc_nums = native_constraints.exclude_doc_nums,
-        });
-    defer result.deinit();
-    const execute_ns = if (bench_query_profile) platform_time.monotonicNs() - execute_start_ns else 0;
+        paging.limit;
+    var candidate_iterations: u32 = 0;
+    var execute_ns: u64 = 0;
+    var hits_ns: u64 = 0;
+    var postprocess_ns: u64 = 0;
 
-    const hits_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-    var hits = try alloc.alloc(types.SearchHit, result.hits.len);
-    var initialized: usize = 0;
-    var owns_hits = true;
-    errdefer {
-        if (owns_hits) {
-            for (hits[0..initialized]) |*hit| hit.deinit(alloc);
-            alloc.free(hits);
+    while (true) {
+        candidate_iterations += 1;
+        var postprocess_req = effective_req;
+        if (late_visibility_paginate) {
+            postprocess_req.offset = 0;
+            postprocess_req.limit = candidate_limit;
         }
-    }
 
-    for (result.hits, 0..) |hit, i| {
-        const doc_ordinal = try snapshot.docOrdinal(hit.doc_id);
-        const id = hit.id orelse {
-            const stored = snapshot.storedDoc(hit.doc_id) orelse return error.StoredDocMissing;
+        const execute_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+        var result = if (effective_req.count_only)
+            try search_mod.executeCountCandidates(alloc, snapshot, search_query)
+        else
+            try search_mod.execute(alloc, snapshot, .{
+                .query = search_query,
+                .k = if (collect_window_candidates) candidate_limit else paging.limit,
+                .offset = if (collect_window_candidates) 0 else paging.offset,
+                .include_stored = load_stored_in_search_engine,
+                .distributed_text_stats = effective_req.distributed_text_stats,
+                .filter_doc_nums = native_constraints.filter_doc_nums,
+                .filter_doc_nums_positive = native_constraints.positive_filter,
+                .exclude_doc_nums = native_constraints.exclude_doc_nums,
+            });
+        defer result.deinit();
+        if (bench_query_profile) execute_ns += platform_time.monotonicNs() - execute_start_ns;
+
+        const candidates_exhausted = !adaptive_late_visibility or
+            candidate_limit >= full_candidate_limit or
+            (result.total_hits_relation == .exact and result.total_hits <= candidate_limit);
+
+        const hits_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+        var hits = try alloc.alloc(types.SearchHit, result.hits.len);
+        var initialized: usize = 0;
+        var owns_hits = true;
+        errdefer {
+            if (owns_hits) {
+                for (hits[0..initialized]) |*hit| hit.deinit(alloc);
+                alloc.free(hits);
+            }
+        }
+
+        for (result.hits, 0..) |hit, i| {
+            const doc_ordinal = try snapshot.docOrdinal(hit.doc_id);
+            const id = hit.id orelse {
+                const stored = snapshot.storedDoc(hit.doc_id) orelse return error.StoredDocMissing;
+                var materialized = types.SearchHit{
+                    .id = try alloc.dupe(u8, stored.id),
+                    .doc_ordinal = doc_ordinal,
+                    .score = hit.score,
+                    .stored_data = null,
+                };
+                var assigned = false;
+                errdefer if (!assigned) materialized.deinit(alloc);
+                materialized.index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
+                hits[i] = materialized;
+                assigned = true;
+                initialized += 1;
+                continue;
+            };
+
             var materialized = types.SearchHit{
-                .id = try alloc.dupe(u8, stored.id),
+                .id = try alloc.dupe(u8, id),
                 .doc_ordinal = doc_ordinal,
                 .score = hit.score,
                 .stored_data = null,
@@ -3694,72 +3735,72 @@ pub fn searchTextQuery(
             var assigned = false;
             errdefer if (!assigned) materialized.deinit(alloc);
             materialized.index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
+            materialized.stored_data = if (load_stored_in_search_engine and hit.stored_data != null)
+                try executor.project_stored_search(executor.ctx, alloc, effective_req, id, hit.stored_data.?)
+            else
+                null;
             hits[i] = materialized;
             assigned = true;
             initialized += 1;
-            continue;
-        };
+        }
+        if (bench_query_profile) hits_ns += platform_time.monotonicNs() - hits_start_ns;
 
-        var materialized = types.SearchHit{
-            .id = try alloc.dupe(u8, id),
-            .doc_ordinal = doc_ordinal,
-            .score = hit.score,
-            .stored_data = null,
-        };
-        var assigned = false;
-        errdefer if (!assigned) materialized.deinit(alloc);
-        materialized.index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
-        materialized.stored_data = if (load_stored_in_search_engine and hit.stored_data != null)
-            try executor.project_stored_search(executor.ctx, alloc, effective_req, id, hit.stored_data.?)
-        else
-            null;
-        hits[i] = materialized;
-        assigned = true;
-        initialized += 1;
-    }
-    const hits_ns = if (bench_query_profile) platform_time.monotonicNs() - hits_start_ns else 0;
-
-    owns_hits = false;
-    const postprocess_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-    var out = try executor.postprocess(executor.ctx, alloc, postprocess_req, .{
-        .alloc = alloc,
-        .hits = hits,
-        .total_hits = result.total_hits,
-        .total_hits_relation = switch (result.total_hits_relation) {
-            .exact => .exact,
-            .gte => .gte,
-        },
-        .graph_results = &.{},
-    }, chunk_backed);
-    errdefer out.deinit();
-    if (late_visibility_paginate and !effective_req.count_only) {
-        try paginateSearchResultInPlace(&out, effective_req.offset, effective_req.limit);
-    }
-    if (bench_query_profile) {
-        const postprocess_ns = platform_time.monotonicNs() - postprocess_start_ns;
-        std.log.info(
-            "antfly_bench_text_query index={s} total_us={d} derive_constraints_us={d} apply_resolved_us={d} convert_constraints_us={d} execute_us={d} hits_us={d} postprocess_us={d} positive_filter={} filter_doc_nums={d} filter_doc_ids={d} exclude_doc_nums={d} exclude_doc_ids={d} snapshot_docs={d} hits={d} total_hits={d}",
-            .{
-                effective_req.index_name orelse "",
-                nsToUs(platform_time.monotonicNs() - total_start_ns),
-                nsToUs(derive_constraints_ns),
-                nsToUs(resolved_filter_ns),
-                nsToUs(convert_constraints_ns),
-                nsToUs(execute_ns),
-                nsToUs(hits_ns),
-                nsToUs(postprocess_ns),
-                native_constraints.positive_filter,
-                native_constraints.filter_doc_nums.len,
-                native_constraints.filter_doc_ids.len,
-                native_constraints.exclude_doc_nums.len,
-                native_constraints.exclude_doc_ids.len,
-                snapshot.global_doc_count,
-                out.hits.len,
-                out.total_hits,
+        owns_hits = false;
+        const postprocess_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+        var out = try executor.postprocess(executor.ctx, alloc, postprocess_req, .{
+            .alloc = alloc,
+            .hits = hits,
+            .total_hits = result.total_hits,
+            .total_hits_relation = switch (result.total_hits_relation) {
+                .exact => .exact,
+                .gte => .gte,
             },
-        );
+            .graph_results = &.{},
+        }, chunk_backed);
+        errdefer out.deinit();
+        if (bench_query_profile) postprocess_ns += platform_time.monotonicNs() - postprocess_start_ns;
+
+        if (adaptive_late_visibility and !candidates_exhausted and out.total_hits < requested_visible_end) {
+            out.deinit();
+            const grown_limit = @min(full_candidate_limit, @max(candidate_limit +| 1, candidate_limit *| 2));
+            if (grown_limit == candidate_limit) return error.InvalidQueryRequest;
+            candidate_limit = grown_limit;
+            continue;
+        }
+        if (adaptive_late_visibility and !candidates_exhausted) {
+            out.total_hits_relation = .gte;
+        }
+        if (late_visibility_paginate and !effective_req.count_only) {
+            try paginateSearchResultInPlace(&out, effective_req.offset, effective_req.limit);
+        }
+        if (bench_query_profile) {
+            std.log.info(
+                "antfly_bench_text_query index={s} total_us={d} derive_constraints_us={d} apply_resolved_us={d} convert_constraints_us={d} execute_us={d} hits_us={d} postprocess_us={d} positive_filter={} filter_doc_nums={d} filter_doc_ids={d} exclude_doc_nums={d} exclude_doc_ids={d} snapshot_docs={d} candidate_window={d} candidate_iterations={d} late_visibility={} hits={d} total_hits={d}",
+                .{
+                    effective_req.index_name orelse "",
+                    nsToUs(platform_time.monotonicNs() - total_start_ns),
+                    nsToUs(derive_constraints_ns),
+                    nsToUs(resolved_filter_ns),
+                    nsToUs(convert_constraints_ns),
+                    nsToUs(execute_ns),
+                    nsToUs(hits_ns),
+                    nsToUs(postprocess_ns),
+                    native_constraints.positive_filter,
+                    native_constraints.filter_doc_nums.len,
+                    native_constraints.filter_doc_ids.len,
+                    native_constraints.exclude_doc_nums.len,
+                    native_constraints.exclude_doc_ids.len,
+                    snapshot.global_doc_count,
+                    candidate_limit,
+                    candidate_iterations,
+                    late_visibility_paginate,
+                    out.hits.len,
+                    out.total_hits,
+                },
+            );
+        }
+        return out;
     }
-    return out;
 }
 
 fn textSearchQueryWithNativeDocIdsAlloc(
