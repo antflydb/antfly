@@ -1035,6 +1035,7 @@ pub fn postprocessTextSearchResult(
     filtered = try applyStoredSearchPatternFilters(alloc, req, filtered, .{
         .ctx = processor.ctx,
         .load_stored = processor.load_stored,
+        .load_many_stored = processor.load_many_stored,
         .resolve_doc_set_doc_ids = processor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = processor.resolve_doc_ids_to_doc_set,
     });
@@ -1572,6 +1573,45 @@ test "applyStoredSearchPatternFilters batch-loads only missing stored docs" {
         .total_hits = 2,
     }, .{
         .ctx = &loader,
+        .load_stored = TestStoredLoader.loadStored,
+        .load_many_stored = TestStoredLoader.loadManyStored,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), loader.single_calls);
+    try std.testing.expectEqual(@as(usize, 1), loader.many_calls);
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+}
+
+const TestPostprocessor = struct {
+    fn isVisible(_: ?*anyopaque, _: Allocator, _: types.SearchHit) !bool {
+        return true;
+    }
+};
+
+test "postprocessTextSearchResult forwards batch stored loader to pattern filters" {
+    const alloc = std.testing.allocator;
+
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .stored_data = try alloc.dupe(u8, "{\"title\":\"alpha\"}"),
+    };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b") };
+
+    var loader = TestStoredLoader{};
+    var result = try postprocessTextSearchResult(alloc, .{
+        .filter_query_json = "{\"term\":{\"title\":\"beta\"}}",
+    }, .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+    }, false, .{
+        .ctx = &loader,
+        .is_visible = TestPostprocessor.isVisible,
+        .resolve_parent_id = TestChunkParentShaper.resolveParentId,
+        .load_parent_stored = TestChunkParentShaper.loadParentStored,
         .load_stored = TestStoredLoader.loadStored,
         .load_many_stored = TestStoredLoader.loadManyStored,
     });

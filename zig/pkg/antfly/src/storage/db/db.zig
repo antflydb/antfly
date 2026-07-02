@@ -11209,6 +11209,8 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
+            .all_docs_visible = allDocsVisibleCallback,
+            .requires_full_candidate_visibility_filter = requiresFullCandidateVisibilityFilterCallback,
             .postprocess = postprocessTextSearchResultCallback,
         });
     }
@@ -11656,6 +11658,15 @@ pub const DB = struct {
     ) anyerror!bool {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.allDocsVisibleSummaryFast(generation);
+    }
+
+    fn requiresFullCandidateVisibilityFilterCallback(
+        ctx: ?*anyopaque,
+        generation: ?u64,
+    ) anyerror!bool {
+        _ = generation;
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return ttlDurationNs(self) != 0;
     }
 
     fn allDocsVisibleAtGeneration(self: *DB, generation: ?u64) !bool {
@@ -37826,6 +37837,58 @@ test "db full-text chunk consumer filters expired parents under ttl" {
     defer parent_result.deinit();
     try std.testing.expectEqual(@as(u32, 1), parent_result.total_hits);
     try std.testing.expectEqualStrings("doc:fresh", parent_result.hits[0].id);
+}
+
+test "db full-text ttl filters before pagination and count-only totals" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = ttl_duration_ns,
+    });
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+
+    const now_ns = currentTimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:old", .value = "{\"body\":\"alpha alpha alpha alpha alpha\"}" }},
+        .timestamp_ns = now_ns - 2 * ttl_duration_ns,
+        .sync_level = .full_text,
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:fresh", .value = "{\"body\":\"alpha\"}" }},
+        .timestamp_ns = now_ns,
+        .sync_level = .full_text,
+    });
+
+    var limited = try waitForSearchResult(alloc, &db, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .limit = 1,
+    }, 1);
+    defer limited.deinit();
+    try std.testing.expectEqual(@as(u32, 1), limited.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), limited.hits.len);
+    try std.testing.expectEqualStrings("doc:fresh", limited.hits[0].id);
+
+    var counted = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .count_only = true,
+    });
+    defer counted.deinit();
+    try std.testing.expectEqual(@as(u32, 1), counted.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), counted.hits.len);
 }
 
 test "db ttl broad live filter preserves all-doc sentinel" {

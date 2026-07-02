@@ -101,6 +101,14 @@ pub const SearchTextQueryExecutor = struct {
         set: *const doc_set.ResolvedDocSet,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    all_docs_visible: ?*const fn (
+        ctx: ?*anyopaque,
+        generation: ?u64,
+    ) anyerror!bool = null,
+    requires_full_candidate_visibility_filter: ?*const fn (
+        ctx: ?*anyopaque,
+        generation: ?u64,
+    ) anyerror!bool = null,
     postprocess: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -2192,6 +2200,47 @@ fn docNumsForResolvedDocSetAlloc(
     };
 }
 
+fn searchTextNeedsLateVisibilityFilter(
+    executor: SearchTextQueryExecutor,
+    can_apply_live_all_docs: bool,
+    has_native_positive_filter: bool,
+    generation: ?u64,
+) !bool {
+    if (has_native_positive_filter) return false;
+    if (executor.requires_full_candidate_visibility_filter) |requires| {
+        if (try requires(executor.ctx, generation)) return true;
+    }
+    if (can_apply_live_all_docs) return false;
+    if (executor.live_filter_doc_set == null) return false;
+    if (executor.all_docs_visible) |all_visible| {
+        return !(try all_visible(executor.ctx, generation));
+    }
+    return true;
+}
+
+fn paginateSearchResultInPlace(result: *types.SearchResult, offset: u32, limit: u32) !void {
+    const alloc = result.alloc;
+    const available: u32 = @intCast(@min(result.hits.len, @as(usize, std.math.maxInt(u32))));
+    const start = @min(offset, available);
+    const end_u64 = @min(@as(u64, start) + @as(u64, limit), @as(u64, available));
+    const start_usize: usize = @intCast(start);
+    const end_usize: usize = @intCast(end_u64);
+    if (start_usize == 0 and end_usize == result.hits.len) return;
+
+    const selected = try alloc.alloc(types.SearchHit, end_usize - start_usize);
+    errdefer alloc.free(selected);
+    for (result.hits, 0..) |*hit, i| {
+        if (i >= start_usize and i < end_usize) {
+            selected[i - start_usize] = hit.*;
+            hit.* = undefined;
+        } else {
+            hit.deinit(alloc);
+        }
+    }
+    if (result.hits.len > 0) alloc.free(result.hits);
+    result.hits = selected;
+}
+
 fn collectStructuredFilterResolvedDocSetAlloc(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -3523,6 +3572,7 @@ pub fn searchTextQuery(
     const arena_alloc = arena.allocator();
     const base_search_query = try textQueryToSearchQuery(arena_alloc, text_query, text_entry.text_analysis, text_entry.runtime_schema);
     const snapshot = text_index.snapshot();
+    const can_apply_live_all_docs = !chunk_backed or snapshot.hasDocOrdinalCoverage();
     const constraints_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var constraint_req = effective_req;
     constraint_req.resolved_doc_filter = null;
@@ -3535,12 +3585,11 @@ pub fn searchTextQuery(
         .live_filter_doc_set = executor.live_filter_doc_set,
         .project_ordinals_to_doc_ids = false,
         .text_snapshot_for_doc_num_projection = snapshot,
-        .apply_live_all_docs = !chunk_backed or snapshot.hasDocOrdinalCoverage(),
+        .apply_live_all_docs = can_apply_live_all_docs,
     });
     defer native_constraints.deinit(alloc);
     const derive_constraints_ns = if (bench_query_profile) platform_time.monotonicNs() - constraints_start_ns else 0;
 
-    const collect_all_hits = group_chunk_parents;
     const resolved_filter_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     if (resolvedTextDocNumFilterFromRequest(effective_req)) |filter| {
         try applyResolvedTextDocNumFilterAlloc(alloc, &native_constraints, filter);
@@ -3569,6 +3618,19 @@ pub fn searchTextQuery(
             .graph_results = &.{},
         }, chunk_backed);
     }
+    const late_visibility_paginate = try searchTextNeedsLateVisibilityFilter(
+        executor,
+        can_apply_live_all_docs,
+        native_constraints.positive_filter,
+        effective_req.identity_read_generation,
+    );
+    const collect_full_candidates = group_chunk_parents or late_visibility_paginate;
+    const full_candidate_limit: u32 = @intCast(@min(snapshot.global_doc_count, @as(u64, std.math.maxInt(u32))));
+    var postprocess_req = effective_req;
+    if (late_visibility_paginate) {
+        postprocess_req.offset = 0;
+        postprocess_req.limit = full_candidate_limit;
+    }
     const search_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints, effective_req.count_only);
     const load_stored_in_search_engine = effective_req.include_stored and !chunk_backed;
 
@@ -3578,8 +3640,8 @@ pub fn searchTextQuery(
     else
         try search_mod.execute(alloc, snapshot, .{
             .query = search_query,
-            .k = if (collect_all_hits) @intCast(snapshot.global_doc_count) else paging.limit,
-            .offset = if (collect_all_hits) 0 else paging.offset,
+            .k = if (collect_full_candidates) full_candidate_limit else paging.limit,
+            .offset = if (collect_full_candidates) 0 else paging.offset,
             .include_stored = load_stored_in_search_engine,
             .distributed_text_stats = effective_req.distributed_text_stats,
             .filter_doc_nums = native_constraints.filter_doc_nums,
@@ -3640,7 +3702,7 @@ pub fn searchTextQuery(
 
     owns_hits = false;
     const postprocess_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-    const out = try executor.postprocess(executor.ctx, alloc, effective_req, .{
+    var out = try executor.postprocess(executor.ctx, alloc, postprocess_req, .{
         .alloc = alloc,
         .hits = hits,
         .total_hits = result.total_hits,
@@ -3650,6 +3712,10 @@ pub fn searchTextQuery(
         },
         .graph_results = &.{},
     }, chunk_backed);
+    errdefer out.deinit();
+    if (late_visibility_paginate and !effective_req.count_only) {
+        try paginateSearchResultInPlace(&out, effective_req.offset, effective_req.limit);
+    }
     if (bench_query_profile) {
         const postprocess_ns = platform_time.monotonicNs() - postprocess_start_ns;
         std.log.info(
