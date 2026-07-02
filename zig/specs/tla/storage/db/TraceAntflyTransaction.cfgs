@@ -30,6 +30,7 @@
 \*     -workers 1 -lncheck final
 
 CONSTANTS
+    BuggySkipIntentConflict = FALSE
     Txns                  <- TraceTxns
     Shards                <- TraceShards
     Keys                  <- TraceKeys
