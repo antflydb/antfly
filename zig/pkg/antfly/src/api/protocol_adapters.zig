@@ -247,6 +247,7 @@ const ExtensionMcpTool = struct {
 const ExtensionRuntimeBinding = struct {
     package_name: []u8,
     package_version: []u8,
+    package_digest: []u8,
     runtime_name: []u8,
     artifact: []u8,
     entrypoint: []u8,
@@ -254,6 +255,7 @@ const ExtensionRuntimeBinding = struct {
     fn deinit(self: ExtensionRuntimeBinding, alloc: std.mem.Allocator) void {
         alloc.free(self.package_name);
         alloc.free(self.package_version);
+        alloc.free(self.package_digest);
         alloc.free(self.runtime_name);
         alloc.free(self.artifact);
         alloc.free(self.entrypoint);
@@ -263,6 +265,7 @@ const ExtensionRuntimeBinding = struct {
         return .{
             .package_name = self.package_name,
             .package_version = self.package_version,
+            .package_digest = self.package_digest,
             .runtime_name = self.runtime_name,
             .artifact = self.artifact,
             .entrypoint = self.entrypoint,
@@ -803,6 +806,8 @@ fn extensionRuntimeBindingAlloc(alloc: std.mem.Allocator, member: *const extensi
     errdefer if (package_name) |value| alloc.free(value);
     var package_version: ?[]u8 = null;
     errdefer if (package_version) |value| alloc.free(value);
+    var package_digest: ?[]u8 = null;
+    errdefer if (package_digest) |value| alloc.free(value);
     var runtime_name: ?[]u8 = null;
     errdefer if (runtime_name) |value| alloc.free(value);
     var artifact: ?[]u8 = null;
@@ -812,6 +817,7 @@ fn extensionRuntimeBindingAlloc(alloc: std.mem.Allocator, member: *const extensi
 
     package_name = try alloc.dupe(u8, installed.package_name);
     package_version = try alloc.dupe(u8, installed.package_version);
+    package_digest = try alloc.dupe(u8, installed.package_digest);
     runtime_name = try alloc.dupe(u8, parsed.runtime_name);
     artifact = try alloc.dupe(u8, runtime.artifact);
     entrypoint = try runtimeEntrypointAlloc(alloc, runtime.config_json);
@@ -819,6 +825,7 @@ fn extensionRuntimeBindingAlloc(alloc: std.mem.Allocator, member: *const extensi
     return .{
         .package_name = package_name.?,
         .package_version = package_version.?,
+        .package_digest = package_digest.?,
         .runtime_name = runtime_name.?,
         .artifact = artifact.?,
         .entrypoint = entrypoint.?,
@@ -904,8 +911,14 @@ fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authorization
             error.WasmtimePackageStoreUnavailable,
             error.WasmtimeArtifactNotFound,
             error.WasmtimeSymbolMissing,
-            => return try mcpError(alloc, "extension wasm runtime is unavailable"),
-            else => return try mcpError(alloc, "extension wasm runtime invocation failed"),
+            => {
+                std.log.warn("extension wasm runtime unavailable package={s} version={s} runtime={s} artifact={s} err={}", .{ binding.package_name, binding.package_version, binding.runtime_name, binding.artifact, err });
+                return try mcpError(alloc, "extension wasm runtime is unavailable");
+            },
+            else => {
+                std.log.warn("extension wasm runtime invocation failed package={s} version={s} runtime={s} artifact={s} err={}", .{ binding.package_name, binding.package_version, binding.runtime_name, binding.artifact, err });
+                return try mcpError(alloc, "extension wasm runtime invocation failed");
+            },
         }
     }
 

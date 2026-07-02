@@ -23,6 +23,7 @@ const core_magic = [_]u8{ 0x00, 'a', 's', 'm', 0x01, 0x00, 0x00, 0x00 };
 pub const RuntimeBinding = struct {
     package_name: []const u8,
     package_version: []const u8,
+    package_digest: []const u8 = "",
     runtime_name: []const u8,
     artifact: []const u8,
     entrypoint: []const u8 = "call-tool",
@@ -88,7 +89,115 @@ fn resolveArtifactPathAlloc(alloc: std.mem.Allocator, binding: RuntimeBinding, p
 
     const root = package_store_root orelse getenv(package_store_env) orelse return error.WasmtimePackageStoreUnavailable;
 
-    return try std.fs.path.join(alloc, &.{ root, binding.package_name, binding.package_version, binding.artifact });
+    var candidates = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (candidates.items) |candidate| alloc.free(candidate);
+        candidates.deinit(alloc);
+    }
+
+    if (contentAddressedDigest(binding.package_digest)) |digest| {
+        try candidates.append(alloc, try std.fs.path.join(alloc, &.{ root, "sha256", digest, binding.artifact }));
+    }
+    try candidates.append(alloc, try std.fs.path.join(alloc, &.{ root, binding.package_name, binding.artifact }));
+    try candidates.append(alloc, try std.fs.path.join(alloc, &.{ root, binding.package_name, binding.package_version, binding.artifact }));
+
+    for (candidates.items) |candidate| {
+        artifactPathExists(candidate) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        const out = try alloc.dupe(u8, candidate);
+        return out;
+    }
+
+    return try alloc.dupe(u8, candidates.items[candidates.items.len - 1]);
+}
+
+fn contentAddressedDigest(digest: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, digest, "sha256:")) return null;
+    const value = digest["sha256:".len..];
+    return if (value.len == 0) null else value;
+}
+
+fn artifactPathExists(path: []const u8) !void {
+    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{
+        .ACCMODE = .RDONLY,
+        .CLOEXEC = true,
+    }, 0);
+    _ = std.posix.system.close(fd);
+}
+
+test "wasmtime runtime resolves canonical package store artifacts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "extensions/memoryaf/target/wasm32-wasip2/release");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "extensions/memoryaf/target/wasm32-wasip2/release/memoryaf_extension.wasm",
+        .data = &component_magic,
+    });
+    const root_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/extensions", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_path);
+
+    const path = try resolveArtifactPathAlloc(std.testing.allocator, .{
+        .package_name = "memoryaf",
+        .package_version = "0.0.1",
+        .package_digest = "sha256:memoryaf-0.0.1-reference",
+        .runtime_name = "memoryaf_wasm",
+        .artifact = "target/wasm32-wasip2/release/memoryaf_extension.wasm",
+    }, root_path);
+    defer std.testing.allocator.free(path);
+
+    try std.testing.expect(std.mem.endsWith(u8, path, "extensions/memoryaf/target/wasm32-wasip2/release/memoryaf_extension.wasm"));
+}
+
+test "wasmtime runtime resolves content-addressed package store artifacts first" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "extensions/sha256/abc123/target/wasm32-wasip2/release");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "extensions/sha256/abc123/target/wasm32-wasip2/release/memoryaf_extension.wasm",
+        .data = &component_magic,
+    });
+    try tmp.dir.createDirPath(std.testing.io, "extensions/memoryaf/target/wasm32-wasip2/release");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "extensions/memoryaf/target/wasm32-wasip2/release/memoryaf_extension.wasm",
+        .data = &component_magic,
+    });
+    const root_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/extensions", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_path);
+
+    const path = try resolveArtifactPathAlloc(std.testing.allocator, .{
+        .package_name = "memoryaf",
+        .package_version = "0.0.1",
+        .package_digest = "sha256:abc123",
+        .runtime_name = "memoryaf_wasm",
+        .artifact = "target/wasm32-wasip2/release/memoryaf_extension.wasm",
+    }, root_path);
+    defer std.testing.allocator.free(path);
+
+    try std.testing.expect(std.mem.indexOf(u8, path, "extensions/sha256/abc123/") != null);
+}
+
+test "wasmtime runtime preserves legacy versioned artifact layout" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "extensions/memoryaf/0.0.1/target/wasm32-wasip2/release");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "extensions/memoryaf/0.0.1/target/wasm32-wasip2/release/memoryaf_extension.wasm",
+        .data = &component_magic,
+    });
+    const root_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/extensions", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_path);
+
+    const path = try resolveArtifactPathAlloc(std.testing.allocator, .{
+        .package_name = "memoryaf",
+        .package_version = "0.0.1",
+        .runtime_name = "memoryaf_wasm",
+        .artifact = "target/wasm32-wasip2/release/memoryaf_extension.wasm",
+    }, root_path);
+    defer std.testing.allocator.free(path);
+
+    try std.testing.expect(std.mem.endsWith(u8, path, "extensions/memoryaf/0.0.1/target/wasm32-wasip2/release/memoryaf_extension.wasm"));
 }
 
 fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
