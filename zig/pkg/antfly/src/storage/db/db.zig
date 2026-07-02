@@ -11572,9 +11572,7 @@ pub const DB = struct {
     ) anyerror!doc_set.ResolvedDocSet {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         const duration_ns = ttlDurationNs(self);
-        var identity_visible = if (duration_ns != 0 and set.* == .all)
-            try doc_identity.visibleDocSetFromStoreAlloc(alloc, self.core.store, generation)
-        else if (try self.allDocsVisibleAtGeneration(generation))
+        var identity_visible = if (try self.allDocsVisibleAtGeneration(generation))
             try doc_set.cloneAlloc(alloc, set)
         else if (set.* == .all)
             try self.broadLiveDocSetCachedAlloc(alloc, generation)
@@ -11582,7 +11580,7 @@ pub const DB = struct {
             try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, set, generation);
         errdefer identity_visible.deinit(alloc);
 
-        if (duration_ns == 0) return identity_visible;
+        if (duration_ns == 0 or identity_visible == .all) return identity_visible;
         const ttl_visible = try self.ttlVisibleResolvedDocSetNoLockAlloc(alloc, &identity_visible, generation, duration_ns);
         identity_visible.deinit(alloc);
         return ttl_visible;
@@ -11597,15 +11595,9 @@ pub const DB = struct {
     ) !doc_set.ResolvedDocSet {
         if (set.* == .none) return .none;
         if (duration_ns == 0) return try doc_set.cloneAlloc(alloc, set);
+        if (set.* == .all) return .all;
 
-        var materialized_all: ?doc_set.ResolvedDocSet = null;
-        defer if (materialized_all) |*owned| owned.deinit(alloc);
-        const materialized = if (set.* == .all) blk: {
-            materialized_all = try doc_identity.visibleDocSetFromStoreAlloc(alloc, self.core.store, generation);
-            break :blk &materialized_all.?;
-        } else set;
-
-        const doc_ids = (try self.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, materialized, generation)) orelse
+        const doc_ids = (try self.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, set, generation)) orelse
             return .none;
         defer freeConstDocIds(alloc, doc_ids);
 
@@ -37749,6 +37741,8 @@ test "db full-text chunk consumer returns parent and chunk modes" {
     const chunk_zero = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
     defer alloc.free(chunk_zero);
     try std.testing.expectEqualStrings(chunk_zero, chunk_result.hits[0].id);
+    try std.testing.expect(chunk_result.hits[0].stored_data != null);
+    try std.testing.expect(std.mem.indexOf(u8, chunk_result.hits[0].stored_data.?, "abcdefgh") != null);
     const chunk_ref = chunk_result.hits[0].artifact_ref orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(types.ArtifactKind.chunk, chunk_ref.kind);
     try std.testing.expectEqualStrings("doc:a", chunk_ref.document_id);
@@ -37832,6 +37826,39 @@ test "db full-text chunk consumer filters expired parents under ttl" {
     defer parent_result.deinit();
     try std.testing.expectEqual(@as(u32, 1), parent_result.total_hits);
     try std.testing.expectEqualStrings("doc:fresh", parent_result.hits[0].id);
+}
+
+test "db ttl broad live filter preserves all-doc sentinel" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = 60 * std.time.ns_per_s,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:old", .value = "{\"body\":\"old\"}" },
+            .{ .key = "doc:fresh", .value = "{\"body\":\"fresh\"}" },
+        },
+        .timestamp_ns = currentTimeNs(),
+        .sync_level = .write,
+    });
+
+    const all: doc_set.ResolvedDocSet = .all;
+    var filtered = try DB.liveFilterDocSetCallback(&db, alloc, &all, null);
+    defer filtered.deinit(alloc);
+    try std.testing.expect(filtered == .all);
 }
 
 test "db getArtifact loads stored chunk artifacts by public id" {

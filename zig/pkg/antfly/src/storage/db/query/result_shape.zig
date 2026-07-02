@@ -417,7 +417,8 @@ fn hydrateDirectChunkAncestors(
     raw: types.SearchResult,
     shaper: ChunkParentResultShaper,
 ) !types.SearchResult {
-    if ((!req.hierarchy_include_source and !req.hierarchy_include_unit) or raw.hits.len == 0) return raw;
+    const needs_chunk_payloads = req.include_stored or req.hierarchy_include_source or req.hierarchy_include_unit;
+    if (!needs_chunk_payloads or raw.hits.len == 0) return raw;
     if (shaper.load_stored == null and shaper.load_many_stored == null) return raw;
 
     var owned = raw;
@@ -434,6 +435,18 @@ fn hydrateDirectChunkAncestors(
 
     const chunk_payloads = try loadDirectChunkPayloads(alloc, owned.hits, shaper);
     defer freeOptionalOwnedBytes(alloc, chunk_payloads);
+
+    if (req.include_stored) {
+        for (owned.hits, 0..) |*hit, i| {
+            if (hit.stored_data != null) continue;
+            if (chunk_payloads[i]) |payload| {
+                hit.stored_data = payload;
+                chunk_payloads[i] = null;
+            }
+        }
+    }
+
+    if (!req.hierarchy_include_source and !req.hierarchy_include_unit) return owned;
 
     var source_count: usize = 0;
     var unit_count: usize = 0;

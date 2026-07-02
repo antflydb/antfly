@@ -3570,6 +3570,7 @@ pub fn searchTextQuery(
         }, chunk_backed);
     }
     const search_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints, effective_req.count_only);
+    const load_stored_in_search_engine = effective_req.include_stored and !chunk_backed;
 
     const execute_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var result = if (effective_req.count_only)
@@ -3579,7 +3580,7 @@ pub fn searchTextQuery(
             .query = search_query,
             .k = if (collect_all_hits) @intCast(snapshot.global_doc_count) else paging.limit,
             .offset = if (collect_all_hits) 0 else paging.offset,
-            .include_stored = effective_req.include_stored,
+            .include_stored = load_stored_in_search_engine,
             .distributed_text_stats = effective_req.distributed_text_stats,
             .filter_doc_nums = native_constraints.filter_doc_nums,
             .filter_doc_nums_positive = native_constraints.positive_filter,
@@ -3627,7 +3628,7 @@ pub fn searchTextQuery(
         var assigned = false;
         errdefer if (!assigned) materialized.deinit(alloc);
         materialized.index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
-        materialized.stored_data = if (effective_req.include_stored and hit.stored_data != null)
+        materialized.stored_data = if (load_stored_in_search_engine and hit.stored_data != null)
             try executor.project_stored_search(executor.ctx, alloc, effective_req, id, hit.stored_data.?)
         else
             null;
