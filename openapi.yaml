@@ -4062,9 +4062,9 @@ paths:
       description: >
         Registers a table-level generated artifact definition. Reusing the same
 
-        artifact name replaces the existing mapping. Chunk enrichments may set
+        artifact name replaces the existing mapping. Chunk or asset enrichments
 
-        `full_text_index: true` to map generated chunk text into the table's
+        may set `full_text_index: true` to map generated text into the table's
 
         default full-text index.
       tags:

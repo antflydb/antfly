@@ -4325,6 +4325,7 @@ pub const HttpHandler = struct {
         if (status.pending_materialization_families.sparse_vector) return false;
         if (status.pending_materialization_families.chunk_preview) return false;
         if (status.pending_materialization_families.chunk_embeddings) return false;
+        if (status.pending_materialization_families.rerank_terms) return false;
         return true;
     }
 
@@ -8972,6 +8973,10 @@ test "serverless full_index sync waits for enrichment and index publication" {
     status.pending_materialization_families.chunk_embeddings = true;
     try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
     status.pending_materialization_families.chunk_embeddings = false;
+
+    status.pending_materialization_families.rerank_terms = true;
+    try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+    status.pending_materialization_families.rerank_terms = false;
 
     status.artifact_actions.dense_vector = .rebuild;
     try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
