@@ -4004,6 +4004,7 @@ pub const ApiHttpServer = struct {
                 const metadata_create_start_ns = platform_time.monotonicNs();
                 while (true) {
                     self.source.createTable(self.alloc, table_name, create_req) catch |err| switch (err) {
+                        error.TableAlreadyExists => return try textResponse(self.alloc, 409, "table already exists"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.NotLeader => return err,
                         error.UnexpectedHttpStatus => {
@@ -19084,6 +19085,7 @@ test "api http server serves table create and drop" {
         fn createTable(ptr: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
+            if (self.created) return error.TableAlreadyExists;
             try std.testing.expectEqual(@as(?u32, 1), req.num_shards);
             try std.testing.expectEqualStrings("docs table", req.description.?);
             try std.testing.expect(req.schema_json == null);
@@ -19156,6 +19158,17 @@ test "api http server serves table create and drop" {
     defer parsed_create.deinit();
     try std.testing.expectEqualStrings("docs", parsed_create.value.name);
     try std.testing.expectEqualStrings("docs table", parsed_create.value.description.?);
+
+    var duplicate_create_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs",
+        .content_type = "application/json",
+        .body = create_body,
+    });
+    defer duplicate_create_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), duplicate_create_resp.status);
+    try std.testing.expectEqualStrings("text/plain", duplicate_create_resp.content_type.?);
+    try std.testing.expectEqualStrings("table already exists", duplicate_create_resp.body);
 
     var drop_resp = try server.handle(.{
         .method = .DELETE,
