@@ -2206,16 +2206,35 @@ fn searchTextNeedsLateVisibilityFilter(
     has_native_positive_filter: bool,
     generation: ?u64,
 ) !bool {
-    if (has_native_positive_filter) return false;
     if (executor.requires_full_candidate_visibility_filter) |requires| {
         if (try requires(executor.ctx, generation)) return true;
     }
+    if (has_native_positive_filter) return false;
     if (can_apply_live_all_docs) return false;
     if (executor.live_filter_doc_set == null) return false;
     if (executor.all_docs_visible) |all_visible| {
         return !(try all_visible(executor.ctx, generation));
     }
     return true;
+}
+
+test "text late visibility requirement overrides positive native filter" {
+    const callbacks = struct {
+        fn requiresFullCandidateVisibilityFilter(_: ?*anyopaque, _: ?u64) anyerror!bool {
+            return true;
+        }
+    };
+
+    const needs_late_filter = try searchTextNeedsLateVisibilityFilter(.{
+        .ctx = null,
+        .text_index_entry = undefined,
+        .text_index_is_chunk_backed = undefined,
+        .search_match_all = undefined,
+        .project_stored_search = undefined,
+        .requires_full_candidate_visibility_filter = callbacks.requiresFullCandidateVisibilityFilter,
+        .postprocess = undefined,
+    }, true, true, null);
+    try std.testing.expect(needs_late_filter);
 }
 
 fn paginateSearchResultInPlace(result: *types.SearchResult, offset: u32, limit: u32) !void {
