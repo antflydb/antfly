@@ -452,6 +452,8 @@ pub const Server = struct {
             .admin_listener = .{
                 .bind_host = result.admin_bind_host,
                 .bind_port = cfg.admin_bind_port,
+                .serve_in_connection_threads = true,
+                .max_connection_threads = 32,
             },
             .service = service_cfg,
             .api_server_cfg = cfg.api_server_cfg,
@@ -1638,6 +1640,30 @@ test "metadata runtime scales bootstrap campaign retry interval with tick" {
         @as(u64, 12 * std.time.ns_per_s),
         metadataBootstrapCampaignRetryIntervalNs(100),
     );
+}
+
+test "metadata runtime serves admin listener requests on threaded io connections" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-admin-threaded-listener/replicas", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root);
+    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-admin-threaded-listener/catalog.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_catalog_path);
+    const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-admin-threaded-listener/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(snapshot_root);
+
+    var server = try Server.init(std.testing.allocator, .{
+        .replica_root_dir = replica_root,
+        .replica_catalog_path = replica_catalog_path,
+        .snapshot_root_dir = snapshot_root,
+    });
+    defer server.deinit();
+
+    const admin_listener = server.server.owned_admin_listener orelse return error.MissingMetadataAdminListener;
+    try std.testing.expect(admin_listener.cfg.serve_in_connection_threads);
+    try std.testing.expectEqual(@as(u32, 32), admin_listener.cfg.max_connection_threads);
+    try std.testing.expect(server.metadataHttpService().apiIoImpl() != null);
 }
 
 test "metadata runtime metrics expose memory ownership buckets" {
