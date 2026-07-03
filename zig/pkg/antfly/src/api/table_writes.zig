@@ -2362,6 +2362,12 @@ pub const TableWriteSource = struct {
             artifact_name: []const u8,
             enrichment_json: []const u8,
         ) anyerror!?void = null,
+        delete_artifact_enrichment: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            artifact_name: []const u8,
+        ) anyerror!?void = null,
         drop_index: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -2620,6 +2626,16 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.put_artifact_enrichment orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name, artifact_name, enrichment_json);
+    }
+
+    pub fn deleteArtifactEnrichment(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.delete_artifact_enrichment orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, artifact_name);
     }
 
     pub fn dropIndex(
@@ -2962,6 +2978,7 @@ pub const BoundTableWriteSource = struct {
                 .update_schema = updateSchema,
                 .create_index = createIndex,
                 .put_artifact_enrichment = putArtifactEnrichment,
+                .delete_artifact_enrichment = deleteArtifactEnrichment,
                 .drop_index = dropIndex,
                 .backup_table = backupTable,
                 .restore_table = restoreTable,
@@ -3322,6 +3339,17 @@ pub const BoundTableWriteSource = struct {
         defer parsed.deinit();
         if (!std.mem.eql(u8, parsed.value.name, artifact_name)) return error.InvalidEnrichmentConfig;
         _ = try self.db.upsertEnrichment(parsed.value);
+    }
+
+    fn deleteArtifactEnrichment(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+    ) !?void {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        _ = try deleteArtifactEnrichmentFromDbByName(alloc, self.db, artifact_name);
     }
 
     fn dropIndex(
@@ -6481,6 +6509,8 @@ pub const ProvisionedTableWriteSource = struct {
                 .create_table = createTable,
                 .update_schema = updateSchema,
                 .create_index = createIndex,
+                .put_artifact_enrichment = putArtifactEnrichment,
+                .delete_artifact_enrichment = deleteArtifactEnrichment,
                 .drop_index = dropIndex,
                 .drop_table = dropTable,
                 .commit_transaction = commitTransaction,
@@ -6508,6 +6538,39 @@ pub const ProvisionedTableWriteSource = struct {
                 .local_runtime_statuses = localRuntimeStatuses,
             },
         };
+    }
+
+    fn putArtifactEnrichment(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        enrichment_json: []const u8,
+    ) !?void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.putArtifactEnrichment(alloc, table_name, artifact_name, enrichment_json);
+        try enforceHAWriteGateOptional(self.ha_write_gate);
+        self.beginLocalStructuralCacheUpdate(table_name);
+        errdefer self.abortLocalStructuralCacheUpdate(table_name);
+        try putLocalArtifactEnrichment(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, artifact_name, enrichment_json);
+        self.finishLocalStructuralCacheUpdate(table_name);
+        self.notifyLocalChange(table_name, .structural);
+    }
+
+    fn deleteArtifactEnrichment(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+    ) !?void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.deleteArtifactEnrichment(alloc, table_name, artifact_name);
+        try enforceHAWriteGateOptional(self.ha_write_gate);
+        self.beginLocalStructuralCacheUpdate(table_name);
+        errdefer self.abortLocalStructuralCacheUpdate(table_name);
+        try dropLocalArtifactEnrichment(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, artifact_name);
+        self.finishLocalStructuralCacheUpdate(table_name);
+        self.notifyLocalChange(table_name, .structural);
     }
 
     fn createTable(
@@ -8515,6 +8578,8 @@ pub const HostedProvisionedTableWriteSource = struct {
             .ptr = self,
             .vtable = &.{
                 .create_index = createIndex,
+                .put_artifact_enrichment = putArtifactEnrichment,
+                .delete_artifact_enrichment = deleteArtifactEnrichment,
                 .drop_index = dropIndex,
                 .commit_transaction = commitTransaction,
                 .commit_transaction_with_id = commitTransactionWithId,
@@ -8551,6 +8616,31 @@ pub const HostedProvisionedTableWriteSource = struct {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         self.invalidateManagedCache(table_name);
         try self.reconcileCachedIndexCreate(alloc, table_name, index_name);
+    }
+
+    fn putArtifactEnrichment(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        enrichment_json: []const u8,
+    ) !?void {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        self.invalidateManagedCache(table_name);
+        try putLocalArtifactEnrichment(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, artifact_name, enrichment_json);
+        self.invalidateManagedCache(table_name);
+    }
+
+    fn deleteArtifactEnrichment(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+    ) !?void {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        self.invalidateManagedCache(table_name);
+        try dropLocalArtifactEnrichment(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, artifact_name);
+        self.invalidateManagedCache(table_name);
     }
 
     fn dropIndex(
@@ -9817,6 +9907,48 @@ fn reconcileDbArtifactEnrichmentsFromIndexesJson(
     }
 }
 
+fn parseArtifactEnrichmentConfig(
+    alloc: std.mem.Allocator,
+    artifact_name: []const u8,
+    enrichment_json: []const u8,
+) !std.json.Parsed(db_mod.types.EnrichmentConfig) {
+    var parsed = try std.json.parseFromSlice(db_mod.types.EnrichmentConfig, alloc, enrichment_json, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    errdefer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.name, artifact_name)) return error.InvalidEnrichmentConfig;
+    return parsed;
+}
+
+fn putArtifactEnrichmentInDb(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    artifact_name: []const u8,
+    enrichment_json: []const u8,
+) !void {
+    var parsed = try parseArtifactEnrichmentConfig(alloc, artifact_name, enrichment_json);
+    defer parsed.deinit();
+    _ = try db.upsertEnrichment(parsed.value);
+}
+
+fn deleteArtifactEnrichmentFromDbByName(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    artifact_name: []const u8,
+) !bool {
+    const enrichments = try db.listEnrichments(alloc);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
+
+    var deleted = false;
+    for (enrichments) |cfg| {
+        if (!std.mem.eql(u8, cfg.name, artifact_name)) continue;
+        _ = try db.deleteEnrichment(cfg.kind, artifact_name);
+        deleted = true;
+    }
+    return deleted;
+}
+
 fn reconcileCachedLocalTableIndexCreate(
     self: *ProvisionedTableWriteSource,
     alloc: std.mem.Allocator,
@@ -10003,6 +10135,67 @@ fn dropLocalTableIndex(
             error.IndexNotFound => {},
             else => return err,
         };
+    }
+}
+
+fn putLocalArtifactEnrichment(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    replica_root_dir: []const u8,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    artifact_name: []const u8,
+    enrichment_json: []const u8,
+) !void {
+    const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+        alloc,
+        catalog,
+        table_name,
+        "",
+        "",
+        5 * std.time.ns_per_s,
+        10,
+    );
+    defer alloc.free(group_ids);
+
+    for (group_ids) |group_id| {
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
+        defer alloc.free(path);
+
+        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, catalog, table_name, group_id, backend_runtime);
+        defer db.close();
+        try putArtifactEnrichmentInDb(alloc, &db, artifact_name, enrichment_json);
+        try drainManagedDbBeforeClose(&db);
+    }
+}
+
+fn dropLocalArtifactEnrichment(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    replica_root_dir: []const u8,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    artifact_name: []const u8,
+) !void {
+    const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+        alloc,
+        catalog,
+        table_name,
+        "",
+        "",
+        5 * std.time.ns_per_s,
+        10,
+    );
+    defer alloc.free(group_ids);
+
+    for (group_ids) |group_id| {
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
+        defer alloc.free(path);
+
+        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, catalog, table_name, group_id, backend_runtime);
+        defer db.close();
+        _ = try deleteArtifactEnrichmentFromDbByName(alloc, &db, artifact_name);
+        try drainManagedDbBeforeClose(&db);
     }
 }
 
@@ -11006,6 +11199,33 @@ test "provisioning detects generated embedding chunkers inside index metadata" {
         \\  "config_json":"{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunker\":{\"provider\":\"antfly\",\"model\":\"fixed-bert-tokenizer\",\"store_chunks\":false}}}"
         \\}]
     ));
+}
+
+test "bound table write source locally deletes artifact enrichment" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bound-table-write-source-delete-artifact-enrichment", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+
+    _ = try db.upsertEnrichment(.{
+        .name = "body_chunks_v1",
+        .kind = .chunk,
+        .field = "body",
+        .chunk_size = 128,
+    });
+
+    var bound = BoundTableWriteSource.init("docs", &db);
+    _ = try bound.source().deleteArtifactEnrichment(alloc, "docs", "body_chunks_v1");
+
+    const remaining = try db.listEnrichments(alloc);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, remaining);
+    for (remaining) |cfg| {
+        try std.testing.expect(!std.mem.eql(u8, cfg.name, "body_chunks_v1"));
+    }
 }
 
 fn drainManagedDbBeforeClose(db: *db_mod.DB) !void {
