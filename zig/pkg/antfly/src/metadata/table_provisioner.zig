@@ -249,7 +249,11 @@ pub fn reconcileDbIndexesWithOptions(
     if (index_summary.added > 0 or indexes_removed > 0 or enrichment_summary.changed() or enrichments_removed > 0 or resolver_summary.changed()) {
         const pending = db.pendingWorkStats();
         if (pending.enrichment.error_count == 0) {
-            try db.core.index_manager.syncAll(true);
+            // Reconciliation persists catalog/applied-sequence state through the
+            // primary store. Avoid forcing every newly-created empty index WAL
+            // during create-table; repair/replay paths force-sync real index
+            // mutations after applying data.
+            try db.core.index_manager.syncAll(false);
         }
     }
     return .{
