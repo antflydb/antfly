@@ -7127,10 +7127,17 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.localWriteOwnerSource()) |owner| return try owner.putArtifactEnrichment(alloc, table_name, artifact_name, enrichment_json);
         try enforceHAWriteGateOptional(self.ha_write_gate);
-        self.beginLocalStructuralCacheUpdate(table_name);
-        errdefer self.abortLocalStructuralCacheUpdate(table_name);
-        try putLocalArtifactEnrichment(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, artifact_name, enrichment_json);
-        self.finishLocalStructuralCacheUpdate(table_name);
+        if (self.write_cache != null) {
+            self.beginLocalStructuralIndexCacheUpdate(table_name);
+            errdefer self.abortLocalStructuralIndexCacheUpdate(table_name);
+            try putCachedLocalArtifactEnrichment(self, alloc, table_name, artifact_name, enrichment_json);
+            self.finishLocalStructuralCacheUpdate(table_name);
+        } else {
+            self.beginLocalStructuralCacheUpdate(table_name);
+            errdefer self.abortLocalStructuralCacheUpdate(table_name);
+            try putLocalArtifactEnrichment(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, artifact_name, enrichment_json);
+            self.finishLocalStructuralCacheUpdate(table_name);
+        }
         self.notifyLocalChange(table_name, .structural);
     }
 
@@ -7143,10 +7150,17 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.localWriteOwnerSource()) |owner| return try owner.deleteArtifactEnrichment(alloc, table_name, artifact_name);
         try enforceHAWriteGateOptional(self.ha_write_gate);
-        self.beginLocalStructuralCacheUpdate(table_name);
-        errdefer self.abortLocalStructuralCacheUpdate(table_name);
-        try dropLocalArtifactEnrichment(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, artifact_name);
-        self.finishLocalStructuralCacheUpdate(table_name);
+        if (self.write_cache != null) {
+            self.beginLocalStructuralIndexCacheUpdate(table_name);
+            errdefer self.abortLocalStructuralIndexCacheUpdate(table_name);
+            try dropCachedLocalArtifactEnrichment(self, alloc, table_name, artifact_name);
+            self.finishLocalStructuralCacheUpdate(table_name);
+        } else {
+            self.beginLocalStructuralCacheUpdate(table_name);
+            errdefer self.abortLocalStructuralCacheUpdate(table_name);
+            try dropLocalArtifactEnrichment(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, artifact_name);
+            self.finishLocalStructuralCacheUpdate(table_name);
+        }
         self.notifyLocalChange(table_name, .structural);
     }
 
@@ -11214,6 +11228,99 @@ fn reconcileCachedLocalTableIndexDrop(
         managed_visibility_changed = true;
     }
     return managed_visibility_changed;
+}
+
+fn putCachedLocalArtifactEnrichment(
+    self: *ProvisionedTableWriteSource,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    artifact_name: []const u8,
+    enrichment_json: []const u8,
+) !void {
+    const cache = self.write_cache orelse return try putLocalArtifactEnrichment(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, artifact_name, enrichment_json);
+    const metadata = try cachedTableMetadataFromCatalog(alloc, self.catalog, cache, table_name);
+    defer {
+        alloc.free(metadata.indexes_json);
+        alloc.free(metadata.schema_json);
+    }
+
+    const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+        alloc,
+        self.catalog,
+        table_name,
+        "",
+        "",
+        5 * std.time.ns_per_s,
+        10,
+    );
+    defer alloc.free(group_ids);
+
+    for (group_ids) |group_id| {
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+
+        var cached = try self.getOrOpenCachedDbModeAlreadyLocked(cache, path, group_id, self.visibleRootGeneration(group_id), table_name, .default_async);
+        var cached_active = true;
+        defer if (cached_active) cached.deinit(alloc);
+        cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
+
+        putArtifactEnrichmentInDb(alloc, cached.db, artifact_name, enrichment_json) catch |err| {
+            cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
+            cached_active = false;
+            return err;
+        };
+        publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db) catch |err| {
+            cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
+            cached_active = false;
+            return err;
+        };
+    }
+}
+
+fn dropCachedLocalArtifactEnrichment(
+    self: *ProvisionedTableWriteSource,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    artifact_name: []const u8,
+) !void {
+    const cache = self.write_cache orelse return try dropLocalArtifactEnrichment(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, artifact_name);
+    const metadata = try cachedTableMetadataFromCatalog(alloc, self.catalog, cache, table_name);
+    defer {
+        alloc.free(metadata.indexes_json);
+        alloc.free(metadata.schema_json);
+    }
+
+    const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+        alloc,
+        self.catalog,
+        table_name,
+        "",
+        "",
+        5 * std.time.ns_per_s,
+        10,
+    );
+    defer alloc.free(group_ids);
+
+    for (group_ids) |group_id| {
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+
+        var cached = try self.getOrOpenCachedDbModeAlreadyLocked(cache, path, group_id, self.visibleRootGeneration(group_id), table_name, .default_async);
+        var cached_active = true;
+        defer if (cached_active) cached.deinit(alloc);
+        cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
+
+        _ = deleteArtifactEnrichmentFromDbByName(alloc, cached.db, artifact_name) catch |err| {
+            cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
+            cached_active = false;
+            return err;
+        };
+        publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db) catch |err| {
+            cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
+            cached_active = false;
+            return err;
+        };
+    }
 }
 
 fn reconcileUncachedLocalTableIndexCreate(
@@ -24668,7 +24775,12 @@ test "provisioned table write source create table provisions local indexes and s
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+
     var source = ProvisionedTableWriteSource.init(path, Catalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
     var req = tables_api.CreateTableRequest{
         .schema_json = try alloc.dupe(u8, schema_json),
     };
@@ -24676,13 +24788,27 @@ test "provisioned table write source create table provisions local indexes and s
 
     _ = try source.source().createTable(alloc, "docs", req);
 
-    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
-    defer alloc.free(db_path);
-    var db = try db_mod.DB.open(alloc, db_path, .{});
-    defer db.close();
+    {
+        lockAtomic(&source.local_db_mutex);
+        defer source.local_db_mutex.unlock();
+        const cached_db = write_cache.getLocked(7001, source.visibleRootGeneration(7001), "docs") orelse return error.TestUnexpectedResult;
+        try std.testing.expect(cached_db.core.index_manager.textIndex("full_text_index_v0") != null);
+        try std.testing.expect(cached_db.core.schema != null);
+    }
 
-    try std.testing.expect(db.core.index_manager.textIndex("full_text_index_v0") != null);
-    try std.testing.expect(db.core.schema != null);
+    _ = try source.source().putArtifactEnrichment(
+        alloc,
+        "docs",
+        "document_units_v1",
+        "{\"name\":\"document_units_v1\",\"kind\":\"asset\",\"field\":\"title\",\"content_type\":\"application/json\"}",
+    );
+
+    lockAtomic(&source.local_db_mutex);
+    defer source.local_db_mutex.unlock();
+    const cached_db = write_cache.getLocked(7001, source.visibleRootGeneration(7001), "docs") orelse return error.TestUnexpectedResult;
+    var enrichment = (try cached_db.getEnrichment(alloc, .asset, "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer enrichment.deinit(alloc);
+    try std.testing.expectEqualStrings("title", enrichment.field);
 }
 
 test "provisioned table write source restore table does not hold local db mutex during restore work" {
