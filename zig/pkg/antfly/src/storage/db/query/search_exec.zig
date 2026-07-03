@@ -4630,10 +4630,11 @@ fn searchDenseInternal(
         native_constraints.exclusion_query_json_resolved,
     );
     const full_candidate_window = group_chunk_parents or unresolved_stored_filters;
+    const page_candidate_window = pagingCandidateWindow(paging);
     const effective_k: u32 = if (full_candidate_window)
         @intCast(index_stats.active_count)
     else
-        @max(dense.k, paging.limit);
+        @max(dense.k, page_candidate_window);
     const effort = resolvedSearchEffort(req.search_effort);
     const resolved_search_width = resolveSearchWidth(dense.k, effort, index_stats);
     const resolved_epsilon = resolveSearchEpsilon(effort);
@@ -4872,6 +4873,10 @@ fn shouldExactScoreNativeDenseFilter(
     const paging_budget = paging.limit *| 32;
     const budget = @max(paging_budget, default_exact_native_filter_candidate_budget);
     return native_constraints.filter_ids.len <= budget;
+}
+
+fn pagingCandidateWindow(paging: ComponentPaging) u32 {
+    return paging.offset +| paging.limit;
 }
 
 fn exactScoreNativeDenseFilter(

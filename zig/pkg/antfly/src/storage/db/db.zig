@@ -28222,6 +28222,7 @@ test "db non chunked search paths apply broad live doc filter" {
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"body\":\"alpha only\",\"embedding\":[0,0],\"sparse\":{\"indices\":[7],\"values\":[1.0]}}" },
             .{ .key = "doc:b", .value = "{\"body\":\"beta only\",\"embedding\":[10,0],\"sparse\":{\"indices\":[8],\"values\":[1.0]}}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"gamma only\",\"embedding\":[20,0],\"sparse\":{\"indices\":[9],\"values\":[1.0]}}" },
         },
         .sync_level = .full_index,
     });
@@ -28248,6 +28249,18 @@ test "db non chunked search paths apply broad live doc filter" {
     try std.testing.expectEqual(@as(usize, 1), dense_live.result.hits.len);
     try std.testing.expectEqualStrings("doc:b", dense_live.result.hits[0].id);
     try std.testing.expectEqual(@as(u32, 1), dense_live.profile.raw_hit_count);
+
+    var dense_live_page_two = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .offset = 1,
+        .include_stored = false,
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_live_page_two.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_live_page_two.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_live_page_two.result.hits.len);
+    try std.testing.expectEqualStrings("doc:c", dense_live_page_two.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 2), dense_live_page_two.profile.raw_hit_count);
 
     var sparse_live = try db.search(alloc, .{
         .index_name = "sp_v1",

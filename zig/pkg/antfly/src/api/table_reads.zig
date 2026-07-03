@@ -9014,9 +9014,55 @@ fn identityGenerationForAggregationFullResultRerun(
     req: db_mod.types.SearchRequest,
     result: db_mod.types.SearchResult,
 ) !?u64 {
-    if (!req.count_only and result.hits.len == result.total_hits) return req.identity_read_generation orelse result.identity_read_generation;
-    if (result.total_hits == 0) return req.identity_read_generation orelse result.identity_read_generation;
+    if (aggregationCanUseCurrentResult(req, result)) return req.identity_read_generation orelse result.identity_read_generation;
     return req.identity_read_generation orelse result.identity_read_generation orelse error.UnsupportedQueryRequest;
+}
+
+fn aggregationCanUseCurrentResult(req: db_mod.types.SearchRequest, result: db_mod.types.SearchResult) bool {
+    if (result.total_hits_relation != .exact) return false;
+    if (result.total_hits == 0) return true;
+    return !req.count_only and result.hits.len == result.total_hits;
+}
+
+fn aggregationFullResultLimit(result: db_mod.types.SearchResult) !u32 {
+    if (result.total_hits_relation != .exact) return error.UnsupportedQueryRequest;
+    return result.total_hits;
+}
+
+test "aggregation completeness requires exact total relation" {
+    const req = db_mod.types.SearchRequest{};
+    try std.testing.expect(aggregationCanUseCurrentResult(req, .{
+        .alloc = std.testing.allocator,
+        .hits = &.{},
+        .total_hits = 0,
+        .total_hits_relation = .exact,
+    }));
+    try std.testing.expect(!aggregationCanUseCurrentResult(req, .{
+        .alloc = std.testing.allocator,
+        .hits = &.{},
+        .total_hits = 0,
+        .total_hits_relation = .gte,
+    }));
+
+    const hits = [_]db_mod.types.SearchHit{.{ .id = @constCast("doc:a") }};
+    try std.testing.expect(aggregationCanUseCurrentResult(req, .{
+        .alloc = std.testing.allocator,
+        .hits = @constCast(hits[0..]),
+        .total_hits = 1,
+        .total_hits_relation = .exact,
+    }));
+    try std.testing.expect(!aggregationCanUseCurrentResult(req, .{
+        .alloc = std.testing.allocator,
+        .hits = @constCast(hits[0..]),
+        .total_hits = 1,
+        .total_hits_relation = .gte,
+    }));
+    try std.testing.expectError(error.UnsupportedQueryRequest, aggregationFullResultLimit(.{
+        .alloc = std.testing.allocator,
+        .hits = @constCast(hits[0..]),
+        .total_hits = 1,
+        .total_hits_relation = .gte,
+    }));
 }
 
 fn applyBoundQueryAggregations(
@@ -9029,18 +9075,16 @@ fn applyBoundQueryAggregations(
 ) !void {
     if (req.aggregations_json.len == 0) return;
     const aggregation_req = requestWithResultIdentityGeneration(req, result.*);
-    if (!req.count_only and result.hits.len == result.total_hits) {
-        return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, self.db), meta);
-    }
-    if (result.total_hits == 0) {
+    if (aggregationCanUseCurrentResult(req, result.*)) {
         return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, self.db), meta);
     }
 
     const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result.*);
+    const full_limit = try aggregationFullResultLimit(result.*);
     var full_req = req;
     full_req.identity_read_generation = identity_read_generation;
     full_req.offset = 0;
-    full_req.limit = result.total_hits;
+    full_req.limit = full_limit;
     full_req.include_stored = true;
     full_req.count_only = false;
     var full_result = try self.reads.searchWithConsistency(alloc, self.db, full_req, consistency);
@@ -9066,19 +9110,17 @@ fn applyProvisionedQueryAggregations(
         var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.backend_runtime);
         defer db.close();
 
-        if (!req.count_only and result.hits.len == result.total_hits) {
-            return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, &db), meta);
-        }
-        if (result.total_hits == 0) {
+        if (aggregationCanUseCurrentResult(req, result.*)) {
             return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, &db), meta);
         }
 
         var reads = raft_mod.FeatureDBReads.init(group_ids[0], self.requester);
         const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result.*);
+        const full_limit = try aggregationFullResultLimit(result.*);
         var full_req = req;
         full_req.identity_read_generation = identity_read_generation;
         full_req.offset = 0;
-        full_req.limit = result.total_hits;
+        full_req.limit = full_limit;
         full_req.include_stored = true;
         full_req.count_only = false;
         var full_result = try reads.searchWithConsistency(alloc, &db, full_req, consistency);
@@ -9092,13 +9134,7 @@ fn applyProvisionedQueryAggregations(
     defer distributed_stats_mod.deinitTextFieldStats(alloc, current_agg_stats);
     const current_bg_stats = try collectProvisionedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits);
     defer db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, current_bg_stats);
-    if (!req.count_only and result.hits.len == result.total_hits) {
-        return try applyAggregationResults(alloc, aggregation_req, result.*, .{
-            .distributed_text_stats = current_agg_stats,
-            .distributed_background_text_stats = current_bg_stats,
-        }, meta);
-    }
-    if (result.total_hits == 0) {
+    if (aggregationCanUseCurrentResult(req, result.*)) {
         return try applyAggregationResults(alloc, aggregation_req, result.*, .{
             .distributed_text_stats = current_agg_stats,
             .distributed_background_text_stats = current_bg_stats,
@@ -9106,10 +9142,11 @@ fn applyProvisionedQueryAggregations(
     }
 
     const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result.*);
+    const full_limit = try aggregationFullResultLimit(result.*);
     var full_req = req;
     full_req.identity_read_generation = identity_read_generation;
     full_req.offset = 0;
-    full_req.limit = result.total_hits;
+    full_req.limit = full_limit;
     full_req.include_stored = true;
     full_req.count_only = false;
     var full_result = try queryProvisionedAcrossGroups(self, alloc, group_ids, full_req, table_name, consistency);
@@ -9275,19 +9312,17 @@ fn applyHostedProvisionedQueryAggregations(
                 var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.backend_runtime);
                 defer db.close();
 
-                if (!req.count_only and result.hits.len == result.total_hits) {
-                    return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, &db), meta);
-                }
-                if (result.total_hits == 0) {
+                if (aggregationCanUseCurrentResult(req, result.*)) {
                     return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, &db), meta);
                 }
 
                 var reads = raft_mod.FeatureDBReads.init(group_ids[0], self.requester);
                 const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result.*);
+                const full_limit = try aggregationFullResultLimit(result.*);
                 var full_req = req;
                 full_req.identity_read_generation = identity_read_generation;
                 full_req.offset = 0;
-                full_req.limit = result.total_hits;
+                full_req.limit = full_limit;
                 full_req.include_stored = true;
                 full_req.count_only = false;
                 var full_result = try reads.searchWithConsistency(alloc, &db, full_req, consistency);
@@ -9304,13 +9339,7 @@ fn applyHostedProvisionedQueryAggregations(
     defer distributed_stats_mod.deinitTextFieldStats(alloc, current_agg_stats);
     const current_bg_stats = try collectHostedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits, consistency);
     defer db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, current_bg_stats);
-    if (!req.count_only and result.hits.len == result.total_hits) {
-        return try applyAggregationResults(alloc, aggregation_req, result.*, .{
-            .distributed_text_stats = current_agg_stats,
-            .distributed_background_text_stats = current_bg_stats,
-        }, meta);
-    }
-    if (result.total_hits == 0) {
+    if (aggregationCanUseCurrentResult(req, result.*)) {
         return try applyAggregationResults(alloc, aggregation_req, result.*, .{
             .distributed_text_stats = current_agg_stats,
             .distributed_background_text_stats = current_bg_stats,
@@ -9318,10 +9347,11 @@ fn applyHostedProvisionedQueryAggregations(
     }
 
     const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result.*);
+    const full_limit = try aggregationFullResultLimit(result.*);
     var full_req = req;
     full_req.identity_read_generation = identity_read_generation;
     full_req.offset = 0;
-    full_req.limit = result.total_hits;
+    full_req.limit = full_limit;
     full_req.include_stored = true;
     full_req.count_only = false;
     var full_result = try queryHostedAcrossGroups(self, alloc, group_ids, full_req, table_name, consistency);
