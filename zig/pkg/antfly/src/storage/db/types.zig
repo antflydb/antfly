@@ -167,6 +167,21 @@ pub const IndexConfig = struct {
     }
 };
 
+pub fn indexConfigHash(cfg: IndexConfig) u64 {
+    var hasher = std.hash.Wyhash.init(0x41504a4346470001);
+    hashLengthPrefixedBytes(&hasher, cfg.name);
+    hashLengthPrefixedBytes(&hasher, @tagName(cfg.kind));
+    hashLengthPrefixedBytes(&hasher, cfg.config_json);
+    return hasher.final();
+}
+
+fn hashLengthPrefixedBytes(hasher: *std.hash.Wyhash, bytes: []const u8) void {
+    var len_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len_buf, bytes.len, .little);
+    hasher.update(&len_buf);
+    hasher.update(bytes);
+}
+
 pub fn freeIndexConfigs(alloc: Allocator, configs: []IndexConfig) void {
     for (configs) |*cfg| cfg.deinit(alloc);
     if (configs.len > 0) alloc.free(configs);
@@ -276,6 +291,33 @@ pub const EnrichmentConfig = struct {
         self.* = undefined;
     }
 };
+
+pub fn enrichmentConfigHash(cfg: EnrichmentConfig) u64 {
+    var hasher = std.hash.Wyhash.init(0x41454a4346470001);
+    hashLengthPrefixedBytes(&hasher, cfg.name);
+    hashLengthPrefixedBytes(&hasher, @tagName(cfg.kind));
+    hashLengthPrefixedBytes(&hasher, cfg.field);
+    hashLengthPrefixedBytes(&hasher, cfg.template);
+    hashLengthPrefixedBytes(&hasher, cfg.source_artifact_name);
+    hashU32(&hasher, cfg.expected_dims);
+    hashU32(&hasher, cfg.chunk_size);
+    hashU32(&hasher, cfg.chunk_overlap);
+    hashLengthPrefixedBytes(&hasher, cfg.chunker_json);
+    hashBool(&hasher, cfg.full_text_index);
+    hashLengthPrefixedBytes(&hasher, cfg.content_type);
+    hashLengthPrefixedBytes(&hasher, cfg.producer_json);
+    return hasher.final();
+}
+
+fn hashU32(hasher: *std.hash.Wyhash, value: u32) void {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, value, .little);
+    hasher.update(&buf);
+}
+
+fn hashBool(hasher: *std.hash.Wyhash, value: bool) void {
+    hasher.update(if (value) "\x01" else "\x00");
+}
 
 pub fn freeEnrichmentConfigs(alloc: Allocator, configs: []EnrichmentConfig) void {
     for (configs) |*cfg| cfg.deinit(alloc);
@@ -1379,6 +1421,11 @@ pub const EnrichmentStats = struct {
     last_acquired_ms: u64 = 0,
     target_sequence: u64 = 0,
     applied_sequence: u64 = 0,
+    projection_checkpoint_status: []const u8 = "clean",
+    projection_checkpoint_applied_sequence: u64 = 0,
+    projection_checkpoint_generation: u64 = 0,
+    projection_checkpoint_config_hash: u64 = 0,
+    checkpoint_replay_tail_sequence_count: u64 = 0,
     processed_requests: u64 = 0,
     error_count: u64 = 0,
     retryable_error_count: u64 = 0,
@@ -1820,8 +1867,14 @@ pub const DBIndexStats = struct {
     repair_issue_count: u64 = 0,
     repair_summary_ready: bool = true,
     repair_issue_count_estimated: bool = false,
+    repair_scan_issue_count: u64 = 0,
+    projection_checkpoint_status: []const u8 = "clean",
+    projection_checkpoint_applied_sequence: u64 = 0,
+    projection_checkpoint_generation: u64 = 0,
+    projection_checkpoint_config_hash: u64 = 0,
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
+    checkpoint_replay_tail_sequence_count: u64 = 0,
     replay_catch_up_required: bool = false,
     catch_up_active: bool = false,
     catch_up_phase: DenseCatchUpStats.Phase = .idle,

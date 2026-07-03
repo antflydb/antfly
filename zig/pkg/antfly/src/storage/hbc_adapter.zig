@@ -136,6 +136,7 @@ const bulk_publish_state_key = "__bulk_publish_state";
 const bulk_publish_state_value = "incomplete";
 const hbc_index_version = vectorindex_hbc.hbc_index_version;
 const IndexMetadata = vectorindex_hbc.IndexMetadata;
+pub const ProjectionCheckpointMetadata = vectorindex_hbc.ProjectionCheckpointMetadata;
 
 // ============================================================================
 // Node representation
@@ -3541,6 +3542,20 @@ pub const HBCIndex = struct {
     fn flushMetadataNow(self: *HBCIndex, txn: anytype) !void {
         var buf: [IndexMetadata.encoded_size]u8 = undefined;
         try self.putNamespaced(txn, .meta, meta_key, self.metadata.encode(&buf));
+    }
+
+    pub fn projectionCheckpointMetadata(self: *const HBCIndex) ProjectionCheckpointMetadata {
+        return self.metadata.projectionCheckpoint();
+    }
+
+    pub fn saveProjectionCheckpointMetadata(self: *HBCIndex, checkpoint: ProjectionCheckpointMetadata) !void {
+        var txn = try self.beginRuntimeBatchTxnOptions(.{});
+        var active = true;
+        errdefer if (active) txn.abort();
+        self.metadata.setProjectionCheckpoint(checkpoint);
+        try self.flushMetadataNow(&txn);
+        try txn.commit();
+        active = false;
     }
 
     fn persistBulkPublishState(self: *HBCIndex) !void {

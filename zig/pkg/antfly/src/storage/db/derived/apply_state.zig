@@ -25,7 +25,6 @@ const platform_time = @import("../../../platform/time.zig");
 
 const metadata_prefix = "\x00\x00__metadata__:derived_apply:";
 const checkpoint_file_name = "derived_apply.checkpoint";
-const legacy_checkpoint_magic = "AFAPSEQ1";
 const checkpoint_magic = "AFPRJCP1";
 const projection_checkpoint_format_version: u32 = 1;
 const checkpoint_max_bytes: usize = 16 * 1024 * 1024;
@@ -236,6 +235,20 @@ pub fn saveAppliedSequenceWithCheckpoint(
     try saveAppliedSequence(store, index_name, sequence);
 }
 
+pub fn saveAppliedSequenceUpdateWithCheckpoint(
+    alloc: Allocator,
+    store: anytype,
+    checkpoint_path: ?[]const u8,
+    update: AppliedSequenceUpdate,
+) !void {
+    if (comptime builtin.os.tag == .freestanding) return try saveAppliedSequence(store, update.index_name, update.sequence);
+    if (checkpoint_path) |path| {
+        try setAppliedSequencesCheckpoint(alloc, path, &[_]AppliedSequenceUpdate{update});
+        return;
+    }
+    try saveAppliedSequence(store, update.index_name, update.sequence);
+}
+
 pub fn saveProjectionCheckpointWithSidecar(
     alloc: Allocator,
     store: anytype,
@@ -367,6 +380,17 @@ const CheckpointMap = struct {
         gop.value_ptr.* = checkpoint;
     }
 
+    fn put(self: *@This(), alloc: Allocator, name: []const u8, checkpoint: ProjectionCheckpoint) !void {
+        const gop = try self.map.getOrPut(alloc, name);
+        if (gop.found_existing) {
+            gop.value_ptr.* = checkpoint;
+            return;
+        }
+        errdefer _ = self.map.remove(name);
+        gop.key_ptr.* = try alloc.dupe(u8, name);
+        gop.value_ptr.* = checkpoint;
+    }
+
     fn putMaxSequence(self: *@This(), alloc: Allocator, name: []const u8, sequence: u64) !void {
         const gop = try self.map.getOrPut(alloc, name);
         if (gop.found_existing) {
@@ -378,15 +402,20 @@ const CheckpointMap = struct {
         gop.value_ptr.* = .{ .applied_sequence = sequence };
     }
 
-    fn put(self: *@This(), alloc: Allocator, name: []const u8, checkpoint: ProjectionCheckpoint) !void {
-        const gop = try self.map.getOrPut(alloc, name);
+    fn putMaxSequenceUpdate(self: *@This(), alloc: Allocator, update: AppliedSequenceUpdate) !void {
+        const gop = try self.map.getOrPut(alloc, update.index_name);
         if (gop.found_existing) {
-            gop.value_ptr.* = checkpoint;
+            gop.value_ptr.*.applied_sequence = @max(gop.value_ptr.*.applied_sequence, update.sequence);
+            mergeSequenceMetadata(gop.value_ptr, update);
             return;
         }
-        errdefer _ = self.map.remove(name);
-        gop.key_ptr.* = try alloc.dupe(u8, name);
-        gop.value_ptr.* = checkpoint;
+        errdefer _ = self.map.remove(update.index_name);
+        gop.key_ptr.* = try alloc.dupe(u8, update.index_name);
+        gop.value_ptr.* = .{
+            .applied_sequence = update.sequence,
+            .generation = update.generation,
+            .config_hash = update.config_hash,
+        };
     }
 
     fn putSequence(self: *@This(), alloc: Allocator, name: []const u8, sequence: u64) !void {
@@ -400,11 +429,32 @@ const CheckpointMap = struct {
         gop.value_ptr.* = .{ .applied_sequence = sequence };
     }
 
+    fn putSequenceUpdate(self: *@This(), alloc: Allocator, update: AppliedSequenceUpdate) !void {
+        const gop = try self.map.getOrPut(alloc, update.index_name);
+        if (gop.found_existing) {
+            gop.value_ptr.*.applied_sequence = update.sequence;
+            mergeSequenceMetadata(gop.value_ptr, update);
+            return;
+        }
+        errdefer _ = self.map.remove(update.index_name);
+        gop.key_ptr.* = try alloc.dupe(u8, update.index_name);
+        gop.value_ptr.* = .{
+            .applied_sequence = update.sequence,
+            .generation = update.generation,
+            .config_hash = update.config_hash,
+        };
+    }
+
     fn remove(self: *@This(), alloc: Allocator, name: []const u8) void {
         const removed = self.map.fetchRemove(name) orelse return;
         alloc.free(@constCast(removed.key));
     }
 };
+
+fn mergeSequenceMetadata(checkpoint: *ProjectionCheckpoint, update: AppliedSequenceUpdate) void {
+    if (update.generation != 0) checkpoint.generation = update.generation;
+    if (update.config_hash != 0) checkpoint.config_hash = update.config_hash;
+}
 
 fn loadProjectionCheckpoint(alloc: Allocator, path: []const u8, index_name: []const u8) !?ProjectionCheckpoint {
     var checkpoint = try loadCheckpoint(alloc, path);
@@ -422,9 +472,7 @@ fn saveAppliedSequencesCheckpoint(alloc: Allocator, path: []const u8, updates: [
     };
     defer checkpoint.deinit(alloc);
 
-    for (updates) |update| {
-        try checkpoint.putMaxSequence(alloc, update.index_name, update.sequence);
-    }
+    for (updates) |update| try checkpoint.putMaxSequenceUpdate(alloc, update);
     try writeCheckpointAtomically(alloc, path, &checkpoint);
 }
 
@@ -454,9 +502,7 @@ fn setAppliedSequencesCheckpoint(alloc: Allocator, path: []const u8, updates: []
     };
     defer checkpoint.deinit(alloc);
 
-    for (updates) |update| {
-        try checkpoint.putSequence(alloc, update.index_name, update.sequence);
-    }
+    for (updates) |update| try checkpoint.putSequenceUpdate(alloc, update);
     try writeCheckpointAtomically(alloc, path, &checkpoint);
 }
 
@@ -500,9 +546,6 @@ fn loadCheckpoint(alloc: Allocator, path: []const u8) !CheckpointMap {
 
 fn decodeCheckpoint(alloc: Allocator, raw: []const u8) !CheckpointMap {
     if (raw.len < checkpoint_magic.len + 4) return error.InvalidDerivedApplyState;
-    if (std.mem.eql(u8, raw[0..legacy_checkpoint_magic.len], legacy_checkpoint_magic)) {
-        return try decodeLegacyCheckpoint(alloc, raw);
-    }
     if (!std.mem.eql(u8, raw[0..checkpoint_magic.len], checkpoint_magic)) return error.InvalidDerivedApplyState;
     if (raw.len < checkpoint_magic.len + 8) return error.InvalidDerivedApplyState;
     var pos: usize = checkpoint_magic.len;
@@ -536,26 +579,6 @@ fn decodeCheckpoint(alloc: Allocator, raw: []const u8) !CheckpointMap {
             .generation = generation,
             .config_hash = config_hash,
         });
-    }
-    if (pos != raw.len) return error.InvalidDerivedApplyState;
-    return checkpoint;
-}
-
-fn decodeLegacyCheckpoint(alloc: Allocator, raw: []const u8) !CheckpointMap {
-    var pos: usize = legacy_checkpoint_magic.len;
-    const count = try readCheckpointInt(raw, &pos, u32);
-
-    var checkpoint = CheckpointMap{};
-    errdefer checkpoint.deinit(alloc);
-    var i: u32 = 0;
-    while (i < count) : (i += 1) {
-        const name_len = try readCheckpointInt(raw, &pos, u32);
-        const applied_sequence = try readCheckpointInt(raw, &pos, u64);
-        if (name_len == 0 or name_len > std.math.maxInt(u16)) return error.InvalidDerivedApplyState;
-        if (pos + name_len > raw.len) return error.InvalidDerivedApplyState;
-        const name = raw[pos .. pos + name_len];
-        pos += name_len;
-        try checkpoint.putMax(alloc, name, .{ .applied_sequence = applied_sequence });
     }
     if (pos != raw.len) return error.InvalidDerivedApplyState;
     return checkpoint;
@@ -860,13 +883,15 @@ test "applied sequence checkpoint preserves projection metadata" {
     try saveAppliedSequencesWithCheckpoint(alloc, runtime, checkpoint_path, &[_]AppliedSequenceUpdate{.{
         .index_name = "dense_idx",
         .sequence = 40,
+        .generation = 10,
+        .config_hash = 0x5678,
     }});
 
     const checkpoint = try loadProjectionCheckpointWithSidecar(alloc, runtime, checkpoint_path, "dense_idx");
     try std.testing.expectEqual(@as(u64, 45), checkpoint.applied_sequence);
     try std.testing.expectEqual(ProjectionStatus.repair_required, checkpoint.status);
-    try std.testing.expectEqual(@as(u64, 9), checkpoint.generation);
-    try std.testing.expectEqual(@as(u64, 0x1234), checkpoint.config_hash);
+    try std.testing.expectEqual(@as(u64, 10), checkpoint.generation);
+    try std.testing.expectEqual(@as(u64, 0x5678), checkpoint.config_hash);
 }
 
 fn writeRawCheckpointTestFile(alloc: Allocator, path: []const u8, raw: []const u8) !void {
@@ -886,7 +911,7 @@ fn writeRawCheckpointTestFile(alloc: Allocator, path: []const u8, raw: []const u
     try writer.end();
 }
 
-test "legacy applied sequence checkpoint decodes as clean projection checkpoint" {
+test "projection checkpoint rejects unknown checkpoint format" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -898,7 +923,7 @@ test "legacy applied sequence checkpoint decodes as clean projection checkpoint"
 
     var raw = std.ArrayListUnmanaged(u8).empty;
     defer raw.deinit(alloc);
-    try raw.appendSlice(alloc, legacy_checkpoint_magic);
+    try raw.appendSlice(alloc, "AFBAD001");
     try appendCheckpointInt(alloc, &raw, u32, 1);
     try appendCheckpointInt(alloc, &raw, u32, @intCast("dense_idx".len));
     try appendCheckpointInt(alloc, &raw, u64, 77);
@@ -910,14 +935,13 @@ test "legacy applied sequence checkpoint decodes as clean projection checkpoint"
     var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
     defer runtime.deinit();
 
-    const checkpoint = try loadProjectionCheckpointWithSidecar(alloc, runtime, checkpoint_path, "dense_idx");
-    try std.testing.expectEqual(@as(u64, 77), checkpoint.applied_sequence);
-    try std.testing.expectEqual(ProjectionStatus.clean, checkpoint.status);
-    try std.testing.expectEqual(@as(u64, 0), checkpoint.generation);
-    try std.testing.expectEqual(@as(u64, 0), checkpoint.config_hash);
-    try std.testing.expectEqual(
-        @as(u64, 77),
-        try loadAppliedSequenceWithCheckpoint(alloc, runtime, checkpoint_path, "dense_idx"),
+    try std.testing.expectError(
+        error.InvalidDerivedApplyState,
+        loadProjectionCheckpointWithSidecar(alloc, runtime, checkpoint_path, "dense_idx"),
+    );
+    try std.testing.expectError(
+        error.InvalidDerivedApplyState,
+        loadAppliedSequenceWithCheckpoint(alloc, runtime, checkpoint_path, "dense_idx"),
     );
 }
 

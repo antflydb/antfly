@@ -153,9 +153,9 @@ the durable projection data visible to queries.
 
 Planned shape by projection type:
 
-- dense/HBC: publish the applied sequence and generation/version identity in
-  the HBC metadata record or in a sidecar committed with the same root metadata
-  publish
+- dense/HBC: publish the applied sequence, status, generation, and config
+  identity in the HBC metadata record; mirror the same checkpoint into the
+  shared sidecar for common status APIs and non-HBC tooling
 - full-text, sparse, graph, and algebraic indexes: store the applied sequence in
   each index manifest or LSM/runtime-store manifest and publish it with the
   visible root
@@ -184,6 +184,23 @@ Implementation plan:
    reserve full-store scans for explicit repair paths.
 7. Reduce read-cache churn so tail replay only invalidates query state when a
    visible root, generation, or config actually changes.
+
+Current implementation notes:
+
+- Dense/HBC metadata format version 2 carries the projection checkpoint fields
+  directly in the HBC metadata record. DB checkpoint saves update HBC metadata
+  first, then update the shared sidecar mirror; dense checkpoint reads prefer
+  the HBC metadata checkpoint when it has a nonzero config identity.
+- Shared sidecar checkpoint format `AFPRJCP1` is current-only and stores applied
+  sequence, status, generation, and config identity for all managed projection
+  types.
+- Enrichment progress uses checkpoint semantics for applied sequence and
+  clean/degraded/repair-required status, with a deterministic enrichment-catalog
+  config identity.
+- Normal dense startup trusts a clean, config-matching, caught-up HBC checkpoint
+  and does not run a primary document-store artifact recount. Recounts remain
+  repair/rebuild tooling for stale config identity, repair-required status,
+  interrupted rebuild state, corruption, or watermark regression.
 
 Acceptance criteria:
 

@@ -2042,6 +2042,42 @@ pub const IndexManager = struct {
         }
     }
 
+    pub fn saveDenseProjectionCheckpointMetadata(
+        self: *IndexManager,
+        index_name: []const u8,
+        checkpoint: apply_state.ProjectionCheckpoint,
+    ) !void {
+        const entry = self.denseIndex(index_name) orelse return error.IndexNotFound;
+        try entry.index.saveProjectionCheckpointMetadata(.{
+            .applied_sequence = checkpoint.applied_sequence,
+            .status = @intFromEnum(checkpoint.status),
+            .generation = checkpoint.generation,
+            .config_hash = checkpoint.config_hash,
+        });
+    }
+
+    pub fn denseProjectionCheckpointMetadata(
+        self: *const IndexManager,
+        index_name: []const u8,
+    ) ?apply_state.ProjectionCheckpoint {
+        const entry = for (self.dense_indexes.items) |*candidate| {
+            if (std.mem.eql(u8, candidate.config.name, index_name)) break candidate;
+        } else return null;
+        const checkpoint = entry.index.projectionCheckpointMetadata();
+        return .{
+            .applied_sequence = checkpoint.applied_sequence,
+            .status = switch (checkpoint.status) {
+                @intFromEnum(apply_state.ProjectionStatus.clean) => .clean,
+                @intFromEnum(apply_state.ProjectionStatus.rebuilding) => .rebuilding,
+                @intFromEnum(apply_state.ProjectionStatus.degraded) => .degraded,
+                @intFromEnum(apply_state.ProjectionStatus.repair_required) => .repair_required,
+                else => .repair_required,
+            },
+            .generation = checkpoint.generation,
+            .config_hash = checkpoint.config_hash,
+        };
+    }
+
     pub fn snapshotLsmNativeStorageStats(self: *const IndexManager) lsm_backend_mod.NativeStorageStats {
         var stats = lsm_backend_mod.NativeStorageStats{};
         for (self.text_indexes.items) |*entry| {
@@ -5986,12 +6022,22 @@ pub const IndexManager = struct {
         if (comptime storeSupportsLatestReplaySequenceForHint(@TypeOf(store))) {
             backfilled_sequence = try store.latestReplaySequenceForHint(replayHintForIndexKind(cfg.kind), backfilled_sequence);
         }
-        try apply_state.saveAppliedSequenceWithCheckpoint(
+        if (cfg.kind == .dense_vector) {
+            try self.saveDenseProjectionCheckpointMetadata(cfg.name, .{
+                .applied_sequence = backfilled_sequence,
+                .status = .clean,
+                .config_hash = types.indexConfigHash(cfg),
+            });
+        }
+        try apply_state.saveAppliedSequenceUpdateWithCheckpoint(
             self.alloc,
             store,
             self.applied_sequence_checkpoint_path,
-            cfg.name,
-            backfilled_sequence,
+            .{
+                .index_name = cfg.name,
+                .sequence = backfilled_sequence,
+                .config_hash = types.indexConfigHash(cfg),
+            },
         );
     }
 

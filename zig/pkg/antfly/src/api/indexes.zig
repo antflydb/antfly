@@ -1498,6 +1498,16 @@ fn appendEnrichmentRuntimeStatus(alloc: std.mem.Allocator, out: *std.ArrayListUn
     try appendIntValue(alloc, out, stats.applied_sequence);
     try out.appendSlice(alloc, ",\"pending_sequence_count\":");
     try appendIntValue(alloc, out, stats.target_sequence -| stats.applied_sequence);
+    try out.appendSlice(alloc, ",\"projection_checkpoint_status\":");
+    try appendJsonString(alloc, out, stats.projection_checkpoint_status);
+    try out.appendSlice(alloc, ",\"projection_checkpoint_applied_sequence\":");
+    try appendIntValue(alloc, out, stats.projection_checkpoint_applied_sequence);
+    try out.appendSlice(alloc, ",\"projection_checkpoint_generation\":");
+    try appendIntValue(alloc, out, stats.projection_checkpoint_generation);
+    try out.appendSlice(alloc, ",\"projection_checkpoint_config_hash\":");
+    try appendIntValue(alloc, out, stats.projection_checkpoint_config_hash);
+    try out.appendSlice(alloc, ",\"checkpoint_replay_tail_sequence_count\":");
+    try appendIntValue(alloc, out, stats.checkpoint_replay_tail_sequence_count);
     try out.appendSlice(alloc, ",\"processed_requests\":");
     try appendIntValue(alloc, out, stats.processed_requests);
     try out.appendSlice(alloc, ",\"error_count\":");
@@ -1727,6 +1737,18 @@ fn appendSingleIndexRuntimeStatus(
     try appendIntValue(alloc, out, replay_target_sequence);
     try out.appendSlice(alloc, ",\"replay_catch_up_required\":");
     try out.appendSlice(alloc, if (replay_catch_up_required) "true" else "false");
+    if (@hasField(@TypeOf(item), "projection_checkpoint_status")) {
+        try out.appendSlice(alloc, ",\"projection_checkpoint_status\":");
+        try appendJsonString(alloc, out, item.projection_checkpoint_status);
+        try out.appendSlice(alloc, ",\"projection_checkpoint_applied_sequence\":");
+        try appendIntValue(alloc, out, item.projection_checkpoint_applied_sequence);
+        try out.appendSlice(alloc, ",\"projection_checkpoint_generation\":");
+        try appendIntValue(alloc, out, item.projection_checkpoint_generation);
+        try out.appendSlice(alloc, ",\"projection_checkpoint_config_hash\":");
+        try appendIntValue(alloc, out, item.projection_checkpoint_config_hash);
+        try out.appendSlice(alloc, ",\"checkpoint_replay_tail_sequence_count\":");
+        try appendIntValue(alloc, out, item.checkpoint_replay_tail_sequence_count);
+    }
     if (@hasField(@TypeOf(item), "repair_degraded")) {
         try out.appendSlice(alloc, ",\"repair_degraded\":");
         try out.appendSlice(alloc, if (item.repair_degraded) "true" else "false");
@@ -1742,6 +1764,10 @@ fn appendSingleIndexRuntimeStatus(
     if (@hasField(@TypeOf(item), "repair_issue_count_estimated")) {
         try out.appendSlice(alloc, ",\"repair_issue_count_estimated\":");
         try out.appendSlice(alloc, if (item.repair_issue_count_estimated) "true" else "false");
+    }
+    if (@hasField(@TypeOf(item), "repair_scan_issue_count")) {
+        try out.appendSlice(alloc, ",\"repair_scan_issue_count\":");
+        try appendIntValue(alloc, out, item.repair_scan_issue_count);
     }
     try out.appendSlice(alloc, ",\"runtime_present\":");
     try out.appendSlice(alloc, if (runtime_present) "true" else "false");

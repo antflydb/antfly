@@ -5137,6 +5137,15 @@ pub const DB = struct {
                 try store_writes.append(self.alloc, haAppliedReplicationLsnWrite(lsn, &ha_applied_lsn_value_buf));
             }
         }
+        try appendDenseArtifactCounterMutations(
+            self.alloc,
+            self.core.store,
+            self.core.index_manager,
+            &store_writes,
+            delete_keys.items,
+            &owned_store_keys,
+            &owned_store_values,
+        );
         const replay_append: ?docstore_mod.DocStore.ReplayAppend = if (opts.suppress_derived_replay_append)
             null
         else
@@ -6130,6 +6139,7 @@ pub const DB = struct {
     const ArtifactRepairSummarySnapshot = struct {
         ready: bool,
         count: u64,
+        repair_scan_count: u64 = 0,
     };
 
     fn artifactRepairSummaryRootSnapshot(self: *DB, alloc: Allocator) !ArtifactRepairSummarySnapshot {
@@ -6155,10 +6165,12 @@ pub const DB = struct {
         else
             try internal_keys.artifactRepairSummaryRebuildIndexKeyAlloc(alloc, index_name);
         defer alloc.free(key);
-        return .{
-            .ready = ready,
-            .count = (try self.loadArtifactRepairSummaryCountByKey(alloc, key)) orelse if (ready) 0 else try self.scanArtifactRepairIssueCountBounded(alloc, index_name),
-        };
+        if (try self.loadArtifactRepairSummaryCountByKey(alloc, key)) |count| {
+            return .{ .ready = ready, .count = count };
+        }
+        if (ready) return .{ .ready = true, .count = 0 };
+        const scanned_count = try self.scanArtifactRepairIssueCountBounded(alloc, index_name);
+        return .{ .ready = false, .count = scanned_count, .repair_scan_count = scanned_count };
     }
 
     const ArtifactRepairIndexFallbackCounts = struct {
@@ -6225,7 +6237,8 @@ pub const DB = struct {
         }
 
         try self.ensureArtifactRepairIndexFallbackCounts(alloc, fallback);
-        return .{ .ready = false, .count = fallback.counts.get(index_name) orelse 0 };
+        const scanned_count = fallback.counts.get(index_name) orelse 0;
+        return .{ .ready = false, .count = scanned_count, .repair_scan_count = scanned_count };
     }
 
     fn artifactRepairSummaryIndexCount(self: *DB, alloc: Allocator, index_name: []const u8) !u64 {
@@ -9610,13 +9623,19 @@ pub const DB = struct {
     fn persistedEnrichmentStats(self: *DB) !types.EnrichmentStats {
         if (!self.core.hasGeneratedEnrichmentTargets()) return .{};
         const resources = self.core.batchExecutionResources();
-        const applied = try enrichment_state.loadAppliedSequence(self.alloc, resources.store, enrichment_runtime_mod.scope_name);
+        const checkpoint = try enrichment_state.loadProjectionCheckpoint(self.alloc, resources.store, enrichment_runtime_mod.scope_name);
+        const applied = checkpoint.applied_sequence;
         const status = try enrichment_state.loadRuntimeStatus(self.alloc, resources.store, enrichment_runtime_mod.scope_name);
         const target = @max(applied, status.target_sequence);
         return .{
             .enabled = target > 0 or status.error_count > 0 or status.retrying or status.worker_failed,
             .target_sequence = target,
             .applied_sequence = applied,
+            .projection_checkpoint_status = enrichment_state.projectionStatusName(checkpoint.status),
+            .projection_checkpoint_applied_sequence = checkpoint.applied_sequence,
+            .projection_checkpoint_generation = checkpoint.generation,
+            .projection_checkpoint_config_hash = checkpoint.config_hash,
+            .checkpoint_replay_tail_sequence_count = target -| checkpoint.applied_sequence,
             .error_count = status.error_count,
             .retryable_error_count = status.retryable_error_count,
             .fatal_error_count = status.fatal_error_count,
@@ -10105,6 +10124,8 @@ pub const DB = struct {
         }
     };
 
+    const dense_artifact_target_counter_prefix = "\x00\x00__metadata__:dense_artifact_target_count:";
+
     fn denseIndexRebuildStatePathAlloc(self: *DB, alloc: Allocator, index_name: []const u8) ![]u8 {
         return try std.fmt.allocPrint(alloc, "{s}/indexes/{s}", .{ self.core.path, index_name });
     }
@@ -10153,6 +10174,135 @@ pub const DB = struct {
             try entry.value_ptr.append(alloc, dense_index_idx);
         }
     };
+
+    fn denseArtifactTargetCounterKeyAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+        return try std.fmt.allocPrint(alloc, "{s}{s}", .{ dense_artifact_target_counter_prefix, index_name });
+    }
+
+    fn loadDenseArtifactTargetCounter(alloc: Allocator, store: *docstore_mod.DocStore, index_name: []const u8) !?u64 {
+        const key = try denseArtifactTargetCounterKeyAlloc(alloc, index_name);
+        defer alloc.free(key);
+        const raw = store.get(alloc, key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer alloc.free(raw);
+        if (raw.len != 8) return error.InvalidDenseArtifactTargetCounter;
+        return std.mem.readInt(u64, raw[0..8], .little);
+    }
+
+    fn appendDenseArtifactTargetCounterWrite(
+        alloc: Allocator,
+        store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+        owned_keys: *std.ArrayListUnmanaged([]u8),
+        owned_values: *std.ArrayListUnmanaged([]u8),
+        index_name: []const u8,
+        count: u64,
+    ) !void {
+        const key = try denseArtifactTargetCounterKeyAlloc(alloc, index_name);
+        errdefer alloc.free(key);
+        const value = try alloc.alloc(u8, 8);
+        errdefer alloc.free(value);
+        std.mem.writeInt(u64, value[0..8], count, .little);
+        try owned_keys.append(alloc, key);
+        try owned_values.append(alloc, value);
+        try store_writes.append(alloc, .{
+            .key = key,
+            .value = value,
+        });
+    }
+
+    fn denseArtifactTargetsForArtifact(
+        index_manager: *const index_manager_mod.IndexManager,
+        artifact_name: []const u8,
+        dims: u32,
+        out: *std.ArrayListUnmanaged(usize),
+        alloc: Allocator,
+    ) !void {
+        for (index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
+            const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null;
+            if (!artifact_backed) continue;
+            if (entry.dims != dims) continue;
+            if (std.mem.eql(u8, entry.config.name, artifact_name) or
+                (entry.embedding_name != null and std.mem.eql(u8, entry.embedding_name.?, artifact_name)))
+            {
+                try out.append(alloc, dense_index_idx);
+            }
+        }
+    }
+
+    fn applyDenseArtifactCounterDelta(
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        index_manager: *const index_manager_mod.IndexManager,
+        counts: *std.AutoHashMapUnmanaged(usize, u64),
+        artifact_key: []const u8,
+        artifact_value: ?[]const u8,
+        delta: i64,
+    ) !void {
+        if (delta == 0) return;
+        const identity = (try internal_keys.parseEmbeddingArtifactKeyView(artifact_key)) orelse return;
+        const value = artifact_value orelse return;
+        const dims = enrichment_artifact_codec.decodeDenseEmbeddingDims(value) catch return;
+        if (dims == 0) return;
+
+        var targets = std.ArrayListUnmanaged(usize).empty;
+        defer targets.deinit(alloc);
+        try denseArtifactTargetsForArtifact(index_manager, identity.artifact_name, dims, &targets, alloc);
+        for (targets.items) |dense_index_idx| {
+            const entry = &index_manager.dense_indexes.items[dense_index_idx];
+            const gop = try counts.getOrPut(alloc, dense_index_idx);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = (try loadDenseArtifactTargetCounter(alloc, store, entry.config.name)) orelse 0;
+            }
+            if (delta > 0) {
+                gop.value_ptr.* +|= @as(u64, @intCast(delta));
+            } else {
+                gop.value_ptr.* -|= @as(u64, @intCast(-delta));
+            }
+        }
+    }
+
+    fn appendDenseArtifactCounterMutations(
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        index_manager: *const index_manager_mod.IndexManager,
+        store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+        delete_keys: []const []const u8,
+        owned_keys: *std.ArrayListUnmanaged([]u8),
+        owned_values: *std.ArrayListUnmanaged([]u8),
+    ) !void {
+        if (index_manager.dense_indexes.items.len == 0) return;
+        var counts = std.AutoHashMapUnmanaged(usize, u64){};
+        defer counts.deinit(alloc);
+
+        for (delete_keys) |key| {
+            const old_value = store.get(alloc, key) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            defer alloc.free(old_value);
+            try applyDenseArtifactCounterDelta(alloc, store, index_manager, &counts, key, old_value, -1);
+        }
+
+        for (store_writes.items) |write| {
+            const old_value = store.get(alloc, write.key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            defer if (old_value) |value| alloc.free(value);
+            if (old_value) |value| {
+                try applyDenseArtifactCounterDelta(alloc, store, index_manager, &counts, write.key, value, -1);
+            }
+            try applyDenseArtifactCounterDelta(alloc, store, index_manager, &counts, write.key, write.value, 1);
+        }
+
+        var it = counts.iterator();
+        while (it.next()) |entry| {
+            const dense_entry = &index_manager.dense_indexes.items[entry.key_ptr.*];
+            try appendDenseArtifactTargetCounterWrite(alloc, store_writes, owned_keys, owned_values, dense_entry.config.name, entry.value_ptr.*);
+        }
+    }
 
     fn collectDenseArtifactTargetCounts(
         self: *DB,
@@ -10237,6 +10387,24 @@ pub const DB = struct {
         return counts;
     }
 
+    fn collectDenseArtifactTargetCountsFromCounters(
+        self: *DB,
+        alloc: Allocator,
+        rebuild_targets: []const DenseArtifactRebuildTarget,
+    ) !?DenseArtifactTargetCounts {
+        var counts: DenseArtifactTargetCounts = .{};
+        errdefer counts.deinit(alloc);
+
+        for (rebuild_targets) |target| {
+            const entry = &self.core.index_manager.dense_indexes.items[target.dense_index_idx];
+            const count = (try loadDenseArtifactTargetCounter(alloc, self.core.store, entry.config.name)) orelse return null;
+            try counts.per_target_index.put(alloc, target.dense_index_idx, count);
+            counts.total_target_artifacts +|= count;
+        }
+
+        return counts;
+    }
+
     fn collectDenseArtifactRebuildPlan(self: *DB, alloc: Allocator) !DenseArtifactRebuildPlan {
         const Candidate = struct {
             dense_index_idx: usize,
@@ -10287,6 +10455,8 @@ pub const DB = struct {
             const persisted_resume = try rebuild_state.check(alloc);
             errdefer if (persisted_resume) |buf| alloc.free(buf);
             const projection_checkpoint = try self.core.loadProjectionCheckpoint(alloc, entry.config.name);
+            const config_hash = types.indexConfigHash(entry.config);
+            const checkpoint_config_mismatch = projection_checkpoint.config_hash != config_hash;
             const applied_sequence = projection_checkpoint.applied_sequence;
             const target_sequence = try self.probeDerivedReplayTargetSequence(
                 alloc,
@@ -10298,6 +10468,7 @@ pub const DB = struct {
                 applied_sequence,
             );
             if (persisted_resume == null and
+                !checkpoint_config_mismatch and
                 applied_sequence < target_sequence and
                 projection_checkpoint.status != .rebuilding and
                 projection_checkpoint.status != .repair_required)
@@ -10305,6 +10476,7 @@ pub const DB = struct {
                 continue;
             }
             const force_reset = blk: {
+                if (checkpoint_config_mismatch) break :blk true;
                 if (projection_checkpoint.status == .repair_required) break :blk true;
                 if (entry.index.stats().active_count == 0) break :blk false;
                 if (@hasDecl(@TypeOf(entry.index), "validateStoredStructure")) {
@@ -10315,6 +10487,15 @@ pub const DB = struct {
                 }
                 break :blk false;
             };
+            if (persisted_resume == null and
+                !force_reset and
+                !watermark_regressed and
+                projection_checkpoint.status == .clean and
+                projection_checkpoint.generation != 0 and
+                applied_sequence >= target_sequence)
+            {
+                continue;
+            }
             try candidates.append(alloc, .{
                 .dense_index_idx = dense_index_idx,
                 .persisted_resume = persisted_resume,
@@ -10331,7 +10512,8 @@ pub const DB = struct {
             try candidate_targets.append(alloc, .{ .dense_index_idx = candidate.dense_index_idx });
         }
 
-        var target_counts = try self.collectDenseArtifactTargetCounts(alloc, candidate_targets.items);
+        var target_counts = (try self.collectDenseArtifactTargetCountsFromCounters(alloc, candidate_targets.items)) orelse
+            try self.collectDenseArtifactTargetCounts(alloc, candidate_targets.items);
         defer target_counts.deinit(alloc);
 
         for (candidates.items) |*candidate| {
@@ -10390,7 +10572,7 @@ pub const DB = struct {
                 .applied_sequence = checkpoint.applied_sequence,
                 .status = .rebuilding,
                 .generation = checkpoint.generation,
-                .config_hash = checkpoint.config_hash,
+                .config_hash = types.indexConfigHash(entry.config),
             });
             if (target.force_reset) {
                 try self.core.index_manager.resetDenseIndexForArtifactRebuild(entry.config.name);
@@ -10425,8 +10607,8 @@ pub const DB = struct {
                 try self.core.saveProjectionCheckpoint(entry.config.name, .{
                     .applied_sequence = applied_sequence,
                     .status = .clean,
-                    .generation = checkpoint.generation,
-                    .config_hash = checkpoint.config_hash,
+                    .generation = checkpoint.generation +| 1,
+                    .config_hash = types.indexConfigHash(entry.config),
                 });
             }
         }
@@ -10933,6 +11115,28 @@ pub const DB = struct {
             .lazy_payload_deferrals = profile.posting_lazy_payload_deferrals,
             .lazy_ancestor_deferrals = profile.posting_lazy_ancestor_deferrals,
         };
+    }
+
+    fn projectionCheckpointStatusName(status: apply_state.ProjectionStatus) []const u8 {
+        return switch (status) {
+            .clean => "clean",
+            .rebuilding => "rebuilding",
+            .degraded => "degraded",
+            .repair_required => "repair_required",
+        };
+    }
+
+    fn applyProjectionCheckpointStats(item: *types.DBIndexStats, checkpoint: apply_state.ProjectionCheckpoint, target_sequence: u64) void {
+        item.projection_checkpoint_status = projectionCheckpointStatusName(checkpoint.status);
+        item.projection_checkpoint_applied_sequence = checkpoint.applied_sequence;
+        item.projection_checkpoint_generation = checkpoint.generation;
+        item.projection_checkpoint_config_hash = checkpoint.config_hash;
+        item.checkpoint_replay_tail_sequence_count = target_sequence -| checkpoint.applied_sequence;
+        switch (checkpoint.status) {
+            .clean => {},
+            .rebuilding => item.backfill_active = true,
+            .degraded, .repair_required => item.repair_degraded = true,
+        }
     }
 
     fn freeDBIndexStatsItem(alloc: Allocator, item: types.DBIndexStats) void {
@@ -11703,6 +11907,7 @@ pub const DB = struct {
         var term_doc_freq_cache_hits: u64 = 0;
         var term_doc_freq_cache_misses: u64 = 0;
         for (configs) |cfg| {
+            const projection_checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
             const applied_sequence = try self.managedIndexAppliedSequence(alloc, cfg.name);
             var item = types.DBIndexStats{
                 .name = try alloc.dupe(u8, cfg.name),
@@ -11715,6 +11920,7 @@ pub const DB = struct {
                 .catch_up_target_sequence = target_sequence,
             };
             errdefer freeDBIndexStatsItem(alloc, item);
+            applyProjectionCheckpointStats(&item, projection_checkpoint, target_sequence);
             if (target_sequence > 0) {
                 item.backfill_progress = @min(
                     1.0,
@@ -11731,6 +11937,7 @@ pub const DB = struct {
             item.repair_issue_count = index_repair_summary.count;
             item.repair_summary_ready = index_repair_summary.ready;
             item.repair_issue_count_estimated = !index_repair_summary.ready;
+            item.repair_scan_issue_count = index_repair_summary.repair_scan_count;
             item.repair_degraded = item.repair_degraded or !index_repair_summary.ready or item.repair_issue_count != 0;
 
             switch (cfg.kind) {
@@ -11883,11 +12090,13 @@ pub const DB = struct {
                 item.catch_up_active = false;
                 break;
             }
+            applyProjectionCheckpointStats(&item, try self.core.loadProjectionCheckpoint(alloc, cfg.name), item.replay_target_sequence);
             if (item.load_error != null) applyTerminalLoadFailureStatus(&item);
             const index_repair_summary = try self.artifactRepairSummaryIndexSnapshotForStats(alloc, cfg.name, repair_summary.ready, &repair_index_fallback);
             item.repair_issue_count = index_repair_summary.count;
             item.repair_summary_ready = index_repair_summary.ready;
             item.repair_issue_count_estimated = !index_repair_summary.ready;
+            item.repair_scan_issue_count = index_repair_summary.repair_scan_count;
             item.repair_degraded = item.repair_degraded or !index_repair_summary.ready or item.repair_issue_count != 0;
             switch (cfg.kind) {
                 .full_text => {
@@ -12059,6 +12268,7 @@ pub const DB = struct {
         }
 
         for (configs) |cfg| {
+            const projection_checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
             const applied_sequence = try self.core.loadAppliedSequence(alloc, cfg.name);
             var item = types.DBIndexStats{
                 .name = try alloc.dupe(u8, cfg.name),
@@ -12071,6 +12281,7 @@ pub const DB = struct {
                 .catch_up_target_sequence = target_sequence,
             };
             errdefer freeDBIndexStatsItem(alloc, item);
+            applyProjectionCheckpointStats(&item, projection_checkpoint, target_sequence);
             if (target_sequence > 0) {
                 item.backfill_progress = @min(
                     1.0,
@@ -12093,6 +12304,7 @@ pub const DB = struct {
             item.repair_issue_count = index_repair_summary.count;
             item.repair_summary_ready = index_repair_summary.ready;
             item.repair_issue_count_estimated = !index_repair_summary.ready;
+            item.repair_scan_issue_count = index_repair_summary.repair_scan_count;
             item.repair_degraded = item.repair_degraded or !index_repair_summary.ready or item.repair_issue_count != 0;
             if (cfg.kind == .full_text) {
                 item.text_merge = self.core.index_manager.textMergeStatsSnapshotForIndex(cfg.name);
@@ -22058,7 +22270,28 @@ fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.
         const reserved_sequence = batch_ctx.store.reserveNextReplaySequence(1);
         const payload = try encodeChangeRecordPayload(&batch_ctx, replay_batch, reserved_sequence);
         defer batch_ctx.alloc.free(payload);
-        try batch_ctx.store.putBatchWithReplay(batch_ctx.io, &.{}, artifact_delete_keys, .{
+        var counter_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer counter_writes.deinit(batch_ctx.alloc);
+        var owned_counter_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_counter_keys.items) |key| batch_ctx.alloc.free(key);
+            owned_counter_keys.deinit(batch_ctx.alloc);
+        }
+        var owned_counter_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_counter_values.items) |value| batch_ctx.alloc.free(value);
+            owned_counter_values.deinit(batch_ctx.alloc);
+        }
+        try DB.appendDenseArtifactCounterMutations(
+            batch_ctx.alloc,
+            batch_ctx.store,
+            batch_ctx.index_manager,
+            &counter_writes,
+            artifact_delete_keys,
+            &owned_counter_keys,
+            &owned_counter_values,
+        );
+        try batch_ctx.store.putBatchWithReplay(batch_ctx.io, counter_writes.items, artifact_delete_keys, .{
             .sequence = reserved_sequence,
             .payload = payload,
         });
@@ -22302,28 +22535,64 @@ fn saveAppliedSequencesBatchContext(
     updates: []const apply_state.AppliedSequenceUpdate,
 ) !void {
     if (updates.len == 0) return;
+    const enriched_updates = try appliedSequenceUpdatesWithConfigHashes(ctx.alloc, ctx.index_manager, updates);
+    defer ctx.alloc.free(enriched_updates);
     if (ctx.async_context) |async_ctx| {
         var seq_lock = lockAtomicWithBackoffProfiled(
             &async_ctx.applied_sequence_mutex,
             &async_ctx.stats.applied_sequence_mutex,
         );
         defer seq_lock.unlock();
+        try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
         try apply_state.saveAppliedSequencesWithCheckpoint(
             ctx.alloc,
             ctx.store,
             ctx.applied_sequence_checkpoint_path,
-            updates,
+            enriched_updates,
         );
-        try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, updates);
+        try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
         return;
     }
+    try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
     try apply_state.saveAppliedSequencesWithCheckpoint(
         ctx.alloc,
         ctx.store,
         ctx.applied_sequence_checkpoint_path,
-        updates,
+        enriched_updates,
     );
-    try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, updates);
+    try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
+}
+
+fn appliedSequenceUpdatesWithConfigHashes(
+    alloc: Allocator,
+    index_manager: *const index_manager_mod.IndexManager,
+    updates: []const apply_state.AppliedSequenceUpdate,
+) ![]apply_state.AppliedSequenceUpdate {
+    const enriched = try alloc.alloc(apply_state.AppliedSequenceUpdate, updates.len);
+    for (updates, 0..) |update, i| {
+        enriched[i] = update;
+        if (enriched[i].config_hash == 0) {
+            if (index_manager.get(update.index_name)) |cfg| {
+                enriched[i].config_hash = types.indexConfigHash(cfg.*);
+            }
+        }
+    }
+    return enriched;
+}
+
+fn saveDenseProjectionMetadataForAppliedSequenceUpdates(
+    index_manager: *index_manager_mod.IndexManager,
+    updates: []const apply_state.AppliedSequenceUpdate,
+) !void {
+    for (updates) |update| {
+        const current = index_manager.denseProjectionCheckpointMetadata(update.index_name) orelse continue;
+        try index_manager.saveDenseProjectionCheckpointMetadata(update.index_name, .{
+            .applied_sequence = update.sequence,
+            .status = current.status,
+            .generation = if (update.generation != 0) update.generation else current.generation,
+            .config_hash = if (update.config_hash != 0) update.config_hash else current.config_hash,
+        });
+    }
 }
 
 fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_hook: ?ReplayProgressHook) !void {
@@ -26101,8 +26370,10 @@ fn registerSplitDestinationIndexesDirect(
         updates[i] = .{
             .index_name = cfg.name,
             .sequence = applied_sequence,
+            .config_hash = types.indexConfigHash(cfg),
         };
     }
+    try saveDenseProjectionMetadataForAppliedSequenceUpdates(dest_indexes, updates);
     try apply_state.saveAppliedSequencesWithCheckpoint(alloc, dest_store, applied_sequence_checkpoint_path, updates);
 }
 
@@ -26930,7 +27201,12 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
 fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) !bool {
     _ = from_sequence;
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
-    const persisted_applied = try apply_state.loadAppliedSequence(ctx.alloc, ctx.store, index_ref.name);
+    const persisted_applied = try apply_state.loadAppliedSequenceWithCheckpoint(
+        ctx.alloc,
+        ctx.store,
+        ctx.applied_sequence_checkpoint_path,
+        index_ref.name,
+    );
     if (persisted_applied >= target_sequence) return true;
     if (!ctx.index_manager.indexLoadComplete(index_ref.name)) return false;
     if (index_ref.kind != .dense_vector) return true;
@@ -27379,14 +27655,15 @@ fn flushFinishedDenseAppliedSequenceLocked(ctx: *AsyncContext, index_name: []con
     // coalescer mutex plus the backend's single-writer commit path. Do not
     // route it through the DB-global apply lock; that makes foreground writes
     // wait behind watermark persistence that does not mutate shared index state.
-    try apply_state.saveAppliedSequencesWithCheckpoint(ctx.alloc, ctx.store, ctx.applied_sequence_checkpoint_path, &[_]apply_state.AppliedSequenceUpdate{.{
+    const raw_update = [_]apply_state.AppliedSequenceUpdate{.{
         .index_name = pending.owned_name,
         .sequence = pending.sequence,
-    }});
-    try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, &[_]apply_state.AppliedSequenceUpdate{.{
-        .index_name = pending.owned_name,
-        .sequence = pending.sequence,
-    }});
+    }};
+    const enriched_updates = try appliedSequenceUpdatesWithConfigHashes(ctx.alloc, ctx.index_manager, &raw_update);
+    defer ctx.alloc.free(enriched_updates);
+    try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+    try apply_state.saveAppliedSequencesWithCheckpoint(ctx.alloc, ctx.store, ctx.applied_sequence_checkpoint_path, enriched_updates);
+    try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
     const save_ns = elapsedSince(save_start_ns);
 
     ctx.applied_sequence_coalescer.last_flush_ns = monotonicTimeNs();
@@ -27416,18 +27693,21 @@ fn flushPendingAppliedSequencesLocked(ctx: *AsyncContext, force: bool) !bool {
         });
     }
     if (updates.items.len == 0) return false;
+    const enriched_updates = try appliedSequenceUpdatesWithConfigHashes(ctx.alloc, ctx.index_manager, updates.items);
+    defer ctx.alloc.free(enriched_updates);
     const sync_ns: u64 = 0;
 
     const save_start_ns = monotonicTimeNs();
     // Index apply/publish paths own index-state durability. The checkpoint
     // writer only persists small applied watermarks used for replay retention.
+    try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
     try apply_state.saveAppliedSequencesWithCheckpoint(
         ctx.alloc,
         ctx.store,
         ctx.applied_sequence_checkpoint_path,
-        updates.items,
+        enriched_updates,
     );
-    try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, updates.items);
+    try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
     const save_ns = elapsedSince(save_start_ns);
     ctx.applied_sequence_coalescer.clearPending(ctx.alloc);
     ctx.applied_sequence_coalescer.last_flush_ns = monotonicTimeNs();
@@ -47255,6 +47535,190 @@ test "db dense artifact rebuild preserves stable vector ids distinct from ordina
     defer alloc.free(stable_metadata);
     try std.testing.expectEqualStrings("doc:b", stable_metadata);
     try std.testing.expectEqual(@as(?[]u8, null), try dense_entry.index.getMetadata(@as(u64, ordinal)));
+}
+
+test "db dense artifact rebuild trusts clean projection checkpoint without artifact recount" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        const dense_cfg: types.IndexConfig = .{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        };
+        try db.addIndex(dense_cfg);
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
+            },
+            .sync_level = .full_index,
+        });
+
+        const target_sequence = db.core.nextDerivedSequence() -| 1;
+        try db.core.saveProjectionCheckpoint("dense_idx", .{
+            .applied_sequence = target_sequence,
+            .status = .clean,
+            .generation = 3,
+        });
+        const checkpoint_path = db.core.applied_sequence_checkpoint_path orelse return error.TestUnexpectedResult;
+        try apply_state.saveProjectionCheckpointWithSidecar(alloc, db.core.store, checkpoint_path, "dense_idx", .{
+            .applied_sequence = 0,
+            .status = .repair_required,
+            .generation = 99,
+            .config_hash = 0xdead,
+        });
+
+        const stale_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:stale", "dense_idx");
+        defer alloc.free(stale_artifact_key);
+        try putDenseEmbeddingArtifactForTest(&db, alloc, stale_artifact_key, null, &[_]f32{ 0, 1, 0 });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
+
+    const checkpoint = try reopened.core.loadProjectionCheckpoint(alloc, "dense_idx");
+    try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
+    try std.testing.expectEqual(@as(u64, 3), checkpoint.generation);
+    try std.testing.expectEqual(types.indexConfigHash(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    }), checkpoint.config_hash);
+
+    const stats = try reopened.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(usize, 1), stats.indexes.len);
+    try std.testing.expectEqualStrings("clean", stats.indexes[0].projection_checkpoint_status);
+    try std.testing.expectEqual(checkpoint.applied_sequence, stats.indexes[0].projection_checkpoint_applied_sequence);
+    try std.testing.expectEqual(@as(u64, 3), stats.indexes[0].projection_checkpoint_generation);
+    try std.testing.expectEqual(types.indexConfigHash(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    }), stats.indexes[0].projection_checkpoint_config_hash);
+    try std.testing.expectEqual(stats.indexes[0].replay_target_sequence -| checkpoint.applied_sequence, stats.indexes[0].checkpoint_replay_tail_sequence_count);
+}
+
+test "db dense artifact rebuild rejects clean checkpoint for stale config identity" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
+            },
+            .sync_level = .full_index,
+        });
+
+        const target_sequence = db.core.nextDerivedSequence() -| 1;
+        try db.core.saveProjectionCheckpoint("dense_idx", .{
+            .applied_sequence = target_sequence,
+            .status = .clean,
+            .generation = 4,
+            .config_hash = types.indexConfigHash(.{
+                .name = "dense_idx",
+                .kind = .dense_vector,
+                .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"external\":true}",
+            }),
+        });
+
+        const stale_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:stale", "dense_idx");
+        defer alloc.free(stale_artifact_key);
+        try putDenseEmbeddingArtifactForTest(&db, alloc, stale_artifact_key, null, &[_]f32{ 0, 1, 0 });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    try std.testing.expect(try reopened.hasPendingDenseArtifactRebuild(alloc));
+}
+
+test "db dense artifact rebuild uses durable artifact counters instead of recount" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        const dense_cfg: types.IndexConfig = .{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        };
+        try db.addIndex(dense_cfg);
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
+            },
+            .sync_level = .full_index,
+        });
+
+        const target_sequence = db.core.nextDerivedSequence() -| 1;
+        try db.core.saveProjectionCheckpoint("dense_idx", .{
+            .applied_sequence = target_sequence,
+            .status = .rebuilding,
+            .generation = 5,
+            .config_hash = types.indexConfigHash(dense_cfg),
+        });
+
+        const stale_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:stale", "dense_idx");
+        defer alloc.free(stale_artifact_key);
+        try putDenseEmbeddingArtifactForTest(&db, alloc, stale_artifact_key, null, &[_]f32{ 0, 1, 0 });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
 }
 
 test "db dense artifact rebuild force-resets corrupt external dense structure" {

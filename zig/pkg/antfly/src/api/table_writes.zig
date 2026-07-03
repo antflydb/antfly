@@ -11230,6 +11230,24 @@ fn reconcileCachedLocalTableIndexDrop(
     return managed_visibility_changed;
 }
 
+fn publishArtifactEnrichmentRuntimeStatusBestEffort(
+    self: *ProvisionedTableWriteSource,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    artifact_name: []const u8,
+    group_id: u64,
+    db: *db_mod.DB,
+) void {
+    publishRuntimeStatusSnapshot(self, alloc, table_name, group_id, db) catch |err| {
+        std.log.warn("artifact enrichment runtime status publish skipped table={s} artifact={s} group_id={d} err={s}", .{
+            table_name,
+            artifact_name,
+            group_id,
+            @errorName(err),
+        });
+    };
+}
+
 fn putCachedLocalArtifactEnrichment(
     self: *ProvisionedTableWriteSource,
     alloc: std.mem.Allocator,
@@ -11269,11 +11287,7 @@ fn putCachedLocalArtifactEnrichment(
             cached_active = false;
             return err;
         };
-        publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db) catch |err| {
-            cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
-            cached_active = false;
-            return err;
-        };
+        publishArtifactEnrichmentRuntimeStatusBestEffort(self, alloc, table_name, artifact_name, group_id, cached.db);
     }
 }
 
@@ -11315,11 +11329,7 @@ fn dropCachedLocalArtifactEnrichment(
             cached_active = false;
             return err;
         };
-        publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db) catch |err| {
-            cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
-            cached_active = false;
-            return err;
-        };
+        publishArtifactEnrichmentRuntimeStatusBestEffort(self, alloc, table_name, artifact_name, group_id, cached.db);
     }
 }
 

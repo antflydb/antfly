@@ -707,12 +707,16 @@ pub const DBCore = struct {
     }
 
     pub fn loadProjectionCheckpoint(self: *DBCore, alloc: Allocator, index_name: []const u8) !apply_state.ProjectionCheckpoint {
-        return try apply_state.loadProjectionCheckpointWithSidecar(
+        const sidecar_checkpoint = try apply_state.loadProjectionCheckpointWithSidecar(
             alloc,
             self.store,
             self.applied_sequence_checkpoint_path,
             index_name,
         );
+        if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |dense_checkpoint| {
+            if (dense_checkpoint.config_hash != 0) return dense_checkpoint;
+        }
+        return sidecar_checkpoint;
     }
 
     pub fn indexRequiresEnrichmentReplay(self: *DBCore, index_name: []const u8) !bool {
@@ -720,22 +724,46 @@ pub const DBCore = struct {
     }
 
     pub fn saveAppliedSequence(self: *DBCore, index_name: []const u8, sequence: u64) !void {
-        try apply_state.saveAppliedSequenceWithCheckpoint(
+        const config_hash = if (self.index_manager.get(index_name)) |cfg|
+            types.indexConfigHash(cfg.*)
+        else
+            0;
+        if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |checkpoint| {
+            try self.index_manager.saveDenseProjectionCheckpointMetadata(index_name, .{
+                .applied_sequence = sequence,
+                .status = checkpoint.status,
+                .generation = checkpoint.generation,
+                .config_hash = if (config_hash != 0) config_hash else checkpoint.config_hash,
+            });
+        }
+        try apply_state.saveAppliedSequenceUpdateWithCheckpoint(
             self.alloc,
             self.store,
             self.applied_sequence_checkpoint_path,
-            index_name,
-            sequence,
+            .{
+                .index_name = index_name,
+                .sequence = sequence,
+                .config_hash = config_hash,
+            },
         );
     }
 
     pub fn saveProjectionCheckpoint(self: *DBCore, index_name: []const u8, checkpoint: apply_state.ProjectionCheckpoint) !void {
+        var checkpoint_with_identity = checkpoint;
+        if (checkpoint_with_identity.config_hash == 0) {
+            if (self.index_manager.get(index_name)) |cfg| {
+                checkpoint_with_identity.config_hash = types.indexConfigHash(cfg.*);
+            }
+        }
+        if (self.index_manager.denseProjectionCheckpointMetadata(index_name) != null) {
+            try self.index_manager.saveDenseProjectionCheckpointMetadata(index_name, checkpoint_with_identity);
+        }
         try apply_state.saveProjectionCheckpointWithSidecar(
             self.alloc,
             self.store,
             self.applied_sequence_checkpoint_path,
             index_name,
-            checkpoint,
+            checkpoint_with_identity,
         );
     }
 
