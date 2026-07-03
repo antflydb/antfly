@@ -22642,6 +22642,75 @@
       "sql": "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' LIMIT 10"
     },
     {
+      "name": "document sql view mapping inner lateral unnest read",
+      "family": "read",
+      "summary": {
+        "document_source_table": "docs",
+        "document_view_mapping": "support_view",
+        "document_native_request": "indexed_query",
+        "document_projections": 2,
+        "document_residual": false,
+        "document_order": false,
+        "document_unnest": true,
+        "document_limit": 10
+      },
+      "plan": "document_query:table=support_view:producer=indexed_query:projections=2:id_proj=1:doc_proj=0:field_proj=0:unnest_proj=1:limit=10:view_mapping=support_view:source_table=docs:required_indexes=1:required_indexes_ready=1:source_generation_fresh=0:source_schema_fingerprint_fresh=0:index=0:native=0:full_text=0:filter=1:residual=0:proj0=id:_->_id:proj1=unnest_value:_->tag:unnest=/tags:unnest_alias=tag:unnest_filter=1",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"tags_array\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"tags_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}"
+        }
+      ],
+      "sql": "SELECT d._id, tag FROM support_view AS d JOIN LATERAL UNNEST(d.tag_list) AS tag ON true WHERE tag = 'urgent' LIMIT 10"
+    },
+    {
+      "name": "document sql view mapping cross lateral unnest read",
+      "family": "read",
+      "summary": {
+        "document_source_table": "docs",
+        "document_view_mapping": "support_view",
+        "document_native_request": "indexed_query",
+        "document_projections": 2,
+        "document_residual": false,
+        "document_order": false,
+        "document_unnest": true,
+        "document_limit": 10
+      },
+      "plan": "document_query:table=support_view:producer=indexed_query:projections=2:id_proj=1:doc_proj=0:field_proj=0:unnest_proj=1:limit=10:view_mapping=support_view:source_table=docs:required_indexes=1:required_indexes_ready=1:source_generation_fresh=0:source_schema_fingerprint_fresh=0:index=0:native=0:full_text=0:filter=1:residual=0:proj0=id:_->_id:proj1=unnest_value:_->tag:unnest=/tags:unnest_alias=tag:unnest_filter=1",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"tags_array\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"tags_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}"
+        }
+      ],
+      "sql": "SELECT d._id, tag FROM support_view AS d CROSS JOIN LATERAL UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' LIMIT 10"
+    },
+    {
+      "name": "document sql view mapping inner lateral unnest residual read",
+      "family": "read",
+      "summary": {
+        "document_source_table": "docs",
+        "document_view_mapping": "support_view",
+        "document_native_request": "indexed_query",
+        "document_projections": 2,
+        "document_residual": true,
+        "document_order": false,
+        "document_unnest": true,
+        "document_limit": 10
+      },
+      "plan": "document_query:table=support_view:producer=indexed_query:projections=2:id_proj=1:doc_proj=0:field_proj=0:unnest_proj=1:limit=10:view_mapping=support_view:source_table=docs:required_indexes=2:required_indexes_ready=1:source_generation_fresh=0:source_schema_fingerprint_fresh=0:index=1:index_name=title_fts:native=0:full_text=1:filter=0:residual=1:candidate_rows=10000:proj0=id:_->_id:proj1=unnest_value:_->tag:unnest=/tags:unnest_alias=tag:unnest_filter=1",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"title_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7},{\"name\":\"tags_array\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"title\",\"path\":\"title\",\"type\":\"text\"},{\"name\":\"status\",\"path\":\"status\",\"type\":\"keyword\"},{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"title_fts\":{\"type\":\"full_text\",\"field\":\"title\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7},\"tags_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}"
+        }
+      ],
+      "sql": "SELECT d._id, tag FROM support_view AS d JOIN LATERAL UNNEST(d.tag_list) AS tag ON true WHERE full_text_search('title:alpha') AND tag = 'urgent' AND status = 'active' LIMIT 10"
+    },
+    {
       "name": "document sql view mapping unnest range indexed read",
       "family": "read",
       "summary": {
@@ -24019,9 +24088,9 @@
       "name": "unsupported document sql view mapping lateral join",
       "family": "unsupported_read",
       "native_request_kind": "query_request",
-      "native_request_json": "{\"classification\":\"unsupported\",\"surface\":\"read_query\",\"native_model\":\"query_request\",\"native_route\":\"unsupported\",\"target_resource\":\"\",\"permission\":\"none\",\"diagnostic\":\"document_sql_unsupported_join\",\"sql_plan\":\"unsupported:read:requires=document_sql_unsupported_join\",\"execution_plan\":\"\"}",
-      "sql_fingerprint": "native_equivalence:class=unsupported:surface=read_query:model=query_request:route=unsupported:target=:permission=none:diagnostic=document_sql_unsupported_join:plan=unsupported:read:requires=document_sql_unsupported_join:execution=",
-      "native_fingerprint": "native_equivalence:class=unsupported:surface=read_query:model=query_request:route=unsupported:target=:permission=none:diagnostic=document_sql_unsupported_join:plan=unsupported:read:requires=document_sql_unsupported_join:execution=",
+      "native_request_json": "{\"classification\":\"unsupported\",\"surface\":\"read_query\",\"native_model\":\"query_request\",\"native_route\":\"unsupported\",\"target_resource\":\"\",\"permission\":\"none\",\"diagnostic\":\"document_sql_lateral_requires_native_producer\",\"sql_plan\":\"unsupported:read:requires=document_sql_lateral_requires_native_producer\",\"execution_plan\":\"\"}",
+      "sql_fingerprint": "native_equivalence:class=unsupported:surface=read_query:model=query_request:route=unsupported:target=:permission=none:diagnostic=document_sql_lateral_requires_native_producer:plan=unsupported:read:requires=document_sql_lateral_requires_native_producer:execution=",
+      "native_fingerprint": "native_equivalence:class=unsupported:surface=read_query:model=query_request:route=unsupported:target=:permission=none:diagnostic=document_sql_lateral_requires_native_producer:plan=unsupported:read:requires=document_sql_lateral_requires_native_producer:execution=",
       "native_equivalence": {
         "classification": "unsupported",
         "surface": "read_query",
@@ -24032,11 +24101,11 @@
         "permission": "none",
         "audit_action": "reject",
         "row_filter": "preserved",
-        "request_fingerprint": "native_equivalence:class=unsupported:surface=read_query:model=query_request:route=unsupported:target=:permission=none:diagnostic=document_sql_unsupported_join:plan=unsupported:read:requires=document_sql_unsupported_join:execution=",
-        "diagnostic": "document_sql_unsupported_join"
+        "request_fingerprint": "native_equivalence:class=unsupported:surface=read_query:model=query_request:route=unsupported:target=:permission=none:diagnostic=document_sql_lateral_requires_native_producer:plan=unsupported:read:requires=document_sql_lateral_requires_native_producer:execution=",
+        "diagnostic": "document_sql_lateral_requires_native_producer"
       },
-      "plan": "unsupported:read:requires=document_sql_unsupported_join",
-      "classification_reason": "document_sql_unsupported_join",
+      "plan": "unsupported:read:requires=document_sql_lateral_requires_native_producer",
+      "classification_reason": "document_sql_lateral_requires_native_producer",
       "catalog_tables": [
         {
           "name": "docs",

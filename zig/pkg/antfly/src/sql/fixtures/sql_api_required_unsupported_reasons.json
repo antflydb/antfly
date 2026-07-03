@@ -7,6 +7,7 @@
     "document_sql_bounded_scan_missing_exact_producer",
     "document_sql_bounded_scan_unbounded_source",
     "document_sql_bounded_scan_unsupported_residual",
+    "document_sql_lateral_requires_native_producer",
     "document_sql_unnest_unsupported",
     "document_sql_unsupported_join",
     "document_sql_view_mapping_catalog",

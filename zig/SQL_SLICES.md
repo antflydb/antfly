@@ -45,15 +45,11 @@ document SQL implementation gates.
   predicate families require an exact indexed/native producer or fail with
   `document_sql_bounded_scan_missing_exact_producer`.
 
-  - [ ] Finish non-`UNNEST` `lateral-view-mapping-joins`: inner and cross
-        `JOIN LATERAL UNNEST(...)` over mapped document arrays are admitted
-        through the existing bounded array-expansion producer, with corpus,
-        required-coverage, residual-filter, runtime-parity, and outer/predicate
-        join rejection evidence. The remaining surface is correlated lateral
-        subqueries over mapped document views: define the native producer
-        contract for branch cardinality, row identity, correlation binding,
-        deterministic ordering, limit interaction, residual filtering, and
-        relational fallback rejection before admitting those shapes.
+  - [ ] Admit correlated lateral subqueries over mapped document views.
+        Land only shapes whose native producer proves branch cardinality, row
+        identity, correlation binding, deterministic ordering, limit
+        interaction, residual filtering, and relational fallback rejection,
+        with executable SQL/native/API parity for result rows and diagnostics.
 
 ## Whole SQL Adapter
 

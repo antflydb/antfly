@@ -3366,6 +3366,18 @@ test "api public SQL endpoint executes document SQL reads through typed document
     try std.testing.expectEqual(@as(u16, 400), join_resp.status);
     try expectPublicSqlDiagnosticBody(alloc, join_resp.body, "plan", "invalid_sql_request", "document_sql_unsupported_join", 0, 0);
 
+    source.tables[0].indexes_json =
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"amount\",\"type\":\"numeric\"}]}}}";
+    var lateral_contract_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10;\"}",
+    });
+    defer lateral_contract_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), lateral_contract_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, lateral_contract_resp.body, "plan", "invalid_sql_request", "document_sql_lateral_requires_native_producer", 0, 0);
+
     var distinct_resp = try server.handle(.{
         .method = .POST,
         .uri = "/db/v1/sql",

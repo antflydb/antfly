@@ -1073,6 +1073,8 @@ pub const RelationalRowsScalarSubqueryProjection = struct {
     output: []const u8,
     query: RelationalRowsQueryRequest = .{},
     output_field: []const u8 = "",
+    correlations: []const RelationalRowsLateralCorrelation = &.{},
+    hidden: bool = false,
 };
 
 pub const RelationalRowsJsonContainsPredicate = struct {
@@ -1179,6 +1181,11 @@ fn freeRelationalRowsScalarSubqueryProjection(alloc: Allocator, projection: Rela
     var query = projection.query;
     query.deinit(alloc);
     if (projection.output_field.len > 0) alloc.free(projection.output_field);
+    for (projection.correlations) |correlation| {
+        alloc.free(correlation.left_field);
+        alloc.free(correlation.right_field);
+    }
+    if (projection.correlations.len > 0) alloc.free(projection.correlations);
 }
 
 fn freeRelationalRowsQueryOrder(alloc: Allocator, order: RelationalRowsQueryOrder) void {

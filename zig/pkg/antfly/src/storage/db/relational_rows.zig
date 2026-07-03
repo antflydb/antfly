@@ -1658,10 +1658,30 @@ fn subqueryProjectedValueAlloc(
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
-    const value = parsed.value.object.get(output_field) orelse return error.InvalidQueryRequest;
+    const value = parsed.value.object.get(output_field) orelse
+        return std.json.parseFromSlice(std.json.Value, alloc, "null", .{}) catch return error.InvalidQueryRequest;
     const value_json = try jsonValueStringAlloc(alloc, value);
     defer alloc.free(value_json);
     return std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
+}
+
+fn objectKeysAlloc(alloc: Allocator, row_json: []const u8) ![][]const u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    const keys = parsed.value.object.keys();
+    if (keys.len == 0) return &.{};
+    const out = try alloc.alloc([]const u8, keys.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |field| alloc.free(field);
+        alloc.free(out);
+    }
+    for (keys, 0..) |key, index| {
+        out[index] = try alloc.dupe(u8, key);
+        initialized += 1;
+    }
+    return out;
 }
 
 fn jsonValueStringAlloc(alloc: Allocator, value: std.json.Value) ![]const u8 {
@@ -8659,7 +8679,7 @@ pub fn validateQueryAgainstSchema(
         }
     }
     for (req.field_aliases) |projection| try validateSchemaField(runtime_schema, projection.field);
-    for (req.expressions) |projection| try validateExpressionAgainstSchema(runtime_schema, projection.expression);
+    for (req.expressions) |projection| try validateExpressionAgainstSchemaWithScalarOutputs(runtime_schema, projection.expression, req.scalar_subqueries);
 }
 
 fn validateAccessPredicateGroupAgainstSchema(
@@ -8689,16 +8709,36 @@ pub fn validateExpressionAgainstSchema(
     runtime_schema: schema_mod.TableSchema,
     expression: types.RelationalRowsExpression,
 ) anyerror!void {
+    return try validateExpressionAgainstSchemaWithScalarOutputs(runtime_schema, expression, &.{});
+}
+
+fn validateExpressionAgainstSchemaWithScalarOutputs(
+    runtime_schema: schema_mod.TableSchema,
+    expression: types.RelationalRowsExpression,
+    scalar_subqueries: []const types.RelationalRowsScalarSubqueryProjection,
+) anyerror!void {
     if (expression.kind == .field) {
         if (expression.field_source != .row) return error.InvalidQueryRequest;
-        try validateSchemaField(runtime_schema, expression.field);
+        if (!schemaCoversField(runtime_schema, expression.field) and
+            !hiddenScalarSubqueryOutputCoversField(scalar_subqueries, expression.field)) return error.InvalidQueryRequest;
     }
-    for (expression.operands) |operand| try validateExpressionAgainstSchema(runtime_schema, operand);
+    for (expression.operands) |operand| try validateExpressionAgainstSchemaWithScalarOutputs(runtime_schema, operand, scalar_subqueries);
     for (expression.case_branches) |branch| {
         try validateExpressionConditionAgainstSchema(runtime_schema, branch.when);
-        try validateExpressionAgainstSchema(runtime_schema, branch.then);
+        try validateExpressionAgainstSchemaWithScalarOutputs(runtime_schema, branch.then, scalar_subqueries);
     }
-    for (expression.case_else) |fallback| try validateExpressionAgainstSchema(runtime_schema, fallback);
+    for (expression.case_else) |fallback| try validateExpressionAgainstSchemaWithScalarOutputs(runtime_schema, fallback, scalar_subqueries);
+}
+
+fn hiddenScalarSubqueryOutputCoversField(
+    scalar_subqueries: []const types.RelationalRowsScalarSubqueryProjection,
+    field: []const u8,
+) bool {
+    if (field.len == 0) return false;
+    for (scalar_subqueries) |projection| {
+        if (projection.hidden and std.mem.eql(u8, projection.output, field)) return true;
+    }
+    return false;
 }
 
 pub fn validateSchemaField(runtime_schema: schema_mod.TableSchema, field: []const u8) !void {
@@ -13467,10 +13507,34 @@ pub fn Impl(comptime DB: type) type {
             row_json: []const u8,
             req: types.RelationalRowsQueryRequest,
         ) anyerror![]u8 {
+            var hidden_scalar_count: usize = 0;
+            for (req.scalar_subqueries) |projection| {
+                if (projection.hidden) hidden_scalar_count += 1;
+            }
+            const expression_row_json = if (hidden_scalar_count == 0)
+                row_json
+            else
+                try @This().rowJsonWithHiddenScalarSubqueriesAlloc(self, alloc, runtime_schema, materialized_ctes, row_json, req.scalar_subqueries);
+            defer if (hidden_scalar_count != 0) alloc.free(expression_row_json);
+
             var base_req = req;
             base_req.scalar_subqueries = &.{};
-            const base_json = try projectQueryCandidateStaticAlloc(alloc, doc_key, row_json, base_req, currentTimeNs());
+            var select_all_fields: [][]const u8 = &.{};
+            defer {
+                for (select_all_fields) |field| alloc.free(field);
+                if (select_all_fields.len > 0) alloc.free(select_all_fields);
+            }
+            if (hidden_scalar_count != 0 and base_req.select_all) {
+                select_all_fields = try objectKeysAlloc(alloc, row_json);
+                base_req.select_all = false;
+                base_req.select = select_all_fields;
+            }
+            const base_json = try projectQueryCandidateStaticAlloc(alloc, doc_key, expression_row_json, base_req, currentTimeNs());
             defer alloc.free(base_json);
+
+            var outer_parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
+            defer outer_parsed.deinit();
+            if (outer_parsed.value != .object) return error.InvalidQueryRequest;
 
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, base_json, .{}) catch return error.InvalidQueryRequest;
             defer parsed.deinit();
@@ -13489,7 +13553,8 @@ pub fn Impl(comptime DB: type) type {
             }
 
             for (req.scalar_subqueries) |projection| {
-                var result = try @This().queryRelationalRowsWithMaterializedCtesAlloc(self, alloc, runtime_schema, materialized_ctes, projection.query);
+                if (projection.hidden) continue;
+                var result = try @This().queryScalarSubqueryProjectionAlloc(self, alloc, runtime_schema, materialized_ctes, outer_parsed.value, projection);
                 defer result.deinit(alloc);
                 if (result.rows.len > 1) return error.InvalidQueryRequest;
 
@@ -13506,6 +13571,78 @@ pub fn Impl(comptime DB: type) type {
             }
             try writer.writeByte('}');
             return try out.toOwnedSlice();
+        }
+
+        fn rowJsonWithHiddenScalarSubqueriesAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
+            row_json: []const u8,
+            scalar_subqueries: []const types.RelationalRowsScalarSubqueryProjection,
+        ) anyerror![]const u8 {
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidQueryRequest;
+
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            errdefer out.deinit();
+            const writer = &out.writer;
+            try writer.writeByte('{');
+            var first = true;
+            for (parsed.value.object.keys(), parsed.value.object.values()) |field, value| {
+                if (!first) try writer.writeByte(',');
+                first = false;
+                try writer.print("{f}:", .{std.json.fmt(field, .{})});
+                try std.json.Stringify.value(value, .{}, writer);
+            }
+            for (scalar_subqueries) |projection| {
+                if (!projection.hidden) continue;
+                var result = try @This().queryScalarSubqueryProjectionAlloc(self, alloc, runtime_schema, materialized_ctes, parsed.value, projection);
+                defer result.deinit(alloc);
+                if (result.rows.len > 1) return error.InvalidQueryRequest;
+
+                if (!first) try writer.writeByte(',');
+                first = false;
+                try writer.print("{f}:", .{std.json.fmt(projection.output, .{})});
+                if (result.rows.len == 0) {
+                    try writer.writeAll("null");
+                } else {
+                    var value = try subqueryProjectedValueAlloc(alloc, result.rows[0], projection.output_field);
+                    defer value.deinit();
+                    try std.json.Stringify.value(value.value, .{}, writer);
+                }
+            }
+            try writer.writeByte('}');
+            return try out.toOwnedSlice();
+        }
+
+        fn queryScalarSubqueryProjectionAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
+            outer_row: std.json.Value,
+            projection: types.RelationalRowsScalarSubqueryProjection,
+        ) anyerror!types.RelationalRowsQueryResult {
+            var local_query = projection.query;
+            var correlated_predicates: []schema_mod.RelationalCheck = &.{};
+            defer {
+                freeRelationalChecks(alloc, correlated_predicates);
+                if (correlated_predicates.len > 0) alloc.free(correlated_predicates);
+            }
+            var combined_predicates: []schema_mod.RelationalCheck = &.{};
+            defer {
+                freeRelationalChecks(alloc, combined_predicates);
+                if (combined_predicates.len > 0) alloc.free(combined_predicates);
+            }
+            if (projection.correlations.len != 0) {
+                correlated_predicates = try lateralCorrelationPredicatesAlloc(alloc, outer_row, projection.correlations);
+                if (correlated_predicates.len != projection.correlations.len) return .{};
+                combined_predicates = try concatRelationalChecksAlloc(alloc, projection.query.predicates, correlated_predicates);
+                local_query.predicates = combined_predicates;
+            }
+            return try @This().queryRelationalRowsWithMaterializedCtesAlloc(self, alloc, runtime_schema, materialized_ctes, local_query);
         }
 
         pub fn projectRelationalRowsQueryCandidateStaticAlloc(
@@ -23947,6 +24084,60 @@ test "relational rows scalar subquery projections enforce scalar cardinality" {
     });
     defer empty_result.deinit(alloc);
     try std.testing.expectEqualStrings("{\"id\":\"a\",\"missing_status\":null}", empty_result.rows[0]);
+
+    const rank_correlation = [_]types.RelationalRowsLateralCorrelation{.{
+        .left_field = "rank",
+        .right_field = "rank",
+    }};
+    const correlated_projection = [_]types.RelationalRowsScalarSubqueryProjection{.{
+        .output = "same_rank_id",
+        .query = .{
+            .select = select_id[0..],
+            .select_all = false,
+        },
+        .output_field = "id",
+        .correlations = rank_correlation[0..],
+    }};
+    var correlated_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .select = select_id[0..],
+        .select_all = false,
+        .scalar_subqueries = correlated_projection[0..],
+        .order_by = order_by_id[0..],
+    });
+    defer correlated_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), correlated_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"same_rank_id\":\"a\"}", correlated_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"same_rank_id\":\"b\"}", correlated_result.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\",\"same_rank_id\":\"c\"}", correlated_result.rows[2]);
+
+    const hidden_projection = [_]types.RelationalRowsScalarSubqueryProjection{.{
+        .output = "__antfly_hidden_id",
+        .query = .{
+            .select = select_id[0..],
+            .select_all = false,
+        },
+        .output_field = "id",
+        .correlations = rank_correlation[0..],
+        .hidden = true,
+    }};
+    const hidden_id_operands = [_]types.RelationalRowsExpression{.{
+        .kind = .field,
+        .field = "__antfly_hidden_id",
+    }};
+    const hidden_id_expression = [_]types.RelationalRowsExpressionProjection{.{
+        .output = "same_rank_id",
+        .expression = .{ .kind = .coalesce, .operands = hidden_id_operands[0..] },
+    }};
+    var hidden_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .select_all = true,
+        .expressions = hidden_id_expression[0..],
+        .scalar_subqueries = hidden_projection[0..],
+        .order_by = order_by_id[0..],
+        .limit = 1,
+    });
+    defer hidden_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), hidden_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"open\",\"rank\":1,\"same_rank_id\":\"a\"}", hidden_result.rows[0]);
 
     const multi_projection = [_]types.RelationalRowsScalarSubqueryProjection{.{
         .output = "too_many_statuses",

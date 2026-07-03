@@ -64,12 +64,12 @@ pub fn planParsedSqlWithSessionAlloc(
             return try binder.logicalWritePlanFromBoundStatement(&bound);
         },
         .read => {
-            var bound = try binder.bindReadPlanCatalogStatementWithSessionAndAuthorizationAlloc(alloc, parsed_sql, options.catalog, options.session, options.authorization);
-            defer bound.deinit(alloc);
-            try binder.enforceBoundSqlStatementAuthorization(&bound);
-            return try binder.logicalReadPlanFromBoundStatement(&bound);
+            return try planCatalogReadParsedSqlWithSessionAlloc(alloc, parsed_sql, options);
         },
         .ddl, .explain, .transaction, .prepared, .session, .unsupported, .unknown => {
+            if (parsed_sql.generatedStatementKind() == .read) {
+                return try planCatalogReadParsedSqlWithSessionAlloc(alloc, parsed_sql, options);
+            }
             var bound = try binder.bindDdlStatementWithCatalogSessionFunctionBindingsAndAuthorizationAlloc(
                 alloc,
                 parsed_sql,
@@ -83,6 +83,17 @@ pub fn planParsedSqlWithSessionAlloc(
             return try lower_ddl.planLogicalDdlPlanBoundStatementWithFunctionBindingsAlloc(alloc, &bound, options.function_bindings);
         },
     }
+}
+
+fn planCatalogReadParsedSqlWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    options: PlanParsedSqlOptions,
+) !SqlExecutionPlan {
+    var bound = try binder.bindReadPlanCatalogStatementWithSessionAndAuthorizationAlloc(alloc, parsed_sql, options.catalog, options.session, options.authorization);
+    defer bound.deinit(alloc);
+    try binder.enforceBoundSqlStatementAuthorization(&bound);
+    return try binder.logicalReadPlanFromBoundStatement(&bound);
 }
 
 pub fn planParsedDdlSqlWithSessionAuthorizationEvidenceAlloc(

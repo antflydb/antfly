@@ -126,6 +126,7 @@ pub const ExpectedError = enum {
     DocumentSqlBoundedScanPolicyRequired,
     DocumentSqlIndexUnavailable,
     DocumentSqlNativeSearchRequiresTableFunction,
+    DocumentSqlLateralRequiresNativeProducer,
     DocumentSqlUnnestUnsupported,
     DocumentSqlUnnestRequiresArray,
     UnsupportedSqlShape,
@@ -154,6 +155,7 @@ pub fn errorFromName(name: []const u8) !ExpectedError {
     if (std.mem.eql(u8, name, "DocumentSqlBoundedScanPolicyRequired")) return .DocumentSqlBoundedScanPolicyRequired;
     if (std.mem.eql(u8, name, "DocumentSqlIndexUnavailable")) return .DocumentSqlIndexUnavailable;
     if (std.mem.eql(u8, name, "DocumentSqlNativeSearchRequiresTableFunction")) return .DocumentSqlNativeSearchRequiresTableFunction;
+    if (std.mem.eql(u8, name, "DocumentSqlLateralRequiresNativeProducer")) return .DocumentSqlLateralRequiresNativeProducer;
     if (std.mem.eql(u8, name, "DocumentSqlUnnestUnsupported")) return .DocumentSqlUnnestUnsupported;
     if (std.mem.eql(u8, name, "DocumentSqlUnnestRequiresArray")) return .DocumentSqlUnnestRequiresArray;
     if (std.mem.eql(u8, name, "UnsupportedSqlShape")) return .UnsupportedSqlShape;
@@ -184,6 +186,7 @@ pub fn errorValue(expected: ExpectedError) anyerror {
         .DocumentSqlBoundedScanPolicyRequired => error.DocumentSqlBoundedScanPolicyRequired,
         .DocumentSqlIndexUnavailable => error.DocumentSqlIndexUnavailable,
         .DocumentSqlNativeSearchRequiresTableFunction => error.DocumentSqlNativeSearchRequiresTableFunction,
+        .DocumentSqlLateralRequiresNativeProducer => error.DocumentSqlLateralRequiresNativeProducer,
         .DocumentSqlUnnestUnsupported => error.DocumentSqlUnnestUnsupported,
         .DocumentSqlUnnestRequiresArray => error.DocumentSqlUnnestRequiresArray,
         .UnsupportedSqlShape => error.UnsupportedSqlShape,

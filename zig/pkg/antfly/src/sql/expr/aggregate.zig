@@ -358,7 +358,13 @@ pub fn validateGeneratedFunctionForSpec(
         if (!expr_generated.generatedTokenRangeEqual(expression.filter_expression.?.tokens orelse return error.UnsupportedSqlShape, expression.filter_predicate_tokens.?)) return error.UnsupportedSqlShape;
     } else {
         if (filter_end != null or filter_predicate_start != null or filter_predicate_end != null) return error.UnsupportedSqlShape;
-        if (expression.filter_tokens != null or expression.filter_predicate_tokens != null or expression.filter_expression != null) return error.UnsupportedSqlShape;
+        if (expression.filter_tokens != null or
+            expression.filter_predicate_tokens != null or
+            expression.filter_expression_kind != null or
+            expression.filter_expression != null)
+        {
+            return error.UnsupportedSqlShape;
+        }
     }
 }
 
@@ -3112,4 +3118,58 @@ test "sql expr_aggregate validates output type and filter ownership" {
     try std.testing.expectEqualStrings("status_lower", bound_group_expressions.items[1].output);
     try appendGroupByFieldOrAlias(alloc, schema, &bound_group_fields, &bound_group_expressions, aggregate_select, try alloc.dupe(u8, "status"), &.{}, &.{}, false);
     try std.testing.expectEqualStrings("status", bound_group_fields.items[1]);
+
+    const generated_count_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "count" },
+        .{ .kind = .lparen, .text = "(" },
+        .{ .kind = .rparen, .text = ")" },
+    };
+    const generated_count_ast = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .function_call,
+        .tokens = .{ .start = 0, .end = 3 },
+        .function_name_tokens = .{ .start = 0, .end = 1 },
+        .aggregate_function_kind = .count,
+    };
+    try validateGeneratedFunctionForSpec(
+        &generated_count_tokens,
+        .count,
+        0,
+        2,
+        2,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        &generated_count_ast,
+    );
+    const stale_generated_count_filter_kind = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .function_call,
+        .tokens = .{ .start = 0, .end = 3 },
+        .function_name_tokens = .{ .start = 0, .end = 1 },
+        .aggregate_function_kind = .count,
+        .filter_expression_kind = .field,
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedFunctionForSpec(
+            &generated_count_tokens,
+            .count,
+            0,
+            2,
+            2,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            &stale_generated_count_filter_kind,
+        ),
+    );
 }

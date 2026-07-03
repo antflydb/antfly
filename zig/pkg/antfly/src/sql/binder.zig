@@ -1570,6 +1570,14 @@ fn requireParsedCatalogReadStatement(statement: tokenized.ParsedStatement) !void
     }
 }
 
+fn requireParsedCatalogReadStatementIncludingGeneratedAst(parsed_sql: *const tokenized.ParsedSql) !void {
+    if (parsed_sql.generatedStatementKind() == .read) {
+        _ = parsed_sql.generatedReadStatementKind() orelse return error.UnsupportedSqlShape;
+        return;
+    }
+    try requireParsedCatalogReadStatement(parsed_sql.statement);
+}
+
 fn requireParsedCatalogWriteStatement(statement: tokenized.ParsedStatement) !void {
     switch (statement) {
         .write => {},
@@ -2670,7 +2678,7 @@ fn resolveReadPlanCatalogSourceSchemaParsedSqlWithSessionAlloc(
     catalog: table_catalog.CatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !CatalogBoundReadPlanSourceSchema {
-    try requireParsedCatalogReadStatement(parsed_sql.statement);
+    try requireParsedCatalogReadStatementIncludingGeneratedAst(parsed_sql);
     return try resolveReadPlanCatalogSourceSchemaFromParsedSqlWithSessionAlloc(alloc, parsed_sql, catalog, session);
 }
 
@@ -3155,7 +3163,7 @@ pub fn bindReadPlanCatalogStatementWithSessionAndAuthorizationAlloc(
     session: catalog_resources.SqlCatalogSession,
     authorization_options: BoundSqlAuthorizationOptions,
 ) !BoundSqlStatement {
-    try requireParsedCatalogReadStatement(parsed_sql.statement);
+    try requireParsedCatalogReadStatementIncludingGeneratedAst(parsed_sql);
     var bound_session = try BoundSqlSession.fromSessionAlloc(alloc, session);
     errdefer bound_session.deinit(alloc);
     var resolved = try resolveReadPlanCatalogSourceSchemaFromParsedSqlWithSessionAndAuthorizationAlloc(alloc, parsed_sql, catalog, session, authorization_options);
@@ -3434,10 +3442,7 @@ fn joinedWriteSourceTableNamesFromWithAlloc(
 }
 
 pub fn readSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_sql: *const tokenized.ParsedSql) !?ReadSourceTableNames {
-    switch (parsed_sql.statement) {
-        .read => {},
-        else => return error.UnsupportedSqlShape,
-    }
+    try requireParsedCatalogReadStatementIncludingGeneratedAst(parsed_sql);
     if (try generatedReadAstForParsedSql(parsed_sql)) |read_ast| {
         return try readSourceTableNamesFromGeneratedReadAstAlloc(alloc, parsed_sql.items(), read_ast);
     }
@@ -3446,7 +3451,7 @@ pub fn readSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_s
 
 fn generatedReadAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) !?*const generated_parser.GeneratedSqlReadAst {
     if (parsed_sql.generatedStatementKind() != .read) return null;
-    _ = parsed_sql.readStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
+    _ = parsed_sql.generatedReadStatementKind() orelse return error.UnsupportedSqlShape;
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
@@ -3534,7 +3539,9 @@ fn readSourceTableNamesFromGeneratedReadBodyAlloc(
         const join = join_items[0];
         const left = try normalizeGeneratedSourceRangeTableNameAlloc(alloc, tokens, join.left_tokens);
         errdefer alloc.free(left);
-        if (generatedSourceRangeStartsWithUnnest(tokens, join.right_tokens)) {
+        if (generatedSourceRangeStartsWithUnnest(tokens, join.right_tokens) or
+            generatedSourceRangeStartsWithLateralUnnest(tokens, join.right_tokens))
+        {
             const source = try alloc.dupe(u8, left);
             errdefer alloc.free(source);
             return .{ .left = left, .source = source };
@@ -3589,6 +3596,14 @@ fn generatedSourceRangeStartsWithUnnest(tokens: []const Token, source_tokens: ge
     if (source_tokens.start >= source_tokens.end or source_tokens.end > tokens.len) return false;
     const token = tokens[source_tokens.start];
     return token.kind == .identifier and std.ascii.eqlIgnoreCase(token.text, "unnest");
+}
+
+fn generatedSourceRangeStartsWithLateralUnnest(tokens: []const Token, source_tokens: generated_parser.GeneratedSqlTokenRange) bool {
+    if (source_tokens.start + 2 >= source_tokens.end or source_tokens.end > tokens.len) return false;
+    return tokens[source_tokens.start].matchesKeywordTag(.lateral) and
+        tokens[source_tokens.start + 1].kind == .identifier and
+        std.ascii.eqlIgnoreCase(tokens[source_tokens.start + 1].text, "unnest") and
+        tokens[source_tokens.start + 2].kind == .lparen;
 }
 
 fn generatedSourceRangeContainsUnnest(tokens: []const Token, source_tokens: generated_parser.GeneratedSqlTokenRange) bool {
@@ -4980,6 +4995,26 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expect(document_unnest_read.source_schema == null);
+
+    var parsed_document_lateral_unnest_read = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT d._id, tag FROM docs AS d JOIN LATERAL UNNEST(d.tags) AS tag ON true WHERE tag = 'urgent' LIMIT 10;",
+    );
+    defer parsed_document_lateral_unnest_read.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.lateral, parsed_document_lateral_unnest_read.generatedReadStatementKind().?);
+    var bound_document_lateral_unnest_read = try bindReadPlanCatalogStatementAlloc(alloc, &parsed_document_lateral_unnest_read, document_catalog.iface());
+    defer bound_document_lateral_unnest_read.deinit(alloc);
+    const document_lateral_unnest_read = try bound_document_lateral_unnest_read.readCatalog();
+    try std.testing.expect(document_lateral_unnest_read.target_binding != null);
+    switch (document_lateral_unnest_read.target_binding.?) {
+        .document => |binding| {
+            try std.testing.expectEqualStrings("docs", binding.target.table_name);
+            try std.testing.expectEqual(runtime_schema.StorageMode.document, binding.schema.storage_mode);
+            try std.testing.expectEqual(source_binding.SqlSourceFamily.document, document_lateral_unnest_read.bound_objects[0].family);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(document_lateral_unnest_read.source_schema == null);
 
     var parsed_document_view_write = try tokenized.ParsedSql.initAlloc(
         alloc,

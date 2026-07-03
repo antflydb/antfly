@@ -54,6 +54,12 @@
       ]
     },
     {
+      "reason": "document_sql_lateral_requires_native_producer",
+      "coverage": [
+        "unsupported_read_document_view_mapping_lateral_join"
+      ]
+    },
+    {
       "reason": "document_sql_unnest_unsupported",
       "coverage": [
         "document_query_array_unnest_rejected_cartesian"
@@ -62,7 +68,8 @@
     {
       "reason": "document_sql_unsupported_join",
       "coverage": [
-        "unsupported_read_document_view_mapping_lateral_join"
+        "unsupported_read_document_view_mapping_lateral_unnest_outer_join",
+        "unsupported_read_document_view_mapping_lateral_unnest_predicate_join"
       ]
     },
     {

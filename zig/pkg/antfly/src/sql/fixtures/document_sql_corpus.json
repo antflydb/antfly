@@ -2881,6 +2881,69 @@
       }
     },
     {
+      "name": "view-mapped correlated lateral subquery remains unsupported until native producer contract exists",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}",
+      "sql": "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "expected_error": "DocumentSqlLateralRequiresNativeProducer"
+      }
+    },
+    {
+      "name": "view-mapped predicated correlated lateral subquery remains unsupported until native residual proof exists",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}",
+      "sql": "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON latest.plan = d.plan WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "expected_error": "DocumentSqlLateralRequiresNativeProducer"
+      }
+    },
+    {
+      "name": "view-mapped correlated lateral subquery without branch limit requires cardinality proof",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}",
+      "sql": "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "expected_error": "DocumentSqlLateralRequiresNativeProducer"
+      }
+    },
+    {
+      "name": "view-mapped correlated lateral subquery ordered branch requires deterministic native ordering proof",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}",
+      "sql": "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan ORDER BY s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "expected_error": "DocumentSqlLateralRequiresNativeProducer"
+      }
+    },
+    {
+      "name": "view-mapped correlated lateral subquery expression correlation requires binding proof",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}",
+      "sql": "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE lower(s.plan) = lower(d.plan) LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "expected_error": "DocumentSqlLateralRequiresNativeProducer"
+      }
+    },
+    {
+      "name": "view-mapped correlated lateral subquery residual predicate requires residual filtering proof",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}",
+      "sql": "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan AND s.score > d.score LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "expected_error": "DocumentSqlLateralRequiresNativeProducer"
+      }
+    },
+    {
+      "name": "view-mapped correlated lateral subquery relational fallback remains rejected",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}",
+      "sql": "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM users AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "expected_error": "DocumentSqlLateralRequiresNativeProducer"
+      }
+    },
+    {
       "name": "view-mapped scalar predicate without indexed path requires exact producer",
       "schema": "text_only",
       "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}",

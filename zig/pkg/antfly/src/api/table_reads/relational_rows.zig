@@ -828,6 +828,18 @@ fn executeLoweredSqlSetOperationPlanWithRoutedCtesAlloc(
             &cte_sources,
         );
     }
+    try appendRoutedSetOperationCteSourceIfNeededAlloc(
+        alloc,
+        source,
+        catalog,
+        default_table_name,
+        default_schema,
+        lowered.right.table_name,
+        consistency,
+        &owned_schemas,
+        &source_rows,
+        &cte_sources,
+    );
 
     return try relational_rows_api.executeRowsSetOperationPlanOnJsonRowsWithSourcesAlloc(alloc, left_schema, .{
         .operation = operation,

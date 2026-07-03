@@ -561,14 +561,9 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
 }
 
 fn generatedSetOperationAllowsQueryFallback(read_ast: *const generated_parser.GeneratedSqlReadAst) bool {
-    const has_result_tail = read_ast.order_tokens != null or
-        read_ast.limit_tokens != null or
-        read_ast.offset_tokens != null or
-        read_ast.fetch_tokens != null;
-    return switch (read_ast.set_operation.kind orelse return false) {
-        .@"union" => true,
-        .intersect, .except => !has_result_tail,
-    };
+    const set_operation_tokens = read_ast.set_operation.tokens orelse return false;
+    const right_query_tokens = read_ast.set_operation.right_query_tokens orelse return false;
+    return right_query_tokens.end < set_operation_tokens.end;
 }
 
 pub fn validateGeneratedReadAstForStatement(
@@ -1406,6 +1401,18 @@ fn validateGeneratedReadJoinLateralPayload(
         return;
     }
 
+    if (join.right_tokens.start + 1 >= join.right_tokens.end or tokens[join.right_tokens.start + 1].kind != .lparen) {
+        if (join.right_lateral_subquery_tokens != null or
+            join.right_lateral_subquery_read_ast != null or
+            join.right_lateral_alias_tokens != null or
+            join.right_lateral_alias_name_tokens != null)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        try validateGeneratedReadLateralTableFunctionSource(tokens, join.right_tokens);
+        return;
+    }
+
     const subquery_tokens = join.right_lateral_subquery_tokens orelse return error.UnsupportedSqlShape;
     const subquery_read = join.right_lateral_subquery_read_ast orelse return error.UnsupportedSqlShape;
     const alias_tokens = join.right_lateral_alias_tokens orelse return error.UnsupportedSqlShape;
@@ -1427,6 +1434,52 @@ fn validateGeneratedReadJoinLateralPayload(
         return error.UnsupportedSqlShape;
     }
     generated_read_validate.validateGeneratedReadAstPayloads(tokens[subquery_tokens.start..subquery_tokens.end], subquery_read.*) catch return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedReadLateralTableFunctionSource(
+    tokens: []const tokenized.Token,
+    source: generated_parser.GeneratedSqlTokenRange,
+) GeneratedReadValidationError!void {
+    if (source.start + 2 >= source.end or source.end > tokens.len) return error.UnsupportedSqlShape;
+    if (!tokens[source.start].matchesKeywordTag(.lateral)) return error.UnsupportedSqlShape;
+    if (tokens[source.start + 1].kind != .identifier) return error.UnsupportedSqlShape;
+    const lparen_index = source.start + 2;
+    if (tokens[lparen_index].kind != .lparen) return error.UnsupportedSqlShape;
+    const rparen_index = generatedReadMatchingParenInRange(tokens, lparen_index, source.end) orelse return error.UnsupportedSqlShape;
+    const alias_start = rparen_index + 1;
+    if (alias_start == source.end) return;
+    if (alias_start + 1 == source.end) {
+        if (tokens[alias_start].kind != .identifier) return error.UnsupportedSqlShape;
+        return;
+    }
+    if (alias_start + 2 != source.end or
+        !tokens[alias_start].matchesKeywordTag(.as) or
+        tokens[alias_start + 1].kind != .identifier)
+    {
+        return error.UnsupportedSqlShape;
+    }
+}
+
+fn generatedReadMatchingParenInRange(
+    tokens: []const tokenized.Token,
+    open_index: usize,
+    end: usize,
+) ?usize {
+    if (open_index >= end or end > tokens.len or tokens[open_index].kind != .lparen) return null;
+    var depth: usize = 0;
+    var index = open_index;
+    while (index < end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) return null;
+                depth -= 1;
+                if (depth == 0) return index;
+            },
+            else => {},
+        }
+    }
+    return null;
 }
 
 fn optionalGeneratedTokenRangeEql(

@@ -45,6 +45,7 @@ pub const SqlDiagnosticCode = enum {
     document_sql_bounded_scan_row_cap_exceeded,
     document_sql_bounded_scan_unbounded_source,
     document_sql_bounded_scan_unsupported_residual,
+    document_sql_lateral_requires_native_producer,
     document_sql_requires_bounded_scan,
     document_sql_unnest_requires_array,
     document_sql_unnest_unsupported,
@@ -154,6 +155,7 @@ pub fn diagnosticCodeDefaultMessage(code: SqlDiagnosticCode) []const u8 {
         .document_sql_bounded_scan_row_cap_exceeded => "document SQL bounded scan row cap exceeded",
         .document_sql_bounded_scan_unbounded_source => "document SQL scan source is unbounded",
         .document_sql_bounded_scan_unsupported_residual => "document SQL bounded scan residual predicate is unsupported",
+        .document_sql_lateral_requires_native_producer => "document SQL correlated lateral requires a native producer contract",
         .document_sql_requires_bounded_scan => "document SQL requires an explicit bounded scan policy",
         .document_sql_unnest_requires_array => "document SQL UNNEST requires an array field",
         .document_sql_unnest_unsupported => "document SQL UNNEST shape is unsupported",
@@ -209,6 +211,7 @@ pub fn diagnosticCodeMissingNativeModel(code: SqlDiagnosticCode) ?[]const u8 {
         .document_sql_unnest_requires_array,
         .document_sql_unnest_unsupported,
         => "document SQL array expansion execution",
+        .document_sql_lateral_requires_native_producer => "document SQL correlated lateral producer contract",
         .document_sql_bounded_scan_byte_cap_exceeded,
         .document_sql_bounded_scan_incomplete_topk,
         .document_sql_bounded_scan_missing_exact_producer,
@@ -258,6 +261,7 @@ pub fn knownErrorDiagnostic(phase: SqlDiagnosticPhase, err: anyerror) ?SqlDiagno
         error.DocumentSqlBoundedScanRowCapExceeded => .document_sql_bounded_scan_row_cap_exceeded,
         error.DocumentSqlBoundedScanUnboundedSource => .document_sql_bounded_scan_unbounded_source,
         error.DocumentSqlBoundedScanUnsupportedResidual => .document_sql_bounded_scan_unsupported_residual,
+        error.DocumentSqlLateralRequiresNativeProducer => .document_sql_lateral_requires_native_producer,
         error.DocumentSqlRequiresBoundedScan => .document_sql_requires_bounded_scan,
         error.DocumentSqlUnnestRequiresArray => .document_sql_unnest_requires_array,
         error.DocumentSqlUnnestUnsupported => .document_sql_unnest_unsupported,
@@ -321,6 +325,7 @@ pub fn knownErrorDiagnostic(phase: SqlDiagnosticPhase, err: anyerror) ?SqlDiagno
         .document_sql_bounded_scan_row_cap_exceeded => diagnostic.withHint("Increase the document SQL bounded-scan row cap or use an indexed/native producer."),
         .document_sql_bounded_scan_unbounded_source => diagnostic.withHint("Add an explicit LIMIT or provide a bounded scan policy."),
         .document_sql_bounded_scan_unsupported_residual => diagnostic.withHint("Rewrite the predicate to a supported exact residual shape or add a native indexed producer."),
+        .document_sql_lateral_requires_native_producer => diagnostic.withHint("Admit correlated lateral document reads only after proving branch cardinality, row identity, correlation binding, deterministic ordering, limit interaction, residual filtering, and relational fallback rejection."),
         .document_sql_requires_bounded_scan => diagnostic.withHint("Provide an explicit document SQL bounded-scan policy or add an exact indexed/native producer."),
         .document_sql_unnest_requires_array => diagnostic.withHint("Use UNNEST only on fields declared with array type metadata."),
         .document_sql_unnest_unsupported => diagnostic.withHint("Use a single top-level UNNEST over one array field with a bounded document producer."),
@@ -352,6 +357,7 @@ pub const SqlAdapterClassificationReason = enum {
     document_sql_bounded_scan_missing_exact_producer,
     document_sql_bounded_scan_unbounded_source,
     document_sql_bounded_scan_unsupported_residual,
+    document_sql_lateral_requires_native_producer,
     document_sql_unnest_unsupported,
     document_sql_unsupported_join,
     document_sql_view_mapping_catalog,
@@ -519,6 +525,7 @@ pub fn nativeExecutionRequirement(reason: SqlAdapterClassificationReason) Native
         .document_sql_bounded_scan_missing_exact_producer => .{ .category = .stream_materialization },
         .document_sql_bounded_scan_unbounded_source => .{ .category = .stream_materialization },
         .document_sql_bounded_scan_unsupported_residual => .{ .category = .stream_materialization },
+        .document_sql_lateral_requires_native_producer => .{ .category = .stream_materialization },
         .document_sql_unnest_unsupported => .{ .category = .stream_materialization },
         .document_sql_unsupported_join => .{ .category = .stream_materialization },
         .document_sql_view_mapping_catalog => .{ .category = .catalog_lifecycle, .durable_metadata = true },
@@ -635,6 +642,7 @@ test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_bounded_scan_missing_exact_producer, classificationReasonFromToken("document_sql_bounded_scan_missing_exact_producer").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_bounded_scan_unbounded_source, classificationReasonFromToken("document_sql_bounded_scan_unbounded_source").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_bounded_scan_unsupported_residual, classificationReasonFromToken("document_sql_bounded_scan_unsupported_residual").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_lateral_requires_native_producer, classificationReasonFromToken("document_sql_lateral_requires_native_producer").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_unsupported_join, classificationReasonFromToken("document_sql_unsupported_join").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_view_mapping_catalog, classificationReasonFromToken("document_sql_view_mapping_catalog").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_view_mapping_unsupported, classificationReasonFromToken("document_sql_view_mapping_unsupported").?);
@@ -848,6 +856,12 @@ test "sql diagnostics expose stable phase code and native model fields" {
     try std.testing.expectEqualStrings("Add a matching native index/materialization or provide a bounded scan policy with exact residual execution.", missing_exact.hint.?);
     const index_unavailable = knownErrorDiagnostic(.plan, error.DocumentSqlIndexUnavailable) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(SqlDiagnosticCode.document_sql_bounded_scan_missing_exact_producer, index_unavailable.code);
+
+    const lateral_contract = knownErrorDiagnostic(.plan, error.DocumentSqlLateralRequiresNativeProducer) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_lateral_requires_native_producer, lateral_contract.code);
+    try std.testing.expectEqualStrings("document SQL correlated lateral requires a native producer contract", lateral_contract.message);
+    try std.testing.expectEqualStrings("document SQL correlated lateral producer contract", lateral_contract.missing_native_model.?);
+    try std.testing.expectEqualStrings("Admit correlated lateral document reads only after proving branch cardinality, row identity, correlation binding, deterministic ordering, limit interaction, residual filtering, and relational fallback rejection.", lateral_contract.hint.?);
 
     const row_cap = knownErrorDiagnostic(.execute, error.DocumentSqlBoundedScanRowCapExceeded) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(SqlDiagnosticCode.document_sql_bounded_scan_row_cap_exceeded, row_cap.code);

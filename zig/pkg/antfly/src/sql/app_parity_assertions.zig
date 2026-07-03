@@ -58,6 +58,7 @@ pub fn expectFailClosedUnsupported(result: anytype) !void {
         error.UnsupportedSqlShape,
         error.InvalidSqlCatalog,
         error.DocumentSqlMergeRequiresNativeProducer,
+        error.DocumentSqlLateralRequiresNativeProducer,
         error.DocumentSqlWriteUnsupported,
         error.DocumentSqlUnsupportedJoin,
         error.DocumentSqlBoundedScanIncompleteTopK,

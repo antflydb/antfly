@@ -1325,6 +1325,40 @@ fn validateGeneratedCountStarArgumentList(
     try expr_generated_validate.validateGeneratedExpressionPayloads(tokens, list.expressions[0]);
 }
 
+fn validateGeneratedWindowFunctionFilterPayloads(
+    filter_start: ?usize,
+    filter_predicate_start: ?usize,
+    filter_predicate_end: ?usize,
+    filter_end: ?usize,
+    generated_expression: ?*const generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const expression = generated_expression orelse return;
+    if (expression.kind != .function_call) return error.UnsupportedSqlShape;
+    if (filter_start) |start| {
+        const end = filter_end orelse return error.UnsupportedSqlShape;
+        const predicate_start = filter_predicate_start orelse return error.UnsupportedSqlShape;
+        const predicate_end = filter_predicate_end orelse return error.UnsupportedSqlShape;
+        if (expression.filter_tokens == null or
+            expression.filter_predicate_tokens == null or
+            expression.filter_expression == null)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        if (expression.filter_tokens.?.start != start or expression.filter_tokens.?.end != end) return error.UnsupportedSqlShape;
+        if (expression.filter_predicate_tokens.?.start != predicate_start or expression.filter_predicate_tokens.?.end != predicate_end) return error.UnsupportedSqlShape;
+        if (!expr_generated.generatedTokenRangeEqual(expression.filter_expression.?.tokens orelse return error.UnsupportedSqlShape, expression.filter_predicate_tokens.?)) return error.UnsupportedSqlShape;
+    } else {
+        if (filter_end != null or filter_predicate_start != null or filter_predicate_end != null) return error.UnsupportedSqlShape;
+        if (expression.filter_tokens != null or
+            expression.filter_predicate_tokens != null or
+            expression.filter_expression_kind != null or
+            expression.filter_expression != null)
+        {
+            return error.UnsupportedSqlShape;
+        }
+    }
+}
+
 fn generatedWindowDefinitionPartitionTokens(options: WindowDefinitionParserOptions) ?generated_parser.GeneratedSqlTokenRange {
     if (options.generated_window_ast) |window| return window.partition_tokens;
     if (options.generated_over_expression_ast) |expression| return expression.over_partition_tokens;
@@ -1847,7 +1881,9 @@ pub fn parseWindowSpecAlloc(
         argument_end,
         options.generated_expression_ast,
     );
-    const generated_filter_expression: ?*const generated_parser.GeneratedSqlExpressionAst = if (parser.peekKeyword(tokens, pos.*, "filter")) blk: {
+    const filter_start = if (parser.peekKeyword(tokens, pos.*, "filter")) pos.* else null;
+    const filter_predicate_start = if (filter_start != null) pos.* + 3 else null;
+    const generated_filter_expression: ?*const generated_parser.GeneratedSqlExpressionAst = if (filter_start != null) blk: {
         const generated_expression = options.generated_expression_ast orelse break :blk null;
         break :blk generated_expression.filter_expression;
     } else null;
@@ -1869,6 +1905,15 @@ pub fn parseWindowSpecAlloc(
     );
     var filter_transferred = false;
     errdefer if (!filter_transferred) expr_aggregate.freeFilter(alloc, filter);
+    const filter_end = if (filter_start != null) pos.* else null;
+    const filter_predicate_end = if (filter_start != null) pos.* - 1 else null;
+    try validateGeneratedWindowFunctionFilterPayloads(
+        filter_start,
+        filter_predicate_start,
+        filter_predicate_end,
+        filter_end,
+        options.generated_expression_ast,
+    );
     if (!functionSupportsFilter(function) and !expr_aggregate.filterIsEmpty(filter)) return error.UnsupportedSqlShape;
     try parser.expectKeyword(tokens, pos, "over");
     const over_start = pos.* - 1;
@@ -2146,6 +2191,51 @@ test "sql expr_window validates frame helpers" {
         .{ .kind = .identifier, .text = "window", .source_start = 0, .source_end = 8 },
     };
     try std.testing.expect(topLevelClauseStart(quoted_window_tokens[0..], 0) == null);
+    const generated_window_count_ast = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .function_call,
+        .tokens = .{ .start = 0, .end = 3 },
+        .function_name_tokens = .{ .start = 0, .end = 1 },
+        .window_function_kind = .count,
+    };
+    try validateGeneratedWindowFunctionFilterPayloads(null, null, null, null, &generated_window_count_ast);
+    const stale_window_count_filter_kind = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .function_call,
+        .tokens = .{ .start = 0, .end = 3 },
+        .function_name_tokens = .{ .start = 0, .end = 1 },
+        .window_function_kind = .count,
+        .filter_expression_kind = .field,
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedWindowFunctionFilterPayloads(null, null, null, null, &stale_window_count_filter_kind),
+    );
+    var generated_filter_child = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .eq,
+        .tokens = .{ .start = 3, .end = 6 },
+    };
+    const filtered_window_count_ast = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .function_call,
+        .tokens = .{ .start = 0, .end = 8 },
+        .function_name_tokens = .{ .start = 0, .end = 1 },
+        .window_function_kind = .count,
+        .filter_tokens = .{ .start = 0, .end = 8 },
+        .filter_predicate_tokens = .{ .start = 3, .end = 6 },
+        .filter_expression = &generated_filter_child,
+    };
+    try validateGeneratedWindowFunctionFilterPayloads(0, 3, 6, 8, &filtered_window_count_ast);
+    const stale_filtered_window_count_ast = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .function_call,
+        .tokens = .{ .start = 0, .end = 8 },
+        .function_name_tokens = .{ .start = 0, .end = 1 },
+        .window_function_kind = .count,
+        .filter_tokens = .{ .start = 0, .end = 8 },
+        .filter_predicate_tokens = .{ .start = 3, .end = 5 },
+        .filter_expression = &generated_filter_child,
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedWindowFunctionFilterPayloads(0, 3, 6, 8, &stale_filtered_window_count_ast),
+    );
 
     try validateFrame(.{
         .unit = .rows,

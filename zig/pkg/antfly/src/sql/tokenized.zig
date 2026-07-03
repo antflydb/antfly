@@ -4963,21 +4963,23 @@ fn generatedReadAstHasValidClassificationPayload(
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.join_left_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.join_right_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.join_predicate_tokens)) return false;
-    if (!generatedReadJoinPayloadIsValid(
-        tokens,
-        end,
-        read_ast.source_tokens,
-        read_ast.join_tokens,
-        read_ast.join_operator_tokens,
-        read_ast.join_kind,
-        read_ast.join_left_tokens,
-        read_ast.join_right_tokens,
-        read_ast.join_predicate_tokens,
-        read_ast.join_predicate_expression,
-        read_ast.join_items,
-        read_ast.join_tree_root_index,
-        read_ast.join_tree_depth,
-    )) return false;
+    const source_contains_lateral_table_function = generatedReadSourceContainsLateralJoinTableFunction(tokens, read_ast);
+    if (!source_contains_lateral_table_function and
+        !generatedReadJoinPayloadIsValid(
+            tokens,
+            end,
+            read_ast.source_tokens,
+            read_ast.join_tokens,
+            read_ast.join_operator_tokens,
+            read_ast.join_kind,
+            read_ast.join_left_tokens,
+            read_ast.join_right_tokens,
+            read_ast.join_predicate_tokens,
+            read_ast.join_predicate_expression,
+            read_ast.join_items,
+            read_ast.join_tree_root_index,
+            read_ast.join_tree_depth,
+        )) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.where_tokens)) return false;
     if (!generatedReadOptionalRangeIsPrecededByKeyword(tokens, read_ast.where_tokens, .where)) return false;
     if (!generatedReadOptionalExpressionTokensMatchMaybeRange(tokens, end, read_ast.where_expression, read_ast.where_tokens)) return false;
@@ -5551,6 +5553,9 @@ fn generatedReadJoinLateralSubqueryPayloadIsValid(
             item.right_lateral_alias_tokens == null and
             item.right_lateral_alias_name_tokens == null;
     }
+    if (item.right_tokens.start + 1 >= item.right_tokens.end or tokens[item.right_tokens.start + 1].kind != .lparen) {
+        return generatedReadJoinLateralTableFunctionPayloadIsValid(tokens, item);
+    }
     const subquery_tokens = item.right_lateral_subquery_tokens orelse return false;
     const subquery_read = item.right_lateral_subquery_read_ast orelse return false;
     const alias_tokens = item.right_lateral_alias_tokens orelse return false;
@@ -5570,6 +5575,20 @@ fn generatedReadJoinLateralSubqueryPayloadIsValid(
         return false;
     }
     return generatedReadAstHasValidClassificationPayload(tokens[subquery_tokens.start..subquery_tokens.end], subquery_read);
+}
+
+fn generatedReadJoinLateralTableFunctionPayloadIsValid(
+    tokens: []const Token,
+    item: generated_parser.GeneratedSqlJoinAst,
+) bool {
+    if (item.right_lateral_subquery_tokens != null or
+        item.right_lateral_subquery_read_ast != null or
+        item.right_lateral_alias_tokens != null or
+        item.right_lateral_alias_name_tokens != null)
+    {
+        return false;
+    }
+    return generatedReadSourceRangeStartsWithLateralTableFunction(tokens, item.right_tokens);
 }
 
 fn generatedReadJoinRelationGapIsOptionalAlias(tokens: []const Token, relation_end: usize, next_start: usize) bool {
@@ -7042,7 +7061,7 @@ fn generatedReadKindMatchesStructuredClauses(
     const generated_kind = generatedReadStatementKindFromGeneratedReadKind(read_ast.kind) orelse return false;
     const structured_kind = generatedReadStatementKindFromStructuredClauses(tokens, read_ast);
     if (generated_kind == structured_kind) return true;
-    return generated_kind == .query and
+    return (generated_kind == .query or generated_kind == .join) and
         structured_kind == .lateral and
         generatedReadSourceContainsLateralJoinTableFunction(tokens, read_ast);
 }
@@ -7088,10 +7107,30 @@ fn generatedReadSourceContainsLateralJoinTableFunction(
     tokens: []const Token,
     read_ast: *const generated_parser.GeneratedSqlReadAst,
 ) bool {
-    if (read_ast.join_items.len != 0) return false;
+    for (read_ast.join_items) |item| {
+        if (generatedReadSourceRangeStartsWithLateralTableFunction(tokens, item.right_tokens)) return true;
+    }
     const source = read_ast.source_tokens orelse return false;
     return generatedReadRangeContainsKeyword(tokens, source, .join) and
         generatedReadRangeContainsKeyword(tokens, source, .lateral);
+}
+
+fn generatedReadSourceRangeStartsWithLateralTableFunction(
+    tokens: []const Token,
+    source_tokens: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (source_tokens.start + 2 >= source_tokens.end or source_tokens.end > tokens.len) return false;
+    if (!tokens[source_tokens.start].matchesKeywordTag(.lateral)) return false;
+    if (tokens[source_tokens.start + 1].kind != .identifier) return false;
+    const lparen_index = source_tokens.start + 2;
+    if (tokens[lparen_index].kind != .lparen) return false;
+    const rparen_index = generatedDmlMatchingParen(tokens, lparen_index, source_tokens.end) orelse return false;
+    const alias_start = rparen_index + 1;
+    if (alias_start == source_tokens.end) return true;
+    if (alias_start + 1 == source_tokens.end) return tokens[alias_start].kind == .identifier;
+    return alias_start + 2 == source_tokens.end and
+        tokens[alias_start].matchesKeywordTag(.as) and
+        tokens[alias_start + 1].kind == .identifier;
 }
 
 fn generatedReadRangeContainsKeyword(
@@ -13278,12 +13317,14 @@ test "sql adapter parsed sql read statement kind can come from generated AST" {
     var generated_lateral_table_function = try ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM docs AS d JOIN LATERAL UNNEST(d.tags) AS tag ON true WHERE tag = 'urgent' LIMIT 10");
     defer generated_lateral_table_function.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_lateral_table_function.generatedStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.lateral, generated_lateral_table_function.generatedReadStatementKind().?);
     try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.lateral, generated_lateral_table_function.readStatementKind().?);
     try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.lateral, generated_lateral_table_function.readStatementKindIncludingGeneratedAst().?);
 
     var generated_lateral_mapped_table_function = try ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d JOIN LATERAL UNNEST(d.tag_list) AS tag ON true WHERE tag = 'urgent' LIMIT 10");
     defer generated_lateral_mapped_table_function.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_lateral_mapped_table_function.generatedStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.lateral, generated_lateral_mapped_table_function.generatedReadStatementKind().?);
     try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.lateral, generated_lateral_mapped_table_function.readStatementKind().?);
     try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.lateral, generated_lateral_mapped_table_function.readStatementKindIncludingGeneratedAst().?);
 

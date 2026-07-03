@@ -5787,6 +5787,8 @@ pub fn freeScalarSubqueryProjection(alloc: std.mem.Allocator, value: db_mod.type
     var query = value.query;
     query.deinit(alloc);
     if (value.output_field.len > 0) alloc.free(value.output_field);
+    freeLateralCorrelations(alloc, value.correlations);
+    if (value.correlations.len > 0) alloc.free(value.correlations);
 }
 
 pub fn freeScalarSubqueryProjections(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsScalarSubqueryProjection) void {

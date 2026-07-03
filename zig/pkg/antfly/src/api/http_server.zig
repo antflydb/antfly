@@ -9224,6 +9224,7 @@ pub const ApiHttpServer = struct {
             error.DocumentSqlBoundedScanByteCapExceeded => "document_sql_bounded_scan_byte_cap_exceeded",
             error.DocumentSqlArrayRequiresUnnest => "document_sql_array_requires_unnest",
             error.DocumentSqlUnnestUnsupported => "document_sql_unnest_unsupported",
+            error.DocumentSqlLateralRequiresNativeProducer => "document_sql_lateral_requires_native_producer",
             error.DocumentSqlUnsupportedJoin => "document_sql_unsupported_join",
             error.DocumentSqlAggregateUnsupported => "document_sql_aggregate_unsupported",
             error.DocumentSqlNativeSearchRequiresTableFunction => "document_sql_native_search_requires_table_function",

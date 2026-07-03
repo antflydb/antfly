@@ -4090,7 +4090,9 @@ fn validateGeneratedJoinLateralSubqueryMetadata(
     join: generated_parser.GeneratedSqlJoinAst,
 ) anyerror!void {
     if (join.right_tokens.start >= join.right_tokens.end or join.right_tokens.end > tokens.len) return error.UnsupportedSqlShape;
-    if (!tokens[join.right_tokens.start].matchesKeywordTag(.lateral)) {
+    const operator_has_lateral = generatedTokenRangeContainsKeyword(tokens, join.operator_tokens, .lateral);
+    const right_starts_lateral = tokens[join.right_tokens.start].matchesKeywordTag(.lateral);
+    if (!right_starts_lateral and !operator_has_lateral) {
         if (join.right_lateral_subquery_tokens != null or
             join.right_lateral_subquery_read_ast != null or
             join.right_lateral_alias_tokens != null or
@@ -4100,6 +4102,10 @@ fn validateGeneratedJoinLateralSubqueryMetadata(
         }
         return;
     }
+    if (generatedJoinLooksLikeLateralTableFunction(tokens, join)) {
+        return try validateGeneratedJoinLateralTableFunctionMetadata(tokens, join);
+    }
+    if (!right_starts_lateral) return error.UnsupportedSqlShape;
     const subquery_tokens = join.right_lateral_subquery_tokens orelse return error.UnsupportedSqlShape;
     const subquery_read = join.right_lateral_subquery_read_ast orelse return error.UnsupportedSqlShape;
     if (join.right_tokens.start + 2 != subquery_tokens.start) return error.UnsupportedSqlShape;
@@ -4114,6 +4120,66 @@ fn validateGeneratedJoinLateralSubqueryMetadata(
         join.right_lateral_alias_name_tokens,
     );
     try validateGeneratedReadAstPayloads(tokens[subquery_tokens.start..subquery_tokens.end], subquery_read.*);
+}
+
+fn generatedTokenRangeContainsKeyword(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    keyword: TokenKeyword,
+) bool {
+    if (range.end > tokens.len or range.start > range.end) return false;
+    var index = range.start;
+    while (index < range.end) : (index += 1) {
+        if (tokens[index].matchesKeywordTag(keyword)) return true;
+    }
+    return false;
+}
+
+fn generatedJoinLooksLikeLateralTableFunction(
+    tokens: []const Token,
+    join: generated_parser.GeneratedSqlJoinAst,
+) bool {
+    if (join.right_tokens.end > tokens.len or join.right_tokens.start >= join.right_tokens.end) return false;
+    var function_start = join.right_tokens.start;
+    if (tokens[function_start].matchesKeywordTag(.lateral)) function_start += 1;
+    if (function_start + 1 >= join.right_tokens.end) return false;
+    return tokens[function_start].kind == .identifier and
+        tokens[function_start + 1].kind == .lparen;
+}
+
+fn validateGeneratedJoinLateralTableFunctionMetadata(
+    tokens: []const Token,
+    join: generated_parser.GeneratedSqlJoinAst,
+) !void {
+    if (join.right_lateral_subquery_tokens != null or
+        join.right_lateral_subquery_read_ast != null or
+        join.right_lateral_alias_tokens != null or
+        join.right_lateral_alias_name_tokens != null)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (!generatedTokenRangeContainsKeyword(tokens, join.operator_tokens, .lateral) and
+        !tokens[join.right_tokens.start].matchesKeywordTag(.lateral)) return error.UnsupportedSqlShape;
+    if (join.right_tokens.end > tokens.len or join.right_tokens.start >= join.right_tokens.end) return error.UnsupportedSqlShape;
+    var function_start = join.right_tokens.start;
+    if (tokens[function_start].matchesKeywordTag(.lateral)) function_start += 1;
+    if (function_start + 1 >= join.right_tokens.end) return error.UnsupportedSqlShape;
+    if (tokens[function_start].kind != .identifier) return error.UnsupportedSqlShape;
+    const lparen_index = function_start + 1;
+    if (tokens[lparen_index].kind != .lparen) return error.UnsupportedSqlShape;
+    const rparen_index = generatedMatchingParenInRange(tokens, lparen_index, join.right_tokens.end) orelse return error.UnsupportedSqlShape;
+    const alias_start = rparen_index + 1;
+    if (alias_start == join.right_tokens.end) return;
+    if (alias_start + 1 == join.right_tokens.end) {
+        if (tokens[alias_start].kind != .identifier) return error.UnsupportedSqlShape;
+        return;
+    }
+    if (alias_start + 2 != join.right_tokens.end or
+        !tokens[alias_start].matchesKeywordTag(.as) or
+        tokens[alias_start + 1].kind != .identifier)
+    {
+        return error.UnsupportedSqlShape;
+    }
 }
 
 fn validateGeneratedLateralSubqueryAlias(

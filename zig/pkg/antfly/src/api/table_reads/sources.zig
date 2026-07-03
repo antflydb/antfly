@@ -9049,12 +9049,13 @@ test "api.table_reads.docid document sql view mapping runtime results match nati
         virtual_schema,
         capabilities,
         "SELECT _id, plan FROM support_view WHERE plan IS NOT NULL LIMIT 10",
-        4,
+        5,
         &.{
             "{\"_id\":\"doc:a\",\"plan\":\"pro\"}",
             "{\"_id\":\"doc:b\",\"plan\":\"free\"}",
             "{\"_id\":\"doc:c\",\"plan\":\"pro\"}",
             "{\"_id\":\"doc:d\",\"plan\":\"team\"}",
+            "{\"_id\":\"doc:f\",\"plan\":\"trial\"}",
         },
     );
     defer is_not_null.deinit(alloc);

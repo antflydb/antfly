@@ -4193,6 +4193,7 @@ fn parseDocumentLateralUnnestFromTailAlloc(
     if (unnest_start >= tokens.len or !tokens[unnest_start].matchesKeywordTag(.lateral)) return error.DocumentSqlUnsupportedJoin;
     unnest_start += 1;
     if (unnest_start >= tokens.len) return error.DocumentSqlUnsupportedJoin;
+    if (tokens[unnest_start].kind == .lparen) return error.DocumentSqlLateralRequiresNativeProducer;
 
     const on_index = findTopLevelKeywordInRange(tokens, unnest_start, tokens.len, .on);
     const unnest_end = on_index orelse tokens.len;
@@ -4349,6 +4350,7 @@ fn rejectUnsupportedDocumentStatementShape(
     if (findTopLevelKeyword(tokens, .join) != null and
         !documentFromTailContainsOnlyLateralUnnestJoin(tokens, from_index, source_tail_end))
     {
+        if (documentFromTailContainsLateralSubquery(tokens, from_index, source_tail_end)) return error.DocumentSqlLateralRequiresNativeProducer;
         return error.DocumentSqlUnsupportedJoin;
     }
     if (!allow_group_by and findTopLevelKeyword(tokens, .group) != null) return error.UnsupportedSqlShape;
@@ -4380,6 +4382,17 @@ fn documentFromTailContainsOnlyLateralUnnestJoin(tokens: []const Token, from_ind
     const unnest_end = on_index orelse tail.len;
     if (unnest_end <= unnest_start) return false;
     return tail[unnest_start].kind == .identifier and std.ascii.eqlIgnoreCase(tail[unnest_start].text, "unnest");
+}
+
+fn documentFromTailContainsLateralSubquery(tokens: []const Token, from_index: usize, source_tail_end: usize) bool {
+    if (from_index + 2 >= source_tail_end) return false;
+    const tail = tokens[from_index + 2 .. source_tail_end];
+    const join_index = findTopLevelKeyword(tail, .join) orelse return false;
+    var lateral_index = join_index + 1;
+    if (lateral_index >= tail.len) return false;
+    if (!tail[lateral_index].matchesKeywordTag(.lateral)) return false;
+    lateral_index += 1;
+    return lateral_index < tail.len and tail[lateral_index].kind == .lparen;
 }
 
 fn documentIdentifierName(token: Token, source_ref: DocumentSourceRef) ![]const u8 {
@@ -7757,6 +7770,10 @@ test "document SQL lowers explicit array unnest over bounded scan" {
     try std.testing.expectError(error.DocumentSqlUnsupportedJoin, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_predicated_lateral_unnest, schema, view_mapping_virtual_schema, .{
         .bounded_scan = .{ .max_rows = 25 },
     }));
+
+    var view_mapping_correlated_lateral = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10");
+    defer view_mapping_correlated_lateral.deinit(alloc);
+    try std.testing.expectError(error.DocumentSqlLateralRequiresNativeProducer, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_correlated_lateral, schema, view_mapping_virtual_schema, .{}));
 
     var view_mapping_indexed_unnest = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' LIMIT 10");
     defer view_mapping_indexed_unnest.deinit(alloc);

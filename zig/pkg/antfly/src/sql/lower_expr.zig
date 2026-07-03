@@ -1305,9 +1305,11 @@ fn parseGeneratedScalarSubquerySelectListAlloc(
             .output = output,
             .query = subquery.query,
             .output_field = subquery.output_field,
+            .correlations = subquery.correlations,
         };
         subquery.query = .{};
         subquery.output_field = "";
+        subquery.correlations = &.{};
         output_transferred = true;
         try outputs.append(alloc, .{ .kind = .scalar_subquery, .index = scalar_subqueries.items.len });
         try scalar_subqueries.append(alloc, projection);
@@ -16177,6 +16179,23 @@ test "sql adapter lower expr lowers generated scalar subquery projections" {
     try std.testing.expectEqual(@as(usize, 1), mixed_lowered.plan.query.order_by.len);
     try std.testing.expectEqualStrings("first_status", mixed_lowered.plan.query.order_by[0].field);
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, mixed_lowered.plan.query.order_by[0].direction);
+
+    var correlated_lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT outer_usage.id, (SELECT status FROM usage_records AS child_usage WHERE child_usage.id = outer_usage.id) AS same_status FROM usage_records AS outer_usage",
+        schema,
+        &.{},
+    );
+    defer correlated_lowered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), correlated_lowered.plan.query.select.len);
+    try std.testing.expectEqualStrings("id", correlated_lowered.plan.query.select[0]);
+    try std.testing.expectEqual(@as(usize, 1), correlated_lowered.plan.query.scalar_subqueries.len);
+    const correlated_projection = correlated_lowered.plan.query.scalar_subqueries[0];
+    try std.testing.expectEqualStrings("same_status", correlated_projection.output);
+    try std.testing.expectEqualStrings("status", correlated_projection.output_field);
+    try std.testing.expectEqual(@as(usize, 1), correlated_projection.correlations.len);
+    try std.testing.expectEqualStrings("id", correlated_projection.correlations[0].left_field);
+    try std.testing.expectEqualStrings("id", correlated_projection.correlations[0].right_field);
 
     var malformed_scalar_projection = try tokenized.ParsedSql.initAlloc(
         alloc,
