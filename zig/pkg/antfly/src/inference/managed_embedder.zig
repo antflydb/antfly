@@ -359,6 +359,7 @@ fn releaseSharedRequestPacer(scope_key: []const u8) void {
 pub const ManagedEmbeddingEntry = struct {
     alloc: std.mem.Allocator,
     index_name: []u8,
+    embedding_name: []u8 = "",
     provider: ProviderKind,
     model: []u8,
     base_url: []u8,
@@ -381,6 +382,7 @@ pub const ManagedEmbeddingEntry = struct {
     fn deinit(self: *ManagedEmbeddingEntry, alloc: std.mem.Allocator) void {
         std.debug.assert(self.alloc.ptr == alloc.ptr);
         alloc.free(self.index_name);
+        if (self.embedding_name.len > 0) alloc.free(self.embedding_name);
         alloc.free(self.model);
         alloc.free(self.base_url);
         if (self.region.len > 0) alloc.free(self.region);
@@ -657,6 +659,7 @@ pub const ManagedEmbedder = struct {
     fn findEntry(self: *const ManagedEmbedder, index_name: []const u8) ?*const ManagedEmbeddingEntry {
         for (self.entries) |*entry| {
             if (std.mem.eql(u8, entry.index_name, index_name)) return entry;
+            if (entry.embedding_name.len > 0 and std.mem.eql(u8, entry.embedding_name, index_name)) return entry;
         }
         return null;
     }
@@ -1063,6 +1066,8 @@ fn buildManagedEmbeddingEntry(
         null;
     const owned_index_name = try alloc.dupe(u8, index_name);
     errdefer alloc.free(owned_index_name);
+    const owned_embedding_name: []u8 = if (cfg.embedding_name) |embedding_name| try alloc.dupe(u8, embedding_name) else @constCast("");
+    errdefer if (owned_embedding_name.len > 0) alloc.free(owned_embedding_name);
     const owned_model = try alloc.dupe(u8, embedder_cfg.model);
     errdefer alloc.free(owned_model);
 
@@ -1096,6 +1101,7 @@ fn buildManagedEmbeddingEntry(
     return .{
         .alloc = alloc,
         .index_name = owned_index_name,
+        .embedding_name = owned_embedding_name,
         .provider = provider,
         .model = owned_model,
         .base_url = base_url,
@@ -2304,6 +2310,13 @@ pub fn testArtifactBackedEmbeddingTranslation() !void {
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"embedding_name\":\"document_chunk_dense_v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"embedder\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"generator\"") == null);
+
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
+        \\{"document_vectors":{"type":"embeddings","field":"embedding","embedding_name":"document_chunk_dense_v1","source_artifact_name":"document_chunks_v1","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}}
+    , local.provider());
+    defer managed.deinit();
+    try std.testing.expect(managed.findEntry("document_vectors") != null);
+    try std.testing.expect(managed.findEntry("document_chunk_dense_v1") != null);
 }
 
 test "managed embedder translates artifact backed embeddings config without generator" {

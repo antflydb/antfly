@@ -3197,7 +3197,7 @@ pub const DB = struct {
             self.core.replaySource(),
             self.core.batchExecutionResources().index_manager,
             append_ctx,
-            appendDerivedBatchFromEnrichment,
+            appendGeneratedBatchFromEnrichment,
             self.executor,
             notifyDerivedExecutorSequence,
             self.backend_runtime,
@@ -13651,6 +13651,11 @@ fn shouldAppendSplitDelta(self: *DB) bool {
     return state.phase == .splitting;
 }
 
+fn shouldAppendSplitDeltaForContext(ctx: *const BatchExecutionContext) bool {
+    const state = ctx.shard_manager.getSplitState() orelse return false;
+    return state.phase == .splitting;
+}
+
 fn splitShadowRequiresMaterializedDerivedBatch(self: *DB) bool {
     if (self.shadow == null) return false;
     const state = self.core.splitState() orelse return false;
@@ -16629,6 +16634,54 @@ fn appendSparseEmbeddingArtifactWrite(
     return try alloc.dupe(u8, key);
 }
 
+fn embeddingArtifactKeyForBaseAlloc(alloc: Allocator, base_key: []const u8, artifact_name: []const u8) ![]u8 {
+    return if (internal_keys.isInternalUserKey(base_key))
+        try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, base_key, artifact_name)
+    else
+        try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, base_key, artifact_name);
+}
+
+const PendingArtifactWriteIndex = struct {
+    values: std.StringHashMapUnmanaged([]const u8) = .empty,
+
+    fn init(alloc: Allocator, writes: []const types.BatchWrite) !PendingArtifactWriteIndex {
+        var index = PendingArtifactWriteIndex{};
+        errdefer index.deinit(alloc);
+        for (writes) |write| {
+            try index.values.put(alloc, write.key, write.value);
+        }
+        return index;
+    }
+
+    fn deinit(self: *PendingArtifactWriteIndex, alloc: Allocator) void {
+        self.values.deinit(alloc);
+        self.* = .{};
+    }
+
+    fn get(self: *const PendingArtifactWriteIndex, key: []const u8) ?[]const u8 {
+        return self.values.get(key);
+    }
+};
+
+fn storedOrPendingEmbeddingSourceHash(
+    alloc: Allocator,
+    db: *DB,
+    pending_writes: ?*const PendingArtifactWriteIndex,
+    artifact_key: []const u8,
+) !?u64 {
+    if (pending_writes) |index| {
+        if (index.get(artifact_key)) |value| {
+            return enrichment_artifact_codec.sourceHash(value) catch null;
+        }
+    }
+    const existing = db.core.store.get(alloc, artifact_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(existing);
+    return enrichment_artifact_codec.sourceHash(existing) catch null;
+}
+
 fn appendGraphEdgeArtifactWrite(
     alloc: Allocator,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
@@ -16953,7 +17006,7 @@ fn computeDenseRequest(
     dense_embeddings: *std.ArrayListUnmanaged(types.EnrichmentDenseEmbeddingWrite),
     cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
 ) !void {
-    return computeDenseRequestImpl(alloc, db, doc_value, request, artifact_writes, dense_embeddings, cache, appendDenseEmbeddingForConsumers);
+    return computeDenseRequestImpl(alloc, db, doc_value, request, artifact_writes, dense_embeddings, cache, false, appendDenseEmbeddingForConsumers);
 }
 
 fn computeDenseRequestDerived(
@@ -16965,7 +17018,7 @@ fn computeDenseRequestDerived(
     dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
     cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
 ) !void {
-    return computeDenseRequestImpl(alloc, db, doc_value, request, artifact_writes, dense_embeddings, cache, appendDerivedDenseEmbeddingForConsumers);
+    return computeDenseRequestImpl(alloc, db, doc_value, request, artifact_writes, dense_embeddings, cache, true, appendDerivedDenseEmbeddingForConsumers);
 }
 
 fn computeDenseRequestImpl(
@@ -16976,6 +17029,7 @@ fn computeDenseRequestImpl(
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     dense_embeddings: anytype,
     cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
+    skip_unchanged_artifacts: bool,
     comptime appendForConsumers: anytype,
 ) !void {
     const dense_embedder = if (db.enrichment_runtime) |runtime|
@@ -16995,16 +17049,40 @@ fn computeDenseRequestImpl(
         const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, artifact_writes.items, cache);
         defer freeChunkEmbeddingSources(alloc, sources);
         if (sources.len == 0) return;
+        var pending_writes = if (skip_unchanged_artifacts)
+            try PendingArtifactWriteIndex.init(alloc, artifact_writes.items)
+        else
+            PendingArtifactWriteIndex{};
+        defer pending_writes.deinit(alloc);
+        const pending_lookup: ?*const PendingArtifactWriteIndex = if (skip_unchanged_artifacts) &pending_writes else null;
 
-        const chunk_texts = try alloc.alloc([]const u8, sources.len);
-        defer alloc.free(chunk_texts);
-        for (sources, 0..) |source, i| chunk_texts[i] = source.text;
+        var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
+        defer chunk_texts.deinit(alloc);
+        var source_indexes = std.ArrayListUnmanaged(usize).empty;
+        defer source_indexes.deinit(alloc);
+        for (sources, 0..) |source, i| {
+            const source_hash = enrichment_artifact_codec.hashSource(source.text);
+            const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
+            defer alloc.free(artifact_key);
+            if (skip_unchanged_artifacts) {
+                if (try storedOrPendingEmbeddingSourceHash(alloc, db, pending_lookup, artifact_key)) |existing_hash| {
+                    if (existing_hash == source_hash) {
+                        try appendForConsumers(alloc, dense_embeddings, source.key, request.doc_key, artifact_key, &.{}, consumer_indexes);
+                        continue;
+                    }
+                }
+            }
+            try chunk_texts.append(alloc, source.text);
+            try source_indexes.append(alloc, i);
+        }
+        if (chunk_texts.items.len == 0) return;
 
-        const vectors = try dense_embedder.embedDenseBatch(alloc, embedding_name, chunk_texts, request.expected_dims);
+        const vectors = try dense_embedder.embedDenseBatch(alloc, embedding_name, chunk_texts.items, request.expected_dims);
         defer embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
-        if (vectors.len != sources.len) return error.InvalidEmbeddingResponse;
+        if (vectors.len != source_indexes.items.len) return error.InvalidEmbeddingResponse;
 
-        for (sources, vectors) |source, vector| {
+        for (source_indexes.items, vectors) |source_index, vector| {
+            const source = sources[source_index];
             const artifact_key = try appendEmbeddingArtifactWrite(
                 alloc,
                 artifact_writes,
@@ -17102,16 +17180,34 @@ fn computeSparseRequestDerived(
         const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, artifact_writes.items, cache);
         defer freeChunkEmbeddingSources(alloc, sources);
         if (sources.len == 0) return;
+        var pending_writes = try PendingArtifactWriteIndex.init(alloc, artifact_writes.items);
+        defer pending_writes.deinit(alloc);
 
-        const chunk_texts = try alloc.alloc([]const u8, sources.len);
-        defer alloc.free(chunk_texts);
-        for (sources, 0..) |source, i| chunk_texts[i] = source.text;
+        var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
+        defer chunk_texts.deinit(alloc);
+        var source_indexes = std.ArrayListUnmanaged(usize).empty;
+        defer source_indexes.deinit(alloc);
+        for (sources, 0..) |source, i| {
+            const source_hash = enrichment_artifact_codec.hashSource(source.text);
+            const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
+            defer alloc.free(artifact_key);
+            if (try storedOrPendingEmbeddingSourceHash(alloc, db, &pending_writes, artifact_key)) |existing_hash| {
+                if (existing_hash == source_hash) {
+                    try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, source.key, artifact_key, &.{}, &.{}, consumer_indexes);
+                    continue;
+                }
+            }
+            try chunk_texts.append(alloc, source.text);
+            try source_indexes.append(alloc, i);
+        }
+        if (chunk_texts.items.len == 0) return;
 
-        const sparse_batch = try sparse_embedder.embedSparseBatch(alloc, embedding_name, chunk_texts);
+        const sparse_batch = try sparse_embedder.embedSparseBatch(alloc, embedding_name, chunk_texts.items);
         defer embedder_mod.freeSparseEmbeddingBatch(alloc, sparse_batch);
-        if (sparse_batch.len != sources.len) return error.InvalidEmbeddingResponse;
+        if (sparse_batch.len != source_indexes.items.len) return error.InvalidEmbeddingResponse;
 
-        for (sources, sparse_batch) |source, sparse| {
+        for (source_indexes.items, sparse_batch) |source_index, sparse| {
+            const source = sources[source_index];
             const artifact_key = try appendSparseEmbeddingArtifactWrite(
                 alloc,
                 artifact_writes,
@@ -19878,6 +19974,47 @@ fn appendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.De
     return sequence;
 }
 
+fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.DerivedBatch, artifact_delete_keys: []const []const u8) !u64 {
+    if (artifact_delete_keys.len == 0) return appendDerivedBatchFromEnrichment(ctx_ptr, batch);
+
+    const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
+    var batch_ctx = ctx.batchContext();
+    try enforceHAWriteGateOptional(batch_ctx.ha_write_gate);
+    const replay_deleted_keys = try concatKeyViews(batch_ctx.alloc, batch.deleted_keys, artifact_delete_keys);
+    defer batch_ctx.alloc.free(replay_deleted_keys);
+    var replay_batch = batch;
+    replay_batch.deleted_keys = replay_deleted_keys;
+
+    batch_ctx.apply_mutex.lockExclusive();
+    const sequence = blk: {
+        defer batch_ctx.apply_mutex.unlockExclusive();
+        const reserved_sequence = batch_ctx.store.reserveNextReplaySequence(1);
+        const payload = try encodeChangeRecordPayload(&batch_ctx, replay_batch, reserved_sequence);
+        defer batch_ctx.alloc.free(payload);
+        try batch_ctx.store.putBatchWithReplay(batch_ctx.io, &.{}, artifact_delete_keys, .{
+            .sequence = reserved_sequence,
+            .payload = payload,
+        });
+        if (shouldAppendSplitDeltaForContext(&batch_ctx)) {
+            try batch_ctx.shard_manager.appendSplitDelta(currentTimeNs(), &.{}, artifact_delete_keys);
+        }
+        mirrorHAReplayPayloadBestEffortContext(&batch_ctx, payload);
+        batch_ctx.executor.trackBacklogBytes(reserved_sequence, @intCast(payload.len)) catch {};
+        break :blk reserved_sequence;
+    };
+
+    notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
+    if (ctx.executor.hasWorkers()) {
+        ctx.executor.forceSequence(sequence);
+        return sequence;
+    }
+
+    var applied_batch = replay_batch;
+    applied_batch.sequence = sequence;
+    try applyDerivedBatchContext(&batch_ctx, applied_batch);
+    return sequence;
+}
+
 fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
     const managed_indexes = try ctx.index_manager.managedIndexes(ctx.alloc);
     defer {
@@ -21635,6 +21772,13 @@ fn concatArtifactKeyViews(alloc: Allocator, lhs: []const []const u8, rhs: []cons
     const out = try alloc.alloc([]const u8, lhs.len + rhs.len);
     @memcpy(out[0..lhs.len], lhs);
     for (rhs, 0..) |key, i| out[lhs.len + i] = key;
+    return out;
+}
+
+fn concatKeyViews(alloc: Allocator, lhs: []const []const u8, rhs: []const []const u8) ![]const []const u8 {
+    const out = try alloc.alloc([]const u8, lhs.len + rhs.len);
+    @memcpy(out[0..lhs.len], lhs);
+    @memcpy(out[lhs.len..], rhs);
     return out;
 }
 
@@ -34017,7 +34161,7 @@ test "db document extraction chunks units through source artifact enrichment" {
         .config_json = "{\"chunk_name\":\"document_chunks_v1\"}",
     });
     try db.addIndex(.{
-        .name = "dv_document_chunks",
+        .name = "document_vectors",
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
     });
@@ -34035,7 +34179,7 @@ test "db document extraction chunks units through source artifact enrichment" {
         alloc.free(dense_consumers);
     }
     try std.testing.expectEqual(@as(usize, 1), dense_consumers.len);
-    try std.testing.expectEqualStrings("dv_document_chunks", dense_consumers[0]);
+    try std.testing.expectEqualStrings("document_vectors", dense_consumers[0]);
     const sparse_consumers = try db.core.index_manager.sparseIndexesForEmbedding(alloc, "document_chunk_sparse_v1");
     defer {
         for (sparse_consumers) |name| alloc.free(name);
@@ -34073,8 +34217,8 @@ test "db document extraction chunks units through source artifact enrichment" {
         }
     }
     try std.testing.expect(saw_document_asset);
-    try std.testing.expect(!saw_document_chunk_dense);
-    try std.testing.expect(!saw_document_chunk_sparse);
+    try std.testing.expect(saw_document_chunk_dense);
+    try std.testing.expect(saw_document_chunk_sparse);
 
     try db.batch(.{
         .writes = &.{.{
@@ -34171,7 +34315,7 @@ test "db document extraction chunks units through source artifact enrichment" {
 
     const query_vec = try deterministic_dense.interface().embedDense(alloc, "document_chunk_dense_v1", "alpha beta gamma", 3);
     defer alloc.free(query_vec);
-    const dense_index = db.core.index_manager.denseIndex("dv_document_chunks") orelse return error.IndexNotFound;
+    const dense_index = db.core.index_manager.denseIndex("document_vectors") orelse return error.IndexNotFound;
     var direct = try waitForDenseIndexResultsWithAttempts(&dense_index.index, query_vec, 3, 1, slow_test_wait_attempts);
     defer direct.deinit();
     const dense_internal_id = if (direct.takeMetadata(0)) |metadata|
@@ -34182,6 +34326,25 @@ test "db document extraction chunks units through source artifact enrichment" {
     };
     defer alloc.free(dense_internal_id);
     try std.testing.expectEqualStrings(chunk_key, dense_internal_id);
+
+    var semantic_rollup = try db.search(alloc, .{
+        .index_name = "document_vectors",
+        .dense = .{ .vector = query_vec, .k = 3 },
+        .return_mode = .parent_with_chunks,
+        .limit = 1,
+        .include_stored = false,
+    });
+    defer semantic_rollup.deinit();
+    try std.testing.expectEqual(@as(u32, 1), semantic_rollup.total_hits);
+    try std.testing.expectEqualStrings("doc:a", semantic_rollup.hits[0].id);
+    try std.testing.expectEqual(@as(usize, 1), semantic_rollup.hits[0].chunk_hits.len);
+    try std.testing.expectEqualStrings(chunk_public_id_for_rollup.id, semantic_rollup.hits[0].chunk_hits[0].id);
+    const semantic_chunk_ref = semantic_rollup.hits[0].chunk_hits[0].artifact_ref orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("doc:a", semantic_chunk_ref.document_id);
+    try std.testing.expectEqualStrings("document_chunks_v1", semantic_chunk_ref.name);
+    try std.testing.expectEqual(types.ArtifactKind.chunk, semantic_chunk_ref.kind);
+    try std.testing.expectEqual(@as(?u32, 0), semantic_chunk_ref.chunk_id);
+    try std.testing.expectEqualStrings("document:000001", semantic_chunk_ref.unit_id.?);
 
     var sparse_query = try deterministic_sparse.interface().embedSparse(alloc, "document_chunk_sparse_v1", "alpha beta gamma");
     defer sparse_query.deinit(alloc);

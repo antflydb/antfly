@@ -3500,8 +3500,7 @@ pub const IndexManager = struct {
                 if (embedding_cfg.expected_dims > 0 and embedding_cfg.expected_dims != entry.dims) continue;
                 if (embedding_cfg.source_artifact_name.len > 0) {
                     const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
-                    if (chunk_cfg.source_artifact_name.len > 0) continue;
-                    if (!hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
+                    if (chunk_cfg.source_artifact_name.len == 0 and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
                         try requests.append(alloc, .{
                             .kind = .chunk_text,
                             .index_name = try alloc.dupe(u8, entry.config.name),
@@ -3591,8 +3590,7 @@ pub const IndexManager = struct {
                 if (embedding_cfg.expected_dims != 0) continue;
                 if (embedding_cfg.source_artifact_name.len > 0) {
                     const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
-                    if (chunk_cfg.source_artifact_name.len > 0) continue;
-                    if (!hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
+                    if (chunk_cfg.source_artifact_name.len == 0 and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
                         try requests.append(alloc, .{
                             .kind = .chunk_text,
                             .index_name = try alloc.dupe(u8, entry.config.name),

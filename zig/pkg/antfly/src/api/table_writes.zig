@@ -2355,6 +2355,13 @@ pub const TableWriteSource = struct {
             index_name: []const u8,
             index_json: []const u8,
         ) anyerror!?void = null,
+        put_artifact_enrichment: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            artifact_name: []const u8,
+            enrichment_json: []const u8,
+        ) anyerror!?void = null,
         drop_index: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -2602,6 +2609,17 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.create_index orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name, index_name, index_json);
+    }
+
+    pub fn putArtifactEnrichment(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        enrichment_json: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.put_artifact_enrichment orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, artifact_name, enrichment_json);
     }
 
     pub fn dropIndex(
@@ -2943,6 +2961,7 @@ pub const BoundTableWriteSource = struct {
                 .create_table = createTable,
                 .update_schema = updateSchema,
                 .create_index = createIndex,
+                .put_artifact_enrichment = putArtifactEnrichment,
                 .drop_index = dropIndex,
                 .backup_table = backupTable,
                 .restore_table = restoreTable,
@@ -3285,6 +3304,24 @@ pub const BoundTableWriteSource = struct {
             alloc.free(cfg.config_json);
         }
         try self.db.addIndex(cfg);
+    }
+
+    fn putArtifactEnrichment(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        enrichment_json: []const u8,
+    ) !?void {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        var parsed = try std.json.parseFromSlice(db_mod.types.EnrichmentConfig, alloc, enrichment_json, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.name, artifact_name)) return error.InvalidEnrichmentConfig;
+        _ = try self.db.upsertEnrichment(parsed.value);
     }
 
     fn dropIndex(
@@ -4041,6 +4078,7 @@ pub const ProvisionedTableWriteSource = struct {
     fn beginLocalStructuralCacheUpdate(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         self.beginStructuralTableActivity(table_name);
         lockAtomic(&self.local_db_mutex);
+        self.invalidateWriteCache(table_name);
         self.invalidateReadCache(table_name);
         self.invalidateRuntimeStatusCache(table_name);
     }
@@ -9755,6 +9793,7 @@ fn applyIndexCreateToCachedDb(
         try db.reconfigureEnrichmentRuntime(enrichments.config());
         enrichments.forgetTransferred();
     }
+    try reconcileDbArtifactEnrichmentsFromIndexesJson(alloc, db, indexes_json);
     db.addIndex(.{
         .name = owned_name,
         .kind = kind,
@@ -9763,6 +9802,19 @@ fn applyIndexCreateToCachedDb(
         error.IndexAlreadyExists => {},
         else => return err,
     };
+}
+
+fn reconcileDbArtifactEnrichmentsFromIndexesJson(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    indexes_json: []const u8,
+) !void {
+    const enrichments = try indexes_api.collectArtifactEnrichmentsFromTableIndexesJson(alloc, indexes_json);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
+    indexes_api.sortArtifactEnrichmentsByDependency(enrichments);
+    for (enrichments) |cfg| {
+        _ = try db.upsertEnrichment(cfg);
+    }
 }
 
 fn reconcileCachedLocalTableIndexCreate(

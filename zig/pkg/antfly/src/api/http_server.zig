@@ -6520,6 +6520,15 @@ pub const ApiHttpServer = struct {
             std.log.err("public artifact enrichment metadata projection wait failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
             return error.InternalFailure;
         };
+        if (self.table_writes) |table_writes_source| {
+            _ = table_writes_source.putArtifactEnrichment(alloc, table_name, artifact_name, enrichment_json) catch |err| switch (err) {
+                error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
+                else => {
+                    std.log.err("public artifact enrichment local apply failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
+                    return error.InternalFailure;
+                },
+            };
+        }
     }
 
     fn executePublicDeleteArtifactEnrichment(
