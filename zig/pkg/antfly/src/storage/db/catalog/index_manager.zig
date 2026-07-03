@@ -1644,6 +1644,10 @@ pub const IndexManager = struct {
         if (self.index_load_states.getPtr(name)) |state| state.* = .complete;
     }
 
+    fn dropIndexLoadStateNoLock(self: *IndexManager, name: []const u8) void {
+        if (self.index_load_states.fetchRemove(name)) |entry| self.alloc.free(entry.key);
+    }
+
     pub fn indexLoadComplete(self: *IndexManager, name: []const u8) bool {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
@@ -3032,6 +3036,7 @@ pub const IndexManager = struct {
             // list; removing one must also clear its recorded load error so a
             // subsequent recreate starts clean.
             self.dropFailedIndexLoad(name);
+            self.dropIndexLoadStateNoLock(name);
             return true;
         }
         for (self.text_indexes.items, 0..) |*entry, i| {
@@ -3045,6 +3050,7 @@ pub const IndexManager = struct {
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 deleteIndexDirIfPresent(index_path);
+                self.dropIndexLoadStateNoLock(name);
                 return true;
             }
         }
@@ -3071,6 +3077,7 @@ pub const IndexManager = struct {
                 try self.deleteDenseIndexMetadata(store, name);
                 try self.deleteOwnedGeneratedArtifacts(store, owned_chunk_name, owned_embedding_name);
                 deleteIndexDirIfPresent(index_path);
+                self.dropIndexLoadStateNoLock(name);
                 return true;
             }
         }
@@ -3096,6 +3103,7 @@ pub const IndexManager = struct {
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 try self.deleteOwnedGeneratedArtifacts(store, owned_chunk_name, owned_embedding_name);
                 deleteIndexDirIfPresent(index_path);
+                self.dropIndexLoadStateNoLock(name);
                 return true;
             }
         }
@@ -3110,6 +3118,7 @@ pub const IndexManager = struct {
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 deleteIndexDirIfPresent(index_path);
+                self.dropIndexLoadStateNoLock(name);
                 return true;
             }
         }
@@ -3159,6 +3168,7 @@ pub const IndexManager = struct {
             try self.deleteOwnedGeneratedArtifacts(store, owned_chunk_name, owned_embedding_name);
             deleteIndexDirIfPresent(index_path);
             removed.deinit(self.alloc);
+            self.dropIndexLoadStateNoLock(name);
             return true;
         }
         return false;
@@ -7249,6 +7259,7 @@ pub const IndexManager = struct {
             if (std.mem.eql(u8, entry.config.name, name)) {
                 self.freeTextIndexEntry(entry);
                 _ = self.text_indexes.orderedRemove(i);
+                self.dropIndexLoadStateNoLock(name);
                 return;
             }
         }
@@ -7256,6 +7267,7 @@ pub const IndexManager = struct {
             if (std.mem.eql(u8, entry.config.name, name)) {
                 self.freeDenseIndexEntry(entry);
                 _ = self.dense_indexes.orderedRemove(i);
+                self.dropIndexLoadStateNoLock(name);
                 return;
             }
         }
@@ -7263,6 +7275,7 @@ pub const IndexManager = struct {
             if (std.mem.eql(u8, entry.config.name, name)) {
                 self.freeSparseIndexEntry(entry);
                 _ = self.sparse_indexes.orderedRemove(i);
+                self.dropIndexLoadStateNoLock(name);
                 return;
             }
         }
@@ -7270,6 +7283,7 @@ pub const IndexManager = struct {
             if (std.mem.eql(u8, entry.config.name, name)) {
                 self.freeGraphIndexEntry(entry);
                 _ = self.graph_indexes.orderedRemove(i);
+                self.dropIndexLoadStateNoLock(name);
                 return;
             }
         }
@@ -16514,15 +16528,71 @@ test "remove status-only malformed dense config drops catalog entry" {
         .config_json = "{\"field\":\"embedding\",\"dims\":",
     };
     try manager.ensureConfiguredIndexDir(cfg);
+    try manager.beginIndexLoadNoLock("bad_dense");
+    manager.completeIndexLoadNoLock("bad_dense");
     try manager.recordFailedIndexLoad(cfg, error.InvalidIndexConfig);
 
     try std.testing.expect(manager.get("bad_dense") != null);
     try std.testing.expect(manager.loadFailure("bad_dense") != null);
+    try std.testing.expectEqual(@as(usize, 1), manager.index_load_states.count());
 
     try std.testing.expect(try manager.remove(&store, "bad_dense"));
     try std.testing.expect(manager.get("bad_dense") == null);
     try std.testing.expect(manager.loadFailure("bad_dense") == null);
     try std.testing.expectEqual(@as(usize, 0), manager.status_only_index_configs.len);
+    try std.testing.expectEqual(@as(usize, 0), manager.index_load_states.count());
+}
+
+test "remove drops runtime index load state" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "runtime-index-load-state-remove");
+    defer cleanupIndexManagerDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    try manager.add(&store, .{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"field\":\"title\"}",
+    });
+    try std.testing.expect(manager.textIndexEntry("ft_v1") != null);
+    try std.testing.expectEqual(@as(usize, 1), manager.index_load_states.count());
+
+    try std.testing.expect(try manager.remove(&store, "ft_v1"));
+    try std.testing.expect(manager.textIndexEntry("ft_v1") == null);
+    try std.testing.expectEqual(@as(usize, 0), manager.index_load_states.count());
+}
+
+test "removeInMemory drops rollback index load state" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "rollback-index-load-state-remove");
+    defer cleanupIndexManagerDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    try manager.openConfiguredIndex(&store, .{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"field\":\"title\"}",
+    }, true, false);
+    try std.testing.expect(manager.textIndexEntry("ft_v1") != null);
+    try std.testing.expectEqual(@as(usize, 1), manager.index_load_states.count());
+
+    manager.removeInMemory("ft_v1");
+    try std.testing.expect(manager.textIndexEntry("ft_v1") == null);
+    try std.testing.expectEqual(@as(usize, 0), manager.index_load_states.count());
 }
 
 test "index load state tracks generic index names independently" {
