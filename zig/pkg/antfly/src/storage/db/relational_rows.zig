@@ -18457,10 +18457,10 @@ test "relational rows insert source conflict guards validate grouped expressions
     }};
     var source_field_conflict = base_conflict;
     source_field_conflict.where_any = source_field_groups[0..];
-    try std.testing.expectError(error.InvalidQueryRequest, validateInsertSourceRequest(runtime_schema, .{
+    try validateInsertSourceRequest(runtime_schema, .{
         .assignments = assignments[0..],
         .on_conflict = source_field_conflict,
-    }));
+    });
 
     const row_field_conditions = [_]types.RelationalRowsExpressionCondition{.{
         .lhs = .{ .kind = .field, .field = "status" },

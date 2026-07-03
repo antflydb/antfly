@@ -4068,10 +4068,10 @@ pub fn ddlPlanFromGeneratedAstAlloc(
     options: DdlPlanParserOptions,
 ) !LegacyDdlParserPlan {
     try validateGeneratedDdlAstSpans(tokens, ast);
-    const tail = generatedStatementTail(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     var pos: usize = 0;
     return switch (ast.kind) {
         .create_table => blk: {
+            const create_table_tail = generatedCreateTableStatementTail(tokens, ast) orelse return error.UnsupportedSqlShape;
             if (generatedCreateTableUsesRelationLifetime(tokens, ast)) {
                 var lifetime_pos: usize = 1;
                 break :blk .{ .relation_lifetime = try parseGeneratedRelationLifetimePlanAlloc(alloc, tokens, &lifetime_pos, ast, options.column_definition_options) };
@@ -4080,7 +4080,7 @@ pub fn ddlPlanFromGeneratedAstAlloc(
                 break :blk .{ .identity_allocator_catalog = try identityAllocatorPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options.column_definition_options) };
             }
             var clone_pos: usize = 0;
-            if (parseCreateTableClonePlanTailAlloc(alloc, tail, &clone_pos)) |parsed_table_clone| {
+            if (parseCreateTableClonePlanTailAlloc(alloc, create_table_tail, &clone_pos)) |parsed_table_clone| {
                 var table_clone = parsed_table_clone;
                 errdefer table_clone.deinit(alloc);
                 try validateGeneratedCreateTableCloneMetadata(alloc, tokens, ast, table_clone);
@@ -4090,14 +4090,14 @@ pub fn ddlPlanFromGeneratedAstAlloc(
                 else => return err,
             }
             var create_partition_pos: usize = 0;
-            if (parseGeneratedCreateTablePartitionTailPlanAlloc(alloc, tokens, ast, tail, &create_partition_pos)) |partition| {
+            if (parseGeneratedCreateTablePartitionTailPlanAlloc(alloc, tokens, ast, create_table_tail, &create_partition_pos)) |partition| {
                 break :blk .{ .table_partition_catalog = .{ .create_partition = partition } };
             } else |err| switch (err) {
                 error.UnsupportedSqlShape => {},
                 else => return err,
             }
             var partitioned_pos: usize = 0;
-            if (parseGeneratedCreatePartitionedTableTailPlanAlloc(alloc, tokens, ast, tail, &partitioned_pos, options.column_definition_options)) |partitioned| {
+            if (parseGeneratedCreatePartitionedTableTailPlanAlloc(alloc, tokens, ast, create_table_tail, &partitioned_pos, options.column_definition_options)) |partitioned| {
                 break :blk .{ .table_partition_catalog = .{ .create_partitioned = partitioned } };
             } else |err| switch (err) {
                 error.UnsupportedSqlShape => {},
@@ -4106,7 +4106,9 @@ pub fn ddlPlanFromGeneratedAstAlloc(
             if (generatedCreateTableAstHasDocumentTableMetadata(tokens, ast)) {
                 break :blk .{ .create_table = try createTablePlanFromGeneratedDocumentAstAlloc(alloc, tokens, ast) };
             }
-            break :blk .{ .create_table = try parseGeneratedCreateTableTailPlanAlloc(alloc, tail, &pos, options.column_definition_options) };
+            var create_table = try parseGeneratedCreateTableTailPlanAlloc(alloc, create_table_tail, &pos, options.column_definition_options);
+            create_table.replace_existing = ast.replace_existing;
+            break :blk .{ .create_table = create_table };
         },
         .create_view,
         .alter_view,
@@ -5386,6 +5388,23 @@ fn validateGeneratedEmptyListAst(items: *const generated_parser.GeneratedSqlList
 
 fn generatedCreateTableUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) bool {
     return generatedStatementEnd(tokens, ast.statement_span) != null;
+}
+
+fn generatedCreateTableStatementTail(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) ?[]const grammar.Token {
+    if (ast.kind != .create_table) return null;
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return null;
+    if (end < 2 or !tokens[0].matchesKeywordTag(.create)) return null;
+    var index: usize = 1;
+    if (ast.replace_existing) {
+        if (end < 4 or
+            !tokens[index].matchesKeywordTag(.@"or") or
+            !tokens[index + 1].matchesKeywordTag(.replace)) return null;
+        index += 2;
+    } else if (tokens[index].matchesKeywordTag(.@"or")) {
+        return null;
+    }
+    if (index >= end or !tokens[index].matchesKeywordTag(.table)) return null;
+    return tokens[index..end];
 }
 
 fn generatedCreateTableUsesRelationLifetime(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) bool {
@@ -16025,6 +16044,7 @@ fn createTablePlanFromGeneratedDocumentAstAlloc(
     var plan: CreateTablePlan = .{
         .table_name = table_name,
         .if_not_exists = ast.if_not_exists,
+        .replace_existing = ast.replace_existing,
         .storage_mode = .document,
         .default_type = default_type.?,
         .document_schemas = owned_document_schemas,
