@@ -503,6 +503,7 @@ pub const ReplayProgressHook = *const fn (ctx: *anyopaque, index_name: []const u
 
 pub const QueryVisibilityChange = enum {
     invalidate,
+    status,
     publish,
     publish_consistent,
     publish_blocking,
@@ -3150,7 +3151,7 @@ pub const DB = struct {
 
     fn notifyAsyncContextVisibilityHook(ptr: *anyopaque) void {
         const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
-        if (ctx.query_visibility_hook) |hook| hook.notify(.publish);
+        if (ctx.query_visibility_hook) |hook| hook.notify(.status);
     }
 
     const DetachedEnrichmentRuntime = struct {
@@ -10241,14 +10242,15 @@ pub const DB = struct {
         delta: i64,
     ) !void {
         if (delta == 0) return;
-        const identity = (try internal_keys.parseEmbeddingArtifactKeyView(artifact_key)) orelse return;
+        var identity = (try artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key)) orelse return;
+        defer identity.deinit(alloc);
         const value = artifact_value orelse return;
         const dims = enrichment_artifact_codec.decodeDenseEmbeddingDims(value) catch return;
         if (dims == 0) return;
 
         var targets = std.ArrayListUnmanaged(usize).empty;
         defer targets.deinit(alloc);
-        try denseArtifactTargetsForArtifact(index_manager, identity.artifact_name, dims, &targets, alloc);
+        try denseArtifactTargetsForArtifact(index_manager, identity.embedding_name, dims, &targets, alloc);
         for (targets.items) |dense_index_idx| {
             const entry = &index_manager.dense_indexes.items[dense_index_idx];
             const gop = try counts.getOrPut(alloc, dense_index_idx);
@@ -27673,7 +27675,7 @@ fn flushFinishedDenseAppliedSequenceLocked(ctx: *AsyncContext, index_name: []con
     _ = ctx.stats.applied_sequence.save_ns.fetchAdd(save_ns, .monotonic);
     _ = ctx.stats.applied_sequence.flush_ns.fetchAdd(flush_ns, .monotonic);
     atomicMaxU64(&ctx.stats.applied_sequence.max_flush_ns, flush_ns);
-    if (ctx.query_visibility_hook) |hook| hook.notify(.publish_consistent);
+    if (ctx.query_visibility_hook) |hook| hook.notify(.status);
     return true;
 }
 
@@ -27718,7 +27720,7 @@ fn flushPendingAppliedSequencesLocked(ctx: *AsyncContext, force: bool) !bool {
     _ = ctx.stats.applied_sequence.save_ns.fetchAdd(save_ns, .monotonic);
     _ = ctx.stats.applied_sequence.flush_ns.fetchAdd(flush_ns, .monotonic);
     atomicMaxU64(&ctx.stats.applied_sequence.max_flush_ns, flush_ns);
-    if (ctx.query_visibility_hook) |hook| hook.notify(.publish);
+    if (ctx.query_visibility_hook) |hook| hook.notify(.status);
     return true;
 }
 
@@ -32472,7 +32474,7 @@ test "db enrichment status changes notify query visibility hook" {
     try std.testing.expectEqualStrings("docs", hook_ctx.table_name.?);
     try std.testing.expectEqual(@as(u64, 7001), hook_ctx.group_id);
     try std.testing.expect(hook_ctx.saw_db);
-    try std.testing.expectEqual(QueryVisibilityChange.publish, hook_ctx.change.?);
+    try std.testing.expectEqual(QueryVisibilityChange.status, hook_ctx.change.?);
 }
 
 test "db full-text index and search survive reopen with durable lsm primary backend" {
@@ -47721,6 +47723,62 @@ test "db dense artifact rebuild uses durable artifact counters instead of recoun
     try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
 }
 
+test "db dense artifact counters include derived chunk embedding artifacts" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    });
+
+    const artifact_key = try expectedChunkEmbeddingArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0, "chunk_dense_v1");
+    defer alloc.free(artifact_key);
+    const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &[_]f32{ 1, 0, 0 });
+    defer alloc.free(payload);
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    try writes.append(alloc, .{ .key = artifact_key, .value = payload });
+
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+
+    try DB.appendDenseArtifactCounterMutations(
+        alloc,
+        db.core.store,
+        db.core.index_manager,
+        &writes,
+        &.{},
+        &owned_keys,
+        &owned_values,
+    );
+    try db.core.store.putBatch(writes.items, &.{});
+
+    try std.testing.expectEqual(
+        @as(?u64, 1),
+        try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "semantic_idx"),
+    );
+}
+
 test "db dense artifact rebuild force-resets corrupt external dense structure" {
     const alloc = std.testing.allocator;
 
@@ -53735,7 +53793,7 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
         fn onChange(ptr: *anyopaque, _: []const u8, _: u64, changed_db: ?*DB, change: QueryVisibilityChange) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             switch (change) {
-                .publish, .publish_consistent => self.publish_calls += 1,
+                .status, .publish, .publish_consistent => self.publish_calls += 1,
                 .publish_blocking => {
                     self.publish_calls += 1;
                     self.publish_blocking_calls += 1;

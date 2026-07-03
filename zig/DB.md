@@ -201,6 +201,14 @@ Current implementation notes:
   and does not run a primary document-store artifact recount. Recounts remain
   repair/rebuild tooling for stale config identity, repair-required status,
   interrupted rebuild state, corruption, or watermark regression.
+- Dense artifact target counters are durable metadata rows updated in the same
+  primary-store batch as artifact writes/deletes. Counter classification uses
+  the shared embedding artifact identity decoder, so direct document embeddings
+  and derived chunk embeddings feed the same O(1) startup coverage path.
+- Applied-sequence and runtime-status-only visibility notifications publish the
+  status snapshot without invalidating cached query DBs. Read-cache invalidation
+  remains reserved for visible-root/data publishes, blocking publish repair, and
+  explicit table invalidation.
 
 Acceptance criteria:
 

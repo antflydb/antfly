@@ -34,6 +34,7 @@ const enrichment_state = @import("enrichment_state.zig");
 const embedder_mod = @import("embedder.zig");
 const asset_producer_mod = @import("asset_producer.zig");
 const document_extraction_mod = @import("document_extraction.zig");
+const artifact_ids = @import("../artifact_ids.zig");
 const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("chunker_stub.zig")
 else
@@ -6969,14 +6970,15 @@ fn applyDenseArtifactCounterDeltaRuntime(
     delta: i64,
 ) !void {
     if (delta == 0) return;
-    const identity = (try internal_keys.parseEmbeddingArtifactKeyView(artifact_key)) orelse return;
+    var identity = (try artifact_ids.decodeEmbeddingArtifactIdentityAlloc(runtime.alloc, artifact_key)) orelse return;
+    defer identity.deinit(runtime.alloc);
     const value = artifact_value orelse return;
     const dims = enrichment_artifact_codec.decodeDenseEmbeddingDims(value) catch return;
     if (dims == 0) return;
 
     var targets = std.ArrayListUnmanaged(usize).empty;
     defer targets.deinit(runtime.alloc);
-    try denseArtifactTargetsForArtifact(runtime, identity.artifact_name, dims, &targets);
+    try denseArtifactTargetsForArtifact(runtime, identity.embedding_name, dims, &targets);
     for (targets.items) |dense_index_idx| {
         const entry = &runtime.index_manager.dense_indexes.items[dense_index_idx];
         const gop = try counts.getOrPut(runtime.alloc, dense_index_idx);
