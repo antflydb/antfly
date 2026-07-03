@@ -7235,7 +7235,7 @@ pub const ApiHttpServer = struct {
 
     pub fn handlePublicListArtifactRepairIssues(self: *ApiHttpServer, table_name: []const u8, query: []const u8) !http_common.HttpResponse {
         const source = self.table_writes orelse return try textResponse(self.alloc, 405, "method not allowed");
-        const target = parseRepairTargetQuery(query) catch return try textResponse(self.alloc, 400, "invalid repair target");
+        const target = (parseRepairTargetQuery(query) catch return try textResponse(self.alloc, 400, "invalid repair target")) orelse .artifact;
         if (target != .artifact) return try textResponse(self.alloc, 400, "invalid repair target");
         const artifact_kind = parseArtifactRepairKindQuery(query) catch return try textResponse(self.alloc, 400, "invalid artifact repair kind");
         const index_name = parseSimpleQueryParamDecodedAlloc(self.alloc, query, "index") catch return try textResponse(self.alloc, 400, "invalid index");
@@ -10023,6 +10023,13 @@ fn parseArtifactRepairKindQuery(query: []const u8) !?db_mod.types.ArtifactRepair
 fn parseRepairTargetQuery(query: []const u8) !?db_mod.types.RepairTarget {
     const value = parseSimpleQueryParam(query, "target") orelse return null;
     return std.meta.stringToEnum(db_mod.types.RepairTarget, value) orelse error.InvalidRepairTarget;
+}
+
+test "artifact repair issue list target defaults to artifact" {
+    try std.testing.expectEqual(db_mod.types.RepairTarget.artifact, (try parseRepairTargetQuery("")) orelse .artifact);
+    try std.testing.expectEqual(db_mod.types.RepairTarget.artifact, (try parseRepairTargetQuery("target=artifact")) orelse .artifact);
+    try std.testing.expectEqual(db_mod.types.RepairTarget.index, (try parseRepairTargetQuery("target=index")).?);
+    try std.testing.expectError(error.InvalidRepairTarget, parseRepairTargetQuery("target=bogus"));
 }
 
 test "artifact repair query params decode percent encoded values" {

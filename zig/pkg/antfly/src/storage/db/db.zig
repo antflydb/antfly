@@ -7261,14 +7261,8 @@ pub const DB = struct {
                     try self.core.index_manager.syncIndexByName(cfg.name, true);
                     break :blk count;
                 },
-                .full_text, .algebraic => blk: {
-                    result.unsupported += 1;
-                    result.unresolved += 1;
-                    result.debt_remaining = true;
-                    break :blk @as(usize, 0);
-                },
+                .full_text, .algebraic => continue,
             };
-            if (rebuilt == 0 and (cfg.kind == .full_text or cfg.kind == .algebraic)) continue;
             result.reprocessed += rebuilt;
             result.repaired += 1;
             result.indexes_rebuilt += 1;
@@ -10119,13 +10113,46 @@ pub const DB = struct {
         return entry.embedding_name orelse entry.config.name;
     }
 
-    fn denseArtifactRefMatchesEntry(entry: anytype, artifact_name: []const u8) bool {
-        if (std.mem.eql(u8, entry.config.name, artifact_name)) return true;
-        if (entry.embedding_name) |embedding_name| {
-            if (std.mem.eql(u8, embedding_name, artifact_name)) return true;
+    const DenseArtifactTargetKey = struct {
+        artifact_name: []const u8,
+        dims: u32,
+    };
+
+    const DenseArtifactTargetKeyContext = struct {
+        pub fn hash(_: @This(), key: DenseArtifactTargetKey) u64 {
+            var hasher = std.hash.Wyhash.init(0);
+            const artifact_name_len: u64 = @intCast(key.artifact_name.len);
+            hasher.update(std.mem.asBytes(&artifact_name_len));
+            hasher.update(key.artifact_name);
+            hasher.update(std.mem.asBytes(&key.dims));
+            return hasher.final();
         }
-        return false;
-    }
+
+        pub fn eql(_: @This(), lhs: DenseArtifactTargetKey, rhs: DenseArtifactTargetKey) bool {
+            return lhs.dims == rhs.dims and std.mem.eql(u8, lhs.artifact_name, rhs.artifact_name);
+        }
+    };
+
+    const DenseArtifactTargetLookup = struct {
+        by_artifact: std.HashMapUnmanaged(DenseArtifactTargetKey, std.ArrayListUnmanaged(usize), DenseArtifactTargetKeyContext, 80) = .empty,
+
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            var values = self.by_artifact.valueIterator();
+            while (values.next()) |indices| indices.deinit(alloc);
+            self.by_artifact.deinit(alloc);
+            self.* = .{};
+        }
+
+        fn add(self: *@This(), alloc: Allocator, artifact_name: []const u8, dims: u32, dense_index_idx: usize) !void {
+            const key: DenseArtifactTargetKey = .{
+                .artifact_name = artifact_name,
+                .dims = dims,
+            };
+            var entry = try self.by_artifact.getOrPut(alloc, key);
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            try entry.value_ptr.append(alloc, dense_index_idx);
+        }
+    };
 
     fn collectDenseArtifactTargetCounts(
         self: *DB,
@@ -10135,33 +10162,43 @@ pub const DB = struct {
         var counts: DenseArtifactTargetCounts = .{};
         errdefer counts.deinit(alloc);
 
-        var tracked_indices = std.ArrayListUnmanaged(usize).empty;
-        defer tracked_indices.deinit(alloc);
+        var target_lookup: DenseArtifactTargetLookup = .{};
+        defer target_lookup.deinit(alloc);
 
         if (rebuild_targets) |targets| {
             for (targets) |target| {
-                try tracked_indices.append(alloc, target.dense_index_idx);
+                const entry = &self.core.index_manager.dense_indexes.items[target.dense_index_idx];
                 try counts.per_target_index.put(alloc, target.dense_index_idx, 0);
+                try target_lookup.add(alloc, entry.config.name, entry.dims, target.dense_index_idx);
+                if (entry.embedding_name) |embedding_name| {
+                    if (!std.mem.eql(u8, embedding_name, entry.config.name)) {
+                        try target_lookup.add(alloc, embedding_name, entry.dims, target.dense_index_idx);
+                    }
+                }
             }
         } else {
             for (self.core.index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
                 const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null;
                 if (!artifact_backed) continue;
-                try tracked_indices.append(alloc, dense_index_idx);
                 try counts.per_target_index.put(alloc, dense_index_idx, 0);
+                try target_lookup.add(alloc, entry.config.name, entry.dims, dense_index_idx);
+                if (entry.embedding_name) |embedding_name| {
+                    if (!std.mem.eql(u8, embedding_name, entry.config.name)) {
+                        try target_lookup.add(alloc, embedding_name, entry.dims, dense_index_idx);
+                    }
+                }
             }
         }
 
-        if (tracked_indices.items.len == 0) return counts;
+        if (target_lookup.by_artifact.count() == 0) return counts;
 
         const lower = try self.core.documentRangeLowerAlloc("");
         defer self.core.alloc.free(lower);
 
         const ScanState = struct {
             alloc: Allocator,
-            db: *DB,
             counts: *DenseArtifactTargetCounts,
-            tracked_indices: []const usize,
+            target_lookup: *const DenseArtifactTargetLookup,
 
             fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
                 const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
@@ -10177,25 +10214,24 @@ pub const DB = struct {
                 };
                 if (dims == 0) return .@"continue";
 
-                var matched = false;
-                for (state.tracked_indices) |dense_index_idx| {
-                    const entry = &state.db.core.index_manager.dense_indexes.items[dense_index_idx];
-                    if (!denseArtifactRefMatchesEntry(entry, artifact_ref.name)) continue;
-                    if (entry.dims != dims) continue;
+                const lookup_key: DenseArtifactTargetKey = .{
+                    .artifact_name = artifact_ref.name,
+                    .dims = dims,
+                };
+                const indices = state.target_lookup.by_artifact.get(lookup_key) orelse return .@"continue";
+                for (indices.items) |dense_index_idx| {
                     const count = state.counts.per_target_index.getPtr(dense_index_idx).?;
                     count.* += 1;
-                    matched = true;
                 }
-                if (matched) state.counts.total_target_artifacts += 1;
+                state.counts.total_target_artifacts += 1;
                 return .@"continue";
             }
         };
 
         var state = ScanState{
             .alloc = alloc,
-            .db = self,
             .counts = &counts,
-            .tracked_indices = tracked_indices.items,
+            .target_lookup = &target_lookup,
         };
         try self.core.store.scanWithContext(lower, "", .{}, &state, ScanState.scanEntry);
         return counts;
@@ -37422,7 +37458,8 @@ test "db index repair cursor advances beyond bounded page" {
     });
     defer first.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), first.scanned);
-    try std.testing.expectEqual(@as(u64, 2), first.unsupported);
+    try std.testing.expectEqual(@as(u64, 0), first.unsupported);
+    try std.testing.expectEqual(@as(u64, 0), first.unresolved);
     try std.testing.expect(first.has_more);
     try std.testing.expect(first.debt_remaining);
     try std.testing.expectEqualStrings("ft_c", first.next_cursor.?);
@@ -37434,10 +37471,22 @@ test "db index repair cursor advances beyond bounded page" {
     });
     defer second.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), second.scanned);
-    try std.testing.expectEqual(@as(u64, 1), second.unsupported);
+    try std.testing.expectEqual(@as(u64, 0), second.unsupported);
+    try std.testing.expectEqual(@as(u64, 0), second.unresolved);
     try std.testing.expect(!second.has_more);
     try std.testing.expect(second.next_cursor == null);
-    try std.testing.expect(second.debt_remaining);
+    try std.testing.expect(!second.debt_remaining);
+
+    var targeted = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .index_name = "ft_a",
+        .limit = 1,
+    });
+    defer targeted.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), targeted.scanned);
+    try std.testing.expectEqual(@as(u64, 0), targeted.unsupported);
+    try std.testing.expectEqual(@as(u64, 0), targeted.unresolved);
+    try std.testing.expect(!targeted.debt_remaining);
 
     try std.testing.expectError(error.InvalidArgument, db.repairArtifactIssuesWithRequest(alloc, .{
         .target = .index,
