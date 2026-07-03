@@ -86,6 +86,11 @@ pub const SearchTextQueryExecutor = struct {
         doc_key: []const u8,
         raw: []const u8,
     ) anyerror![]u8,
+    load_stored: *const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        key: []const u8,
+    ) anyerror!?[]u8,
     resolve_doc_set_doc_ids: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -1069,7 +1074,7 @@ pub fn searchComposed(
     const fuse_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var base = if (named_sets.items.len == 0)
         try emptySearchResult(alloc)
-    else if (named_sets.items.len == 1 and shared_req.merge_config == null)
+    else if (named_sets.items.len == 1)
         try executor.clone_named_set(executor.ctx, alloc, named_sets.items[0], shared_req.include_stored)
     else
         try executor.fuse_named_sets(executor.ctx, alloc, shared_req, named_sets.items);
@@ -1155,7 +1160,9 @@ fn appendEmbeddingsResultAlias(
         return;
     }
 
-    var embeddings_result = try executor.fuse_named_sets(executor.ctx, alloc, req, embedding_sets.items);
+    var embeddings_req = req;
+    embeddings_req.merge_config = null;
+    var embeddings_result = try executor.fuse_named_sets(executor.ctx, alloc, embeddings_req, embedding_sets.items);
     errdefer embeddings_result.deinit();
     const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, req, executor, owned_resolved_sets, embeddings_result.hits);
     try named_sets.append(alloc, .{
@@ -2264,6 +2271,7 @@ test "text late visibility requirement overrides positive native filter" {
         .text_index_is_chunk_backed = undefined,
         .search_match_all = undefined,
         .project_stored_search = undefined,
+        .load_stored = undefined,
         .requires_full_candidate_visibility_filter = callbacks.requiresFullCandidateVisibilityFilter,
         .postprocess = undefined,
     }, true, true, null);
@@ -2311,6 +2319,277 @@ fn paginateSearchResultInPlace(result: *types.SearchResult, offset: u32, limit: 
         }
     }
     if (result.hits.len > 0) alloc.free(result.hits);
+    result.hits = selected;
+}
+
+const SortValue = union(enum) {
+    null_value,
+    bool_value: bool,
+    integer: i64,
+    number: f64,
+    number_string: []const u8,
+    string: []const u8,
+
+    fn deinit(self: @This(), alloc: Allocator) void {
+        switch (self) {
+            .string, .number_string => |text| alloc.free(@constCast(text)),
+            else => {},
+        }
+    }
+};
+
+const DecoratedSortHit = struct {
+    hit: types.SearchHit,
+    keys: []SortValue,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        self.hit.deinit(alloc);
+        freeSortValues(alloc, self.keys);
+        self.* = undefined;
+    }
+};
+
+fn freeSortValues(alloc: Allocator, values: []SortValue) void {
+    for (values) |value| value.deinit(alloc);
+    if (values.len > 0) alloc.free(values);
+}
+
+fn deinitSortValues(values: []SortValue, alloc: Allocator) void {
+    for (values) |value| value.deinit(alloc);
+}
+
+fn sortValueRank(value: SortValue) u8 {
+    return switch (value) {
+        .null_value => 0,
+        .bool_value => 1,
+        .integer, .number, .number_string => 2,
+        .string => 3,
+    };
+}
+
+fn sortValueAsFloat(value: SortValue) f64 {
+    return switch (value) {
+        .integer => |v| @floatFromInt(v),
+        .number => |v| v,
+        .number_string => |v| std.fmt.parseFloat(f64, v) catch std.math.nan(f64),
+        else => std.math.nan(f64),
+    };
+}
+
+fn compareNumberSortValues(a: SortValue, b: SortValue) std.math.Order {
+    if (a == .integer and b == .integer) return std.math.order(a.integer, b.integer);
+    return std.math.order(sortValueAsFloat(a), sortValueAsFloat(b));
+}
+
+fn compareSortValues(a: SortValue, b: SortValue) std.math.Order {
+    const ar = sortValueRank(a);
+    const br = sortValueRank(b);
+    if (ar != br) return std.math.order(ar, br);
+    return switch (a) {
+        .null_value => .eq,
+        .bool_value => |av| std.math.order(@intFromBool(av), @intFromBool(b.bool_value)),
+        .integer, .number, .number_string => compareNumberSortValues(a, b),
+        .string => |av| std.mem.order(u8, av, b.string),
+    };
+}
+
+fn compareDecoratedSortHits(req: types.SearchRequest, a: DecoratedSortHit, b: DecoratedSortHit) std.math.Order {
+    for (req.order_by, 0..) |field, i| {
+        const order = compareSortValues(a.keys[i], b.keys[i]);
+        if (order != .eq) {
+            if (field.desc) {
+                return switch (order) {
+                    .lt => .gt,
+                    .eq => .eq,
+                    .gt => .lt,
+                };
+            }
+            return order;
+        }
+    }
+    return .eq;
+}
+
+fn decoratedLessThan(req: types.SearchRequest, a: DecoratedSortHit, b: DecoratedSortHit) bool {
+    return compareDecoratedSortHits(req, a, b) == .lt;
+}
+
+fn jsonFieldValue(value: std.json.Value, field: []const u8) ?std.json.Value {
+    var current = value;
+    var parts = std.mem.splitScalar(u8, field, '.');
+    while (parts.next()) |part| {
+        if (part.len == 0) return null;
+        if (current != .object) return null;
+        current = current.object.get(part) orelse return null;
+    }
+    return current;
+}
+
+fn sortValueFromJson(value: ?std.json.Value) SortValue {
+    const actual = value orelse return .null_value;
+    return switch (actual) {
+        .null => .null_value,
+        .bool => |v| .{ .bool_value = v },
+        .integer => |v| .{ .integer = v },
+        .float => |v| .{ .number = v },
+        .number_string => |v| .{ .number_string = v },
+        .string => |v| .{ .string = v },
+        else => .null_value,
+    };
+}
+
+fn ownedSortValueFromJson(alloc: Allocator, value: ?std.json.Value) !SortValue {
+    const sort_value = sortValueFromJson(value);
+    return switch (sort_value) {
+        .string => |text| .{ .string = try alloc.dupe(u8, text) },
+        .number_string => |text| .{ .number_string = try alloc.dupe(u8, text) },
+        else => sort_value,
+    };
+}
+
+fn appendSortValueJson(alloc: Allocator, values: *std.ArrayListUnmanaged(std.json.Value), value: SortValue) !void {
+    const json_value: std.json.Value = switch (value) {
+        .null_value => .null,
+        .bool_value => |v| .{ .bool = v },
+        .integer => |v| .{ .integer = v },
+        .number => |v| .{ .float = v },
+        .number_string => |v| .{ .number_string = try alloc.dupe(u8, v) },
+        .string => |v| .{ .string = try alloc.dupe(u8, v) },
+    };
+    errdefer {
+        var owned = json_value;
+        types.deinitJsonValue(alloc, &owned);
+    }
+    try values.append(alloc, json_value);
+}
+
+fn compareDecoratedHitToCursor(req: types.SearchRequest, hit: DecoratedSortHit, cursor: []const std.json.Value) std.math.Order {
+    for (req.order_by, 0..) |field, i| {
+        const order = compareSortValues(hit.keys[i], sortValueFromJson(cursor[i]));
+        if (order != .eq) {
+            if (field.desc) {
+                return switch (order) {
+                    .lt => .gt,
+                    .eq => .eq,
+                    .gt => .lt,
+                };
+            }
+            return order;
+        }
+    }
+    return .eq;
+}
+
+fn searchHitSortStoredJsonAlloc(
+    alloc: Allocator,
+    hit: *types.SearchHit,
+    load_ctx: ?*anyopaque,
+    load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
+) !std.json.Parsed(std.json.Value) {
+    if (hit.stored_data == null) {
+        hit.stored_data = (try load_stored(load_ctx, alloc, hit.id)) orelse return error.StoredDocMissing;
+    }
+    return try std.json.parseFromSlice(std.json.Value, alloc, hit.stored_data.?, .{});
+}
+
+fn decorateSortHitAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    hit: types.SearchHit,
+    load_ctx: ?*anyopaque,
+    load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
+) !DecoratedSortHit {
+    var owned_hit = hit;
+    errdefer owned_hit.deinit(alloc);
+
+    const keys = try alloc.alloc(SortValue, req.order_by.len);
+    var keys_initialized: usize = 0;
+    var values = std.ArrayListUnmanaged(std.json.Value).empty;
+    errdefer {
+        for (values.items) |*value| types.deinitJsonValue(alloc, value);
+        values.deinit(alloc);
+        deinitSortValues(keys[0..keys_initialized], alloc);
+        alloc.free(keys);
+    }
+
+    var parsed_doc: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed_doc) |*parsed| parsed.deinit();
+    for (req.order_by, 0..) |field, i| {
+        const sort_value: SortValue = if (std.mem.eql(u8, field.field, "_id"))
+            .{ .string = try alloc.dupe(u8, owned_hit.id) }
+        else blk: {
+            if (parsed_doc == null) parsed_doc = try searchHitSortStoredJsonAlloc(alloc, &owned_hit, load_ctx, load_stored);
+            break :blk try ownedSortValueFromJson(alloc, jsonFieldValue(parsed_doc.?.value, field.field));
+        };
+        keys[i] = sort_value;
+        keys_initialized += 1;
+        try appendSortValueJson(alloc, &values, sort_value);
+    }
+    owned_hit.sort_values = try values.toOwnedSlice(alloc);
+    return .{ .hit = owned_hit, .keys = keys };
+}
+
+fn sortAndPageSearchResultInPlace(
+    result: *types.SearchResult,
+    req: types.SearchRequest,
+    load_ctx: ?*anyopaque,
+    load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
+) !void {
+    if (req.order_by.len == 0 or req.count_only) return;
+
+    const alloc = result.alloc;
+    var decorated = try alloc.alloc(DecoratedSortHit, result.hits.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (decorated[0..initialized]) |*item| item.deinit(alloc);
+        if (decorated.len > 0) alloc.free(decorated);
+    }
+    for (result.hits, 0..) |*hit, i| {
+        decorated[i] = try decorateSortHitAlloc(alloc, req, hit.*, load_ctx, load_stored);
+        hit.* = undefined;
+        initialized += 1;
+    }
+    if (result.hits.len > 0) alloc.free(result.hits);
+    result.hits = &.{};
+
+    std.sort.pdq(DecoratedSortHit, decorated, req, decoratedLessThan);
+
+    var start: usize = 0;
+    var end: usize = decorated.len;
+    if (req.search_after.len > 0) {
+        while (start < decorated.len and compareDecoratedHitToCursor(req, decorated[start], req.search_after) != .gt) {
+            start += 1;
+        }
+    } else if (req.search_before.len > 0) {
+        end = 0;
+        while (end < decorated.len and compareDecoratedHitToCursor(req, decorated[end], req.search_before) == .lt) {
+            end += 1;
+        }
+        start = if (end > req.limit) end - req.limit else 0;
+    } else {
+        start = @min(@as(usize, @intCast(req.offset)), decorated.len);
+    }
+    if (req.search_before.len == 0) {
+        end = @min(start + @as(usize, @intCast(req.limit)), decorated.len);
+    }
+
+    const selected = try alloc.alloc(types.SearchHit, end - start);
+    var selected_initialized: usize = 0;
+    errdefer {
+        for (selected[0..selected_initialized]) |*hit| hit.deinit(alloc);
+        if (selected.len > 0) alloc.free(selected);
+    }
+    for (decorated, 0..) |*item, i| {
+        if (i >= start and i < end) {
+            selected[selected_initialized] = item.hit;
+            item.hit = undefined;
+            selected_initialized += 1;
+        } else {
+            item.hit.deinit(alloc);
+        }
+        freeSortValues(alloc, item.keys);
+    }
+    if (decorated.len > 0) alloc.free(decorated);
     result.hits = selected;
 }
 
@@ -3700,17 +3979,18 @@ pub fn searchTextQuery(
     const full_candidate_limit = effectiveTextCandidateLimit(snapshot.global_doc_count, native_constraints);
     const search_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints, effective_req.count_only);
     const load_stored_in_search_engine = effective_req.include_stored and !chunk_backed;
+    const requires_stored_sort = effective_req.order_by.len > 0;
     const exact_late_visibility_totals = late_visibility_paginate and
         (effective_req.count_only or
             effective_req.limit == 0 or
             effective_req.aggregations_json.len != 0 or
             effective_req.graph_queries.len != 0 or
             group_chunk_parents);
+    const exact_candidate_budget = lateVisibilityExactCandidateBudget();
     if (exact_late_visibility_totals) {
-        const exact_candidate_budget = lateVisibilityExactCandidateBudget();
         enforceLateVisibilityExactCandidateBudget(full_candidate_limit, exact_candidate_budget) catch |err| {
             std.log.warn(
-                "text query exact late visibility candidate budget exceeded index={s} candidates={d} budget={d} count_only={} limit={d} aggregations={} graph_queries={d} chunk_parent_grouping={}",
+                "text query exact candidate budget exceeded index={s} candidates={d} budget={d} count_only={} limit={d} aggregations={} graph_queries={d} chunk_parent_grouping={}",
                 .{
                     effective_req.index_name orelse "",
                     full_candidate_limit,
@@ -3727,9 +4007,11 @@ pub fn searchTextQuery(
     }
     const adaptive_late_visibility = late_visibility_paginate and !exact_late_visibility_totals;
     const requested_visible_end = effective_req.offset +| effective_req.limit;
-    const collect_window_candidates = group_chunk_parents or late_visibility_paginate;
+    const collect_window_candidates = group_chunk_parents or late_visibility_paginate or requires_stored_sort;
     var candidate_limit: u32 = if (collect_window_candidates)
-        if (adaptive_late_visibility)
+        if (requires_stored_sort)
+            @min(full_candidate_limit, exact_candidate_budget)
+        else if (adaptive_late_visibility)
             @min(full_candidate_limit, @max(@as(u32, 1), @max(paging.limit, requested_visible_end)))
         else
             full_candidate_limit
@@ -3743,7 +4025,7 @@ pub fn searchTextQuery(
     while (true) {
         candidate_iterations += 1;
         var postprocess_req = effective_req;
-        if (late_visibility_paginate) {
+        if (late_visibility_paginate or requires_stored_sort) {
             postprocess_req.offset = 0;
             postprocess_req.limit = candidate_limit;
         }
@@ -3765,7 +4047,7 @@ pub fn searchTextQuery(
         defer result.deinit();
         if (bench_query_profile) execute_ns += platform_time.monotonicNs() - execute_start_ns;
 
-        const candidates_exhausted = !adaptive_late_visibility or
+        const candidates_exhausted = !collect_window_candidates or
             candidate_limit >= full_candidate_limit or
             (result.total_hits_relation == .exact and result.total_hits <= candidate_limit);
 
@@ -3845,7 +4127,17 @@ pub fn searchTextQuery(
             out.total_hits = visible_candidate_count;
             out.total_hits_relation = .gte;
         }
-        if (late_visibility_paginate and !effective_req.count_only) {
+        if (requires_stored_sort and !candidates_exhausted) {
+            std.log.warn("text query stored sort candidate budget exceeded index={s} candidates={d} budget={d}", .{
+                effective_req.index_name orelse "",
+                result.total_hits,
+                candidate_limit,
+            });
+            return error.QueryCandidateBudgetExceeded;
+        }
+        if (requires_stored_sort) {
+            try sortAndPageSearchResultInPlace(&out, effective_req, executor.ctx, executor.load_stored);
+        } else if (late_visibility_paginate and !effective_req.count_only) {
             try paginateSearchResultInPlace(&out, effective_req.offset, effective_req.limit);
         }
         if (bench_query_profile) {
@@ -5578,6 +5870,13 @@ pub fn searchMatchAll(
     });
     defer native_constraints.deinit(alloc);
     try applyMatchAllDocIdConstraintsAlloc(alloc, &candidates, &native_constraints);
+    if (req.order_by.len > 0) {
+        const candidate_count: u32 = @intCast(@min(candidates.items.len, @as(usize, std.math.maxInt(u32))));
+        enforceLateVisibilityExactCandidateBudget(candidate_count, lateVisibilityExactCandidateBudget()) catch |err| {
+            std.log.warn("match_all stored sort candidate budget exceeded candidates={d} budget={d}", .{ candidate_count, lateVisibilityExactCandidateBudget() });
+            return err;
+        };
+    }
 
     const needs_stored_pattern_filter =
         req.filter_query_json.len > 0 or
@@ -5616,6 +5915,20 @@ pub fn searchMatchAll(
         var filtered_owned = true;
         errdefer if (filtered_owned) filtered.deinit();
 
+        if (req.order_by.len > 0) {
+            try sortAndPageSearchResultInPlace(&filtered, req, executor.ctx, executor.load_stored);
+            filtered_owned = false;
+            errdefer filtered.deinit();
+            if (req.include_stored) {
+                for (filtered.hits) |*hit| {
+                    if (hit.stored_data == null) {
+                        hit.stored_data = try executor.load_projected_document(executor.ctx, alloc, req, hit.id);
+                    }
+                }
+            }
+            return filtered;
+        }
+
         var paged = try pageSearchResultInPlace(alloc, filtered, componentPaging(req));
         filtered_owned = false;
         errdefer paged.deinit();
@@ -5630,8 +5943,8 @@ pub fn searchMatchAll(
     const paging = componentPaging(req);
 
     const total_hits: u32 = @intCast(candidates.items.len);
-    const start = @min(paging.offset, total_hits);
-    const end = @min(start + paging.limit, total_hits);
+    const start = if (req.order_by.len > 0) 0 else @min(paging.offset, total_hits);
+    const end = if (req.order_by.len > 0) total_hits else @min(start + paging.limit, total_hits);
     const start_usize: usize = @intCast(start);
     const end_usize: usize = @intCast(end);
 
@@ -5652,12 +5965,17 @@ pub fn searchMatchAll(
         candidate.id = @constCast(&[_]u8{});
     }
 
-    return .{
+    var out = types.SearchResult{
         .alloc = alloc,
         .hits = hits,
         .total_hits = total_hits,
         .graph_results = &.{},
     };
+    errdefer out.deinit();
+    if (req.order_by.len > 0) {
+        try sortAndPageSearchResultInPlace(&out, req, executor.ctx, executor.load_stored);
+    }
+    return out;
 }
 
 fn applyMatchAllDocIdConstraintsAlloc(
@@ -6560,11 +6878,11 @@ fn testMatchAllLoadStoredCallback(
     key: []const u8,
 ) anyerror!?[]u8 {
     const json = if (std.mem.eql(u8, key, "doc:a"))
-        "{\"tier\":\"gold\"}"
+        "{\"tier\":\"gold\",\"rank\":2,\"nested\":{\"created_at\":\"2026-01-02\"}}"
     else if (std.mem.eql(u8, key, "doc:b"))
-        "{\"tier\":\"silver\"}"
+        "{\"tier\":\"silver\",\"rank\":1,\"nested\":{\"created_at\":\"2026-01-01\"}}"
     else if (std.mem.eql(u8, key, "doc:c"))
-        "{\"tier\":\"gold\"}"
+        "{\"tier\":\"gold\",\"rank\":1,\"nested\":{\"created_at\":\"2026-01-03\"}}"
     else
         return null;
     return try alloc.dupe(u8, json);
@@ -6705,6 +7023,89 @@ test "match_all applies stored pattern filters before paging" {
     try std.testing.expectEqual(@as(u32, 2), result.total_hits);
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc:c", result.hits[0].id);
+}
+
+test "match_all applies stored sort before cursor pagination" {
+    const alloc = std.testing.allocator;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+    };
+    const order_by = [_]types.SortField{
+        .{ .field = "rank" },
+        .{ .field = "_id" },
+    };
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+    var first_page = try searchMatchAll(alloc, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+    }, executor);
+    defer first_page.deinit();
+
+    try std.testing.expectEqual(@as(u32, 3), first_page.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), first_page.hits.len);
+    try std.testing.expectEqualStrings("doc:b", first_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", first_page.hits[1].id);
+    try std.testing.expectEqual(@as(i64, 1), first_page.hits[0].sort_values[0].integer);
+    try std.testing.expectEqualStrings("doc:b", first_page.hits[0].sort_values[1].string);
+    try std.testing.expectEqual(@as(i64, 1), first_page.hits[1].sort_values[0].integer);
+    try std.testing.expectEqualStrings("doc:c", first_page.hits[1].sort_values[1].string);
+
+    const cursor = first_page.hits[1].sort_values;
+    var second_page = try searchMatchAll(alloc, .{
+        .order_by = &order_by,
+        .search_after = cursor,
+        .include_stored = false,
+        .limit = 2,
+    }, executor);
+    defer second_page.deinit();
+
+    try std.testing.expectEqual(@as(u32, 3), second_page.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), second_page.hits.len);
+    try std.testing.expectEqualStrings("doc:a", second_page.hits[0].id);
+    try std.testing.expectEqual(@as(i64, 2), second_page.hits[0].sort_values[0].integer);
+    try std.testing.expectEqualStrings("doc:a", second_page.hits[0].sort_values[1].string);
+}
+
+test "match_all supports dotted stored sort and search_before" {
+    const alloc = std.testing.allocator;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+    };
+    const order_by = [_]types.SortField{
+        .{ .field = "nested.created_at", .desc = true },
+        .{ .field = "_id" },
+    };
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+    var current_page = try searchMatchAll(alloc, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+    }, executor);
+    defer current_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), current_page.hits.len);
+    try std.testing.expectEqualStrings("doc:c", current_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:a", current_page.hits[1].id);
+    try std.testing.expectEqualStrings("2026-01-03", current_page.hits[0].sort_values[0].string);
+
+    const cursor = current_page.hits[1].sort_values;
+    var previous_page = try searchMatchAll(alloc, .{
+        .order_by = &order_by,
+        .search_before = cursor,
+        .include_stored = false,
+        .limit = 2,
+    }, executor);
+    defer previous_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), previous_page.hits.len);
+    try std.testing.expectEqualStrings("doc:c", previous_page.hits[0].id);
 }
 
 fn testResolveDocSetDocIdsCallback(
@@ -7817,6 +8218,7 @@ test "composed search skips resolved doc-set materialization without graph queri
     const dense_vector = [_]f32{1.0};
     var result = try searchComposed(alloc, .{
         .dense = .{ .vector = &dense_vector, .k = 1 },
+        .merge_config = .{ .strategy = .rsf },
         .include_stored = false,
     }, .{
         .ctx = null,

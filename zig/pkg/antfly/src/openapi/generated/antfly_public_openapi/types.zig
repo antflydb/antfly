@@ -1585,8 +1585,8 @@ pub const QueryHit = struct {
     _source: ?std.json.Value = null,
     /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level rollup includes child chunks. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and `ancestors` with response-local or requested DB-backed source/unit context when available.
     hierarchy: ?std.json.Value = null,
-    /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Only present when order_by is specified.
-    _sort: ?[]const []const u8 = null,
+    /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Values preserve their JSON types. Only present when order_by is specified.
+    _sort: ?[]const std.json.Value = null,
 };
 
 /// Total hit count metadata.
@@ -2628,12 +2628,12 @@ pub const QueryRequest = struct {
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Only available for full_text_search queries. Not supported for semantic_search due to vector index limitations.
     offset: ?i64 = null,
-    /// Sort order for results. Array of sort fields with direction. Only applicable for full_text_search queries. Semantic searches are always sorted by similarity score.
+    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Only applicable for full_text_search queries. Semantic searches are always sorted by similarity score.
     order_by: ?[]const SortField = null,
-    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
-    search_after: ?[]const []const u8 = null,
-    /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
-    search_before: ?[]const []const u8 = null,
+    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, null remains null, and strings remain strings. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
+    search_after: ?[]const std.json.Value = null,
+    /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, null remains null, and strings remain strings. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
+    search_before: ?[]const std.json.Value = null,
     /// Maximum distance threshold for semantic similarity search. Results with distance greater than this value are excluded. Lower distances indicate higher similarity. Useful for filtering out low-confidence matches.
     distance_under: ?f32 = null,
     /// Minimum distance threshold for semantic similarity search. Results with distance less than this value are excluded. Useful for excluding near-exact duplicates or finding dissimilar documents.
@@ -2757,12 +2757,12 @@ pub const RetrievalQueryRequest = struct {
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Only available for full_text_search queries. Not supported for semantic_search due to vector index limitations.
     offset: ?i64 = null,
-    /// Sort order for results. Array of sort fields with direction. Only applicable for full_text_search queries. Semantic searches are always sorted by similarity score.
+    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Only applicable for full_text_search queries. Semantic searches are always sorted by similarity score.
     order_by: ?[]const SortField = null,
-    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
-    search_after: ?[]const []const u8 = null,
-    /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
-    search_before: ?[]const []const u8 = null,
+    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, null remains null, and strings remain strings. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
+    search_after: ?[]const std.json.Value = null,
+    /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, null remains null, and strings remain strings. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
+    search_before: ?[]const std.json.Value = null,
     /// Maximum distance threshold for semantic similarity search. Results with distance greater than this value are excluded. Lower distances indicate higher similarity. Useful for filtering out low-confidence matches.
     distance_under: ?f32 = null,
     /// Minimum distance threshold for semantic similarity search. Results with distance less than this value are excluded. Useful for excluding near-exact duplicates or finding dissimilar documents.

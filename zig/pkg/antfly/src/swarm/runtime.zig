@@ -1966,7 +1966,7 @@ fn registerInternalGroupRoutes(server: anytype) !void {
         group_prefix ++ routes.shard_ops_observe_split_suffix,
         group_prefix ++ routes.shard_ops_observe_merge_suffix,
         group_prefix ++ routes.shard_ops_execute_suffix,
-        table_prefix ++ routes.lookup_suffix,
+        table_prefix ++ routes.documents_suffix,
         table_prefix ++ routes.graph_expand_suffix,
         table_prefix ++ routes.graph_hydrate_suffix,
         table_prefix ++ routes.text_stats_suffix,
@@ -3142,7 +3142,7 @@ test "swarm runtime registers internal group routes explicitly" {
     try std.testing.expect(server.hasRoute(.post, group_prefix ++ routes.shard_ops_observe_split_suffix));
     try std.testing.expect(server.hasRoute(.post, group_prefix ++ routes.shard_ops_observe_merge_suffix));
     try std.testing.expect(server.hasRoute(.post, group_prefix ++ routes.shard_ops_execute_suffix));
-    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.lookup_suffix));
+    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.documents_suffix));
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.graph_expand_suffix));
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.graph_hydrate_suffix));
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.text_stats_suffix));

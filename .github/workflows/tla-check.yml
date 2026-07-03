@@ -19,6 +19,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   tla-check:
     # TLA+ model checking now runs inside the Zig unit job in zig-tests.yml so

@@ -1753,6 +1753,9 @@ fn applyCommonSearchRequestOptions(
     if (request.distance_over) |distance_over| req.distance_over = distance_over;
     if (request.distance_under) |distance_under| req.distance_under = distance_under;
     req.search_effort = request.search_effort;
+    if (request.order_by) |order_by| req.order_by = try cloneSortFieldsWithStableTiebreaker(alloc, order_by);
+    if (request.search_after) |search_after| req.search_after = try cloneJsonValues(alloc, search_after);
+    if (request.search_before) |search_before| req.search_before = try cloneJsonValues(alloc, search_before);
     if (request.merge_config) |merge_config| req.merge_config = try parseMergeConfig(alloc, merge_config);
     if (request.pruner) |pruner| req.pruner = try parsePruner(pruner);
     if (request.reranker) |reranker| {
@@ -1766,9 +1769,50 @@ fn applyCommonSearchRequestOptions(
 
     const has_semantic = request.semantic_search != null or request.embeddings != null;
     if (has_semantic and req.offset > 0) return error.UnsupportedQueryRequest;
+    if (has_semantic and req.order_by.len > 0) return error.UnsupportedQueryRequest;
+    if (req.order_by.len > 0 and req.offset > 0 and (req.search_after.len > 0 or req.search_before.len > 0)) return error.UnsupportedQueryRequest;
+    if (req.search_after.len > 0 and req.search_before.len > 0) return error.UnsupportedQueryRequest;
+    if ((req.search_after.len > 0 or req.search_before.len > 0) and req.order_by.len == 0) return error.UnsupportedQueryRequest;
+    if (req.search_after.len > 0 and req.search_after.len != req.order_by.len) return error.UnsupportedQueryRequest;
+    if (req.search_before.len > 0 and req.search_before.len != req.order_by.len) return error.UnsupportedQueryRequest;
     if (request.embedding_template != null and request.semantic_search == null) return error.UnsupportedQueryRequest;
     if (request.embedding_template != null and request.embeddings != null) return error.UnsupportedQueryRequest;
     if (req.count_only and req.reranker != null) return error.UnsupportedQueryRequest;
+}
+
+fn cloneSortFieldsWithStableTiebreaker(
+    alloc: std.mem.Allocator,
+    fields: []const metadata_openapi.SortField,
+) ![]const db_mod.types.SortField {
+    if (fields.len == 0) return error.UnsupportedQueryRequest;
+    var has_id = false;
+    for (fields) |field| {
+        if (field.field.len == 0) return error.UnsupportedQueryRequest;
+        if (std.mem.eql(u8, field.field, "_id")) has_id = true;
+    }
+
+    const out_len = fields.len + @as(usize, if (has_id) 0 else 1);
+    const out = try alloc.alloc(db_mod.types.SortField, out_len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |item| alloc.free(item.field);
+        alloc.free(out);
+    }
+    for (fields, 0..) |field, i| {
+        out[i] = .{
+            .field = try alloc.dupe(u8, field.field),
+            .desc = field.desc orelse false,
+        };
+        initialized += 1;
+    }
+    if (!has_id) {
+        out[fields.len] = .{
+            .field = try alloc.dupe(u8, "_id"),
+            .desc = false,
+        };
+        initialized += 1;
+    }
+    return out;
 }
 
 fn applySearchRequestFields(
@@ -1791,6 +1835,14 @@ fn applySearchRequestFields(
 fn freeClonedFields(alloc: std.mem.Allocator, fields: []const []const u8) void {
     for (fields) |field| alloc.free(field);
     if (fields.len > 0) alloc.free(fields);
+}
+
+fn cloneJsonValues(alloc: std.mem.Allocator, values: []const std.json.Value) ![]std.json.Value {
+    return try db_mod.types.cloneJsonValues(alloc, values);
+}
+
+fn freeClonedJsonValues(alloc: std.mem.Allocator, values: []const std.json.Value) void {
+    db_mod.types.freeJsonValues(alloc, @constCast(values));
 }
 
 pub fn parseQueryRequest(
@@ -1826,9 +1878,6 @@ pub fn parseQueryRequest(
     const request = parsed.value;
 
     if (request.analyses != null) return error.UnsupportedQueryRequest;
-    if (request.order_by != null) return error.UnsupportedQueryRequest;
-    if (request.search_after != null) return error.UnsupportedQueryRequest;
-    if (request.search_before != null) return error.UnsupportedQueryRequest;
     if (request.document_renderer != null) return error.UnsupportedQueryRequest;
     if (request.join != null) return error.UnsupportedQueryRequest;
     if (request.foreign_sources != null) return error.UnsupportedQueryRequest;
@@ -1971,7 +2020,7 @@ fn preflightBaseResultSetCount(req: db_mod.types.SearchRequest) u32 {
 
 fn preflightRequiresFusion(req: db_mod.types.SearchRequest) bool {
     const base_result_sets = preflightBaseResultSetCount(req);
-    return base_result_sets > 1 or (base_result_sets == 1 and req.merge_config != null);
+    return base_result_sets > 1;
 }
 
 fn countAggregationRequests(aggregations: ?std.json.ArrayHashMap(metadata_openapi.AggregationRequest)) u32 {
@@ -2256,6 +2305,7 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
         ._id = hit.id,
         ._score = if (hit.score) |score| finiteScoreOrZero(score) else 0,
         ._index_scores = try indexScoresJsonValue(alloc, hit.index_scores),
+        ._sort = if (hit.sort_values.len > 0) hit.sort_values else null,
         ._source = if (hit.stored_data) |stored_data|
             if (req.defer_stored_projection)
                 try document_query.projectLookupJsonValue(alloc, stored_data, .{
@@ -4290,6 +4340,18 @@ pub fn encodeSupportedPatternFilterQueryAlloc(
     return try encodePatternFilterQuery(alloc, parsed);
 }
 
+pub fn normalizePublicFilterQueryAlloc(
+    alloc: std.mem.Allocator,
+    query: std.json.Value,
+) ![]u8 {
+    var clauses = std.ArrayListUnmanaged([]u8).empty;
+    errdefer deinitOwnedStringArrayList(alloc, &clauses);
+    try appendPublicFilterClausesAlloc(alloc, &clauses, query, 10);
+    const out = try buildStructuredFilterClausesJsonAlloc(alloc, clauses.items, .all);
+    deinitOwnedStringArrayList(alloc, &clauses);
+    return out;
+}
+
 fn appendPatternFilterQueryValue(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -5118,6 +5180,10 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
     if (req.full_text) |full_text| freeTextQuery(alloc, full_text);
     if (req.filter_query_json.len > 0) alloc.free(req.filter_query_json);
     if (req.exclusion_query_json.len > 0) alloc.free(req.exclusion_query_json);
+    for (req.order_by) |field| alloc.free(field.field);
+    if (req.order_by.len > 0) alloc.free(req.order_by);
+    freeClonedJsonValues(alloc, req.search_after);
+    freeClonedJsonValues(alloc, req.search_before);
     switch (req.query) {
         .term => |term| {
             alloc.free(term.field);
@@ -6307,6 +6373,43 @@ test "api query contract preflight rejects cursor pagination without sort" {
     defer parsed.deinit();
 
     try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed.value));
+}
+
+test "api query contract appends stable id sort tiebreaker for cursors" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "order_by": [{"field":"created_at","desc":true}],
+        \\  "search_after": ["2026-01-01", "doc-9"],
+        \\  "limit": 10
+        \\}
+    ;
+
+    var parsed = try parseQueryRequest(alloc, null, "docs", body);
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.req.order_by.len);
+    try std.testing.expectEqualStrings("created_at", parsed.req.order_by[0].field);
+    try std.testing.expect(parsed.req.order_by[0].desc);
+    try std.testing.expectEqualStrings("_id", parsed.req.order_by[1].field);
+    try std.testing.expect(!parsed.req.order_by[1].desc);
+    try std.testing.expectEqual(@as(usize, 2), parsed.req.search_after.len);
+    try std.testing.expectEqualStrings("2026-01-01", parsed.req.search_after[0].string);
+    try std.testing.expectEqualStrings("doc-9", parsed.req.search_after[1].string);
+}
+
+test "api query contract rejects cursor width that omits stable id tiebreaker" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "order_by": [{"field":"created_at","desc":true}],
+        \\  "search_after": ["2026-01-01"]
+        \\}
+    ;
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
 }
 
 test "api query contract parses packed dense embeddings via antfly-json" {

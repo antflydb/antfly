@@ -256,7 +256,7 @@ pub fn parseUpdateSchemaBody(allocator: std.mem.Allocator, body: []const u8) !st
     return std.json.parseFromSlice(antfly_schema_openapi.TableSchema, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Scan keys in a table within a key range
+/// Scan documents in a table within a key range
 pub const ScanKeysPathParams = struct {
     /// Name of the table
     table_name: []const u8,
@@ -483,7 +483,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/backup", .operation_id = "backupTable" },
     .{ .method = "POST", .path = "/tables/{tableName}/restore", .operation_id = "restoreTable" },
     .{ .method = "PUT", .path = "/tables/{tableName}/schema", .operation_id = "updateSchema" },
-    .{ .method = "POST", .path = "/tables/{tableName}/lookup", .operation_id = "scanKeys" },
+    .{ .method = "POST", .path = "/tables/{tableName}/documents", .operation_id = "scanKeys" },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey" },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests" },
     .{ .method = "GET", .path = "/tables/{tableName}/artifacts", .operation_id = "listArtifactEnrichments" },
@@ -618,7 +618,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/tables/:tableName/backup", backupTable);
             try server.post("/tables/:tableName/restore", restoreTable);
             try server.put("/tables/:tableName/schema", updateSchema);
-            try server.post("/tables/:tableName/lookup", scanKeys);
+            try server.post("/tables/:tableName/documents", scanKeys);
             try server.get("/tables/:tableName/documents/:key", lookupKey);
             try server.get("/tables/:tableName/documents/:key/artifacts", listDocumentArtifactManifests);
             try server.get("/tables/:tableName/artifacts", listArtifactEnrichments);
@@ -932,8 +932,8 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.updateSchema(ctx, table_name);
         }
 
-        /// Scan keys in a table within a key range
-        /// POST /tables/{tableName}/lookup
+        /// Scan documents in a table within a key range
+        /// POST /tables/{tableName}/documents
         fn scanKeys(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });

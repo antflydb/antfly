@@ -255,7 +255,7 @@ pub fn parseUpdateSchemaBody(allocator: std.mem.Allocator, body: []const u8) !st
     return std.json.parseFromSlice(antfly_schema_openapi.TableSchema, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Scan keys in a table within a key range
+/// Scan documents in a table within a key range
 pub const ScanKeysPathParams = struct {
     /// Name of the table
     table_name: []const u8,
@@ -669,7 +669,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/backup", .operation_id = "backupTable" },
     .{ .method = "POST", .path = "/tables/{tableName}/restore", .operation_id = "restoreTable" },
     .{ .method = "PUT", .path = "/tables/{tableName}/schema", .operation_id = "updateSchema" },
-    .{ .method = "POST", .path = "/tables/{tableName}/lookup", .operation_id = "scanKeys" },
+    .{ .method = "POST", .path = "/tables/{tableName}/documents", .operation_id = "scanKeys" },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey" },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests" },
     .{ .method = "GET", .path = "/tables/{tableName}/artifacts", .operation_id = "listArtifactEnrichments" },

@@ -886,6 +886,7 @@ pub const ScanOptions = struct {
     limit: u32 = 0,
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
+    filter_query_json: []const u8 = "",
 };
 
 pub const ScanDocument = struct {
@@ -1090,6 +1091,9 @@ pub const SearchRequest = struct {
     hierarchy_include_source: bool = false,
     hierarchy_include_unit: bool = false,
     fields: []const []const u8 = &.{},
+    order_by: []const SortField = &.{},
+    search_after: []const std.json.Value = &.{},
+    search_before: []const std.json.Value = &.{},
     include_all_fields: bool = true,
     defer_stored_projection: bool = false,
     limit: u32 = 10,
@@ -1115,6 +1119,11 @@ pub const SearchRequest = struct {
     identity_read_generation: ?u64 = null,
     require_algebraic_filter_resolution: bool = false,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
+};
+
+pub const SortField = struct {
+    field: []const u8,
+    desc: bool = false,
 };
 
 pub const ResolvedDocFilterWireContext = struct {
@@ -1174,6 +1183,7 @@ pub const SearchHit = struct {
     doc_ordinal: ?u32 = null,
     score: ?f32 = null,
     index_scores: []fusion_mod.IndexScore = &.{},
+    sort_values: []std.json.Value = &.{},
     stored_data: ?[]u8 = null,
     ancestor_source_data: ?[]u8 = null,
     ancestor_unit_data: ?[]u8 = null,
@@ -1186,6 +1196,7 @@ pub const SearchHit = struct {
             .doc_ordinal = self.doc_ordinal,
             .score = self.score,
             .index_scores = try cloneIndexScores(alloc, self.index_scores),
+            .sort_values = try cloneJsonValues(alloc, self.sort_values),
             .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
             .ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null,
             .ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null,
@@ -1195,6 +1206,7 @@ pub const SearchHit = struct {
         errdefer {
             alloc.free(cloned.id);
             freeIndexScores(alloc, cloned.index_scores);
+            freeJsonValues(alloc, cloned.sort_values);
             if (cloned.stored_data) |data| alloc.free(data);
             if (cloned.ancestor_source_data) |data| alloc.free(data);
             if (cloned.ancestor_unit_data) |data| alloc.free(data);
@@ -1219,6 +1231,7 @@ pub const SearchHit = struct {
     pub fn deinit(self: *SearchHit, alloc: Allocator) void {
         alloc.free(self.id);
         freeIndexScores(alloc, self.index_scores);
+        freeJsonValues(alloc, self.sort_values);
         if (self.stored_data) |data| alloc.free(data);
         if (self.ancestor_source_data) |data| alloc.free(data);
         if (self.ancestor_unit_data) |data| alloc.free(data);
@@ -1228,6 +1241,107 @@ pub const SearchHit = struct {
         self.* = undefined;
     }
 };
+
+pub fn cloneOwnedByteSlices(alloc: Allocator, values: []const []const u8) ![]const []u8 {
+    if (values.len == 0) return &.{};
+    const cloned = try alloc.alloc([]u8, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |value| alloc.free(value);
+        alloc.free(cloned);
+    }
+    for (values, 0..) |value, i| {
+        cloned[i] = try alloc.dupe(u8, value);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+pub fn freeOwnedByteSlices(alloc: Allocator, values: []const []u8) void {
+    for (values) |value| alloc.free(value);
+    if (values.len > 0) alloc.free(values);
+}
+
+pub fn cloneJsonValue(alloc: Allocator, value: std.json.Value) !std.json.Value {
+    return switch (value) {
+        .null, .bool, .integer, .float => value,
+        .number_string => |text| .{ .number_string = try alloc.dupe(u8, text) },
+        .string => |text| .{ .string = try alloc.dupe(u8, text) },
+        .array => |arr| blk: {
+            var cloned = std.json.Array.init(alloc);
+            errdefer {
+                for (cloned.items) |*item| deinitJsonValue(alloc, item);
+                cloned.deinit();
+            }
+            for (arr.items) |item| {
+                var cloned_item = try cloneJsonValue(alloc, item);
+                errdefer deinitJsonValue(alloc, &cloned_item);
+                try cloned.append(cloned_item);
+            }
+            break :blk .{ .array = cloned };
+        },
+        .object => |obj| blk: {
+            var cloned = std.json.ObjectMap.empty;
+            errdefer {
+                var it = cloned.iterator();
+                while (it.next()) |entry| {
+                    alloc.free(@constCast(entry.key_ptr.*));
+                    deinitJsonValue(alloc, entry.value_ptr);
+                }
+                cloned.deinit(alloc);
+            }
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                const key = try alloc.dupe(u8, entry.key_ptr.*);
+                errdefer alloc.free(key);
+                var cloned_value = try cloneJsonValue(alloc, entry.value_ptr.*);
+                errdefer deinitJsonValue(alloc, &cloned_value);
+                try cloned.put(alloc, key, cloned_value);
+            }
+            break :blk .{ .object = cloned };
+        },
+    };
+}
+
+pub fn deinitJsonValue(alloc: Allocator, value: *std.json.Value) void {
+    switch (value.*) {
+        .string, .number_string => |text| alloc.free(text),
+        .array => |*arr| {
+            for (arr.items) |*item| deinitJsonValue(alloc, item);
+            arr.deinit();
+        },
+        .object => |*obj| {
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                alloc.free(@constCast(entry.key_ptr.*));
+                deinitJsonValue(alloc, entry.value_ptr);
+            }
+            obj.deinit(alloc);
+        },
+        else => {},
+    }
+    value.* = .null;
+}
+
+pub fn cloneJsonValues(alloc: Allocator, values: []const std.json.Value) ![]std.json.Value {
+    if (values.len == 0) return &.{};
+    const cloned = try alloc.alloc(std.json.Value, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |*value| deinitJsonValue(alloc, value);
+        alloc.free(cloned);
+    }
+    for (values, 0..) |value, i| {
+        cloned[i] = try cloneJsonValue(alloc, value);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+pub fn freeJsonValues(alloc: Allocator, values: []std.json.Value) void {
+    for (values) |*value| deinitJsonValue(alloc, value);
+    if (values.len > 0) alloc.free(values);
+}
 
 pub fn cloneIndexScores(alloc: Allocator, scores: []const fusion_mod.IndexScore) ![]fusion_mod.IndexScore {
     if (scores.len == 0) return &.{};

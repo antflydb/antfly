@@ -10958,6 +10958,10 @@ pub const DB = struct {
             }
             if (try isExpiredDocumentKey(self, alloc, raw_key)) continue;
 
+            if (opts.filter_query_json.len > 0) {
+                if (!(try db_query_graph.storedDocMatchesPatternFilter(alloc, raw_key, doc.value, opts.filter_query_json))) continue;
+            }
+
             const hash = std.hash.Wyhash.hash(0, doc.value);
             try hashes.append(alloc, .{
                 .id = try alloc.dupe(u8, raw_key),
@@ -11061,7 +11065,7 @@ pub const DB = struct {
         exec_ctx: types.ExecutionContext,
     ) !types.SearchResult {
         const execution_req = directSingleVectorRequest(req) orelse req;
-        if (execution_req.full_text_queries.len > 0 or execution_req.dense_queries.len > 0 or execution_req.sparse_queries.len > 0 or execution_req.merge_config != null) {
+        if (searchRequestRequiresComposedSearch(execution_req)) {
             var composed = try self.searchComposed(alloc, execution_req, exec_ctx);
             errdefer composed.deinit();
             try externalizeSearchResultArtifactIds(alloc, &composed);
@@ -11115,6 +11119,21 @@ pub const DB = struct {
         try self.applyGraphExpandStrategy(alloc, &base, execution_req.expand_strategy);
         try externalizeSearchResultArtifactIds(alloc, &base);
         return base;
+    }
+
+    fn searchRequestRequiresComposedSearch(req: types.SearchRequest) bool {
+        if (req.full_text_queries.len > 0 or req.dense_queries.len > 0 or req.sparse_queries.len > 0) return true;
+
+        var base_result_sets: u32 = 0;
+        if (req.full_text != null) base_result_sets += 1;
+        if (req.dense != null) base_result_sets += 1;
+        if (req.sparse != null) base_result_sets += 1;
+        switch (req.query) {
+            .dense_knn => base_result_sets += 1,
+            .sparse_knn => base_result_sets += 1,
+            else => {},
+        }
+        return base_result_sets > 1;
     }
 
     fn directSingleVectorRequest(req: types.SearchRequest) ?types.SearchRequest {
@@ -11227,6 +11246,7 @@ pub const DB = struct {
             .text_index_is_chunk_backed = textIndexIsChunkBackedCallback,
             .search_match_all = searchMatchAllCallback,
             .project_stored_search = projectStoredBytesForSearchCallback,
+            .load_stored = loadStoredSearchDocumentCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
@@ -44356,7 +44376,7 @@ test "db search fuses full_text and dense named searches before graph expansion"
         .merge_config = .{
             .strategy = .rrf,
             .weights = &.{
-                .{ .name = "$full_text_results", .weight = 1.0 },
+                .{ .name = "full_text", .weight = 1.0 },
                 .{ .name = "dv_v1", .weight = 1.0 },
             },
         },
@@ -44429,7 +44449,7 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
             .strategy = .rsf,
             .window_size = 10,
             .weights = &.{
-                .{ .name = "$full_text_results", .weight = 0.4 },
+                .{ .name = "full_text", .weight = 0.4 },
                 .{ .name = "dv_v1", .weight = 1.0 },
             },
         },
@@ -44501,7 +44521,7 @@ test "db search fuses full_text and dense named searches before graph expansion 
         .merge_config = .{
             .strategy = .rrf,
             .weights = &.{
-                .{ .name = "$full_text_results", .weight = 1.0 },
+                .{ .name = "full_text", .weight = 1.0 },
                 .{ .name = "dv_v1", .weight = 1.0 },
             },
         },
@@ -53081,6 +53101,36 @@ test "db scan returns hashes and projected documents" {
     try std.testing.expectEqual(@as(usize, 2), result.documents.len);
     try std.testing.expect(std.mem.indexOf(u8, result.documents[0].json, "\"title\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.documents[0].json, "\"body\"") == null);
+}
+
+test "db scan applies structured filter before limit" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"tenant\":\"t1\"}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"tenant\":\"t2\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"tenant\":\"t2\"}" },
+        },
+    });
+
+    var result = try db.scan(alloc, "", "", .{
+        .include_all_fields = false,
+        .limit = 1,
+        .filter_query_json = "{\"term\":{\"tenant\":\"t2\"}}",
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.hashes.len);
+    try std.testing.expectEqualStrings("doc:b", result.hashes[0].id);
+    try std.testing.expectEqual(@as(usize, 0), result.documents.len);
 }
 
 test "db updateRange constrains index backfill" {

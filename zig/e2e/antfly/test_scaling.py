@@ -422,6 +422,10 @@ class MultiNodeScalingCluster:
         ]
 
     @property
+    def data_base_urls(self) -> list[str]:
+        return [self.data_base_url_for_node(node) for node in self.data_nodes]
+
+    @property
     def live_data_api_urls(self) -> list[str]:
         urls: list[str] = []
         for node in self.data_nodes:
@@ -431,7 +435,10 @@ class MultiNodeScalingCluster:
         return urls
 
     def data_api_url_for_node(self, node: dict[str, int]) -> str:
-        return antfly_public_api_url(f"http://{self.host}:{node['api_port']}", binary=self.binary)
+        return antfly_public_api_url(self.data_base_url_for_node(node), binary=self.binary)
+
+    def data_base_url_for_node(self, node: dict[str, int]) -> str:
+        return f"http://{self.host}:{node['api_port']}"
 
     def _new_data_node(self, node_id: int) -> dict[str, int]:
         return {
@@ -499,15 +506,20 @@ class MultiNodeScalingCluster:
         for node in self.data_nodes:
             self._start_data_node(node)
 
-        for url in self.data_api_urls:
-            if not wait_for_server(url, timeout=self.startup_timeout(30.0)):
-                raise RuntimeError(f"Data node failed to start at {url}\n{self.debug_logs()}")
+        for node in self.data_nodes:
+            base_url = self.data_base_url_for_node(node)
+            if not wait_for_server(base_url, timeout=self.startup_timeout(30.0)):
+                raise RuntimeError(f"Data node process failed to become healthy at {base_url}\n{self.debug_logs()}")
         if not self.wait_for_all_data_nodes_registered(timeout_s=self.startup_timeout(60.0)):
             raise RuntimeError(
                 "Data nodes did not register on all metadata nodes\n"
                 f"metadata statuses: {json.dumps(self.metadata_statuses(), indent=2, sort_keys=True)}\n"
                 f"{self.debug_logs()}"
             )
+        for node in self.data_nodes:
+            url = self.data_api_url_for_node(node)
+            if not wait_for_server(url, timeout=self.startup_timeout(30.0)):
+                raise RuntimeError(f"Data node public API failed to become ready at {url}\n{self.debug_logs()}")
 
     def startup_timeout(self, max_timeout_s: float) -> float:
         if self.startup_deadline is None:
@@ -554,15 +566,18 @@ class MultiNodeScalingCluster:
         node = self._new_data_node(max(int(existing["id"]) for existing in self.data_nodes) + 1)
         self.data_nodes.append(node)
         self._start_data_node(node)
+        base_url = self.data_base_url_for_node(node)
+        if not wait_for_server(base_url):
+            raise RuntimeError(f"Added data node process failed to become healthy at {base_url}\n{self.debug_logs()}")
         url = self.data_api_url_for_node(node)
-        if not wait_for_server(url):
-            raise RuntimeError(f"Added data node failed to start at {url}\n{self.debug_logs()}")
         if not self.wait_for_data_nodes_registered({int(node["id"])}, timeout_s=60.0):
             raise RuntimeError(
                 f"Added data node {node['id']} did not register on all metadata nodes\n"
                 f"metadata statuses: {json.dumps(self.metadata_statuses(), indent=2, sort_keys=True)}\n"
                 f"{self.debug_logs()}"
             )
+        if not wait_for_server(url):
+            raise RuntimeError(f"Added data node public API failed to become ready at {url}\n{self.debug_logs()}")
         return node
 
     def stop_data_node(self, node_id: int) -> None:

@@ -10,6 +10,9 @@ permissions:
   packages: write # Required if publishing Docker images
   id-token: write # Required for keyless OIDC signing in container workflow
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build-zig-runtime-archives:
     name: Build Zig archive (${{ matrix.artifact_name }})

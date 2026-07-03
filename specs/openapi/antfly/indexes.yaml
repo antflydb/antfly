@@ -175,25 +175,83 @@ components:
           type: integer
           format: uint64
           description: "Number of documents in the index"
-        disk_usage:
-          x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
-          description: "Size of the index in bytes"
         rebuilding:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "Whether the index is currently rebuilding"
+        backfill_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Whether the index is actively rebuilding, replaying, or catching up."
         backfill_progress:
           x-go-type-skip-optional-pointer: true
           type: number
           format: double
           description: "Progress of ongoing rebuild as fraction [0.0, 1.0]"
-        backfill_items_processed:
+        backfill_state:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Operational readiness state such as ready, running, retrying, or failed."
+        doc_count:
           x-go-type-skip-optional-pointer: true
           type: integer
           format: uint64
-          description: "Number of documents indexed during current rebuild"
+          description: "Number of documents visible to the index."
+        term_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of indexed terms when available."
+        replay_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Highest replay sequence applied to the index runtime."
+        replay_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Replay sequence the index runtime must reach to be current."
+        replay_catch_up_required:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Whether replay must catch up before the index is fully current."
+        runtime_present:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_fresh:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_source:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        runtime_freshness:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        catch_up_phase:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        catch_up_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        text_merge:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Full-text merge runtime diagnostics."
+        async_indexing:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Asynchronous indexer runtime diagnostics."
     EmbeddingsIndexConfig:
       type: object
       description: >-
@@ -290,11 +348,6 @@ components:
           type: integer
           format: uint64
           description: "Number of vectors/documents in the index"
-        disk_usage:
-          x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
-          description: "Size of the index in bytes"
         total_nodes:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -309,21 +362,115 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "Whether the index enricher is currently backfilling"
-        wal_backlog:
+        backfill_active:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
-          description: "Number of documents pending enrichment in the WAL"
+          type: boolean
+          description: "Whether the index is actively rebuilding, replaying, enriching, or catching up."
         backfill_progress:
           x-go-type-skip-optional-pointer: true
           type: number
           format: double
           description: "Backfill progress as a ratio from 0.0 to 1.0"
-        backfill_items_processed:
+        backfill_state:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Operational readiness state such as ready, running, retrying, or failed."
+        doc_count:
           x-go-type-skip-optional-pointer: true
           type: integer
           format: uint64
-          description: "Total items processed during backfill"
+          description: "Number of documents visible to the index."
+        query_visible_doc_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Documents currently visible to queries."
+        published_doc_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        published_node_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        root_node:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        published_root_node:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        dense_replay_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        dense_replay_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        dense_publish_pending:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Whether dense/vector artifacts still need publication before queries see the latest data."
+        replay_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_catch_up_required:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_present:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_fresh:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_source:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        runtime_freshness:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        catch_up_phase:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        catch_up_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        enrichment_runtime:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          properties:
+            pending_sequence_count:
+              type: integer
+              format: uint64
+          description: "Embedding enrichment worker runtime diagnostics."
+        hbc_cache:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+        hbc_posting:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+        async_indexing:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
     IndexStats:
       type: object
       description: "Statistics for an index"
@@ -360,25 +507,73 @@ components:
           type: integer
           format: uint64
           description: "Number of documents reflected in the algebraic sidecar"
-        disk_usage:
-          x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
-          description: "Size of the index in bytes"
         rebuilding:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "Whether the sidecar is currently rebuilding"
+        backfill_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Whether the sidecar is actively rebuilding, replaying, or catching up."
         backfill_progress:
           x-go-type-skip-optional-pointer: true
           type: number
           format: double
           description: "Backfill progress as a ratio from 0.0 to 1.0"
-        backfill_items_processed:
+        backfill_state:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Operational readiness state such as ready, running, retrying, or failed."
+        doc_count:
           x-go-type-skip-optional-pointer: true
           type: integer
           format: uint64
-          description: "Number of documents processed during current backfill"
+          description: "Number of documents visible to the sidecar."
+        term_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_catch_up_required:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_present:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_fresh:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_source:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        runtime_freshness:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        catch_up_phase:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        catch_up_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        async_indexing:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
         healthy:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -686,16 +881,85 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "Whether the index is currently rebuilding"
+        backfill_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Whether the index is actively rebuilding, materializing, or catching up."
         backfill_progress:
           x-go-type-skip-optional-pointer: true
           type: number
           format: double
           description: "Rebuild progress as a ratio from 0.0 to 1.0"
-        backfill_items_processed:
+        backfill_state:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Operational readiness state such as ready, running, retrying, or failed."
+        doc_count:
           x-go-type-skip-optional-pointer: true
           type: integer
           format: uint64
-          description: "Number of edges indexed during current rebuild"
+          description: "Number of documents covered by the graph index."
+        edge_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of graph edges currently indexed."
+        node_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of graph nodes currently indexed."
+        replay_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_catch_up_required:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_present:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_fresh:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_source:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        runtime_freshness:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        catch_up_phase:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        catch_up_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        source_artifact:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Graph source artifact materialization status."
+        resolver_replay:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Resolver replay diagnostics for graph materialization."
+        async_indexing:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
         algebraic_graph:
           x-go-type-skip-optional-pointer: true
           type: object

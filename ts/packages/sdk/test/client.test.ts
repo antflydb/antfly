@@ -495,27 +495,27 @@ describe("AntflyClient", () => {
 
     it("should scan keys and stream results", async () => {
       const mockDocuments = [
-        { _key: "user:1", name: "Alice" },
-        { _key: "user:2", name: "Bob" },
-        { _key: "user:3", name: "Charlie" },
+        { _id: "user:1", name: "Alice" },
+        { _id: "user:2", name: "Bob" },
+        { _id: "user:3", name: "Charlie" },
       ];
 
       const mockFetch = vi
         .spyOn(globalThis, "fetch")
         .mockResolvedValueOnce(createNDJSONResponse(mockDocuments));
 
-      const results: Array<{ _key: string; [key: string]: unknown }> = [];
+      const results: Array<{ _id: string; [key: string]: unknown }> = [];
       for await (const doc of client.tables.scan("users")) {
         results.push(doc);
       }
 
       expect(results).toHaveLength(3);
-      expect(results[0]).toEqual({ _key: "user:1", name: "Alice" });
-      expect(results[1]).toEqual({ _key: "user:2", name: "Bob" });
-      expect(results[2]).toEqual({ _key: "user:3", name: "Charlie" });
+      expect(results[0]).toEqual({ _id: "user:1", name: "Alice" });
+      expect(results[1]).toEqual({ _id: "user:2", name: "Bob" });
+      expect(results[2]).toEqual({ _id: "user:3", name: "Charlie" });
 
       expect(mockFetch).toHaveBeenCalledWith(
-        "http://localhost:8080/db/v1/tables/users/lookup",
+        "http://localhost:8080/db/v1/tables/users/documents",
         expect.objectContaining({
           method: "POST",
           body: "{}",
@@ -527,15 +527,15 @@ describe("AntflyClient", () => {
 
     it("should scan keys with range and field parameters", async () => {
       const mockDocuments = [
-        { _key: "user:100", name: "User 100" },
-        { _key: "user:101", name: "User 101" },
+        { _id: "user:100", name: "User 100" },
+        { _id: "user:101", name: "User 101" },
       ];
 
       const mockFetch = vi
         .spyOn(globalThis, "fetch")
         .mockResolvedValueOnce(createNDJSONResponse(mockDocuments));
 
-      const results: Array<{ _key: string; [key: string]: unknown }> = [];
+      const results: Array<{ _id: string; [key: string]: unknown }> = [];
       for await (const doc of client.tables.scan("users", {
         from: "user:100",
         to: "user:200",
@@ -548,7 +548,7 @@ describe("AntflyClient", () => {
       expect(results).toHaveLength(2);
 
       expect(mockFetch).toHaveBeenCalledWith(
-        "http://localhost:8080/db/v1/tables/users/lookup",
+        "http://localhost:8080/db/v1/tables/users/documents",
         expect.objectContaining({
           method: "POST",
           body: JSON.stringify({
@@ -576,8 +576,8 @@ describe("AntflyClient", () => {
 
     it("should collect all results with scanAll", async () => {
       const mockDocuments = [
-        { _key: "prod:1", title: "Product 1", price: 10 },
-        { _key: "prod:2", title: "Product 2", price: 20 },
+        { _id: "prod:1", title: "Product 1", price: 10 },
+        { _id: "prod:2", title: "Product 2", price: 20 },
       ];
 
       const mockFetch = vi
@@ -589,8 +589,8 @@ describe("AntflyClient", () => {
       });
 
       expect(results).toHaveLength(2);
-      expect(results[0]).toEqual({ _key: "prod:1", title: "Product 1", price: 10 });
-      expect(results[1]).toEqual({ _key: "prod:2", title: "Product 2", price: 20 });
+      expect(results[0]).toEqual({ _id: "prod:1", title: "Product 1", price: 10 });
+      expect(results[1]).toEqual({ _id: "prod:2", title: "Product 2", price: 20 });
 
       mockFetch.mockRestore();
     });

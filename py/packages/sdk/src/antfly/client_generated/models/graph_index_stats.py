@@ -11,7 +11,10 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
+    from ..models.graph_index_stats_async_indexing import GraphIndexStatsAsyncIndexing
     from ..models.graph_index_stats_edge_types import GraphIndexStatsEdgeTypes
+    from ..models.graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
+    from ..models.graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
 
 
 T = TypeVar("T", bound="GraphIndexStats")
@@ -27,8 +30,26 @@ class GraphIndexStats:
         total_edges (int | Unset): Total number of edges in the graph
         edge_types (GraphIndexStatsEdgeTypes | Unset): Count of edges per edge type
         rebuilding (bool | Unset): Whether the index is currently rebuilding
+        backfill_active (bool | Unset): Whether the index is actively rebuilding, materializing, or catching up.
         backfill_progress (float | Unset): Rebuild progress as a ratio from 0.0 to 1.0
-        backfill_items_processed (int | Unset): Number of edges indexed during current rebuild
+        backfill_state (str | Unset): Operational readiness state such as ready, running, retrying, or failed.
+        doc_count (int | Unset): Number of documents covered by the graph index.
+        edge_count (int | Unset): Number of graph edges currently indexed.
+        node_count (int | Unset): Number of graph nodes currently indexed.
+        replay_applied_sequence (int | Unset):
+        replay_target_sequence (int | Unset):
+        replay_catch_up_required (bool | Unset):
+        runtime_present (bool | Unset):
+        runtime_fresh (bool | Unset):
+        runtime_source (str | Unset):
+        runtime_freshness (str | Unset):
+        catch_up_active (bool | Unset):
+        catch_up_phase (str | Unset):
+        catch_up_applied_sequence (int | Unset):
+        catch_up_target_sequence (int | Unset):
+        source_artifact (GraphIndexStatsSourceArtifact | Unset): Graph source artifact materialization status.
+        resolver_replay (GraphIndexStatsResolverReplay | Unset): Resolver replay diagnostics for graph materialization.
+        async_indexing (GraphIndexStatsAsyncIndexing | Unset):
         algebraic_graph (GraphIndexStatsAlgebraicGraph | Unset): Algebraic graph execution health for bounded semiring
             traversal.
     """
@@ -38,8 +59,26 @@ class GraphIndexStats:
     total_edges: int | Unset = UNSET
     edge_types: GraphIndexStatsEdgeTypes | Unset = UNSET
     rebuilding: bool | Unset = UNSET
+    backfill_active: bool | Unset = UNSET
     backfill_progress: float | Unset = UNSET
-    backfill_items_processed: int | Unset = UNSET
+    backfill_state: str | Unset = UNSET
+    doc_count: int | Unset = UNSET
+    edge_count: int | Unset = UNSET
+    node_count: int | Unset = UNSET
+    replay_applied_sequence: int | Unset = UNSET
+    replay_target_sequence: int | Unset = UNSET
+    replay_catch_up_required: bool | Unset = UNSET
+    runtime_present: bool | Unset = UNSET
+    runtime_fresh: bool | Unset = UNSET
+    runtime_source: str | Unset = UNSET
+    runtime_freshness: str | Unset = UNSET
+    catch_up_active: bool | Unset = UNSET
+    catch_up_phase: str | Unset = UNSET
+    catch_up_applied_sequence: int | Unset = UNSET
+    catch_up_target_sequence: int | Unset = UNSET
+    source_artifact: GraphIndexStatsSourceArtifact | Unset = UNSET
+    resolver_replay: GraphIndexStatsResolverReplay | Unset = UNSET
+    async_indexing: GraphIndexStatsAsyncIndexing | Unset = UNSET
     algebraic_graph: GraphIndexStatsAlgebraicGraph | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -56,9 +95,51 @@ class GraphIndexStats:
 
         rebuilding = self.rebuilding
 
+        backfill_active = self.backfill_active
+
         backfill_progress = self.backfill_progress
 
-        backfill_items_processed = self.backfill_items_processed
+        backfill_state = self.backfill_state
+
+        doc_count = self.doc_count
+
+        edge_count = self.edge_count
+
+        node_count = self.node_count
+
+        replay_applied_sequence = self.replay_applied_sequence
+
+        replay_target_sequence = self.replay_target_sequence
+
+        replay_catch_up_required = self.replay_catch_up_required
+
+        runtime_present = self.runtime_present
+
+        runtime_fresh = self.runtime_fresh
+
+        runtime_source = self.runtime_source
+
+        runtime_freshness = self.runtime_freshness
+
+        catch_up_active = self.catch_up_active
+
+        catch_up_phase = self.catch_up_phase
+
+        catch_up_applied_sequence = self.catch_up_applied_sequence
+
+        catch_up_target_sequence = self.catch_up_target_sequence
+
+        source_artifact: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.source_artifact, Unset):
+            source_artifact = self.source_artifact.to_dict()
+
+        resolver_replay: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.resolver_replay, Unset):
+            resolver_replay = self.resolver_replay.to_dict()
+
+        async_indexing: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.async_indexing, Unset):
+            async_indexing = self.async_indexing.to_dict()
 
         algebraic_graph: dict[str, Any] | Unset = UNSET
         if not isinstance(self.algebraic_graph, Unset):
@@ -79,10 +160,46 @@ class GraphIndexStats:
             field_dict["edge_types"] = edge_types
         if rebuilding is not UNSET:
             field_dict["rebuilding"] = rebuilding
+        if backfill_active is not UNSET:
+            field_dict["backfill_active"] = backfill_active
         if backfill_progress is not UNSET:
             field_dict["backfill_progress"] = backfill_progress
-        if backfill_items_processed is not UNSET:
-            field_dict["backfill_items_processed"] = backfill_items_processed
+        if backfill_state is not UNSET:
+            field_dict["backfill_state"] = backfill_state
+        if doc_count is not UNSET:
+            field_dict["doc_count"] = doc_count
+        if edge_count is not UNSET:
+            field_dict["edge_count"] = edge_count
+        if node_count is not UNSET:
+            field_dict["node_count"] = node_count
+        if replay_applied_sequence is not UNSET:
+            field_dict["replay_applied_sequence"] = replay_applied_sequence
+        if replay_target_sequence is not UNSET:
+            field_dict["replay_target_sequence"] = replay_target_sequence
+        if replay_catch_up_required is not UNSET:
+            field_dict["replay_catch_up_required"] = replay_catch_up_required
+        if runtime_present is not UNSET:
+            field_dict["runtime_present"] = runtime_present
+        if runtime_fresh is not UNSET:
+            field_dict["runtime_fresh"] = runtime_fresh
+        if runtime_source is not UNSET:
+            field_dict["runtime_source"] = runtime_source
+        if runtime_freshness is not UNSET:
+            field_dict["runtime_freshness"] = runtime_freshness
+        if catch_up_active is not UNSET:
+            field_dict["catch_up_active"] = catch_up_active
+        if catch_up_phase is not UNSET:
+            field_dict["catch_up_phase"] = catch_up_phase
+        if catch_up_applied_sequence is not UNSET:
+            field_dict["catch_up_applied_sequence"] = catch_up_applied_sequence
+        if catch_up_target_sequence is not UNSET:
+            field_dict["catch_up_target_sequence"] = catch_up_target_sequence
+        if source_artifact is not UNSET:
+            field_dict["source_artifact"] = source_artifact
+        if resolver_replay is not UNSET:
+            field_dict["resolver_replay"] = resolver_replay
+        if async_indexing is not UNSET:
+            field_dict["async_indexing"] = async_indexing
         if algebraic_graph is not UNSET:
             field_dict["algebraic_graph"] = algebraic_graph
 
@@ -91,7 +208,10 @@ class GraphIndexStats:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
+        from ..models.graph_index_stats_async_indexing import GraphIndexStatsAsyncIndexing
         from ..models.graph_index_stats_edge_types import GraphIndexStatsEdgeTypes
+        from ..models.graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
+        from ..models.graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
 
         d = dict(src_dict)
         index_type = GraphIndexStatsIndexType(d.pop("index_type"))
@@ -109,9 +229,60 @@ class GraphIndexStats:
 
         rebuilding = d.pop("rebuilding", UNSET)
 
+        backfill_active = d.pop("backfill_active", UNSET)
+
         backfill_progress = d.pop("backfill_progress", UNSET)
 
-        backfill_items_processed = d.pop("backfill_items_processed", UNSET)
+        backfill_state = d.pop("backfill_state", UNSET)
+
+        doc_count = d.pop("doc_count", UNSET)
+
+        edge_count = d.pop("edge_count", UNSET)
+
+        node_count = d.pop("node_count", UNSET)
+
+        replay_applied_sequence = d.pop("replay_applied_sequence", UNSET)
+
+        replay_target_sequence = d.pop("replay_target_sequence", UNSET)
+
+        replay_catch_up_required = d.pop("replay_catch_up_required", UNSET)
+
+        runtime_present = d.pop("runtime_present", UNSET)
+
+        runtime_fresh = d.pop("runtime_fresh", UNSET)
+
+        runtime_source = d.pop("runtime_source", UNSET)
+
+        runtime_freshness = d.pop("runtime_freshness", UNSET)
+
+        catch_up_active = d.pop("catch_up_active", UNSET)
+
+        catch_up_phase = d.pop("catch_up_phase", UNSET)
+
+        catch_up_applied_sequence = d.pop("catch_up_applied_sequence", UNSET)
+
+        catch_up_target_sequence = d.pop("catch_up_target_sequence", UNSET)
+
+        _source_artifact = d.pop("source_artifact", UNSET)
+        source_artifact: GraphIndexStatsSourceArtifact | Unset
+        if isinstance(_source_artifact, Unset):
+            source_artifact = UNSET
+        else:
+            source_artifact = GraphIndexStatsSourceArtifact.from_dict(_source_artifact)
+
+        _resolver_replay = d.pop("resolver_replay", UNSET)
+        resolver_replay: GraphIndexStatsResolverReplay | Unset
+        if isinstance(_resolver_replay, Unset):
+            resolver_replay = UNSET
+        else:
+            resolver_replay = GraphIndexStatsResolverReplay.from_dict(_resolver_replay)
+
+        _async_indexing = d.pop("async_indexing", UNSET)
+        async_indexing: GraphIndexStatsAsyncIndexing | Unset
+        if isinstance(_async_indexing, Unset):
+            async_indexing = UNSET
+        else:
+            async_indexing = GraphIndexStatsAsyncIndexing.from_dict(_async_indexing)
 
         _algebraic_graph = d.pop("algebraic_graph", UNSET)
         algebraic_graph: GraphIndexStatsAlgebraicGraph | Unset
@@ -126,8 +297,26 @@ class GraphIndexStats:
             total_edges=total_edges,
             edge_types=edge_types,
             rebuilding=rebuilding,
+            backfill_active=backfill_active,
             backfill_progress=backfill_progress,
-            backfill_items_processed=backfill_items_processed,
+            backfill_state=backfill_state,
+            doc_count=doc_count,
+            edge_count=edge_count,
+            node_count=node_count,
+            replay_applied_sequence=replay_applied_sequence,
+            replay_target_sequence=replay_target_sequence,
+            replay_catch_up_required=replay_catch_up_required,
+            runtime_present=runtime_present,
+            runtime_fresh=runtime_fresh,
+            runtime_source=runtime_source,
+            runtime_freshness=runtime_freshness,
+            catch_up_active=catch_up_active,
+            catch_up_phase=catch_up_phase,
+            catch_up_applied_sequence=catch_up_applied_sequence,
+            catch_up_target_sequence=catch_up_target_sequence,
+            source_artifact=source_artifact,
+            resolver_replay=resolver_replay,
+            async_indexing=async_indexing,
             algebraic_graph=algebraic_graph,
         )
 

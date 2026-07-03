@@ -129,11 +129,11 @@ type QueryRequest struct {
 	// OrderBy specifies fields to order by with direction
 	OrderBy []oapi.SortField `json:"order_by,omitempty"`
 
-	// SearchAfter cursor for forward pagination (pass _sort values from last hit)
-	SearchAfter []string `json:"search_after,omitempty"`
+	// SearchAfter cursor for forward pagination. Pass typed _sort values from the last hit.
+	SearchAfter []any `json:"search_after,omitempty"`
 
-	// SearchBefore cursor for backward pagination (pass _sort values from first hit)
-	SearchBefore []string `json:"search_before,omitempty"`
+	// SearchBefore cursor for backward pagination. Pass typed _sort values from the first hit.
+	SearchBefore []any `json:"search_before,omitempty"`
 
 	// Reranker configuration for reranking results
 	Reranker *RerankerConfig `json:"reranker,omitempty"`

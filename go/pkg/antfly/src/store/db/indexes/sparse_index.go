@@ -765,27 +765,31 @@ func (si *SparseIndex) Stats() IndexStats {
 	// Index-level backfill tracking (from runBackfill)
 	if si.backfilling.Load() {
 		is.Rebuilding = true
+		is.BackfillActive = true
 		is.BackfillProgress = si.loadBackfillProgress()
-		is.BackfillItemsProcessed = si.backfillItemsProcessed.Load()
 	}
 
 	// Enricher stats (WAL backlog, enricher-level backfill)
+	var pendingSequenceCount uint64
 	si.enricherMu.RLock()
 	e := si.enricher
 	si.enricherMu.RUnlock()
 	if e != nil {
 		es := e.EnricherStats()
 		is.Rebuilding = is.Rebuilding || es.Backfilling
+		is.BackfillActive = is.BackfillActive || es.Backfilling
 		if es.Backfilling && (!si.backfilling.Load() || es.BackfillProgress < is.BackfillProgress) {
 			is.BackfillProgress = es.BackfillProgress
 		}
-		is.BackfillItemsProcessed += es.BackfillItemsProcessed
-		is.WalBacklog = uint64(es.WALBacklog) //nolint:gosec // G115: WALBacklog is non-negative
+		pendingSequenceCount += uint64(es.WALBacklog) //nolint:gosec // G115: WALBacklog is non-negative
 	}
 
 	// Include index-level WAL backlog
 	if si.walBuf != nil {
-		is.WalBacklog += uint64(si.walBuf.Len()) //nolint:gosec // G115: Len() is non-negative
+		pendingSequenceCount += uint64(si.walBuf.Len()) //nolint:gosec // G115: Len() is non-negative
+	}
+	if pendingSequenceCount > 0 {
+		is.EnrichmentRuntime.PendingSequenceCount = &pendingSequenceCount
 	}
 
 	return is.AsIndexStats()

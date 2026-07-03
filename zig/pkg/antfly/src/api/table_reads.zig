@@ -12534,6 +12534,10 @@ fn encodeScanRequest(
     if (opts.fields.len > 0 and !opts.include_all_fields) {
         try appendJsonFieldNames(alloc, &out, &first, "fields", opts.fields);
     }
+    if (opts.filter_query_json.len > 0) {
+        try appendJsonFieldName(alloc, &out, &first, "filter_query");
+        try out.appendSlice(alloc, opts.filter_query_json);
+    }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
 }
@@ -13599,7 +13603,7 @@ fn appendScanLine(
     const escaped_key = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(key, .{})});
     defer alloc.free(escaped_key);
 
-    try out.appendSlice(alloc, "{\"key\":");
+    try out.appendSlice(alloc, "{\"_id\":");
     try out.appendSlice(alloc, escaped_key);
     if (projected_json) |json| {
         if (json.len < 2 or json[0] != '{' or json[json.len - 1] != '}') return error.InvalidProjectedDocumentJson;
@@ -13741,13 +13745,13 @@ test "bound table read source scans keys as ndjson" {
     }, .read_index)).?;
     defer scan.deinit(alloc);
     const ScanRow = struct {
-        key: []const u8,
+        _id: []const u8,
         title: []const u8,
     };
     const rows = try parseNdjsonTestRowsAlloc(ScanRow, alloc, scan.ndjson);
     defer alloc.free(rows);
     try std.testing.expectEqual(@as(usize, 2), rows.len);
-    try std.testing.expectEqualStrings("doc:a", rows[0].key);
+    try std.testing.expectEqualStrings("doc:a", rows[0]._id);
     try std.testing.expectEqualStrings("alpha", rows[0].title);
 }
 
@@ -14082,7 +14086,7 @@ test "provisioned table read source routes lookup and scan across ranges" {
     }, .stale)).?;
     defer scan.deinit(alloc);
     const ScanRow = struct {
-        key: []const u8,
+        _id: []const u8,
         title: []const u8,
     };
     const rows = try parseNdjsonTestRowsAlloc(ScanRow, alloc, scan.ndjson);

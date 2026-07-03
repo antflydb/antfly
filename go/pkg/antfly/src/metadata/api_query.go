@@ -1355,7 +1355,7 @@ func (t *TableApi) bleveResultToQueryResult(
 			ID:     r.ID,
 		}
 		if len(r.Sort) > 0 {
-			resp[i].Sort = r.Sort
+			resp[i].Sort = stringSliceAsAny(r.Sort)
 		}
 	}
 
@@ -1375,6 +1375,17 @@ func (t *TableApi) bleveResultToQueryResult(
 	}
 
 	return queryResult
+}
+
+func stringSliceAsAny(values []string) []any {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]any, len(values))
+	for i, value := range values {
+		out[i] = value
+	}
+	return out
 }
 
 // buildShardsProfile creates a QueryProfile with shard statistics from the search status.

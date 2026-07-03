@@ -940,7 +940,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/db/v1/tables/{tableName}/lookup": {
+    "/db/v1/tables/{tableName}/documents": {
         parameters: {
             query?: never;
             header?: never;
@@ -953,10 +953,10 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Scan keys in a table within a key range
+         * Scan documents in a table within a key range
          * @description Scans keys in a table within an optional key range and returns them as
          *     newline-delimited JSON (NDJSON). Each line contains a JSON object with
-         *     the key and optionally projected document fields. This is useful for
+         *     the `_id` document identifier and optionally projected document fields. This is useful for
          *     iterating through all keys in a table or a subset of keys within a range.
          */
         post: operations["scanKeys"];
@@ -5093,6 +5093,7 @@ export interface components {
             offset?: number;
             /**
              * @description Sort order for results. Array of sort fields with direction.
+             *     Antfly appends `_id` ascending as a stable tie-breaker when it is omitted.
              *     Only applicable for full_text_search queries. Semantic searches are always sorted by similarity score.
              * @example [
              *       {
@@ -5108,16 +5109,22 @@ export interface components {
             order_by?: components["schemas"]["SortField"][];
             /**
              * @description Cursor for forward pagination. Pass the `_sort` values from the last hit
-             *     of the previous page. Mutually exclusive with `offset`.
+             *     of the previous page exactly, including the appended `_id` tie-breaker.
+             *     Values preserve their JSON types; for example numbers remain numbers,
+             *     booleans remain booleans, null remains null, and strings remain strings.
+             *     Mutually exclusive with `offset`.
              *     Requires `order_by` to be set. Only supported for full_text_search queries.
              */
-            search_after?: string[];
+            search_after?: unknown[];
             /**
              * @description Cursor for backward pagination. Pass the `_sort` values from the first hit
-             *     of the current page. Mutually exclusive with `offset`.
+             *     of the current page exactly, including the appended `_id` tie-breaker.
+             *     Values preserve their JSON types; for example numbers remain numbers,
+             *     booleans remain booleans, null remains null, and strings remain strings.
+             *     Mutually exclusive with `offset`.
              *     Requires `order_by` to be set. Only supported for full_text_search queries.
              */
-            search_before?: string[];
+            search_before?: unknown[];
             /**
              * Format: float
              * @description Maximum distance threshold for semantic similarity search. Results with distance
@@ -5627,9 +5634,10 @@ export interface components {
             };
             /**
              * @description Sort key values for this hit. Pass as search_after or search_before
-             *     to paginate to the next/previous page. Only present when order_by is specified.
+             *     to paginate to the next/previous page. Values preserve their JSON
+             *     types. Only present when order_by is specified.
              */
-            _sort?: string[];
+            _sort?: unknown[];
         };
         /** @description A list of query hits. */
         QueryHits: {
@@ -7809,23 +7817,57 @@ export interface components {
              * @description Number of documents in the index
              */
             total_indexed?: number;
-            /**
-             * Format: uint64
-             * @description Size of the index in bytes
-             */
-            disk_usage?: number;
             /** @description Whether the index is currently rebuilding */
             rebuilding?: boolean;
+            /** @description Whether the index is actively rebuilding, replaying, or catching up. */
+            backfill_active?: boolean;
             /**
              * Format: double
              * @description Progress of ongoing rebuild as fraction [0.0, 1.0]
              */
             backfill_progress?: number;
+            /** @description Operational readiness state such as ready, running, retrying, or failed. */
+            backfill_state?: string;
             /**
              * Format: uint64
-             * @description Number of documents indexed during current rebuild
+             * @description Number of documents visible to the index.
              */
-            backfill_items_processed?: number;
+            doc_count?: number;
+            /**
+             * Format: uint64
+             * @description Number of indexed terms when available.
+             */
+            term_count?: number;
+            /**
+             * Format: uint64
+             * @description Highest replay sequence applied to the index runtime.
+             */
+            replay_applied_sequence?: number;
+            /**
+             * Format: uint64
+             * @description Replay sequence the index runtime must reach to be current.
+             */
+            replay_target_sequence?: number;
+            /** @description Whether replay must catch up before the index is fully current. */
+            replay_catch_up_required?: boolean;
+            runtime_present?: boolean;
+            runtime_fresh?: boolean;
+            runtime_source?: string;
+            runtime_freshness?: string;
+            catch_up_active?: boolean;
+            catch_up_phase?: string;
+            /** Format: uint64 */
+            catch_up_applied_sequence?: number;
+            /** Format: uint64 */
+            catch_up_target_sequence?: number;
+            /** @description Full-text merge runtime diagnostics. */
+            text_merge?: {
+                [key: string]: unknown;
+            };
+            /** @description Asynchronous indexer runtime diagnostics. */
+            async_indexing?: {
+                [key: string]: unknown;
+            };
         };
         /** @description Statistics for an embeddings index (dense or sparse) */
         EmbeddingsIndexStats: {
@@ -7843,11 +7885,6 @@ export interface components {
             total_indexed?: number;
             /**
              * Format: uint64
-             * @description Size of the index in bytes
-             */
-            disk_usage?: number;
-            /**
-             * Format: uint64
              * @description Total number of nodes in the index (dense only)
              */
             total_nodes?: number;
@@ -7858,21 +7895,70 @@ export interface components {
             total_terms?: number;
             /** @description Whether the index enricher is currently backfilling */
             rebuilding?: boolean;
-            /**
-             * Format: uint64
-             * @description Number of documents pending enrichment in the WAL
-             */
-            wal_backlog?: number;
+            /** @description Whether the index is actively rebuilding, replaying, enriching, or catching up. */
+            backfill_active?: boolean;
             /**
              * Format: double
              * @description Backfill progress as a ratio from 0.0 to 1.0
              */
             backfill_progress?: number;
+            /** @description Operational readiness state such as ready, running, retrying, or failed. */
+            backfill_state?: string;
             /**
              * Format: uint64
-             * @description Total items processed during backfill
+             * @description Number of documents visible to the index.
              */
-            backfill_items_processed?: number;
+            doc_count?: number;
+            /**
+             * Format: uint64
+             * @description Documents currently visible to queries.
+             */
+            query_visible_doc_count?: number;
+            /** Format: uint64 */
+            published_doc_count?: number;
+            /** Format: uint64 */
+            published_node_count?: number;
+            /** Format: uint64 */
+            root_node?: number;
+            /** Format: uint64 */
+            published_root_node?: number;
+            /** Format: uint64 */
+            dense_replay_applied_sequence?: number;
+            /** Format: uint64 */
+            dense_replay_target_sequence?: number;
+            /** @description Whether dense/vector artifacts still need publication before queries see the latest data. */
+            dense_publish_pending?: boolean;
+            /** Format: uint64 */
+            replay_applied_sequence?: number;
+            /** Format: uint64 */
+            replay_target_sequence?: number;
+            replay_catch_up_required?: boolean;
+            runtime_present?: boolean;
+            runtime_fresh?: boolean;
+            runtime_source?: string;
+            runtime_freshness?: string;
+            catch_up_active?: boolean;
+            catch_up_phase?: string;
+            /** Format: uint64 */
+            catch_up_applied_sequence?: number;
+            /** Format: uint64 */
+            catch_up_target_sequence?: number;
+            /** @description Embedding enrichment worker runtime diagnostics. */
+            enrichment_runtime?: {
+                /** Format: uint64 */
+                pending_sequence_count?: number;
+            } & {
+                [key: string]: unknown;
+            };
+            hbc_cache?: {
+                [key: string]: unknown;
+            };
+            hbc_posting?: {
+                [key: string]: unknown;
+            };
+            async_indexing?: {
+                [key: string]: unknown;
+            };
         };
         /** @description Statistics for graph index */
         GraphIndexStats: {
@@ -7894,16 +7980,56 @@ export interface components {
             };
             /** @description Whether the index is currently rebuilding */
             rebuilding?: boolean;
+            /** @description Whether the index is actively rebuilding, materializing, or catching up. */
+            backfill_active?: boolean;
             /**
              * Format: double
              * @description Rebuild progress as a ratio from 0.0 to 1.0
              */
             backfill_progress?: number;
+            /** @description Operational readiness state such as ready, running, retrying, or failed. */
+            backfill_state?: string;
             /**
              * Format: uint64
-             * @description Number of edges indexed during current rebuild
+             * @description Number of documents covered by the graph index.
              */
-            backfill_items_processed?: number;
+            doc_count?: number;
+            /**
+             * Format: uint64
+             * @description Number of graph edges currently indexed.
+             */
+            edge_count?: number;
+            /**
+             * Format: uint64
+             * @description Number of graph nodes currently indexed.
+             */
+            node_count?: number;
+            /** Format: uint64 */
+            replay_applied_sequence?: number;
+            /** Format: uint64 */
+            replay_target_sequence?: number;
+            replay_catch_up_required?: boolean;
+            runtime_present?: boolean;
+            runtime_fresh?: boolean;
+            runtime_source?: string;
+            runtime_freshness?: string;
+            catch_up_active?: boolean;
+            catch_up_phase?: string;
+            /** Format: uint64 */
+            catch_up_applied_sequence?: number;
+            /** Format: uint64 */
+            catch_up_target_sequence?: number;
+            /** @description Graph source artifact materialization status. */
+            source_artifact?: {
+                [key: string]: unknown;
+            };
+            /** @description Resolver replay diagnostics for graph materialization. */
+            resolver_replay?: {
+                [key: string]: unknown;
+            };
+            async_indexing?: {
+                [key: string]: unknown;
+            };
             /** @description Algebraic graph execution health for bounded semiring traversal. */
             algebraic_graph?: {
                 traversal?: {
@@ -7934,23 +8060,42 @@ export interface components {
              * @description Number of documents reflected in the algebraic sidecar
              */
             total_indexed?: number;
-            /**
-             * Format: uint64
-             * @description Size of the index in bytes
-             */
-            disk_usage?: number;
             /** @description Whether the sidecar is currently rebuilding */
             rebuilding?: boolean;
+            /** @description Whether the sidecar is actively rebuilding, replaying, or catching up. */
+            backfill_active?: boolean;
             /**
              * Format: double
              * @description Backfill progress as a ratio from 0.0 to 1.0
              */
             backfill_progress?: number;
+            /** @description Operational readiness state such as ready, running, retrying, or failed. */
+            backfill_state?: string;
             /**
              * Format: uint64
-             * @description Number of documents processed during current backfill
+             * @description Number of documents visible to the sidecar.
              */
-            backfill_items_processed?: number;
+            doc_count?: number;
+            /** Format: uint64 */
+            term_count?: number;
+            /** Format: uint64 */
+            replay_applied_sequence?: number;
+            /** Format: uint64 */
+            replay_target_sequence?: number;
+            replay_catch_up_required?: boolean;
+            runtime_present?: boolean;
+            runtime_fresh?: boolean;
+            runtime_source?: string;
+            runtime_freshness?: string;
+            catch_up_active?: boolean;
+            catch_up_phase?: string;
+            /** Format: uint64 */
+            catch_up_applied_sequence?: number;
+            /** Format: uint64 */
+            catch_up_target_sequence?: number;
+            async_indexing?: {
+                [key: string]: unknown;
+            };
             healthy?: boolean;
             /** Format: uint64 */
             parse_error_count?: number;

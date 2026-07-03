@@ -693,6 +693,8 @@ pub fn fuseNamedSets(
     }
     defer for (ranked_results) |result| alloc.free(result.hits);
 
+    if (req.merge_config) |config| try validateFusionWeights(config.weights, ranked_results);
+
     const merge_config = if (req.merge_config) |config|
         fusion_mod.FusionConfig{
             .strategy = config.strategy,
@@ -1204,6 +1206,22 @@ fn fusionWeightName(name: []const u8) []const u8 {
     if (std.mem.startsWith(u8, name, "$full_text_results.")) return name["$full_text_results.".len..];
     if (std.mem.startsWith(u8, name, "$aknn_results.")) return name["$aknn_results.".len..];
     return name;
+}
+
+fn validateFusionWeights(weights: []const fusion_mod.NamedWeight, results: []const fusion_mod.RankedResult) !void {
+    for (weights, 0..) |weight, i| {
+        for (weights[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, weight.name)) return error.InvalidQueryRequest;
+        }
+        var found = false;
+        for (results) |result| {
+            if (std.mem.eql(u8, result.index_name, weight.name)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return error.InvalidQueryRequest;
+    }
 }
 
 fn fusionUsesDistanceScore(req: types.SearchRequest, name: []const u8) bool {
@@ -3303,6 +3321,43 @@ test "fuseNamedSets preserves source hit ordinals" {
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 11), result.hits[0].doc_ordinal);
     try std.testing.expectEqualStrings("doc:b", result.hits[1].id);
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 12), result.hits[1].doc_ordinal);
+}
+
+test "fuseNamedSets rejects unknown merge weights" {
+    const alloc = std.testing.allocator;
+
+    const id_a = try alloc.dupe(u8, "doc:a");
+    defer alloc.free(id_a);
+    const id_b = try alloc.dupe(u8, "doc:b");
+    defer alloc.free(id_b);
+    const left_hits = [_]types.SearchHit{.{ .id = id_a, .score = 1.0 }};
+    const right_hits = [_]types.SearchHit{.{ .id = id_b, .score = 0.5 }};
+    const named_sets = [_]NamedResultSet{
+        .{ .name = "$full_text_results", .hits = &left_hits, .total_hits = left_hits.len },
+        .{ .name = "dense_idx", .hits = &right_hits, .total_hits = right_hits.len },
+    };
+
+    const Harness = struct {
+        fn loadProjectedDocument(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+        ) anyerror!?[]u8 {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    try std.testing.expectError(error.InvalidQueryRequest, fuseNamedSets(alloc, .{
+        .limit = 2,
+        .include_stored = false,
+        .merge_config = .{
+            .weights = &.{.{ .name = "missing_idx", .weight = 2.0 }},
+        },
+    }, &named_sets, .{
+        .ctx = null,
+        .load_projected_document = Harness.loadProjectedDocument,
+    }));
 }
 
 test "fuseNamedSets deduplicates aliases by ordinal when complete" {

@@ -119,14 +119,36 @@ pub const FullTextIndexStats = struct {
     @"error": ?[]const u8 = null,
     /// Number of documents in the index
     total_indexed: ?i64 = null,
-    /// Size of the index in bytes
-    disk_usage: ?i64 = null,
     /// Whether the index is currently rebuilding
     rebuilding: ?bool = null,
+    /// Whether the index is actively rebuilding, replaying, or catching up.
+    backfill_active: ?bool = null,
     /// Progress of ongoing rebuild as fraction [0.0, 1.0]
     backfill_progress: ?f64 = null,
-    /// Number of documents indexed during current rebuild
-    backfill_items_processed: ?i64 = null,
+    /// Operational readiness state such as ready, running, retrying, or failed.
+    backfill_state: ?[]const u8 = null,
+    /// Number of documents visible to the index.
+    doc_count: ?i64 = null,
+    /// Number of indexed terms when available.
+    term_count: ?i64 = null,
+    /// Highest replay sequence applied to the index runtime.
+    replay_applied_sequence: ?i64 = null,
+    /// Replay sequence the index runtime must reach to be current.
+    replay_target_sequence: ?i64 = null,
+    /// Whether replay must catch up before the index is fully current.
+    replay_catch_up_required: ?bool = null,
+    runtime_present: ?bool = null,
+    runtime_fresh: ?bool = null,
+    runtime_source: ?[]const u8 = null,
+    runtime_freshness: ?[]const u8 = null,
+    catch_up_active: ?bool = null,
+    catch_up_phase: ?[]const u8 = null,
+    catch_up_applied_sequence: ?i64 = null,
+    catch_up_target_sequence: ?i64 = null,
+    /// Full-text merge runtime diagnostics.
+    text_merge: ?std.json.Value = null,
+    /// Asynchronous indexer runtime diagnostics.
+    async_indexing: ?std.json.Value = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -160,20 +182,46 @@ pub const EmbeddingsIndexStats = struct {
     @"error": ?[]const u8 = null,
     /// Number of vectors/documents in the index
     total_indexed: ?i64 = null,
-    /// Size of the index in bytes
-    disk_usage: ?i64 = null,
     /// Total number of nodes in the index (dense only)
     total_nodes: ?i64 = null,
     /// Number of unique terms in the inverted index (sparse only)
     total_terms: ?i64 = null,
     /// Whether the index enricher is currently backfilling
     rebuilding: ?bool = null,
-    /// Number of documents pending enrichment in the WAL
-    wal_backlog: ?i64 = null,
+    /// Whether the index is actively rebuilding, replaying, enriching, or catching up.
+    backfill_active: ?bool = null,
     /// Backfill progress as a ratio from 0.0 to 1.0
     backfill_progress: ?f64 = null,
-    /// Total items processed during backfill
-    backfill_items_processed: ?i64 = null,
+    /// Operational readiness state such as ready, running, retrying, or failed.
+    backfill_state: ?[]const u8 = null,
+    /// Number of documents visible to the index.
+    doc_count: ?i64 = null,
+    /// Documents currently visible to queries.
+    query_visible_doc_count: ?i64 = null,
+    published_doc_count: ?i64 = null,
+    published_node_count: ?i64 = null,
+    root_node: ?i64 = null,
+    published_root_node: ?i64 = null,
+    dense_replay_applied_sequence: ?i64 = null,
+    dense_replay_target_sequence: ?i64 = null,
+    /// Whether dense/vector artifacts still need publication before queries see the latest data.
+    dense_publish_pending: ?bool = null,
+    replay_applied_sequence: ?i64 = null,
+    replay_target_sequence: ?i64 = null,
+    replay_catch_up_required: ?bool = null,
+    runtime_present: ?bool = null,
+    runtime_fresh: ?bool = null,
+    runtime_source: ?[]const u8 = null,
+    runtime_freshness: ?[]const u8 = null,
+    catch_up_active: ?bool = null,
+    catch_up_phase: ?[]const u8 = null,
+    catch_up_applied_sequence: ?i64 = null,
+    catch_up_target_sequence: ?i64 = null,
+    /// Embedding enrichment worker runtime diagnostics.
+    enrichment_runtime: ?std.json.Value = null,
+    hbc_cache: ?std.json.Value = null,
+    hbc_posting: ?std.json.Value = null,
+    async_indexing: ?std.json.Value = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -207,14 +255,29 @@ pub const AlgebraicIndexStats = struct {
     @"error": ?[]const u8 = null,
     /// Number of documents reflected in the algebraic sidecar
     total_indexed: ?i64 = null,
-    /// Size of the index in bytes
-    disk_usage: ?i64 = null,
     /// Whether the sidecar is currently rebuilding
     rebuilding: ?bool = null,
+    /// Whether the sidecar is actively rebuilding, replaying, or catching up.
+    backfill_active: ?bool = null,
     /// Backfill progress as a ratio from 0.0 to 1.0
     backfill_progress: ?f64 = null,
-    /// Number of documents processed during current backfill
-    backfill_items_processed: ?i64 = null,
+    /// Operational readiness state such as ready, running, retrying, or failed.
+    backfill_state: ?[]const u8 = null,
+    /// Number of documents visible to the sidecar.
+    doc_count: ?i64 = null,
+    term_count: ?i64 = null,
+    replay_applied_sequence: ?i64 = null,
+    replay_target_sequence: ?i64 = null,
+    replay_catch_up_required: ?bool = null,
+    runtime_present: ?bool = null,
+    runtime_fresh: ?bool = null,
+    runtime_source: ?[]const u8 = null,
+    runtime_freshness: ?[]const u8 = null,
+    catch_up_active: ?bool = null,
+    catch_up_phase: ?[]const u8 = null,
+    catch_up_applied_sequence: ?i64 = null,
+    catch_up_target_sequence: ?i64 = null,
+    async_indexing: ?std.json.Value = null,
     healthy: ?bool = null,
     parse_error_count: ?i64 = null,
     schema_version: ?i64 = null,
@@ -423,10 +486,34 @@ pub const GraphIndexStats = struct {
     edge_types: ?std.json.ArrayHashMap(i64) = null,
     /// Whether the index is currently rebuilding
     rebuilding: ?bool = null,
+    /// Whether the index is actively rebuilding, materializing, or catching up.
+    backfill_active: ?bool = null,
     /// Rebuild progress as a ratio from 0.0 to 1.0
     backfill_progress: ?f64 = null,
-    /// Number of edges indexed during current rebuild
-    backfill_items_processed: ?i64 = null,
+    /// Operational readiness state such as ready, running, retrying, or failed.
+    backfill_state: ?[]const u8 = null,
+    /// Number of documents covered by the graph index.
+    doc_count: ?i64 = null,
+    /// Number of graph edges currently indexed.
+    edge_count: ?i64 = null,
+    /// Number of graph nodes currently indexed.
+    node_count: ?i64 = null,
+    replay_applied_sequence: ?i64 = null,
+    replay_target_sequence: ?i64 = null,
+    replay_catch_up_required: ?bool = null,
+    runtime_present: ?bool = null,
+    runtime_fresh: ?bool = null,
+    runtime_source: ?[]const u8 = null,
+    runtime_freshness: ?[]const u8 = null,
+    catch_up_active: ?bool = null,
+    catch_up_phase: ?[]const u8 = null,
+    catch_up_applied_sequence: ?i64 = null,
+    catch_up_target_sequence: ?i64 = null,
+    /// Graph source artifact materialization status.
+    source_artifact: ?std.json.Value = null,
+    /// Resolver replay diagnostics for graph materialization.
+    resolver_replay: ?std.json.Value = null,
+    async_indexing: ?std.json.Value = null,
     /// Algebraic graph execution health for bounded semiring traversal.
     algebraic_graph: ?std.json.Value = null,
 };

@@ -5345,6 +5345,7 @@ components:
             $ref: '#/components/schemas/SortField'
           description: |
             Sort order for results. Array of sort fields with direction.
+            Antfly appends `_id` ascending as a stable tie-breaker when it is omitted.
             Only applicable for full_text_search queries. Semantic searches are always sorted by similarity score.
           example:
             - field: created_at
@@ -5353,19 +5354,23 @@ components:
               desc: true
         search_after:
           type: array
-          items:
-            type: string
+          items: {}
           description: |
             Cursor for forward pagination. Pass the `_sort` values from the last hit
-            of the previous page. Mutually exclusive with `offset`.
+            of the previous page exactly, including the appended `_id` tie-breaker.
+            Values preserve their JSON types; for example numbers remain numbers,
+            booleans remain booleans, null remains null, and strings remain strings.
+            Mutually exclusive with `offset`.
             Requires `order_by` to be set. Only supported for full_text_search queries.
         search_before:
           type: array
-          items:
-            type: string
+          items: {}
           description: |
             Cursor for backward pagination. Pass the `_sort` values from the first hit
-            of the current page. Mutually exclusive with `offset`.
+            of the current page exactly, including the appended `_id` tie-breaker.
+            Values preserve their JSON types; for example numbers remain numbers,
+            booleans remain booleans, null remains null, and strings remain strings.
+            Mutually exclusive with `offset`.
             Requires `order_by` to be set. Only supported for full_text_search queries.
         distance_under:
           x-go-type-skip-optional-pointer: false
@@ -5946,11 +5951,11 @@ components:
                 additionalProperties: true
         _sort:
           type: array
-          items:
-            type: string
+          items: {}
           description: |
             Sort key values for this hit. Pass as search_after or search_before
-            to paginate to the next/previous page. Only present when order_by is specified.
+            to paginate to the next/previous page. Values preserve their JSON
+            types. Only present when order_by is specified.
           x-go-name: sort
     QueryHits:
       x-omitempty: false
@@ -7948,7 +7953,7 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalServerError"
-  /tables/{tableName}/lookup:
+  /tables/{tableName}/documents:
     parameters:
       - name: tableName
         in: path
@@ -7957,11 +7962,11 @@ paths:
         schema:
           type: string
     post:
-      summary: Scan keys in a table within a key range
+      summary: Scan documents in a table within a key range
       description: |
         Scans keys in a table within an optional key range and returns them as
         newline-delimited JSON (NDJSON). Each line contains a JSON object with
-        the key and optionally projected document fields. This is useful for
+        the `_id` document identifier and optionally projected document fields. This is useful for
         iterating through all keys in a table or a subset of keys within a range.
       tags:
         - data_operations
@@ -7979,7 +7984,7 @@ paths:
             application/x-ndjson:
               schema:
                 type: string
-                description: Newline-delimited JSON, each line is a JSON object with a "key" field
+                description: Newline-delimited JSON, each line is a JSON object with an "_id" field
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":

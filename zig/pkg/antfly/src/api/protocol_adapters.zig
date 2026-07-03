@@ -396,7 +396,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
             if (jsonStringArg(args, "to")) |to| if (to.len != 0) try body.put(alloc, "to", .{ .string = to });
             if (jsonBoolArg(args, "inclusiveFrom")) |inclusive| try body.put(alloc, "inclusive_from", .{ .bool = inclusive });
             if (jsonValueArg(args, "fields")) |fields| try body.put(alloc, "fields", fields);
-            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/lookup", .{ routes.Routes.tables, table_name });
+            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}{s}", .{ routes.Routes.tables, table_name, routes.Routes.documents_suffix });
             return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, .{ .object = body }));
         }
 

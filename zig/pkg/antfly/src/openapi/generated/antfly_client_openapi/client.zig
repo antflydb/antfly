@@ -610,12 +610,12 @@ pub const Client = struct {
         return ApiResponse(types.Table).fromResponse(self.allocator, &resp);
     }
 
-    /// Scan keys in a table within a key range
-    /// POST /db/v1/tables/{tableName}/lookup
+    /// Scan documents in a table within a key range
+    /// POST /db/v1/tables/{tableName}/documents
     pub fn scanKeys(self: *@This(), table_name: []const u8, body: types.ScanKeysRequest) !RawResponse {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/lookup", .{ self.base_url, encoded_table_name });
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);

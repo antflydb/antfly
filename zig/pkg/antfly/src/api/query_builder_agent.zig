@@ -3696,8 +3696,8 @@ fn buildQueryBuilderQueryRequest(
     if (out.full_text_search != null) {
         out.order_by = try queryBuilderConstraintSortFields(alloc, request.constraints, fields);
         if (out.order_by != null) {
-            const search_after = try queryBuilderConstraintStringSlice(alloc, request.constraints, "search_after");
-            const search_before = try queryBuilderConstraintStringSlice(alloc, request.constraints, "search_before");
+            const search_after = try queryBuilderConstraintJsonValueSlice(alloc, request.constraints, "search_after");
+            const search_before = try queryBuilderConstraintJsonValueSlice(alloc, request.constraints, "search_before");
             if (search_after.len > 0) {
                 out.search_after = search_after;
             } else if (search_before.len > 0) {
@@ -4839,6 +4839,35 @@ fn queryBuilderConstraintStringSlice(
                 if (trimmed.len == 0) continue;
                 try out.append(alloc, try alloc.dupe(u8, trimmed));
             }
+        },
+        else => {},
+    }
+    if (out.items.len == 0) return &.{};
+    return try out.toOwnedSlice(alloc);
+}
+
+fn queryBuilderConstraintJsonValueSlice(
+    alloc: std.mem.Allocator,
+    constraints: ?std.json.Value,
+    key: []const u8,
+) ![]const std.json.Value {
+    const value = constraints orelse return &.{};
+    if (value != .object) return &.{};
+    const raw = value.object.get(key) orelse return &.{};
+
+    var out = std.ArrayListUnmanaged(std.json.Value).empty;
+    errdefer {
+        for (out.items) |*item| db_mod.types.deinitJsonValue(alloc, item);
+        out.deinit(alloc);
+    }
+    switch (raw) {
+        .array => |values| {
+            for (values.items) |item| {
+                try out.append(alloc, try db_mod.types.cloneJsonValue(alloc, item));
+            }
+        },
+        .null, .bool, .integer, .float, .number_string, .string => {
+            try out.append(alloc, try db_mod.types.cloneJsonValue(alloc, raw));
         },
         else => {},
     }

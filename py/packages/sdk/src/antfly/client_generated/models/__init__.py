@@ -18,6 +18,7 @@ from .algebraic_aggregation_join import AlgebraicAggregationJoin
 from .algebraic_aggregation_join_kind import AlgebraicAggregationJoinKind
 from .algebraic_index_config import AlgebraicIndexConfig
 from .algebraic_index_stats import AlgebraicIndexStats
+from .algebraic_index_stats_async_indexing import AlgebraicIndexStatsAsyncIndexing
 from .algebraic_index_stats_index_type import AlgebraicIndexStatsIndexType
 from .algebraic_index_stats_planner_last_decision import AlgebraicIndexStatsPlannerLastDecision
 from .analyses import Analyses
@@ -148,6 +149,10 @@ from .embedding_type_1 import EmbeddingType1
 from .embedding_type_3 import EmbeddingType3
 from .embeddings_index_config import EmbeddingsIndexConfig
 from .embeddings_index_stats import EmbeddingsIndexStats
+from .embeddings_index_stats_async_indexing import EmbeddingsIndexStatsAsyncIndexing
+from .embeddings_index_stats_enrichment_runtime import EmbeddingsIndexStatsEnrichmentRuntime
+from .embeddings_index_stats_hbc_cache import EmbeddingsIndexStatsHbcCache
+from .embeddings_index_stats_hbc_posting import EmbeddingsIndexStatsHbcPosting
 from .embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
 from .enrichment_config import EnrichmentConfig
 from .enrichment_kind import EnrichmentKind
@@ -208,7 +213,9 @@ from .foreign_source import ForeignSource
 from .foreign_source_type import ForeignSourceType
 from .full_text_index_config import FullTextIndexConfig
 from .full_text_index_stats import FullTextIndexStats
+from .full_text_index_stats_async_indexing import FullTextIndexStatsAsyncIndexing
 from .full_text_index_stats_index_type import FullTextIndexStatsIndexType
+from .full_text_index_stats_text_merge import FullTextIndexStatsTextMerge
 from .fuzziness_type_1 import FuzzinessType1
 from .fuzzy_query import FuzzyQuery
 from .generation_step_config import GenerationStepConfig
@@ -228,8 +235,11 @@ from .graph_index_config import GraphIndexConfig
 from .graph_index_stats import GraphIndexStats
 from .graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
 from .graph_index_stats_algebraic_graph_traversal import GraphIndexStatsAlgebraicGraphTraversal
+from .graph_index_stats_async_indexing import GraphIndexStatsAsyncIndexing
 from .graph_index_stats_edge_types import GraphIndexStatsEdgeTypes
 from .graph_index_stats_index_type import GraphIndexStatsIndexType
+from .graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
+from .graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
 from .graph_node_selector import GraphNodeSelector
 from .graph_query import GraphQuery
 from .graph_query_params import GraphQueryParams
@@ -608,6 +618,7 @@ __all__ = (
     "AlgebraicAggregationJoinKind",
     "AlgebraicIndexConfig",
     "AlgebraicIndexStats",
+    "AlgebraicIndexStatsAsyncIndexing",
     "AlgebraicIndexStatsIndexType",
     "AlgebraicIndexStatsPlannerLastDecision",
     "Analyses",
@@ -734,6 +745,10 @@ __all__ = (
     "EmbedderProvider",
     "EmbeddingsIndexConfig",
     "EmbeddingsIndexStats",
+    "EmbeddingsIndexStatsAsyncIndexing",
+    "EmbeddingsIndexStatsEnrichmentRuntime",
+    "EmbeddingsIndexStatsHbcCache",
+    "EmbeddingsIndexStatsHbcPosting",
     "EmbeddingsIndexStatsIndexType",
     "EmbeddingType1",
     "EmbeddingType3",
@@ -796,7 +811,9 @@ __all__ = (
     "ForeignSourceType",
     "FullTextIndexConfig",
     "FullTextIndexStats",
+    "FullTextIndexStatsAsyncIndexing",
     "FullTextIndexStatsIndexType",
+    "FullTextIndexStatsTextMerge",
     "FuzzinessType1",
     "FuzzyQuery",
     "GenerationStepConfig",
@@ -816,8 +833,11 @@ __all__ = (
     "GraphIndexStats",
     "GraphIndexStatsAlgebraicGraph",
     "GraphIndexStatsAlgebraicGraphTraversal",
+    "GraphIndexStatsAsyncIndexing",
     "GraphIndexStatsEdgeTypes",
     "GraphIndexStatsIndexType",
+    "GraphIndexStatsResolverReplay",
+    "GraphIndexStatsSourceArtifact",
     "GraphNodeSelector",
     "GraphQuery",
     "GraphQueryParams",

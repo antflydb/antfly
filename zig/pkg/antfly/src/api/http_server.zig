@@ -14183,7 +14183,7 @@ test "api http server serves fielded full-text search through mcp tools" {
 
 test "api http server serves table scan as ndjson" {
     const ScanRow = struct {
-        key: []const u8,
+        _id: []const u8,
         title: []const u8,
     };
     const alloc = std.testing.allocator;
@@ -14225,7 +14225,7 @@ test "api http server serves table scan as ndjson" {
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
     var resp = try server.handle(.{
         .method = .POST,
-        .uri = "/tables/docs/lookup",
+        .uri = "/tables/docs/documents",
         .content_type = "application/json",
         .body = "{\"from\":\"doc:a\",\"to\":\"doc:b\",\"inclusive_from\":true,\"fields\":[\"title\"]}",
     });
@@ -14235,7 +14235,7 @@ test "api http server serves table scan as ndjson" {
     const newline = std.mem.indexOfScalar(u8, resp.body, '\n') orelse resp.body.len;
     var parsed = try std.json.parseFromSlice(ScanRow, std.testing.allocator, resp.body[0..newline], .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("doc:a", parsed.value.key);
+    try std.testing.expectEqualStrings("doc:a", parsed.value._id);
     try std.testing.expectEqualStrings("alpha", parsed.value.title);
 }
 
