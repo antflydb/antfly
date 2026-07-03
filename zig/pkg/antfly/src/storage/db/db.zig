@@ -10286,7 +10286,8 @@ pub const DB = struct {
             const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
             const persisted_resume = try rebuild_state.check(alloc);
             errdefer if (persisted_resume) |buf| alloc.free(buf);
-            const applied_sequence = try self.core.loadAppliedSequence(alloc, entry.config.name);
+            const projection_checkpoint = try self.core.loadProjectionCheckpoint(alloc, entry.config.name);
+            const applied_sequence = projection_checkpoint.applied_sequence;
             const target_sequence = try self.probeDerivedReplayTargetSequence(
                 alloc,
                 self.core.replaySource(),
@@ -10296,8 +10297,15 @@ pub const DB = struct {
                 },
                 applied_sequence,
             );
-            if (persisted_resume == null and applied_sequence < target_sequence) continue;
+            if (persisted_resume == null and
+                applied_sequence < target_sequence and
+                projection_checkpoint.status != .rebuilding and
+                projection_checkpoint.status != .repair_required)
+            {
+                continue;
+            }
             const force_reset = blk: {
+                if (projection_checkpoint.status == .repair_required) break :blk true;
                 if (entry.index.stats().active_count == 0) break :blk false;
                 if (@hasDecl(@TypeOf(entry.index), "validateStoredStructure")) {
                     entry.index.validateStoredStructure(alloc) catch |err| {
@@ -10377,6 +10385,13 @@ pub const DB = struct {
     fn prepareDenseArtifactRebuildPlan(self: *DB, plan: DenseArtifactRebuildPlan) !void {
         for (plan.targets) |target| {
             const entry = &self.core.index_manager.dense_indexes.items[target.dense_index_idx];
+            const checkpoint = try self.core.loadProjectionCheckpoint(self.alloc, entry.config.name);
+            try self.core.saveProjectionCheckpoint(entry.config.name, .{
+                .applied_sequence = checkpoint.applied_sequence,
+                .status = .rebuilding,
+                .generation = checkpoint.generation,
+                .config_hash = checkpoint.config_hash,
+            });
             if (target.force_reset) {
                 try self.core.index_manager.resetDenseIndexForArtifactRebuild(entry.config.name);
             }
@@ -10406,6 +10421,13 @@ pub const DB = struct {
             const repaired = entry.index.stats().active_count >= target.artifact_target_count and applied_sequence >= target_sequence;
             if (repaired) {
                 try rebuild_state.clear();
+                const checkpoint = try self.core.loadProjectionCheckpoint(alloc, entry.config.name);
+                try self.core.saveProjectionCheckpoint(entry.config.name, .{
+                    .applied_sequence = applied_sequence,
+                    .status = .clean,
+                    .generation = checkpoint.generation,
+                    .config_hash = checkpoint.config_hash,
+                });
             }
         }
     }
@@ -10724,8 +10746,7 @@ pub const DB = struct {
     pub fn hasPendingDenseArtifactRebuild(self: *DB, alloc: Allocator) !bool {
         var plan = try self.collectDenseArtifactRebuildPlan(alloc);
         defer plan.deinit(alloc);
-        if (plan.targets.len > 0) return true;
-        return try self.denseArtifactWatermarkRepairNeeded(alloc);
+        return plan.targets.len > 0;
     }
 
     pub fn rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeededWithProgress(

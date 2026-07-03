@@ -706,6 +706,15 @@ pub const DBCore = struct {
         );
     }
 
+    pub fn loadProjectionCheckpoint(self: *DBCore, alloc: Allocator, index_name: []const u8) !apply_state.ProjectionCheckpoint {
+        return try apply_state.loadProjectionCheckpointWithSidecar(
+            alloc,
+            self.store,
+            self.applied_sequence_checkpoint_path,
+            index_name,
+        );
+    }
+
     pub fn indexRequiresEnrichmentReplay(self: *DBCore, index_name: []const u8) !bool {
         return try self.index_manager.requiresEnrichmentReplay(index_name);
     }
@@ -717,6 +726,16 @@ pub const DBCore = struct {
             self.applied_sequence_checkpoint_path,
             index_name,
             sequence,
+        );
+    }
+
+    pub fn saveProjectionCheckpoint(self: *DBCore, index_name: []const u8, checkpoint: apply_state.ProjectionCheckpoint) !void {
+        try apply_state.saveProjectionCheckpointWithSidecar(
+            self.alloc,
+            self.store,
+            self.applied_sequence_checkpoint_path,
+            index_name,
+            checkpoint,
         );
     }
 
