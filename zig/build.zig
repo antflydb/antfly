@@ -3845,6 +3845,8 @@ pub fn build(b: *std.Build) void {
             "managed startup catch-up uses provided indexes json without catalog fetch",
             "managed startup catch-up marks FileNotFound index open terminal degraded",
             "managed startup catch-up finishes restore repair before terminal index load degradation",
+            "managed source status-only open drains stale pending close before retry",
+            "write cache HA gate clear drains inactive pending closes before returning",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
