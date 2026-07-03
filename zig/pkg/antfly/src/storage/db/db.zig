@@ -11564,6 +11564,18 @@ pub const DB = struct {
         return applied_sequence;
     }
 
+    fn projectionStatsTargetSequence(self: *DB, alloc: Allocator, cfg: types.IndexConfig, applied_sequence: u64) !u64 {
+        return try self.probeDerivedReplayTargetSequence(
+            alloc,
+            self.core.replaySource(),
+            .{
+                .name = cfg.name,
+                .kind = cfg.kind,
+            },
+            applied_sequence,
+        );
+    }
+
     fn overlayRuntimeStatusRuntimeOnly(self: *DB, runtime_stats: *types.DBStats) void {
         runtime_stats.async_indexing = self.snapshotAsyncIndexingStats();
         runtime_stats.enrichment = if (self.enrichment_runtime) |runtime|
@@ -11575,7 +11587,6 @@ pub const DB = struct {
         runtime_stats.ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else runtime_stats.ttl_cleanup;
         runtime_stats.transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else runtime_stats.transaction_recovery;
 
-        const target_sequence = self.core.nextDerivedSequence();
         for (runtime_stats.indexes) |*item| {
             if (self.enrichment_runtime) |runtime| {
                 item.enrichment_failed = runtime.indexHasIsolatedFailure(item.name);
@@ -11583,8 +11594,8 @@ pub const DB = struct {
             const dense_catch_up = item.kind == .dense_vector and runtime_stats.async_indexing.dense_catch_up.active;
             if (!dense_catch_up) if (self.executor.appliedSequence(item.name)) |live_applied| {
                 item.replay_applied_sequence = @max(item.replay_applied_sequence, live_applied);
+                item.replay_target_sequence = @max(item.replay_target_sequence, live_applied);
             };
-            item.replay_target_sequence = @max(item.replay_target_sequence, target_sequence);
             item.catch_up_active = dense_catch_up;
             if (item.kind == .dense_vector) {
                 const progress = runtime_stats.async_indexing.dense_catch_up;
@@ -11627,6 +11638,7 @@ pub const DB = struct {
                 item.backfill_active = false;
                 if (item.replay_target_sequence > 0) item.backfill_progress = 1.0;
             }
+            item.checkpoint_replay_tail_sequence_count = item.replay_target_sequence -| item.projection_checkpoint_applied_sequence;
         }
     }
 
@@ -11888,7 +11900,6 @@ pub const DB = struct {
     fn statsLocked(self: *DB, alloc: Allocator) !types.DBStats {
         const configs = try self.core.listIndexes(alloc);
         defer types.freeIndexConfigs(alloc, configs);
-        const target_sequence = self.core.nextDerivedSequence();
         const async_indexing = self.snapshotAsyncIndexingStats();
         const identity_stats = dbDocIdentityStats(try doc_identity.fastStatsFromStore(self.core.store), self.core.identity_namespace);
         const primary_doc_count = self.scanPrimaryDocCount(self.core.byteRange()) catch 0;
@@ -11911,6 +11922,7 @@ pub const DB = struct {
         for (configs) |cfg| {
             const projection_checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
             const applied_sequence = try self.managedIndexAppliedSequence(alloc, cfg.name);
+            const target_sequence = try self.projectionStatsTargetSequence(alloc, cfg, applied_sequence);
             var item = types.DBIndexStats{
                 .name = try alloc.dupe(u8, cfg.name),
                 .kind = cfg.kind,
@@ -12253,7 +12265,6 @@ pub const DB = struct {
 
         const configs = try self.core.listIndexes(alloc);
         defer types.freeIndexConfigs(alloc, configs);
-        const target_sequence = self.core.nextDerivedSequence();
         var visible_doc_count: u64 = 0;
         const identity_stats = dbDocIdentityStats(try doc_identity.fastStatsFromStore(self.core.store), self.core.identity_namespace);
         const repair_summary = try self.artifactRepairSummaryRootSnapshot(alloc);
@@ -12272,6 +12283,7 @@ pub const DB = struct {
         for (configs) |cfg| {
             const projection_checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
             const applied_sequence = try self.core.loadAppliedSequence(alloc, cfg.name);
+            const target_sequence = try self.projectionStatsTargetSequence(alloc, cfg, applied_sequence);
             var item = types.DBIndexStats{
                 .name = try alloc.dupe(u8, cfg.name),
                 .kind = cfg.kind,
@@ -44686,6 +44698,93 @@ test "db catch-up advances vacuous derived replay target gap" {
         try std.testing.expectEqual(target_sequence, after[0].target_sequence);
         try std.testing.expect(!after[0].catch_up_required);
     }
+}
+
+test "db stats report projection checkpoint replay tail per index hint" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const dense_target_sequence: u64 = 7;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+        });
+
+        try db.core.store.ensureReplayNextSequenceAtLeast(dense_target_sequence + 1);
+        var latest_raw: [8]u8 = undefined;
+        std.mem.writeInt(u64, &latest_raw, dense_target_sequence, .little);
+        const latest_key = internal_keys.replayLatestSequenceKey(@intCast(@intFromEnum(change_journal_mod.TargetHint.dense_vector)));
+        var batch = try db.core.store.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.put(latest_key[0..], latest_raw[0..]);
+        try batch.commit();
+
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(usize, 2), stats.indexes.len);
+        var full_text_seen = false;
+        var dense_seen = false;
+        for (stats.indexes) |index| {
+            if (std.mem.eql(u8, index.name, "ft_v1")) {
+                full_text_seen = true;
+                try std.testing.expectEqual(@as(u64, 0), index.replay_target_sequence);
+                try std.testing.expectEqual(@as(u64, 0), index.checkpoint_replay_tail_sequence_count);
+                try std.testing.expect(!index.replay_catch_up_required);
+            } else if (std.mem.eql(u8, index.name, "dv_v1")) {
+                dense_seen = true;
+                try std.testing.expectEqual(dense_target_sequence, index.replay_target_sequence);
+                try std.testing.expectEqual(dense_target_sequence, index.checkpoint_replay_tail_sequence_count);
+                try std.testing.expect(index.replay_catch_up_required);
+            }
+        }
+        try std.testing.expect(full_text_seen);
+        try std.testing.expect(dense_seen);
+    }
+
+    var status_db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .status_only,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer status_db.close();
+
+    const status_stats = try status_db.stats(alloc);
+    defer types.freeDBStats(alloc, status_stats);
+    try std.testing.expectEqual(@as(usize, 2), status_stats.indexes.len);
+    var status_full_text_seen = false;
+    var status_dense_seen = false;
+    for (status_stats.indexes) |index| {
+        if (std.mem.eql(u8, index.name, "ft_v1")) {
+            status_full_text_seen = true;
+            try std.testing.expectEqual(@as(u64, 0), index.replay_target_sequence);
+            try std.testing.expectEqual(@as(u64, 0), index.checkpoint_replay_tail_sequence_count);
+            try std.testing.expect(!index.replay_catch_up_required);
+        } else if (std.mem.eql(u8, index.name, "dv_v1")) {
+            status_dense_seen = true;
+            try std.testing.expectEqual(dense_target_sequence, index.replay_target_sequence);
+            try std.testing.expectEqual(dense_target_sequence, index.checkpoint_replay_tail_sequence_count);
+            try std.testing.expect(index.replay_catch_up_required);
+        }
+    }
+    try std.testing.expect(status_full_text_seen);
+    try std.testing.expect(status_dense_seen);
 }
 
 test "db catch-up rebuilds dense coverage before vacuous target advance" {
