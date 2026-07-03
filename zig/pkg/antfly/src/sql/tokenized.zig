@@ -7014,6 +7014,9 @@ fn generatedReadStatementKindFromAst(
     read_ast: *const generated_parser.GeneratedSqlReadAst,
 ) ?sql_statement_kind.SqlReadStatementKind {
     if (read_ast.kind == .cte) return generatedCteReadStatementKind(tokens, read_ast);
+    if (generatedReadSourceContainsLateralJoinTableFunction(tokens, read_ast)) {
+        return generatedReadStatementKindFromStructuredClauses(tokens, read_ast);
+    }
     return generatedReadStatementKindFromGeneratedReadKind(read_ast.kind);
 }
 
@@ -7037,7 +7040,11 @@ fn generatedReadKindMatchesStructuredClauses(
 ) bool {
     if (read_ast.kind == .cte) return true;
     const generated_kind = generatedReadStatementKindFromGeneratedReadKind(read_ast.kind) orelse return false;
-    return generated_kind == generatedReadStatementKindFromStructuredClauses(tokens, read_ast);
+    const structured_kind = generatedReadStatementKindFromStructuredClauses(tokens, read_ast);
+    if (generated_kind == structured_kind) return true;
+    return generated_kind == .query and
+        structured_kind == .lateral and
+        generatedReadSourceContainsLateralJoinTableFunction(tokens, read_ast);
 }
 
 fn generatedReadStatementKindFromStructuredClauses(
@@ -7048,6 +7055,11 @@ fn generatedReadStatementKindFromStructuredClauses(
     if (read_ast.kind == .lateral and read_ast.join_items.len != 0) return .lateral;
     if (read_ast.source_tokens) |source| {
         if (generatedReadRangeContainsKeyword(tokens, source, .lateral) and read_ast.join_items.len != 0) return .lateral;
+        if (generatedReadRangeContainsKeyword(tokens, source, .lateral) and
+            generatedReadRangeContainsKeyword(tokens, source, .join))
+        {
+            return .lateral;
+        }
     }
     if (read_ast.kind == .window or read_ast.window_tokens != null) return .window;
     if (read_ast.projection_tokens) |projection| {
@@ -7070,6 +7082,16 @@ fn generatedReadStatementKindFromStructuredClauses(
         if (generatedReadRangeContainsKeyword(tokens, source, .join)) return .join;
     }
     return .query;
+}
+
+fn generatedReadSourceContainsLateralJoinTableFunction(
+    tokens: []const Token,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
+) bool {
+    if (read_ast.join_items.len != 0) return false;
+    const source = read_ast.source_tokens orelse return false;
+    return generatedReadRangeContainsKeyword(tokens, source, .join) and
+        generatedReadRangeContainsKeyword(tokens, source, .lateral);
 }
 
 fn generatedReadRangeContainsKeyword(
@@ -13252,6 +13274,18 @@ test "sql adapter parsed sql read statement kind can come from generated AST" {
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_document_unnest.generatedStatementKind().?);
     try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, generated_document_unnest.readStatementKind().?);
     try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, generated_document_unnest.readStatementKindIncludingGeneratedAst().?);
+
+    var generated_lateral_table_function = try ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM docs AS d JOIN LATERAL UNNEST(d.tags) AS tag ON true WHERE tag = 'urgent' LIMIT 10");
+    defer generated_lateral_table_function.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_lateral_table_function.generatedStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.lateral, generated_lateral_table_function.readStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.lateral, generated_lateral_table_function.readStatementKindIncludingGeneratedAst().?);
+
+    var generated_lateral_mapped_table_function = try ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d JOIN LATERAL UNNEST(d.tag_list) AS tag ON true WHERE tag = 'urgent' LIMIT 10");
+    defer generated_lateral_mapped_table_function.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_lateral_mapped_table_function.generatedStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.lateral, generated_lateral_mapped_table_function.readStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.lateral, generated_lateral_mapped_table_function.readStatementKindIncludingGeneratedAst().?);
 
     var generated_scalar_subquery_projection = try ParsedSql.initAlloc(alloc, "SELECT (SELECT status FROM usage_records WHERE id = 'u1') AS first_status FROM usage_records");
     defer generated_scalar_subquery_projection.deinit(alloc);

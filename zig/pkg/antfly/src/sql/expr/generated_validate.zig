@@ -21,9 +21,15 @@ const expr_token = @import("token.zig");
 const generated_parser = @import("../generated_parser.zig");
 const runtime_schema = @import("../../storage/schema.zig");
 const token_mod = @import("../token.zig");
+const value_mod = @import("../value.zig");
 
 pub const Token = token_mod.Token;
 pub const TokenKind = token_mod.TokenKind;
+
+pub const StrictValidationContext = struct {
+    alloc: ?std.mem.Allocator = null,
+    params: []const value_mod.SqlValue = &.{},
+};
 
 fn validateGeneratedExpressionOperatorTokens(
     tokens: []const Token,
@@ -1287,6 +1293,7 @@ fn generatedLeafKindMayRepresentRowExpression(
 }
 
 fn validateGeneratedConcatExpressionOperandStrict(
+    context: StrictValidationContext,
     tokens: []const Token,
     generated_expression: *const generated_parser.GeneratedSqlExpressionAst,
     parsed_expression: db_mod.types.RelationalRowsExpression,
@@ -1294,14 +1301,15 @@ fn validateGeneratedConcatExpressionOperandStrict(
 ) anyerror!void {
     if (generated_expression.kind == .string_concat) {
         const left_expression = generated_expression.left_expression orelse return error.UnsupportedSqlShape;
-        try validateGeneratedConcatExpressionOperandStrict(tokens, left_expression, parsed_expression, parsed_operand_index);
+        try validateGeneratedConcatExpressionOperandStrict(context, tokens, left_expression, parsed_expression, parsed_operand_index);
         const right_expression = generated_expression.right_expression orelse return error.UnsupportedSqlShape;
-        try validateGeneratedConcatExpressionOperandStrict(tokens, right_expression, parsed_expression, parsed_operand_index);
+        try validateGeneratedConcatExpressionOperandStrict(context, tokens, right_expression, parsed_expression, parsed_operand_index);
         return;
     }
     if (parsed_operand_index.* >= parsed_expression.operands.len) return error.UnsupportedSqlShape;
     const range = generated_expression.tokens orelse return error.UnsupportedSqlShape;
-    try validateGeneratedRowExpressionIdentityStrict(
+    try validateGeneratedRowExpressionIdentityStrictWithContext(
+        context,
         tokens,
         range.start,
         range.end,
@@ -1312,12 +1320,13 @@ fn validateGeneratedConcatExpressionOperandStrict(
 }
 
 fn validateGeneratedConcatExpressionOperandsStrict(
+    context: StrictValidationContext,
     tokens: []const Token,
     parsed_expression: db_mod.types.RelationalRowsExpression,
     generated_expression: *const generated_parser.GeneratedSqlExpressionAst,
 ) anyerror!void {
     var parsed_operand_index: usize = 0;
-    try validateGeneratedConcatExpressionOperandStrict(tokens, generated_expression, parsed_expression, &parsed_operand_index);
+    try validateGeneratedConcatExpressionOperandStrict(context, tokens, generated_expression, parsed_expression, &parsed_operand_index);
     if (parsed_operand_index != parsed_expression.operands.len) return error.UnsupportedSqlShape;
 }
 
@@ -1342,6 +1351,7 @@ fn generatedPositionFunctionArgumentSeparator(
 }
 
 fn validateGeneratedPositionFunctionOperandsStrict(
+    context: StrictValidationContext,
     tokens: []const Token,
     parsed_expression: db_mod.types.RelationalRowsExpression,
     generated_expression: *const generated_parser.GeneratedSqlExpressionAst,
@@ -1353,14 +1363,16 @@ fn validateGeneratedPositionFunctionOperandsStrict(
     const argument_tokens = generated_expression.argument_tokens orelse return error.UnsupportedSqlShape;
     const separator = generatedPositionFunctionArgumentSeparator(tokens, argument_tokens) orelse return error.UnsupportedSqlShape;
     if (separator == argument_tokens.start or separator + 1 >= argument_tokens.end) return error.UnsupportedSqlShape;
-    try validateGeneratedRowExpressionIdentityStrict(
+    try validateGeneratedRowExpressionIdentityStrictWithContext(
+        context,
         tokens,
         separator + 1,
         argument_tokens.end,
         parsed_expression.operands[0],
         generated_expression,
     );
-    try validateGeneratedRowExpressionIdentityStrict(
+    try validateGeneratedRowExpressionIdentityStrictWithContext(
+        context,
         tokens,
         argument_tokens.start,
         separator,
@@ -1388,6 +1400,7 @@ fn jsonPathSegmentCount(path: []const u8) ?usize {
 }
 
 fn validateGeneratedJsonExtractPathFunctionOperandsStrict(
+    context: StrictValidationContext,
     tokens: []const Token,
     parsed_expression: db_mod.types.RelationalRowsExpression,
     generated_expression: *const generated_parser.GeneratedSqlExpressionAst,
@@ -1405,7 +1418,8 @@ fn validateGeneratedJsonExtractPathFunctionOperandsStrict(
         return error.UnsupportedSqlShape;
     }
     const source_tokens = generated_expression.argument_items.items[0];
-    try validateGeneratedRowExpressionIdentityStrict(
+    try validateGeneratedRowExpressionIdentityStrictWithContext(
+        context,
         tokens,
         source_tokens.start,
         source_tokens.end,
@@ -1433,6 +1447,7 @@ fn generatedJsonKeySetArrayExpression(
 }
 
 fn validateGeneratedJsonKeySetExpressionOperandsStrict(
+    context: StrictValidationContext,
     tokens: []const Token,
     parsed_expression: db_mod.types.RelationalRowsExpression,
     generated_expression: *const generated_parser.GeneratedSqlExpressionAst,
@@ -1462,7 +1477,8 @@ fn validateGeneratedJsonKeySetExpressionOperandsStrict(
         if (path_exists.kind != .json_path_exists or path_exists.operands.len != 1) return error.UnsupportedSqlShape;
         if (item_tokens.end != item_tokens.start + 1 or tokens[item_tokens.start].kind != .string) return error.UnsupportedSqlShape;
         if (!std.mem.eql(u8, path_exists.json_path, tokens[item_tokens.start].text)) return error.UnsupportedSqlShape;
-        try validateGeneratedRowExpressionIdentityStrict(
+        try validateGeneratedRowExpressionIdentityStrictWithContext(
+            context,
             tokens,
             left_tokens.start,
             left_tokens.end,
@@ -1473,23 +1489,288 @@ fn validateGeneratedJsonKeySetExpressionOperandsStrict(
     return true;
 }
 
+fn validateGeneratedCastExpressionOperandsStrict(
+    context: StrictValidationContext,
+    tokens: []const Token,
+    parsed_expression: db_mod.types.RelationalRowsExpression,
+    generated_expression: *const generated_parser.GeneratedSqlExpressionAst,
+) anyerror!bool {
+    if (parsed_expression.kind != .cast or generated_expression.kind != .cast) return false;
+    if (parsed_expression.operands.len != 1) return error.UnsupportedSqlShape;
+
+    const cast_expression_tokens = generated_expression.cast_expression_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedRowExpressionIdentityStrictWithContext(
+        context,
+        tokens,
+        cast_expression_tokens.start,
+        cast_expression_tokens.end,
+        parsed_expression.operands[0],
+        generated_expression,
+    );
+
+    const cast_type_tokens = generated_expression.cast_type_tokens orelse return error.UnsupportedSqlShape;
+    var cast_type_pos = cast_type_tokens.start;
+    const generated_cast_type = try expr_operator.parseExpressionCastType(tokens, &cast_type_pos);
+    if (cast_type_pos != cast_type_tokens.end) return error.UnsupportedSqlShape;
+    if (parsed_expression.cast_type == null or parsed_expression.cast_type.? != generated_cast_type) return error.UnsupportedSqlShape;
+    return true;
+}
+
+fn validateGeneratedExtractExpressionOperandsStrict(
+    context: StrictValidationContext,
+    tokens: []const Token,
+    parsed_expression: db_mod.types.RelationalRowsExpression,
+    generated_expression: *const generated_parser.GeneratedSqlExpressionAst,
+) anyerror!bool {
+    if (parsed_expression.kind != .date_part or generated_expression.kind != .extract_expression) return false;
+    if (parsed_expression.operands.len != 2) return error.UnsupportedSqlShape;
+
+    const source_tokens = generated_expression.extract_source_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedRowExpressionIdentityStrictWithContext(
+        context,
+        tokens,
+        source_tokens.start,
+        source_tokens.end,
+        parsed_expression.operands[1],
+        generated_expression,
+    );
+    return true;
+}
+
+fn validateGeneratedCaseExpressionOperandsStrict(
+    context: StrictValidationContext,
+    tokens: []const Token,
+    parsed_expression: db_mod.types.RelationalRowsExpression,
+    generated_expression: *const generated_parser.GeneratedSqlExpressionAst,
+) anyerror!bool {
+    if (parsed_expression.kind != .case or generated_expression.kind != .case_expression) return false;
+    if (parsed_expression.case_branches.len == 0 or parsed_expression.case_else.len != 1) return error.UnsupportedSqlShape;
+    if (generated_expression.case_branch_count != parsed_expression.case_branches.len) return error.UnsupportedSqlShape;
+    if (generated_expression.case_condition_items.count != parsed_expression.case_branches.len or
+        generated_expression.case_result_items.count != parsed_expression.case_branches.len)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    for (parsed_expression.case_branches, 0..) |branch, index| {
+        const condition_tokens = generated_expression.case_condition_items.items[index];
+        try validateGeneratedExpressionConditionIdentityStrictWithContext(
+            context,
+            tokens,
+            condition_tokens.start,
+            condition_tokens.end,
+            branch.when,
+            generated_expression,
+        );
+
+        const result_tokens = generated_expression.case_result_items.items[index];
+        try validateGeneratedRowExpressionIdentityStrictWithContext(
+            context,
+            tokens,
+            result_tokens.start,
+            result_tokens.end,
+            branch.then,
+            generated_expression,
+        );
+    }
+
+    const else_tokens = generated_expression.case_else_expression_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedRowExpressionIdentityStrictWithContext(
+        context,
+        tokens,
+        else_tokens.start,
+        else_tokens.end,
+        parsed_expression.case_else[0],
+        generated_expression,
+    );
+    return true;
+}
+
+fn jsonTopLevelArrayElementCount(value_json: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < value_json.len and std.ascii.isWhitespace(value_json[i])) : (i += 1) {}
+    if (i >= value_json.len or value_json[i] != '[') return null;
+    i += 1;
+    while (i < value_json.len and std.ascii.isWhitespace(value_json[i])) : (i += 1) {}
+    if (i < value_json.len and value_json[i] == ']') {
+        i += 1;
+        while (i < value_json.len and std.ascii.isWhitespace(value_json[i])) : (i += 1) {}
+        return if (i == value_json.len) 0 else null;
+    }
+
+    var count: usize = 0;
+    while (i < value_json.len) {
+        count += 1;
+        var depth: usize = 0;
+        var in_string = false;
+        var escaped = false;
+        var saw_value_byte = false;
+        while (i < value_json.len) : (i += 1) {
+            const ch = value_json[i];
+            if (in_string) {
+                saw_value_byte = true;
+                if (escaped) {
+                    escaped = false;
+                } else if (ch == '\\') {
+                    escaped = true;
+                } else if (ch == '"') {
+                    in_string = false;
+                }
+                continue;
+            }
+            switch (ch) {
+                '"' => {
+                    in_string = true;
+                    saw_value_byte = true;
+                },
+                '[', '{' => {
+                    depth += 1;
+                    saw_value_byte = true;
+                },
+                ']', '}' => {
+                    if (depth == 0) {
+                        if (ch == ']') break;
+                        return null;
+                    }
+                    depth -= 1;
+                    saw_value_byte = true;
+                },
+                ',' => {
+                    if (depth == 0) break;
+                    saw_value_byte = true;
+                },
+                else => {
+                    if (!std.ascii.isWhitespace(ch)) saw_value_byte = true;
+                },
+            }
+        }
+        if (!saw_value_byte or in_string or escaped) return null;
+        while (i < value_json.len and std.ascii.isWhitespace(value_json[i])) : (i += 1) {}
+        if (i >= value_json.len) return null;
+        if (value_json[i] == ',') {
+            i += 1;
+            while (i < value_json.len and std.ascii.isWhitespace(value_json[i])) : (i += 1) {}
+            if (i >= value_json.len or value_json[i] == ']') return null;
+            continue;
+        }
+        if (value_json[i] == ']') {
+            i += 1;
+            while (i < value_json.len and std.ascii.isWhitespace(value_json[i])) : (i += 1) {}
+            return if (i == value_json.len) count else null;
+        }
+        return null;
+    }
+    return null;
+}
+
+fn validateGeneratedArrayConstructorExpressionStrict(
+    context: StrictValidationContext,
+    tokens: []const Token,
+    parsed_expression: db_mod.types.RelationalRowsExpression,
+    generated_expression: *const generated_parser.GeneratedSqlExpressionAst,
+) !bool {
+    if (generated_expression.kind != .array_constructor or parsed_expression.kind != .value) return false;
+    if (parsed_expression.operands.len != 0) return error.UnsupportedSqlShape;
+    if (context.alloc) |alloc| {
+        const expression_tokens = generated_expression.tokens orelse return error.UnsupportedSqlShape;
+        var pos = expression_tokens.start;
+        const generated_json = try value_mod.parseSqlArrayConstructorJsonAlloc(alloc, tokens, &pos, context.params);
+        defer alloc.free(generated_json);
+        if (pos != expression_tokens.end or !std.mem.eql(u8, parsed_expression.value_json, generated_json)) return error.UnsupportedSqlShape;
+        return true;
+    }
+    const parsed_count = jsonTopLevelArrayElementCount(parsed_expression.value_json) orelse return error.UnsupportedSqlShape;
+    if (parsed_count != generated_expression.array_items.count) return error.UnsupportedSqlShape;
+    return true;
+}
+
+fn validateGeneratedIntervalLiteralExpressionStrict(
+    tokens: []const Token,
+    parsed_expression: db_mod.types.RelationalRowsExpression,
+    generated_expression: *const generated_parser.GeneratedSqlExpressionAst,
+) !bool {
+    if (generated_expression.kind != .interval_literal) return false;
+    if (parsed_expression.kind != .interval_ns and parsed_expression.kind != .interval_months) return false;
+    if (parsed_expression.operands.len != 1 or parsed_expression.operands[0].kind != .value) return error.UnsupportedSqlShape;
+
+    const expression_tokens = generated_expression.tokens orelse return error.UnsupportedSqlShape;
+    var pos = expression_tokens.start;
+    const interval = try value_mod.parseSqlIntervalLiteral(tokens, &pos);
+    if (pos != expression_tokens.end) return error.UnsupportedSqlShape;
+
+    const parsed_value = std.fmt.parseUnsigned(u64, parsed_expression.operands[0].value_json, 10) catch return error.UnsupportedSqlShape;
+    const has_calendar = interval.calendar_months != 0 or (interval.saw_calendar and interval.fixed_ns == 0);
+    const has_fixed = interval.fixed_ns != 0 or (interval.saw_fixed and !has_calendar);
+    if (has_calendar and has_fixed) return error.UnsupportedSqlShape;
+    switch (parsed_expression.kind) {
+        .interval_months => if (!has_calendar or parsed_value != interval.calendar_months) return error.UnsupportedSqlShape,
+        .interval_ns => if (!has_fixed or parsed_value != interval.fixed_ns) return error.UnsupportedSqlShape,
+        else => return error.UnsupportedSqlShape,
+    }
+    return true;
+}
+
+fn validateGeneratedTemporalLeafExpressionStrict(
+    context: StrictValidationContext,
+    tokens: []const Token,
+    parsed_expression: db_mod.types.RelationalRowsExpression,
+    generated_expression: *const generated_parser.GeneratedSqlExpressionAst,
+) !bool {
+    if (try validateGeneratedIntervalLiteralExpressionStrict(tokens, parsed_expression, generated_expression)) return true;
+    switch (generated_expression.kind) {
+        .timestamp_literal => {
+            if (parsed_expression.kind != .value or parsed_expression.operands.len != 0) return error.UnsupportedSqlShape;
+            if (context.alloc) |alloc| {
+                const expression_tokens = generated_expression.tokens orelse return error.UnsupportedSqlShape;
+                var pos = expression_tokens.start;
+                const generated_json = try value_mod.parseSqlTypedDatetimeLiteralValueJsonAlloc(alloc, tokens, &pos);
+                defer alloc.free(generated_json);
+                if (pos != expression_tokens.end or !std.mem.eql(u8, parsed_expression.value_json, generated_json)) return error.UnsupportedSqlShape;
+            }
+            return true;
+        },
+        .current_timestamp => {
+            if (parsed_expression.kind != .now or parsed_expression.operands.len != 0) return error.UnsupportedSqlShape;
+            return true;
+        },
+        .current_date => {
+            if (parsed_expression.kind != .date_trunc or parsed_expression.operands.len != 2) return error.UnsupportedSqlShape;
+            if (parsed_expression.operands[0].kind != .value or
+                !std.mem.eql(u8, parsed_expression.operands[0].value_json, "\"day\"") or
+                parsed_expression.operands[1].kind != .now)
+            {
+                return error.UnsupportedSqlShape;
+            }
+            return true;
+        },
+        else => return false,
+    }
+}
+
 fn validateGeneratedRowExpressionOperandsStrict(
+    context: StrictValidationContext,
     tokens: []const Token,
     parsed_expression: db_mod.types.RelationalRowsExpression,
     generated_expression: *const generated_parser.GeneratedSqlExpressionAst,
 ) anyerror!void {
+    if (try validateGeneratedCaseExpressionOperandsStrict(context, tokens, parsed_expression, generated_expression)) return;
+    if (try validateGeneratedArrayConstructorExpressionStrict(context, tokens, parsed_expression, generated_expression)) return;
+    if (try validateGeneratedTemporalLeafExpressionStrict(context, tokens, parsed_expression, generated_expression)) return;
     if (parsed_expression.operands.len == 0) return;
     if (parsed_expression.kind == .concat and generated_expression.kind == .string_concat) {
-        try validateGeneratedConcatExpressionOperandsStrict(tokens, parsed_expression, generated_expression);
+        try validateGeneratedConcatExpressionOperandsStrict(context, tokens, parsed_expression, generated_expression);
         return;
     }
-    if (try validateGeneratedPositionFunctionOperandsStrict(tokens, parsed_expression, generated_expression)) return;
-    if (try validateGeneratedJsonExtractPathFunctionOperandsStrict(tokens, parsed_expression, generated_expression)) return;
-    if (try validateGeneratedJsonKeySetExpressionOperandsStrict(tokens, parsed_expression, generated_expression)) return;
+    if (try validateGeneratedPositionFunctionOperandsStrict(context, tokens, parsed_expression, generated_expression)) return;
+    if (try validateGeneratedJsonExtractPathFunctionOperandsStrict(context, tokens, parsed_expression, generated_expression)) return;
+    if (try validateGeneratedJsonKeySetExpressionOperandsStrict(context, tokens, parsed_expression, generated_expression)) return;
+    if (try validateGeneratedCastExpressionOperandsStrict(context, tokens, parsed_expression, generated_expression)) return;
+    if (try validateGeneratedExtractExpressionOperandsStrict(context, tokens, parsed_expression, generated_expression)) return;
     var expected_operand_count: usize = 0;
     if (generated_expression.left_tokens) |left_tokens| {
         if (parsed_expression.operands.len <= expected_operand_count) return error.UnsupportedSqlShape;
-        try validateGeneratedRowExpressionIdentityStrict(
+        try validateGeneratedRowExpressionIdentityStrictWithContext(
+            context,
             tokens,
             left_tokens.start,
             left_tokens.end,
@@ -1500,7 +1781,8 @@ fn validateGeneratedRowExpressionOperandsStrict(
     }
     if (generated_expression.right_tokens) |right_tokens| {
         if (parsed_expression.operands.len <= expected_operand_count) return error.UnsupportedSqlShape;
-        try validateGeneratedRowExpressionIdentityStrict(
+        try validateGeneratedRowExpressionIdentityStrictWithContext(
+            context,
             tokens,
             right_tokens.start,
             right_tokens.end,
@@ -1513,7 +1795,8 @@ fn validateGeneratedRowExpressionOperandsStrict(
         if (expected_operand_count != 0) return error.UnsupportedSqlShape;
         if (generated_expression.argument_items.count != parsed_expression.operands.len) return error.UnsupportedSqlShape;
         for (generated_expression.argument_items.items, 0..) |argument_tokens, index| {
-            try validateGeneratedRowExpressionIdentityStrict(
+            try validateGeneratedRowExpressionIdentityStrictWithContext(
+                context,
                 tokens,
                 argument_tokens.start,
                 argument_tokens.end,
@@ -1523,6 +1806,7 @@ fn validateGeneratedRowExpressionOperandsStrict(
         }
         return;
     }
+    if (expected_operand_count != 0 and expected_operand_count != parsed_expression.operands.len) return error.UnsupportedSqlShape;
 }
 
 pub fn validateGeneratedRowExpressionIdentity(
@@ -1532,7 +1816,7 @@ pub fn validateGeneratedRowExpressionIdentity(
     parsed_expression: db_mod.types.RelationalRowsExpression,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
-    try validateGeneratedRowExpressionIdentityWithMode(tokens, start, end, parsed_expression, generated_expression_ast, false);
+    try validateGeneratedRowExpressionIdentityWithMode(.{}, tokens, start, end, parsed_expression, generated_expression_ast, false);
 }
 
 pub fn validateGeneratedRowExpressionIdentityStrict(
@@ -1542,10 +1826,22 @@ pub fn validateGeneratedRowExpressionIdentityStrict(
     parsed_expression: db_mod.types.RelationalRowsExpression,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
-    try validateGeneratedRowExpressionIdentityWithMode(tokens, start, end, parsed_expression, generated_expression_ast, true);
+    try validateGeneratedRowExpressionIdentityWithMode(.{}, tokens, start, end, parsed_expression, generated_expression_ast, true);
+}
+
+pub fn validateGeneratedRowExpressionIdentityStrictWithContext(
+    context: StrictValidationContext,
+    tokens: []const Token,
+    start: usize,
+    end: usize,
+    parsed_expression: db_mod.types.RelationalRowsExpression,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    try validateGeneratedRowExpressionIdentityWithMode(context, tokens, start, end, parsed_expression, generated_expression_ast, true);
 }
 
 fn validateGeneratedRowExpressionIdentityWithMode(
+    context: StrictValidationContext,
     tokens: []const Token,
     start: usize,
     end: usize,
@@ -1563,7 +1859,7 @@ fn validateGeneratedRowExpressionIdentityWithMode(
     if (generated_expression.kind == .grouped) {
         const inner_expression = generated_expression.inner_expression orelse return error.UnsupportedSqlShape;
         const inner_tokens = inner_expression.tokens orelse return error.UnsupportedSqlShape;
-        try validateGeneratedRowExpressionIdentityWithMode(tokens, inner_tokens.start, inner_tokens.end, parsed_expression, inner_expression, require_exact_expression);
+        try validateGeneratedRowExpressionIdentityWithMode(context, tokens, inner_tokens.start, inner_tokens.end, parsed_expression, inner_expression, require_exact_expression);
         return;
     }
     switch (generated_expression.kind) {
@@ -1583,7 +1879,7 @@ fn validateGeneratedRowExpressionIdentityWithMode(
             }
         },
     }
-    if (require_exact_expression) try validateGeneratedRowExpressionOperandsStrict(tokens, parsed_expression, generated_expression);
+    if (require_exact_expression) try validateGeneratedRowExpressionOperandsStrict(context, tokens, parsed_expression, generated_expression);
 }
 
 pub fn validateGeneratedExpressionConditionIdentity(
@@ -1593,7 +1889,7 @@ pub fn validateGeneratedExpressionConditionIdentity(
     parsed_condition: db_mod.types.RelationalRowsExpressionCondition,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
-    try validateGeneratedExpressionConditionIdentityWithMode(tokens, start, end, parsed_condition, generated_expression_ast, false);
+    try validateGeneratedExpressionConditionIdentityWithMode(.{}, tokens, start, end, parsed_condition, generated_expression_ast, false);
 }
 
 pub fn validateGeneratedExpressionConditionIdentityStrict(
@@ -1603,10 +1899,22 @@ pub fn validateGeneratedExpressionConditionIdentityStrict(
     parsed_condition: db_mod.types.RelationalRowsExpressionCondition,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
-    try validateGeneratedExpressionConditionIdentityWithMode(tokens, start, end, parsed_condition, generated_expression_ast, true);
+    try validateGeneratedExpressionConditionIdentityWithMode(.{}, tokens, start, end, parsed_condition, generated_expression_ast, true);
+}
+
+pub fn validateGeneratedExpressionConditionIdentityStrictWithContext(
+    context: StrictValidationContext,
+    tokens: []const Token,
+    start: usize,
+    end: usize,
+    parsed_condition: db_mod.types.RelationalRowsExpressionCondition,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    try validateGeneratedExpressionConditionIdentityWithMode(context, tokens, start, end, parsed_condition, generated_expression_ast, true);
 }
 
 fn validateGeneratedExpressionConditionIdentityWithMode(
+    context: StrictValidationContext,
     tokens: []const Token,
     start: usize,
     end: usize,
@@ -1618,10 +1926,15 @@ fn validateGeneratedExpressionConditionIdentityWithMode(
     const range: generated_parser.GeneratedSqlTokenRange = .{ .start = start, .end = end };
     const generated_expression = generatedExpressionForExactRange(root, range) orelse return error.UnsupportedSqlShape;
     const operator_tokens = generated_expression.operator_tokens orelse return error.UnsupportedSqlShape;
-    try validateGeneratedRelationalPredicateExpression(generated_expression, tokens, operator_tokens.start, parsed_condition.op);
+    const boolean_literal_tail = generatedBooleanLiteralIsTailForCondition(parsed_condition);
+    if (boolean_literal_tail) |is_tail| {
+        try validateGeneratedIsTailPredicateExpression(generated_expression, tokens, operator_tokens.start, is_tail);
+    } else {
+        try validateGeneratedRelationalPredicateExpression(generated_expression, tokens, operator_tokens.start, parsed_condition.op);
+    }
     const lhs_tokens = generated_expression.left_tokens orelse return error.UnsupportedSqlShape;
     if (require_exact_child_expressions) {
-        try validateGeneratedRowExpressionIdentityStrict(tokens, lhs_tokens.start, lhs_tokens.end, parsed_condition.lhs, generated_expression);
+        try validateGeneratedRowExpressionIdentityStrictWithContext(context, tokens, lhs_tokens.start, lhs_tokens.end, parsed_condition.lhs, generated_expression);
     } else {
         try validateGeneratedRowExpressionIdentity(tokens, lhs_tokens.start, lhs_tokens.end, parsed_condition.lhs, generated_expression);
     }
@@ -1630,15 +1943,40 @@ fn validateGeneratedExpressionConditionIdentityWithMode(
             if (parsed_condition.rhs.len != 0 or generated_expression.right_tokens != null) return error.UnsupportedSqlShape;
         },
         else => {
+            if (boolean_literal_tail != null) {
+                if (generated_expression.right_tokens) |rhs_tokens| {
+                    if (require_exact_child_expressions) {
+                        try validateGeneratedRowExpressionIdentityStrictWithContext(context, tokens, rhs_tokens.start, rhs_tokens.end, parsed_condition.rhs[0], generated_expression);
+                    } else {
+                        try validateGeneratedRowExpressionIdentity(tokens, rhs_tokens.start, rhs_tokens.end, parsed_condition.rhs[0], generated_expression);
+                    }
+                }
+                return;
+            }
             if (parsed_condition.rhs.len != 1) return error.UnsupportedSqlShape;
             const rhs_tokens = generated_expression.right_tokens orelse return error.UnsupportedSqlShape;
             if (require_exact_child_expressions) {
-                try validateGeneratedRowExpressionIdentityStrict(tokens, rhs_tokens.start, rhs_tokens.end, parsed_condition.rhs[0], generated_expression);
+                try validateGeneratedRowExpressionIdentityStrictWithContext(context, tokens, rhs_tokens.start, rhs_tokens.end, parsed_condition.rhs[0], generated_expression);
             } else {
                 try validateGeneratedRowExpressionIdentity(tokens, rhs_tokens.start, rhs_tokens.end, parsed_condition.rhs[0], generated_expression);
             }
         },
     }
+}
+
+fn generatedBooleanLiteralIsTailForCondition(
+    parsed_condition: db_mod.types.RelationalRowsExpressionCondition,
+) ?expr_operator.ExpressionIsTail {
+    if (parsed_condition.op != .eq or parsed_condition.rhs.len != 1) return null;
+    const rhs = parsed_condition.rhs[0];
+    if (rhs.kind != .value) return null;
+    if (std.mem.eql(u8, rhs.value_json, "true")) {
+        return .{ .op = .eq, .kind = .boolean_literal, .boolean_value = true };
+    }
+    if (std.mem.eql(u8, rhs.value_json, "false")) {
+        return .{ .op = .eq, .kind = .boolean_literal, .boolean_value = false };
+    }
+    return null;
 }
 
 pub fn validateGeneratedQuantifiedPredicateIdentity(
@@ -2195,6 +2533,8 @@ pub fn validateGeneratedIsTailPredicateIdentity(
 }
 
 pub fn testGeneratedValidationChecksPredicateAndRowExpressionIdentity() !void {
+    const alloc = std.testing.allocator;
+
     const regex_tokens = [_]Token{.{ .kind = .regex_not_imatch, .text = "!~*" }};
     const regex_expression = generated_parser.GeneratedSqlExpressionAst{
         .kind = .regex_not_imatch,
@@ -2527,6 +2867,362 @@ pub fn testGeneratedValidationChecksPredicateAndRowExpressionIdentity() !void {
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         validateGeneratedExpressionPayloads(&grouped_tokens, stale_grouped_expression),
+    );
+
+    const strict_cast_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "cast", .keyword = .cast },
+        .{ .kind = .lparen, .text = "(" },
+        .{ .kind = .identifier, .text = "amount" },
+        .{ .kind = .identifier, .text = "as", .keyword = .as },
+        .{ .kind = .identifier, .text = "text" },
+        .{ .kind = .rparen, .text = ")" },
+    };
+    var strict_cast_child = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .token_range,
+        .tokens = .{ .start = 2, .end = 3 },
+    };
+    const strict_cast_ast = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .cast,
+        .tokens = .{ .start = 0, .end = 6 },
+        .cast_expression_tokens = .{ .start = 2, .end = 3 },
+        .cast_expression = &strict_cast_child,
+        .cast_type_tokens = .{ .start = 4, .end = 5 },
+    };
+    const strict_cast_operands = [_]db_mod.types.RelationalRowsExpression{.{ .kind = .field, .field = "amount" }};
+    const strict_cast_expression = db_mod.types.RelationalRowsExpression{
+        .kind = .cast,
+        .operands = strict_cast_operands[0..],
+        .cast_type = .text,
+    };
+    try validateGeneratedRowExpressionIdentityStrict(&strict_cast_tokens, 0, 6, strict_cast_expression, &strict_cast_ast);
+    const stale_strict_cast_expression = db_mod.types.RelationalRowsExpression{
+        .kind = .cast,
+        .operands = strict_cast_operands[0..],
+        .cast_type = .numeric,
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedRowExpressionIdentityStrict(&strict_cast_tokens, 0, 6, stale_strict_cast_expression, &strict_cast_ast),
+    );
+
+    const strict_extract_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "extract", .keyword = .extract },
+        .{ .kind = .lparen, .text = "(" },
+        .{ .kind = .identifier, .text = "dow" },
+        .{ .kind = .identifier, .text = "from", .keyword = .from },
+        .{ .kind = .identifier, .text = "amount" },
+        .{ .kind = .rparen, .text = ")" },
+    };
+    var strict_extract_source = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .token_range,
+        .tokens = .{ .start = 4, .end = 5 },
+    };
+    const strict_extract_ast = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .extract_expression,
+        .tokens = .{ .start = 0, .end = 6 },
+        .extract_field_tokens = .{ .start = 2, .end = 3 },
+        .extract_source_tokens = .{ .start = 4, .end = 5 },
+        .extract_source_expression = &strict_extract_source,
+    };
+    const strict_extract_operands = [_]db_mod.types.RelationalRowsExpression{
+        .{ .kind = .value, .value_json = "\"dow\"" },
+        .{ .kind = .field, .field = "amount" },
+    };
+    const strict_extract_expression = db_mod.types.RelationalRowsExpression{
+        .kind = .date_part,
+        .operands = strict_extract_operands[0..],
+    };
+    try validateGeneratedRowExpressionIdentityStrict(&strict_extract_tokens, 0, 6, strict_extract_expression, &strict_extract_ast);
+    const stale_strict_extract_operands = [_]db_mod.types.RelationalRowsExpression{.{ .kind = .value, .value_json = "\"dow\"" }};
+    const stale_strict_extract_expression = db_mod.types.RelationalRowsExpression{
+        .kind = .date_part,
+        .operands = stale_strict_extract_operands[0..],
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedRowExpressionIdentityStrict(&strict_extract_tokens, 0, 6, stale_strict_extract_expression, &strict_extract_ast),
+    );
+
+    const strict_case_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "case", .keyword = .case },
+        .{ .kind = .identifier, .text = "when", .keyword = .when },
+        .{ .kind = .identifier, .text = "status" },
+        .{ .kind = .identifier, .text = "is", .keyword = .is },
+        .{ .kind = .identifier, .text = "null", .keyword = .null },
+        .{ .kind = .identifier, .text = "then", .keyword = .then },
+        .{ .kind = .string, .text = "missing" },
+        .{ .kind = .identifier, .text = "else", .keyword = .@"else" },
+        .{ .kind = .string, .text = "fallback" },
+        .{ .kind = .identifier, .text = "end", .keyword = .end },
+    };
+    var strict_case_condition_left = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .token_range,
+        .tokens = .{ .start = 2, .end = 3 },
+    };
+    var strict_case_condition = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .is_null,
+        .tokens = .{ .start = 2, .end = 5 },
+        .left_tokens = .{ .start = 2, .end = 3 },
+        .left_expression = &strict_case_condition_left,
+        .operator_tokens = .{ .start = 3, .end = 5 },
+    };
+    var strict_case_result = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .token_range,
+        .tokens = .{ .start = 6, .end = 7 },
+    };
+    var strict_case_else = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .token_range,
+        .tokens = .{ .start = 8, .end = 9 },
+    };
+    var strict_case_condition_items = [_]generated_parser.GeneratedSqlTokenRange{.{ .start = 2, .end = 5 }};
+    var strict_case_result_items = [_]generated_parser.GeneratedSqlTokenRange{.{ .start = 6, .end = 7 }};
+    var strict_case_condition_expressions = [_]generated_parser.GeneratedSqlExpressionAst{strict_case_condition};
+    var strict_case_result_expressions = [_]generated_parser.GeneratedSqlExpressionAst{strict_case_result};
+    const strict_case_ast = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .case_expression,
+        .tokens = .{ .start = 0, .end = 10 },
+        .case_branch_count = 1,
+        .case_first_when_tokens = .{ .start = 1, .end = 7 },
+        .case_last_when_tokens = .{ .start = 1, .end = 7 },
+        .case_first_condition_tokens = .{ .start = 2, .end = 5 },
+        .case_first_condition_kind = .is_null,
+        .case_first_condition = &strict_case_condition,
+        .case_first_result_tokens = .{ .start = 6, .end = 7 },
+        .case_first_result = &strict_case_result,
+        .case_condition_items = .{
+            .first_tokens = strict_case_condition_items[0],
+            .last_tokens = strict_case_condition_items[0],
+            .items = strict_case_condition_items[0..],
+            .expression_items = strict_case_condition_items[0..],
+            .expressions = strict_case_condition_expressions[0..],
+            .count = 1,
+        },
+        .case_result_items = .{
+            .first_tokens = strict_case_result_items[0],
+            .last_tokens = strict_case_result_items[0],
+            .items = strict_case_result_items[0..],
+            .expression_items = strict_case_result_items[0..],
+            .expressions = strict_case_result_expressions[0..],
+            .count = 1,
+        },
+        .case_else_tokens = .{ .start = 7, .end = 9 },
+        .case_else_expression_tokens = .{ .start = 8, .end = 9 },
+        .case_else_expression = &strict_case_else,
+    };
+    const strict_case_branches = [_]db_mod.types.RelationalRowsExpressionCaseBranch{.{
+        .when = .{
+            .lhs = .{ .kind = .field, .field = "status" },
+            .op = .is_null,
+        },
+        .then = .{ .kind = .value, .value_json = "\"missing\"" },
+    }};
+    const strict_case_fallback = [_]db_mod.types.RelationalRowsExpression{.{ .kind = .value, .value_json = "\"fallback\"" }};
+    const strict_case_expression = db_mod.types.RelationalRowsExpression{
+        .kind = .case,
+        .case_branches = strict_case_branches[0..],
+        .case_else = strict_case_fallback[0..],
+    };
+    try validateGeneratedRowExpressionIdentityStrict(&strict_case_tokens, 0, 10, strict_case_expression, &strict_case_ast);
+    const stale_strict_case_expression = db_mod.types.RelationalRowsExpression{
+        .kind = .case,
+        .case_branches = strict_case_branches[0..],
+        .case_else = &.{},
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedRowExpressionIdentityStrict(&strict_case_tokens, 0, 10, stale_strict_case_expression, &strict_case_ast),
+    );
+
+    const strict_array_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "array", .keyword = .array },
+        .{ .kind = .lbracket, .text = "[" },
+        .{ .kind = .number, .text = "1" },
+        .{ .kind = .comma, .text = "," },
+        .{ .kind = .string, .text = "two" },
+        .{ .kind = .rbracket, .text = "]" },
+    };
+    const strict_array_first_expression = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .token_range,
+        .tokens = .{ .start = 2, .end = 3 },
+    };
+    const strict_array_second_expression = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .token_range,
+        .tokens = .{ .start = 4, .end = 5 },
+    };
+    var strict_array_items = [_]generated_parser.GeneratedSqlTokenRange{
+        .{ .start = 2, .end = 3 },
+        .{ .start = 4, .end = 5 },
+    };
+    var strict_array_expressions = [_]generated_parser.GeneratedSqlExpressionAst{
+        strict_array_first_expression,
+        strict_array_second_expression,
+    };
+    const strict_array_ast = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .array_constructor,
+        .tokens = .{ .start = 0, .end = 6 },
+        .array_tokens = .{ .start = 2, .end = 5 },
+        .array_items = .{
+            .first_tokens = strict_array_items[0],
+            .last_tokens = strict_array_items[1],
+            .items = strict_array_items[0..],
+            .expression_items = strict_array_items[0..],
+            .expressions = strict_array_expressions[0..],
+            .count = 2,
+        },
+    };
+    const strict_array_expression = db_mod.types.RelationalRowsExpression{
+        .kind = .value,
+        .value_json = "[1,\"two\"]",
+    };
+    try validateGeneratedRowExpressionIdentityStrict(&strict_array_tokens, 0, 6, strict_array_expression, &strict_array_ast);
+    try validateGeneratedRowExpressionIdentityStrictWithContext(
+        .{ .alloc = alloc },
+        &strict_array_tokens,
+        0,
+        6,
+        strict_array_expression,
+        &strict_array_ast,
+    );
+    const stale_strict_array_expression = db_mod.types.RelationalRowsExpression{
+        .kind = .value,
+        .value_json = "[1]",
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedRowExpressionIdentityStrict(&strict_array_tokens, 0, 6, stale_strict_array_expression, &strict_array_ast),
+    );
+    const stale_strict_array_same_count_expression = db_mod.types.RelationalRowsExpression{
+        .kind = .value,
+        .value_json = "[1,\"stale\"]",
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedRowExpressionIdentityStrictWithContext(
+            .{ .alloc = alloc },
+            &strict_array_tokens,
+            0,
+            6,
+            stale_strict_array_same_count_expression,
+            &strict_array_ast,
+        ),
+    );
+
+    const strict_interval_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "interval", .keyword = .interval },
+        .{ .kind = .string, .text = "2 days" },
+    };
+    const strict_interval_ast = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .interval_literal,
+        .tokens = .{ .start = 0, .end = 2 },
+        .interval_value_tokens = .{ .start = 1, .end = 2 },
+    };
+    const strict_interval_operands = [_]db_mod.types.RelationalRowsExpression{.{
+        .kind = .value,
+        .value_json = "172800000000000",
+    }};
+    const strict_interval_expression = db_mod.types.RelationalRowsExpression{
+        .kind = .interval_ns,
+        .operands = strict_interval_operands[0..],
+    };
+    try validateGeneratedRowExpressionIdentityStrict(&strict_interval_tokens, 0, 2, strict_interval_expression, &strict_interval_ast);
+    const stale_strict_interval_operands = [_]db_mod.types.RelationalRowsExpression{.{
+        .kind = .value,
+        .value_json = "86400000000000",
+    }};
+    const stale_strict_interval_expression = db_mod.types.RelationalRowsExpression{
+        .kind = .interval_ns,
+        .operands = stale_strict_interval_operands[0..],
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedRowExpressionIdentityStrict(&strict_interval_tokens, 0, 2, stale_strict_interval_expression, &strict_interval_ast),
+    );
+
+    const strict_current_date_tokens = [_]Token{.{ .kind = .identifier, .text = "current_date", .keyword = .current_date }};
+    const strict_current_date_ast = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .current_date,
+        .tokens = .{ .start = 0, .end = 1 },
+    };
+    const strict_current_date_operands = [_]db_mod.types.RelationalRowsExpression{
+        .{ .kind = .value, .value_json = "\"day\"" },
+        .{ .kind = .now },
+    };
+    const strict_current_date_expression = db_mod.types.RelationalRowsExpression{
+        .kind = .date_trunc,
+        .operands = strict_current_date_operands[0..],
+    };
+    try validateGeneratedRowExpressionIdentityStrict(&strict_current_date_tokens, 0, 1, strict_current_date_expression, &strict_current_date_ast);
+    const stale_strict_current_date_operands = [_]db_mod.types.RelationalRowsExpression{
+        .{ .kind = .value, .value_json = "\"hour\"" },
+        .{ .kind = .now },
+    };
+    const stale_strict_current_date_expression = db_mod.types.RelationalRowsExpression{
+        .kind = .date_trunc,
+        .operands = stale_strict_current_date_operands[0..],
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedRowExpressionIdentityStrict(&strict_current_date_tokens, 0, 1, stale_strict_current_date_expression, &strict_current_date_ast),
+    );
+
+    const strict_current_timestamp_tokens = [_]Token{.{ .kind = .identifier, .text = "current_timestamp", .keyword = .current_timestamp }};
+    const strict_current_timestamp_ast = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .current_timestamp,
+        .tokens = .{ .start = 0, .end = 1 },
+    };
+    try validateGeneratedRowExpressionIdentityStrict(
+        &strict_current_timestamp_tokens,
+        0,
+        1,
+        .{ .kind = .now, .value_json = "1" },
+        &strict_current_timestamp_ast,
+    );
+    const stale_strict_current_timestamp_operands = [_]db_mod.types.RelationalRowsExpression{.{ .kind = .value, .value_json = "1" }};
+    const stale_strict_current_timestamp_expression = db_mod.types.RelationalRowsExpression{
+        .kind = .now,
+        .operands = stale_strict_current_timestamp_operands[0..],
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedRowExpressionIdentityStrict(&strict_current_timestamp_tokens, 0, 1, stale_strict_current_timestamp_expression, &strict_current_timestamp_ast),
+    );
+
+    const strict_timestamp_literal_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "timestamp", .keyword = .timestamp },
+        .{ .kind = .string, .text = "1970-01-01T00:00:01Z" },
+    };
+    const strict_timestamp_literal_ast = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .timestamp_literal,
+        .tokens = .{ .start = 0, .end = 2 },
+        .timestamp_type_tokens = .{ .start = 0, .end = 1 },
+        .timestamp_value_tokens = .{ .start = 1, .end = 2 },
+    };
+    const strict_timestamp_literal_expression = db_mod.types.RelationalRowsExpression{
+        .kind = .value,
+        .value_json = "1000000000",
+    };
+    try validateGeneratedRowExpressionIdentityStrictWithContext(
+        .{ .alloc = alloc },
+        &strict_timestamp_literal_tokens,
+        0,
+        2,
+        strict_timestamp_literal_expression,
+        &strict_timestamp_literal_ast,
+    );
+    const stale_strict_timestamp_literal_expression = db_mod.types.RelationalRowsExpression{
+        .kind = .value,
+        .value_json = "0",
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedRowExpressionIdentityStrictWithContext(
+            .{ .alloc = alloc },
+            &strict_timestamp_literal_tokens,
+            0,
+            2,
+            stale_strict_timestamp_literal_expression,
+            &strict_timestamp_literal_ast,
+        ),
     );
 
     const additive_tokens = [_]Token{

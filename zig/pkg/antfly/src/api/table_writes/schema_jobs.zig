@@ -21,6 +21,7 @@ const schema_mod = @import("../../schema/mod.zig");
 const relational_rows_api = @import("../../sql/relational_rows.zig");
 const storage_schema = @import("../../storage/schema.zig");
 const table_catalog = @import("../../metadata/catalog/routing.zig");
+const metadata_catalog_jobs = @import("../../metadata/catalog/jobs.zig");
 const tables_api = @import("../../metadata/catalog/table_ddl.zig");
 const table_write_relational_mutation = @import("relational_mutation.zig");
 
@@ -2765,6 +2766,276 @@ test "table emptying and secondary index rebuild converge across chaos and reope
     try std.testing.expectEqualStrings("", final_rebuilds[0].lease_owner);
     try std.testing.expectEqual(@as(u32, 1), final_rebuilds[0].attempts);
     try std.testing.expectEqual(@as(u64, 0), final_rebuilds[0].completed_row_count);
+}
+
+test "schema rewrite and table emptying isolate generations across reopen" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/schema-rewrite-table-emptying-generation-isolation", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"numeric","x-antfly-default":{"op":"sequence_next","sequence":"orders_id_seq"}},"status":{"type":"keyword"}},"required":["id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"numeric","x-antfly-default":{"op":"sequence_next","sequence":"orders_id_seq"}},"status":{"type":"keyword"},"status_key":{"type":"keyword"}},"required":["id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const sequence_id = metadata_table_manager.deriveSequenceId(
+        metadata_table_manager.default_database_name,
+        metadata_table_manager.default_namespace_name,
+        "orders_id_seq",
+    );
+    const table = metadata_table_manager.TableRecord{
+        .table_id = 77,
+        .name = "orders",
+        .schema_json = schema_v2,
+        .read_schema_json = schema_v1,
+    };
+    const range = metadata_table_manager.RangeRecord{
+        .group_id = 9001,
+        .range_id = 9101,
+        .table_id = table.table_id,
+        .start_key = "",
+        .end_key = null,
+    };
+    const rewrite_job = metadata_table_manager.SchemaRewriteJobRecord{
+        .job_id = 8101,
+        .table_id = table.table_id,
+        .group_id = range.group_id,
+        .range_id = range.range_id,
+        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_v2),
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = range.start_key,
+        .end_row_key = range.end_key,
+        .target_column = "status_key",
+        .expression = .{
+            .kind = .lower,
+            .operands = &.{.{ .kind = .field, .field = "status" }},
+        },
+    };
+    var stale_emptying_job = metadata_table_manager.TableEmptyingJobRecord{
+        .job_id = 0,
+        .table_id = table.table_id,
+        .group_id = range.group_id,
+        .range_id = range.range_id,
+        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_v1),
+        .data_generation = 0,
+        .start_row_key = range.start_key,
+        .end_row_key = range.end_key,
+        .affected_table_ids = &.{table.table_id},
+    };
+    stale_emptying_job.job_id = metadata_table_manager.stableTableEmptyingJobId(stale_emptying_job);
+    var current_emptying_job = metadata_table_manager.TableEmptyingJobRecord{
+        .job_id = 0,
+        .table_id = table.table_id,
+        .group_id = range.group_id,
+        .range_id = range.range_id,
+        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_v2),
+        .data_generation = 0,
+        .barrier_id = 8808,
+        .start_row_key = range.start_key,
+        .end_row_key = range.end_key,
+        .affected_table_ids = &.{table.table_id},
+        .restart_identity = true,
+    };
+    current_emptying_job.job_id = metadata_table_manager.stableTableEmptyingJobId(current_emptying_job);
+
+    var manager = metadata_table_manager.TableManager.init(alloc);
+    defer manager.deinit();
+    try manager.upsertTable(table);
+    try manager.upsertRange(range);
+    try manager.upsertSequence(.{
+        .sequence_id = sequence_id,
+        .name = "orders_id_seq",
+        .options_json = "{\"start_with\":10,\"increment_by\":5}",
+        .last_value = 105,
+        .last_allocation_id = 7001,
+    });
+    try manager.upsertSchemaRewriteJob(rewrite_job);
+    try manager.upsertTableEmptyingJob(stale_emptying_job);
+
+    const Catalog = struct {
+        manager: *metadata_table_manager.TableManager,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .begin_schema_rewrite_job = beginSchemaRewriteJob,
+                    .finish_schema_rewrite_job = finishSchemaRewriteJob,
+                    .invalidate_schema_rewrite_job = invalidateSchemaRewriteJob,
+                    .compare_and_swap_table_schema = compareAndSwapTableSchema,
+                    .begin_table_emptying_job = beginTableEmptyingJob,
+                    .finish_table_emptying_job = finishTableEmptyingJob,
+                    .invalidate_table_emptying_job = invalidateTableEmptyingJob,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const alloc_inner = std.testing.allocator;
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .sequences = try self.manager.listSequences(alloc_inner),
+                .tables = try self.manager.listTables(alloc_inner),
+                .ranges = try self.manager.listRanges(alloc_inner),
+                .schema_rewrite_jobs = try self.manager.listSchemaRewriteJobs(alloc_inner),
+                .table_emptying_jobs = try self.manager.listTableEmptyingJobs(alloc_inner),
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const alloc_inner = std.testing.allocator;
+            self.manager.freeSequences(alloc_inner, snapshot.sequences);
+            self.manager.freeTables(alloc_inner, snapshot.tables);
+            self.manager.freeRanges(alloc_inner, snapshot.ranges);
+            self.manager.freeSchemaRewriteJobs(alloc_inner, snapshot.schema_rewrite_jobs);
+            self.manager.freeTableEmptyingJobs(alloc_inner, snapshot.table_emptying_jobs);
+        }
+
+        fn beginSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobBeginRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.beginSchemaRewriteJob(request);
+        }
+
+        fn finishSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobFinishRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.finishSchemaRewriteJob(request);
+        }
+
+        fn invalidateSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobInvalidateRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.invalidateSchemaRewriteJob(request);
+        }
+
+        fn compareAndSwapTableSchema(ptr: *anyopaque, request: metadata_table_manager.TableSchemaCompareAndSwapRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const tables = try self.manager.listTables(std.testing.allocator);
+            defer self.manager.freeTables(std.testing.allocator, tables);
+            for (tables) |existing| {
+                if (existing.table_id != request.table_id) continue;
+                if (!std.mem.eql(u8, existing.schema_json, request.expected_schema_json)) return;
+                try self.manager.upsertTable(request.promoted_table);
+                _ = self.manager.removeSchemaRewriteJobsForTable(request.table_id);
+                return;
+            }
+            return error.TableNotFound;
+        }
+
+        fn beginTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobBeginRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.beginTableEmptyingJob(request);
+        }
+
+        fn finishTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobFinishRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.finishTableEmptyingJob(request);
+        }
+
+        fn invalidateTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobInvalidateRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.invalidateTableEmptyingJob(request);
+        }
+    };
+    var catalog = Catalog{ .manager = &manager };
+
+    {
+        var db = try db_mod.DB.open(alloc, path, .{});
+        defer db.close();
+
+        try db.applyTableSchemaJson(alloc, schema_v1, .{});
+        try db.batch(.{ .writes = &.{
+            .{ .key = "row:1", .value = "{\"id\":1,\"status\":\"ACTIVE\"}" },
+        } });
+        try db.applyTableSchemaJson(alloc, schema_v2, .{});
+
+        const rewrite = try runSchemaRewriteJobGroupLocal(alloc, &db, catalog.iface(), rewrite_job, "rewrite-a", 1_000, 500);
+        try std.testing.expect(rewrite.claimed);
+        try std.testing.expect(rewrite.completed);
+        try std.testing.expect(!rewrite.invalidated);
+
+        const rewritten = (try db.get(alloc, "row:1")) orelse return error.TestUnexpectedResult;
+        defer alloc.free(rewritten);
+        try std.testing.expect(std.mem.indexOf(u8, rewritten, "\"status_key\":\"active\"") != null);
+    }
+
+    {
+        var db = try db_mod.DB.open(alloc, path, .{});
+        defer db.close();
+
+        try std.testing.expect(try metadata_catalog_jobs.promoteCompletedSchemaRewriteForTableIdAlloc(alloc, catalog.iface(), table.table_id));
+        const promoted_tables = try manager.listTables(alloc);
+        defer manager.freeTables(alloc, promoted_tables);
+        try std.testing.expectEqualStrings("", promoted_tables[0].read_schema_json);
+
+        try std.testing.expectError(
+            error.InvalidTableEmptyingJob,
+            runTableEmptyingJobGroupLocal(alloc, &db, catalog.iface(), promoted_tables[0], stale_emptying_job, "empty-stale", 1_100, 500),
+        );
+        const after_stale_emptying = (try db.get(alloc, "row:1")) orelse return error.TestUnexpectedResult;
+        defer alloc.free(after_stale_emptying);
+        try std.testing.expect(std.mem.indexOf(u8, after_stale_emptying, "\"status_key\":\"active\"") != null);
+
+        try db.batch(.{ .writes = &.{
+            .{ .key = "row:2", .value = "{\"id\":2,\"status\":\"OPEN\",\"status_key\":\"open\"}" },
+        } });
+        try manager.upsertTableEmptyingJob(current_emptying_job);
+
+        var emptied = try runTableEmptyingJobGroupLocal(alloc, &db, catalog.iface(), promoted_tables[0], current_emptying_job, "empty-current", 1_200, 500);
+        defer emptied.deinit(alloc);
+        try std.testing.expect(emptied.claimed);
+        try std.testing.expect(emptied.completed);
+        try std.testing.expect(!emptied.invalidated);
+        try std.testing.expectEqual(@as(u32, 2), emptied.result.matched);
+        try std.testing.expectEqual(@as(u32, 2), emptied.result.staged);
+
+        try manager.promoteTableEmptyingBarrier(.{
+            .job_ids = &.{current_emptying_job.job_id},
+            .promotions = &.{.{ .table_id = table.table_id, .target_generation = 1 }},
+        });
+    }
+
+    {
+        var db = try db_mod.DB.open(alloc, path, .{});
+        defer db.close();
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, "row:1"));
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, "row:2"));
+    }
+
+    const final_tables = try manager.listTables(alloc);
+    defer manager.freeTables(alloc, final_tables);
+    try std.testing.expectEqual(@as(usize, 1), final_tables.len);
+    try std.testing.expectEqual(@as(u64, 1), final_tables[0].data_generation);
+    try std.testing.expectEqualStrings("", final_tables[0].read_schema_json);
+
+    const final_sequences = try manager.listSequences(alloc);
+    defer manager.freeSequences(alloc, final_sequences);
+    try std.testing.expectEqual(@as(usize, 1), final_sequences.len);
+    try std.testing.expectEqual(@as(i64, 5), final_sequences[0].last_value);
+    try std.testing.expectEqual(@as(u128, 0), final_sequences[0].last_allocation_id);
+
+    const final_rewrites = try manager.listSchemaRewriteJobs(alloc);
+    defer manager.freeSchemaRewriteJobs(alloc, final_rewrites);
+    try std.testing.expectEqual(@as(usize, 0), final_rewrites.len);
+
+    const final_emptying = try manager.listTableEmptyingJobs(alloc);
+    defer manager.freeTableEmptyingJobs(alloc, final_emptying);
+    try std.testing.expectEqual(@as(usize, 1), final_emptying.len);
+    try std.testing.expectEqual(stale_emptying_job.job_id, final_emptying[0].job_id);
+    try std.testing.expectEqualStrings(metadata_table_manager.table_emptying_invalid, final_emptying[0].state);
+    try std.testing.expectEqualStrings(@errorName(error.InvalidTableEmptyingJob), final_emptying[0].last_error);
 }
 
 test "schema rewrite worker invalidates stale range job before rewriting rows" {

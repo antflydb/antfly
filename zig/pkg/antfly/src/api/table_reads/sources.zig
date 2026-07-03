@@ -9253,6 +9253,57 @@ test "api.table_reads.docid document sql view mapping runtime results match nati
     defer unnest.deinit(alloc);
     try std.testing.expect(unnest.unnest != null);
     try Harness.expectIndexedFilter(unnest);
+
+    var lateral_unnest = try Harness.expectRows(
+        alloc,
+        adapter.runtimeSource(),
+        schema,
+        virtual_schema,
+        capabilities,
+        "SELECT d._id, tag FROM support_view AS d JOIN LATERAL UNNEST(d.tag_list) AS tag ON true WHERE tag = 'urgent' LIMIT 10",
+        2,
+        &.{
+            "{\"_id\":\"doc:a\",\"tag\":\"urgent\"}",
+            "{\"_id\":\"doc:c\",\"tag\":\"urgent\"}",
+        },
+    );
+    defer lateral_unnest.deinit(alloc);
+    try std.testing.expect(lateral_unnest.unnest != null);
+    try Harness.expectIndexedFilter(lateral_unnest);
+
+    var cross_lateral_unnest = try Harness.expectRows(
+        alloc,
+        adapter.runtimeSource(),
+        schema,
+        virtual_schema,
+        capabilities,
+        "SELECT d._id, tag FROM support_view AS d CROSS JOIN LATERAL UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' LIMIT 10",
+        2,
+        &.{
+            "{\"_id\":\"doc:a\",\"tag\":\"urgent\"}",
+            "{\"_id\":\"doc:c\",\"tag\":\"urgent\"}",
+        },
+    );
+    defer cross_lateral_unnest.deinit(alloc);
+    try std.testing.expect(cross_lateral_unnest.unnest != null);
+    try Harness.expectIndexedFilter(cross_lateral_unnest);
+
+    var lateral_unnest_residual = try Harness.expectRows(
+        alloc,
+        adapter.runtimeSource(),
+        schema,
+        virtual_schema,
+        capabilities,
+        "SELECT d._id, tag FROM support_view AS d JOIN LATERAL UNNEST(d.tag_list) AS tag ON true WHERE full_text_search('title:alpha') AND tag = 'urgent' AND status = 'active' LIMIT 10",
+        1,
+        &.{
+            "{\"_id\":\"doc:a\",\"tag\":\"urgent\"}",
+        },
+    );
+    defer lateral_unnest_residual.deinit(alloc);
+    try std.testing.expect(lateral_unnest_residual.unnest != null);
+    try std.testing.expect(lateral_unnest_residual.producer.indexed_query.residual_filter_json != null);
+
     var native_scan = (try source.source().scan(alloc, "docs", "", "", .{
         .include_documents = true,
         .fields = &.{"tags"},

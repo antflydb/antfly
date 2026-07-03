@@ -8,6 +8,7 @@
     "document_sql_bounded_scan_unbounded_source",
     "document_sql_bounded_scan_unsupported_residual",
     "document_sql_unnest_unsupported",
+    "document_sql_unsupported_join",
     "document_sql_view_mapping_catalog",
     "document_sql_view_mapping_unsupported",
     "document_sql_write_join_missing_cardinality_proof",

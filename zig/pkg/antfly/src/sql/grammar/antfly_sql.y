@@ -24,7 +24,7 @@
 %reference postgres_scan_l https://github.com/postgres/postgres/blob/4cc02b80774ecdc4cf2a2d5df09c07df36d68ca5/src/backend/parser/scan.l
 %reference cockroach_sql_y https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/parser/sql.y
 
-%expect 10435
+%expect 10436
 
 %start statement
 
@@ -1414,6 +1414,7 @@ table_reference_list:
 table_reference:
     table_relation_source system_time_as_of_opt
   | qualified_name LPAREN function_argument_list_opt RPAREN table_function_alias_opt
+  | LATERAL qualified_name LPAREN function_argument_list_opt RPAREN table_function_alias_opt
   | table_reference qualified_join_operator table_reference join_condition
   | table_reference conditionless_join_operator table_reference
   | LATERAL LPAREN read_statement RPAREN AS identifier_name

@@ -59,6 +59,7 @@ pub fn expectFailClosedUnsupported(result: anytype) !void {
         error.InvalidSqlCatalog,
         error.DocumentSqlMergeRequiresNativeProducer,
         error.DocumentSqlWriteUnsupported,
+        error.DocumentSqlUnsupportedJoin,
         error.DocumentSqlBoundedScanIncompleteTopK,
         error.DocumentSqlBoundedScanMissingExactProducer,
         error.DocumentSqlBoundedScanUnboundedSource,
@@ -218,7 +219,10 @@ pub fn expectAppParityReadSummary(summary: corpus.AppParityPlanSummary, lowered:
             try expectQuerySummary(summary, query.plan.query);
         },
         .document_query => |document| try expectDocumentReadSummary(summary, document),
-        .document_aggregate => if (summary.table_name != null or corpus.corpusFixtureHasDocumentReadSummary(summary)) return error.TestUnexpectedResult,
+        .document_aggregate => |aggregate| {
+            try expectOptionalTableName(summary.table_name, aggregate.table_name);
+            if (corpus.corpusFixtureHasDocumentReadSummary(summary)) return error.TestUnexpectedResult;
+        },
         .set_operation => |set_operation| {
             try expectOptionalTableName(summary.table_name, set_operation.left.table_name);
             try expectOptionalUsize(summary.ctes, set_operation.ctes.len + set_operation.left.plan.ctes.len + set_operation.right.plan.ctes.len);

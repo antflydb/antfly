@@ -353,6 +353,7 @@ pub const SqlAdapterClassificationReason = enum {
     document_sql_bounded_scan_unbounded_source,
     document_sql_bounded_scan_unsupported_residual,
     document_sql_unnest_unsupported,
+    document_sql_unsupported_join,
     document_sql_view_mapping_catalog,
     document_sql_view_mapping_unsupported,
     document_sql_write_join_missing_cardinality_proof,
@@ -519,6 +520,7 @@ pub fn nativeExecutionRequirement(reason: SqlAdapterClassificationReason) Native
         .document_sql_bounded_scan_unbounded_source => .{ .category = .stream_materialization },
         .document_sql_bounded_scan_unsupported_residual => .{ .category = .stream_materialization },
         .document_sql_unnest_unsupported => .{ .category = .stream_materialization },
+        .document_sql_unsupported_join => .{ .category = .stream_materialization },
         .document_sql_view_mapping_catalog => .{ .category = .catalog_lifecycle, .durable_metadata = true },
         .document_sql_view_mapping_unsupported => .{ .category = .stream_materialization },
         .document_sql_write_join_missing_cardinality_proof, .document_sql_write_join_missing_exact_producer => .{ .category = .stream_materialization },
@@ -633,6 +635,7 @@ test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_bounded_scan_missing_exact_producer, classificationReasonFromToken("document_sql_bounded_scan_missing_exact_producer").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_bounded_scan_unbounded_source, classificationReasonFromToken("document_sql_bounded_scan_unbounded_source").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_bounded_scan_unsupported_residual, classificationReasonFromToken("document_sql_bounded_scan_unsupported_residual").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_unsupported_join, classificationReasonFromToken("document_sql_unsupported_join").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_view_mapping_catalog, classificationReasonFromToken("document_sql_view_mapping_catalog").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_view_mapping_unsupported, classificationReasonFromToken("document_sql_view_mapping_unsupported").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_join_missing_cardinality_proof, classificationReasonFromToken("document_sql_write_join_missing_cardinality_proof").?);

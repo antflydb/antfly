@@ -1612,7 +1612,10 @@ pub fn selectOutputOrderByRefAlloc(
             if (expression.kind == .field) break :blk try orderForOwnedOutputFieldAlloc(alloc, schema, try alloc.dupe(u8, expression.field));
             break :blk .{ .expression = try cloneExpressionAlloc(alloc, expression) };
         },
-        .scalar_subquery => return error.UnsupportedSqlShape,
+        .scalar_subquery => blk: {
+            const projection = select.scalar_subqueries[output.index];
+            break :blk try orderForOwnedOutputFieldAlloc(alloc, schema, try alloc.dupe(u8, projection.output));
+        },
     };
 }
 

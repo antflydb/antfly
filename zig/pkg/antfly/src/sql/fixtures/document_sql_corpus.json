@@ -2835,6 +2835,52 @@
       }
     },
     {
+      "name": "view-mapped inner lateral unnest predicate over indexed array lowers to indexed array element producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"tags_array\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"tags_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, tag FROM support_view AS d JOIN LATERAL UNNEST(d.tag_list) AS tag ON true WHERE tag = 'urgent' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"array_any\"",
+          "\"/tags\"",
+          "\"urgent\""
+        ]
+      }
+    },
+    {
+      "name": "view-mapped cross lateral unnest predicate over indexed array lowers to indexed array element producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"tags_array\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"tags_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, tag FROM support_view AS d CROSS JOIN LATERAL UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"array_any\"",
+          "\"/tags\"",
+          "\"urgent\""
+        ]
+      }
+    },
+    {
+      "name": "view-mapped outer lateral unnest remains unsupported to avoid null-extended rows",
+      "schema": "array_ready",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"tags_array\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"tags_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, tag FROM support_view AS d LEFT JOIN LATERAL UNNEST(d.tag_list) AS tag ON true WHERE tag = 'urgent' LIMIT 10",
+      "expected": {
+        "expected_error": "DocumentSqlUnsupportedJoin"
+      }
+    },
+    {
+      "name": "view-mapped predicated lateral unnest join remains unsupported until join predicates have native residual proof",
+      "schema": "array_ready",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"tags_array\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"tags_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, tag FROM support_view AS d JOIN LATERAL UNNEST(d.tag_list) AS tag ON tag = 'urgent' LIMIT 10",
+      "expected": {
+        "expected_error": "DocumentSqlUnsupportedJoin"
+      }
+    },
+    {
       "name": "view-mapped scalar predicate without indexed path requires exact producer",
       "schema": "text_only",
       "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}",

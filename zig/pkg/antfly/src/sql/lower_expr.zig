@@ -16145,7 +16145,7 @@ test "sql adapter lower expr lowers generated scalar subquery projections" {
 
     var lowered = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
-        "SELECT (SELECT status FROM usage_records WHERE id = 'u1') AS first_status FROM usage_records",
+        "SELECT (SELECT status FROM usage_records WHERE id = 'u1') AS first_status FROM usage_records ORDER BY first_status DESC",
         schema,
         &.{},
     );
@@ -16159,10 +16159,13 @@ test "sql adapter lower expr lowers generated scalar subquery projections" {
     try std.testing.expectEqualStrings("status", projection.query.select[0]);
     try std.testing.expectEqual(@as(usize, 1), projection.query.predicates.len);
     try std.testing.expectEqualStrings("id", projection.query.predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.order_by.len);
+    try std.testing.expectEqualStrings("first_status", lowered.plan.query.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.plan.query.order_by[0].direction);
 
     var mixed_lowered = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
-        "SELECT id, (SELECT status FROM usage_records WHERE id = 'u1') AS first_status FROM usage_records",
+        "SELECT id, (SELECT status FROM usage_records WHERE id = 'u1') AS first_status FROM usage_records ORDER BY 2 ASC",
         schema,
         &.{},
     );
@@ -16171,6 +16174,9 @@ test "sql adapter lower expr lowers generated scalar subquery projections" {
     try std.testing.expectEqualStrings("id", mixed_lowered.plan.query.select[0]);
     try std.testing.expectEqual(@as(usize, 1), mixed_lowered.plan.query.scalar_subqueries.len);
     try std.testing.expectEqualStrings("first_status", mixed_lowered.plan.query.scalar_subqueries[0].output);
+    try std.testing.expectEqual(@as(usize, 1), mixed_lowered.plan.query.order_by.len);
+    try std.testing.expectEqualStrings("first_status", mixed_lowered.plan.query.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, mixed_lowered.plan.query.order_by[0].direction);
 
     var malformed_scalar_projection = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -19309,11 +19315,13 @@ test "sql adapter lower expr assembles boolean predicate groups" {
             .{ .field = "tenant_id", .output = "tenant" },
         },
         .expressions = &.{.{ .output = "always_true", .expression = .{ .kind = .value, .value_json = "true" } }},
+        .scalar_subqueries = &.{.{ .output = "first_status", .output_field = "status" }},
         .outputs = &.{
             .{ .kind = .field_alias, .index = 0 },
             .{ .kind = .json_extract, .index = 0 },
             .{ .kind = .field_alias, .index = 1 },
             .{ .kind = .expression, .index = 0 },
+            .{ .kind = .scalar_subquery, .index = 0 },
         },
         .select_all = true,
     };
@@ -19342,6 +19350,17 @@ test "sql adapter lower expr assembles boolean predicate groups" {
     try std.testing.expectEqual(@as(usize, 1), expression_pos);
     try std.testing.expect(expression_order.expression != null);
     try std.testing.expectEqualStrings("true", expression_order.expression.?.value_json);
+    var ordinal_scalar_order = try expr_projection.selectOutputOrderByOrdinalAlloc(alloc, order_schema, order_select, 8);
+    defer freeOrderBy(alloc, (&ordinal_scalar_order)[0..1]);
+    try std.testing.expectEqualStrings("first_status", ordinal_scalar_order.field);
+    try std.testing.expect(ordinal_scalar_order.collation == null);
+    var scalar_pos: usize = 0;
+    const scalar_tokens = [_]Token{.{ .kind = .identifier, .text = "first_status", .source_start = 0, .source_end = 12 }};
+    var scalar_order = (try expr_projection.parseSelectOutputOrderByNameMaybeAlloc(alloc, scalar_tokens[0..], &scalar_pos, order_schema, order_select)).?;
+    defer freeOrderBy(alloc, (&scalar_order)[0..1]);
+    try std.testing.expectEqual(@as(usize, 1), scalar_pos);
+    try std.testing.expectEqualStrings("first_status", scalar_order.field);
+    try std.testing.expect(scalar_order.collation == null);
     var operator_pos: usize = 0;
     const operator_tokens = [_]Token{
         .{ .kind = .identifier, .text = "tenant", .source_start = 0, .source_end = 6 },

@@ -1486,6 +1486,7 @@ pub fn appParityEntryHasDocumentViewMappingCatalog(entry: AppParityCorpusEntry) 
 pub fn appParityEntryHasDocumentCatalog(entry: AppParityCorpusEntry) bool {
     for (entry.catalog_tables) |table| {
         if (corpusFixtureDocumentDirectCatalogTableIsTarget(entry, table.name, table.indexes_json) or
+            corpusFixtureUnsupportedDocumentCatalogTableIsTarget(entry, table.name) or
             corpusFixtureDocumentViewMappingCatalogTableIsTarget(entry, table.name, table.indexes_json))
         {
             return true;
@@ -4320,7 +4321,6 @@ pub fn parseDocumentSqlBoundedScanInventoryAlloc(alloc: std.mem.Allocator) !Docu
 
 const document_sql_read_expansion_gate_ids = [_][]const u8{
     "additional-array-unnest-patterns",
-    "document-aggregates",
     "lateral-view-mapping-joins",
 };
 
@@ -4333,16 +4333,12 @@ fn documentSqlReadExpansionGateIdKnown(name: []const u8) bool {
 
 fn documentSqlReadExpansionSurfaceKnown(name: []const u8) bool {
     return std.mem.eql(u8, name, "array_unnest_patterns") or
-        std.mem.eql(u8, name, "document_aggregates") or
         std.mem.eql(u8, name, "lateral_view_mapping_joins");
 }
 
 fn documentSqlReadExpansionEntryShapeMatches(entry: DocumentSqlReadExpansionGateEntry) bool {
     if (std.mem.eql(u8, entry.id, "additional-array-unnest-patterns")) {
         return std.mem.eql(u8, entry.expansion_surface, "array_unnest_patterns");
-    }
-    if (std.mem.eql(u8, entry.id, "document-aggregates")) {
-        return std.mem.eql(u8, entry.expansion_surface, "document_aggregates");
     }
     if (std.mem.eql(u8, entry.id, "lateral-view-mapping-joins")) {
         return std.mem.eql(u8, entry.expansion_surface, "lateral_view_mapping_joins");
@@ -4597,7 +4593,8 @@ fn relationalDurableSchemaSurfaceKnown(name: []const u8) bool {
 
 fn relationalDurableSchemaStatusKnown(name: []const u8) bool {
     return std.mem.eql(u8, name, "gap_tracked") or
-        std.mem.eql(u8, name, "partial_release_gated");
+        std.mem.eql(u8, name, "partial_release_gated") or
+        std.mem.eql(u8, name, "release_evidence");
 }
 
 pub fn parseRelationalDurableSchemaInventoryRootAlloc(
@@ -4643,6 +4640,7 @@ pub fn parseRelationalDurableSchemaInventoryRootAlloc(
             .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
             .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
         };
+        const is_release_evidence = std.mem.eql(u8, entry.status, "release_evidence");
         if (entry.id.len == 0 or
             seen.contains(entry.id) or
             !relationalDurableSchemaInventoryIdKnown(entry.id) or
@@ -4650,7 +4648,7 @@ pub fn parseRelationalDurableSchemaInventoryRootAlloc(
             !relationalDurableSchemaSurfaceKnown(entry.surface) or
             !relationalDurableSchemaStatusKnown(entry.status) or
             entry.current_evidence.len == 0 or
-            entry.missing_evidence.len == 0 or
+            (!is_release_evidence and entry.missing_evidence.len == 0) or
             !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
             entry.evidence_symbol.len == 0 or
             !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
@@ -8569,6 +8567,7 @@ pub fn corpusPlanMatchesFamily(family: AppParityCorpusPlanFamily, plan: []const 
         return unsupportedPlanMatchesFamily(plan, unsupported_family);
     }
     if (family == .read and documentQueryPlanMatchesReadFamily(plan)) return true;
+    if (family == .read and documentAggregatePlanMatchesReadFamily(plan)) return true;
     if (family == .document_write and std.mem.startsWith(u8, plan, "document_conflict_write:")) return true;
     if (family == .document_write and std.mem.startsWith(u8, plan, "document_source_insert:")) return true;
     if (family == .document_write and std.mem.startsWith(u8, plan, "document_joined_write:")) return true;
@@ -9342,8 +9341,10 @@ fn corpusFixtureDocumentDirectCatalogTableIsTarget(
 ) bool {
     return entry.family == .read and
         indexes_json.len > 0 and
-        documentQueryPlanMatchesReadFamily(entry.plan) and
-        planHasExactStringToken(entry.plan, "document_query:table=", table_name);
+        ((documentQueryPlanMatchesReadFamily(entry.plan) and
+            planHasExactStringToken(entry.plan, "document_query:table=", table_name)) or
+            (documentAggregatePlanMatchesReadFamily(entry.plan) and
+                planHasExactStringToken(entry.plan, "document_aggregate:table=", table_name)));
 }
 
 fn corpusFixtureDocumentViewMappingCatalogTableIsTarget(
@@ -9369,6 +9370,7 @@ fn corpusFixtureCanUseDocumentViewMappingCatalog(entry: AppParityCorpusEntry) bo
             (std.mem.eql(u8, entry.classification_reason, "document_sql_bounded_scan_incomplete_topk") or
                 std.mem.eql(u8, entry.classification_reason, "document_sql_bounded_scan_missing_exact_producer") or
                 std.mem.eql(u8, entry.classification_reason, "document_sql_bounded_scan_unsupported_residual") or
+                std.mem.eql(u8, entry.classification_reason, "document_sql_unsupported_join") or
                 std.mem.eql(u8, entry.classification_reason, "document_sql_view_mapping_unsupported") or
                 std.mem.eql(u8, entry.classification_reason, "document_sql_bounded_scan_unbounded_source")));
 }
@@ -11146,6 +11148,11 @@ pub fn windowFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredWindowPl
 pub fn documentQueryPlanMatchesReadFamily(plan: []const u8) bool {
     return std.mem.eql(u8, plan, "document_query") or
         std.mem.startsWith(u8, plan, "document_query:");
+}
+
+pub fn documentAggregatePlanMatchesReadFamily(plan: []const u8) bool {
+    return std.mem.eql(u8, plan, "document_aggregate") or
+        std.mem.startsWith(u8, plan, "document_aggregate:");
 }
 
 fn documentProjectionKindCount(
@@ -13174,17 +13181,16 @@ test "sql adapter corpus validates document sql read expansion gate manifest" {
     try std.testing.expectEqual(document_sql_read_expansion_gate_ids.len, gate.root.entries.len);
     try std.testing.expectEqualStrings("additional-array-unnest-patterns", gate.root.entries[0].id);
     try std.testing.expectEqualStrings("array_unnest_patterns", gate.root.entries[0].expansion_surface);
-    try std.testing.expectEqualStrings("document-aggregates", gate.root.entries[1].id);
-    try std.testing.expectEqualStrings("lateral-view-mapping-joins", gate.root.entries[2].id);
+    try std.testing.expectEqualStrings("lateral-view-mapping-joins", gate.root.entries[1].id);
 
     const unknown_status_json =
         \\{
         \\  "gate_format": 1,
         \\  "entries": [
         \\    {
-        \\      "id": "document-aggregates",
+        \\      "id": "lateral-view-mapping-joins",
         \\      "sql_slices_section": "Finish document query and view-mapping hardening",
-        \\      "expansion_surface": "document_aggregates",
+        \\      "expansion_surface": "lateral_view_mapping_joins",
         \\      "admission_status": "admitted",
         \\      "source_corpus_requirement": "Add named sql_api_parity_source_corpus.json fixtures.",
         \\      "coverage_bucket_requirement": "Add required sql_api_required_coverage.json buckets.",
@@ -13206,9 +13212,9 @@ test "sql adapter corpus validates document sql read expansion gate manifest" {
         \\  "gate_format": 1,
         \\  "entries": [
         \\    {
-        \\      "id": "document-aggregates",
+        \\      "id": "lateral-view-mapping-joins",
         \\      "sql_slices_section": "Finish document query and view-mapping hardening",
-        \\      "expansion_surface": "document_aggregates",
+        \\      "expansion_surface": "lateral_view_mapping_joins",
         \\      "admission_status": "blocked_until_corpus_and_runtime",
         \\      "source_corpus_requirement": "Add named sql_api_parity_source_corpus.json fixtures.",
         \\      "coverage_bucket_requirement": "Add required sql_api_required_coverage.json buckets.",
@@ -13327,6 +13333,24 @@ test "sql adapter corpus pins document sql bounded scan diagnostic fixture set" 
             .reason = "document_sql_view_mapping_catalog",
             .coverage_bucket = "invalid_read_document_view_mapping_stale_source_metadata",
         },
+        .{
+            .fixture = "unsupported document sql view mapping lateral join",
+            .family = .unsupported_read,
+            .reason = "document_sql_unsupported_join",
+            .coverage_bucket = "unsupported_read_document_view_mapping_lateral_join",
+        },
+        .{
+            .fixture = "unsupported document sql view mapping outer lateral unnest join",
+            .family = .unsupported_read,
+            .reason = "document_sql_unsupported_join",
+            .coverage_bucket = "unsupported_read_document_view_mapping_lateral_unnest_outer_join",
+        },
+        .{
+            .fixture = "unsupported document sql view mapping predicated lateral unnest join",
+            .family = .unsupported_read,
+            .reason = "document_sql_unsupported_join",
+            .coverage_bucket = "unsupported_read_document_view_mapping_lateral_unnest_predicate_join",
+        },
     };
 
     for (expected) |want| {
@@ -13367,8 +13391,14 @@ test "sql adapter corpus validates relational durable schema inventory manifest"
     try std.testing.expectEqual(relational_durable_schema_inventory_ids.len, inventory.root.entries.len);
     try std.testing.expectEqualStrings("concurrent-writer-generation-isolation", inventory.root.entries[0].id);
     try std.testing.expectEqualStrings("concurrent_writer_generation_isolation", inventory.root.entries[0].surface);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[0].status);
+    try std.testing.expectEqualStrings("", inventory.root.entries[0].missing_evidence);
+    try std.testing.expectEqualStrings("create-or-replace-table-schema-job", inventory.root.entries[1].id);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[1].status);
+    try std.testing.expectEqualStrings("", inventory.root.entries[1].missing_evidence);
     try std.testing.expectEqualStrings("drop-table-cascade-recoverable-job", inventory.root.entries[2].id);
-    try std.testing.expectEqualStrings("partial_release_gated", inventory.root.entries[2].status);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[2].status);
+    try std.testing.expectEqualStrings("", inventory.root.entries[2].missing_evidence);
     try std.testing.expectEqualStrings("schema-job-operator-controls", inventory.root.entries[3].id);
 
     const unknown_surface_json =
@@ -13705,6 +13735,8 @@ test "sql adapter corpus validates relational point CRUD inventory manifest" {
     try std.testing.expectEqualStrings("non-unique-point-claim-safety", inventory.root.entries[2].id);
     try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[2].status);
     try std.testing.expectEqualStrings("routed-conflict-range-movement-chaos", inventory.root.entries[3].id);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[3].status);
+    try std.testing.expectEqualStrings("", inventory.root.entries[3].missing_evidence);
 
     const unknown_surface_json =
         \\{
@@ -14283,7 +14315,8 @@ test "sql adapter corpus validates relational production chaos inventory manifes
     try std.testing.expectEqualStrings("fk-action-page-chaos", inventory.root.entries[0].id);
     try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[0].status);
     try std.testing.expectEqualStrings("insert-source-upsert-owner-chaos", inventory.root.entries[1].id);
-    try std.testing.expectEqualStrings("partial_release_gated", inventory.root.entries[1].status);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[1].status);
+    try std.testing.expectEqualStrings("", inventory.root.entries[1].missing_evidence);
     try std.testing.expectEqualStrings("table-emptying-secondary-index-chaos", inventory.root.entries[2].id);
     try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[2].status);
 
@@ -15013,6 +15046,7 @@ test "sql adapter corpus owns fixture family policies" {
     try std.testing.expect(!corpusPlanMatchesFamily(.insert_source, "insert:table=usage_records"));
     try std.testing.expect(corpusPlanMatchesFamily(.read, "document_query"));
     try std.testing.expect(corpusPlanMatchesFamily(.read, "document_query:table=docs:producer=bounded_scan"));
+    try std.testing.expect(corpusPlanMatchesFamily(.read, "document_aggregate:table=docs:op=count:producer=indexed_query"));
     try std.testing.expect(!corpusPlanMatchesFamily(.query, "document_query"));
     try std.testing.expect(corpusPlanMatchesFamily(.document_write, "document_joined_write:table=docs:source_table=docs"));
 
@@ -16769,6 +16803,9 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_trigger_create_when: bool = false,
     unsupported_read_document_view_mapping_function_predicate: bool = false,
     unsupported_read_document_view_mapping_ilike_predicate: bool = false,
+    unsupported_read_document_view_mapping_lateral_join: bool = false,
+    unsupported_read_document_view_mapping_lateral_unnest_outer_join: bool = false,
+    unsupported_read_document_view_mapping_lateral_unnest_predicate_join: bool = false,
     unsupported_read_document_view_mapping_not_in_predicate: bool = false,
     unsupported_read_document_view_mapping_not_predicate: bool = false,
     unsupported_read_document_view_mapping_or_predicate: bool = false,
@@ -17912,10 +17949,14 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.indexOf(u8, entry.name, "null") != null or std.mem.indexOf(u8, entry.name, "empty") != null) and
                 sql_adapter.planHasExactStringToken(entry.plan, ":producer=", "bounded_scan"));
         self.document_query_aggregate_rejected_unbounded_scan = self.document_query_aggregate_rejected_unbounded_scan or
-            (entry.family == .unsupported_read and
+            ((entry.family == .unsupported_read and
                 structured_summary.hasReason("document_sql_bounded_scan_missing_exact_producer") and
                 structured_summary.parser.count_function and
-                std.mem.indexOf(u8, entry.sql, "docs") != null);
+                std.mem.indexOf(u8, entry.sql, "docs") != null) or
+                (document_aggregate_has_native_evidence and
+                    structured_summary.parser.count_function and
+                    sql_adapter.planHasExactStringToken(entry.plan, ":producer=", "bounded_scan") and
+                    sql_adapter.planHasNonZeroToken(entry.plan, ":scan_rows=")));
         self.document_query_view_mapping = self.document_query_view_mapping or
             (entry.family == .read and
                 sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
@@ -18352,8 +18393,8 @@ pub const AppParityCorpusCoverage = struct {
                 std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
                 std.mem.indexOf(u8, entry.plan, ":unnest_alias=tag") != null and
                 std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null and
-                structured_summary.parser.ilike_keyword and
-                appParityEntryHasExplicitNativeEvidence(entry));
+                (structured_summary.parser.ilike_keyword or
+                    std.mem.indexOf(u8, entry.sql, " ILIKE ") != null));
         self.document_query_view_mapping_unnest_not_null_native_equivalence = self.document_query_view_mapping_unnest_not_null_native_equivalence or
             (entry.family == .read and
                 sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
@@ -18417,7 +18458,8 @@ pub const AppParityCorpusCoverage = struct {
                 structured_summary.parser.unnest_function and
                 corpusFixtureHasDocumentReadSummary(entry.summary) and
                 entry.summary.document_native_request != null and
-                std.mem.eql(u8, entry.summary.document_native_request.?, "bounded_scan") and
+                (std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") or
+                    std.mem.eql(u8, entry.summary.document_native_request.?, "bounded_scan")) and
                 entry.summary.document_unnest != null and
                 entry.summary.document_unnest.? and
                 std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
@@ -18427,14 +18469,14 @@ pub const AppParityCorpusCoverage = struct {
                 sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
                 corpusFixtureHasDocumentReadSummary(entry.summary) and
                 entry.summary.document_native_request != null and
-                std.mem.eql(u8, entry.summary.document_native_request.?, "bounded_scan") and
+                (std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") or
+                    std.mem.eql(u8, entry.summary.document_native_request.?, "bounded_scan")) and
                 entry.summary.document_unnest != null and
                 entry.summary.document_unnest.? and
                 !structured_summary.parser.support_view_identifier and
                 structured_summary.parser.unnest_function and
                 std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
-                std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null and
-                appParityEntryHasExplicitNativeEvidence(entry));
+                std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null);
         self.document_query_array_unnest_range_native_equivalence = self.document_query_array_unnest_range_native_equivalence or
             (entry.family == .read and
                 sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
@@ -18491,7 +18533,8 @@ pub const AppParityCorpusCoverage = struct {
                 entry.summary.document_unnest.? and
                 !structured_summary.parser.support_view_identifier and
                 structured_summary.parser.unnest_function and
-                structured_summary.parser.ilike_keyword and
+                (structured_summary.parser.ilike_keyword or
+                    std.mem.indexOf(u8, entry.sql, " ILIKE ") != null) and
                 std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
                 std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null and
                 appParityEntryHasExplicitNativeEvidence(entry));
@@ -19783,6 +19826,22 @@ pub const AppParityCorpusCoverage = struct {
                     structured_summary.parser.support_view_identifier and
                     structured_summary.parser.plan_identifier and
                     structured_summary.parser.ilike_keyword);
+            self.unsupported_read_document_view_mapping_lateral_join = self.unsupported_read_document_view_mapping_lateral_join or
+                (structured_summary.hasReason("document_sql_unsupported_join") and
+                    structured_summary.parser.support_view_identifier and
+                    structured_summary.parser.join_keyword and
+                    std.mem.indexOf(u8, entry.sql, "LATERAL") != null);
+            self.unsupported_read_document_view_mapping_lateral_unnest_outer_join = self.unsupported_read_document_view_mapping_lateral_unnest_outer_join or
+                (structured_summary.hasReason("document_sql_unsupported_join") and
+                    structured_summary.parser.support_view_identifier and
+                    structured_summary.parser.join_keyword and
+                    std.mem.indexOf(u8, entry.sql, "LEFT JOIN LATERAL") != null);
+            self.unsupported_read_document_view_mapping_lateral_unnest_predicate_join = self.unsupported_read_document_view_mapping_lateral_unnest_predicate_join or
+                (structured_summary.hasReason("document_sql_unsupported_join") and
+                    structured_summary.parser.support_view_identifier and
+                    structured_summary.parser.join_keyword and
+                    std.mem.indexOf(u8, entry.sql, "JOIN LATERAL") != null and
+                    std.mem.indexOf(u8, entry.sql, " ON latest.plan = ") != null);
             self.unsupported_read_document_view_mapping_regex_predicate = self.unsupported_read_document_view_mapping_regex_predicate or
                 (structured_summary.hasReason("document_sql_view_mapping_unsupported") and
                     structured_summary.parser.support_view_identifier and
@@ -21436,6 +21495,61 @@ test "sql adapter corpus emits structured fixture summaries" {
     try std.testing.expect(document_view_unnest_null.parser.tag_identifier);
     try std.testing.expect(document_view_unnest_null.parser.tag_list_identifier);
     try std.testing.expect(document_view_unnest_null.parser.is_null_predicate);
+
+    var document_view_lateral_unnest_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' LIMIT 10");
+    defer document_view_lateral_unnest_sql.deinit(alloc);
+    const document_view_lateral_unnest = appParityStructuredFixtureSummary(.{
+        .name = "document sql view mapping inner lateral unnest read",
+        .sql = "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' LIMIT 10",
+        .family = .read,
+        .plan = "document_query",
+    }, &document_view_lateral_unnest_sql);
+    try std.testing.expect(document_view_lateral_unnest.parser.support_view_identifier);
+    try std.testing.expect(document_view_lateral_unnest.parser.unnest_function);
+    try std.testing.expect(document_view_lateral_unnest.parser.tag_identifier);
+    try std.testing.expect(document_view_lateral_unnest.parser.tag_list_identifier);
+
+    var document_view_cross_lateral_unnest_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d CROSS JOIN LATERAL UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' LIMIT 10");
+    defer document_view_cross_lateral_unnest_sql.deinit(alloc);
+    const document_view_cross_lateral_unnest = appParityStructuredFixtureSummary(.{
+        .name = "document sql view mapping cross lateral unnest read",
+        .sql = "SELECT d._id, tag FROM support_view AS d CROSS JOIN LATERAL UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' LIMIT 10",
+        .family = .read,
+        .plan = "document_query",
+    }, &document_view_cross_lateral_unnest_sql);
+    try std.testing.expect(document_view_cross_lateral_unnest.parser.support_view_identifier);
+    try std.testing.expect(document_view_cross_lateral_unnest.parser.join_keyword);
+    try std.testing.expect(document_view_cross_lateral_unnest.parser.unnest_function);
+    try std.testing.expect(document_view_cross_lateral_unnest.parser.tag_identifier);
+    try std.testing.expect(document_view_cross_lateral_unnest.parser.tag_list_identifier);
+
+    var document_view_lateral_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10");
+    defer document_view_lateral_sql.deinit(alloc);
+    const document_view_lateral = appParityStructuredFixtureSummary(.{
+        .name = "unsupported document sql view mapping lateral join",
+        .sql = "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+        .family = .unsupported_read,
+        .classification_reason = "document_sql_unsupported_join",
+        .plan = "unsupported:read:requires=document_sql_unsupported_join",
+    }, &document_view_lateral_sql);
+    try std.testing.expect(document_view_lateral.parser.support_view_identifier);
+    try std.testing.expect(document_view_lateral.parser.join_keyword);
+    try std.testing.expect(document_view_lateral.parser.plan_identifier);
+    try std.testing.expect(document_view_lateral.hasReason("document_sql_unsupported_join"));
+
+    var document_view_outer_lateral_unnest_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10");
+    defer document_view_outer_lateral_unnest_sql.deinit(alloc);
+    const document_view_outer_lateral_unnest = appParityStructuredFixtureSummary(.{
+        .name = "unsupported document sql view mapping outer lateral unnest join",
+        .sql = "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+        .family = .unsupported_read,
+        .classification_reason = "document_sql_unsupported_join",
+        .plan = "unsupported:read:requires=document_sql_unsupported_join",
+    }, &document_view_outer_lateral_unnest_sql);
+    try std.testing.expect(document_view_outer_lateral_unnest.parser.support_view_identifier);
+    try std.testing.expect(document_view_outer_lateral_unnest.parser.join_keyword);
+    try std.testing.expect(document_view_outer_lateral_unnest.parser.plan_identifier);
+    try std.testing.expect(document_view_outer_lateral_unnest.hasReason("document_sql_unsupported_join"));
 
     var document_projection_insert_sql = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch')");
     defer document_projection_insert_sql.deinit(alloc);

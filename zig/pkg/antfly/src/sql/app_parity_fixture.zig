@@ -183,7 +183,13 @@ pub fn validateAppParityFixtureMetadataWithBaseSchema(
             return error.TestUnexpectedResult;
         }
         if (entry.summary.table_name) |target_table_name| {
-            if (entry.family != .ddl and entry.catalog_tables.len == 1 and std.mem.eql(u8, catalog_table.name, target_table_name)) return error.TestUnexpectedResult;
+            if (entry.family != .ddl and
+                entry.catalog_tables.len == 1 and
+                std.mem.eql(u8, catalog_table.name, target_table_name) and
+                !corpus.appParityEntryHasDocumentCatalog(entry))
+            {
+                return error.TestUnexpectedResult;
+            }
         }
     }
     if (entry.source_schema_json.len > 0 and entry.family != .insert) {

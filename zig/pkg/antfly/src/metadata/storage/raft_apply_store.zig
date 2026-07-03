@@ -9881,6 +9881,262 @@ test "metadata raft apply store applies table catalog drop with child updates at
     try std.testing.expectEqual(@as(u64, 52), jobs[0].table_id);
 }
 
+test "metadata raft apply store recovers drop cascade through emptying and catalog cleanup" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-drop-cascade-recoverable-cleanup", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const parent_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"numeric","x-antfly-default":{"op":"sequence_next","sequence":"parents_id_seq"}},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const child_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"numeric","x-antfly-default":{"op":"sequence_next","sequence":"children_id_seq"}},"parent_id":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const child_schema_after_drop =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"numeric","x-antfly-default":{"op":"sequence_next","sequence":"children_id_seq"}},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const parent_schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(parent_schema_json);
+    const child_schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(child_schema_json);
+    const parent_sequence_id = metadata_table_manager.deriveSequenceId("tenant", "billing", "parents_id_seq");
+    const child_sequence_id = metadata_table_manager.deriveSequenceId("tenant", "billing", "children_id_seq");
+    const sequence_options_json = "{\"start_with\":10,\"increment_by\":5}";
+
+    const parent_table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = .{
+            .table_id = 51,
+            .name = "parents",
+            .database_name = "tenant",
+            .namespace_name = "billing",
+            .schema_json = parent_schema_json,
+            .data_generation = 3,
+        },
+    });
+    defer std.testing.allocator.free(parent_table_cmd);
+    const child_table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = .{
+            .table_id = 52,
+            .name = "children",
+            .database_name = "tenant",
+            .namespace_name = "billing",
+            .schema_json = child_schema_json,
+            .data_generation = 3,
+        },
+    });
+    defer std.testing.allocator.free(child_table_cmd);
+    const parent_sequence_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_sequence = .{
+            .sequence_id = parent_sequence_id,
+            .name = "parents_id_seq",
+            .database_name = "tenant",
+            .namespace_name = "billing",
+            .options_json = sequence_options_json,
+            .last_value = 105,
+            .last_allocation_id = 90001,
+        },
+    });
+    defer std.testing.allocator.free(parent_sequence_cmd);
+    const child_sequence_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_sequence = .{
+            .sequence_id = child_sequence_id,
+            .name = "children_id_seq",
+            .database_name = "tenant",
+            .namespace_name = "billing",
+            .options_json = sequence_options_json,
+            .last_value = 205,
+            .last_allocation_id = 90002,
+        },
+    });
+    defer std.testing.allocator.free(child_sequence_cmd);
+    const parent_range_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = .{
+            .group_id = 9001,
+            .range_id = 9101,
+            .table_id = 51,
+            .start_key = "",
+            .end_key = null,
+        },
+    });
+    defer std.testing.allocator.free(parent_range_cmd);
+    const child_range_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = .{
+            .group_id = 9002,
+            .range_id = 9102,
+            .table_id = 52,
+            .start_key = "",
+            .end_key = null,
+        },
+    });
+    defer std.testing.allocator.free(child_range_cmd);
+    const parent_empty_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table_emptying_job = .{
+            .job_id = 9301,
+            .table_id = 51,
+            .group_id = 9001,
+            .range_id = 9101,
+            .schema_generation = parent_schema_generation,
+            .data_generation = 3,
+            .barrier_id = 7707,
+            .start_row_key = "",
+            .end_row_key = null,
+            .affected_table_ids = &.{ 51, 52 },
+            .restart_identity = true,
+            .cascade = true,
+            .state = metadata_table_manager.table_emptying_ready,
+        },
+    });
+    defer std.testing.allocator.free(parent_empty_cmd);
+    const child_empty_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table_emptying_job = .{
+            .job_id = 9302,
+            .table_id = 52,
+            .group_id = 9002,
+            .range_id = 9102,
+            .schema_generation = child_schema_generation,
+            .data_generation = 3,
+            .barrier_id = 7707,
+            .start_row_key = "",
+            .end_row_key = null,
+            .affected_table_ids = &.{ 51, 52 },
+            .restart_identity = true,
+            .cascade = true,
+            .state = metadata_table_manager.table_emptying_ready,
+        },
+    });
+    defer std.testing.allocator.free(child_empty_cmd);
+    const promote_emptying_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .promote_table_emptying_barrier = .{
+            .job_ids = &.{ 9301, 9302 },
+            .promotions = &.{
+                .{ .table_id = 51, .target_generation = 4 },
+                .{ .table_id = 52, .target_generation = 4 },
+            },
+        },
+    });
+    defer std.testing.allocator.free(promote_emptying_cmd);
+    const drop_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .apply_table_catalog_drop_with_schema_rewrite_jobs = .{
+            .table_id = 51,
+            .sequence_ids = &.{parent_sequence_id},
+            .range_group_ids = &.{9001},
+            .table_updates = &.{.{
+                .table_id = 52,
+                .name = "children",
+                .database_name = "tenant",
+                .namespace_name = "billing",
+                .schema_json = child_schema_after_drop,
+                .data_generation = 4,
+            }},
+            .schema_rewrite_jobs = &.{
+                .{
+                    .job_id = 9502,
+                    .table_id = 52,
+                    .group_id = 9002,
+                    .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(child_schema_after_drop),
+                    .action = "rewrite",
+                    .reason = "drop_fk_parent",
+                    .start_row_key = "",
+                    .end_row_key = null,
+                    .full_row_rewrite = true,
+                },
+            },
+        },
+    });
+    defer std.testing.allocator.free(drop_cmd);
+
+    const setup_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = parent_table_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = child_table_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = parent_sequence_cmd },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = child_sequence_cmd },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = parent_range_cmd },
+        .{ .term = 1, .index = 6, .entry_type = .normal, .data = child_range_cmd },
+        .{ .term = 1, .index = 7, .entry_type = .normal, .data = parent_empty_cmd },
+        .{ .term = 1, .index = 8, .entry_type = .normal, .data = child_empty_cmd },
+        .{ .term = 1, .index = 9, .entry_type = .normal, .data = promote_emptying_cmd },
+    });
+    defer std.testing.allocator.free(setup_entries);
+    const drop_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 10, .entry_type = .normal, .data = drop_cmd },
+    });
+    defer std.testing.allocator.free(drop_entries);
+
+    {
+        var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+        defer store.deinit();
+        try store.snapshotBuilder().applyBatch(.{
+            .group_id = 51,
+            .commit_index = 9,
+            .entries_bytes = setup_entries,
+        });
+    }
+
+    {
+        var reopened = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+        defer reopened.deinit();
+        const tables = try reopened.listTables(std.testing.allocator, 51);
+        defer reopened.freeTables(std.testing.allocator, tables);
+        try std.testing.expectEqual(@as(usize, 2), tables.len);
+        for (tables) |table| try std.testing.expectEqual(@as(u64, 4), table.data_generation);
+
+        const jobs = try reopened.listTableEmptyingJobs(std.testing.allocator, 51);
+        defer reopened.freeTableEmptyingJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqual(@as(usize, 0), jobs.len);
+
+        const sequences = try reopened.listSequences(std.testing.allocator, 51);
+        defer reopened.freeSequences(std.testing.allocator, sequences);
+        try std.testing.expectEqual(@as(usize, 2), sequences.len);
+        for (sequences) |sequence| {
+            try std.testing.expectEqual(@as(i64, 5), sequence.last_value);
+            try std.testing.expectEqual(@as(u128, 0), sequence.last_allocation_id);
+        }
+    }
+
+    {
+        var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+        defer store.deinit();
+        try store.snapshotBuilder().applyBatch(.{
+            .group_id = 51,
+            .commit_index = 10,
+            .entries_bytes = drop_entries,
+        });
+    }
+
+    var reopened = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer reopened.deinit();
+    const tables = try reopened.listTables(std.testing.allocator, 51);
+    defer reopened.freeTables(std.testing.allocator, tables);
+    try std.testing.expectEqual(@as(usize, 1), tables.len);
+    try std.testing.expectEqual(@as(u64, 52), tables[0].table_id);
+    try std.testing.expectEqual(@as(u64, 4), tables[0].data_generation);
+    try std.testing.expectEqualStrings(child_schema_after_drop, tables[0].schema_json);
+
+    const ranges = try reopened.listRanges(std.testing.allocator, 51);
+    defer reopened.freeRanges(std.testing.allocator, ranges);
+    try std.testing.expectEqual(@as(usize, 1), ranges.len);
+    try std.testing.expectEqual(@as(u64, 9002), ranges[0].group_id);
+    try std.testing.expectEqual(@as(u64, 52), ranges[0].table_id);
+
+    const sequences = try reopened.listSequences(std.testing.allocator, 51);
+    defer reopened.freeSequences(std.testing.allocator, sequences);
+    try std.testing.expectEqual(@as(usize, 1), sequences.len);
+    try std.testing.expectEqual(@as(u64, child_sequence_id), sequences[0].sequence_id);
+    try std.testing.expectEqual(@as(i64, 5), sequences[0].last_value);
+    try std.testing.expectEqual(@as(u128, 0), sequences[0].last_allocation_id);
+
+    const rewrite_jobs = try reopened.listSchemaRewriteJobs(std.testing.allocator, 51);
+    defer reopened.freeSchemaRewriteJobs(std.testing.allocator, rewrite_jobs);
+    try std.testing.expectEqual(@as(usize, 1), rewrite_jobs.len);
+    try std.testing.expectEqual(@as(u64, 9502), rewrite_jobs[0].job_id);
+    try std.testing.expectEqual(@as(u64, 52), rewrite_jobs[0].table_id);
+    try std.testing.expectEqualStrings("drop_fk_parent", rewrite_jobs[0].reason);
+
+    const emptying_jobs = try reopened.listTableEmptyingJobs(std.testing.allocator, 51);
+    defer reopened.freeTableEmptyingJobs(std.testing.allocator, emptying_jobs);
+    try std.testing.expectEqual(@as(usize, 0), emptying_jobs.len);
+}
+
 test "metadata raft apply store rejects table catalog drop with omitted table ranges" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -11095,6 +11351,203 @@ test "metadata raft apply store gates table schema compare and swap on rewrite j
     const jobs = try ready_store.listSchemaRewriteJobs(std.testing.allocator, 61);
     defer ready_store.freeSchemaRewriteJobs(std.testing.allocator, jobs);
     try std.testing.expectEqual(@as(usize, 0), jobs.len);
+}
+
+test "metadata raft apply store replays create-or-replace schema rewrite workflow idempotently" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-create-or-replace-schema-workflow", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const old_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const replace_schema =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"status_norm":{"type":"keyword"},"amount":{"type":"number"}},"required":["id","status_norm"],"additionalProperties":false}}}}
+    ;
+    const replace_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(replace_schema);
+
+    const apply_replace_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .apply_table_catalog_update_with_schema_rewrite_jobs = .{
+            .table = .{
+                .table_id = 81,
+                .name = "usage_records",
+                .schema_json = replace_schema,
+                .read_schema_json = old_schema,
+            },
+            .schema_rewrite_jobs = &.{
+                .{
+                    .job_id = 9811,
+                    .table_id = 81,
+                    .group_id = 7001,
+                    .schema_generation = replace_generation,
+                    .action = "rewrite",
+                    .reason = "row_images",
+                    .start_row_key = "",
+                    .end_row_key = null,
+                    .full_row_rewrite = true,
+                },
+                .{
+                    .job_id = 9812,
+                    .table_id = 81,
+                    .group_id = 7001,
+                    .schema_generation = replace_generation,
+                    .action = "validate",
+                    .reason = "constraints",
+                    .start_row_key = "",
+                    .end_row_key = null,
+                },
+            },
+        },
+    });
+    defer std.testing.allocator.free(apply_replace_cmd);
+    const begin_rewrite_a_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .begin_schema_rewrite_job = .{
+            .job_id = 9811,
+            .lease_owner = "worker-a",
+            .now_ms = 1000,
+            .lease_expires_at_ms = 2000,
+        },
+    });
+    defer std.testing.allocator.free(begin_rewrite_a_cmd);
+    const invalidate_rewrite_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .invalidate_schema_rewrite_job = .{
+            .job_id = 9811,
+            .lease_owner = "worker-a",
+            .last_error = "replace rewrite owner moved",
+        },
+    });
+    defer std.testing.allocator.free(invalidate_rewrite_cmd);
+    const retry_rewrite_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .retry_schema_rewrite_job = .{ .job_id = 9811, .reason = "operator retry create-or-replace rewrite" },
+    });
+    defer std.testing.allocator.free(retry_rewrite_cmd);
+    const begin_rewrite_b_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .begin_schema_rewrite_job = .{
+            .job_id = 9811,
+            .lease_owner = "worker-b",
+            .now_ms = 3000,
+            .lease_expires_at_ms = 4000,
+        },
+    });
+    defer std.testing.allocator.free(begin_rewrite_b_cmd);
+    const finish_rewrite_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .finish_schema_rewrite_job = .{
+            .job_id = 9811,
+            .lease_owner = "worker-b",
+            .completed_row_count = 3,
+            .progress_row_key = "usage:z",
+        },
+    });
+    defer std.testing.allocator.free(finish_rewrite_cmd);
+    const begin_validate_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .begin_schema_rewrite_job = .{
+            .job_id = 9812,
+            .lease_owner = "validator-a",
+            .now_ms = 5000,
+            .lease_expires_at_ms = 6000,
+        },
+    });
+    defer std.testing.allocator.free(begin_validate_cmd);
+    const finish_validate_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .finish_schema_rewrite_job = .{
+            .job_id = 9812,
+            .lease_owner = "validator-a",
+            .completed_row_count = 3,
+            .progress_row_key = "usage:z",
+        },
+    });
+    defer std.testing.allocator.free(finish_validate_cmd);
+    const promote_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .compare_and_swap_table_schema = .{
+            .table_id = 81,
+            .expected_schema_json = replace_schema,
+            .promoted_table = .{
+                .table_id = 81,
+                .name = "usage_records",
+                .schema_json = replace_schema,
+                .read_schema_json = "",
+            },
+        },
+    });
+    defer std.testing.allocator.free(promote_cmd);
+
+    const apply_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = apply_replace_cmd },
+    });
+    defer std.testing.allocator.free(apply_entries);
+    const complete_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = begin_rewrite_a_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = invalidate_rewrite_cmd },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = retry_rewrite_cmd },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = begin_rewrite_b_cmd },
+        .{ .term = 1, .index = 6, .entry_type = .normal, .data = finish_rewrite_cmd },
+        .{ .term = 1, .index = 7, .entry_type = .normal, .data = begin_validate_cmd },
+        .{ .term = 1, .index = 8, .entry_type = .normal, .data = finish_validate_cmd },
+        .{ .term = 1, .index = 9, .entry_type = .normal, .data = promote_cmd },
+    });
+    defer std.testing.allocator.free(complete_entries);
+    const promote_replay_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 10, .entry_type = .normal, .data = promote_cmd },
+    });
+    defer std.testing.allocator.free(promote_replay_entries);
+
+    {
+        var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+        defer store.deinit();
+        try store.snapshotBuilder().applyBatch(.{
+            .group_id = 81,
+            .commit_index = 1,
+            .entries_bytes = apply_entries,
+        });
+    }
+
+    {
+        var reopened = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+        defer reopened.deinit();
+        const tables = try reopened.listTables(std.testing.allocator, 81);
+        defer reopened.freeTables(std.testing.allocator, tables);
+        try std.testing.expectEqual(@as(usize, 1), tables.len);
+        try std.testing.expectEqualStrings(replace_schema, tables[0].schema_json);
+        try std.testing.expectEqualStrings(old_schema, tables[0].read_schema_json);
+
+        const jobs = try reopened.listSchemaRewriteJobs(std.testing.allocator, 81);
+        defer reopened.freeSchemaRewriteJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqual(@as(usize, 2), jobs.len);
+    }
+
+    {
+        var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+        defer store.deinit();
+        try store.snapshotBuilder().applyBatch(.{
+            .group_id = 81,
+            .commit_index = 9,
+            .entries_bytes = complete_entries,
+        });
+    }
+
+    var promoted = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer promoted.deinit();
+    const tables = try promoted.listTables(std.testing.allocator, 81);
+    defer promoted.freeTables(std.testing.allocator, tables);
+    try std.testing.expectEqual(@as(usize, 1), tables.len);
+    try std.testing.expectEqualStrings(replace_schema, tables[0].schema_json);
+    try std.testing.expectEqualStrings("", tables[0].read_schema_json);
+    {
+        const jobs = try promoted.listSchemaRewriteJobs(std.testing.allocator, 81);
+        defer promoted.freeSchemaRewriteJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqual(@as(usize, 0), jobs.len);
+    }
+
+    try promoted.snapshotBuilder().applyBatch(.{
+        .group_id = 81,
+        .commit_index = 10,
+        .entries_bytes = promote_replay_entries,
+    });
+    const replay_jobs = try promoted.listSchemaRewriteJobs(std.testing.allocator, 81);
+    defer promoted.freeSchemaRewriteJobs(std.testing.allocator, replay_jobs);
+    try std.testing.expectEqual(@as(usize, 0), replay_jobs.len);
 }
 
 test "metadata raft apply store rejects reserved data group ids in transition records" {

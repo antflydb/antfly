@@ -17,12 +17,12 @@
       "id": "insert-source-upsert-owner-chaos",
       "relational_slices_section": "Release parity and production chaos gate",
       "scope": "insert_source_upsert_owner_movement",
-      "status": "partial_release_gated",
+      "status": "release_evidence",
       "required_behavior": "Hosted/provisioned insert-source upsert must handle unique owner movement between source read, conflict lookup, grouped conflict guard evaluation, staging, and commit without duplicate unique entries, stale owner writes, or SQL versus typed-plan divergence.",
-      "current_evidence": "Release-gated local insert-source conflict/upsert parity, hosted mutation-source collect/stage topology retry, and typed insert-source planner fail-closed coverage for ordinary unique and temporal-overlap owner topology errors exist. A public API insert-source mutation harness now drives the current API-layer planning path through source read, unique-owner topology unavailability, deterministic 503 response, and zero commitTransaction/batch calls, proving that owner movement before grouped conflict updates fails closed before writes are staged.",
-      "missing_evidence": "Insert-source upsert still plans in the API/server layer and then batches writes; it has no hosted/provisioned native stage protocol equivalent to mutation-source staging. Full release evidence still needs hosted/provisioned owner-movement chaos or a native stage protocol covering successful conflict-owner lookup followed by guard evaluation, grouped staging, commit retry/fail-closed behavior, and SQL versus typed-plan convergence.",
+      "current_evidence": "Release-gated local insert-source conflict/upsert parity, hosted mutation-source collect/stage topology retry, and typed insert-source planner fail-closed coverage for ordinary unique and temporal-overlap owner topology errors exist. Public API insert-source mutation coverage drives the current API-layer planning path through source read, unique-owner topology unavailability, deterministic 503 response, and zero commitTransaction/batch calls. It also covers successful source read, conflict-owner lookup, existing-row lookup, conflict guard evaluation, grouped transform/predicate construction, and commit-time TopologyChanged returning 503 without falling back to stale batch writes. Hosted/provisioned release evidence now runs the public insert-source upsert endpoint against a HostedProvisionedTableWriteSource: source read, conflict-owner lookup, existing-row lookup, conflict guard evaluation, routed transaction begin, and remote prepare all occur before the remote owner returns TopologyChanged, the response fails closed as 503, and no stale batch fallback route is exercised.",
+      "missing_evidence": "",
       "evidence_file": "zig/pkg/antfly/src/api_rows_test_root.zig",
-      "evidence_symbol": "api rows insert-source upsert aborts before commit when unique owner topology moves",
+      "evidence_symbol": "api rows hosted insert-source upsert fails closed when conflict owner moves during prepare",
       "release_gate": "relational-release-gate"
     },
     {

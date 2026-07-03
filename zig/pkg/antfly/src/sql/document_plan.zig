@@ -4150,6 +4150,9 @@ fn parseDocumentFromTailAlloc(
 ) !DocumentFromBinding {
     const comma = findComma(tokens, 0);
     if (comma == null) {
+        if (findTopLevelKeyword(tokens, .join)) |join_index| {
+            return try parseDocumentLateralUnnestFromTailAlloc(alloc, table_name, tokens, join_index, schema, virtual_schema);
+        }
         return .{ .source_ref = .{
             .table_name = table_name,
             .alias = try parseFromTailAlias(tokens),
@@ -4168,6 +4171,86 @@ fn parseDocumentFromTailAlloc(
         .source_ref = source_ref,
         .unnest = unnest,
     };
+}
+
+fn parseDocumentLateralUnnestFromTailAlloc(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    tokens: []const Token,
+    join_index: usize,
+    schema: runtime_schema.TableSchema,
+    virtual_schema: source_binding.DocumentSqlSchema,
+) !DocumentFromBinding {
+    const join_modifier_start = documentLateralUnnestJoinModifierStart(tokens, join_index);
+    const source_ref = DocumentSourceRef{
+        .table_name = table_name,
+        .alias = try parseFromTailAlias(tokens[0..join_modifier_start]),
+    };
+    const join_kind = documentLateralUnnestJoinKind(tokens, join_index);
+    if (join_kind == .unsupported) return error.DocumentSqlUnsupportedJoin;
+
+    var unnest_start = join_index + 1;
+    if (unnest_start >= tokens.len or !tokens[unnest_start].matchesKeywordTag(.lateral)) return error.DocumentSqlUnsupportedJoin;
+    unnest_start += 1;
+    if (unnest_start >= tokens.len) return error.DocumentSqlUnsupportedJoin;
+
+    const on_index = findTopLevelKeywordInRange(tokens, unnest_start, tokens.len, .on);
+    const unnest_end = on_index orelse tokens.len;
+    if (unnest_end <= unnest_start) return error.DocumentSqlUnsupportedJoin;
+    switch (join_kind) {
+        .inner => {
+            const on = on_index orelse return error.DocumentSqlUnsupportedJoin;
+            try requireDocumentLateralUnnestOnTrue(tokens[on + 1 ..]);
+        },
+        .cross => if (on_index != null) return error.DocumentSqlUnsupportedJoin,
+        .unsupported => unreachable,
+    }
+
+    var unnest = try parseDocumentUnnestAlloc(alloc, tokens[unnest_start..unnest_end], schema, virtual_schema, source_ref);
+    errdefer unnest.deinit(alloc);
+    return .{
+        .source_ref = source_ref,
+        .unnest = unnest,
+    };
+}
+
+const DocumentLateralUnnestJoinKind = enum {
+    inner,
+    cross,
+    unsupported,
+};
+
+fn documentLateralUnnestJoinModifierStart(tokens: []const Token, join_index: usize) usize {
+    if (join_index == 0) return 0;
+    const previous = tokens[join_index - 1];
+    if (previous.matchesKeywordTag(.inner) or
+        previous.matchesKeywordTag(.cross) or
+        previous.matchesKeywordTag(.left) or
+        previous.matchesKeywordTag(.right) or
+        previous.matchesKeywordTag(.full))
+    {
+        return join_index - 1;
+    }
+    return join_index;
+}
+
+fn documentLateralUnnestJoinKind(tokens: []const Token, join_index: usize) DocumentLateralUnnestJoinKind {
+    if (join_index == 0) return .inner;
+    const previous = tokens[join_index - 1];
+    if (previous.matchesKeywordTag(.cross)) return .cross;
+    if (previous.matchesKeywordTag(.inner)) return .inner;
+    if (previous.matchesKeywordTag(.left) or
+        previous.matchesKeywordTag(.right) or
+        previous.matchesKeywordTag(.full))
+    {
+        return .unsupported;
+    }
+    return .inner;
+}
+
+fn requireDocumentLateralUnnestOnTrue(tokens: []const Token) !void {
+    if (tokens.len != 1) return error.DocumentSqlUnsupportedJoin;
+    if (!tokens[0].matchesKeywordTag(.true)) return error.DocumentSqlUnsupportedJoin;
 }
 
 fn parseDocumentUnnestAlloc(
@@ -4259,8 +4342,12 @@ fn rejectUnsupportedDocumentStatementShape(
         findTopLevelKeyword(tokens, .intersect) != null or
         findTopLevelKeyword(tokens, .except) != null or
         findTopLevelKeyword(tokens, .with) != null or
-        findTopLevelKeyword(tokens, .recursive) != null or
-        findTopLevelKeyword(tokens, .join) != null)
+        findTopLevelKeyword(tokens, .recursive) != null)
+    {
+        return error.DocumentSqlUnsupportedJoin;
+    }
+    if (findTopLevelKeyword(tokens, .join) != null and
+        !documentFromTailContainsOnlyLateralUnnestJoin(tokens, from_index, source_tail_end))
     {
         return error.DocumentSqlUnsupportedJoin;
     }
@@ -4277,6 +4364,22 @@ fn documentFromTailCommaStartsUnnest(tokens: []const Token, comma_index: usize, 
     if (comma_index + 1 >= source_tail_end) return false;
     const token = tokens[comma_index + 1];
     return token.kind == .identifier and std.ascii.eqlIgnoreCase(token.text, "unnest");
+}
+
+fn documentFromTailContainsOnlyLateralUnnestJoin(tokens: []const Token, from_index: usize, source_tail_end: usize) bool {
+    if (from_index + 2 >= source_tail_end) return false;
+    const tail = tokens[from_index + 2 .. source_tail_end];
+    const join_index = findTopLevelKeyword(tail, .join) orelse return false;
+    if (findTopLevelKeywordInRange(tail, join_index + 1, tail.len, .join) != null) return false;
+    if (documentLateralUnnestJoinKind(tail, join_index) == .unsupported) return false;
+    var unnest_start = join_index + 1;
+    if (unnest_start >= tail.len or !tail[unnest_start].matchesKeywordTag(.lateral)) return false;
+    unnest_start += 1;
+    if (unnest_start >= tail.len) return false;
+    const on_index = findTopLevelKeywordInRange(tail, unnest_start, tail.len, .on);
+    const unnest_end = on_index orelse tail.len;
+    if (unnest_end <= unnest_start) return false;
+    return tail[unnest_start].kind == .identifier and std.ascii.eqlIgnoreCase(tail[unnest_start].text, "unnest");
 }
 
 fn documentIdentifierName(token: Token, source_ref: DocumentSourceRef) ![]const u8 {
@@ -7617,6 +7720,43 @@ test "document SQL lowers explicit array unnest over bounded scan" {
     try std.testing.expectEqualStrings("tag", view_mapping_unnest_lowered.unnest.?.alias);
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, view_mapping_unnest_lowered.unnest.?.item_type);
     try std.testing.expectEqualStrings("\"urgent\"", view_mapping_unnest_lowered.unnest.?.filter_value_json.?);
+
+    var view_mapping_lateral_unnest = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d JOIN LATERAL UNNEST(d.tag_list) AS tag ON true WHERE tag = 'urgent' LIMIT 10");
+    defer view_mapping_lateral_unnest.deinit(alloc);
+    var view_mapping_lateral_unnest_lowered = try lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_lateral_unnest, schema, view_mapping_virtual_schema, .{
+        .bounded_scan = .{ .max_rows = 25 },
+    });
+    defer view_mapping_lateral_unnest_lowered.deinit(alloc);
+
+    try std.testing.expect(view_mapping_lateral_unnest_lowered.unnest != null);
+    try std.testing.expectEqualStrings("/tags", view_mapping_lateral_unnest_lowered.unnest.?.field);
+    try std.testing.expectEqualStrings("tag", view_mapping_lateral_unnest_lowered.unnest.?.alias);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, view_mapping_lateral_unnest_lowered.unnest.?.item_type);
+    try std.testing.expectEqualStrings("\"urgent\"", view_mapping_lateral_unnest_lowered.unnest.?.filter_value_json.?);
+
+    var view_mapping_cross_lateral_unnest = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d CROSS JOIN LATERAL UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' LIMIT 10");
+    defer view_mapping_cross_lateral_unnest.deinit(alloc);
+    var view_mapping_cross_lateral_unnest_lowered = try lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_cross_lateral_unnest, schema, view_mapping_virtual_schema, .{
+        .bounded_scan = .{ .max_rows = 25 },
+    });
+    defer view_mapping_cross_lateral_unnest_lowered.deinit(alloc);
+
+    try std.testing.expect(view_mapping_cross_lateral_unnest_lowered.unnest != null);
+    try std.testing.expectEqualStrings("/tags", view_mapping_cross_lateral_unnest_lowered.unnest.?.field);
+    try std.testing.expectEqualStrings("tag", view_mapping_cross_lateral_unnest_lowered.unnest.?.alias);
+    try std.testing.expectEqualStrings("\"urgent\"", view_mapping_cross_lateral_unnest_lowered.unnest.?.filter_value_json.?);
+
+    var view_mapping_left_lateral_unnest = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d LEFT JOIN LATERAL UNNEST(d.tag_list) AS tag ON true WHERE tag = 'urgent' LIMIT 10");
+    defer view_mapping_left_lateral_unnest.deinit(alloc);
+    try std.testing.expectError(error.DocumentSqlUnsupportedJoin, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_left_lateral_unnest, schema, view_mapping_virtual_schema, .{
+        .bounded_scan = .{ .max_rows = 25 },
+    }));
+
+    var view_mapping_predicated_lateral_unnest = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d JOIN LATERAL UNNEST(d.tag_list) AS tag ON tag = 'urgent' LIMIT 10");
+    defer view_mapping_predicated_lateral_unnest.deinit(alloc);
+    try std.testing.expectError(error.DocumentSqlUnsupportedJoin, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_predicated_lateral_unnest, schema, view_mapping_virtual_schema, .{
+        .bounded_scan = .{ .max_rows = 25 },
+    }));
 
     var view_mapping_indexed_unnest = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' LIMIT 10");
     defer view_mapping_indexed_unnest.deinit(alloc);

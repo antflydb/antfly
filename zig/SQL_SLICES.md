@@ -45,18 +45,15 @@ document SQL implementation gates.
   predicate families require an exact indexed/native producer or fail with
   `document_sql_bounded_scan_missing_exact_producer`.
 
-  - [ ] Admit `document-aggregates`: add `document_sql_corpus.json` cases for
-        mapped-field `COUNT`, `MIN`/`MAX`, `SUM`/`AVG`, grouped aggregates,
-        `HAVING`, order, and limit shapes; add required coverage buckets and
-        executable runtime parity tests proving aggregate results, residual
-        filtering, empty input, null handling, and rejection of unbounded
-        aggregate scans.
-  - [ ] Admit `lateral-view-mapping-joins`: add `document_sql_corpus.json`
-        cases for each allowed lateral document/view-mapping join shape, join
-        predicate family, limit interaction, and unsupported correlated form;
-        add required coverage buckets and executable runtime parity tests
-        proving row identity, cardinality, residual filtering, and stable
-        diagnostics.
+  - [ ] Finish non-`UNNEST` `lateral-view-mapping-joins`: inner and cross
+        `JOIN LATERAL UNNEST(...)` over mapped document arrays are admitted
+        through the existing bounded array-expansion producer, with corpus,
+        required-coverage, residual-filter, runtime-parity, and outer/predicate
+        join rejection evidence. The remaining surface is correlated lateral
+        subqueries over mapped document views: define the native producer
+        contract for branch cardinality, row identity, correlation binding,
+        deterministic ordering, limit interaction, residual filtering, and
+        relational fallback rejection before admitting those shapes.
 
 ## Whole SQL Adapter
 

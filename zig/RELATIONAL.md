@@ -4942,10 +4942,21 @@ per-feature status and remaining gaps live in the release-gated SQL and
 relational fixture inventories, which are checked by `relational-release-gate`
 and the SQL parity fixture gates. As of the current inventory, no status rows
 carry `gap_tracked` or `missing_native_harness`, no routed visibility row is
-left as `gap_tracked`, and 5 rows still carry `partial_release_gated` status.
+left as `gap_tracked`, and no row still carries `partial_release_gated` status.
 Routed live-write pagination is release evidence because paginated routed reads
 prove stable page boundaries after range rescans and fail closed when a live
 write changes scanned range membership before returning a page.
+Routed insert-source conflict movement is release evidence because public API
+insert-source upsert now fails closed both when unique-owner topology is
+unavailable before staging and when topology changes after source read,
+conflict-owner lookup, existing-row lookup, conflict guard evaluation, and
+grouped transform/predicate construction at transaction commit, without
+falling back to stale batch writes. Hosted insert-source upsert owner-movement
+is also release evidence because the public endpoint now runs against the
+hosted/provisioned write source through source read, conflict-owner lookup,
+existing-row lookup, conflict guard evaluation, routed transaction begin, and
+remote prepare before a moved owner returns `TopologyChanged`; the API fails
+closed as 503 and does not exercise a stale batch fallback.
 CTE spill resumability is release evidence because CTE spill rows persist in
 the internal spill store with row-count/materialized-byte accounting, reload
 with stable row order and contents after DB close/reopen, and clean up spill
@@ -5006,6 +5017,24 @@ also release evidence because the provisioned owner-local harness now combines
 remote ref-owner outage, partial page progress, concurrent parent and child
 writes, lease handoff, writable reopen/resume, completed-job replay, and final
 child-row convergence without duplicate set-null effects.
+Create-or-replace schema jobs are also release evidence because the durable
+raft apply-store workflow now applies a replacement table with read-schema
+fallback plus rewrite/validation jobs, reopens with pending work, retries an
+invalidated row rewrite, completes validation, promotes through table schema
+CAS, deletes completed jobs, reopens on the promoted schema, and replays the
+promotion command idempotently.
+Drop-table cascade recovery is also release evidence because one durable raft
+apply-store workflow now combines cascade/restart-identity table-emptying
+barrier promotion across parent and child ranges, reopen after partial
+progress, data-generation promotion, identity allocator reset, catalog child
+schema update, dropped range and sequence cleanup, child rewrite cleanup work,
+and final reopen with no stale table-emptying jobs.
+Concurrent schema-generation isolation is also release evidence because one
+worker-level workflow now rewrites live v1 rows to v2, reopens before schema
+promotion, promotes through table schema CAS, proves a stale v1 table-emptying
+job fails closed without deleting rewritten rows, then empties rewritten and
+post-promotion rows under the current v2 generation, promotes the barrier,
+resets identity allocation, and reopens with no mixed-generation rows.
 Adapter-only transaction-control coverage includes `BEGIN`, `BEGIN WORK`, bare
 `START TRANSACTION`, `COMMIT`, `COMMIT TRANSACTION`, `ROLLBACK`, and `ROLLBACK
 WORK` as explicit no-op classifications, so migration wrappers and client

@@ -60,6 +60,12 @@
       ]
     },
     {
+      "reason": "document_sql_unsupported_join",
+      "coverage": [
+        "unsupported_read_document_view_mapping_lateral_join"
+      ]
+    },
+    {
       "reason": "document_sql_view_mapping_catalog",
       "coverage": [
         "invalid_read_document_view_mapping_missing_required_index",
