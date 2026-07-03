@@ -1899,7 +1899,7 @@ def stateful_api():
             return self.get(lookup_key_path(table_name, key))
 
         def scan_keys(self, table_name: str, payload: dict) -> list[dict]:
-            response = self._request("POST", f"/tables/{table_name}/lookup", payload)
+            response = self._request("POST", f"/tables/{table_name}/documents", payload)
             if response.status_code >= 400:
                 return self._check(response)
             if not response.content:
@@ -2224,7 +2224,7 @@ def backup_api():
             return self.get(lookup_key_path(table_name, key))
 
         def scan_keys(self, table_name: str, payload: dict) -> list[dict]:
-            response = self._request("POST", f"/tables/{table_name}/lookup", payload)
+            response = self._request("POST", f"/tables/{table_name}/documents", payload)
             if response.status_code >= 400:
                 return self._check(response)
             if not response.content:

@@ -9076,6 +9076,21 @@ fn aggregationFullResultLimit(req: db_mod.types.SearchRequest, result: db_mod.ty
     return result.total_hits;
 }
 
+fn aggregationFullResultRequest(req: db_mod.types.SearchRequest, result: db_mod.types.SearchResult, operation: []const u8) !db_mod.types.SearchRequest {
+    const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result);
+    const full_limit = try aggregationFullResultLimit(req, result, operation);
+    var full_req = req;
+    full_req.identity_read_generation = identity_read_generation;
+    full_req.offset = 0;
+    full_req.limit = full_limit;
+    full_req.include_stored = true;
+    full_req.count_only = false;
+    full_req.order_by = &.{};
+    full_req.search_after = &.{};
+    full_req.search_before = &.{};
+    return full_req;
+}
+
 test "aggregation completeness requires exact total relation" {
     const req = db_mod.types.SearchRequest{};
     try std.testing.expect(aggregationCanUseCurrentResult(req, .{
@@ -9116,6 +9131,31 @@ test "aggregation completeness requires exact total relation" {
         .total_hits = default_aggregation_full_result_budget + 1,
         .total_hits_relation = .exact,
     }, "test"));
+
+    const order_by = [_]db_mod.types.SortField{.{ .field = "created_at", .desc = true }};
+    const cursor = [_]std.json.Value{.{ .string = "2026-01-01" }};
+    const full_req = try aggregationFullResultRequest(.{
+        .offset = 10,
+        .limit = 5,
+        .count_only = true,
+        .include_stored = false,
+        .order_by = order_by[0..],
+        .search_after = cursor[0..],
+    }, .{
+        .alloc = std.testing.allocator,
+        .hits = @constCast(hits[0..]),
+        .total_hits = 1,
+        .total_hits_relation = .exact,
+        .identity_read_generation = 99,
+    }, "test");
+    try std.testing.expectEqual(@as(u32, 0), full_req.offset);
+    try std.testing.expectEqual(@as(u32, 1), full_req.limit);
+    try std.testing.expect(!full_req.count_only);
+    try std.testing.expect(full_req.include_stored);
+    try std.testing.expectEqual(@as(?u64, 99), full_req.identity_read_generation);
+    try std.testing.expectEqual(@as(usize, 0), full_req.order_by.len);
+    try std.testing.expectEqual(@as(usize, 0), full_req.search_after.len);
+    try std.testing.expectEqual(@as(usize, 0), full_req.search_before.len);
 }
 
 fn applyBoundQueryAggregations(
@@ -9132,14 +9172,7 @@ fn applyBoundQueryAggregations(
         return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, self.db), meta);
     }
 
-    const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result.*);
-    const full_limit = try aggregationFullResultLimit(req, result.*, "bound");
-    var full_req = req;
-    full_req.identity_read_generation = identity_read_generation;
-    full_req.offset = 0;
-    full_req.limit = full_limit;
-    full_req.include_stored = true;
-    full_req.count_only = false;
+    const full_req = try aggregationFullResultRequest(req, result.*, "bound");
     var full_result = try self.reads.searchWithConsistency(alloc, self.db, full_req, consistency);
     defer full_result.deinit();
     return try applyAggregationResults(alloc, full_req, full_result, try aggregationContextForDb(alloc, full_req, self.db), meta);
@@ -9168,14 +9201,7 @@ fn applyProvisionedQueryAggregations(
         }
 
         var reads = raft_mod.FeatureDBReads.init(group_ids[0], self.requester);
-        const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result.*);
-        const full_limit = try aggregationFullResultLimit(req, result.*, "provisioned-local");
-        var full_req = req;
-        full_req.identity_read_generation = identity_read_generation;
-        full_req.offset = 0;
-        full_req.limit = full_limit;
-        full_req.include_stored = true;
-        full_req.count_only = false;
+        const full_req = try aggregationFullResultRequest(req, result.*, "provisioned-local");
         var full_result = try reads.searchWithConsistency(alloc, &db, full_req, consistency);
         defer full_result.deinit();
         return try applyAggregationResults(alloc, full_req, full_result, try aggregationContextForDb(alloc, full_req, &db), meta);
@@ -9194,14 +9220,7 @@ fn applyProvisionedQueryAggregations(
         }, meta);
     }
 
-    const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result.*);
-    const full_limit = try aggregationFullResultLimit(req, result.*, "provisioned-distributed");
-    var full_req = req;
-    full_req.identity_read_generation = identity_read_generation;
-    full_req.offset = 0;
-    full_req.limit = full_limit;
-    full_req.include_stored = true;
-    full_req.count_only = false;
+    const full_req = try aggregationFullResultRequest(req, result.*, "provisioned-distributed");
     var full_result = try queryProvisionedAcrossGroups(self, alloc, group_ids, full_req, table_name, consistency);
     defer full_result.deinit();
     const full_agg_stats = try collectProvisionedAggregationTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits);
@@ -9370,14 +9389,7 @@ fn applyHostedProvisionedQueryAggregations(
                 }
 
                 var reads = raft_mod.FeatureDBReads.init(group_ids[0], self.requester);
-                const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result.*);
-                const full_limit = try aggregationFullResultLimit(req, result.*, "hosted-local");
-                var full_req = req;
-                full_req.identity_read_generation = identity_read_generation;
-                full_req.offset = 0;
-                full_req.limit = full_limit;
-                full_req.include_stored = true;
-                full_req.count_only = false;
+                const full_req = try aggregationFullResultRequest(req, result.*, "hosted-local");
                 var full_result = try reads.searchWithConsistency(alloc, &db, full_req, consistency);
                 defer full_result.deinit();
                 return try applyAggregationResults(alloc, full_req, full_result, try aggregationContextForDb(alloc, full_req, &db), meta);
@@ -9399,14 +9411,7 @@ fn applyHostedProvisionedQueryAggregations(
         }, meta);
     }
 
-    const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result.*);
-    const full_limit = try aggregationFullResultLimit(req, result.*, "hosted-distributed");
-    var full_req = req;
-    full_req.identity_read_generation = identity_read_generation;
-    full_req.offset = 0;
-    full_req.limit = full_limit;
-    full_req.include_stored = true;
-    full_req.count_only = false;
+    const full_req = try aggregationFullResultRequest(req, result.*, "hosted-distributed");
     var full_result = try queryHostedAcrossGroups(self, alloc, group_ids, full_req, table_name, consistency);
     defer full_result.deinit();
     const full_agg_stats = try collectHostedAggregationTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits, consistency);
@@ -13659,21 +13664,58 @@ fn appendScanLine(
     try out.appendSlice(alloc, "{\"_id\":");
     try out.appendSlice(alloc, escaped_key);
     if (projected_json) |json| {
-        if (json.len < 2 or json[0] != '{' or json[json.len - 1] != '}') return error.InvalidProjectedDocumentJson;
-        if (json.len > 2) {
-            try out.append(alloc, ',');
-            try out.appendSlice(alloc, json[1..]);
-        } else {
-            try out.append(alloc, '}');
-        }
+        try appendScanProjectedFields(alloc, out, json);
     } else {
         try out.append(alloc, '}');
     }
     try out.append(alloc, '\n');
 }
 
+fn appendScanProjectedFields(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    projected_json: []const u8,
+) !void {
+    if (projected_json.len < 2 or projected_json[0] != '{' or projected_json[projected_json.len - 1] != '}') return error.InvalidProjectedDocumentJson;
+    if (projected_json.len == 2) {
+        try out.append(alloc, '}');
+        return;
+    }
+
+    if (std.mem.indexOf(u8, projected_json, "\"_id\"") == null) {
+        try out.append(alloc, ',');
+        try out.appendSlice(alloc, projected_json[1..]);
+        return;
+    }
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, projected_json, .{}) catch return error.InvalidProjectedDocumentJson;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidProjectedDocumentJson;
+
+    var it = parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "_id")) continue;
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, out, entry.key_ptr.*);
+        try out.append(alloc, ':');
+        const encoded_value = try std.json.Stringify.valueAlloc(alloc, entry.value_ptr.*, .{});
+        defer alloc.free(encoded_value);
+        try out.appendSlice(alloc, encoded_value);
+    }
+    try out.append(alloc, '}');
+}
+
 fn parseJsonTestBody(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(T) {
     return try std.json.parseFromSlice(T, alloc, body, .{});
+}
+
+test "scan ndjson keeps _id reserved for server document identity" {
+    const alloc = std.testing.allocator;
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+
+    try appendScanLine(alloc, &out, "doc:server", "{\"_id\":\"doc:stored\",\"title\":\"alpha\"}");
+    try std.testing.expectEqualStrings("{\"_id\":\"doc:server\",\"title\":\"alpha\"}\n", out.items);
 }
 
 fn parseNdjsonTestRowsAlloc(comptime T: type, alloc: std.mem.Allocator, ndjson: []const u8) ![]T {

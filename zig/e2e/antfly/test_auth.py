@@ -179,7 +179,7 @@ class AuthApi:
         return self.get(lookup_key_path(table_name, key))
 
     def scan_keys(self, table_name: str, payload: dict) -> list[dict]:
-        response = self.s.post(f"{self.url}/tables/{table_name}/lookup", json=payload, timeout=30)
+        response = self.s.post(f"{self.url}/tables/{table_name}/documents", json=payload, timeout=30)
         if response.status_code >= 400:
             self._check(response)
         if not response.content:
@@ -505,7 +505,7 @@ def test_swarm_auth_enforces_row_filters_on_lookup_and_scan(auth_api: AuthApi):
         )
     )
     assert scan_result is not None
-    assert [entry["key"] for entry in scan_result] == ["doc:gold"]
+    assert [entry["_id"] for entry in scan_result] == ["doc:gold"]
     assert scan_result[0]["tier"] == "gold"
     assert scan_result[0]["title"] == "gold doc"
 
@@ -629,6 +629,6 @@ def test_stateful_auth_enforces_row_filters_on_lookup_and_scan(stateful_auth_api
         )
     )
     assert scan_result is not None
-    assert [entry["key"] for entry in scan_result] == ["doc:gold"]
+    assert [entry["_id"] for entry in scan_result] == ["doc:gold"]
     assert scan_result[0]["tier"] == "gold"
     assert scan_result[0]["title"] == "gold doc"

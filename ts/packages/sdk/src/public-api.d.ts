@@ -5092,6 +5092,14 @@ export interface components {
              */
             offset?: number;
             /**
+             * @description Optional query execution deadline in milliseconds. The server applies this as a
+             *     cooperative deadline across query planning, search execution, aggregation reruns,
+             *     sorting, and response post-processing. If the deadline expires before the query
+             *     completes, the HTTP API returns 504.
+             * @example 5000
+             */
+            timeout_ms?: number;
+            /**
              * @description Sort order for results. Array of sort fields with direction.
              *     Antfly appends `_id` ascending as a stable tie-breaker when it is omitted.
              *     Only applicable for full_text_search queries. Semantic searches are always sorted by similarity score.

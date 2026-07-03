@@ -3635,6 +3635,7 @@ pub fn build(b: *std.Build) void {
             "auth row filter validator rejects malformed auth node",
             "effective resolved row filter prefers table filter before wildcard",
             "artifact operations apply source document row filter visibility",
+            "scan line key uses reserved _id document identity",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

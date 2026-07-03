@@ -1855,7 +1855,7 @@ fn parseQueryTimeoutMs(alloc: std.mem.Allocator, body: []const u8) !?u64 {
     return switch (value) {
         .null => null,
         .integer => |v| if (v >= 0) @as(u64, @intCast(v)) else error.InvalidQueryRequest,
-        .float => |v| if (v >= 0 and v <= @as(f64, @floatFromInt(std.math.maxInt(u64)))) @as(u64, @intFromFloat(v)) else error.InvalidQueryRequest,
+        .float => error.InvalidQueryRequest,
         .number_string => |v| std.fmt.parseUnsigned(u64, v, 10) catch error.InvalidQueryRequest,
         else => error.InvalidQueryRequest,
     };
@@ -6214,6 +6214,9 @@ test "api query contract public parser rejects internal shard doc identity contr
     try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs",
         \\{"query":{"match_all":{}},"timeout_ms":-1}
     ));
+    try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs",
+        \\{"query":{"match_all":{}},"timeout_ms":1.5}
+    ));
 }
 
 test "api query contract treats canonical typed scalar term as structured filter" {
@@ -7250,6 +7253,9 @@ test "api query contract rejects invalid timeout_ms" {
     ));
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
         \\{"query":{"match_all":{}},"timeout_ms":"bad"}
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
+        \\{"query":{"match_all":{}},"timeout_ms":1.5}
     ));
 }
 

@@ -9611,13 +9611,23 @@ fn injectRowFilterIntoOpenApiQueryRequest(
 
 pub fn scanLineKey(alloc: std.mem.Allocator, line: []const u8) ![]u8 {
     const ScanLineKey = struct {
-        key: []const u8,
+        _id: []const u8,
     };
     var parsed = try std.json.parseFromSlice(ScanLineKey, alloc, line, .{
         .ignore_unknown_fields = true,
     });
     defer parsed.deinit();
-    return try alloc.dupe(u8, parsed.value.key);
+    return try alloc.dupe(u8, parsed.value._id);
+}
+
+test "scan line key uses reserved _id document identity" {
+    const alloc = std.testing.allocator;
+
+    const key = try scanLineKey(alloc, "{\"_id\":\"doc:server\",\"title\":\"alpha\"}");
+    defer alloc.free(key);
+    try std.testing.expectEqualStrings("doc:server", key);
+
+    try std.testing.expectError(error.MissingField, scanLineKey(alloc, "{\"key\":\"doc:legacy\"}"));
 }
 
 const TestQueryHitInput = struct {

@@ -5339,6 +5339,15 @@ components:
             Number of results to skip for pagination. Only available for full_text_search queries.
             Not supported for semantic_search due to vector index limitations.
           example: 0
+        timeout_ms:
+          type: integer
+          minimum: 0
+          description: |
+            Optional query execution deadline in milliseconds. The server applies this as a
+            cooperative deadline across query planning, search execution, aggregation reruns,
+            sorting, and response post-processing. If the deadline expires before the query
+            completes, the HTTP API returns 504.
+          example: 5000
         order_by:
           type: array
           items:
