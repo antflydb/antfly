@@ -468,6 +468,7 @@ fn saveAppliedSequencesCheckpoint(alloc: Allocator, path: []const u8, updates: [
 
     var checkpoint = loadCheckpoint(alloc, path) catch |err| switch (err) {
         error.FileNotFound => CheckpointMap{},
+        error.InvalidDerivedApplyState => CheckpointMap{},
         else => return err,
     };
     defer checkpoint.deinit(alloc);
@@ -482,6 +483,7 @@ fn saveProjectionCheckpoints(alloc: Allocator, path: []const u8, updates: []cons
 
     var checkpoint = loadCheckpoint(alloc, path) catch |err| switch (err) {
         error.FileNotFound => CheckpointMap{},
+        error.InvalidDerivedApplyState => CheckpointMap{},
         else => return err,
     };
     defer checkpoint.deinit(alloc);
@@ -498,6 +500,7 @@ fn setAppliedSequencesCheckpoint(alloc: Allocator, path: []const u8, updates: []
 
     var checkpoint = loadCheckpoint(alloc, path) catch |err| switch (err) {
         error.FileNotFound => CheckpointMap{},
+        error.InvalidDerivedApplyState => CheckpointMap{},
         else => return err,
     };
     defer checkpoint.deinit(alloc);
@@ -512,6 +515,7 @@ fn setProjectionCheckpoints(alloc: Allocator, path: []const u8, updates: []const
 
     var checkpoint = loadCheckpoint(alloc, path) catch |err| switch (err) {
         error.FileNotFound => CheckpointMap{},
+        error.InvalidDerivedApplyState => CheckpointMap{},
         else => return err,
     };
     defer checkpoint.deinit(alloc);
@@ -528,6 +532,7 @@ fn clearAppliedSequenceCheckpoint(alloc: Allocator, path: []const u8, index_name
 
     var checkpoint = loadCheckpoint(alloc, path) catch |err| switch (err) {
         error.FileNotFound => return,
+        error.InvalidDerivedApplyState => return,
         else => return err,
     };
     defer checkpoint.deinit(alloc);

@@ -701,24 +701,33 @@ pub const DBCore = struct {
         if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |dense_checkpoint| {
             if (dense_checkpoint.config_hash != 0) return dense_checkpoint.applied_sequence;
         }
-        return try apply_state.loadAppliedSequenceWithCheckpoint(
+        return apply_state.loadAppliedSequenceWithCheckpoint(
             alloc,
             self.store,
             self.applied_sequence_checkpoint_path,
             index_name,
-        );
+        ) catch |err| switch (err) {
+            error.InvalidDerivedApplyState => 0,
+            else => return err,
+        };
     }
 
     pub fn loadProjectionCheckpoint(self: *DBCore, alloc: Allocator, index_name: []const u8) !apply_state.ProjectionCheckpoint {
         if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |dense_checkpoint| {
             if (dense_checkpoint.config_hash != 0) return dense_checkpoint;
         }
-        return try apply_state.loadProjectionCheckpointWithSidecar(
+        return apply_state.loadProjectionCheckpointWithSidecar(
             alloc,
             self.store,
             self.applied_sequence_checkpoint_path,
             index_name,
-        );
+        ) catch |err| switch (err) {
+            error.InvalidDerivedApplyState => .{
+                .status = .repair_required,
+                .config_hash = if (self.index_manager.get(index_name)) |cfg| types.indexConfigHash(cfg.*) else 0,
+            },
+            else => return err,
+        };
     }
 
     pub fn indexRequiresEnrichmentReplay(self: *DBCore, index_name: []const u8) !bool {

@@ -28138,6 +28138,23 @@ fn putDenseEmbeddingArtifactWithCounterForTest(db: *DB, alloc: Allocator, artifa
     try markArtifactPresenceForTest(db);
 }
 
+fn writeRawProjectionCheckpointSidecarForTest(path: []const u8, raw: []const u8) !void {
+    if (std.fs.path.dirname(path)) |parent| {
+        var io_parent = threadedIo();
+        defer io_parent.deinit();
+        try fs_paths.createDirPathPortable(io_parent.io(), parent);
+    }
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var file = try fs_paths.createFilePortable(io, path, .{ .truncate = true });
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    try writer.interface.writeAll(raw);
+    try writer.end();
+}
+
 fn markArtifactPresenceForTest(db: *DB) !void {
     db.core.artifact_cleanup_maybe.store(true, .release);
     try db.core.store.put(internal_keys.artifact_presence_key[0..], "1");
@@ -47864,12 +47881,11 @@ test "db dense projection checkpoint prefers hbc metadata over corrupt sidecar" 
         });
 
         const checkpoint_path = db.core.applied_sequence_checkpoint_path orelse return error.TestUnexpectedResult;
-        var io_impl = threadedIo();
-        defer io_impl.deinit();
-        try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
-            .sub_path = checkpoint_path,
-            .data = "not-a-derived-apply-checkpoint",
-        });
+        try writeRawProjectionCheckpointSidecarForTest(checkpoint_path, "not-a-derived-apply-checkpoint");
+        try std.testing.expectError(
+            error.InvalidDerivedApplyState,
+            apply_state.loadProjectionCheckpointWithSidecar(alloc, db.core.store, checkpoint_path, "dense_idx"),
+        );
     }
 
     var reopened = try DB.open(alloc, std.mem.span(path), .{
@@ -47890,6 +47906,79 @@ test "db dense projection checkpoint prefers hbc metadata over corrupt sidecar" 
     try std.testing.expectEqual(@as(usize, 1), stats.indexes.len);
     try std.testing.expectEqual(checkpoint.applied_sequence, stats.indexes[0].projection_checkpoint_applied_sequence);
     try std.testing.expectEqual(@as(u64, 11), stats.indexes[0].projection_checkpoint_generation);
+}
+
+test "db corrupt projection sidecar degrades non-dense checkpoint and can be replaced" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const text_cfg: types.IndexConfig = .{
+        .name = "ft_idx",
+        .kind = .full_text,
+        .config_json = "{}",
+    };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(text_cfg);
+        try db.core.saveProjectionCheckpoint("ft_idx", .{
+            .applied_sequence = 9,
+            .status = .clean,
+            .generation = 4,
+            .config_hash = types.indexConfigHash(text_cfg),
+        });
+
+        const checkpoint_path = db.core.applied_sequence_checkpoint_path orelse return error.TestUnexpectedResult;
+        try writeRawProjectionCheckpointSidecarForTest(checkpoint_path, "not-a-derived-apply-checkpoint");
+    }
+
+    {
+        var status_only = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .status_only,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer status_only.close();
+
+        try std.testing.expectEqual(@as(u64, 0), try status_only.core.loadAppliedSequence(alloc, "ft_idx"));
+        const degraded_checkpoint = try status_only.core.loadProjectionCheckpoint(alloc, "ft_idx");
+        try std.testing.expectEqual(apply_state.ProjectionStatus.repair_required, degraded_checkpoint.status);
+        try std.testing.expectEqual(@as(u64, 0), degraded_checkpoint.applied_sequence);
+        try std.testing.expectEqual(types.indexConfigHash(text_cfg), degraded_checkpoint.config_hash);
+
+        const degraded_stats = try status_only.stats(alloc);
+        defer types.freeDBStats(alloc, degraded_stats);
+        try std.testing.expectEqual(@as(usize, 1), degraded_stats.indexes.len);
+        try std.testing.expectEqualStrings("repair_required", degraded_stats.indexes[0].projection_checkpoint_status);
+        try std.testing.expect(degraded_stats.indexes[0].repair_degraded);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    try std.testing.expectEqual(@as(u64, 0), try reopened.core.loadAppliedSequence(alloc, "ft_idx"));
+    const repaired_by_open_checkpoint = try reopened.core.loadProjectionCheckpoint(alloc, "ft_idx");
+    try std.testing.expectEqual(apply_state.ProjectionStatus.clean, repaired_by_open_checkpoint.status);
+    try std.testing.expectEqual(@as(u64, 0), repaired_by_open_checkpoint.applied_sequence);
+    try std.testing.expectEqual(types.indexConfigHash(text_cfg), repaired_by_open_checkpoint.config_hash);
+
+    try reopened.core.saveAppliedSequence("ft_idx", 7);
+    const repaired_checkpoint = try reopened.core.loadProjectionCheckpoint(alloc, "ft_idx");
+    try std.testing.expectEqual(apply_state.ProjectionStatus.clean, repaired_checkpoint.status);
+    try std.testing.expectEqual(@as(u64, 7), repaired_checkpoint.applied_sequence);
+    try std.testing.expectEqual(types.indexConfigHash(text_cfg), repaired_checkpoint.config_hash);
 }
 
 test "db dense artifact rebuild rejects clean checkpoint for stale config identity" {
