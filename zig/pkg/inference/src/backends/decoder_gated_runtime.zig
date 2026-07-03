@@ -325,11 +325,11 @@ fn disableGemma4DirectDecodeRequested() bool {
 }
 
 fn disableGemmaFusedQkvRequested() bool {
-    return getenvBool("TERMITE_METAL_DISABLE_GEMMA_FUSED_QKV");
+    return getenvBool("ANTFLY_INFERENCE_METAL_DISABLE_GEMMA_FUSED_QKV");
 }
 
 fn enableGemmaFusedQkvRequested() bool {
-    return getenvBool("TERMITE_METAL_ENABLE_GEMMA_FUSED_QKV");
+    return getenvBool("ANTFLY_INFERENCE_METAL_ENABLE_GEMMA_FUSED_QKV");
 }
 
 fn preferSplitGemmaDecodeQkv(gpt_config: gpt_mod.Config, phase: BlockTimingPhase, query_sequence_len: usize) bool {

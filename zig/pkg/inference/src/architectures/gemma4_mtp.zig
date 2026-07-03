@@ -194,12 +194,7 @@ pub const DraftDeviceRequest = struct {
 };
 
 fn monotonicNowNs() u64 {
-    if (comptime @import("builtin").os.tag == .freestanding) return 0;
-    var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
-        .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
-        else => return 0,
-    }
+    return platform.time.monotonicNs();
 }
 
 fn profileNow(enabled: bool) u64 {
@@ -423,14 +418,6 @@ fn wantsMaskedEmbeddingArgmax(draft_cfg: gpt_mod.Config) bool {
     return draft_cfg.mtp_use_ordered_embeddings and
         draft_cfg.mtp_num_centroids != 0 and
         draft_cfg.mtp_centroid_intermediate_top_k != 0;
-}
-
-fn mtpPhaseNowNs() u64 {
-    var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
-        .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
-        else => return 0,
-    }
 }
 
 fn getenvBool(comptime name: [*:0]const u8) bool {
@@ -800,8 +787,6 @@ pub fn draftTokenDevice(request: DraftDeviceRequest) !DraftDeviceResult {
     profileEvalTensor(request.draft_cb, draft_target_embedding, request.profile_sync);
     profile.target_embedding_ns = profileElapsedNs(target_embedding_started_at);
 
-    const phase_trace = getenvBool("ANTFLY_GEMMA4_MTP_DRAFT_PHASE_TRACE");
-    var phase_t0: u64 = if (phase_trace) mtpPhaseNowNs() else 0;
     const preprojection_started_at = profileNow(request.profile_enabled);
     const pre_w = try getMtpWeight(request.draft_cb, "pre_projection.weight");
     defer request.draft_cb.free(pre_w);
@@ -831,7 +816,6 @@ pub fn draftTokenDevice(request: DraftDeviceRequest) !DraftDeviceResult {
     };
     profileEvalTensor(request.draft_cb, assistant_input, request.profile_sync);
     profile.preprojection_ns = profileElapsedNs(preprojection_started_at);
-    if (phase_trace) { const now = mtpPhaseNowNs(); std.debug.print("mtp_phase: pre_proj_us={d}\n", .{(now - phase_t0) / 1000}); phase_t0 = now; }
     var draft_frame_active = false;
     if (request.draft_cb.kind() == .metal and !request.draft_cb.decoderRuntimeHasActiveFrame() and !getenvBool("ANTFLY_GEMMA4_MTP_DISABLE_DRAFT_FRAME")) {
         draft_frame_active = request.draft_cb.decoderRuntimeBeginFrame() catch false;
@@ -871,7 +855,6 @@ pub fn draftTokenDevice(request: DraftDeviceRequest) !DraftDeviceResult {
         null,
     );
     defer request.draft_cb.free(assistant_hidden);
-    if (phase_trace) { const now = mtpPhaseNowNs(); std.debug.print("mtp_phase: assistant_forward_us={d}\n", .{(now - phase_t0) / 1000}); phase_t0 = now; }
     profileEvalTensor(request.draft_cb, assistant_hidden, request.profile_sync);
     profile.assistant_ns = profileElapsedNs(assistant_started_at);
 
@@ -883,7 +866,6 @@ pub fn draftTokenDevice(request: DraftDeviceRequest) !DraftDeviceResult {
     profileEvalTensor(request.draft_cb, projected, request.profile_sync);
     profile.postprojection_ns = profileElapsedNs(postprojection_started_at);
 
-    if (phase_trace) { const now = mtpPhaseNowNs(); std.debug.print("mtp_phase: post_proj_us={d}\n", .{(now - phase_t0) / 1000}); phase_t0 = now; }
     if (draft_frame_active) {
         draft_frame_active = false;
         try request.draft_cb.decoderRuntimeSubmitAndWaitFrame();
@@ -955,7 +937,6 @@ pub fn draftTokenDevice(request: DraftDeviceRequest) !DraftDeviceResult {
     };
     profile.argmax_ns = profileElapsedNs(argmax_started_at);
 
-    if (phase_trace) { std.debug.print("mtp_phase: lm_argmax_us={d} source={s}\n", .{ (mtpPhaseNowNs() - phase_t0) / 1000, @tagName(logit_source) }); }
     return .{
         .token = token,
         .projected_activation = projected,

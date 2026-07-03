@@ -74,7 +74,7 @@ const Config = struct {
 
 fn usage() void {
     std.debug.print(
-        \\usage: zig build bench-metal-q4-0-linear -- [--mode linear|q6-linear|q6-argmax|head-rope|pair|qkv|split-qkv|ffn|ple] [--in N] [--out N] [--kv-out N] [--warmup N] [--iters N] [--ops-per-frame N]
+        \\usage: zig build inference-metal-bench -- [--mode linear|q6-linear|q6-argmax|head-rope|pair|qkv|split-qkv|ffn|ple] [--in N] [--out N] [--kv-out N] [--warmup N] [--iters N] [--ops-per-frame N]
         \\
     , .{});
 }
