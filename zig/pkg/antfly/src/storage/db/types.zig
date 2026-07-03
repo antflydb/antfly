@@ -151,12 +151,14 @@ pub const IndexConfig = struct {
     name: []const u8,
     kind: IndexKind,
     config_json: []const u8,
+    coverage_generation: u64 = 0,
 
     pub fn clone(alloc: Allocator, cfg: IndexConfig) !IndexConfig {
         return .{
             .name = try alloc.dupe(u8, cfg.name),
             .kind = cfg.kind,
             .config_json = try alloc.dupe(u8, cfg.config_json),
+            .coverage_generation = cfg.coverage_generation,
         };
     }
 

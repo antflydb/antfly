@@ -2674,19 +2674,22 @@ pub const IndexManager = struct {
         self.bindPrimaryStore(store);
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
 
+        var stored_cfg = try indexConfigWithCoverageGeneration(self.alloc, cfg);
+        defer stored_cfg.deinit(self.alloc);
+
         const enrichment_checkpoint = self.enrichments.items.len;
         var enrichment_catalog_committed = false;
         errdefer if (!enrichment_catalog_committed) self.truncateEnrichments(enrichment_checkpoint);
 
-        const enrichments_changed = try self.ensureShorthandEnrichments(cfg);
+        const enrichments_changed = try self.ensureShorthandEnrichments(stored_cfg);
         const has_generated_after_enrichments = if (enrichments_changed)
             try self.computeGeneratedEnrichmentTargetCache()
         else
             false;
 
-        try self.openConfiguredIndex(store, cfg, true, false);
+        try self.openConfiguredIndex(store, stored_cfg, true, false);
         errdefer {
-            self.removeInMemory(cfg.name);
+            self.removeInMemory(stored_cfg.name);
         }
         const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCache();
         if (enrichments_changed) {
@@ -2694,7 +2697,7 @@ pub const IndexManager = struct {
             enrichment_catalog_committed = true;
         }
         self.persistCatalog(store) catch |err| {
-            self.removeInMemory(cfg.name);
+            self.removeInMemory(stored_cfg.name);
             if (enrichment_catalog_committed) {
                 self.storeGeneratedEnrichmentTargetCache(has_generated_after_enrichments);
             }
@@ -2709,6 +2712,17 @@ pub const IndexManager = struct {
         self.bindPrimaryStore(store);
         if (configs.len == 0) return;
 
+        var stored_configs = try self.alloc.alloc(types.IndexConfig, configs.len);
+        var stored_initialized: usize = 0;
+        defer {
+            for (stored_configs[0..stored_initialized]) |*stored_cfg| stored_cfg.deinit(self.alloc);
+            self.alloc.free(stored_configs);
+        }
+        for (configs, 0..) |cfg, i| {
+            stored_configs[i] = try indexConfigWithCoverageGeneration(self.alloc, cfg);
+            stored_initialized += 1;
+        }
+
         var opened = std.ArrayListUnmanaged([]const u8).empty;
         defer opened.deinit(self.alloc);
         errdefer {
@@ -2720,9 +2734,9 @@ pub const IndexManager = struct {
         errdefer if (!enrichment_catalog_committed) self.truncateEnrichments(enrichment_checkpoint);
 
         var enrichments_changed = false;
-        for (configs, 0..) |cfg, i| {
+        for (stored_configs, 0..) |cfg, i| {
             if (self.has(cfg.name)) return error.IndexAlreadyExists;
-            for (configs[0..i]) |prior| {
+            for (stored_configs[0..i]) |prior| {
                 if (std.mem.eql(u8, prior.name, cfg.name)) return error.IndexAlreadyExists;
             }
             enrichments_changed = (try self.ensureShorthandEnrichments(cfg)) or enrichments_changed;
@@ -2732,7 +2746,7 @@ pub const IndexManager = struct {
         else
             false;
 
-        for (configs) |cfg| {
+        for (stored_configs) |cfg| {
             try self.openConfiguredIndex(store, cfg, false, false);
             try opened.append(self.alloc, cfg.name);
         }
@@ -2756,9 +2770,11 @@ pub const IndexManager = struct {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
-        try self.openConfiguredIndex(store, cfg, true, false);
+        var stored_cfg = try indexConfigWithCoverageGeneration(self.alloc, cfg);
+        defer stored_cfg.deinit(self.alloc);
+        try self.openConfiguredIndex(store, stored_cfg, true, false);
         errdefer {
-            self.removeInMemory(cfg.name);
+            self.removeInMemory(stored_cfg.name);
         }
         try self.refreshGeneratedEnrichmentTargetCache();
     }
@@ -4900,14 +4916,14 @@ pub const IndexManager = struct {
 
     pub fn coverageGenerationForIndex(self: *const IndexManager, index_name: []const u8) ?u64 {
         for (self.dense_indexes.items) |entry| {
-            if (std.mem.eql(u8, entry.config.name, index_name)) return internal_keys.derivedCoverageGeneration(entry.config.config_json);
+            if (std.mem.eql(u8, entry.config.name, index_name)) return coverageGenerationForConfig(entry.config);
         }
         for (self.sparse_indexes.items) |entry| {
-            if (std.mem.eql(u8, entry.config.name, index_name)) return internal_keys.derivedCoverageGeneration(entry.config.config_json);
+            if (std.mem.eql(u8, entry.config.name, index_name)) return coverageGenerationForConfig(entry.config);
         }
         for (self.status_only_index_configs) |cfg| {
             if (std.mem.eql(u8, cfg.name, index_name) and (cfg.kind == .dense_vector or cfg.kind == .sparse_vector)) {
-                return internal_keys.derivedCoverageGeneration(cfg.config_json);
+                return coverageGenerationForConfig(cfg);
             }
         }
         return null;
@@ -11810,45 +11826,59 @@ fn isPrimaryDocumentCandidate(key: []const u8) bool {
     return true;
 }
 
+fn newCoverageGeneration() !u64 {
+    var generation: u64 = 0;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    while (generation == 0) try io_impl.io().randomSecure(std.mem.asBytes(&generation));
+    return generation;
+}
+
+fn indexConfigWithCoverageGeneration(alloc: Allocator, cfg: types.IndexConfig) !types.IndexConfig {
+    var stored_cfg = try types.IndexConfig.clone(alloc, cfg);
+    errdefer stored_cfg.deinit(alloc);
+    if (stored_cfg.coverage_generation == 0) stored_cfg.coverage_generation = try newCoverageGeneration();
+    return stored_cfg;
+}
+
+fn coverageGenerationForConfig(cfg: types.IndexConfig) u64 {
+    return internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json);
+}
+
+fn appendCatalogConfig(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, cfg: types.IndexConfig) !void {
+    try appendStr(out, alloc, cfg.name);
+    try out.append(alloc, @intFromEnum(cfg.kind));
+    try appendStr(out, alloc, cfg.config_json);
+    try appendU64(out, alloc, coverageGenerationForConfig(cfg));
+}
+
 fn serializeCatalog(alloc: Allocator, manager: *const IndexManager) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
 
     try out.appendSlice(alloc, "AIDX");
-    try appendU32(&out, alloc, 1);
+    try appendU32(&out, alloc, 2);
     const count = manager.text_indexes.items.len + manager.dense_indexes.items.len + manager.sparse_indexes.items.len + manager.algebraic_indexes.items.len + manager.status_only_index_configs.len;
     const graph_count = manager.graph_indexes.items.len;
     try appendU32(&out, alloc, @intCast(count + graph_count));
 
     for (manager.text_indexes.items) |entry| {
-        try appendStr(&out, alloc, entry.config.name);
-        try out.append(alloc, @intFromEnum(entry.config.kind));
-        try appendStr(&out, alloc, entry.config.config_json);
+        try appendCatalogConfig(&out, alloc, entry.config);
     }
     for (manager.dense_indexes.items) |entry| {
-        try appendStr(&out, alloc, entry.config.name);
-        try out.append(alloc, @intFromEnum(entry.config.kind));
-        try appendStr(&out, alloc, entry.config.config_json);
+        try appendCatalogConfig(&out, alloc, entry.config);
     }
     for (manager.sparse_indexes.items) |entry| {
-        try appendStr(&out, alloc, entry.config.name);
-        try out.append(alloc, @intFromEnum(entry.config.kind));
-        try appendStr(&out, alloc, entry.config.config_json);
+        try appendCatalogConfig(&out, alloc, entry.config);
     }
     for (manager.graph_indexes.items) |entry| {
-        try appendStr(&out, alloc, entry.config.name);
-        try out.append(alloc, @intFromEnum(entry.config.kind));
-        try appendStr(&out, alloc, entry.config.config_json);
+        try appendCatalogConfig(&out, alloc, entry.config);
     }
     for (manager.algebraic_indexes.items) |entry| {
-        try appendStr(&out, alloc, entry.config.name);
-        try out.append(alloc, @intFromEnum(entry.config.kind));
-        try appendStr(&out, alloc, entry.config.config_json);
+        try appendCatalogConfig(&out, alloc, entry.config);
     }
     for (manager.status_only_index_configs) |cfg| {
-        try appendStr(&out, alloc, cfg.name);
-        try out.append(alloc, @intFromEnum(cfg.kind));
-        try appendStr(&out, alloc, cfg.config_json);
+        try appendCatalogConfig(&out, alloc, cfg);
     }
 
     const owned = try alloc.dupe(u8, out.items);
@@ -11861,7 +11891,7 @@ fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]types.IndexConfig {
 
     var pos: usize = 4;
     const version = try readU32(data, &pos);
-    if (version != 1) return error.UnsupportedIndexCatalogVersion;
+    if (version != 1 and version != 2) return error.UnsupportedIndexCatalogVersion;
 
     const count = try readU32(data, &pos);
     var configs = try alloc.alloc(types.IndexConfig, count);
@@ -11888,10 +11918,16 @@ fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]types.IndexConfig {
         };
 
         const config_json = try alloc.dupe(u8, try readStr(data, &pos));
+        errdefer alloc.free(config_json);
+        const coverage_generation = if (version >= 2)
+            try readU64(data, &pos)
+        else
+            internal_keys.derivedCoverageGeneration(config_json);
         configs[i] = .{
             .name = name,
             .kind = kind,
             .config_json = config_json,
+            .coverage_generation = coverage_generation,
         };
         initialized += 1;
     }
@@ -11902,6 +11938,12 @@ fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]types.IndexConfig {
 fn appendU32(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: u32) !void {
     var bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &bytes, value, .little);
+    try out.appendSlice(alloc, &bytes);
+}
+
+fn appendU64(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: u64) !void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, value, .little);
     try out.appendSlice(alloc, &bytes);
 }
 
@@ -11917,12 +11959,56 @@ fn readU32(data: []const u8, pos: *usize) !u32 {
     return value;
 }
 
+fn readU64(data: []const u8, pos: *usize) !u64 {
+    if (pos.* + 8 > data.len) return error.InvalidIndexCatalog;
+    const value = std.mem.readInt(u64, data[pos.*..][0..8], .little);
+    pos.* += 8;
+    return value;
+}
+
 fn readStr(data: []const u8, pos: *usize) ![]const u8 {
     const len = try readU32(data, pos);
     if (pos.* + len > data.len) return error.InvalidIndexCatalog;
     const value = data[pos.* .. pos.* + len];
     pos.* += len;
     return value;
+}
+
+test "index catalog preserves coverage generation and migrates legacy generation" {
+    const alloc = std.testing.allocator;
+    const config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\"}";
+    const generation: u64 = 0x1234_5678_9abc_def0;
+
+    var manager = try IndexManager.init(alloc, ".");
+    defer manager.deinit();
+    manager.status_only_index_configs = try alloc.alloc(types.IndexConfig, 1);
+    manager.status_only_index_configs[0] = try types.IndexConfig.clone(alloc, .{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = config_json,
+        .coverage_generation = generation,
+    });
+
+    const encoded = try serializeCatalog(alloc, &manager);
+    defer alloc.free(encoded);
+    const decoded = try deserializeCatalog(alloc, encoded);
+    defer types.freeIndexConfigs(alloc, decoded);
+    try std.testing.expectEqual(@as(usize, 1), decoded.len);
+    try std.testing.expectEqual(generation, decoded[0].coverage_generation);
+
+    var legacy = std.ArrayListUnmanaged(u8).empty;
+    defer legacy.deinit(alloc);
+    try legacy.appendSlice(alloc, "AIDX");
+    try appendU32(&legacy, alloc, 1);
+    try appendU32(&legacy, alloc, 1);
+    try appendStr(&legacy, alloc, "semantic_idx");
+    try legacy.append(alloc, @intFromEnum(types.IndexKind.dense_vector));
+    try appendStr(&legacy, alloc, config_json);
+
+    const legacy_decoded = try deserializeCatalog(alloc, legacy.items);
+    defer types.freeIndexConfigs(alloc, legacy_decoded);
+    try std.testing.expectEqual(@as(usize, 1), legacy_decoded.len);
+    try std.testing.expectEqual(internal_keys.derivedCoverageGeneration(config_json), legacy_decoded[0].coverage_generation);
 }
 
 const DenseConfig = struct {

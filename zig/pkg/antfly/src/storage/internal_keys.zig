@@ -246,6 +246,11 @@ pub fn derivedCoverageGeneration(config_json: []const u8) u64 {
     return std.hash.Wyhash.hash(0x6472_636f_7665_7231, config_json);
 }
 
+pub fn derivedCoverageGenerationForConfig(coverage_generation: u64, config_json: []const u8) u64 {
+    if (coverage_generation != 0) return coverage_generation;
+    return derivedCoverageGeneration(config_json);
+}
+
 pub fn derivedCoverageOutcomePrefixAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);

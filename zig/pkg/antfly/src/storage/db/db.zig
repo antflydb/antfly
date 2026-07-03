@@ -10249,7 +10249,7 @@ pub const DB = struct {
                         item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     }
-                    item.coverage_skipped_count = try self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGeneration(cfg.config_json));
+                    item.coverage_skipped_count = try self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json));
                     if (async_indexing.dense_catch_up.active) {
                         item.catch_up_active = true;
                         item.backfill_active = true;
@@ -10272,7 +10272,7 @@ pub const DB = struct {
                         item.term_count = sparse_snapshot.term_count;
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     }
-                    item.coverage_skipped_count = try self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGeneration(cfg.config_json));
+                    item.coverage_skipped_count = try self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json));
                 },
                 .graph => {
                     if (self.core.graphIndex(cfg.name)) |entry| {
@@ -10398,7 +10398,7 @@ pub const DB = struct {
                             }
                         }
                     }
-                    item.coverage_skipped_count = try self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGeneration(cfg.config_json));
+                    item.coverage_skipped_count = try self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json));
                     if (!item.backfill_active and item.replay_target_sequence > 0 and item.doc_count < visible_doc_count) {
                         item.backfill_progress = @min(
                             1.0,
@@ -10428,7 +10428,7 @@ pub const DB = struct {
                             item.backfill_progress = progress;
                         }
                     }
-                    item.coverage_skipped_count = try self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGeneration(cfg.config_json));
+                    item.coverage_skipped_count = try self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json));
                     if (!item.backfill_active and item.replay_target_sequence > 0) {
                         item.backfill_progress = @min(
                             1.0,
@@ -10552,7 +10552,7 @@ pub const DB = struct {
                 visible_doc_count = @max(visible_doc_count, item.doc_count);
             }
             if (cfg.kind == .dense_vector or cfg.kind == .sparse_vector) {
-                item.coverage_skipped_count = self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGeneration(cfg.config_json)) catch item.coverage_skipped_count;
+                item.coverage_skipped_count = self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json)) catch item.coverage_skipped_count;
             }
             if (cfg.kind == .full_text) {
                 item.text_merge = self.core.index_manager.textMergeStatsSnapshotForIndex(cfg.name);
