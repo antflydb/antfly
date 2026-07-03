@@ -527,12 +527,18 @@ pub const MatchAllCandidates = struct {
     }
 };
 
+pub const MatchAllCandidateCollectOptions = struct {
+    candidate_limit: ?u32 = null,
+    constraints: ?*const NativeDocIdConstraints = null,
+};
+
 pub const MatchAllExecutor = struct {
     ctx: ?*anyopaque,
     collect_candidates: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
         req: types.SearchRequest,
+        options: MatchAllCandidateCollectOptions,
     ) anyerror!MatchAllCandidates,
     text_index_entry: *const fn (
         ctx: ?*anyopaque,
@@ -582,6 +588,13 @@ pub const MatchAllCandidateCollector = struct {
         lower: []const u8,
         upper: []const u8,
     ) anyerror![]docstore_mod.OwnedKVPair,
+    scan_store_range_with_context: ?*const fn (
+        ctx: ?*anyopaque,
+        lower: []const u8,
+        upper: []const u8,
+        scan_ctx: ?*anyopaque,
+        callback: docstore_mod.DocStore.ScanWithContextCallback,
+    ) anyerror!void = null,
     is_expired_key: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -5871,9 +5884,6 @@ pub fn searchMatchAll(
     executor: MatchAllExecutor,
 ) !types.SearchResult {
     try checkSearchRequestDeadline(req);
-    var candidates = try executor.collect_candidates(executor.ctx, alloc, req);
-    defer candidates.deinit(alloc);
-
     var native_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, req, .{
         .ctx = executor.ctx,
         .text_index_entry = executor.text_index_entry,
@@ -5884,12 +5894,24 @@ pub fn searchMatchAll(
         .apply_live_all_docs = true,
     });
     defer native_constraints.deinit(alloc);
+
+    const exact_sort_budget = lateVisibilityExactCandidateBudget();
+    var candidates = executor.collect_candidates(executor.ctx, alloc, req, if (req.order_by.len > 0) .{
+        .candidate_limit = exact_sort_budget,
+        .constraints = &native_constraints,
+    } else .{}) catch |err| {
+        if (req.order_by.len > 0 and err == error.QueryCandidateBudgetExceeded) {
+            std.log.warn("match_all stored sort candidate budget exceeded candidates>{d} budget={d}", .{ exact_sort_budget, exact_sort_budget });
+        }
+        return err;
+    };
+    defer candidates.deinit(alloc);
     try applyMatchAllDocIdConstraintsAlloc(alloc, &candidates, &native_constraints);
     try checkSearchRequestDeadline(req);
     if (req.order_by.len > 0) {
         const candidate_count: u32 = @intCast(@min(candidates.items.len, @as(usize, std.math.maxInt(u32))));
-        enforceLateVisibilityExactCandidateBudget(candidate_count, lateVisibilityExactCandidateBudget()) catch |err| {
-            std.log.warn("match_all stored sort candidate budget exceeded candidates={d} budget={d}", .{ candidate_count, lateVisibilityExactCandidateBudget() });
+        enforceLateVisibilityExactCandidateBudget(candidate_count, exact_sort_budget) catch |err| {
+            std.log.warn("match_all stored sort candidate budget exceeded candidates={d} budget={d}", .{ candidate_count, exact_sort_budget });
             return err;
         };
     }
@@ -6056,47 +6078,109 @@ pub fn collectMatchAllCandidates(
     req: types.SearchRequest,
     collector: MatchAllCandidateCollector,
 ) !MatchAllCandidates {
+    return try collectMatchAllCandidatesWithOptions(alloc, req, collector, .{});
+}
+
+pub fn collectMatchAllCandidatesWithOptions(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    collector: MatchAllCandidateCollector,
+    options: MatchAllCandidateCollectOptions,
+) !MatchAllCandidates {
     _ = req.index_name;
 
     const lower = try internal_keys.documentRangeLowerAlloc(alloc, "");
     defer alloc.free(lower);
 
-    const docs = try collector.scan_store_range(collector.ctx, alloc, lower, "");
-    defer docstore_mod.DocStore.freeResults(alloc, docs);
+    var state = MatchAllCandidateCollectState{
+        .alloc = alloc,
+        .req = req,
+        .collector = collector,
+        .options = options,
+    };
+    defer state.seen.deinit(alloc);
+    errdefer state.deinitCandidates();
 
-    var candidates = std.ArrayListUnmanaged(MatchAllCandidate).empty;
-    var seen = std.StringHashMapUnmanaged(void){};
-    defer seen.deinit(alloc);
-    errdefer {
-        for (candidates.items) |*item| item.deinit(alloc);
-        candidates.deinit(alloc);
+    if (collector.scan_store_range_with_context) |scan| {
+        try scan(collector.ctx, lower, "", &state, MatchAllCandidateCollectState.scanEntry);
+    } else {
+        const docs = try collector.scan_store_range(collector.ctx, alloc, lower, "");
+        defer docstore_mod.DocStore.freeResults(alloc, docs);
+        for (docs) |doc| try state.consumeStoreKey(doc.key);
     }
 
-    for (docs) |doc| {
-        if (!internal_keys.isPrimaryDocumentKey(doc.key)) continue;
-        const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, doc.key)) orelse continue;
-        errdefer alloc.free(raw_key);
-        if (try collector.is_expired_key(collector.ctx, alloc, raw_key)) {
-            alloc.free(raw_key);
-            continue;
+    return .{ .items = try state.candidates.toOwnedSlice(alloc) };
+}
+
+const MatchAllCandidateCollectState = struct {
+    alloc: Allocator,
+    req: types.SearchRequest,
+    collector: MatchAllCandidateCollector,
+    options: MatchAllCandidateCollectOptions,
+    candidates: std.ArrayListUnmanaged(MatchAllCandidate) = .empty,
+    seen: std.StringHashMapUnmanaged(void) = .{},
+    scanned: usize = 0,
+
+    fn deinitCandidates(self: *@This()) void {
+        for (self.candidates.items) |*item| item.deinit(self.alloc);
+        self.candidates.deinit(self.alloc);
+    }
+
+    fn scanEntry(ctx: ?*anyopaque, key: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+        const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        try self.consumeStoreKey(key);
+        return .@"continue";
+    }
+
+    fn consumeStoreKey(self: *@This(), store_key: []const u8) !void {
+        self.scanned += 1;
+        if (self.scanned % 1024 == 0) try checkSearchRequestDeadline(self.req);
+
+        if (!internal_keys.isPrimaryDocumentKey(store_key)) return;
+        var raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, store_key)) orelse return;
+        errdefer self.alloc.free(raw_key);
+
+        if (try self.collector.is_expired_key(self.collector.ctx, self.alloc, raw_key)) {
+            self.alloc.free(raw_key);
+            return;
         }
-        if (seen.contains(raw_key)) {
-            alloc.free(raw_key);
-            continue;
+
+        if (self.seen.contains(raw_key)) {
+            self.alloc.free(raw_key);
+            return;
         }
-        const ordinal = if (collector.lookup_doc_ordinal) |lookup|
-            try lookup(collector.ctx, alloc, raw_key, req.identity_read_generation)
+
+        const ordinal = if (self.collector.lookup_doc_ordinal) |lookup|
+            try lookup(self.collector.ctx, self.alloc, raw_key, self.req.identity_read_generation)
         else
             null;
-        try seen.put(alloc, raw_key, {});
-        try candidates.append(alloc, .{
+
+        var candidate = MatchAllCandidate{
             .id = raw_key,
             .ordinal = ordinal,
-        });
-    }
+        };
+        raw_key = @constCast(&[_]u8{});
 
-    return .{ .items = try candidates.toOwnedSlice(alloc) };
-}
+        if (self.options.constraints) |constraints| {
+            if (!matchAllCandidateAllowed(candidate, constraints)) {
+                candidate.deinit(self.alloc);
+                return;
+            }
+        }
+
+        if (self.options.candidate_limit) |limit| {
+            if (self.candidates.items.len >= limit) {
+                candidate.deinit(self.alloc);
+                return error.QueryCandidateBudgetExceeded;
+            }
+        }
+
+        errdefer candidate.deinit(self.alloc);
+        try self.seen.put(self.alloc, candidate.id, {});
+        try self.candidates.append(self.alloc, candidate);
+        candidate.id = @constCast(&[_]u8{});
+    }
+};
 
 pub fn textQueryToSearchQuery(
     alloc: Allocator,
@@ -6867,20 +6951,35 @@ fn testCollectMatchAllCandidatesCallback(
     ctx: ?*anyopaque,
     alloc: Allocator,
     _: types.SearchRequest,
+    options: MatchAllCandidateCollectOptions,
 ) anyerror!MatchAllCandidates {
     const test_ctx: *const TestMatchAllCtx = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-    var out = try alloc.alloc(MatchAllCandidate, test_ctx.ids.len);
+    var out = std.ArrayListUnmanaged(MatchAllCandidate).empty;
     var initialized: usize = 0;
     errdefer {
-        for (out[0..initialized]) |*candidate| candidate.deinit(alloc);
-        if (out.len > 0) alloc.free(out);
+        for (out.items[0..initialized]) |*candidate| candidate.deinit(alloc);
+        out.deinit(alloc);
     }
     for (test_ctx.ids, 0..) |id, i| {
         const ordinal = if (i < test_ctx.ordinals.len) test_ctx.ordinals[i] else null;
-        out[i] = .{ .id = try alloc.dupe(u8, id), .ordinal = ordinal };
+        var candidate = MatchAllCandidate{ .id = try alloc.dupe(u8, id), .ordinal = ordinal };
+        if (options.constraints) |constraints| {
+            if (!matchAllCandidateAllowed(candidate, constraints)) {
+                candidate.deinit(alloc);
+                continue;
+            }
+        }
+        if (options.candidate_limit) |limit| {
+            if (out.items.len >= limit) {
+                candidate.deinit(alloc);
+                return error.QueryCandidateBudgetExceeded;
+            }
+        }
+        try out.append(alloc, candidate);
+        candidate.id = @constCast(&[_]u8{});
         initialized += 1;
     }
-    return .{ .items = out };
+    return .{ .items = try out.toOwnedSlice(alloc) };
 }
 
 fn testMatchAllLoadProjectedCallback(
@@ -6995,6 +7094,57 @@ test "match_all candidate ordinal lookup uses identity read generation" {
     try std.testing.expectEqual(@as(?u64, 77), harness.seen_generation);
     try std.testing.expectEqual(@as(usize, 1), candidates.items.len);
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 9), candidates.items[0].ordinal);
+}
+
+test "match_all streaming collection stops after exact sort budget" {
+    const alloc = std.testing.allocator;
+    const encoded = [_][]u8{
+        try internal_keys.documentKeyAlloc(alloc, "doc:a"),
+        try internal_keys.documentKeyAlloc(alloc, "doc:b"),
+        try internal_keys.documentKeyAlloc(alloc, "doc:c"),
+    };
+    defer for (encoded) |key| alloc.free(key);
+
+    const Harness = struct {
+        keys: []const []const u8,
+        visited: usize = 0,
+
+        fn scanStoreRange(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror![]docstore_mod.OwnedKVPair {
+            return error.UnexpectedTestCall;
+        }
+
+        fn scanStoreRangeWithContext(
+            ctx: ?*anyopaque,
+            _: []const u8,
+            _: []const u8,
+            scan_ctx: ?*anyopaque,
+            callback: docstore_mod.DocStore.ScanWithContextCallback,
+        ) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            for (self.keys) |key| {
+                self.visited += 1;
+                if (try callback(scan_ctx, key, "{}") == .stop) return;
+            }
+        }
+
+        fn isExpiredKey(_: ?*anyopaque, _: Allocator, _: []const u8) anyerror!bool {
+            return false;
+        }
+    };
+
+    var harness = Harness{ .keys = &encoded };
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, collectMatchAllCandidatesWithOptions(alloc, .{}, .{
+        .ctx = &harness,
+        .scan_store_range = Harness.scanStoreRange,
+        .scan_store_range_with_context = Harness.scanStoreRangeWithContext,
+        .is_expired_key = Harness.isExpiredKey,
+    }, .{ .candidate_limit = 1 }));
+    try std.testing.expectEqual(@as(usize, 2), harness.visited);
 }
 
 test "match_all consumes resolved ordinal filters without doc id projection" {

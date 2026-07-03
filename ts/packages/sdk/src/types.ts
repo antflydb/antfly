@@ -55,14 +55,51 @@ export type QueryHit = components["schemas"]["QueryHit"];
 export type QueryHitsTotal = components["schemas"]["QueryHitsTotal"];
 export type QueryResponses = components["schemas"]["QueryResponses"];
 
+export interface QueryHitsTotalFormatOptions {
+  locale?: Intl.LocalesArgument;
+  singular?: string;
+  plural?: string;
+}
+
+/** Returns structured hit-count metadata, including whether the value is exact. */
 export function queryResultHitsTotal(result: QueryResult | null | undefined): QueryHitsTotal | undefined {
   return result?.hits?.total ?? undefined;
 }
 
+/**
+ * Returns only the numeric hit-count value.
+ *
+ * For user-facing output, inspect `total.relation` or use `formatQueryHitsTotal`
+ * so lower-bound totals are not presented as exact counts.
+ */
 export function queryHitsTotalValue(total: QueryHitsTotal | null | undefined): number | undefined {
   return total?.value;
 }
 
+/** Returns true for exact totals, false for lower-bound totals, and undefined when absent. */
+export function queryHitsTotalIsExact(total: QueryHitsTotal | null | undefined): boolean | undefined {
+  return total == null ? undefined : total.relation === "exact";
+}
+
+/** Formats hit-count metadata without losing lower-bound semantics. */
+export function formatQueryHitsTotal(
+  total: QueryHitsTotal | null | undefined,
+  options: QueryHitsTotalFormatOptions = {},
+): string | undefined {
+  if (total == null) return undefined;
+  const singular = options.singular ?? "hit";
+  const plural = options.plural ?? `${singular}s`;
+  const noun = total.value === 1 ? singular : plural;
+  const prefix = total.relation === "gte" ? ">= " : "";
+  return `${prefix}${new Intl.NumberFormat(options.locale).format(total.value)} ${noun}`;
+}
+
+/**
+ * Returns only the numeric hit-count value from a query result.
+ *
+ * For user-facing output, prefer `queryResultHitsTotal` plus
+ * `formatQueryHitsTotal` so lower-bound totals are not rendered as exact.
+ */
 export function queryResultTotalHits(result: QueryResult | null | undefined): number | undefined {
   return queryHitsTotalValue(queryResultHitsTotal(result));
 }

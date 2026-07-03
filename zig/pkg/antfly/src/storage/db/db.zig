@@ -12650,14 +12650,16 @@ pub const DB = struct {
         ctx: ?*anyopaque,
         alloc: Allocator,
         req: types.SearchRequest,
+        options: db_query_search.MatchAllCandidateCollectOptions,
     ) anyerror!db_query_search.MatchAllCandidates {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try db_query_search.collectMatchAllCandidates(alloc, req, .{
+        return try db_query_search.collectMatchAllCandidatesWithOptions(alloc, req, .{
             .ctx = self,
             .scan_store_range = scanStoreRangeCallback,
+            .scan_store_range_with_context = scanStoreRangeWithContextCallback,
             .is_expired_key = isExpiredDocumentKeyCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalCallback,
-        });
+        }, options);
     }
 
     fn lookupLiveDocOrdinalCallback(
@@ -12751,6 +12753,17 @@ pub const DB = struct {
     ) anyerror![]docstore_mod.OwnedKVPair {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.core.scanStoreRange(alloc, lower, upper);
+    }
+
+    fn scanStoreRangeWithContextCallback(
+        ctx: ?*anyopaque,
+        lower: []const u8,
+        upper: []const u8,
+        scan_ctx: ?*anyopaque,
+        callback: docstore_mod.DocStore.ScanWithContextCallback,
+    ) anyerror!void {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.core.scanStoreRangeWithContext(lower, upper, .{}, scan_ctx, callback);
     }
 
     fn searchGraph(self: *DB, alloc: Allocator, req: types.SearchRequest, graph_query: graph_query_mod.GraphQuery, base_hits: ?[]const types.SearchHit) !types.SearchResult {

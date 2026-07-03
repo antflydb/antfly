@@ -266,7 +266,9 @@ export type {
 } from "./types.js";
 export {
   embedderProviders,
+  formatQueryHitsTotal,
   generatorProviders,
+  queryHitsTotalIsExact,
   queryHitsTotalValue,
   queryResultHitsTotal,
   queryResultTotalHits,

@@ -16,7 +16,12 @@ import type {
   QueryStringQuery,
   TermQuery,
 } from "../src/types.js";
-import { queryResultHitsTotal, queryResultTotalHits } from "../src/types.js";
+import {
+  formatQueryHitsTotal,
+  queryHitsTotalIsExact,
+  queryResultHitsTotal,
+  queryResultTotalHits,
+} from "../src/types.js";
 
 describe("Antfly Query Type Integration", () => {
   describe("QueryRequest type safety", () => {
@@ -348,7 +353,7 @@ describe("Antfly Query Type Integration", () => {
 });
 
 describe("Query total helpers", () => {
-  it("preserves the structured total relation when callers need display semantics", () => {
+  it("preserves lower-bound total semantics for display", () => {
     const result: QueryResult = {
       hits: {
         total: { value: 42, relation: "gte" },
@@ -357,6 +362,9 @@ describe("Query total helpers", () => {
     };
 
     expect(queryResultHitsTotal(result)).toEqual({ value: 42, relation: "gte" });
+    expect(queryHitsTotalIsExact(result.hits?.total)).toBe(false);
+    expect(formatQueryHitsTotal(result.hits?.total)).toBe(">= 42 hits");
+    expect(formatQueryHitsTotal({ value: 1, relation: "exact" })).toBe("1 hit");
     expect(queryResultTotalHits(result)).toBe(42);
   });
 });
