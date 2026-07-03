@@ -3829,6 +3829,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table write source backs up a portable local table",
             "provisioned table restore rejects mismatched doc identity namespace",
             "provisioned table restore retry skips exact incomplete restore state with active writer",
+            "provisioned restore repair source deinit cancels sleeping retry worker",
             "provisioned restore repair open rejects stale doc identity namespace",
             "write cache blocks same-root generation replacement while stale lease stays live",
             "provisioned create index updates cached writer in place",
@@ -3851,6 +3852,7 @@ pub fn build(b: *std.Build) void {
             "managed startup catch-up marks FileNotFound index open terminal degraded",
             "managed startup catch-up finishes restore repair before terminal index load degradation",
             "managed source status-only open drains stale pending close before retry",
+            "hosted status-only open drains stale pending close before retry",
             "write cache HA gate clear drains inactive pending closes before returning",
         },
         .test_runner = .{

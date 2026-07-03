@@ -48,7 +48,7 @@ pub fn getTimingStats() TimingStats {
 
 fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingStats, has_runtime: bool) void {
     std.debug.print(
-        "metal_executor_ms: runtime_prepare_calls={d} runtime_prepare={d} runtime_prepare_family={d} runtime_prepare_greedy={d} runtime_prepare_fast_hits={d} prefill_calls={d} prefill_prepare={d} prefill_direct_last={d} prefill_direct_family={d} prefill_family_project={d} prefill_family_span_prep={d} prefill_family_quant_attn={d} prefill_family_block_apply={d} prefill_family_frame_wait={d} prefill_family_frame_gpu={d} prefill_fallback={d} decode_begin={d} sample_calls={d} sample_direct={d} sample_fallback={d} greedy_calls={d} greedy_direct={d} greedy_fallback={d} greedy_token_handoff_attempts={d} greedy_token_handoff_hits={d} greedy_token_handoff_fallbacks={d} greedy_token_seeds={d} ensure_prepared_calls={d} ensure_prepared={d} ensure_sync={d} ensure_family={d} ensure_greedy={d} ensure_fast_hits={d}\n",
+        "metal_executor_ms: runtime_prepare_calls={d} runtime_prepare={d} runtime_prepare_family={d} runtime_prepare_greedy={d} runtime_prepare_fast_hits={d} prefill_calls={d} prefill_prepare={d} prefill_direct_last={d} prefill_direct_family={d} prefill_family_project={d} prefill_family_span_prep={d} prefill_family_quant_attn={d} prefill_family_block_apply={d} prefill_family_frame_wait={d} prefill_family_frame_gpu={d} prefill_fallback={d} decode_begin={d} sample_calls={d} sample_direct={d} sample_fallback={d} greedy_calls={d} greedy_direct={d} greedy_fallback={d} greedy_token_handoff_attempts={d} greedy_token_handoff_hits={d} greedy_token_handoff_fallbacks={d} greedy_token_seeds={d}\n",
         .{
             metal_stats.runtime_prepare_calls,
             @divTrunc(metal_stats.runtime_prepare_nanos, std.time.ns_per_ms),
@@ -77,6 +77,11 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
             metal_stats.decode_greedy_device_token_handoff_hits,
             metal_stats.decode_greedy_device_token_handoff_fallbacks,
             metal_stats.decode_greedy_device_token_seeds,
+        },
+    );
+    std.debug.print(
+        "metal_executor_ms: ensure_prepared_calls={d} ensure_prepared={d} ensure_sync={d} ensure_family={d} ensure_greedy={d} ensure_fast_hits={d}\n",
+        .{
             metal_stats.ensure_prepared_calls,
             @divTrunc(metal_stats.ensure_prepared_nanos, std.time.ns_per_ms),
             @divTrunc(metal_stats.ensure_prepared_sync_nanos, std.time.ns_per_ms),

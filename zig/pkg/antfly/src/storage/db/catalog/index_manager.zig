@@ -766,6 +766,7 @@ pub const IndexManager = struct {
     // and retry/backoff state for self-healing (retryFailedIndexLoads).
     // Keys are duped index names; err_name values are static @errorName memory.
     failed_index_loads: std.StringHashMapUnmanaged(FailedIndexLoad) = .empty,
+    index_load_states: std.StringHashMapUnmanaged(IndexLoadState) = .empty,
 
     pub const FailedIndexLoad = struct {
         err_name: []const u8,
@@ -773,6 +774,11 @@ pub const IndexManager = struct {
         // Monotonic deadline before which retryFailedIndexLoads skips this
         // index. 0 = due immediately (first retry happens on the next tick).
         next_retry_ns: u64 = 0,
+    };
+
+    const IndexLoadState = enum {
+        loading,
+        complete,
     };
 
     pub const TextIndex = struct {
@@ -1575,6 +1581,8 @@ pub const IndexManager = struct {
         self.clearStatusOnlyIndexConfigs();
         self.clearFailedIndexLoads();
         self.failed_index_loads.deinit(self.alloc);
+        self.clearIndexLoadStates();
+        self.index_load_states.deinit(self.alloc);
         for (self.enrichments.items) |*entry| entry.deinit(self.alloc);
         for (self.resolvers.items) |*entry| entry.deinit(self.alloc);
         self.text_indexes.deinit(self.alloc);
@@ -1612,6 +1620,30 @@ pub const IndexManager = struct {
 
     fn dropFailedIndexLoad(self: *IndexManager, name: []const u8) void {
         if (self.failed_index_loads.fetchRemove(name)) |entry| self.alloc.free(entry.key);
+    }
+
+    fn clearIndexLoadStates(self: *IndexManager) void {
+        var it = self.index_load_states.keyIterator();
+        while (it.next()) |key| self.alloc.free(key.*);
+        self.index_load_states.clearRetainingCapacity();
+    }
+
+    fn beginIndexLoadNoLock(self: *IndexManager, name: []const u8) !void {
+        const gop = try self.index_load_states.getOrPut(self.alloc, name);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.alloc.dupe(u8, name);
+        }
+        gop.value_ptr.* = .loading;
+    }
+
+    fn completeIndexLoadNoLock(self: *IndexManager, name: []const u8) void {
+        if (self.index_load_states.getPtr(name)) |state| state.* = .complete;
+    }
+
+    pub fn indexLoadComplete(self: *IndexManager, name: []const u8) bool {
+        if (!self.catalog_mutex.tryLockShared()) return false;
+        defer self.catalog_mutex.unlockShared();
+        return (self.index_load_states.get(name) orelse .complete) == .complete;
     }
 
     fn appendStatusOnlyConfig(self: *IndexManager, cfg: types.IndexConfig) !void {
@@ -1704,6 +1736,8 @@ pub const IndexManager = struct {
                 self.dropFailedIndexLoad(name);
                 continue;
             };
+            try self.beginIndexLoadNoLock(cfg.name);
+            defer self.completeIndexLoadNoLock(cfg.name);
             var opened = self.openConfiguredIndexDetached(store, cfg, true, false) catch |err| {
                 const record = self.failed_index_loads.getPtr(name) orelse continue;
                 record.err_name = @errorName(err);
@@ -2583,6 +2617,18 @@ pub const IndexManager = struct {
         allow_backfill: bool,
         read_only: bool,
     ) !void {
+        var marked_loading: usize = 0;
+        errdefer {
+            for (configs[0..marked_loading]) |cfg| self.completeIndexLoadNoLock(cfg.name);
+        }
+        for (configs) |cfg| {
+            try self.beginIndexLoadNoLock(cfg.name);
+            marked_loading += 1;
+        }
+        defer {
+            for (configs) |cfg| self.completeIndexLoadNoLock(cfg.name);
+        }
+
         const Store = @TypeOf(store);
         const WorkerState = struct {
             manager: *IndexManager,
@@ -6026,6 +6072,8 @@ pub const IndexManager = struct {
     }
 
     fn openConfiguredIndex(self: *IndexManager, store: anytype, cfg: types.IndexConfig, allow_backfill: bool, read_only: bool) !void {
+        try self.beginIndexLoadNoLock(cfg.name);
+        defer self.completeIndexLoadNoLock(cfg.name);
         try self.ensureConfiguredIndexDir(cfg);
         var opened = try self.openConfiguredIndexDetached(store, cfg, allow_backfill, read_only);
         errdefer opened.deinit(self);
@@ -16468,6 +16516,32 @@ test "remove status-only malformed dense config drops catalog entry" {
     try std.testing.expect(manager.get("bad_dense") == null);
     try std.testing.expect(manager.loadFailure("bad_dense") == null);
     try std.testing.expectEqual(@as(usize, 0), manager.status_only_index_configs.len);
+}
+
+test "index load state tracks generic index names independently" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "generic-index-load-state");
+    defer cleanupIndexManagerDir(path);
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+
+    try std.testing.expect(manager.indexLoadComplete("ft_v1"));
+    try std.testing.expect(manager.indexLoadComplete("sp_v1"));
+
+    try manager.beginIndexLoadNoLock("ft_v1");
+    try manager.beginIndexLoadNoLock("sp_v1");
+    try std.testing.expect(!manager.indexLoadComplete("ft_v1"));
+    try std.testing.expect(!manager.indexLoadComplete("sp_v1"));
+    try std.testing.expect(manager.indexLoadComplete("dv_v1"));
+
+    manager.completeIndexLoadNoLock("ft_v1");
+    try std.testing.expect(manager.indexLoadComplete("ft_v1"));
+    try std.testing.expect(!manager.indexLoadComplete("sp_v1"));
+
+    manager.completeIndexLoadNoLock("sp_v1");
+    try std.testing.expect(manager.indexLoadComplete("sp_v1"));
 }
 
 test "dense artifact preload session reuses cached raw values across calls" {

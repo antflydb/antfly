@@ -109,6 +109,7 @@ var test_before_batch_execution_hook: ?TestExecutionHook = null;
 var test_before_drop_table_delete_hook: ?TestExecutionHook = null;
 var test_before_drop_index_work_hook: ?TestExecutionHook = null;
 var test_before_restore_work_hook: ?TestExecutionHook = null;
+var test_before_restore_repair_retry_sleep_hook: ?TestExecutionHook = null;
 var test_after_startup_catch_up_replay_pass_hook: ?TestStartupCatchUpReplayPassHook = null;
 
 const dropped_table_trash_dir_name = ".antfly-drop-trash";
@@ -183,6 +184,12 @@ fn runTestBeforeDropIndexWorkHook() void {
 fn runTestBeforeRestoreWorkHook() void {
     if (comptime builtin.is_test) {
         if (test_before_restore_work_hook) |hook| hook.run(hook.ptr);
+    }
+}
+
+fn runTestBeforeRestoreRepairRetrySleepHook() void {
+    if (comptime builtin.is_test) {
+        if (test_before_restore_repair_retry_sleep_hook) |hook| hook.run(hook.ptr);
     }
 }
 
@@ -1072,8 +1079,8 @@ pub const ProvisionedTableWriteCache = struct {
     }
 
     pub fn clear(self: *ProvisionedTableWriteCache) void {
-        lockAtomic(&self.entry_lifecycle_mutex);
-        defer self.entry_lifecycle_mutex.unlock();
+        lockAtomic(@constCast(&self.entry_lifecycle_mutex));
+        defer @constCast(&self.entry_lifecycle_mutex).unlock();
         self.retired_entries.ensureUnusedCapacity(self.alloc, self.entries.items.len) catch return;
         self.closing_entries.ensureUnusedCapacity(self.alloc, self.entries.items.len) catch return;
 
@@ -1125,8 +1132,8 @@ pub const ProvisionedTableWriteCache = struct {
             if (entry.auto_bulk_ingest_finish_requested) stats.auto_bulk_ingest_finish_requested_entries += 1;
             accumulateDiagnosticsLsmStats(&stats, entry.db.trySnapshotLsmMaintenanceStats());
         }
-        lockAtomic(&self.entry_lifecycle_mutex);
-        defer self.entry_lifecycle_mutex.unlock();
+        lockAtomic(@constCast(&self.entry_lifecycle_mutex));
+        defer @constCast(&self.entry_lifecycle_mutex).unlock();
         stats.retired_entries = @intCast(self.retired_entries.items.len + self.closing_entries.items.len);
         for (self.retired_entries.items) |entry| {
             stats.retired_active_leases += entry.active_leases;
@@ -4119,7 +4126,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.drainDroppedTableDeletes();
         const io = self.table_activity_threaded.io();
         self.restore_repair_shutdown.store(true, .release);
-        self.restore_repair_work_group.await(io) catch {};
+        self.restore_repair_work_group.cancel(io);
         self.restore_repair_completion_group.await(io) catch {};
         self.freeRestoreRepairCompletions();
         self.freeWriteCoalesceQueues();
@@ -6913,7 +6920,10 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []u8,
 
         fn sleepRetry(self: *@This()) void {
-            self.source.table_activity_threaded.io().sleep(Io.Duration.fromMilliseconds(100), .awake) catch {};
+            runTestBeforeRestoreRepairRetrySleepHook();
+            self.source.table_activity_threaded.io().sleep(Io.Duration.fromMilliseconds(100), .awake) catch |err| switch (err) {
+                error.Canceled => Io.recancel(self.source.table_activity_threaded.io()),
+            };
         }
 
         fn runAndDeinit(work: *@This()) Io.Cancelable!void {
@@ -15074,6 +15084,102 @@ test "provisioned table restore retry skips exact incomplete restore state with 
         .backup_root = backup_root,
         .manifest = &manifest,
     });
+}
+
+test "provisioned restore repair source deinit cancels sleeping retry worker" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), ".", alloc);
+    defer alloc.free(cwd);
+    const path = try std.fmt.allocPrint(alloc, "{s}/.zig-cache/tmp/{s}/provisioned-restore-retry-deinit-cancel", .{ cwd, tmp.sub_path });
+    defer alloc.free(path);
+
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
+    defer alloc.free(db_path);
+
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .description = "docs table",
+                    .schema_json = "",
+                    .read_schema_json = "",
+                    .indexes_json = tables_api.default_indexes_json,
+                    .replication_sources_json = "[]",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
+    _ = try source.source().createTable(alloc, "docs", .{});
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .timestamp_ns = 1,
+    });
+
+    try db_mod.DB.markRestorePrimaryRestoredForPath(alloc, db_path, "snap1", "local", "snap1/groups/7001", 7001);
+    try std.testing.expect(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path));
+    source.testingMarkGroupOperationActive("docs", 7001);
+
+    const HookCtx = struct {
+        seen: std.atomic.Value(bool) = .init(false),
+
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.seen.store(true, .release);
+        }
+    };
+    var hook_ctx = HookCtx{};
+    test_before_restore_repair_retry_sleep_hook = .{ .ptr = &hook_ctx, .run = HookCtx.run };
+    defer test_before_restore_repair_retry_sleep_hook = null;
+
+    source.requestRestoreRepairCatchUp("docs", 7001);
+    const wait_start_ns = platform_time.monotonicNs();
+    while (!hook_ctx.seen.load(.acquire)) {
+        if (platform_time.monotonicNs() -| wait_start_ns > std.time.ns_per_s) return error.TestUnexpectedResult;
+        io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+
+    const deinit_start_ns = platform_time.monotonicNs();
+    source.deinit();
+    const deinit_elapsed_ns = platform_time.monotonicNs() -| deinit_start_ns;
+    try std.testing.expect(deinit_elapsed_ns < 75 * std.time.ns_per_ms);
 }
 
 test "provisioned table write source backs up a portable local table" {
@@ -25258,10 +25364,141 @@ test "write cache HA gate clear drains inactive pending closes before returning"
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), write_cache.closing_entries.items.len);
 
-    const fake_gate: db_mod.HAWriteGate = .{ .primary = @ptrFromInt(0x1000) };
-    write_cache.setHAWriteGate(fake_gate);
+    const ha_log_path_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-ha-clear-drain-log", .{tmp.sub_path});
+    defer alloc.free(ha_log_path_raw);
+    const ha_log_path = try alloc.dupeZ(u8, ha_log_path_raw);
+    defer alloc.free(ha_log_path);
+    const ha_slots_path_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-ha-clear-drain-slots", .{tmp.sub_path});
+    defer alloc.free(ha_slots_path_raw);
+    const ha_slots_path = try alloc.dupeZ(u8, ha_slots_path_raw);
+    defer alloc.free(ha_slots_path);
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path.ptr, ha_slots_path.ptr, .{
+        .cluster_id = 700,
+        .shard_id = 1,
+        .table_id = 7,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+
+    write_cache.setHAWriteGate(.{ .primary = &primary });
     try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), write_cache.closing_entries.items.len);
+}
+
+test "hosted status-only open drains stale pending close before retry" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-status-only-pending-close", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    defer closeHostedManagedDbCacheForRoot(replica_root_dir);
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"indexes\":[]}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const Router = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, group_id: u64) raft_mod.HostedReplicaStatus {
+            return if (group_id == 7001) .active else .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, group_id: u64) ?u64 {
+            return if (group_id == 7001) 1 else null;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
+            _ = node_id;
+            return if (group_id == 7001) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+    };
+
+    const Executor = struct {
+        fn iface() http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return error.UnexpectedHttpRequest;
+        }
+    };
+
+    var generation: u64 = 0;
+    var source = HostedProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface(), Router.iface(), Executor.iface());
+    _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&generation));
+
+    const hosted_cache = try hostedManagedDbCacheForRoot(replica_root_dir);
+    var writer = try source.getOrOpenCachedDbMode(hosted_cache, path, 7001, "docs", .default_async);
+    writer.deinit(hosted_cache.write_cache.alloc);
+    try std.testing.expectEqual(@as(usize, 1), hosted_cache.write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hosted_cache.write_cache.closing_entries.items.len);
+
+    generation = 1;
+    var status_only = try source.getOrOpenCachedDbMode(hosted_cache, path, 7001, "docs", .status_only);
+    defer status_only.deinit(hosted_cache.write_cache.alloc);
+    try std.testing.expect(status_only.owned_db != null);
+    try std.testing.expectEqual(@as(usize, 0), hosted_cache.write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hosted_cache.write_cache.closing_entries.items.len);
 }
 
 fn testingVisibleRootGenerationSource(value: *u64) table_reads.GroupVisibleRootGenerationSource {
