@@ -724,8 +724,9 @@ pub const DBCore = struct {
     }
 
     pub fn saveAppliedSequence(self: *DBCore, index_name: []const u8, sequence: u64) !void {
-        const config_hash = if (self.index_manager.get(index_name)) |cfg|
-            types.indexConfigHash(cfg.*)
+        const cfg = self.index_manager.get(index_name);
+        const config_hash = if (cfg) |value|
+            types.indexConfigHash(value.*)
         else
             0;
         if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |checkpoint| {
@@ -738,6 +739,11 @@ pub const DBCore = struct {
             try self.index_manager.checkpointLsmWalForManagedIndex(.{
                 .name = index_name,
                 .kind = .dense_vector,
+            });
+        } else if (cfg) |value| {
+            try self.index_manager.checkpointLsmWalForManagedIndex(.{
+                .name = index_name,
+                .kind = value.kind,
             });
         }
         try apply_state.saveAppliedSequenceUpdateWithCheckpoint(

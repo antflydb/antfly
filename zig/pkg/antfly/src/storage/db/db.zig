@@ -22558,7 +22558,7 @@ fn saveAppliedSequencesBatchContext(
         );
         defer seq_lock.unlock();
         try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-        try checkpointDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+        try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
         try apply_state.saveAppliedSequencesWithCheckpoint(
             ctx.alloc,
             ctx.store,
@@ -22569,7 +22569,7 @@ fn saveAppliedSequencesBatchContext(
         return;
     }
     try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-    try checkpointDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+    try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
     try apply_state.saveAppliedSequencesWithCheckpoint(
         ctx.alloc,
         ctx.store,
@@ -22611,15 +22611,15 @@ fn saveDenseProjectionMetadataForAppliedSequenceUpdates(
     }
 }
 
-fn checkpointDenseProjectionMetadataForAppliedSequenceUpdates(
+fn checkpointManagedProjectionEffectsForAppliedSequenceUpdates(
     index_manager: *index_manager_mod.IndexManager,
     updates: []const apply_state.AppliedSequenceUpdate,
 ) !void {
     for (updates) |update| {
-        if (index_manager.denseProjectionCheckpointMetadata(update.index_name) == null) continue;
+        const cfg = index_manager.get(update.index_name) orelse continue;
         try index_manager.checkpointLsmWalForManagedIndex(.{
             .name = update.index_name,
-            .kind = .dense_vector,
+            .kind = cfg.kind,
         });
     }
 }
@@ -27698,7 +27698,7 @@ fn flushFinishedDenseAppliedSequenceLocked(ctx: *AsyncContext, index_name: []con
     const enriched_updates = try appliedSequenceUpdatesWithConfigHashes(ctx.alloc, ctx.index_manager, &raw_update);
     defer ctx.alloc.free(enriched_updates);
     try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-    try checkpointDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+    try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
     try apply_state.saveAppliedSequencesWithCheckpoint(ctx.alloc, ctx.store, ctx.applied_sequence_checkpoint_path, enriched_updates);
     try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
     const save_ns = elapsedSince(save_start_ns);
@@ -27738,7 +27738,7 @@ fn flushPendingAppliedSequencesLocked(ctx: *AsyncContext, force: bool) !bool {
     // Index apply/publish paths own index-state durability. The checkpoint
     // writer only persists small applied watermarks used for replay retention.
     try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-    try checkpointDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+    try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
     try apply_state.saveAppliedSequencesWithCheckpoint(
         ctx.alloc,
         ctx.store,
@@ -42601,6 +42601,11 @@ test "db batch persists per-index applied sequence watermark" {
     });
     const applied = try db.core.loadAppliedSequence(alloc, "ft_v1");
     try std.testing.expect(applied > 0);
+    const index_lsm = db.core.index_manager.snapshotLsmMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), index_lsm.mutable_entries);
+    try std.testing.expectEqual(@as(u64, 0), index_lsm.immutable_memtables);
+    try std.testing.expect(index_lsm.wal_checkpoint_current_segment > 0);
+    try std.testing.expectEqual(@as(u64, 0), index_lsm.wal_checkpoint_lag_segments);
 }
 
 test "db batch truncates replay logs after managed indexes catch up" {

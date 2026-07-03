@@ -1879,19 +1879,21 @@ pub const IndexManager = struct {
     pub fn syncReplayStateByName(self: *IndexManager, store: *docstore_mod.DocStore, name: []const u8) !void {
         for (self.text_indexes.items) |*entry| {
             if (std.mem.eql(u8, entry.config.name, name)) {
-                try entry.persistent.sync(false);
+                try entry.persistent.checkpointLsmWalAfterDurableBoundary();
                 return;
             }
         }
         for (self.dense_indexes.items) |*entry| {
             if (std.mem.eql(u8, entry.config.name, name)) {
                 try entry.index.syncReplayState();
+                try entry.index.checkpointLsmWalAfterDurableBoundary();
                 return;
             }
         }
         for (self.sparse_indexes.items) |*entry| {
             if (std.mem.eql(u8, entry.config.name, name)) {
                 try entry.index.syncReplayState();
+                try entry.index.checkpointLsmWalAfterDurableBoundary();
                 return;
             }
         }
@@ -1899,6 +1901,7 @@ pub const IndexManager = struct {
             if (std.mem.eql(u8, entry.config.name, name)) {
                 try store.syncReplayState();
                 try entry.index.syncReplayState();
+                try entry.index.checkpointLsmWalAfterDurableBoundary();
                 return;
             }
         }
