@@ -27175,8 +27175,8 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
             &ctx.stats.applied_sequence_mutex,
         );
         defer seq_lock.unlock();
-        const published = try flushFinishedDenseAppliedSequenceLocked(ctx, index_ref.name);
         try ctx.index_manager.checkpointLsmWalForManagedIndex(index_ref);
+        const published = try flushFinishedDenseAppliedSequenceLocked(ctx, index_ref.name);
         break :blk published;
     };
     const after_lsm_stats = denseLsmWriteStatsSnapshot(ctx, index_ref.name);
@@ -53982,6 +53982,8 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
 
     const HookCtx = struct {
         publish_calls: u64 = 0,
+        status_calls: u64 = 0,
+        status_calls_after_wal_checkpoint: u64 = 0,
         publish_blocking_calls: u64 = 0,
         publish_blocking_while_applied_sequence_locked: u64 = 0,
         invalidate_calls: u64 = 0,
@@ -53989,7 +53991,18 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
         fn onChange(ptr: *anyopaque, _: []const u8, _: u64, changed_db: ?*DB, change: QueryVisibilityChange) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             switch (change) {
-                .status, .publish, .publish_consistent => self.publish_calls += 1,
+                .status => {
+                    self.publish_calls += 1;
+                    self.status_calls += 1;
+                    if (changed_db) |hook_db| {
+                        if (hook_db.core.denseIndex("dense_idx")) |entry| if (entry.index.snapshotLsmMaintenanceStats()) |stats| {
+                            if (stats.wal_checkpoint_current_segment > 0 and stats.wal_checkpoint_lag_segments == 0) {
+                                self.status_calls_after_wal_checkpoint += 1;
+                            }
+                        };
+                    }
+                },
+                .publish, .publish_consistent => self.publish_calls += 1,
                 .publish_blocking => {
                     self.publish_calls += 1;
                     self.publish_blocking_calls += 1;
@@ -54041,6 +54054,8 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
     try db.executor.waitForAll(4);
 
     try std.testing.expect(hook_ctx.publish_calls > 0);
+    try std.testing.expect(hook_ctx.status_calls > 0);
+    try std.testing.expect(hook_ctx.status_calls_after_wal_checkpoint > 0);
     try std.testing.expect(hook_ctx.publish_blocking_calls > 0);
     try std.testing.expectEqual(@as(u64, 0), hook_ctx.publish_blocking_while_applied_sequence_locked);
     try std.testing.expectEqual(@as(u64, 0), hook_ctx.invalidate_calls);
