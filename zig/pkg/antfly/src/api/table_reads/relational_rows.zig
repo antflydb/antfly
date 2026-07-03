@@ -728,7 +728,7 @@ fn executeLoweredSqlSetOperationPlanAlloc(
         }, left.rows, right.rows);
     }
     if (lowered.right.system_time_as_of_sequence != null or lowered.right.system_time_as_of_timestamp_ns != null) return error.UnsupportedRowsQuery;
-    if (lowered.ctes.len != 0) {
+    if (lowered.ctes.len != 0 and source.vtable.rows_query_plan_catalog == null) {
         return try executeLoweredSqlSetOperationPlanWithRoutedCtesAlloc(
             alloc,
             source,
@@ -741,7 +741,6 @@ fn executeLoweredSqlSetOperationPlanAlloc(
             consistency,
         );
     }
-
     var left = (try source.rowsQueryPlanCatalog(alloc, left_target, left_schema, left_plan, consistency)) orelse return null;
     defer left.deinit(alloc);
     var right = (try source.rowsQueryPlanCatalog(alloc, right_target, right_schema, right_plan, consistency)) orelse return null;

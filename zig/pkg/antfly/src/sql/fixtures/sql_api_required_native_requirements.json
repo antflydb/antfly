@@ -1,6 +1,8 @@
 {
   "requirement_format": 1,
   "required": [
+    "backup_lifecycle_sql_unavailable",
+    "default_scalar_subquery_plan",
     "document_table_ddl_duplicate_schema_name",
     "document_table_ddl_invalid_antfly_extension",
     "document_table_ddl_invalid_dynamic_template",
@@ -10,6 +12,7 @@
     "document_table_ddl_multi_document_type_unsupported",
     "document_table_ddl_shorthand",
     "document_table_ddl_unknown_default_type",
-    "graph_query_plan"
+    "graph_query_plan",
+    "row_batch_scalar_subquery_plan"
   ]
 }

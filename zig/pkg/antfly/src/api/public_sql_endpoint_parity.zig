@@ -2562,6 +2562,7 @@ test "api public SQL endpoint executes document SQL reads through typed document
     const DualNameReads = struct {
         public: table_reads.BoundTableReadSource,
         native: table_reads.BoundTableReadSource,
+        force_ordered_lateral_branch_row_cap: bool = false,
 
         fn source(self: *@This()) table_reads.TableReadSource {
             return .{
@@ -2612,6 +2613,17 @@ test "api public SQL endpoint executes document SQL reads through typed document
             consistency: raft_mod.ReadConsistency,
         ) !?query_api.QueryResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.force_ordered_lateral_branch_row_cap and
+                !std.mem.eql(u8, table_name, "docs") and
+                req.limit == sql_adapter.default_document_sql_bounded_scan_rows and
+                std.mem.indexOf(u8, req.filter_query_json, "/metadata/plan") != null)
+            {
+                return .{ .json = try std.fmt.allocPrint(
+                    inner_alloc,
+                    "{{\"responses\":[{{\"hits\":{{\"total\":{d},\"hits\":[]}}}}]}}",
+                    .{sql_adapter.default_document_sql_bounded_scan_rows + 1},
+                ) };
+            }
             if (std.mem.eql(u8, table_name, "docs") and std.mem.indexOf(u8, req.filter_query_json, "duplicate-source") != null) {
                 return .{ .json = try inner_alloc.dupe(u8,
                     \\{"responses":[{"hits":{"total":2,"hits":[{"_id":"doc:dup-target"},{"_id":"doc:dup-source"}]}}]}
@@ -3104,6 +3116,57 @@ test "api public SQL endpoint executes document SQL reads through typed document
     try std.testing.expectEqualStrings("doc:e", unnest_not_equal_rows[2].object.get("_id").?.string);
     try std.testing.expectEqualStrings("visible", unnest_not_equal_rows[2].object.get("tag").?.string);
 
+    var unnest_not_in_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag NOT IN ('stale', 'archived') LIMIT 10;\"}",
+    });
+    defer unnest_not_in_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), unnest_not_in_resp.status);
+    var unnest_not_in_parsed = try std.json.parseFromSlice(std.json.Value, alloc, unnest_not_in_resp.body, .{ .allocate = .alloc_always });
+    defer unnest_not_in_parsed.deinit();
+    const unnest_not_in_result = unnest_not_in_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 3), unnest_not_in_result.get("total").?.integer);
+    const unnest_not_in_rows = unnest_not_in_result.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), unnest_not_in_rows.len);
+    try std.testing.expectEqualStrings("doc:a", unnest_not_in_rows[0].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("urgent", unnest_not_in_rows[0].object.get("tag").?.string);
+    try std.testing.expectEqualStrings("doc:a", unnest_not_in_rows[1].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("vip", unnest_not_in_rows[1].object.get("tag").?.string);
+    try std.testing.expectEqualStrings("doc:e", unnest_not_in_rows[2].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("visible", unnest_not_in_rows[2].object.get("tag").?.string);
+
+    var unnest_in_not_in_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag IN ('urgent', 'vip') AND tag NOT IN ('vip') LIMIT 10;\"}",
+    });
+    defer unnest_in_not_in_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), unnest_in_not_in_resp.status);
+    var unnest_in_not_in_parsed = try std.json.parseFromSlice(std.json.Value, alloc, unnest_in_not_in_resp.body, .{ .allocate = .alloc_always });
+    defer unnest_in_not_in_parsed.deinit();
+    const unnest_in_not_in_result = unnest_in_not_in_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), unnest_in_not_in_result.get("total").?.integer);
+    const unnest_in_not_in_row = unnest_in_not_in_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", unnest_in_not_in_row.get("_id").?.string);
+    try std.testing.expectEqualStrings("urgent", unnest_in_not_in_row.get("tag").?.string);
+
+    var unnest_not_in_null_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag NOT IN ('urgent', NULL) LIMIT 10;\"}",
+    });
+    defer unnest_not_in_null_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), unnest_not_in_null_resp.status);
+    var unnest_not_in_null_parsed = try std.json.parseFromSlice(std.json.Value, alloc, unnest_not_in_null_resp.body, .{ .allocate = .alloc_always });
+    defer unnest_not_in_null_parsed.deinit();
+    const unnest_not_in_null_result = unnest_not_in_null_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 0), unnest_not_in_null_result.get("total").?.integer);
+    try std.testing.expectEqual(@as(usize, 0), unnest_not_in_null_result.get("rows").?.array.items.len);
+
     var unnest_compound_resp = try server.handle(.{
         .method = .POST,
         .uri = "/db/v1/sql",
@@ -3367,16 +3430,353 @@ test "api public SQL endpoint executes document SQL reads through typed document
     try expectPublicSqlDiagnosticBody(alloc, join_resp.body, "plan", "invalid_sql_request", "document_sql_unsupported_join", 0, 0);
 
     source.tables[0].indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"amount\",\"type\":\"numeric\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\"}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\",\"nullable\":false,\"unique\":true},{\"name\":\"score\",\"path\":\"amount\",\"type\":\"numeric\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\"}}";
+    var lateral_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10;\"}",
+    });
+    defer lateral_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), lateral_resp.status);
+    var lateral_parsed = try std.json.parseFromSlice(std.json.Value, alloc, lateral_resp.body, .{ .allocate = .alloc_always });
+    defer lateral_parsed.deinit();
+    try std.testing.expectEqualStrings("read", lateral_parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", lateral_parsed.value.object.get("statement_kind").?.string);
+    const lateral_result = lateral_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), lateral_result.get("total").?.integer);
+    const lateral_row = lateral_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", lateral_row.get("_id").?.string);
+    try std.testing.expectEqual(@as(i64, 10), lateral_row.get("score").?.integer);
+
+    var inner_lateral_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, latest.score FROM support_view AS d JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan ORDER BY s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10;\"}",
+    });
+    defer inner_lateral_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), inner_lateral_resp.status);
+    var inner_lateral_parsed = try std.json.parseFromSlice(std.json.Value, alloc, inner_lateral_resp.body, .{ .allocate = .alloc_always });
+    defer inner_lateral_parsed.deinit();
+    const inner_lateral_result = inner_lateral_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), inner_lateral_result.get("total").?.integer);
+    const inner_lateral_row = inner_lateral_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", inner_lateral_row.get("_id").?.string);
+    try std.testing.expectEqual(@as(i64, 10), inner_lateral_row.get("score").?.integer);
+
+    var cross_lateral_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, latest.score FROM support_view AS d CROSS JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest WHERE d.plan = 'pro' LIMIT 10;\"}",
+    });
+    defer cross_lateral_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), cross_lateral_resp.status);
+    var cross_lateral_parsed = try std.json.parseFromSlice(std.json.Value, alloc, cross_lateral_resp.body, .{ .allocate = .alloc_always });
+    defer cross_lateral_parsed.deinit();
+    const cross_lateral_result = cross_lateral_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), cross_lateral_result.get("total").?.integer);
+    const cross_lateral_row = cross_lateral_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", cross_lateral_row.get("_id").?.string);
+    try std.testing.expectEqual(@as(i64, 10), cross_lateral_row.get("score").?.integer);
+
+    var left_lateral_residual_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan AND s.score > 100 LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10;\"}",
+    });
+    defer left_lateral_residual_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), left_lateral_residual_resp.status);
+    var left_lateral_residual_parsed = try std.json.parseFromSlice(std.json.Value, alloc, left_lateral_residual_resp.body, .{ .allocate = .alloc_always });
+    defer left_lateral_residual_parsed.deinit();
+    const left_lateral_residual_result = left_lateral_residual_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), left_lateral_residual_result.get("total").?.integer);
+    const left_lateral_residual_row = left_lateral_residual_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", left_lateral_residual_row.get("_id").?.string);
+    try std.testing.expect(left_lateral_residual_row.get("score").? == .null);
+
+    var inner_lateral_residual_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, latest.score FROM support_view AS d JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan AND s.score > 100 LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10;\"}",
+    });
+    defer inner_lateral_residual_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), inner_lateral_residual_resp.status);
+    var inner_lateral_residual_parsed = try std.json.parseFromSlice(std.json.Value, alloc, inner_lateral_residual_resp.body, .{ .allocate = .alloc_always });
+    defer inner_lateral_residual_parsed.deinit();
+    const inner_lateral_residual_result = inner_lateral_residual_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 0), inner_lateral_residual_result.get("total").?.integer);
+    try std.testing.expectEqual(@as(usize, 0), inner_lateral_residual_result.get("rows").?.array.items.len);
+
+    var lateral_source_residual_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan AND s.score > d.score LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10;\"}",
+    });
+    defer lateral_source_residual_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), lateral_source_residual_resp.status);
+    var lateral_source_residual_parsed = try std.json.parseFromSlice(std.json.Value, alloc, lateral_source_residual_resp.body, .{ .allocate = .alloc_always });
+    defer lateral_source_residual_parsed.deinit();
+    const lateral_source_residual_result = lateral_source_residual_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), lateral_source_residual_result.get("total").?.integer);
+    const lateral_source_residual_row = lateral_source_residual_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", lateral_source_residual_row.get("_id").?.string);
+    try std.testing.expect(lateral_source_residual_row.get("plan").? == .null);
+
+    source.tables[0].indexes_json =
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\"}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\",\"nullable\":false},{\"name\":\"score\",\"path\":\"amount\",\"type\":\"numeric\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\"}}";
     var lateral_contract_resp = try server.handle(.{
         .method = .POST,
         .uri = "/db/v1/sql",
         .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10;\"}",
+        .body = "{\"sql\":\"SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan AND s.score > d.score LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10;\"}",
     });
     defer lateral_contract_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 400), lateral_contract_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, lateral_contract_resp.body, "plan", "invalid_sql_request", "document_sql_lateral_requires_native_producer", 0, 0);
+    try std.testing.expectEqual(@as(u16, 200), lateral_contract_resp.status);
+    var lateral_contract_parsed = try std.json.parseFromSlice(std.json.Value, alloc, lateral_contract_resp.body, .{ .allocate = .alloc_always });
+    defer lateral_contract_parsed.deinit();
+    const lateral_contract_result = lateral_contract_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), lateral_contract_result.get("total").?.integer);
+    const lateral_contract_row = lateral_contract_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", lateral_contract_row.get("_id").?.string);
+    try std.testing.expect(lateral_contract_row.get("plan").? == .null);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:f", .value = "{\"title\":\"duplicate plan\",\"status\":\"duplicate-pro\",\"amount\":60,\"note\":\"duplicate branch\",\"metadata\":{\"plan\":\"pro\"},\"tags\":[\"duplicate\"]}" },
+        },
+        .sync_level = .full_index,
+    });
+    var nonunique_echo_lateral_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON true WHERE d.plan = 'pro' ORDER BY d._id ASC LIMIT 10;\"}",
+    });
+    defer nonunique_echo_lateral_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), nonunique_echo_lateral_resp.status);
+    var nonunique_echo_lateral_parsed = try std.json.parseFromSlice(std.json.Value, alloc, nonunique_echo_lateral_resp.body, .{ .allocate = .alloc_always });
+    defer nonunique_echo_lateral_parsed.deinit();
+    const nonunique_echo_lateral_result = nonunique_echo_lateral_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 2), nonunique_echo_lateral_result.get("total").?.integer);
+    const nonunique_echo_lateral_rows = nonunique_echo_lateral_result.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), nonunique_echo_lateral_rows.len);
+    try std.testing.expectEqualStrings("doc:a", nonunique_echo_lateral_rows[0].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("pro", nonunique_echo_lateral_rows[0].object.get("plan").?.string);
+    try std.testing.expectEqualStrings("doc:f", nonunique_echo_lateral_rows[1].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("pro", nonunique_echo_lateral_rows[1].object.get("plan").?.string);
+
+    var nonunique_branch_residual_lateral_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan AND s.score > d.score LIMIT 1) AS latest ON true WHERE d.plan = 'pro' ORDER BY d._id ASC LIMIT 10;\"}",
+    });
+    defer nonunique_branch_residual_lateral_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), nonunique_branch_residual_lateral_resp.status);
+    var nonunique_branch_residual_lateral_parsed = try std.json.parseFromSlice(std.json.Value, alloc, nonunique_branch_residual_lateral_resp.body, .{ .allocate = .alloc_always });
+    defer nonunique_branch_residual_lateral_parsed.deinit();
+    const nonunique_branch_residual_lateral_result = nonunique_branch_residual_lateral_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 2), nonunique_branch_residual_lateral_result.get("total").?.integer);
+    const nonunique_branch_residual_lateral_rows = nonunique_branch_residual_lateral_result.get("rows").?.array.items;
+    try std.testing.expectEqualStrings("doc:a", nonunique_branch_residual_lateral_rows[0].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("pro", nonunique_branch_residual_lateral_rows[0].object.get("plan").?.string);
+    try std.testing.expectEqualStrings("doc:f", nonunique_branch_residual_lateral_rows[1].object.get("_id").?.string);
+    try std.testing.expect(nonunique_branch_residual_lateral_rows[1].object.get("plan").? == .null);
+
+    var nonunique_branch_static_residual_lateral_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan AND s.score > 50 LIMIT 1) AS latest ON true WHERE d.plan = 'pro' ORDER BY d._id ASC LIMIT 10;\"}",
+    });
+    defer nonunique_branch_static_residual_lateral_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), nonunique_branch_static_residual_lateral_resp.status);
+    var nonunique_branch_static_residual_lateral_parsed = try std.json.parseFromSlice(std.json.Value, alloc, nonunique_branch_static_residual_lateral_resp.body, .{ .allocate = .alloc_always });
+    defer nonunique_branch_static_residual_lateral_parsed.deinit();
+    const nonunique_branch_static_residual_lateral_result = nonunique_branch_static_residual_lateral_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 2), nonunique_branch_static_residual_lateral_result.get("total").?.integer);
+    const nonunique_branch_static_residual_lateral_rows = nonunique_branch_static_residual_lateral_result.get("rows").?.array.items;
+    try std.testing.expectEqualStrings("doc:a", nonunique_branch_static_residual_lateral_rows[0].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("pro", nonunique_branch_static_residual_lateral_rows[0].object.get("plan").?.string);
+    try std.testing.expectEqualStrings("doc:f", nonunique_branch_static_residual_lateral_rows[1].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("pro", nonunique_branch_static_residual_lateral_rows[1].object.get("plan").?.string);
+
+    var nonunique_alternate_pinned_lateral_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan AND s.score = 60 ORDER BY s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' ORDER BY d._id ASC LIMIT 10;\"}",
+    });
+    defer nonunique_alternate_pinned_lateral_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), nonunique_alternate_pinned_lateral_resp.status);
+    var nonunique_alternate_pinned_lateral_parsed = try std.json.parseFromSlice(std.json.Value, alloc, nonunique_alternate_pinned_lateral_resp.body, .{ .allocate = .alloc_always });
+    defer nonunique_alternate_pinned_lateral_parsed.deinit();
+    const nonunique_alternate_pinned_lateral_result = nonunique_alternate_pinned_lateral_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 2), nonunique_alternate_pinned_lateral_result.get("total").?.integer);
+    const nonunique_alternate_pinned_lateral_rows = nonunique_alternate_pinned_lateral_result.get("rows").?.array.items;
+    try std.testing.expectEqualStrings("doc:a", nonunique_alternate_pinned_lateral_rows[0].object.get("_id").?.string);
+    try std.testing.expectEqual(@as(i64, 60), nonunique_alternate_pinned_lateral_rows[0].object.get("score").?.integer);
+    try std.testing.expectEqualStrings("doc:f", nonunique_alternate_pinned_lateral_rows[1].object.get("_id").?.string);
+    try std.testing.expectEqual(@as(i64, 60), nonunique_alternate_pinned_lateral_rows[1].object.get("score").?.integer);
+
+    var nonunique_order_sensitive_lateral_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan ORDER BY s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10;\"}",
+    });
+    defer nonunique_order_sensitive_lateral_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), nonunique_order_sensitive_lateral_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, nonunique_order_sensitive_lateral_resp.body, "plan", "invalid_sql_request", "document_sql_lateral_requires_native_producer", 0, 0);
+
+    var nonunique_compound_without_unique_lateral_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan ORDER BY s.plan ASC, s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10;\"}",
+    });
+    defer nonunique_compound_without_unique_lateral_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), nonunique_compound_without_unique_lateral_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, nonunique_compound_without_unique_lateral_resp.body, "plan", "invalid_sql_request", "document_sql_lateral_requires_native_producer", 0, 0);
+
+    var nonunique_expression_order_lateral_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan ORDER BY lower(s.plan) LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10;\"}",
+    });
+    defer nonunique_expression_order_lateral_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), nonunique_expression_order_lateral_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, nonunique_expression_order_lateral_resp.body, "plan", "invalid_sql_request", "document_sql_lateral_requires_native_producer", 0, 0);
+
+    var nonunique_ordered_residual_lateral_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan AND s.score > d.score ORDER BY s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10;\"}",
+    });
+    defer nonunique_ordered_residual_lateral_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), nonunique_ordered_residual_lateral_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, nonunique_ordered_residual_lateral_resp.body, "plan", "invalid_sql_request", "document_sql_lateral_requires_native_producer", 0, 0);
+
+    source.tables[0].indexes_json =
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\"}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\",\"nullable\":false},{\"name\":\"score\",\"path\":\"amount\",\"type\":\"numeric\",\"unique\":true}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\"}}";
+    var nonunique_ordered_branch_lateral_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan ORDER BY s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' ORDER BY d._id ASC LIMIT 10;\"}",
+    });
+    defer nonunique_ordered_branch_lateral_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), nonunique_ordered_branch_lateral_resp.status);
+    var nonunique_ordered_branch_lateral_parsed = try std.json.parseFromSlice(std.json.Value, alloc, nonunique_ordered_branch_lateral_resp.body, .{ .allocate = .alloc_always });
+    defer nonunique_ordered_branch_lateral_parsed.deinit();
+    const nonunique_ordered_branch_lateral_result = nonunique_ordered_branch_lateral_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 2), nonunique_ordered_branch_lateral_result.get("total").?.integer);
+    const nonunique_ordered_branch_lateral_rows = nonunique_ordered_branch_lateral_result.get("rows").?.array.items;
+    try std.testing.expectEqualStrings("doc:a", nonunique_ordered_branch_lateral_rows[0].object.get("_id").?.string);
+    try std.testing.expectEqual(@as(i64, 60), nonunique_ordered_branch_lateral_rows[0].object.get("score").?.integer);
+    try std.testing.expectEqualStrings("doc:f", nonunique_ordered_branch_lateral_rows[1].object.get("_id").?.string);
+    try std.testing.expectEqual(@as(i64, 60), nonunique_ordered_branch_lateral_rows[1].object.get("score").?.integer);
+
+    var nonunique_compound_ordered_branch_lateral_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan ORDER BY s.score DESC, s.plan ASC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' ORDER BY d._id ASC LIMIT 10;\"}",
+    });
+    defer nonunique_compound_ordered_branch_lateral_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), nonunique_compound_ordered_branch_lateral_resp.status);
+    var nonunique_compound_ordered_branch_lateral_parsed = try std.json.parseFromSlice(std.json.Value, alloc, nonunique_compound_ordered_branch_lateral_resp.body, .{ .allocate = .alloc_always });
+    defer nonunique_compound_ordered_branch_lateral_parsed.deinit();
+    const nonunique_compound_ordered_branch_lateral_result = nonunique_compound_ordered_branch_lateral_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 2), nonunique_compound_ordered_branch_lateral_result.get("total").?.integer);
+    const nonunique_compound_ordered_branch_lateral_rows = nonunique_compound_ordered_branch_lateral_result.get("rows").?.array.items;
+    try std.testing.expectEqualStrings("doc:a", nonunique_compound_ordered_branch_lateral_rows[0].object.get("_id").?.string);
+    try std.testing.expectEqual(@as(i64, 60), nonunique_compound_ordered_branch_lateral_rows[0].object.get("score").?.integer);
+    try std.testing.expectEqualStrings("doc:f", nonunique_compound_ordered_branch_lateral_rows[1].object.get("_id").?.string);
+    try std.testing.expectEqual(@as(i64, 60), nonunique_compound_ordered_branch_lateral_rows[1].object.get("score").?.integer);
+
+    var nonunique_later_unique_compound_ordered_branch_lateral_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan ORDER BY s.plan ASC, s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' ORDER BY d._id ASC LIMIT 10;\"}",
+    });
+    defer nonunique_later_unique_compound_ordered_branch_lateral_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), nonunique_later_unique_compound_ordered_branch_lateral_resp.status);
+    var nonunique_later_unique_compound_ordered_branch_lateral_parsed = try std.json.parseFromSlice(std.json.Value, alloc, nonunique_later_unique_compound_ordered_branch_lateral_resp.body, .{ .allocate = .alloc_always });
+    defer nonunique_later_unique_compound_ordered_branch_lateral_parsed.deinit();
+    const nonunique_later_unique_compound_ordered_branch_lateral_result = nonunique_later_unique_compound_ordered_branch_lateral_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 2), nonunique_later_unique_compound_ordered_branch_lateral_result.get("total").?.integer);
+    const nonunique_later_unique_compound_ordered_branch_lateral_rows = nonunique_later_unique_compound_ordered_branch_lateral_result.get("rows").?.array.items;
+    try std.testing.expectEqualStrings("doc:a", nonunique_later_unique_compound_ordered_branch_lateral_rows[0].object.get("_id").?.string);
+    try std.testing.expectEqual(@as(i64, 60), nonunique_later_unique_compound_ordered_branch_lateral_rows[0].object.get("score").?.integer);
+    try std.testing.expectEqualStrings("doc:f", nonunique_later_unique_compound_ordered_branch_lateral_rows[1].object.get("_id").?.string);
+    try std.testing.expectEqual(@as(i64, 60), nonunique_later_unique_compound_ordered_branch_lateral_rows[1].object.get("score").?.integer);
+
+    read_source.force_ordered_lateral_branch_row_cap = true;
+    var nonunique_ordered_branch_cap_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan ORDER BY s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' ORDER BY d._id ASC LIMIT 10;\"}",
+    });
+    read_source.force_ordered_lateral_branch_row_cap = false;
+    defer nonunique_ordered_branch_cap_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), nonunique_ordered_branch_cap_resp.status);
+    try expectPublicSqlDiagnosticBody(
+        alloc,
+        nonunique_ordered_branch_cap_resp.body,
+        "execute",
+        "document_sql_bounded_scan_row_cap_exceeded",
+        "document SQL bounded scan row cap exceeded",
+        null,
+        null,
+    );
+
+    var relational_fallback_lateral_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM users AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10;\"}",
+    });
+    defer relational_fallback_lateral_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), relational_fallback_lateral_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, relational_fallback_lateral_resp.body, "plan", "invalid_sql_request", "document_sql_lateral_requires_native_producer", 0, 0);
+
+    source.tables[0].indexes_json =
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"note\",\"path\":\"note\",\"type\":\"keyword\",\"unique\":true},{\"name\":\"score\",\"path\":\"amount\",\"type\":\"numeric\"}]}}}";
+    var left_lateral_nullable_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.note = d.note LIMIT 1) AS latest ON true WHERE d._id = 'doc:a' LIMIT 10;\"}",
+    });
+    defer left_lateral_nullable_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), left_lateral_nullable_resp.status);
+    var left_lateral_nullable_parsed = try std.json.parseFromSlice(std.json.Value, alloc, left_lateral_nullable_resp.body, .{ .allocate = .alloc_always });
+    defer left_lateral_nullable_parsed.deinit();
+    const left_lateral_nullable_result = left_lateral_nullable_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), left_lateral_nullable_result.get("total").?.integer);
+    const left_lateral_nullable_row = left_lateral_nullable_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", left_lateral_nullable_row.get("_id").?.string);
+    try std.testing.expect(left_lateral_nullable_row.get("score").? == .null);
+
+    var inner_lateral_nullable_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, latest.score FROM support_view AS d JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.note = d.note LIMIT 1) AS latest ON true WHERE d._id = 'doc:a' LIMIT 10;\"}",
+    });
+    defer inner_lateral_nullable_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), inner_lateral_nullable_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, inner_lateral_nullable_resp.body, "plan", "invalid_sql_request", "document_sql_lateral_requires_native_producer", 0, 0);
 
     var distinct_resp = try server.handle(.{
         .method = .POST,

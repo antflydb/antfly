@@ -20,6 +20,7 @@ const sql_statement_kind = @import("statement_kind.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const diagnostics = @import("diagnostics.zig");
 const document_plan = @import("document_plan.zig");
+const document_sql_corpus = @import("document_sql_corpus.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const expr_aggregate = @import("expr/aggregate.zig");
 const expr_projection = @import("expr/projection.zig");
@@ -64,6 +65,7 @@ const aggregateFilterGroupCount = expr_aggregate.filterGroupCount;
 const aggregateFilterJsonAccessCount = expr_aggregate.filterJsonAccessCount;
 const aggregateFilterStructuredAccessCount = expr_aggregate.filterStructuredAccessCount;
 const aggregateInputExpressionCount = expr_aggregate.inputExpressionCount;
+const aggregateArgumentOrderCount = expr_aggregate.argumentOrderCount;
 const aggregateModeCount = expr_aggregate.modeCount;
 const aggregatePercentileArrayCount = expr_aggregate.percentileArrayCount;
 const expressionOrderCount = expr_projection.expressionOrderCount;
@@ -589,6 +591,7 @@ pub const AppParityParserFixtureSummary = struct {
     row_number_function: bool = false,
     percentile_cont_function: bool = false,
     percentile_disc_function: bool = false,
+    string_agg_order_function: bool = false,
     within_group_keywords: bool = false,
     group_by_keywords: bool = false,
     over_keyword: bool = false,
@@ -1023,6 +1026,7 @@ pub fn appParityStructuredFixtureSummary(
             .row_number_function = appParityTokensHaveFunctionCall(sql_tokens, "row_number"),
             .percentile_cont_function = appParityTokensHaveFunctionCall(sql_tokens, "percentile_cont"),
             .percentile_disc_function = appParityTokensHaveFunctionCall(sql_tokens, "percentile_disc"),
+            .string_agg_order_function = appParityTokensHaveFunctionCallWithKeyword(sql_tokens, "string_agg", .order),
             .within_group_keywords = appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .within, .group }),
             .group_by_keywords = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .group, .by }),
             .over_keyword = appParityTokensHaveKeyword(sql_tokens, .over),
@@ -2046,6 +2050,7 @@ pub const SqlGeneratedAstMigrationFixtureCase = struct {
     expected_statement_kind: []const u8,
     expected_statement_tag: []const u8,
     expected_error: []const u8,
+    expected_antfly_functions: []const []const u8 = &.{},
 };
 
 pub const SqlGeneratedAstMigrationFixtureRoot = struct {
@@ -3234,7 +3239,10 @@ pub fn parseSqlGeneratedAstMigrationFixtureRootAlloc(
     if (case_values.items.len == 0) return error.TestUnexpectedResult;
 
     var cases = std.ArrayListUnmanaged(SqlGeneratedAstMigrationFixtureCase).empty;
-    errdefer cases.deinit(alloc);
+    errdefer {
+        for (cases.items) |case| freeSqlGeneratedAstMigrationFixtureCase(alloc, case);
+        cases.deinit(alloc);
+    }
     var seen = std.StringHashMapUnmanaged(void){};
     defer seen.deinit(alloc);
     var seen_family = std.StringHashMapUnmanaged(void){};
@@ -3249,6 +3257,7 @@ pub fn parseSqlGeneratedAstMigrationFixtureRootAlloc(
             "expected_statement_kind",
             "expected_statement_tag",
             "expected_error",
+            "expected_antfly_functions",
         });
         const name = try fixtureJsonOptionalString(item, "name", "");
         const family = try fixtureJsonOptionalString(item, "family", "");
@@ -3256,6 +3265,8 @@ pub fn parseSqlGeneratedAstMigrationFixtureRootAlloc(
         const expected_statement_kind = try fixtureJsonOptionalString(item, "expected_statement_kind", "");
         const expected_statement_tag = try fixtureJsonOptionalString(item, "expected_statement_tag", "");
         const expected_error = try fixtureJsonOptionalString(item, "expected_error", "");
+        const expected_antfly_functions = try parseFixtureStringListAlloc(alloc, item, "expected_antfly_functions");
+        errdefer if (expected_antfly_functions.len > 0) alloc.free(expected_antfly_functions);
         if (name.len == 0 or
             family.len == 0 or
             sql.len == 0 or
@@ -3280,6 +3291,7 @@ pub fn parseSqlGeneratedAstMigrationFixtureRootAlloc(
             .expected_statement_kind = expected_statement_kind,
             .expected_statement_tag = expected_statement_tag,
             .expected_error = expected_error,
+            .expected_antfly_functions = expected_antfly_functions,
         });
     }
     for (sql_parser_migration_table_families) |known| {
@@ -3292,10 +3304,18 @@ pub fn parseSqlGeneratedAstMigrationFixtureRootAlloc(
     };
 }
 
+fn freeSqlGeneratedAstMigrationFixtureCase(
+    alloc: std.mem.Allocator,
+    case: SqlGeneratedAstMigrationFixtureCase,
+) void {
+    if (case.expected_antfly_functions.len > 0) alloc.free(case.expected_antfly_functions);
+}
+
 pub fn freeSqlGeneratedAstMigrationFixtureRoot(
     alloc: std.mem.Allocator,
     root: SqlGeneratedAstMigrationFixtureRoot,
 ) void {
+    for (root.cases) |case| freeSqlGeneratedAstMigrationFixtureCase(alloc, case);
     if (root.cases.len > 0) alloc.free(root.cases);
 }
 
@@ -3334,6 +3354,24 @@ fn sqlGeneratedAstMigrationExpectedErrorMatches(err: anyerror, expected: []const
     return std.mem.eql(u8, expected, @errorName(err));
 }
 
+fn validateSqlGeneratedAstMigrationAntflyFunctionKinds(
+    case: SqlGeneratedAstMigrationFixtureCase,
+    parsed: generated_parser.GeneratedSqlParseResult,
+) !void {
+    if (case.expected_antfly_functions.len == 0) return;
+    const ast = parsed.ast orelse return error.TestUnexpectedResult;
+    const read = switch (ast) {
+        .read => |read| read,
+        else => return error.TestUnexpectedResult,
+    };
+    if (read.source_antfly_function_items.len != case.expected_antfly_functions.len) return error.TestUnexpectedResult;
+    for (case.expected_antfly_functions, 0..) |expected, i| {
+        const expected_kind = std.meta.stringToEnum(generated_parser.GeneratedSqlAntflyTableFunctionKind, expected) orelse
+            return error.TestUnexpectedResult;
+        if (read.source_antfly_function_items[i].kind != expected_kind) return error.TestUnexpectedResult;
+    }
+}
+
 pub fn validateSqlGeneratedAstMigrationFixtureCaseAlloc(
     alloc: std.mem.Allocator,
     case: SqlGeneratedAstMigrationFixtureCase,
@@ -3349,6 +3387,7 @@ pub fn validateSqlGeneratedAstMigrationFixtureCaseAlloc(
     if (!std.mem.eql(u8, @tagName(parsed.kind), case.expected_statement_kind)) return error.TestUnexpectedResult;
     if (!std.mem.eql(u8, generatedSqlStatementPayloadTag(parsed.statement), case.expected_statement_tag)) return error.TestUnexpectedResult;
     if (parsed.ast == null) return error.TestUnexpectedResult;
+    try validateSqlGeneratedAstMigrationAntflyFunctionKinds(case, parsed);
 }
 
 pub fn sqlGeneratedAstMigrationFixtureContains(
@@ -3376,22 +3415,55 @@ fn sqlParserMigrationEvidenceStringListContains(list: []const []const u8, name: 
     return false;
 }
 
+fn sqlParserMigrationFamilyMinimumRawAstFixtures(family: []const u8) usize {
+    if (std.mem.eql(u8, family, "backups")) return 2;
+    if (std.mem.eql(u8, family, "ddl")) return 4;
+    if (std.mem.eql(u8, family, "dml")) return 6;
+    if (std.mem.eql(u8, family, "extensions")) return 4;
+    if (std.mem.eql(u8, family, "functions")) return 10;
+    if (std.mem.eql(u8, family, "lakes")) return 11;
+    if (std.mem.eql(u8, family, "maintenance")) return 16;
+    if (std.mem.eql(u8, family, "query")) return 9;
+    if (std.mem.eql(u8, family, "roles")) return 17;
+    return 1;
+}
+
+fn sqlParserMigrationFamilyUsesLogicalDdlCompatibilityPath(family: []const u8) bool {
+    return std.mem.eql(u8, family, "backups") or
+        std.mem.eql(u8, family, "ddl") or
+        std.mem.eql(u8, family, "extensions") or
+        std.mem.eql(u8, family, "functions") or
+        std.mem.eql(u8, family, "maintenance") or
+        std.mem.eql(u8, family, "roles");
+}
+
+fn sqlParserMigrationDeletedCompatibilityPathKnown(family: []const u8, path: []const u8) bool {
+    if (sqlParserMigrationFamilyUsesLogicalDdlCompatibilityPath(family)) {
+        return std.mem.eql(u8, path, "ddl_plan.parseLogicalDdlPlanAlloc missing-generated fallback") or
+            std.mem.eql(u8, path, "ddl_plan.parseLogicalDdlPlanTokensAlloc");
+    }
+    if (std.mem.eql(u8, family, "dml")) {
+        return std.mem.eql(u8, path, "tokenized.ParsedSql.writeStatementIncludingGeneratedAst missing-generated fallback");
+    }
+    if (std.mem.eql(u8, family, "lakes") or std.mem.eql(u8, family, "query")) {
+        return std.mem.eql(u8, path, "tokenized.ParsedSql.readStatementKindIncludingGeneratedAst missing-generated fallback");
+    }
+    return false;
+}
+
 fn validateSqlParserMigrationEvidenceNames(
     evidence: SqlParserMigrationRemovalEvidence,
     family: []const u8,
     raw_ast: SqlGeneratedAstMigrationFixtureRoot,
     source: AppParitySourceCorpusRoot,
 ) !void {
-    if (evidence.raw_ast_fixtures.len == 0 or
+    if (evidence.raw_ast_fixtures.len < sqlParserMigrationFamilyMinimumRawAstFixtures(family) or
+        evidence.binder_fixtures.len == 0 or
+        evidence.lowering_fixtures.len == 0 or
+        evidence.runtime_fixtures.len == 0 or
+        evidence.api_native_parity_fixtures.len == 0 or
+        evidence.unsupported_shape_fixtures.len == 0 or
         evidence.stale_metadata_tests.len == 0)
-    {
-        return error.TestUnexpectedResult;
-    }
-    if (evidence.deleted_compatibility_paths.len != 0 and
-        (evidence.binder_fixtures.len == 0 or
-            evidence.lowering_fixtures.len == 0 or
-            evidence.runtime_fixtures.len == 0 or
-            evidence.api_native_parity_fixtures.len == 0))
     {
         return error.TestUnexpectedResult;
     }
@@ -3409,6 +3481,9 @@ fn validateSqlParserMigrationEvidenceNames(
         for (list) |name| {
             if (!appParitySourceCorpusContainsName(source, name)) return error.TestUnexpectedResult;
         }
+    }
+    for (evidence.deleted_compatibility_paths) |path| {
+        if (!sqlParserMigrationDeletedCompatibilityPathKnown(family, path)) return error.TestUnexpectedResult;
     }
 }
 
@@ -4296,7 +4371,7 @@ pub fn parseDocumentSqlBoundedScanInventoryRootAlloc(
         if (entry.id.len == 0 or
             seen.contains(entry.id) or
             !documentSqlBoundedScanInventoryIdKnown(entry.id) or
-            !std.mem.eql(u8, entry.sql_slices_section, "Finish document query and view-mapping hardening") or
+            !std.mem.eql(u8, entry.sql_slices_section, "Document SQL") or
             !documentSqlBoundedScanContractKindKnown(entry.contract_kind) or
             !documentSqlBoundedScanStatusKnown(entry.status) or
             !documentSqlBoundedScanSourceFixtureKnown(entry.source_fixture) or
@@ -4375,6 +4450,11 @@ fn documentSqlReadExpansionEntryShapeMatches(entry: DocumentSqlReadExpansionGate
     return false;
 }
 
+fn documentSqlReadExpansionAdmissionStatusKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "blocked_until_corpus_and_runtime") or
+        std.mem.eql(u8, name, "guarded_with_corpus_and_runtime");
+}
+
 fn documentSqlReadExpansionRequirementNamesArtifact(
     text: []const u8,
     artifact: []const u8,
@@ -4432,10 +4512,10 @@ pub fn parseDocumentSqlReadExpansionGateRootAlloc(
         if (entry.id.len == 0 or
             seen.contains(entry.id) or
             !documentSqlReadExpansionGateIdKnown(entry.id) or
-            !std.mem.eql(u8, entry.sql_slices_section, "Finish document query and view-mapping hardening") or
+            !std.mem.eql(u8, entry.sql_slices_section, "Document SQL") or
             !documentSqlReadExpansionSurfaceKnown(entry.expansion_surface) or
             !documentSqlReadExpansionEntryShapeMatches(entry) or
-            !std.mem.eql(u8, entry.admission_status, "blocked_until_corpus_and_runtime") or
+            !documentSqlReadExpansionAdmissionStatusKnown(entry.admission_status) or
             !documentSqlReadExpansionRequirementNamesArtifact(entry.source_corpus_requirement, "sql_api_parity_source_corpus.json") or
             !documentSqlReadExpansionRequirementNamesArtifact(entry.coverage_bucket_requirement, "sql_api_required_coverage.json") or
             !documentSqlReadExpansionRequirementNamesArtifact(entry.runtime_parity_requirement, "runtime result-parity") or
@@ -6832,7 +6912,7 @@ fn sourceCorpusEntryHasSubqueryPredicateReason(entry: AppParityCorpusEntry) bool
         sourceCorpusEntryHasClassificationReason(entry, "subquery_quantified_plan");
 }
 
-fn sourceCorpusEntryHasMatchingSubqueryReason(entry: AppParityCorpusEntry, reason: []const u8) bool {
+fn sourceCorpusEntryHasMatchingReason(entry: AppParityCorpusEntry, reason: []const u8) bool {
     return sourceCorpusEntryHasClassificationReason(entry, reason) and
         corpusPlanMatchesReason(entry.family, entry.plan, reason);
 }
@@ -6846,11 +6926,17 @@ fn validateSourceCorpusGeneratedParseFailureEntryAlloc(
         error.UnexpectedToken, error.UnsupportedSqlShape => {},
         else => return false,
     }
+    if (entry.family == .unsupported_ddl and
+        (sourceCorpusEntryHasMatchingReason(entry, "backup_lifecycle_sql_unavailable") or
+            sourceCorpusEntryHasMatchingReason(entry, "default_scalar_subquery_plan")))
+    {
+        return true;
+    }
     return entry.family == .unsupported_read and
-        (sourceCorpusEntryHasMatchingSubqueryReason(entry, "subquery_expression_plan") or
-            sourceCorpusEntryHasMatchingSubqueryReason(entry, "subquery_scalar_plan") or
-            sourceCorpusEntryHasMatchingSubqueryReason(entry, "subquery_semijoin_plan") or
-            sourceCorpusEntryHasMatchingSubqueryReason(entry, "subquery_quantified_plan"));
+        (sourceCorpusEntryHasMatchingReason(entry, "subquery_expression_plan") or
+            sourceCorpusEntryHasMatchingReason(entry, "subquery_scalar_plan") or
+            sourceCorpusEntryHasMatchingReason(entry, "subquery_semijoin_plan") or
+            sourceCorpusEntryHasMatchingReason(entry, "subquery_quantified_plan"));
 }
 
 pub fn sourceCorpusGeneratedParseFailureEntryAlloc(
@@ -9399,7 +9485,6 @@ fn corpusFixtureCanUseDocumentViewMappingCatalog(entry: AppParityCorpusEntry) bo
             (std.mem.eql(u8, entry.classification_reason, "document_sql_bounded_scan_incomplete_topk") or
                 std.mem.eql(u8, entry.classification_reason, "document_sql_bounded_scan_missing_exact_producer") or
                 std.mem.eql(u8, entry.classification_reason, "document_sql_bounded_scan_unsupported_residual") or
-                std.mem.eql(u8, entry.classification_reason, "document_sql_lateral_requires_native_producer") or
                 std.mem.eql(u8, entry.classification_reason, "document_sql_unsupported_join") or
                 std.mem.eql(u8, entry.classification_reason, "document_sql_view_mapping_unsupported") or
                 std.mem.eql(u8, entry.classification_reason, "document_sql_bounded_scan_unbounded_source")));
@@ -10683,6 +10768,7 @@ pub fn appendSourceQueryAccessPathFingerprintAlloc(
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_expr_not", query.expression_not_predicates.len);
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_expr_array", query.expression_array_contains.len);
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_subquery_pred", query.subquery_predicates.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_scalar_subquery", query.scalar_subqueries.len);
     return fingerprint;
 }
 
@@ -10699,6 +10785,7 @@ pub fn appendSourceQueryAccessOnlyFingerprintAlloc(
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_text_pattern", query.text_patterns.len);
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_access_or", query.access_or_predicates.len);
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_access_not", query.access_not_predicates.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_scalar_subquery", query.scalar_subqueries.len);
     return fingerprint;
 }
 
@@ -10886,6 +10973,7 @@ pub fn aggregateFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredAggre
         fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "filter_expr_array", filter_expression_arrays);
         fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "filter_json", filter_json_access);
         fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "filter_structured", filter_structured_access);
+        fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "agg_arg_order", aggregateArgumentOrderCount(lowered.aggregate.aggregations));
         fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "percentile_desc", aggregateDescendingPercentileCount(lowered.aggregate.aggregations));
         fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "percentile_array", aggregatePercentileArrayCount(lowered.aggregate.aggregations));
         fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "mode", aggregateModeCount(lowered.aggregate.aggregations));
@@ -10916,6 +11004,7 @@ pub fn aggregateFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredAggre
             },
         );
         var fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, base, "order_expr", expressionOrderCount(lowered.aggregate.order_by));
+        fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "agg_arg_order", aggregateArgumentOrderCount(lowered.aggregate.aggregations));
         fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "percentile_desc", aggregateDescendingPercentileCount(lowered.aggregate.aggregations));
         fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "percentile_array", aggregatePercentileArrayCount(lowered.aggregate.aggregations));
         fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "mode", aggregateModeCount(lowered.aggregate.aggregations));
@@ -10940,6 +11029,7 @@ pub fn aggregateFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredAggre
         },
     );
     var fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, base, "order_expr", expressionOrderCount(lowered.aggregate.order_by));
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "agg_arg_order", aggregateArgumentOrderCount(lowered.aggregate.aggregations));
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "percentile_desc", aggregateDescendingPercentileCount(lowered.aggregate.aggregations));
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "percentile_array", aggregatePercentileArrayCount(lowered.aggregate.aggregations));
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "mode", aggregateModeCount(lowered.aggregate.aggregations));
@@ -11223,7 +11313,40 @@ fn appendDocumentProjectionFingerprintAlloc(
         },
     );
     alloc.free(owned_base);
-    return out;
+    var fingerprint = out;
+    if (projection.field2.len > 0) {
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "field2", projection.field2);
+    }
+    if (projection.kind == .numeric_arithmetic) {
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "numeric_op", @tagName(projection.numeric_operator));
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "numeric_operand", projection.numeric_operand);
+    }
+    if (projection.kind == .text_substring or projection.kind == .text_overlay) {
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "start", projection.numeric_operand);
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "length", projection.numeric_operand2);
+    }
+    if (projection.kind == .text_left or projection.kind == .text_right or projection.kind == .text_repeat) {
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "count", projection.numeric_operand);
+    }
+    if (projection.kind == .text_lpad or projection.kind == .text_rpad) {
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "width", projection.numeric_operand);
+    }
+    if (projection.kind == .text_chr and projection.numeric_operand.len > 0) {
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "codepoint", projection.numeric_operand);
+    }
+    switch (projection.kind) {
+        .regexp_count, .regexp_instr, .regexp_substr, .array_append, .array_cat, .array_prepend, .array_remove, .array_replace, .array_position, .array_positions, .text_starts_with, .text_ends_with, .text_strpos, .text_split_part, .text_replace, .text_nullif, .text_translate, .text_concat_ws, .text_array_to_string, .text_string_to_array, .text_lpad, .text_rpad, .text_overlay => {
+            fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "pattern", projection.pattern);
+        },
+        else => {},
+    }
+    if (projection.kind == .text_replace or projection.kind == .text_translate or projection.kind == .array_replace) {
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "replacement", projection.numeric_operand);
+    }
+    if (projection.kind == .text_split_part) {
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "part", projection.numeric_operand);
+    }
+    return fingerprint;
 }
 
 fn appendDocumentProducerFingerprintAlloc(
@@ -11300,7 +11423,21 @@ fn documentQueryFingerprintAlloc(
     if (plan.unnest) |unnest| {
         fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "unnest", unnest.field);
         fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "unnest_alias", unnest.alias);
-        fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "unnest_filter", unnest.filter_value_json != null or unnest.filter_values_json != null or unnest.filter_range_json != null or unnest.filter_not_query_json != null or unnest.filter_pattern_query_json != null or unnest.filter_is_not_null or unnest.filter_match_none);
+        fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "unnest_filter", unnest.filter_value_json != null or unnest.filter_values_json != null or unnest.filter_range_json != null or unnest.filter_not_values_json != null or unnest.filter_not_query_json != null or unnest.filter_pattern_query_json != null or unnest.filter_is_not_null or unnest.filter_match_none);
+    }
+    if (plan.lateral_subquery) |lateral| {
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "lateral_alias", lateral.alias);
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "lateral_field", lateral.field);
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "lateral_path", lateral.path);
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "lateral_correlation_field", lateral.correlation_field);
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "lateral_correlation_path", lateral.correlation_path);
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "lateral_join_kind", @tagName(lateral.join_kind));
+        fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "lateral_branch_ordered", lateral.branch_ordered);
+        fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "lateral_branch_order_keys", if (lateral.branch_order_by.len > 1) lateral.branch_order_by.len else 0);
+        fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "lateral_branch_lookup", lateral.branch_lookup_required);
+        fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "lateral_correlation_nullable", lateral.correlation_nullable);
+        fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "lateral_field_residuals", lateral.field_residuals.len);
+        fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "lateral_residual", lateral.residual_filter_json != null);
     }
     return fingerprint;
 }
@@ -12769,7 +12906,24 @@ test "sql adapter corpus validates parser migration table manifest" {
     try std.testing.expectEqualStrings("durable_executor", table.root.families[7].entrypoints[2]);
     try std.testing.expectEqualStrings("generated_gated_unsupported", table.root.families[0].parser_status);
     try std.testing.expectEqualStrings("tokenized parsed sql retained AST corruption rejects generated unsupported DDL", table.root.families[0].retained_ast_corruption_test);
-    try std.testing.expect(table.root.families[0].removal_evidence.raw_ast_fixtures.len > 0);
+    try std.testing.expectEqual(@as(usize, 2), table.root.families[0].removal_evidence.raw_ast_fixtures.len);
+    try std.testing.expectEqual(@as(usize, 4), table.root.families[1].removal_evidence.raw_ast_fixtures.len);
+    try std.testing.expectEqual(@as(usize, 6), table.root.families[2].removal_evidence.raw_ast_fixtures.len);
+    try std.testing.expectEqual(@as(usize, 4), table.root.families[3].removal_evidence.raw_ast_fixtures.len);
+    try std.testing.expectEqual(@as(usize, 10), table.root.families[4].removal_evidence.raw_ast_fixtures.len);
+    try std.testing.expectEqual(@as(usize, 11), table.root.families[5].removal_evidence.raw_ast_fixtures.len);
+    try std.testing.expectEqual(@as(usize, 16), table.root.families[6].removal_evidence.raw_ast_fixtures.len);
+    try std.testing.expectEqual(@as(usize, 9), table.root.families[7].removal_evidence.raw_ast_fixtures.len);
+    try std.testing.expectEqual(@as(usize, 17), table.root.families[table.root.families.len - 1].removal_evidence.raw_ast_fixtures.len);
+    try std.testing.expectEqual(@as(usize, 2), table.root.families[0].removal_evidence.deleted_compatibility_paths.len);
+    try std.testing.expectEqual(@as(usize, 2), table.root.families[1].removal_evidence.deleted_compatibility_paths.len);
+    try std.testing.expectEqual(@as(usize, 1), table.root.families[2].removal_evidence.deleted_compatibility_paths.len);
+    try std.testing.expectEqual(@as(usize, 2), table.root.families[3].removal_evidence.deleted_compatibility_paths.len);
+    try std.testing.expectEqual(@as(usize, 2), table.root.families[4].removal_evidence.deleted_compatibility_paths.len);
+    try std.testing.expectEqual(@as(usize, 1), table.root.families[5].removal_evidence.deleted_compatibility_paths.len);
+    try std.testing.expectEqual(@as(usize, 2), table.root.families[6].removal_evidence.deleted_compatibility_paths.len);
+    try std.testing.expectEqual(@as(usize, 1), table.root.families[7].removal_evidence.deleted_compatibility_paths.len);
+    try std.testing.expectEqual(@as(usize, 2), table.root.families[table.root.families.len - 1].removal_evidence.deleted_compatibility_paths.len);
     try std.testing.expect(table.root.families[0].removal_evidence.stale_metadata_tests.len > 0);
 
     const unknown_json =
@@ -13052,6 +13206,53 @@ test "sql adapter corpus validates document sql dependency guard manifest" {
     try std.testing.expectEqualStrings("document-table-writes", guard.root.entries[2].id);
     try std.testing.expectEqualStrings("unsupported_fail_closed", guard.root.entries[2].admission);
     try std.testing.expectEqualStrings("document-view-mapping", guard.root.entries[3].id);
+    try std.testing.expectEqualStrings("admitted_read_only", guard.root.entries[3].admission);
+    try std.testing.expectEqualStrings("shared_relational_evidence", guard.root.entries[3].parser_guard);
+    try std.testing.expectEqualStrings("native_document_query_path", guard.root.entries[3].durable_storage_guard);
+    try std.testing.expectEqualStrings("read_only", guard.root.entries[3].durable_document);
+    try std.testing.expect(std.mem.indexOf(u8, guard.root.entries[3].evidence_symbol, "view mapping") != null);
+    try std.testing.expect(std.mem.indexOf(u8, guard.root.entries[3].evidence_symbol, "boolean residual") != null);
+    try std.testing.expect(std.mem.indexOf(u8, guard.root.entries[3].evidence_symbol, "pattern residual") != null);
+    try std.testing.expect(std.mem.indexOf(u8, guard.root.entries[3].evidence_symbol, "JSON residual") != null);
+    try std.testing.expect(std.mem.indexOf(u8, guard.root.entries[3].evidence_symbol, "array residual") != null);
+
+    var document_corpus = try document_sql_corpus.parseDocumentSqlCorpusAlloc(alloc);
+    defer document_corpus.deinit();
+    var saw_grouped_not = false;
+    var saw_not_in = false;
+    var saw_grouped_or = false;
+    var saw_ilike = false;
+    var saw_regex = false;
+    var saw_regex_not_imatch = false;
+    var saw_json_key_exists = false;
+    var saw_json_key_any = false;
+    var saw_json_key_all = false;
+    var saw_array_overlap = false;
+    var saw_array_contains = false;
+    for (document_corpus.value.document_read_plan_cases) |case| {
+        saw_grouped_not = saw_grouped_not or std.mem.eql(u8, case.name, "view-mapped grouped not predicate lowers to indexed residual");
+        saw_not_in = saw_not_in or std.mem.eql(u8, case.name, "view-mapped not in predicate lowers to indexed residual");
+        saw_grouped_or = saw_grouped_or or std.mem.eql(u8, case.name, "view-mapped grouped or predicate lowers to indexed residual");
+        saw_ilike = saw_ilike or std.mem.eql(u8, case.name, "view-mapped ilike predicate lowers to indexed residual");
+        saw_regex = saw_regex or std.mem.eql(u8, case.name, "view-mapped regex predicate lowers to indexed residual");
+        saw_regex_not_imatch = saw_regex_not_imatch or std.mem.eql(u8, case.name, "view-mapped regex not imatch predicate lowers to indexed residual");
+        saw_json_key_exists = saw_json_key_exists or std.mem.eql(u8, case.name, "view-mapped JSON key exists predicate with indexed scalar conjunct lowers to bounded residual");
+        saw_json_key_any = saw_json_key_any or std.mem.eql(u8, case.name, "view-mapped JSON key any predicate with indexed scalar conjunct lowers to bounded residual");
+        saw_json_key_all = saw_json_key_all or std.mem.eql(u8, case.name, "view-mapped JSON key all predicate with indexed scalar conjunct lowers to bounded residual");
+        saw_array_overlap = saw_array_overlap or std.mem.eql(u8, case.name, "view-mapped array overlap predicate with indexed scalar conjunct lowers to bounded residual");
+        saw_array_contains = saw_array_contains or std.mem.eql(u8, case.name, "view-mapped array contains predicate with indexed scalar conjunct lowers to bounded residual");
+    }
+    try std.testing.expect(saw_grouped_not);
+    try std.testing.expect(saw_not_in);
+    try std.testing.expect(saw_grouped_or);
+    try std.testing.expect(saw_ilike);
+    try std.testing.expect(saw_regex);
+    try std.testing.expect(saw_regex_not_imatch);
+    try std.testing.expect(saw_json_key_exists);
+    try std.testing.expect(saw_json_key_any);
+    try std.testing.expect(saw_json_key_all);
+    try std.testing.expect(saw_array_overlap);
+    try std.testing.expect(saw_array_contains);
 
     const unknown_guard_json =
         \\{
@@ -13155,7 +13356,7 @@ test "sql adapter corpus validates document sql bounded scan inventory manifest"
         \\  "entries": [
         \\    {
         \\      "id": "unexpected-bounded-scan-contract",
-        \\      "sql_slices_section": "Finish document query and view-mapping hardening",
+        \\      "sql_slices_section": "Document SQL",
         \\      "contract_kind": "view_mapping_residual",
         \\      "status": "covered",
         \\      "source_fixture": "unexpected bounded scan fixture",
@@ -13182,7 +13383,7 @@ test "sql adapter corpus validates document sql bounded scan inventory manifest"
         \\  "entries": [
         \\    {
         \\      "id": "unexpected-bounded-scan-contract",
-        \\      "sql_slices_section": "Finish document query and view-mapping hardening",
+        \\      "sql_slices_section": "Document SQL",
         \\      "contract_kind": "view_mapping_residual",
         \\      "status": "intentional_contract",
         \\      "source_fixture": "unexpected bounded scan fixture",
@@ -13219,15 +13420,15 @@ test "sql adapter corpus validates document sql read expansion gate manifest" {
         \\  "entries": [
         \\    {
         \\      "id": "lateral-view-mapping-joins",
-        \\      "sql_slices_section": "Finish document query and view-mapping hardening",
+        \\      "sql_slices_section": "Document SQL",
         \\      "expansion_surface": "lateral_view_mapping_joins",
-        \\      "admission_status": "admitted",
+        \\      "admission_status": "admitted_without_required_evidence",
         \\      "source_corpus_requirement": "Add named sql_api_parity_source_corpus.json fixtures.",
         \\      "coverage_bucket_requirement": "Add required sql_api_required_coverage.json buckets.",
         \\      "runtime_parity_requirement": "Add executable runtime result-parity tests.",
         \\      "current_guard": "guard",
-        \\      "evidence_file": "zig/SQL_SLICES.md",
-        \\      "evidence_symbol": "Finish document query and view-mapping hardening",
+        \\      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/document_sql_read_expansion_gate.json",
+        \\      "evidence_symbol": "Document SQL",
         \\      "release_gate": "document-sql-hardening-gate"
         \\    }
         \\  ]
@@ -13243,15 +13444,15 @@ test "sql adapter corpus validates document sql read expansion gate manifest" {
         \\  "entries": [
         \\    {
         \\      "id": "lateral-view-mapping-joins",
-        \\      "sql_slices_section": "Finish document query and view-mapping hardening",
+        \\      "sql_slices_section": "Document SQL",
         \\      "expansion_surface": "lateral_view_mapping_joins",
         \\      "admission_status": "blocked_until_corpus_and_runtime",
         \\      "source_corpus_requirement": "Add named sql_api_parity_source_corpus.json fixtures.",
         \\      "coverage_bucket_requirement": "Add required sql_api_required_coverage.json buckets.",
         \\      "runtime_parity_requirement": "Add tests.",
         \\      "current_guard": "guard",
-        \\      "evidence_file": "zig/SQL_SLICES.md",
-        \\      "evidence_symbol": "Finish document query and view-mapping hardening",
+        \\      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/document_sql_read_expansion_gate.json",
+        \\      "evidence_symbol": "Document SQL",
         \\      "release_gate": "document-sql-hardening-gate"
         \\    }
         \\  ]
@@ -13362,12 +13563,6 @@ test "sql adapter corpus pins document sql bounded scan diagnostic fixture set" 
             .family = .invalid_read,
             .reason = "document_sql_view_mapping_catalog",
             .coverage_bucket = "invalid_read_document_view_mapping_stale_source_metadata",
-        },
-        .{
-            .fixture = "unsupported document sql view mapping lateral join",
-            .family = .unsupported_read,
-            .reason = "document_sql_lateral_requires_native_producer",
-            .coverage_bucket = "unsupported_read_document_view_mapping_lateral_join",
         },
         .{
             .fixture = "unsupported document sql view mapping outer lateral unnest join",
@@ -16667,6 +16862,9 @@ pub const AppParityCorpusCoverage = struct {
     read_quantified_subquery_ilike_all: bool = false,
     read_quantified_subquery_not_like_any: bool = false,
     read_quantified_subquery_not_ilike_any: bool = false,
+    read_non_equality_correlated_subquery: bool = false,
+    read_or_correlated_subquery: bool = false,
+    read_or_correlated_nested_subquery: bool = false,
     query: bool = false,
     query_select_all_disambiguated_outputs: bool = false,
     aggregate: bool = false,
@@ -16690,6 +16888,7 @@ pub const AppParityCorpusCoverage = struct {
     insert: bool = false,
     insert_source: bool = false,
     recursive_insert_source: bool = false,
+    insert_source_scalar_subquery_assignment: bool = false,
     insert_source_expression_assignment: bool = false,
     insert_source_regexp_expression_assignment: bool = false,
     insert_source_computed_pattern_source: bool = false,
@@ -16699,6 +16898,7 @@ pub const AppParityCorpusCoverage = struct {
     insert_source_conflict_default_update: bool = false,
     insert_source_conflict_json_set_expression: bool = false,
     insert_source_conflict_regexp_expression: bool = false,
+    insert_source_conflict_scalar_subquery_update: bool = false,
     insert_source_conflict_boolean_is_not_guard: bool = false,
     update: bool = false,
     delete: bool = false,
@@ -16737,12 +16937,33 @@ pub const AppParityCorpusCoverage = struct {
     document_query_native_graph_metric_native_equivalence: bool = false,
     document_query_native_graph_metric_rerank_native_equivalence: bool = false,
     document_query_view_mapping_full_text_backed_native_equivalence: bool = false,
+    document_query_view_mapping_correlated_lateral_native_equivalence: bool = false,
+    document_query_view_mapping_nullable_lateral_native_equivalence: bool = false,
+    document_query_view_mapping_source_relative_lateral_native_equivalence: bool = false,
+    document_query_view_mapping_function_predicate_native_equivalence: bool = false,
+    document_query_view_mapping_ilike_predicate_native_equivalence: bool = false,
+    document_query_view_mapping_regex_predicate_native_equivalence: bool = false,
+    document_query_view_mapping_regex_not_imatch_predicate_native_equivalence: bool = false,
+    document_query_view_mapping_json_key_exists_predicate_native_equivalence: bool = false,
+    document_query_view_mapping_json_key_any_predicate_native_equivalence: bool = false,
+    document_query_view_mapping_json_key_all_predicate_native_equivalence: bool = false,
+    document_query_view_mapping_array_overlap_predicate_native_equivalence: bool = false,
+    document_query_view_mapping_array_contains_predicate_native_equivalence: bool = false,
+    document_query_view_mapping_not_predicate_native_equivalence: bool = false,
+    document_query_view_mapping_not_in_predicate_native_equivalence: bool = false,
+    document_query_view_mapping_or_predicate_native_equivalence: bool = false,
+    document_query_view_mapping_nonunique_echo_lateral_branch_lookup_native_equivalence: bool = false,
+    document_query_view_mapping_nonunique_pinned_alternate_lateral_branch_row_native_equivalence: bool = false,
+    document_query_view_mapping_nonunique_ordered_alternate_lateral_branch_row_native_equivalence: bool = false,
+    document_query_view_mapping_nonunique_compound_ordered_alternate_lateral_branch_row_native_equivalence: bool = false,
+    document_query_view_mapping_nonunique_later_unique_compound_ordered_alternate_lateral_branch_row_native_equivalence: bool = false,
     document_query_view_mapping_native_equivalence: bool = false,
     document_query_view_mapping_text_field_native_equivalence: bool = false,
     document_query_view_mapping_boolean_field_native_equivalence: bool = false,
     document_query_view_mapping_optional_missing_field_native_equivalence: bool = false,
     document_query_view_mapping_nested_field_native_equivalence: bool = false,
     document_query_view_mapping_multi_field_projection_native_equivalence: bool = false,
+    document_query_view_mapping_projection_expression_native_equivalence: bool = false,
     document_query_view_mapping_rejected_mistyped_field: bool = false,
     document_query_view_mapping_null_predicate: bool = false,
     document_query_view_mapping_null_predicate_native_equivalence: bool = false,
@@ -16758,8 +16979,10 @@ pub const AppParityCorpusCoverage = struct {
     document_query_view_mapping_ordered_topk_native_equivalence: bool = false,
     document_query_array_unnest: bool = false,
     document_query_array_unnest_compound_not_equal_native_equivalence: bool = false,
+    document_query_array_unnest_compound_not_in_native_equivalence: bool = false,
     document_query_array_unnest_native_equivalence: bool = false,
     document_query_array_unnest_not_equal_native_equivalence: bool = false,
+    document_query_array_unnest_not_in_native_equivalence: bool = false,
     document_query_array_unnest_null_native_equivalence: bool = false,
     document_query_array_unnest_not_null_native_equivalence: bool = false,
     document_query_array_unnest_case_insensitive_pattern_native_equivalence: bool = false,
@@ -16769,11 +16992,13 @@ pub const AppParityCorpusCoverage = struct {
     document_query_array_unnest_rejected_non_equality: bool = false,
     document_query_view_mapping_unnest: bool = false,
     document_query_view_mapping_unnest_compound_not_equal_native_equivalence: bool = false,
+    document_query_view_mapping_unnest_compound_not_in_native_equivalence: bool = false,
     document_query_view_mapping_lateral_unnest_cross_native_equivalence: bool = false,
     document_query_view_mapping_lateral_unnest_native_equivalence: bool = false,
     document_query_view_mapping_lateral_unnest_residual_native_equivalence: bool = false,
     document_query_view_mapping_unnest_native_equivalence: bool = false,
     document_query_view_mapping_unnest_not_equal_native_equivalence: bool = false,
+    document_query_view_mapping_unnest_not_in_native_equivalence: bool = false,
     document_query_view_mapping_unnest_null_native_equivalence: bool = false,
     document_query_view_mapping_unnest_not_null_native_equivalence: bool = false,
     document_query_view_mapping_unnest_case_insensitive_pattern_native_equivalence: bool = false,
@@ -16783,11 +17008,16 @@ pub const AppParityCorpusCoverage = struct {
     adapter_noop_ddl: bool = false,
     unsupported_read: bool = false,
     unsupported_ddl: bool = false,
+    unsupported_ddl_backup_database_sql_unavailable: bool = false,
+    unsupported_ddl_restore_database_sql_unavailable: bool = false,
     unsupported_ddl_copy_wrong_stream_endpoint: bool = false,
     unsupported_ddl_copy_unsupported_options: bool = false,
     unsupported_ddl_conversion_alter: bool = false,
     unsupported_ddl_conversion_create: bool = false,
     unsupported_ddl_conversion_drop: bool = false,
+    unsupported_ddl_create_default_scalar_subquery: bool = false,
+    unsupported_ddl_alter_default_scalar_subquery: bool = false,
+    unsupported_ddl_alter_default_scalar_subquery_paginated: bool = false,
     unsupported_ddl_document_table_duplicate_schema_name: bool = false,
     unsupported_ddl_document_table_invalid_antfly_extension: bool = false,
     unsupported_ddl_document_table_invalid_dynamic_template: bool = false,
@@ -16834,18 +17064,9 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_trigger_create_truncate: bool = false,
     unsupported_ddl_trigger_create_update_of: bool = false,
     unsupported_ddl_trigger_create_when: bool = false,
-    unsupported_read_document_view_mapping_function_predicate: bool = false,
-    unsupported_read_document_view_mapping_ilike_predicate: bool = false,
-    unsupported_read_document_view_mapping_lateral_join: bool = false,
     unsupported_read_document_view_mapping_lateral_unnest_outer_join: bool = false,
     unsupported_read_document_view_mapping_lateral_unnest_predicate_join: bool = false,
-    unsupported_read_document_view_mapping_not_in_predicate: bool = false,
-    unsupported_read_document_view_mapping_not_predicate: bool = false,
-    unsupported_read_document_view_mapping_or_predicate: bool = false,
-    unsupported_read_document_view_mapping_projection_expression: bool = false,
     unsupported_read_document_view_mapping_projection_path: bool = false,
-    unsupported_read_document_view_mapping_regex_not_imatch_predicate: bool = false,
-    unsupported_read_document_view_mapping_regex_predicate: bool = false,
     document_write_document_sql_full_document_insert: bool = false,
     document_write_document_sql_generated_id_insert: bool = false,
     document_write_document_sql_exact_id_delete: bool = false,
@@ -16959,6 +17180,8 @@ pub const AppParityCorpusCoverage = struct {
     invalid_read_document_view_mapping_stale_source_metadata: bool = false,
     unsupported_insert: bool = false,
     unsupported_insert_overriding_value: bool = false,
+    unsupported_insert_row_batch_scalar_subquery_conflict_update: bool = false,
+    unsupported_insert_row_batch_scalar_subquery_values: bool = false,
     invalid_read_row_lock_target: bool = false,
     invalid_update_source_row_lock_mode: bool = false,
     invalid_update_source_row_lock_target: bool = false,
@@ -17092,17 +17315,26 @@ pub const AppParityCorpusCoverage = struct {
     point_update_array: bool = false,
     point_update_uuid_generation: bool = false,
     point_update_patch_expression: bool = false,
+    point_update_returning_scalar_subquery_expression: bool = false,
     update_source_claim_skip_locked: bool = false,
     update_source_pagination: bool = false,
     update_source_nullable_pagination: bool = false,
     update_source_boolean_is_not_predicate: bool = false,
+    update_source_scalar_subquery_expression_update: bool = false,
+    update_source_nullif_scalar_subquery_expression_update: bool = false,
+    update_source_greatest_scalar_subquery_expression_update: bool = false,
+    update_source_least_scalar_subquery_expression_update: bool = false,
+    update_source_scalar_subquery_row_assignment: bool = false,
     update_source_returning_expression: bool = false,
+    update_source_returning_scalar_subquery_expression: bool = false,
     point_update_expression_partial_unique_selector: bool = false,
     point_delete_expression_partial_unique_selector: bool = false,
+    point_delete_returning_scalar_subquery_expression: bool = false,
     delete_source_fetch_pagination: bool = false,
     delete_source_nullable_pagination: bool = false,
     delete_source_boolean_unknown_predicate: bool = false,
     delete_source_returning_expression: bool = false,
+    delete_source_returning_scalar_subquery_expression: bool = false,
     joined_source_ordered_pagination: bool = false,
     joined_source_expression_predicate: bool = false,
     joined_source_expression_group: bool = false,
@@ -17310,6 +17542,7 @@ pub const AppParityCorpusCoverage = struct {
     aggregate_percentile_nulls: bool = false,
     aggregate_percentile_array: bool = false,
     aggregate_mode: bool = false,
+    aggregate_argument_order_by: bool = false,
     aggregate_duplicate_output_label: bool = false,
     aggregate_group_expression: bool = false,
     aggregate_group_expression_alias: bool = false,
@@ -17319,6 +17552,7 @@ pub const AppParityCorpusCoverage = struct {
     aggregate_boolean_is_not_having: bool = false,
     aggregate_filter_expression: bool = false,
     aggregate_computed_pattern_filter: bool = false,
+    aggregate_computed_pattern_some_filter: bool = false,
     aggregate_filter_groups: bool = false,
     aggregate_boolean_is_not_filter: bool = false,
     aggregate_boolean_unknown_filter: bool = false,
@@ -17358,6 +17592,7 @@ pub const AppParityCorpusCoverage = struct {
     window_frame_signature: bool = false,
     window_aggregate_filter: bool = false,
     window_computed_pattern_filter: bool = false,
+    window_computed_pattern_some_filter: bool = false,
     window_scalar_minmax: bool = false,
     window_modulo_expression: bool = false,
     joined_source_computed_pattern_filter: bool = false,
@@ -17412,8 +17647,14 @@ pub const AppParityCorpusCoverage = struct {
         entry: AppParityCorpusEntry,
         err: anyerror,
     ) !bool {
-        _ = self;
         if (!(try validateSourceCorpusGeneratedParseFailureEntryAlloc(alloc, entry, err))) return false;
+        if (entry.family == .unsupported_ddl and sourceCorpusEntryHasClassificationReason(entry, "backup_lifecycle_sql_unavailable")) {
+            self.unsupported_ddl = true;
+            self.unsupported_ddl_backup_database_sql_unavailable = self.unsupported_ddl_backup_database_sql_unavailable or
+                std.mem.startsWith(u8, entry.sql, "BACKUP DATABASE ");
+            self.unsupported_ddl_restore_database_sql_unavailable = self.unsupported_ddl_restore_database_sql_unavailable or
+                std.mem.startsWith(u8, entry.sql, "RESTORE DATABASE ");
+        }
         return true;
     }
 
@@ -17529,6 +17770,12 @@ pub const AppParityCorpusCoverage = struct {
                 planHasExactStringToken(entry.plan, "update:table=", "usage_records") and
                 planHasNonZeroToken(entry.plan, ":op_set=") and
                 structured_summary.parser.set_status_lower_assignment);
+        self.point_update_returning_scalar_subquery_expression = self.point_update_returning_scalar_subquery_expression or
+            (entry.family == .update_source and
+                planHasExactStringToken(entry.plan, ":claim=", "locked") and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr=") and
+                structured_summary.parser.returning_keyword and
+                structured_summary.parser.select_keyword);
         self.update_source_claim_skip_locked = self.update_source_claim_skip_locked or (entry.family == .update_source and
             sql_adapter.planHasAnyExactStringToken(entry.plan, ":claim=", &.{ "skip_locked", "no_key_update_skip_locked" }));
         self.update_source_claim_nowait = self.update_source_claim_nowait or (entry.family == .update_source and
@@ -17540,7 +17787,36 @@ pub const AppParityCorpusCoverage = struct {
             structured_summary.parser.limit_null_offset_null and
             sql_adapter.planHasExactStringToken(entry.plan, ":source_limit=", "-1") and
             sql_adapter.planTokenAbsent(entry.plan, ":source_offset="));
+        self.update_source_scalar_subquery_expression_update = self.update_source_scalar_subquery_expression_update or
+            (entry.family == .update_source and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr=") and
+                structured_summary.parser.select_keyword);
+        self.update_source_nullif_scalar_subquery_expression_update = self.update_source_nullif_scalar_subquery_expression_update or
+            (entry.family == .update_source and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr=") and
+                structured_summary.parser.select_keyword and
+                structured_summary.parser.nullif_function);
+        self.update_source_greatest_scalar_subquery_expression_update = self.update_source_greatest_scalar_subquery_expression_update or
+            (entry.family == .update_source and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr=") and
+                structured_summary.parser.select_keyword and
+                structured_summary.parser.greatest_function);
+        self.update_source_least_scalar_subquery_expression_update = self.update_source_least_scalar_subquery_expression_update or
+            (entry.family == .update_source and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr=") and
+                structured_summary.parser.select_keyword and
+                structured_summary.parser.least_function);
+        self.update_source_scalar_subquery_row_assignment = self.update_source_scalar_subquery_row_assignment or
+            (entry.family == .update_source and
+                structured_summary.parser.set_row_assignment and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr=") and
+                structured_summary.parser.select_keyword);
         self.update_source_returning_expression = self.update_source_returning_expression or (entry.family == .update_source and sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
+        self.update_source_returning_scalar_subquery_expression = self.update_source_returning_scalar_subquery_expression or
+            (entry.family == .update_source and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr=") and
+                structured_summary.parser.returning_keyword and
+                structured_summary.parser.select_keyword);
         self.schema_temporal_numrange_insert = self.schema_temporal_numrange_insert or (entry.family == .insert and
             structured_summary.parser.numrange_literal and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "price_intervals") and
@@ -17739,7 +18015,18 @@ pub const AppParityCorpusCoverage = struct {
         self.delete_source_boolean_unknown_predicate = self.delete_source_boolean_unknown_predicate or (entry.family == .delete_source and
             sql_adapter.planHasNonZeroToken(entry.plan, ":source_pred=") and
             structured_summary.parser.boolean_unknown_or_not_unknown);
+        self.point_delete_returning_scalar_subquery_expression = self.point_delete_returning_scalar_subquery_expression or
+            (entry.family == .delete_source and
+                planHasExactStringToken(entry.plan, ":claim=", "locked") and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr=") and
+                structured_summary.parser.returning_keyword and
+                structured_summary.parser.select_keyword);
         self.delete_source_returning_expression = self.delete_source_returning_expression or (entry.family == .delete_source and sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
+        self.delete_source_returning_scalar_subquery_expression = self.delete_source_returning_scalar_subquery_expression or
+            (entry.family == .delete_source and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr=") and
+                structured_summary.parser.returning_keyword and
+                structured_summary.parser.select_keyword);
         self.joined_source_ordered_pagination = self.joined_source_ordered_pagination or (is_joined_source and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":limit=") and
@@ -18088,7 +18375,7 @@ pub const AppParityCorpusCoverage = struct {
         self.document_query_view_mapping_rejected_unsupported_residual = self.document_query_view_mapping_rejected_unsupported_residual or
             (entry.family == .unsupported_read and
                 structured_summary.hasReason("document_sql_bounded_scan_unsupported_residual") and
-                structured_summary.parser.length_function and
+                structured_summary.parser.regexp_count_function and
                 structured_summary.parser.status_identifier and
                 structured_summary.parser.where_keyword);
         self.document_query_view_mapping_rejected_missing_exact_producer = self.document_query_view_mapping_rejected_missing_exact_producer or
@@ -18205,6 +18492,150 @@ pub const AppParityCorpusCoverage = struct {
                 entry.summary.document_view_mapping != null and
                 appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
                 appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"full_text\""));
+        self.document_query_view_mapping_correlated_lateral_native_equivalence = self.document_query_view_mapping_correlated_lateral_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_view_mapping != null and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.join_keyword and
+                std.mem.indexOf(u8, entry.sql, "JOIN LATERAL") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_alias=latest") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_field=score") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_path=/metrics/score") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_correlation_field=plan") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_correlation_path=/metadata/plan") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_join_kind=inner") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_branch_ordered=1") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_residual=1") != null and
+                appParityDocumentViewMappingCatalogContains(entry, "\"unique\":true"));
+        self.document_query_view_mapping_nullable_lateral_native_equivalence = self.document_query_view_mapping_nullable_lateral_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "id_lookup") and
+                entry.summary.document_view_mapping != null and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.join_keyword and
+                std.mem.indexOf(u8, entry.sql, "LEFT JOIN LATERAL") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_alias=latest") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_field=score") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_correlation_field=note") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_join_kind=left") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_correlation_nullable=1") != null and
+                appParityDocumentViewMappingCatalogContains(entry, "\"unique\":true"));
+        self.document_query_view_mapping_source_relative_lateral_native_equivalence = self.document_query_view_mapping_source_relative_lateral_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_view_mapping != null and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.join_keyword and
+                std.mem.indexOf(u8, entry.sql, "LEFT JOIN LATERAL") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_alias=latest") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_field=plan") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_correlation_field=plan") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_join_kind=left") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_field_residuals=1") != null and
+                appParityDocumentViewMappingCatalogContains(entry, "\"unique\":true"));
+        self.document_query_view_mapping_nonunique_echo_lateral_branch_lookup_native_equivalence = self.document_query_view_mapping_nonunique_echo_lateral_branch_lookup_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_view_mapping != null and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.join_keyword and
+                std.mem.indexOf(u8, entry.sql, "LEFT JOIN LATERAL") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_alias=latest") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_field=plan") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_correlation_field=plan") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_join_kind=left") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_branch_lookup=1") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_field_residuals=1") != null and
+                !appParityDocumentViewMappingCatalogContains(entry, "\"unique\":true"));
+        self.document_query_view_mapping_nonunique_pinned_alternate_lateral_branch_row_native_equivalence = self.document_query_view_mapping_nonunique_pinned_alternate_lateral_branch_row_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_view_mapping != null and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.join_keyword and
+                std.mem.indexOf(u8, entry.sql, "LEFT JOIN LATERAL") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_alias=latest") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_field=score") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_correlation_field=plan") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_join_kind=left") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_branch_ordered=1") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_branch_lookup=1") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_residual=1") != null and
+                !appParityDocumentViewMappingCatalogContains(entry, "\"unique\":true"));
+        self.document_query_view_mapping_nonunique_ordered_alternate_lateral_branch_row_native_equivalence = self.document_query_view_mapping_nonunique_ordered_alternate_lateral_branch_row_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_view_mapping != null and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.join_keyword and
+                std.mem.indexOf(u8, entry.sql, "LEFT JOIN LATERAL") != null and
+                std.mem.indexOf(u8, entry.sql, "ORDER BY s.score DESC") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_alias=latest") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_field=score") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_correlation_field=plan") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_join_kind=left") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_branch_ordered=1") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_branch_lookup=1") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_residual=0") != null and
+                appParityDocumentViewMappingCatalogContains(entry, "\"unique\":true"));
+        self.document_query_view_mapping_nonunique_compound_ordered_alternate_lateral_branch_row_native_equivalence = self.document_query_view_mapping_nonunique_compound_ordered_alternate_lateral_branch_row_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_view_mapping != null and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.join_keyword and
+                std.mem.indexOf(u8, entry.sql, "LEFT JOIN LATERAL") != null and
+                std.mem.indexOf(u8, entry.sql, "ORDER BY s.score DESC, s.plan ASC") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_alias=latest") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_field=score") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_correlation_field=plan") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_join_kind=left") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_branch_ordered=1") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_branch_lookup=1") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_residual=0") != null and
+                appParityDocumentViewMappingCatalogContains(entry, "\"unique\":true"));
+        self.document_query_view_mapping_nonunique_later_unique_compound_ordered_alternate_lateral_branch_row_native_equivalence = self.document_query_view_mapping_nonunique_later_unique_compound_ordered_alternate_lateral_branch_row_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_view_mapping != null and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.join_keyword and
+                std.mem.indexOf(u8, entry.sql, "LEFT JOIN LATERAL") != null and
+                std.mem.indexOf(u8, entry.sql, "ORDER BY s.plan ASC, s.score DESC") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_alias=latest") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_field=score") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_correlation_field=plan") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_join_kind=left") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_branch_ordered=1") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_branch_order_keys=2") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_branch_lookup=1") != null and
+                std.mem.indexOf(u8, entry.plan, ":lateral_residual=0") != null and
+                appParityDocumentViewMappingCatalogContains(entry, "\"unique\":true"));
         self.document_query_view_mapping_text_field_native_equivalence = self.document_query_view_mapping_text_field_native_equivalence or
             (entry.family == .read and
                 sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
@@ -18274,6 +18705,19 @@ pub const AppParityCorpusCoverage = struct {
                 std.mem.indexOf(u8, entry.plan, "field:/metrics/score->score") != null and
                 std.mem.indexOf(u8, entry.plan, "field:/published->published") != null and
                 std.mem.indexOf(u8, entry.plan, "field:/metadata/region->region") != null);
+        self.document_query_view_mapping_projection_expression_native_equivalence = self.document_query_view_mapping_projection_expression_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_view_mapping != null and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.lower_function and
+                structured_summary.parser.plan_identifier and
+                std.mem.indexOf(u8, entry.plan, "text_lower:/metadata/plan->plan_lower") != null and
+                appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"metadata.plan\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\""));
         self.document_query_view_mapping_rejected_mistyped_field = self.document_query_view_mapping_rejected_mistyped_field or
             (entry.family == .invalid_read and
                 structured_summary.hasReason("document_sql_view_mapping_catalog") and
@@ -18303,6 +18747,209 @@ pub const AppParityCorpusCoverage = struct {
                 appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
                 appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"full_text\"") and
                 appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"metadata.plan\""));
+        self.document_query_view_mapping_function_predicate_native_equivalence = self.document_query_view_mapping_function_predicate_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_residual != null and
+                entry.summary.document_residual.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier and
+                structured_summary.parser.length_function and
+                structured_summary.parser.full_text_search_function and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":candidate_rows=") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"full_text\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"metadata.plan\""));
+        self.document_query_view_mapping_ilike_predicate_native_equivalence = self.document_query_view_mapping_ilike_predicate_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_residual != null and
+                entry.summary.document_residual.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier and
+                structured_summary.parser.ilike_keyword and
+                structured_summary.parser.full_text_search_function and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":candidate_rows=") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"full_text\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"metadata.plan\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"region\""));
+        self.document_query_view_mapping_regex_predicate_native_equivalence = self.document_query_view_mapping_regex_predicate_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_residual != null and
+                entry.summary.document_residual.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier and
+                structured_summary.parser.regex_match_operator and
+                structured_summary.parser.full_text_search_function and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":candidate_rows=") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"full_text\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"metadata.plan\""));
+        self.document_query_view_mapping_regex_not_imatch_predicate_native_equivalence = self.document_query_view_mapping_regex_not_imatch_predicate_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_residual != null and
+                entry.summary.document_residual.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier and
+                structured_summary.parser.regex_not_imatch_operator and
+                structured_summary.parser.full_text_search_function and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":candidate_rows=") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"full_text\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"metadata.plan\""));
+        self.document_query_view_mapping_json_key_exists_predicate_native_equivalence = self.document_query_view_mapping_json_key_exists_predicate_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_residual != null and
+                entry.summary.document_residual.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier and
+                structured_summary.parser.full_text_search_function and
+                std.mem.indexOf(u8, entry.sql, " metadata ? '") != null and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":candidate_rows=") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"full_text\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"metadata.plan\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"json\""));
+        self.document_query_view_mapping_json_key_any_predicate_native_equivalence = self.document_query_view_mapping_json_key_any_predicate_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_residual != null and
+                entry.summary.document_residual.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier and
+                structured_summary.parser.full_text_search_function and
+                std.mem.indexOf(u8, entry.sql, " ?| ARRAY") != null and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":candidate_rows=") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"full_text\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"metadata.plan\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"json\""));
+        self.document_query_view_mapping_json_key_all_predicate_native_equivalence = self.document_query_view_mapping_json_key_all_predicate_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_residual != null and
+                entry.summary.document_residual.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier and
+                structured_summary.parser.full_text_search_function and
+                std.mem.indexOf(u8, entry.sql, " ?& ARRAY") != null and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":candidate_rows=") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"full_text\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"metadata.plan\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"json\""));
+        self.document_query_view_mapping_array_overlap_predicate_native_equivalence = self.document_query_view_mapping_array_overlap_predicate_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_residual != null and
+                entry.summary.document_residual.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier and
+                structured_summary.parser.full_text_search_function and
+                std.mem.indexOf(u8, entry.sql, " tag_list && ARRAY") != null and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":candidate_rows=") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"full_text\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"metadata.plan\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"tags\""));
+        self.document_query_view_mapping_array_contains_predicate_native_equivalence = self.document_query_view_mapping_array_contains_predicate_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_residual != null and
+                entry.summary.document_residual.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier and
+                structured_summary.parser.full_text_search_function and
+                std.mem.indexOf(u8, entry.sql, " tag_list @> ARRAY") != null and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":candidate_rows=") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"full_text\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"metadata.plan\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"tags\""));
+        self.document_query_view_mapping_not_predicate_native_equivalence = self.document_query_view_mapping_not_predicate_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_residual != null and
+                entry.summary.document_residual.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier and
+                structured_summary.parser.not_keyword and
+                !structured_summary.parser.in_keyword and
+                structured_summary.parser.full_text_search_function and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":candidate_rows=") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"full_text\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"metadata.plan\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"region\""));
+        self.document_query_view_mapping_not_in_predicate_native_equivalence = self.document_query_view_mapping_not_in_predicate_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_residual != null and
+                entry.summary.document_residual.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier and
+                structured_summary.parser.not_keyword and
+                structured_summary.parser.in_keyword and
+                structured_summary.parser.full_text_search_function and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":candidate_rows=") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"full_text\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"metadata.plan\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"region\""));
+        self.document_query_view_mapping_or_predicate_native_equivalence = self.document_query_view_mapping_or_predicate_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_residual != null and
+                entry.summary.document_residual.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier and
+                structured_summary.parser.or_keyword and
+                structured_summary.parser.full_text_search_function and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":candidate_rows=") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"full_text\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"metadata.plan\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"region\""));
         self.document_query_view_mapping_bounded_order = self.document_query_view_mapping_bounded_order or
             (entry.family == .read and
                 sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
@@ -18502,6 +19149,24 @@ pub const AppParityCorpusCoverage = struct {
                 std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
                 std.mem.indexOf(u8, entry.plan, ":unnest_alias=tag") != null and
                 std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null);
+        self.document_query_view_mapping_unnest_not_in_native_equivalence = self.document_query_view_mapping_unnest_not_in_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_unnest != null and
+                entry.summary.document_unnest.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.unnest_function and
+                appParityDocumentViewMappingCatalogContains(entry, "\"tag_list\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array_element\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                std.mem.indexOf(u8, entry.sql, " NOT IN ") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_alias=tag") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null);
         self.document_query_view_mapping_unnest_compound_not_equal_native_equivalence = self.document_query_view_mapping_unnest_compound_not_equal_native_equivalence or
             (entry.family == .read and
                 sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
@@ -18517,6 +19182,26 @@ pub const AppParityCorpusCoverage = struct {
                 appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array_element\"") and
                 appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
                 std.mem.indexOf(u8, entry.sql, "<>") != null and
+                std.mem.indexOf(u8, entry.sql, " AND ") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_alias=tag") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null);
+        self.document_query_view_mapping_unnest_compound_not_in_native_equivalence = self.document_query_view_mapping_unnest_compound_not_in_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_unnest != null and
+                entry.summary.document_unnest.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.unnest_function and
+                appParityDocumentViewMappingCatalogContains(entry, "\"tag_list\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array_element\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                std.mem.indexOf(u8, entry.sql, " IN ") != null and
+                std.mem.indexOf(u8, entry.sql, " NOT IN ") != null and
                 std.mem.indexOf(u8, entry.sql, " AND ") != null and
                 std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
                 std.mem.indexOf(u8, entry.plan, ":unnest_alias=tag") != null and
@@ -18637,6 +19322,20 @@ pub const AppParityCorpusCoverage = struct {
                 std.mem.indexOf(u8, entry.sql, " AND ") == null and
                 std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
                 std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null);
+        self.document_query_array_unnest_not_in_native_equivalence = self.document_query_array_unnest_not_in_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                (std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") or
+                    std.mem.eql(u8, entry.summary.document_native_request.?, "bounded_scan")) and
+                entry.summary.document_unnest != null and
+                entry.summary.document_unnest.? and
+                !structured_summary.parser.support_view_identifier and
+                structured_summary.parser.unnest_function and
+                std.mem.indexOf(u8, entry.sql, " NOT IN ") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null);
         self.document_query_array_unnest_compound_not_equal_native_equivalence = self.document_query_array_unnest_compound_not_equal_native_equivalence or
             (entry.family == .read and
                 sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
@@ -18649,6 +19348,22 @@ pub const AppParityCorpusCoverage = struct {
                 !structured_summary.parser.support_view_identifier and
                 structured_summary.parser.unnest_function and
                 std.mem.indexOf(u8, entry.sql, "<>") != null and
+                std.mem.indexOf(u8, entry.sql, " AND ") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null);
+        self.document_query_array_unnest_compound_not_in_native_equivalence = self.document_query_array_unnest_compound_not_in_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                (std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") or
+                    std.mem.eql(u8, entry.summary.document_native_request.?, "bounded_scan")) and
+                entry.summary.document_unnest != null and
+                entry.summary.document_unnest.? and
+                !structured_summary.parser.support_view_identifier and
+                structured_summary.parser.unnest_function and
+                std.mem.indexOf(u8, entry.sql, " IN ") != null and
+                std.mem.indexOf(u8, entry.sql, " NOT IN ") != null and
                 std.mem.indexOf(u8, entry.sql, " AND ") != null and
                 std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
                 std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null);
@@ -18737,6 +19452,8 @@ pub const AppParityCorpusCoverage = struct {
                     sql_adapter.planHasNonZeroToken(entry.plan, ":percentile_array=");
                 self.aggregate_mode = self.aggregate_mode or
                     sql_adapter.planHasNonZeroToken(entry.plan, ":mode=");
+                self.aggregate_argument_order_by = self.aggregate_argument_order_by or
+                    structured_summary.parser.string_agg_order_function;
                 self.aggregate_duplicate_output_label = self.aggregate_duplicate_output_label or
                     (structured_summary.parser.count_function and
                         structured_summary.parser.as_keyword and
@@ -18758,6 +19475,10 @@ pub const AppParityCorpusCoverage = struct {
                 self.aggregate_filter_expression = self.aggregate_filter_expression or sql_adapter.planHasNonZeroToken(entry.plan, ":filter_expr=");
                 self.aggregate_computed_pattern_filter = self.aggregate_computed_pattern_filter or
                     uses_computed_pattern and sql_adapter.planHasNonZeroToken(entry.plan, ":filter_expr=");
+                self.aggregate_computed_pattern_some_filter = self.aggregate_computed_pattern_some_filter or
+                    uses_computed_pattern and
+                        sql_adapter.planHasNonZeroToken(entry.plan, ":filter_expr=") and
+                        std.mem.indexOf(u8, entry.sql, " LIKE SOME") != null;
                 self.aggregate_filter_groups = self.aggregate_filter_groups or sql_adapter.planHasNonZeroToken(entry.plan, ":filter_groups=");
                 self.aggregate_boolean_is_not_filter = self.aggregate_boolean_is_not_filter or
                     sql_adapter.planHasNonZeroToken(entry.plan, ":filter_groups=") and
@@ -18871,6 +19592,10 @@ pub const AppParityCorpusCoverage = struct {
                     sql_adapter.planHasNonZeroToken(entry.plan, ":window_filter_groups=");
                 self.window_computed_pattern_filter = self.window_computed_pattern_filter or
                     uses_computed_pattern and sql_adapter.planHasNonZeroToken(entry.plan, ":window_filter_expr=");
+                self.window_computed_pattern_some_filter = self.window_computed_pattern_some_filter or
+                    uses_computed_pattern and
+                        sql_adapter.planHasNonZeroToken(entry.plan, ":window_filter_expr=") and
+                        std.mem.indexOf(u8, entry.sql, " LIKE SOME") != null;
             },
             .explain => {
                 self.explain = true;
@@ -19714,6 +20439,16 @@ pub const AppParityCorpusCoverage = struct {
                 self.unsupported_insert = true;
                 self.unsupported_insert_overriding_value = self.unsupported_insert_overriding_value or
                     structured_summary.hasReason("insert_overriding_value_plan");
+                self.unsupported_insert_row_batch_scalar_subquery_conflict_update =
+                    self.unsupported_insert_row_batch_scalar_subquery_conflict_update or
+                    (structured_summary.hasReason("row_batch_scalar_subquery_plan") and
+                        structured_summary.parser.select_keyword and
+                        std.mem.indexOf(u8, entry.sql, "ON CONFLICT") != null);
+                self.unsupported_insert_row_batch_scalar_subquery_values =
+                    self.unsupported_insert_row_batch_scalar_subquery_values or
+                    (structured_summary.hasReason("row_batch_scalar_subquery_plan") and
+                        structured_summary.parser.select_keyword and
+                        std.mem.indexOf(u8, entry.sql, "ON CONFLICT") == null);
             },
             .unsupported_update => {},
             .unsupported_update_source => {},
@@ -19760,6 +20495,22 @@ pub const AppParityCorpusCoverage = struct {
                     (is_public_quantified_subquery and std.mem.indexOf(u8, entry.sql, " NOT LIKE ANY (SELECT") != null);
                 self.read_quantified_subquery_not_ilike_any = self.read_quantified_subquery_not_ilike_any or
                     (is_public_quantified_subquery and std.mem.indexOf(u8, entry.sql, " NOT ILIKE ANY (SELECT") != null);
+                self.read_non_equality_correlated_subquery = self.read_non_equality_correlated_subquery or
+                    (is_public_quantified_subquery and
+                        std.mem.indexOf(u8, entry.sql, " AS outer_usage ") != null and
+                        (std.mem.indexOf(u8, entry.sql, " > outer_usage.") != null or
+                            std.mem.indexOf(u8, entry.sql, " < outer_usage.") != null or
+                            std.mem.indexOf(u8, entry.sql, " >= outer_usage.") != null or
+                            std.mem.indexOf(u8, entry.sql, " <= outer_usage.") != null));
+                self.read_or_correlated_subquery = self.read_or_correlated_subquery or
+                    (is_public_quantified_subquery and
+                        std.mem.indexOf(u8, entry.sql, " AS outer_usage ") != null and
+                        std.mem.indexOf(u8, entry.sql, " OR ") != null);
+                self.read_or_correlated_nested_subquery = self.read_or_correlated_nested_subquery or
+                    (is_public_quantified_subquery and
+                        std.mem.indexOf(u8, entry.sql, " AS outer_usage ") != null and
+                        std.mem.indexOf(u8, entry.sql, " OR ") != null and
+                        std.mem.indexOf(u8, entry.sql, " IN (SELECT") != null);
                 self.read_recursive_cte_stream_plan = self.read_recursive_cte_stream_plan or is_read_recursive_cte;
                 self.read_aggregate = self.read_aggregate or is_read_aggregate;
                 self.read_join = self.read_join or is_read_join;
@@ -19880,70 +20631,25 @@ pub const AppParityCorpusCoverage = struct {
             self.unsupported_read_set_operation_output_shape = self.unsupported_read_set_operation_output_shape or
                 (structured_summary.hasReason("set_operation_output_shape") and
                     structured_summary.parser.intersect);
-            self.unsupported_read_document_view_mapping_projection_expression = self.unsupported_read_document_view_mapping_projection_expression or
-                (structured_summary.hasReason("document_sql_view_mapping_unsupported") and
-                    structured_summary.parser.support_view_identifier and
-                    structured_summary.parser.plan_identifier and
-                    structured_summary.parser.lower_function);
             self.unsupported_read_document_view_mapping_projection_path = self.unsupported_read_document_view_mapping_projection_path or
                 (structured_summary.hasReason("document_sql_view_mapping_unsupported") and
                     structured_summary.parser.support_view_identifier and
                     structured_summary.parser.plan_identifier and
                     structured_summary.parser.title_identifier and
                     !structured_summary.parser.lower_function);
-            self.unsupported_read_document_view_mapping_ilike_predicate = self.unsupported_read_document_view_mapping_ilike_predicate or
-                (structured_summary.hasReason("document_sql_view_mapping_unsupported") and
-                    structured_summary.parser.support_view_identifier and
-                    structured_summary.parser.plan_identifier and
-                    structured_summary.parser.ilike_keyword);
-            self.unsupported_read_document_view_mapping_lateral_join = self.unsupported_read_document_view_mapping_lateral_join or
-                (structured_summary.hasReason("document_sql_lateral_requires_native_producer") and
-                    structured_summary.parser.support_view_identifier and
-                    structured_summary.parser.join_keyword and
-                    std.mem.indexOf(u8, entry.sql, "LATERAL") != null);
             self.unsupported_read_document_view_mapping_lateral_unnest_outer_join = self.unsupported_read_document_view_mapping_lateral_unnest_outer_join or
                 (structured_summary.hasReason("document_sql_unsupported_join") and
                     structured_summary.parser.support_view_identifier and
                     structured_summary.parser.join_keyword and
+                    structured_summary.parser.unnest_function and
                     std.mem.indexOf(u8, entry.sql, "LEFT JOIN LATERAL") != null);
             self.unsupported_read_document_view_mapping_lateral_unnest_predicate_join = self.unsupported_read_document_view_mapping_lateral_unnest_predicate_join or
                 (structured_summary.hasReason("document_sql_unsupported_join") and
                     structured_summary.parser.support_view_identifier and
                     structured_summary.parser.join_keyword and
+                    structured_summary.parser.unnest_function and
                     std.mem.indexOf(u8, entry.sql, "JOIN LATERAL") != null and
-                    std.mem.indexOf(u8, entry.sql, " ON latest.plan = ") != null);
-            self.unsupported_read_document_view_mapping_regex_predicate = self.unsupported_read_document_view_mapping_regex_predicate or
-                (structured_summary.hasReason("document_sql_view_mapping_unsupported") and
-                    structured_summary.parser.support_view_identifier and
-                    structured_summary.parser.plan_identifier and
-                    structured_summary.parser.regex_match_operator);
-            self.unsupported_read_document_view_mapping_regex_not_imatch_predicate = self.unsupported_read_document_view_mapping_regex_not_imatch_predicate or
-                (structured_summary.hasReason("document_sql_view_mapping_unsupported") and
-                    structured_summary.parser.support_view_identifier and
-                    structured_summary.parser.plan_identifier and
-                    structured_summary.parser.regex_not_imatch_operator);
-            self.unsupported_read_document_view_mapping_not_predicate = self.unsupported_read_document_view_mapping_not_predicate or
-                (structured_summary.hasReason("document_sql_view_mapping_unsupported") and
-                    structured_summary.parser.support_view_identifier and
-                    structured_summary.parser.plan_identifier and
-                    structured_summary.parser.not_keyword and
-                    !structured_summary.parser.in_keyword);
-            self.unsupported_read_document_view_mapping_not_in_predicate = self.unsupported_read_document_view_mapping_not_in_predicate or
-                (structured_summary.hasReason("document_sql_view_mapping_unsupported") and
-                    structured_summary.parser.support_view_identifier and
-                    structured_summary.parser.plan_identifier and
-                    structured_summary.parser.not_keyword and
-                    structured_summary.parser.in_keyword);
-            self.unsupported_read_document_view_mapping_or_predicate = self.unsupported_read_document_view_mapping_or_predicate or
-                (structured_summary.hasReason("document_sql_view_mapping_unsupported") and
-                    structured_summary.parser.support_view_identifier and
-                    structured_summary.parser.plan_identifier and
-                    structured_summary.parser.or_keyword);
-            self.unsupported_read_document_view_mapping_function_predicate = self.unsupported_read_document_view_mapping_function_predicate or
-                (structured_summary.hasReason("document_sql_view_mapping_unsupported") and
-                    structured_summary.parser.support_view_identifier and
-                    structured_summary.parser.plan_identifier and
-                    structured_summary.parser.length_function);
+                    std.mem.indexOf(u8, entry.sql, " ON tag = ") != null);
         } else if (entry.family == .merge_mutation) {
             self.merge_mutation_default_expressions = self.merge_mutation_default_expressions or
                 (structured_summary.parser.default_keyword and
@@ -20019,6 +20725,22 @@ pub const AppParityCorpusCoverage = struct {
                 (structured_summary.hasReason("conversion_catalog_plan") and
                     structured_summary.parser.starts_with_drop and
                     structured_summary.parser.conversion_catalog);
+            self.unsupported_ddl_create_default_scalar_subquery = self.unsupported_ddl_create_default_scalar_subquery or
+                (structured_summary.hasReason("default_scalar_subquery_plan") and
+                    structured_summary.parser.starts_with_create and
+                    std.mem.indexOf(u8, entry.sql, "CREATE TABLE") != null and
+                    structured_summary.parser.select_keyword);
+            self.unsupported_ddl_alter_default_scalar_subquery = self.unsupported_ddl_alter_default_scalar_subquery or
+                (structured_summary.hasReason("default_scalar_subquery_plan") and
+                    structured_summary.parser.starts_with_alter and
+                    structured_summary.parser.alter_table and
+                    structured_summary.parser.select_keyword);
+            self.unsupported_ddl_alter_default_scalar_subquery_paginated = self.unsupported_ddl_alter_default_scalar_subquery_paginated or
+                (structured_summary.hasReason("default_scalar_subquery_plan") and
+                    structured_summary.parser.starts_with_alter and
+                    structured_summary.parser.alter_table and
+                    structured_summary.parser.select_keyword and
+                    std.mem.indexOf(u8, entry.sql, " LIMIT ") != null);
             self.unsupported_ddl_document_table_duplicate_schema_name = self.unsupported_ddl_document_table_duplicate_schema_name or
                 sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_duplicate_schema_name");
             self.unsupported_ddl_document_table_invalid_antfly_extension = self.unsupported_ddl_document_table_invalid_antfly_extension or
@@ -21385,6 +22107,11 @@ pub const AppParityCorpusCoverage = struct {
             (entry.family == .insert_source and
                 appParityEntryHasCatalogSchemas(entry) and
                 sql_adapter.planHasExactStringToken(entry.plan, ":source_table=", "archived_records"));
+        self.insert_source_scalar_subquery_assignment = self.insert_source_scalar_subquery_assignment or
+            (entry.family == .insert_source and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":source_scalar_subquery=") and
+                sql_adapter.planHasExactStringToken(entry.plan, ":conflict=", "0") and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":assignments="));
         self.insert_source_expression_assignment = self.insert_source_expression_assignment or
             (entry.family == .insert_source and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":assignment_expr="));
@@ -21423,6 +22150,10 @@ pub const AppParityCorpusCoverage = struct {
                 structured_summary.parser.regexp_substr_function and
                 structured_summary.parser.regexp_count_function and
                 structured_summary.parser.excluded_status_identifier and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":conflict_patch_expr="));
+        self.insert_source_conflict_scalar_subquery_update = self.insert_source_conflict_scalar_subquery_update or
+            (entry.family == .insert_source and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":source_scalar_subquery=") and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":conflict_patch_expr="));
         self.insert_source_conflict_boolean_is_not_guard = self.insert_source_conflict_boolean_is_not_guard or
             (entry.family == .insert_source and
@@ -21594,32 +22325,30 @@ test "sql adapter corpus emits structured fixture summaries" {
     try std.testing.expect(document_view_cross_lateral_unnest.parser.tag_identifier);
     try std.testing.expect(document_view_cross_lateral_unnest.parser.tag_list_identifier);
 
-    var document_view_lateral_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10");
+    var document_view_lateral_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, latest.score FROM support_view AS d JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan AND s.score > 0 ORDER BY s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10");
     defer document_view_lateral_sql.deinit(alloc);
     const document_view_lateral = appParityStructuredFixtureSummary(.{
-        .name = "unsupported document sql view mapping lateral join",
-        .sql = "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
-        .family = .unsupported_read,
-        .classification_reason = "document_sql_lateral_requires_native_producer",
-        .plan = "unsupported:read:requires=document_sql_lateral_requires_native_producer",
+        .name = "document sql view mapping correlated lateral read",
+        .sql = "SELECT d._id, latest.score FROM support_view AS d JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan AND s.score > 0 ORDER BY s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+        .family = .read,
+        .plan = "document_query:table=support_view:producer=indexed_query:lateral_alias=latest:lateral_field=score:lateral_path=/metrics/score:lateral_correlation_field=plan:lateral_correlation_path=/metadata/plan:lateral_join_kind=inner:lateral_branch_ordered=1:lateral_correlation_nullable=0:lateral_residual=1",
     }, &document_view_lateral_sql);
     try std.testing.expect(document_view_lateral.parser.support_view_identifier);
     try std.testing.expect(document_view_lateral.parser.join_keyword);
     try std.testing.expect(document_view_lateral.parser.plan_identifier);
-    try std.testing.expect(document_view_lateral.hasReason("document_sql_lateral_requires_native_producer"));
 
-    var document_view_outer_lateral_unnest_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10");
+    var document_view_outer_lateral_unnest_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d LEFT JOIN LATERAL UNNEST(d.tag_list) AS tag ON true WHERE tag = 'urgent' LIMIT 10");
     defer document_view_outer_lateral_unnest_sql.deinit(alloc);
     const document_view_outer_lateral_unnest = appParityStructuredFixtureSummary(.{
         .name = "unsupported document sql view mapping outer lateral unnest join",
-        .sql = "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+        .sql = "SELECT d._id, tag FROM support_view AS d LEFT JOIN LATERAL UNNEST(d.tag_list) AS tag ON true WHERE tag = 'urgent' LIMIT 10",
         .family = .unsupported_read,
         .classification_reason = "document_sql_unsupported_join",
         .plan = "unsupported:read:requires=document_sql_unsupported_join",
     }, &document_view_outer_lateral_unnest_sql);
     try std.testing.expect(document_view_outer_lateral_unnest.parser.support_view_identifier);
     try std.testing.expect(document_view_outer_lateral_unnest.parser.join_keyword);
-    try std.testing.expect(document_view_outer_lateral_unnest.parser.plan_identifier);
+    try std.testing.expect(document_view_outer_lateral_unnest.parser.unnest_function);
     try std.testing.expect(document_view_outer_lateral_unnest.hasReason("document_sql_unsupported_join"));
 
     var document_projection_insert_sql = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch')");

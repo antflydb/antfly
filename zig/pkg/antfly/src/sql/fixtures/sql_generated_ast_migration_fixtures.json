@@ -10,11 +10,59 @@
       "expected_error": "UnexpectedToken"
     },
     {
+      "name": "backups-restore-database-generated-rejection",
+      "family": "backups",
+      "sql": "RESTORE DATABASE tenant_ops FROM 's3://usage-backups/tenant_ops'",
+      "expected_statement_kind": "",
+      "expected_statement_tag": "",
+      "expected_error": "UnexpectedToken"
+    },
+    {
+      "name": "ddl-alter-table-add-primary-key-generated-ast",
+      "family": "ddl",
+      "sql": "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id)",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "alter_table",
+      "expected_error": ""
+    },
+    {
       "name": "ddl-create-table-generated-ast",
       "family": "ddl",
       "sql": "CREATE TABLE usage_records (id text PRIMARY KEY, status text DEFAULT 'open')",
       "expected_statement_kind": "ddl",
       "expected_statement_tag": "create_table",
+      "expected_error": ""
+    },
+    {
+      "name": "ddl-create-view-generated-ast",
+      "family": "ddl",
+      "sql": "CREATE VIEW usage_records_v AS SELECT id FROM usage_records",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "create_view",
+      "expected_error": ""
+    },
+    {
+      "name": "ddl-drop-table-generated-ast",
+      "family": "ddl",
+      "sql": "DROP TABLE IF EXISTS usage_records CASCADE",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "drop_table",
+      "expected_error": ""
+    },
+    {
+      "name": "dml-delete-using-generated-ast",
+      "family": "dml",
+      "sql": "DELETE FROM usage_records USING source_records AS source WHERE usage_records.id = source.id RETURNING id",
+      "expected_statement_kind": "dml",
+      "expected_statement_tag": "delete",
+      "expected_error": ""
+    },
+    {
+      "name": "dml-insert-on-conflict-generated-ast",
+      "family": "dml",
+      "sql": "INSERT INTO usage_records (id, email, status) VALUES ('u2', 'a@example.test', 'pending') ON CONFLICT (email) DO UPDATE SET status = excluded.status RETURNING id, status",
+      "expected_statement_kind": "dml",
+      "expected_statement_tag": "insert_values",
       "expected_error": ""
     },
     {
@@ -26,11 +74,83 @@
       "expected_error": ""
     },
     {
+      "name": "dml-merge-generated-ast",
+      "family": "dml",
+      "sql": "MERGE INTO usage_records USING source_records ON usage_records.id = source_records.id WHEN MATCHED THEN UPDATE SET status = source_records.status",
+      "expected_statement_kind": "dml",
+      "expected_statement_tag": "merge",
+      "expected_error": ""
+    },
+    {
+      "name": "dml-truncate-generated-ast",
+      "family": "dml",
+      "sql": "TRUNCATE TABLE usage_records",
+      "expected_statement_kind": "dml",
+      "expected_statement_tag": "truncate",
+      "expected_error": ""
+    },
+    {
+      "name": "dml-update-from-generated-ast",
+      "family": "dml",
+      "sql": "UPDATE usage_records SET status = source_records.status FROM source_records WHERE usage_records.id = source_records.id RETURNING id",
+      "expected_statement_kind": "dml",
+      "expected_statement_tag": "update",
+      "expected_error": ""
+    },
+    {
       "name": "extensions-create-extension-generated-ast",
       "family": "extensions",
       "sql": "CREATE EXTENSION IF NOT EXISTS vector WITH VERSION '0.7.0'",
       "expected_statement_kind": "extension_index",
       "expected_statement_tag": "create_extension",
+      "expected_error": ""
+    },
+    {
+      "name": "extensions-create-index-generated-ast",
+      "family": "extensions",
+      "sql": "CREATE UNIQUE INDEX usage_records_status_active_idx ON usage_records (status) INCLUDE (tenant_id, amount) WHERE deleted_at IS NULL",
+      "expected_statement_kind": "extension_index",
+      "expected_statement_tag": "create_index",
+      "expected_error": ""
+    },
+    {
+      "name": "extensions-drop-extension-generated-ast",
+      "family": "extensions",
+      "sql": "DROP EXTENSION IF EXISTS postgis CASCADE",
+      "expected_statement_kind": "extension_index",
+      "expected_statement_tag": "drop_extension",
+      "expected_error": ""
+    },
+    {
+      "name": "extensions-drop-index-generated-ast",
+      "family": "extensions",
+      "sql": "DROP INDEX CONCURRENTLY IF EXISTS usage_records_status_active_idx RESTRICT",
+      "expected_statement_kind": "extension_index",
+      "expected_statement_tag": "drop_index",
+      "expected_error": ""
+    },
+    {
+      "name": "functions-call-procedure-generated-unsupported-ast",
+      "family": "functions",
+      "sql": "CALL rotate_usage()",
+      "expected_statement_kind": "unsupported",
+      "expected_statement_tag": "call",
+      "expected_error": ""
+    },
+    {
+      "name": "functions-create-aggregate-generated-ast",
+      "family": "functions",
+      "sql": "CREATE AGGREGATE first_value_text(text) (SFUNC = first_sfunc, STYPE = text)",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "create_aggregate",
+      "expected_error": ""
+    },
+    {
+      "name": "functions-create-cast-generated-ast",
+      "family": "functions",
+      "sql": "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "create_cast",
       "expected_error": ""
     },
     {
@@ -42,11 +162,270 @@
       "expected_error": ""
     },
     {
+      "name": "functions-create-procedure-generated-ast",
+      "family": "functions",
+      "sql": "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "create_procedure",
+      "expected_error": ""
+    },
+    {
+      "name": "functions-create-trigger-generated-unsupported-ast",
+      "family": "functions",
+      "sql": "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION touch_updated_at()",
+      "expected_statement_kind": "unsupported",
+      "expected_statement_tag": "create_trigger",
+      "expected_error": ""
+    },
+    {
+      "name": "functions-drop-aggregate-generated-ast",
+      "family": "functions",
+      "sql": "DROP AGGREGATE first_value_text(text)",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "drop_aggregate",
+      "expected_error": ""
+    },
+    {
+      "name": "functions-drop-cast-generated-ast",
+      "family": "functions",
+      "sql": "DROP CAST (jsonb AS text)",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "drop_cast",
+      "expected_error": ""
+    },
+    {
+      "name": "functions-drop-function-generated-ast",
+      "family": "functions",
+      "sql": "DROP FUNCTION IF EXISTS audit_changes(text) CASCADE",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "drop_function",
+      "expected_error": ""
+    },
+    {
+      "name": "functions-drop-procedure-generated-ast",
+      "family": "functions",
+      "sql": "DROP PROCEDURE IF EXISTS rotate_usage(text) CASCADE",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "drop_procedure",
+      "expected_error": ""
+    },
+    {
       "name": "lakes-antfly-source-function-generated-read-ast",
       "family": "lakes",
       "sql": "SELECT * FROM antfly.semantic_search(index => 'docs_embeddings', query => 'refund', limit => 10)",
       "expected_statement_kind": "read",
       "expected_statement_tag": "query",
+      "expected_error": "",
+      "expected_antfly_functions": ["semantic_search"]
+    },
+    {
+      "name": "lakes-full-text-source-function-generated-read-ast",
+      "family": "lakes",
+      "sql": "SELECT * FROM antfly.full_text_search(index => 'docs_body_fts', query => 'refund', limit => 10)",
+      "expected_statement_kind": "read",
+      "expected_statement_tag": "query",
+      "expected_error": "",
+      "expected_antfly_functions": ["full_text_search"]
+    },
+    {
+      "name": "lakes-graph-k-shortest-paths-source-function-generated-read-ast",
+      "family": "lakes",
+      "sql": "SELECT * FROM antfly.graph_k_shortest_paths(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', target => 'doc:leaf', k => 3)",
+      "expected_statement_kind": "read",
+      "expected_statement_tag": "query",
+      "expected_error": "",
+      "expected_antfly_functions": ["graph_k_shortest_paths"]
+    },
+    {
+      "name": "lakes-graph-match-source-function-generated-read-ast",
+      "family": "lakes",
+      "sql": "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm",
+      "expected_statement_kind": "read",
+      "expected_statement_tag": "query",
+      "expected_error": "",
+      "expected_antfly_functions": ["graph_match"]
+    },
+    {
+      "name": "lakes-graph-metric-rerank-source-function-generated-read-ast",
+      "family": "lakes",
+      "sql": "SELECT * FROM antfly.graph_metric_rerank(full_text_index => 'docs_body_fts', query => 'refund', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', weight => 1.5, base_weight => 0.25)",
+      "expected_statement_kind": "read",
+      "expected_statement_tag": "query",
+      "expected_error": "",
+      "expected_antfly_functions": ["graph_metric_rerank"]
+    },
+    {
+      "name": "lakes-graph-metric-source-function-generated-read-ast",
+      "family": "lakes",
+      "sql": "SELECT * FROM antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 5)",
+      "expected_statement_kind": "read",
+      "expected_statement_tag": "query",
+      "expected_error": "",
+      "expected_antfly_functions": ["graph_metric"]
+    },
+    {
+      "name": "lakes-graph-neighbors-source-function-generated-read-ast",
+      "family": "lakes",
+      "sql": "SELECT * FROM antfly.graph_neighbors(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root')",
+      "expected_statement_kind": "read",
+      "expected_statement_tag": "query",
+      "expected_error": "",
+      "expected_antfly_functions": ["graph_neighbors"]
+    },
+    {
+      "name": "lakes-graph-shortest-path-source-function-generated-read-ast",
+      "family": "lakes",
+      "sql": "SELECT * FROM antfly.graph_shortest_path(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', target => 'doc:leaf')",
+      "expected_statement_kind": "read",
+      "expected_statement_tag": "query",
+      "expected_error": "",
+      "expected_antfly_functions": ["graph_shortest_path"]
+    },
+    {
+      "name": "lakes-graph-traverse-source-function-generated-read-ast",
+      "family": "lakes",
+      "sql": "SELECT * FROM antfly.graph_traverse(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', max_depth => 2)",
+      "expected_statement_kind": "read",
+      "expected_statement_tag": "query",
+      "expected_error": "",
+      "expected_antfly_functions": ["graph_traverse"]
+    },
+    {
+      "name": "lakes-hybrid-source-function-generated-read-ast",
+      "family": "lakes",
+      "sql": "SELECT * FROM antfly.hybrid_search(index => 'docs_hybrid', query => 'refund', vector => '[0.1,0.2]', limit => 10)",
+      "expected_statement_kind": "read",
+      "expected_statement_tag": "query",
+      "expected_error": "",
+      "expected_antfly_functions": ["hybrid_search"]
+    },
+    {
+      "name": "lakes-vector-source-function-generated-read-ast",
+      "family": "lakes",
+      "sql": "SELECT * FROM antfly.vector_search(index => 'docs_vectors', vector => '[0.1,0.2]', limit => 10)",
+      "expected_statement_kind": "read",
+      "expected_statement_tag": "query",
+      "expected_error": "",
+      "expected_antfly_functions": ["vector_search"]
+    },
+    {
+      "name": "maintenance-analyze-generated-unsupported-ast",
+      "family": "maintenance",
+      "sql": "ANALYZE public.usage_records",
+      "expected_statement_kind": "unsupported",
+      "expected_statement_tag": "analyze",
+      "expected_error": ""
+    },
+    {
+      "name": "maintenance-cluster-generated-unsupported-ast",
+      "family": "maintenance",
+      "sql": "CLUSTER usage_records USING usage_status_idx",
+      "expected_statement_kind": "unsupported",
+      "expected_statement_tag": "cluster",
+      "expected_error": ""
+    },
+    {
+      "name": "maintenance-cursor-declare-generated-ast",
+      "family": "maintenance",
+      "sql": "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id",
+      "expected_statement_kind": "cursor",
+      "expected_statement_tag": "declare",
+      "expected_error": ""
+    },
+    {
+      "name": "maintenance-cursor-fetch-generated-ast",
+      "family": "maintenance",
+      "sql": "FETCH FORWARD 10 IN usage_cursor",
+      "expected_statement_kind": "cursor",
+      "expected_statement_tag": "fetch",
+      "expected_error": ""
+    },
+    {
+      "name": "maintenance-prepared-deallocate-generated-ast",
+      "family": "maintenance",
+      "sql": "DEALLOCATE PREPARE usage_lookup",
+      "expected_statement_kind": "prepared",
+      "expected_statement_tag": "deallocate",
+      "expected_error": ""
+    },
+    {
+      "name": "maintenance-prepared-execute-generated-ast",
+      "family": "maintenance",
+      "sql": "EXECUTE usage_lookup('active')",
+      "expected_statement_kind": "prepared",
+      "expected_statement_tag": "execute",
+      "expected_error": ""
+    },
+    {
+      "name": "maintenance-prepared-prepare-generated-ast",
+      "family": "maintenance",
+      "sql": "PREPARE usage_lookup(text) AS SELECT id FROM usage_records WHERE status = $1",
+      "expected_statement_kind": "prepared",
+      "expected_statement_tag": "prepare",
+      "expected_error": ""
+    },
+    {
+      "name": "maintenance-prepared-transaction-commit-generated-ast",
+      "family": "maintenance",
+      "sql": "COMMIT PREPARED 'usage_batch'",
+      "expected_statement_kind": "prepared_transaction",
+      "expected_statement_tag": "commit",
+      "expected_error": ""
+    },
+    {
+      "name": "maintenance-prepared-transaction-prepare-generated-ast",
+      "family": "maintenance",
+      "sql": "PREPARE TRANSACTION 'usage_batch'",
+      "expected_statement_kind": "prepared_transaction",
+      "expected_statement_tag": "prepare",
+      "expected_error": ""
+    },
+    {
+      "name": "maintenance-prepared-transaction-rollback-generated-ast",
+      "family": "maintenance",
+      "sql": "ROLLBACK PREPARED 'usage_batch'",
+      "expected_statement_kind": "prepared_transaction",
+      "expected_statement_tag": "rollback",
+      "expected_error": ""
+    },
+    {
+      "name": "maintenance-reindex-generated-unsupported-ast",
+      "family": "maintenance",
+      "sql": "REINDEX INDEX CONCURRENTLY public.usage_status_idx",
+      "expected_statement_kind": "unsupported",
+      "expected_statement_tag": "reindex",
+      "expected_error": ""
+    },
+    {
+      "name": "maintenance-transaction-begin-generated-ast",
+      "family": "maintenance",
+      "sql": "BEGIN READ WRITE",
+      "expected_statement_kind": "transaction",
+      "expected_statement_tag": "begin",
+      "expected_error": ""
+    },
+    {
+      "name": "maintenance-transaction-commit-generated-ast",
+      "family": "maintenance",
+      "sql": "COMMIT WORK",
+      "expected_statement_kind": "transaction",
+      "expected_statement_tag": "commit",
+      "expected_error": ""
+    },
+    {
+      "name": "maintenance-transaction-rollback-generated-ast",
+      "family": "maintenance",
+      "sql": "ROLLBACK",
+      "expected_statement_kind": "transaction",
+      "expected_statement_tag": "rollback",
+      "expected_error": ""
+    },
+    {
+      "name": "maintenance-transaction-savepoint-generated-ast",
+      "family": "maintenance",
+      "sql": "SAVEPOINT before_retry",
+      "expected_statement_kind": "transaction",
+      "expected_statement_tag": "savepoint",
       "expected_error": ""
     },
     {
@@ -58,6 +437,14 @@
       "expected_error": ""
     },
     {
+      "name": "query-aggregate-generated-read-ast",
+      "family": "query",
+      "sql": "SELECT status, count(*) AS row_count FROM usage_records GROUP BY status HAVING count(*) > 1 ORDER BY status",
+      "expected_statement_kind": "read",
+      "expected_statement_tag": "aggregate",
+      "expected_error": ""
+    },
+    {
       "name": "query-join-generated-read-ast",
       "family": "query",
       "sql": "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id",
@@ -66,11 +453,195 @@
       "expected_error": ""
     },
     {
+      "name": "query-lateral-generated-read-ast",
+      "family": "query",
+      "sql": "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount FROM usage_records AS bal WHERE bal.organization_id = org.id ORDER BY amount DESC LIMIT 1) AS latest ON true",
+      "expected_statement_kind": "read",
+      "expected_statement_tag": "lateral",
+      "expected_error": ""
+    },
+    {
+      "name": "query-recursive-cte-generated-read-ast",
+      "family": "query",
+      "sql": "WITH RECURSIVE usage_tree AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN usage_tree AS parent ON child.organization_id = parent.id) SELECT id FROM usage_tree",
+      "expected_statement_kind": "read",
+      "expected_statement_tag": "cte",
+      "expected_error": ""
+    },
+    {
+      "name": "query-set-except-generated-read-ast",
+      "family": "query",
+      "sql": "SELECT id FROM usage_records WHERE status = 'open' EXCEPT SELECT id FROM usage_records WHERE status = 'deleted'",
+      "expected_statement_kind": "read",
+      "expected_statement_tag": "set_operation",
+      "expected_error": ""
+    },
+    {
+      "name": "query-set-intersect-generated-read-ast",
+      "family": "query",
+      "sql": "SELECT id FROM usage_records WHERE status = 'open' INTERSECT SELECT id FROM usage_records WHERE enabled IS TRUE",
+      "expected_statement_kind": "read",
+      "expected_statement_tag": "set_operation",
+      "expected_error": ""
+    },
+    {
+      "name": "query-set-union-generated-read-ast",
+      "family": "query",
+      "sql": "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE enabled IS TRUE",
+      "expected_statement_kind": "read",
+      "expected_statement_tag": "set_operation",
+      "expected_error": ""
+    },
+    {
+      "name": "query-single-table-generated-read-ast",
+      "family": "query",
+      "sql": "SELECT id, status FROM usage_records WHERE status = 'active' ORDER BY id LIMIT 10",
+      "expected_statement_kind": "read",
+      "expected_statement_tag": "query",
+      "expected_error": ""
+    },
+    {
+      "name": "query-window-generated-read-ast",
+      "family": "query",
+      "sql": "SELECT tenant_id, id, row_number() OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS row_num FROM usage_records WHERE status = 'open' ORDER BY row_num LIMIT 5",
+      "expected_statement_kind": "read",
+      "expected_statement_tag": "window",
+      "expected_error": ""
+    },
+    {
+      "name": "roles-alter-default-privileges-generated-ast",
+      "family": "roles",
+      "sql": "ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public GRANT SELECT ON TABLES TO readonly",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "alter_default_privileges",
+      "expected_error": ""
+    },
+    {
+      "name": "roles-alter-policy-generated-ast",
+      "family": "roles",
+      "sql": "ALTER POLICY usage_policy ON usage_records WITH CHECK (status = 'ready')",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "alter_policy",
+      "expected_error": ""
+    },
+    {
+      "name": "roles-alter-role-generated-ast",
+      "family": "roles",
+      "sql": "ALTER ROLE app_writer RESET statement_timeout",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "alter_role",
+      "expected_error": ""
+    },
+    {
+      "name": "roles-create-policy-generated-ast",
+      "family": "roles",
+      "sql": "CREATE POLICY usage_select_policy ON usage_records AS RESTRICTIVE FOR SELECT TO app_reader USING (tenant_id = current_user) WITH CHECK (status = 'ready')",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "create_policy",
+      "expected_error": ""
+    },
+    {
       "name": "roles-create-role-generated-ast",
       "family": "roles",
       "sql": "CREATE ROLE app_writer",
       "expected_statement_kind": "ddl",
       "expected_statement_tag": "create_role",
+      "expected_error": ""
+    },
+    {
+      "name": "roles-create-schema-generated-ast",
+      "family": "roles",
+      "sql": "CREATE SCHEMA analytics",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "create_schema",
+      "expected_error": ""
+    },
+    {
+      "name": "roles-drop-policy-generated-ast",
+      "family": "roles",
+      "sql": "DROP POLICY IF EXISTS usage_policy ON usage_records CASCADE",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "drop_policy",
+      "expected_error": ""
+    },
+    {
+      "name": "roles-drop-role-generated-ast",
+      "family": "roles",
+      "sql": "DROP ROLE IF EXISTS app_writer",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "drop_role",
+      "expected_error": ""
+    },
+    {
+      "name": "roles-drop-schema-generated-ast",
+      "family": "roles",
+      "sql": "DROP SCHEMA analytics CASCADE",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "drop_schema",
+      "expected_error": ""
+    },
+    {
+      "name": "roles-grant-role-generated-ast",
+      "family": "roles",
+      "sql": "GRANT readonly TO app_writer",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "grant",
+      "expected_error": ""
+    },
+    {
+      "name": "roles-grant-table-generated-ast",
+      "family": "roles",
+      "sql": "GRANT SELECT ON TABLE usage_records TO readonly",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "grant",
+      "expected_error": ""
+    },
+    {
+      "name": "roles-revoke-role-generated-ast",
+      "family": "roles",
+      "sql": "REVOKE readonly FROM app_writer",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "revoke",
+      "expected_error": ""
+    },
+    {
+      "name": "roles-revoke-table-generated-ast",
+      "family": "roles",
+      "sql": "REVOKE SELECT ON TABLE usage_records FROM readonly",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "revoke",
+      "expected_error": ""
+    },
+    {
+      "name": "roles-session-set-generated-ast",
+      "family": "roles",
+      "sql": "SET search_path TO public",
+      "expected_statement_kind": "session",
+      "expected_statement_tag": "set",
+      "expected_error": ""
+    },
+    {
+      "name": "roles-unsupported-create-schema-options-generated-ast",
+      "family": "roles",
+      "sql": "CREATE SCHEMA analytics AUTHORIZATION app_user",
+      "expected_statement_kind": "unsupported",
+      "expected_statement_tag": "create_schema_options",
+      "expected_error": ""
+    },
+    {
+      "name": "roles-unsupported-drop-role-multi-generated-ast",
+      "family": "roles",
+      "sql": "DROP ROLE app_writer, app_reader",
+      "expected_statement_kind": "unsupported",
+      "expected_statement_tag": "drop_role_multi",
+      "expected_error": ""
+    },
+    {
+      "name": "roles-unsupported-grant-generated-ast",
+      "family": "roles",
+      "sql": "GRANT readonly TO app_writer WITH GRANT OPTION",
+      "expected_statement_kind": "unsupported",
+      "expected_statement_tag": "grant",
       "expected_error": ""
     }
   ]

@@ -72,39 +72,179 @@ const ParsedGeneratedSubqueryRequest = struct {
     query: db_mod.types.RelationalRowsQueryRequest,
     output_field: []const u8 = "",
     correlations: []const db_mod.types.RelationalRowsLateralCorrelation = &.{},
+    correlation_or_predicates: []const db_mod.types.RelationalRowsSubqueryCorrelationGroup = &.{},
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.query.deinit(alloc);
         if (self.output_field.len > 0) alloc.free(self.output_field);
         plan_mod.freeLateralCorrelations(alloc, self.correlations);
         if (self.correlations.len > 0) alloc.free(self.correlations);
+        freeSubqueryCorrelationGroups(alloc, self.correlation_or_predicates);
+        if (self.correlation_or_predicates.len > 0) alloc.free(self.correlation_or_predicates);
         self.* = undefined;
     }
 };
-
-fn generatedSubqueryTailIsLowerable(tail: ?*const generated_parser.GeneratedSqlSubqueryTailAst) bool {
-    const present = tail orelse return true;
-    return present.order_tokens == null and
-        present.order_items.count == 0 and
-        present.order_items.items.len == 0 and
-        present.order_items.expressions.len == 0 and
-        present.order_first_expression == null and
-        present.order_last_expression == null and
-        present.limit_tokens == null and
-        present.limit_expression == null and
-        !present.limit_all and
-        present.offset_tokens == null and
-        present.offset_expression == null and
-        present.fetch_tokens == null and
-        present.fetch_count_tokens == null and
-        present.fetch_count_expression == null;
-}
 
 fn generatedTokenRangeEqual(
     a: generated_parser.GeneratedSqlTokenRange,
     b: generated_parser.GeneratedSqlTokenRange,
 ) bool {
     return a.start == b.start and a.end == b.end;
+}
+
+fn parseGeneratedSubqueryPaginationNullableU32(
+    tokens: []const Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+    expected_range: generated_parser.GeneratedSqlTokenRange,
+    params: []const value_mod.SqlValue,
+) !?u32 {
+    const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+    if (!generatedTokenRangeEqual(expression_tokens, expected_range)) return error.UnsupportedSqlShape;
+    switch (expression.kind) {
+        .token_range => {
+            var pos = expected_range.start;
+            const value = try value_mod.parseNullableSqlU32Value(tokens, &pos, params);
+            if (pos != expected_range.end) return error.UnsupportedSqlShape;
+            return value;
+        },
+        .unary_positive => {
+            const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
+            if (operator_tokens.start != expected_range.start or operator_tokens.end != expected_range.start + 1) return error.UnsupportedSqlShape;
+            if (operator_tokens.end > tokens.len or tokens[operator_tokens.start].kind != .plus) return error.UnsupportedSqlShape;
+            const value_range = expression.right_tokens orelse return error.UnsupportedSqlShape;
+            if (value_range.start != operator_tokens.end or value_range.end != expected_range.end) return error.UnsupportedSqlShape;
+            const right_expression = expression.right_expression orelse return error.UnsupportedSqlShape;
+            if (right_expression.kind != .token_range) return error.UnsupportedSqlShape;
+            if (!generatedTokenRangeEqual(right_expression.tokens orelse return error.UnsupportedSqlShape, value_range)) return error.UnsupportedSqlShape;
+            var pos = value_range.start;
+            const value = try value_mod.parseNullableSqlU32Value(tokens, &pos, params);
+            if (pos != value_range.end) return error.UnsupportedSqlShape;
+            return value;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
+fn parseGeneratedSubqueryTailOrderAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    tail: generated_parser.GeneratedSqlSubqueryTailAst,
+    schema: runtime_schema.TableSchema,
+) ![]const db_mod.types.RelationalRowsQueryOrder {
+    const order_tokens = tail.order_tokens orelse return &.{};
+    try generated_read_validate.validateGeneratedOrderListForClause(tokens, order_tokens, tail.order_items);
+    const first_order_expression = tail.order_first_expression orelse return error.UnsupportedSqlShape;
+    const last_order_expression = tail.order_last_expression orelse return error.UnsupportedSqlShape;
+    try generated_read_validate.validateGeneratedReadListBoundaryExpressions(tokens, tail.order_items, first_order_expression.*, last_order_expression.*);
+    if (tail.order_items.items.len != tail.order_items.count or
+        tail.order_items.expression_items.len != tail.order_items.count or
+        tail.order_items.expressions.len != tail.order_items.count or
+        tail.order_items.direction_items.len != tail.order_items.count or
+        tail.order_items.directions.len != tail.order_items.count or
+        tail.order_items.nulls_order_items.len != tail.order_items.count or
+        tail.order_items.nulls_orders.len != tail.order_items.count)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    var order_by = std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder).empty;
+    errdefer {
+        freeOrderBy(alloc, order_by.items);
+        order_by.deinit(alloc);
+    }
+
+    for (tail.order_items.items, 0..) |item_range, index| {
+        const expression_range = tail.order_items.expression_items[index];
+        const expression = tail.order_items.expressions[index];
+        if (expression.kind != .token_range) return error.UnsupportedSqlShape;
+        if (!generatedTokenRangeEqual(expression.tokens orelse return error.UnsupportedSqlShape, expression_range)) return error.UnsupportedSqlShape;
+        if (expression_range.start < item_range.start or expression_range.end > item_range.end) return error.UnsupportedSqlShape;
+        if (expression_range.end != expression_range.start + 1 or expression_range.end > tokens.len or tokens[expression_range.start].kind != .identifier) return error.UnsupportedSqlShape;
+        const field = try binder.normalizeRowExpressionFieldAlloc(
+            alloc,
+            schema,
+            tokens[expression_range.start].text,
+            &.{},
+            &.{},
+            false,
+        );
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        if (binder.relationalColumnForField(schema, field, null) == null) return error.InvalidSqlCatalog;
+
+        const order: db_mod.types.RelationalRowsQueryOrder = .{
+            .field = field,
+            .direction = switch (tail.order_items.directions[index] orelse .asc) {
+                .asc => .asc,
+                .desc => .desc,
+            },
+        };
+        const explicit_nulls_first: ?bool = if (tail.order_items.nulls_orders[index]) |nulls_order| switch (nulls_order) {
+            .first => true,
+            .last => false,
+        } else null;
+        try expr_order.appendWithNullPlacement(alloc, &order_by, order, explicit_nulls_first);
+        field_transferred = true;
+    }
+
+    return try order_by.toOwnedSlice(alloc);
+}
+
+fn applyGeneratedSubqueryTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    params: []const value_mod.SqlValue,
+    schema: runtime_schema.TableSchema,
+    tail: ?*const generated_parser.GeneratedSqlSubqueryTailAst,
+    query: *db_mod.types.RelationalRowsQueryRequest,
+) !void {
+    const generated_tail = tail orelse return;
+    if (query.order_by.len != 0 or query.limit != null or query.offset != 0) return error.UnsupportedSqlShape;
+    if (generated_tail.order_tokens) |_| {
+        query.order_by = try parseGeneratedSubqueryTailOrderAlloc(alloc, tokens, generated_tail.*, schema);
+    } else {
+        try generated_read_validate.validateGeneratedEmptyList(generated_tail.order_items);
+        if (generated_tail.order_first_expression != null or generated_tail.order_last_expression != null) return error.UnsupportedSqlShape;
+    }
+
+    if (generated_tail.limit_tokens) |range| {
+        if (generated_tail.limit_all) {
+            try generated_read_validate.validateGeneratedLimitAllRangeLayout(tokens, range);
+            if (generated_tail.limit_expression != null) return error.UnsupportedSqlShape;
+            query.limit = null;
+        } else {
+            const expression = generated_tail.limit_expression orelse return error.UnsupportedSqlShape;
+            query.limit = try parseGeneratedSubqueryPaginationNullableU32(tokens, expression.*, range, params);
+        }
+    } else if (generated_tail.limit_expression != null or generated_tail.limit_all) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (generated_tail.offset_tokens) |range| {
+        const expression = generated_tail.offset_expression orelse return error.UnsupportedSqlShape;
+        const expression_range = expression.tokens orelse return error.UnsupportedSqlShape;
+        if (expression_range.start != range.start or expression_range.end > range.end) return error.UnsupportedSqlShape;
+        if (expression_range.end != range.end) {
+            if (expression_range.end + 1 != range.end) return error.UnsupportedSqlShape;
+            if (!tokens[expression_range.end].matchesKeywordTag(.row) and !tokens[expression_range.end].matchesKeywordTag(.rows)) return error.UnsupportedSqlShape;
+        }
+        query.offset = (try parseGeneratedSubqueryPaginationNullableU32(tokens, expression.*, expression_range, params)) orelse 0;
+    } else if (generated_tail.offset_expression != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (generated_tail.fetch_tokens) |range| {
+        try generated_read_validate.validateGeneratedFetchRangeLayout(tokens, range, generated_tail.fetch_count_tokens);
+        query.limit = if (generated_tail.fetch_count_tokens) |count_range| blk: {
+            const expression = generated_tail.fetch_count_expression orelse return error.UnsupportedSqlShape;
+            break :blk try parseGeneratedSubqueryPaginationNullableU32(tokens, expression.*, count_range, params);
+        } else blk: {
+            if (generated_tail.fetch_count_expression != null) return error.UnsupportedSqlShape;
+            break :blk @as(?u32, 1);
+        };
+    } else if (generated_tail.fetch_count_tokens != null or generated_tail.fetch_count_expression != null) {
+        return error.UnsupportedSqlShape;
+    }
 }
 
 pub const NamedWindowSpecsContextHooks = struct {
@@ -466,7 +606,40 @@ fn freeSubqueryPredicates(alloc: std.mem.Allocator, values: []const db_mod.types
         if (value.output_field.len > 0) alloc.free(value.output_field);
         plan_mod.freeLateralCorrelations(alloc, value.correlations);
         if (value.correlations.len > 0) alloc.free(value.correlations);
+        freeSubqueryCorrelationGroups(alloc, value.correlation_or_predicates);
+        if (value.correlation_or_predicates.len > 0) alloc.free(value.correlation_or_predicates);
         if (value.collation) |collation| alloc.free(collation);
+    }
+}
+
+fn freeSubqueryCorrelationGroups(
+    alloc: std.mem.Allocator,
+    values: []const db_mod.types.RelationalRowsSubqueryCorrelationGroup,
+) void {
+    for (values) |value| {
+        freeRelationalChecks(alloc, value.predicates);
+        if (value.predicates.len > 0) alloc.free(value.predicates);
+        freePredicateGroups(alloc, value.or_predicates);
+        if (value.or_predicates.len > 0) alloc.free(value.or_predicates);
+        freePredicateGroups(alloc, value.not_predicates);
+        if (value.not_predicates.len > 0) alloc.free(value.not_predicates);
+        freeExpressionConditions(alloc, value.expression_predicates);
+        if (value.expression_predicates.len > 0) alloc.free(value.expression_predicates);
+        freeExpressionPredicateGroups(alloc, value.expression_or_predicates);
+        if (value.expression_or_predicates.len > 0) alloc.free(value.expression_or_predicates);
+        freeExpressionPredicateGroups(alloc, value.expression_not_predicates);
+        if (value.expression_not_predicates.len > 0) alloc.free(value.expression_not_predicates);
+        freeExpressionArrayContains(alloc, value.expression_array_contains);
+        if (value.expression_array_contains.len > 0) alloc.free(value.expression_array_contains);
+        freeAccessPredicateGroups(alloc, &.{value.access_predicates});
+        freeAccessPredicateGroups(alloc, value.access_or_predicates);
+        if (value.access_or_predicates.len > 0) alloc.free(value.access_or_predicates);
+        freeAccessPredicateGroups(alloc, value.access_not_predicates);
+        if (value.access_not_predicates.len > 0) alloc.free(value.access_not_predicates);
+        freeSubqueryPredicates(alloc, value.subquery_predicates);
+        if (value.subquery_predicates.len > 0) alloc.free(value.subquery_predicates);
+        plan_mod.freeLateralCorrelations(alloc, value.correlations);
+        if (value.correlations.len > 0) alloc.free(value.correlations);
     }
 }
 
@@ -587,6 +760,7 @@ fn generatedSubqueryCorrelationFromQualifiedFieldsAlloc(
     inner_schema: runtime_schema.TableSchema,
     source_table: plan_mod.TableAlias,
     left: plan_mod.QualifiedField,
+    op: runtime_schema.RelationalCheckOp,
     right: plan_mod.QualifiedField,
 ) !?db_mod.types.RelationalRowsLateralCorrelation {
     const left_inner = generatedSubqueryQualifierMatchesSource(source_table, left.qualifier);
@@ -594,11 +768,21 @@ fn generatedSubqueryCorrelationFromQualifiedFieldsAlloc(
     if (left_inner == right_inner) return null;
     const inner_field = if (left_inner) left.field else right.field;
     const outer_field = if (left_inner) right.field else left.field;
+    const correlation_op = if (left_inner) op else switch (op) {
+        .eq => runtime_schema.RelationalCheckOp.eq,
+        .ne => runtime_schema.RelationalCheckOp.ne,
+        .gt => runtime_schema.RelationalCheckOp.lt,
+        .gte => runtime_schema.RelationalCheckOp.lte,
+        .lt => runtime_schema.RelationalCheckOp.gt,
+        .lte => runtime_schema.RelationalCheckOp.gte,
+        .is_null, .is_not_null, .is_distinct, .is_not_distinct => return error.UnsupportedSqlShape,
+    };
     if (binder.relationalColumnForField(inner_schema, inner_field, null) == null) return error.InvalidSqlCatalog;
     if (binder.relationalColumnForField(outer_schema, outer_field, null) == null) return error.InvalidSqlCatalog;
     return .{
         .left_field = try alloc.dupe(u8, outer_field),
         .right_field = try alloc.dupe(u8, inner_field),
+        .op = correlation_op,
     };
 }
 
@@ -628,7 +812,10 @@ fn generatedSubqueryCorrelationWhereAlloc(
     }
     if (where_expression.kind != .comparison) return null;
     const operator_tokens = where_expression.operator_tokens orelse return error.UnsupportedSqlShape;
-    if (operator_tokens.end != operator_tokens.start + 1 or tokens[operator_tokens.start].kind != .eq) return null;
+    if (operator_tokens.end != operator_tokens.start + 1) return error.UnsupportedSqlShape;
+    var operator_pos = operator_tokens.start;
+    const op = expr_operator.parseComparisonOp(tokens[0..operator_tokens.end], &operator_pos) catch return null;
+    if (operator_pos != operator_tokens.end) return error.UnsupportedSqlShape;
     const left = (try generatedSubqueryQualifiedFieldFromSideAlloc(
         alloc,
         tokens,
@@ -651,6 +838,7 @@ fn generatedSubqueryCorrelationWhereAlloc(
         inner_schema,
         source_table,
         left,
+        op,
         right,
     );
 }
@@ -816,6 +1004,397 @@ fn parseGeneratedSubqueryWhereItemAlloc(
     if (item_pos != item_tokens.end) return error.UnsupportedSqlShape;
 }
 
+const GeneratedSubqueryWhereTargets = struct {
+    predicates: *std.ArrayListUnmanaged(runtime_schema.RelationalCheck),
+    json_contains: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsJsonContainsPredicate),
+    json_path_eq: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsJsonPathEqPredicate),
+    json_path_exists: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsJsonPathExistsPredicate),
+    array_any: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayAnyPredicate),
+    array_contains: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayContainsPredicate),
+    array_eq: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayEqPredicate),
+    in_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsInPredicate),
+    text_patterns: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsTextPatternPredicate),
+    or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup),
+    not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup),
+    access_or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsAccessPredicateGroup),
+    access_not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsAccessPredicateGroup),
+    expression_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
+    expression_or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+    expression_not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+    expression_array_contains: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionArrayContainsPredicate),
+    subquery_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsSubqueryPredicate),
+};
+
+fn generatedSubqueryGroupedLogicalAndInner(
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+) !?*const generated_parser.GeneratedSqlExpressionAst {
+    if (expression.kind != .grouped) return null;
+    const inner = expression.inner_expression orelse return error.UnsupportedSqlShape;
+    if (expression.inner_expression_kind != null and expression.inner_expression_kind.? != inner.kind) return error.UnsupportedSqlShape;
+    if (inner.kind != .logical_and) return null;
+    const inner_tokens = expression.inner_tokens orelse return error.UnsupportedSqlShape;
+    const inner_expression_tokens = inner.tokens orelse return error.UnsupportedSqlShape;
+    if (!generatedTokenRangeEqual(inner_expression_tokens, inner_tokens)) return error.UnsupportedSqlShape;
+    return inner;
+}
+
+fn generatedSubqueryGroupedLogicalOrInner(
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+) !?*const generated_parser.GeneratedSqlExpressionAst {
+    if (expression.kind != .grouped) return null;
+    const inner = expression.inner_expression orelse return error.UnsupportedSqlShape;
+    if (expression.inner_expression_kind != null and expression.inner_expression_kind.? != inner.kind) return error.UnsupportedSqlShape;
+    if (inner.kind != .logical_or) return null;
+    const inner_tokens = expression.inner_tokens orelse return error.UnsupportedSqlShape;
+    const inner_expression_tokens = inner.tokens orelse return error.UnsupportedSqlShape;
+    if (!generatedTokenRangeEqual(inner_expression_tokens, inner_tokens)) return error.UnsupportedSqlShape;
+    return inner;
+}
+
+fn parseGeneratedSubqueryWhereExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    item_tokens: generated_parser.GeneratedSqlTokenRange,
+    params: []const value_mod.SqlValue,
+    schema: runtime_schema.TableSchema,
+    outer_schema: runtime_schema.TableSchema,
+    subquery_type_context: expr_type.RowExpressionTypeContext,
+    source_table: plan_mod.TableAlias,
+    correlations: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsLateralCorrelation),
+    targets: GeneratedSubqueryWhereTargets,
+    realtime_ns: u64,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
+    available_ctes: []const db_mod.types.RelationalRowsCte,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+    if (!generatedTokenRangeEqual(expression_tokens, item_tokens)) return error.UnsupportedSqlShape;
+
+    if (try generatedSubqueryGroupedLogicalAndInner(expression)) |inner| {
+        return try parseGeneratedSubqueryWhereExpressionAlloc(
+            alloc,
+            tokens,
+            expression.inner_tokens.?,
+            params,
+            schema,
+            outer_schema,
+            subquery_type_context,
+            source_table,
+            correlations,
+            targets,
+            realtime_ns,
+            fixed_binary_hooks,
+            bare_boolean_hooks,
+            expression_alternatives_hooks,
+            expression_condition_hooks,
+            available_ctes,
+            inner,
+        );
+    }
+
+    if (expression.kind == .logical_and) {
+        const condition_items = expression.boolean_condition_items;
+        if (condition_items.items.len != condition_items.count or condition_items.expressions.len != condition_items.count) return error.UnsupportedSqlShape;
+        for (condition_items.expressions, 0..) |*condition_expression, condition_index| {
+            try parseGeneratedSubqueryWhereExpressionAlloc(
+                alloc,
+                tokens,
+                condition_items.items[condition_index],
+                params,
+                schema,
+                outer_schema,
+                subquery_type_context,
+                source_table,
+                correlations,
+                targets,
+                realtime_ns,
+                fixed_binary_hooks,
+                bare_boolean_hooks,
+                expression_alternatives_hooks,
+                expression_condition_hooks,
+                available_ctes,
+                condition_expression,
+            );
+        }
+        return;
+    }
+
+    const correlation = try generatedSubqueryCorrelationWhereAlloc(
+        alloc,
+        tokens,
+        outer_schema,
+        subquery_type_context.schema,
+        source_table,
+        expression,
+    );
+    if (correlation) |value| {
+        try appendGeneratedSubqueryCorrelationAlloc(alloc, correlations, value);
+        return;
+    }
+
+    try parseGeneratedSubqueryWhereItemAlloc(
+        alloc,
+        tokens,
+        item_tokens,
+        params,
+        schema,
+        subquery_type_context,
+        targets.predicates,
+        targets.json_contains,
+        targets.json_path_eq,
+        targets.json_path_exists,
+        targets.array_any,
+        targets.array_contains,
+        targets.array_eq,
+        targets.in_predicates,
+        targets.text_patterns,
+        targets.or_predicates,
+        targets.not_predicates,
+        targets.access_or_predicates,
+        targets.access_not_predicates,
+        targets.expression_predicates,
+        targets.expression_or_predicates,
+        targets.expression_not_predicates,
+        targets.expression_array_contains,
+        targets.subquery_predicates,
+        realtime_ns,
+        fixed_binary_hooks,
+        bare_boolean_hooks,
+        expression_alternatives_hooks,
+        expression_condition_hooks,
+        available_ctes,
+        expression,
+    );
+}
+
+fn appendGeneratedSubqueryWhereOrCorrelationGroupsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    params: []const value_mod.SqlValue,
+    schema: runtime_schema.TableSchema,
+    outer_schema: runtime_schema.TableSchema,
+    subquery_type_context: expr_type.RowExpressionTypeContext,
+    source_table: plan_mod.TableAlias,
+    groups: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsSubqueryCorrelationGroup),
+    realtime_ns: u64,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
+    available_ctes: []const db_mod.types.RelationalRowsCte,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const or_expression = (try generatedSubqueryGroupedLogicalOrInner(expression)) orelse expression;
+    if (or_expression.kind != .logical_or) return error.UnsupportedSqlShape;
+    const condition_items = or_expression.boolean_condition_items;
+    if (condition_items.items.len != condition_items.count or condition_items.expressions.len != condition_items.count) return error.UnsupportedSqlShape;
+    if (condition_items.count == 0) return error.UnsupportedSqlShape;
+
+    for (condition_items.expressions, 0..) |*condition_expression, condition_index| {
+        var predicates = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
+        errdefer {
+            freeRelationalChecks(alloc, predicates.items);
+            predicates.deinit(alloc);
+        }
+        var correlations = std.ArrayListUnmanaged(db_mod.types.RelationalRowsLateralCorrelation).empty;
+        errdefer {
+            plan_mod.freeLateralCorrelations(alloc, correlations.items);
+            correlations.deinit(alloc);
+        }
+        var json_contains = std.ArrayListUnmanaged(db_mod.types.RelationalRowsJsonContainsPredicate).empty;
+        errdefer {
+            freeJsonContains(alloc, json_contains.items);
+            json_contains.deinit(alloc);
+        }
+        var json_path_eq = std.ArrayListUnmanaged(db_mod.types.RelationalRowsJsonPathEqPredicate).empty;
+        errdefer {
+            freeJsonPathEq(alloc, json_path_eq.items);
+            json_path_eq.deinit(alloc);
+        }
+        var json_path_exists = std.ArrayListUnmanaged(db_mod.types.RelationalRowsJsonPathExistsPredicate).empty;
+        errdefer {
+            freeJsonPathExists(alloc, json_path_exists.items);
+            json_path_exists.deinit(alloc);
+        }
+        var array_any = std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayAnyPredicate).empty;
+        errdefer {
+            freeArrayAny(alloc, array_any.items);
+            array_any.deinit(alloc);
+        }
+        var array_contains = std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayContainsPredicate).empty;
+        errdefer {
+            freeArrayContains(alloc, array_contains.items);
+            array_contains.deinit(alloc);
+        }
+        var array_eq = std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayEqPredicate).empty;
+        errdefer {
+            freeArrayEq(alloc, array_eq.items);
+            array_eq.deinit(alloc);
+        }
+        var in_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsInPredicate).empty;
+        errdefer {
+            freeInPredicates(alloc, in_predicates.items);
+            in_predicates.deinit(alloc);
+        }
+        var text_patterns = std.ArrayListUnmanaged(db_mod.types.RelationalRowsTextPatternPredicate).empty;
+        errdefer {
+            freeTextPatterns(alloc, text_patterns.items);
+            text_patterns.deinit(alloc);
+        }
+        var or_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup).empty;
+        errdefer {
+            freePredicateGroups(alloc, or_predicates.items);
+            or_predicates.deinit(alloc);
+        }
+        var not_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup).empty;
+        errdefer {
+            freePredicateGroups(alloc, not_predicates.items);
+            not_predicates.deinit(alloc);
+        }
+        var access_or_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsAccessPredicateGroup).empty;
+        errdefer {
+            freeAccessPredicateGroups(alloc, access_or_predicates.items);
+            access_or_predicates.deinit(alloc);
+        }
+        var access_not_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsAccessPredicateGroup).empty;
+        errdefer {
+            freeAccessPredicateGroups(alloc, access_not_predicates.items);
+            access_not_predicates.deinit(alloc);
+        }
+        var expression_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition).empty;
+        errdefer {
+            freeExpressionConditions(alloc, expression_predicates.items);
+            expression_predicates.deinit(alloc);
+        }
+        var expression_or_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+        errdefer {
+            freeExpressionPredicateGroups(alloc, expression_or_predicates.items);
+            expression_or_predicates.deinit(alloc);
+        }
+        var expression_not_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+        errdefer {
+            freeExpressionPredicateGroups(alloc, expression_not_predicates.items);
+            expression_not_predicates.deinit(alloc);
+        }
+        var expression_array_contains = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionArrayContainsPredicate).empty;
+        errdefer {
+            freeExpressionArrayContains(alloc, expression_array_contains.items);
+            expression_array_contains.deinit(alloc);
+        }
+        var subquery_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsSubqueryPredicate).empty;
+        errdefer {
+            freeSubqueryPredicates(alloc, subquery_predicates.items);
+            subquery_predicates.deinit(alloc);
+        }
+
+        try parseGeneratedSubqueryWhereExpressionAlloc(
+            alloc,
+            tokens,
+            condition_items.items[condition_index],
+            params,
+            schema,
+            outer_schema,
+            subquery_type_context,
+            source_table,
+            &correlations,
+            .{
+                .predicates = &predicates,
+                .json_contains = &json_contains,
+                .json_path_eq = &json_path_eq,
+                .json_path_exists = &json_path_exists,
+                .array_any = &array_any,
+                .array_contains = &array_contains,
+                .array_eq = &array_eq,
+                .in_predicates = &in_predicates,
+                .text_patterns = &text_patterns,
+                .or_predicates = &or_predicates,
+                .not_predicates = &not_predicates,
+                .access_or_predicates = &access_or_predicates,
+                .access_not_predicates = &access_not_predicates,
+                .expression_predicates = &expression_predicates,
+                .expression_or_predicates = &expression_or_predicates,
+                .expression_not_predicates = &expression_not_predicates,
+                .expression_array_contains = &expression_array_contains,
+                .subquery_predicates = &subquery_predicates,
+            },
+            realtime_ns,
+            fixed_binary_hooks,
+            bare_boolean_hooks,
+            expression_alternatives_hooks,
+            expression_condition_hooks,
+            available_ctes,
+            condition_expression,
+        );
+
+        if (predicates.items.len == 0 and
+            or_predicates.items.len == 0 and
+            not_predicates.items.len == 0 and
+            expression_predicates.items.len == 0 and
+            expression_or_predicates.items.len == 0 and
+            expression_not_predicates.items.len == 0 and
+            expression_array_contains.items.len == 0 and
+            correlations.items.len == 0 and
+            subquery_predicates.items.len == 0 and
+            json_contains.items.len == 0 and
+            json_path_eq.items.len == 0 and
+            json_path_exists.items.len == 0 and
+            array_any.items.len == 0 and
+            array_contains.items.len == 0 and
+            array_eq.items.len == 0 and
+            in_predicates.items.len == 0 and
+            text_patterns.items.len == 0 and
+            access_or_predicates.items.len == 0 and
+            access_not_predicates.items.len == 0) return error.UnsupportedSqlShape;
+
+        var group = db_mod.types.RelationalRowsSubqueryCorrelationGroup{};
+        var group_transferred = false;
+        errdefer if (!group_transferred) freeSubqueryCorrelationGroups(alloc, &.{group});
+        group.predicates = try predicates.toOwnedSlice(alloc);
+        group.or_predicates = try or_predicates.toOwnedSlice(alloc);
+        group.not_predicates = try not_predicates.toOwnedSlice(alloc);
+        group.expression_predicates = try expression_predicates.toOwnedSlice(alloc);
+        group.expression_or_predicates = try expression_or_predicates.toOwnedSlice(alloc);
+        group.expression_not_predicates = try expression_not_predicates.toOwnedSlice(alloc);
+        group.expression_array_contains = try expression_array_contains.toOwnedSlice(alloc);
+        group.access_predicates.array_any = try array_any.toOwnedSlice(alloc);
+        group.access_predicates.array_contains = try array_contains.toOwnedSlice(alloc);
+        group.access_predicates.array_eq = try array_eq.toOwnedSlice(alloc);
+        group.access_predicates.in_predicates = try in_predicates.toOwnedSlice(alloc);
+        group.access_predicates.json_contains = try json_contains.toOwnedSlice(alloc);
+        group.access_predicates.json_path_eq = try json_path_eq.toOwnedSlice(alloc);
+        group.access_predicates.json_path_exists = try json_path_exists.toOwnedSlice(alloc);
+        group.access_predicates.text_patterns = try text_patterns.toOwnedSlice(alloc);
+        group.access_or_predicates = try access_or_predicates.toOwnedSlice(alloc);
+        group.access_not_predicates = try access_not_predicates.toOwnedSlice(alloc);
+        group.subquery_predicates = try subquery_predicates.toOwnedSlice(alloc);
+        group.correlations = try correlations.toOwnedSlice(alloc);
+        predicates = .empty;
+        or_predicates = .empty;
+        not_predicates = .empty;
+        expression_predicates = .empty;
+        expression_or_predicates = .empty;
+        expression_not_predicates = .empty;
+        expression_array_contains = .empty;
+        array_any = .empty;
+        array_contains = .empty;
+        array_eq = .empty;
+        in_predicates = .empty;
+        json_contains = .empty;
+        json_path_eq = .empty;
+        json_path_exists = .empty;
+        text_patterns = .empty;
+        access_or_predicates = .empty;
+        access_not_predicates = .empty;
+        subquery_predicates = .empty;
+        correlations = .empty;
+        try groups.append(alloc, group);
+        group_transferred = true;
+    }
+}
+
 fn parseGeneratedSubqueryRequestAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -832,8 +1411,7 @@ fn parseGeneratedSubqueryRequestAlloc(
     expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
 ) anyerror!ParsedGeneratedSubqueryRequest {
     if (expression.subquery_read_kind != .query or
-        expression.subquery_set_operation_tokens != null or
-        !generatedSubqueryTailIsLowerable(expression.subquery_tail)) return error.UnsupportedSqlShape;
+        expression.subquery_set_operation_tokens != null) return error.UnsupportedSqlShape;
     _ = expression.subquery_select_tokens orelse return error.UnsupportedSqlShape;
     var query = db_mod.types.RelationalRowsQueryRequest{ .select_all = true };
     errdefer query.deinit(alloc);
@@ -856,6 +1434,11 @@ fn parseGeneratedSubqueryRequestAlloc(
     errdefer {
         plan_mod.freeLateralCorrelations(alloc, correlations.items);
         correlations.deinit(alloc);
+    }
+    var correlation_or_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsSubqueryCorrelationGroup).empty;
+    errdefer {
+        freeSubqueryCorrelationGroups(alloc, correlation_or_predicates.items);
+        correlation_or_predicates.deinit(alloc);
     }
     const output_field = if (need_output)
         try parseGeneratedSubqueryProjectionAlloc(alloc, tokens, expression, subquery_type_context, &query)
@@ -959,59 +1542,65 @@ fn parseGeneratedSubqueryRequestAlloc(
             subquery_predicates.deinit(alloc);
         }
 
-        if (where_expression.kind == .logical_and) {
-            const condition_items = where_expression.boolean_condition_items;
-            if (condition_items.items.len != condition_items.count or condition_items.expressions.len != condition_items.count) return error.UnsupportedSqlShape;
-            for (condition_items.expressions, 0..) |*condition_expression, condition_index| {
-                const condition_tokens = condition_items.items[condition_index];
-                const condition_expression_tokens = condition_expression.tokens orelse return error.UnsupportedSqlShape;
-                if (!generatedTokenRangeEqual(condition_expression_tokens, condition_tokens)) return error.UnsupportedSqlShape;
-                const correlation = try generatedSubqueryCorrelationWhereAlloc(
-                    alloc,
-                    tokens,
-                    type_context.schema,
-                    subquery_type_context.schema,
-                    source_table,
-                    condition_expression,
-                );
-                if (correlation) |value| {
-                    try appendGeneratedSubqueryCorrelationAlloc(alloc, &correlations, value);
-                    continue;
-                }
-                try parseGeneratedSubqueryWhereItemAlloc(
-                    alloc,
-                    tokens,
-                    condition_tokens,
-                    params,
-                    schema,
-                    subquery_type_context,
-                    &predicates,
-                    &json_contains,
-                    &json_path_eq,
-                    &json_path_exists,
-                    &array_any,
-                    &array_contains,
-                    &array_eq,
-                    &in_predicates,
-                    &text_patterns,
-                    &or_predicates,
-                    &not_predicates,
-                    &access_or_predicates,
-                    &access_not_predicates,
-                    &expression_predicates,
-                    &expression_or_predicates,
-                    &expression_not_predicates,
-                    &expression_array_contains,
-                    &subquery_predicates,
-                    realtime_ns,
-                    fixed_binary_hooks,
-                    bare_boolean_hooks,
-                    expression_alternatives_hooks,
-                    expression_condition_hooks,
-                    available_ctes,
-                    condition_expression,
-                );
-            }
+        const grouped_and = try generatedSubqueryGroupedLogicalAndInner(where_expression);
+        const grouped_or = try generatedSubqueryGroupedLogicalOrInner(where_expression);
+        if (where_expression.kind == .logical_and or grouped_and != null) {
+            try parseGeneratedSubqueryWhereExpressionAlloc(
+                alloc,
+                tokens,
+                where_tokens,
+                params,
+                schema,
+                type_context.schema,
+                subquery_type_context,
+                source_table,
+                &correlations,
+                .{
+                    .predicates = &predicates,
+                    .json_contains = &json_contains,
+                    .json_path_eq = &json_path_eq,
+                    .json_path_exists = &json_path_exists,
+                    .array_any = &array_any,
+                    .array_contains = &array_contains,
+                    .array_eq = &array_eq,
+                    .in_predicates = &in_predicates,
+                    .text_patterns = &text_patterns,
+                    .or_predicates = &or_predicates,
+                    .not_predicates = &not_predicates,
+                    .access_or_predicates = &access_or_predicates,
+                    .access_not_predicates = &access_not_predicates,
+                    .expression_predicates = &expression_predicates,
+                    .expression_or_predicates = &expression_or_predicates,
+                    .expression_not_predicates = &expression_not_predicates,
+                    .expression_array_contains = &expression_array_contains,
+                    .subquery_predicates = &subquery_predicates,
+                },
+                realtime_ns,
+                fixed_binary_hooks,
+                bare_boolean_hooks,
+                expression_alternatives_hooks,
+                expression_condition_hooks,
+                available_ctes,
+                where_expression,
+            );
+        } else if (where_expression.kind == .logical_or or grouped_or != null) {
+            try appendGeneratedSubqueryWhereOrCorrelationGroupsAlloc(
+                alloc,
+                tokens,
+                params,
+                schema,
+                type_context.schema,
+                subquery_type_context,
+                source_table,
+                &correlation_or_predicates,
+                realtime_ns,
+                fixed_binary_hooks,
+                bare_boolean_hooks,
+                expression_alternatives_hooks,
+                expression_condition_hooks,
+                available_ctes,
+                where_expression,
+            );
         } else if (try generatedSubqueryCorrelationWhereAlloc(
             alloc,
             tokens,
@@ -1080,14 +1669,17 @@ fn parseGeneratedSubqueryRequestAlloc(
         query.expression_array_contains = try expression_array_contains.toOwnedSlice(alloc);
         query.subquery_predicates = try subquery_predicates.toOwnedSlice(alloc);
     }
+    try applyGeneratedSubqueryTailAlloc(alloc, tokens, params, subquery_type_context.schema, expression.subquery_tail, &query);
 
     const out = ParsedGeneratedSubqueryRequest{
         .query = query,
         .output_field = output_field,
         .correlations = try correlations.toOwnedSlice(alloc),
+        .correlation_or_predicates = try correlation_or_predicates.toOwnedSlice(alloc),
     };
     query = .{};
     correlations = .empty;
+    correlation_or_predicates = .empty;
     return out;
 }
 
@@ -1142,18 +1734,55 @@ fn parseGeneratedSubqueryWherePredicateAlloc(
         .query = subquery.query,
         .output_field = subquery.output_field,
         .correlations = subquery.correlations,
+        .correlation_or_predicates = subquery.correlation_or_predicates,
         .collation = null,
     };
     lhs_transferred = true;
     subquery.query = .{};
     subquery.output_field = "";
     subquery.correlations = &.{};
+    subquery.correlation_or_predicates = &.{};
     try subquery_predicates.append(alloc, predicate);
     pos.* = expression_tokens.end;
     return true;
 }
 
-fn generatedProjectionAliasOutputAlloc(
+fn generatedExpressionContainsSubquery(expression: generated_parser.GeneratedSqlExpressionAst) bool {
+    if (expression.kind == .subquery) return true;
+    if (expression.inner_expression) |inner| {
+        if (generatedExpressionContainsSubquery(inner.*)) return true;
+    }
+    if (expression.left_expression) |left| {
+        if (generatedExpressionContainsSubquery(left.*)) return true;
+    }
+    if (expression.right_expression) |right| {
+        if (generatedExpressionContainsSubquery(right.*)) return true;
+    }
+    if (expression.cast_expression) |cast_expression| {
+        if (generatedExpressionContainsSubquery(cast_expression.*)) return true;
+    }
+    if (expression.filter_expression) |filter_expression| {
+        if (generatedExpressionContainsSubquery(filter_expression.*)) return true;
+    }
+    for (expression.argument_items.expressions) |argument_expression| {
+        if (generatedExpressionContainsSubquery(argument_expression)) return true;
+    }
+    for (expression.array_items.expressions) |array_expression| {
+        if (generatedExpressionContainsSubquery(array_expression)) return true;
+    }
+    for (expression.case_condition_items.expressions) |condition_expression| {
+        if (generatedExpressionContainsSubquery(condition_expression)) return true;
+    }
+    for (expression.case_result_items.expressions) |result_expression| {
+        if (generatedExpressionContainsSubquery(result_expression)) return true;
+    }
+    if (expression.case_else_expression) |else_expression| {
+        if (generatedExpressionContainsSubquery(else_expression.*)) return true;
+    }
+    return false;
+}
+
+pub fn generatedProjectionAliasOutputAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     list: generated_parser.GeneratedSqlListAst,
@@ -1173,6 +1802,1257 @@ fn generatedProjectionAliasOutputAlloc(
     }
     if (alias_name_range.end != alias_name_range.start + 1) return error.UnsupportedSqlShape;
     return try alloc.dupe(u8, tokens[alias_name_range.start].text);
+}
+
+fn generatedSameDomainFunctionExpressionKind(
+    tokens: []const Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !db_mod.types.RelationalRowsExpressionKind {
+    const name_tokens = expression.function_name_tokens orelse return error.UnsupportedSqlShape;
+    if (name_tokens.end != name_tokens.start + 1 or name_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    const name = tokens[name_tokens.start].text;
+    if (std.ascii.eqlIgnoreCase(name, "coalesce")) return .coalesce;
+    if (std.ascii.eqlIgnoreCase(name, "nullif")) return .nullif;
+    if (std.ascii.eqlIgnoreCase(name, "greatest")) return .greatest;
+    if (std.ascii.eqlIgnoreCase(name, "least")) return .least;
+    return error.UnsupportedSqlShape;
+}
+
+fn generatedConcatFunctionExpressionKind(
+    tokens: []const Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !?db_mod.types.RelationalRowsExpressionKind {
+    const name_tokens = expression.function_name_tokens orelse return error.UnsupportedSqlShape;
+    if (name_tokens.end != name_tokens.start + 1 or name_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    const name = tokens[name_tokens.start].text;
+    if (std.ascii.eqlIgnoreCase(name, "concat")) return .concat;
+    if (std.ascii.eqlIgnoreCase(name, "concat_ws")) return .concat_ws;
+    return null;
+}
+
+fn generatedUnaryTextFunctionExpressionKind(
+    tokens: []const Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !?db_mod.types.RelationalRowsExpressionKind {
+    const name_tokens = expression.function_name_tokens orelse return error.UnsupportedSqlShape;
+    if (name_tokens.end != name_tokens.start + 1 or name_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    const name = tokens[name_tokens.start].text;
+    if (std.ascii.eqlIgnoreCase(name, "lower")) return .lower;
+    if (std.ascii.eqlIgnoreCase(name, "upper")) return .upper;
+    if (std.ascii.eqlIgnoreCase(name, "initcap")) return .initcap;
+    if (std.ascii.eqlIgnoreCase(name, "md5")) return .md5;
+    return null;
+}
+
+fn generatedUnaryTextNumericFunctionExpressionKind(
+    tokens: []const Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !?db_mod.types.RelationalRowsExpressionKind {
+    const name_tokens = expression.function_name_tokens orelse return error.UnsupportedSqlShape;
+    if (name_tokens.end != name_tokens.start + 1 or name_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    const name = tokens[name_tokens.start].text;
+    if (std.ascii.eqlIgnoreCase(name, "length") or
+        std.ascii.eqlIgnoreCase(name, "char_length") or
+        std.ascii.eqlIgnoreCase(name, "character_length"))
+    {
+        return .length;
+    }
+    if (std.ascii.eqlIgnoreCase(name, "octet_length")) return .octet_length;
+    if (std.ascii.eqlIgnoreCase(name, "bit_length")) return .bit_length;
+    if (std.ascii.eqlIgnoreCase(name, "ascii")) return .ascii;
+    return null;
+}
+
+fn generatedUnaryNumericFunctionExpressionKind(
+    tokens: []const Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !?db_mod.types.RelationalRowsExpressionKind {
+    const name_tokens = expression.function_name_tokens orelse return error.UnsupportedSqlShape;
+    if (name_tokens.end != name_tokens.start + 1 or name_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    const name = tokens[name_tokens.start].text;
+    if (std.ascii.eqlIgnoreCase(name, "abs")) return .abs;
+    if (std.ascii.eqlIgnoreCase(name, "round")) return .round;
+    if (std.ascii.eqlIgnoreCase(name, "trunc")) return .trunc;
+    if (std.ascii.eqlIgnoreCase(name, "floor")) return .floor;
+    if (std.ascii.eqlIgnoreCase(name, "ceil")) return .ceil;
+    if (std.ascii.eqlIgnoreCase(name, "sqrt")) return .sqrt;
+    if (std.ascii.eqlIgnoreCase(name, "sign")) return .sign;
+    return null;
+}
+
+fn generatedBinaryFunctionExpressionKind(
+    tokens: []const Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !?db_mod.types.RelationalRowsExpressionKind {
+    const name_tokens = expression.function_name_tokens orelse return error.UnsupportedSqlShape;
+    if (name_tokens.end != name_tokens.start + 1 or name_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    const name = tokens[name_tokens.start].text;
+    if (std.ascii.eqlIgnoreCase(name, "power")) return .power;
+    if (std.ascii.eqlIgnoreCase(name, "strpos")) return .strpos;
+    return null;
+}
+
+const GeneratedArgumentFunctionOutput = enum {
+    text,
+    numeric,
+};
+
+const GeneratedArgumentFunctionSpec = struct {
+    kind: db_mod.types.RelationalRowsExpressionKind,
+    output: GeneratedArgumentFunctionOutput,
+    min_args: usize,
+    max_args: usize,
+};
+
+fn generatedArgumentFunctionExpressionSpec(
+    tokens: []const Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !?GeneratedArgumentFunctionSpec {
+    const name_tokens = expression.function_name_tokens orelse return error.UnsupportedSqlShape;
+    if (name_tokens.end != name_tokens.start + 1 or name_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    const name = tokens[name_tokens.start].text;
+    if (std.ascii.eqlIgnoreCase(name, "trim") or std.ascii.eqlIgnoreCase(name, "btrim")) return .{ .kind = .trim, .output = .text, .min_args = 1, .max_args = 2 };
+    if (std.ascii.eqlIgnoreCase(name, "ltrim")) return .{ .kind = .ltrim, .output = .text, .min_args = 1, .max_args = 2 };
+    if (std.ascii.eqlIgnoreCase(name, "rtrim")) return .{ .kind = .rtrim, .output = .text, .min_args = 1, .max_args = 2 };
+    if (std.ascii.eqlIgnoreCase(name, "replace")) return .{ .kind = .replace, .output = .text, .min_args = 3, .max_args = 3 };
+    if (std.ascii.eqlIgnoreCase(name, "translate")) return .{ .kind = .translate, .output = .text, .min_args = 3, .max_args = 3 };
+    if (std.ascii.eqlIgnoreCase(name, "regexp_replace")) return .{ .kind = .regexp_replace, .output = .text, .min_args = 3, .max_args = 4 };
+    if (std.ascii.eqlIgnoreCase(name, "regexp_substr")) return .{ .kind = .regexp_substr, .output = .text, .min_args = 2, .max_args = 2 };
+    if (std.ascii.eqlIgnoreCase(name, "substring") or std.ascii.eqlIgnoreCase(name, "substr")) return .{ .kind = .substring, .output = .text, .min_args = 2, .max_args = 3 };
+    if (std.ascii.eqlIgnoreCase(name, "split_part")) return .{ .kind = .split_part, .output = .text, .min_args = 3, .max_args = 3 };
+    if (std.ascii.eqlIgnoreCase(name, "left")) return .{ .kind = .left, .output = .text, .min_args = 2, .max_args = 2 };
+    if (std.ascii.eqlIgnoreCase(name, "right")) return .{ .kind = .right, .output = .text, .min_args = 2, .max_args = 2 };
+    if (std.ascii.eqlIgnoreCase(name, "lpad")) return .{ .kind = .lpad, .output = .text, .min_args = 2, .max_args = 3 };
+    if (std.ascii.eqlIgnoreCase(name, "rpad")) return .{ .kind = .rpad, .output = .text, .min_args = 2, .max_args = 3 };
+    if (std.ascii.eqlIgnoreCase(name, "repeat")) return .{ .kind = .repeat, .output = .text, .min_args = 2, .max_args = 2 };
+    if (std.ascii.eqlIgnoreCase(name, "reverse")) return .{ .kind = .reverse, .output = .text, .min_args = 1, .max_args = 1 };
+    if (std.ascii.eqlIgnoreCase(name, "regexp_count")) return .{ .kind = .regexp_count, .output = .numeric, .min_args = 2, .max_args = 2 };
+    if (std.ascii.eqlIgnoreCase(name, "regexp_instr")) return .{ .kind = .regexp_instr, .output = .numeric, .min_args = 2, .max_args = 2 };
+    return null;
+}
+
+fn scalarSubqueryProjectionOutputExists(
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
+    output: []const u8,
+) bool {
+    for (scalar_subqueries) |projection| {
+        if (std.mem.eql(u8, projection.output, output)) return true;
+    }
+    return false;
+}
+
+fn generatedHiddenScalarSubqueryOutputAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
+) ![]const u8 {
+    var ordinal = scalar_subqueries.len;
+    while (true) : (ordinal += 1) {
+        const output = try std.fmt.allocPrint(alloc, "__antfly_hidden_scalar_subquery_{d}", .{ordinal});
+        if (binder.relationalColumnForField(schema, output, null) == null and !scalarSubqueryProjectionOutputExists(scalar_subqueries, output)) return output;
+        alloc.free(output);
+    }
+}
+
+pub const GeneratedScalarSubqueryTypeContext = struct {
+    context: expr_type.RowExpressionTypeContext,
+    synthetic_columns: []runtime_schema.RelationalColumn,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.synthetic_columns);
+        self.synthetic_columns = &.{};
+    }
+};
+
+pub fn generatedScalarSubqueryTypeContextAlloc(
+    alloc: std.mem.Allocator,
+    type_context: expr_type.RowExpressionTypeContext,
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
+) !GeneratedScalarSubqueryTypeContext {
+    var hidden_count: usize = 0;
+    for (scalar_subqueries) |projection| {
+        if (projection.hidden) hidden_count += 1;
+    }
+    if (hidden_count == 0) return .{ .context = type_context, .synthetic_columns = &.{} };
+
+    const synthetic_columns = try alloc.alloc(runtime_schema.RelationalColumn, type_context.schema.relational_columns.len + hidden_count);
+    errdefer alloc.free(synthetic_columns);
+    @memcpy(synthetic_columns[0..type_context.schema.relational_columns.len], type_context.schema.relational_columns);
+    var index = type_context.schema.relational_columns.len;
+    for (scalar_subqueries) |projection| {
+        if (!projection.hidden) continue;
+        const source = binder.relationalColumnForField(type_context.schema, projection.output_field, null);
+        synthetic_columns[index] = .{
+            .name = projection.output,
+            .path = projection.output,
+            .field_type = if (source) |column| column.field_type else .json,
+            .array_item_type = if (source) |column| column.array_item_type else null,
+        };
+        index += 1;
+    }
+    var synthetic_context = type_context;
+    synthetic_context.schema.relational_columns = synthetic_columns;
+    return .{ .context = synthetic_context, .synthetic_columns = synthetic_columns };
+}
+
+fn lowerGeneratedScalarSubqueryArgumentListFunctionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    params: []const value_mod.SqlValue,
+    schema: runtime_schema.TableSchema,
+    type_context: expr_type.RowExpressionTypeContext,
+    available_ctes: []const db_mod.types.RelationalRowsCte,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+    scalar_subqueries: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection),
+    realtime_ns: u64,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
+    spec: GeneratedArgumentFunctionSpec,
+) !db_mod.types.RelationalRowsExpression {
+    if (expression.argument_items.count < spec.min_args or expression.argument_items.count > spec.max_args or
+        expression.argument_items.items.len != expression.argument_items.count or
+        expression.argument_items.expression_items.len != expression.argument_items.count or
+        expression.argument_items.expressions.len != expression.argument_items.count)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
+    errdefer {
+        for (operands.items) |operand| freeExpression(alloc, operand);
+        operands.deinit(alloc);
+    }
+    try operands.ensureTotalCapacity(alloc, expression.argument_items.count);
+
+    for (expression.argument_items.expressions, 0..) |*argument_expression, argument_index| {
+        const argument_item_range = expression.argument_items.items[argument_index];
+        const argument_expression_range = expression.argument_items.expression_items[argument_index];
+        if (argument_expression_range.start < argument_item_range.start or argument_expression_range.end > argument_item_range.end) return error.UnsupportedSqlShape;
+        const operand = try parseGeneratedScalarSubqueryExpressionAlloc(
+            alloc,
+            tokens,
+            params,
+            schema,
+            type_context,
+            available_ctes,
+            argument_expression,
+            argument_expression_range,
+            scalar_subqueries,
+            realtime_ns,
+            fixed_binary_hooks,
+            bare_boolean_hooks,
+            expression_alternatives_hooks,
+            expression_condition_hooks,
+        );
+        operands.appendAssumeCapacity(operand);
+    }
+
+    const lowered = try expr_build.buildFunctionExpressionFromOperandListAlloc(alloc, spec.kind, &operands);
+    var lowered_transferred = false;
+    errdefer if (!lowered_transferred) freeExpression(alloc, lowered);
+    var synthetic_type_context = try generatedScalarSubqueryTypeContextAlloc(alloc, type_context, scalar_subqueries.items);
+    defer synthetic_type_context.deinit(alloc);
+    switch (spec.output) {
+        .text => try synthetic_type_context.context.validateTextRowExpression(lowered),
+        .numeric => try synthetic_type_context.context.validateNumericRowExpression(lowered),
+    }
+    lowered_transferred = true;
+    return lowered;
+}
+
+fn generatedArithmeticExpressionKind(kind: generated_parser.GeneratedSqlExpressionKind) ?db_mod.types.RelationalRowsExpressionKind {
+    return switch (kind) {
+        .additive => .add,
+        .subtractive => .sub,
+        .multiplicative => .mul,
+        .divisive => .div,
+        .modulo => .mod,
+        else => null,
+    };
+}
+
+fn generatedBooleanExpressionKind(kind: generated_parser.GeneratedSqlExpressionKind) ?db_mod.types.RelationalRowsExpressionKind {
+    return switch (kind) {
+        .logical_and => .bool_and,
+        .logical_or => .bool_or,
+        .logical_not => .bool_not,
+        else => null,
+    };
+}
+
+fn generatedScalarSubqueryCaseConditionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    params: []const value_mod.SqlValue,
+    schema: runtime_schema.TableSchema,
+    type_context: expr_type.RowExpressionTypeContext,
+    available_ctes: []const db_mod.types.RelationalRowsCte,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+    expression_range: generated_parser.GeneratedSqlTokenRange,
+    scalar_subqueries: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection),
+    realtime_ns: u64,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
+) anyerror!db_mod.types.RelationalRowsExpressionCondition {
+    if (expression.tokens) |expression_tokens| {
+        if (!generatedTokenRangeEqual(expression_tokens, expression_range)) return error.UnsupportedSqlShape;
+    }
+
+    const left_expression = expression.left_expression orelse return error.UnsupportedSqlShape;
+    const left_range = expression.left_tokens orelse return error.UnsupportedSqlShape;
+    const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
+    if (left_range.start != expression_range.start or left_range.end != operator_tokens.start) return error.UnsupportedSqlShape;
+    if (operator_tokens.start >= operator_tokens.end or operator_tokens.end > expression_range.end or operator_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+
+    const op: runtime_schema.RelationalCheckOp = switch (expression.kind) {
+        .comparison => blk: {
+            const right_range = expression.right_tokens orelse return error.UnsupportedSqlShape;
+            if (operator_tokens.end != right_range.start or right_range.end != expression_range.end) return error.UnsupportedSqlShape;
+            var operator_pos = operator_tokens.start;
+            const parsed = try expr_operator.parseComparisonOp(tokens, &operator_pos);
+            if (operator_pos != operator_tokens.end) return error.UnsupportedSqlShape;
+            break :blk parsed;
+        },
+        .is_null => .is_null,
+        .is_not_null => .is_not_null,
+        else => return error.UnsupportedSqlShape,
+    };
+
+    const lhs = try parseGeneratedScalarSubqueryExpressionAlloc(
+        alloc,
+        tokens,
+        params,
+        schema,
+        type_context,
+        available_ctes,
+        left_expression,
+        left_range,
+        scalar_subqueries,
+        realtime_ns,
+        fixed_binary_hooks,
+        bare_boolean_hooks,
+        expression_alternatives_hooks,
+        expression_condition_hooks,
+    );
+    var lhs_transferred = false;
+    errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
+
+    const rhs: []const db_mod.types.RelationalRowsExpression = switch (op) {
+        .is_null, .is_not_null => &.{},
+        else => blk: {
+            const right_expression = expression.right_expression orelse return error.UnsupportedSqlShape;
+            const right_range = expression.right_tokens orelse return error.UnsupportedSqlShape;
+            const out = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+            var out_transferred = false;
+            errdefer if (!out_transferred) alloc.free(out);
+            out[0] = try parseGeneratedScalarSubqueryExpressionAlloc(
+                alloc,
+                tokens,
+                params,
+                schema,
+                type_context,
+                available_ctes,
+                right_expression,
+                right_range,
+                scalar_subqueries,
+                realtime_ns,
+                fixed_binary_hooks,
+                bare_boolean_hooks,
+                expression_alternatives_hooks,
+                expression_condition_hooks,
+            );
+            out_transferred = true;
+            break :blk out;
+        },
+    };
+    var rhs_transferred = false;
+    errdefer if (!rhs_transferred and rhs.len > 0) {
+        for (rhs) |rhs_expression| freeExpression(alloc, rhs_expression);
+        alloc.free(rhs);
+    };
+
+    var synthetic_type_context = try generatedScalarSubqueryTypeContextAlloc(alloc, type_context, scalar_subqueries.items);
+    defer synthetic_type_context.deinit(alloc);
+    try expr_type.validateExpressionConditionTypes(synthetic_type_context.context, synthetic_type_context.context.defer_row_expression_field_validation, lhs, op, rhs);
+
+    lhs_transferred = true;
+    rhs_transferred = true;
+    return .{
+        .lhs = lhs,
+        .op = op,
+        .rhs = rhs,
+    };
+}
+
+pub fn parseGeneratedScalarSubqueryExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    params: []const value_mod.SqlValue,
+    schema: runtime_schema.TableSchema,
+    type_context: expr_type.RowExpressionTypeContext,
+    available_ctes: []const db_mod.types.RelationalRowsCte,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+    expression_range: generated_parser.GeneratedSqlTokenRange,
+    scalar_subqueries: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection),
+    realtime_ns: u64,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
+) anyerror!db_mod.types.RelationalRowsExpression {
+    if (expression.tokens) |expression_tokens| {
+        if (!generatedTokenRangeEqual(expression_tokens, expression_range)) return error.UnsupportedSqlShape;
+    }
+
+    if (expression.kind == .subquery) {
+        const hidden_output = try generatedHiddenScalarSubqueryOutputAlloc(alloc, type_context.schema, scalar_subqueries.items);
+        var hidden_output_transferred = false;
+        errdefer if (!hidden_output_transferred) alloc.free(hidden_output);
+        var subquery = try parseGeneratedSubqueryRequestAlloc(
+            alloc,
+            tokens,
+            params,
+            schema,
+            type_context,
+            available_ctes,
+            expression,
+            true,
+            realtime_ns,
+            fixed_binary_hooks,
+            bare_boolean_hooks,
+            expression_alternatives_hooks,
+            expression_condition_hooks,
+        );
+        errdefer subquery.deinit(alloc);
+
+        const projection = db_mod.types.RelationalRowsScalarSubqueryProjection{
+            .output = hidden_output,
+            .query = subquery.query,
+            .output_field = subquery.output_field,
+            .correlations = subquery.correlations,
+            .hidden = true,
+        };
+        var projection_transferred = false;
+        errdefer if (!projection_transferred) plan_mod.freeScalarSubqueryProjection(alloc, projection);
+        subquery.query = .{};
+        subquery.output_field = "";
+        subquery.correlations = &.{};
+        hidden_output_transferred = true;
+        try scalar_subqueries.append(alloc, projection);
+        projection_transferred = true;
+
+        return .{
+            .kind = .field,
+            .field = try alloc.dupe(u8, hidden_output),
+        };
+    }
+
+    if (expression.kind == .grouped) {
+        const inner_expression = expression.inner_expression orelse return error.UnsupportedSqlShape;
+        const inner_range = expression.inner_tokens orelse return error.UnsupportedSqlShape;
+        if (inner_range.start <= expression_range.start or inner_range.end >= expression_range.end) return error.UnsupportedSqlShape;
+        return try parseGeneratedScalarSubqueryExpressionAlloc(
+            alloc,
+            tokens,
+            params,
+            schema,
+            type_context,
+            available_ctes,
+            inner_expression,
+            inner_range,
+            scalar_subqueries,
+            realtime_ns,
+            fixed_binary_hooks,
+            bare_boolean_hooks,
+            expression_alternatives_hooks,
+            expression_condition_hooks,
+        );
+    }
+
+    if (expression.kind == .unary_positive or expression.kind == .unary_negative) {
+        const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
+        if (operator_tokens.start != expression_range.start or operator_tokens.end != expression_range.start + 1 or operator_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+        const expected_kind: TokenKind = if (expression.kind == .unary_positive) .plus else .minus;
+        if (tokens[operator_tokens.start].kind != expected_kind) return error.UnsupportedSqlShape;
+        const right_expression = expression.right_expression orelse return error.UnsupportedSqlShape;
+        const right_range = expression.right_tokens orelse return error.UnsupportedSqlShape;
+        if (right_range.start != operator_tokens.end or right_range.end != expression_range.end) return error.UnsupportedSqlShape;
+        const operand = try parseGeneratedScalarSubqueryExpressionAlloc(
+            alloc,
+            tokens,
+            params,
+            schema,
+            type_context,
+            available_ctes,
+            right_expression,
+            right_range,
+            scalar_subqueries,
+            realtime_ns,
+            fixed_binary_hooks,
+            bare_boolean_hooks,
+            expression_alternatives_hooks,
+            expression_condition_hooks,
+        );
+        var operand_transferred = false;
+        errdefer if (!operand_transferred) freeExpression(alloc, operand);
+        if (expression.kind == .unary_positive) {
+            operand_transferred = true;
+            return operand;
+        }
+        const lowered = try expr_build.buildUnaryNegativeExpressionAlloc(alloc, operand);
+        var lowered_transferred = false;
+        errdefer if (!lowered_transferred) freeExpression(alloc, lowered);
+        operand_transferred = true;
+        var synthetic_type_context = try generatedScalarSubqueryTypeContextAlloc(alloc, type_context, scalar_subqueries.items);
+        defer synthetic_type_context.deinit(alloc);
+        try synthetic_type_context.context.validateNumericRowExpression(lowered);
+        lowered_transferred = true;
+        return lowered;
+    }
+
+    if (expression.kind == .cast and generatedExpressionContainsSubquery(expression.*)) {
+        const cast_expression = expression.cast_expression orelse return error.UnsupportedSqlShape;
+        const cast_expression_range = expression.cast_expression_tokens orelse return error.UnsupportedSqlShape;
+        const cast_type_range = expression.cast_type_tokens orelse return error.UnsupportedSqlShape;
+        if (expression_range.end < expression_range.start + 6 or
+            !tokens[expression_range.start].matchesKeywordTag(.cast) or
+            tokens[expression_range.start + 1].kind != .lparen or
+            tokens[expression_range.end - 1].kind != .rparen or
+            cast_expression_range.start != expression_range.start + 2 or
+            cast_expression_range.end >= cast_type_range.start or
+            cast_type_range.end != expression_range.end - 1 or
+            cast_type_range.end > tokens.len or
+            !tokens[cast_expression_range.end].matchesKeywordTag(.as))
+        {
+            return error.UnsupportedSqlShape;
+        }
+        const operand = try parseGeneratedScalarSubqueryExpressionAlloc(
+            alloc,
+            tokens,
+            params,
+            schema,
+            type_context,
+            available_ctes,
+            cast_expression,
+            cast_expression_range,
+            scalar_subqueries,
+            realtime_ns,
+            fixed_binary_hooks,
+            bare_boolean_hooks,
+            expression_alternatives_hooks,
+            expression_condition_hooks,
+        );
+        var operand_transferred = false;
+        errdefer if (!operand_transferred) freeExpression(alloc, operand);
+        var cast_type_pos = cast_type_range.start;
+        const cast_type = try expr_operator.parseExpressionCastType(tokens, &cast_type_pos);
+        if (cast_type_pos != cast_type_range.end) return error.UnsupportedSqlShape;
+        const lowered = try expr_build.buildCastExpressionAlloc(alloc, operand, cast_type);
+        var lowered_transferred = false;
+        errdefer if (!lowered_transferred) freeExpression(alloc, lowered);
+        operand_transferred = true;
+        var synthetic_type_context = try generatedScalarSubqueryTypeContextAlloc(alloc, type_context, scalar_subqueries.items);
+        defer synthetic_type_context.deinit(alloc);
+        switch (cast_type) {
+            .text => try synthetic_type_context.context.validateTextRowExpression(lowered),
+            .numeric => try synthetic_type_context.context.validateNumericRowExpression(lowered),
+            .bool => try synthetic_type_context.context.validateBooleanRowExpression(lowered),
+            .datetime => try synthetic_type_context.context.validateNumericOrDatetimeRowExpression(lowered),
+        }
+        lowered_transferred = true;
+        return lowered;
+    }
+
+    if (generatedArithmeticExpressionKind(expression.kind)) |kind| {
+        const left_expression = expression.left_expression orelse return error.UnsupportedSqlShape;
+        const left_range = expression.left_tokens orelse return error.UnsupportedSqlShape;
+        const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
+        const right_expression = expression.right_expression orelse return error.UnsupportedSqlShape;
+        const right_range = expression.right_tokens orelse return error.UnsupportedSqlShape;
+        if (left_range.start != expression_range.start or left_range.end != operator_tokens.start) return error.UnsupportedSqlShape;
+        if (operator_tokens.end != right_range.start or right_range.end != expression_range.end) return error.UnsupportedSqlShape;
+        const lhs = try parseGeneratedScalarSubqueryExpressionAlloc(
+            alloc,
+            tokens,
+            params,
+            schema,
+            type_context,
+            available_ctes,
+            left_expression,
+            left_range,
+            scalar_subqueries,
+            realtime_ns,
+            fixed_binary_hooks,
+            bare_boolean_hooks,
+            expression_alternatives_hooks,
+            expression_condition_hooks,
+        );
+        var lhs_transferred = false;
+        errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
+        const rhs = try parseGeneratedScalarSubqueryExpressionAlloc(
+            alloc,
+            tokens,
+            params,
+            schema,
+            type_context,
+            available_ctes,
+            right_expression,
+            right_range,
+            scalar_subqueries,
+            realtime_ns,
+            fixed_binary_hooks,
+            bare_boolean_hooks,
+            expression_alternatives_hooks,
+            expression_condition_hooks,
+        );
+        var rhs_transferred = false;
+        errdefer if (!rhs_transferred) freeExpression(alloc, rhs);
+        const lowered = try expr_build.buildBinaryExpressionAlloc(alloc, kind, lhs, rhs);
+        var lowered_transferred = false;
+        errdefer if (!lowered_transferred) freeExpression(alloc, lowered);
+        lhs_transferred = true;
+        rhs_transferred = true;
+        var synthetic_type_context = try generatedScalarSubqueryTypeContextAlloc(alloc, type_context, scalar_subqueries.items);
+        defer synthetic_type_context.deinit(alloc);
+        try synthetic_type_context.context.validateNumericRowExpression(lowered);
+        lowered_transferred = true;
+        return lowered;
+    }
+
+    if (generatedBooleanExpressionKind(expression.kind)) |kind| {
+        const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
+        if (operator_tokens.start >= operator_tokens.end or operator_tokens.end > expression_range.end or operator_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+        switch (expression.kind) {
+            .logical_not => {
+                if (operator_tokens.start != expression_range.start or operator_tokens.end != expression_range.start + 1 or !tokens[operator_tokens.start].matchesKeywordTag(.not)) return error.UnsupportedSqlShape;
+                const right_expression = expression.right_expression orelse return error.UnsupportedSqlShape;
+                const right_range = expression.right_tokens orelse return error.UnsupportedSqlShape;
+                if (right_range.start != operator_tokens.end or right_range.end != expression_range.end) return error.UnsupportedSqlShape;
+                const operand = try parseGeneratedScalarSubqueryExpressionAlloc(
+                    alloc,
+                    tokens,
+                    params,
+                    schema,
+                    type_context,
+                    available_ctes,
+                    right_expression,
+                    right_range,
+                    scalar_subqueries,
+                    realtime_ns,
+                    fixed_binary_hooks,
+                    bare_boolean_hooks,
+                    expression_alternatives_hooks,
+                    expression_condition_hooks,
+                );
+                var operand_transferred = false;
+                errdefer if (!operand_transferred) freeExpression(alloc, operand);
+                const lowered = try expr_build.buildUnaryFunctionExpressionAlloc(alloc, kind, operand);
+                var lowered_transferred = false;
+                errdefer if (!lowered_transferred) freeExpression(alloc, lowered);
+                operand_transferred = true;
+                var synthetic_type_context = try generatedScalarSubqueryTypeContextAlloc(alloc, type_context, scalar_subqueries.items);
+                defer synthetic_type_context.deinit(alloc);
+                try synthetic_type_context.context.validateBooleanRowExpression(lowered);
+                lowered_transferred = true;
+                return lowered;
+            },
+            .logical_and, .logical_or => {
+                const left_expression = expression.left_expression orelse return error.UnsupportedSqlShape;
+                const left_range = expression.left_tokens orelse return error.UnsupportedSqlShape;
+                const right_expression = expression.right_expression orelse return error.UnsupportedSqlShape;
+                const right_range = expression.right_tokens orelse return error.UnsupportedSqlShape;
+                if (left_range.start != expression_range.start or left_range.end != operator_tokens.start) return error.UnsupportedSqlShape;
+                if (operator_tokens.end != right_range.start or right_range.end != expression_range.end) return error.UnsupportedSqlShape;
+                const expected_keyword: TokenKeyword = if (expression.kind == .logical_and) .@"and" else .@"or";
+                if (operator_tokens.end != operator_tokens.start + 1 or !tokens[operator_tokens.start].matchesKeywordTag(expected_keyword)) return error.UnsupportedSqlShape;
+                const lhs = try parseGeneratedScalarSubqueryExpressionAlloc(
+                    alloc,
+                    tokens,
+                    params,
+                    schema,
+                    type_context,
+                    available_ctes,
+                    left_expression,
+                    left_range,
+                    scalar_subqueries,
+                    realtime_ns,
+                    fixed_binary_hooks,
+                    bare_boolean_hooks,
+                    expression_alternatives_hooks,
+                    expression_condition_hooks,
+                );
+                var lhs_transferred = false;
+                errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
+                const rhs = try parseGeneratedScalarSubqueryExpressionAlloc(
+                    alloc,
+                    tokens,
+                    params,
+                    schema,
+                    type_context,
+                    available_ctes,
+                    right_expression,
+                    right_range,
+                    scalar_subqueries,
+                    realtime_ns,
+                    fixed_binary_hooks,
+                    bare_boolean_hooks,
+                    expression_alternatives_hooks,
+                    expression_condition_hooks,
+                );
+                var rhs_transferred = false;
+                errdefer if (!rhs_transferred) freeExpression(alloc, rhs);
+                const lowered = try expr_build.buildBinaryExpressionAlloc(alloc, kind, lhs, rhs);
+                var lowered_transferred = false;
+                errdefer if (!lowered_transferred) freeExpression(alloc, lowered);
+                lhs_transferred = true;
+                rhs_transferred = true;
+                var synthetic_type_context = try generatedScalarSubqueryTypeContextAlloc(alloc, type_context, scalar_subqueries.items);
+                defer synthetic_type_context.deinit(alloc);
+                try synthetic_type_context.context.validateBooleanRowExpression(lowered);
+                lowered_transferred = true;
+                return lowered;
+            },
+            else => unreachable,
+        }
+    }
+
+    if (expression.kind == .case_expression and generatedExpressionContainsSubquery(expression.*)) {
+        if (expression.case_branch_count == 0 or
+            expression.case_condition_items.count != expression.case_branch_count or
+            expression.case_result_items.count != expression.case_branch_count or
+            expression.case_condition_items.items.len != expression.case_branch_count or
+            expression.case_condition_items.expression_items.len != expression.case_branch_count or
+            expression.case_condition_items.expressions.len != expression.case_branch_count or
+            expression.case_result_items.items.len != expression.case_branch_count or
+            expression.case_result_items.expression_items.len != expression.case_branch_count or
+            expression.case_result_items.expressions.len != expression.case_branch_count)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        if (expression.case_else_tokens == null) return error.UnsupportedSqlShape;
+        const else_expression = expression.case_else_expression orelse return error.UnsupportedSqlShape;
+        const else_expression_range = expression.case_else_expression_tokens orelse return error.UnsupportedSqlShape;
+
+        var branches = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCaseBranch).empty;
+        errdefer {
+            for (branches.items) |branch| plan_mod.freeExpressionCaseBranch(alloc, branch);
+            branches.deinit(alloc);
+        }
+        for (expression.case_condition_items.expressions, 0..) |*condition_expression, branch_index| {
+            const condition_item_range = expression.case_condition_items.items[branch_index];
+            const condition_expression_range = expression.case_condition_items.expression_items[branch_index];
+            if (condition_expression_range.start < condition_item_range.start or condition_expression_range.end > condition_item_range.end) return error.UnsupportedSqlShape;
+            const condition = try generatedScalarSubqueryCaseConditionAlloc(
+                alloc,
+                tokens,
+                params,
+                schema,
+                type_context,
+                available_ctes,
+                condition_expression,
+                condition_expression_range,
+                scalar_subqueries,
+                realtime_ns,
+                fixed_binary_hooks,
+                bare_boolean_hooks,
+                expression_alternatives_hooks,
+                expression_condition_hooks,
+            );
+            var condition_transferred = false;
+            errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
+
+            const result_item_range = expression.case_result_items.items[branch_index];
+            const result_expression_range = expression.case_result_items.expression_items[branch_index];
+            if (result_expression_range.start < result_item_range.start or result_expression_range.end > result_item_range.end) return error.UnsupportedSqlShape;
+            const then_expression = try parseGeneratedScalarSubqueryExpressionAlloc(
+                alloc,
+                tokens,
+                params,
+                schema,
+                type_context,
+                available_ctes,
+                &expression.case_result_items.expressions[branch_index],
+                result_expression_range,
+                scalar_subqueries,
+                realtime_ns,
+                fixed_binary_hooks,
+                bare_boolean_hooks,
+                expression_alternatives_hooks,
+                expression_condition_hooks,
+            );
+            var then_transferred = false;
+            errdefer if (!then_transferred) freeExpression(alloc, then_expression);
+
+            try branches.append(alloc, .{ .when = condition, .then = then_expression });
+            condition_transferred = true;
+            then_transferred = true;
+        }
+
+        const fallback = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+        var fallback_initialized = false;
+        errdefer {
+            if (fallback_initialized) freeExpression(alloc, fallback[0]);
+            alloc.free(fallback);
+        }
+        fallback[0] = try parseGeneratedScalarSubqueryExpressionAlloc(
+            alloc,
+            tokens,
+            params,
+            schema,
+            type_context,
+            available_ctes,
+            else_expression,
+            else_expression_range,
+            scalar_subqueries,
+            realtime_ns,
+            fixed_binary_hooks,
+            bare_boolean_hooks,
+            expression_alternatives_hooks,
+            expression_condition_hooks,
+        );
+        fallback_initialized = true;
+
+        const owned_branches = try branches.toOwnedSlice(alloc);
+        var branches_transferred = false;
+        errdefer if (!branches_transferred) {
+            for (owned_branches) |branch| plan_mod.freeExpressionCaseBranch(alloc, branch);
+            alloc.free(owned_branches);
+        };
+        branches = .empty;
+
+        var synthetic_type_context = try generatedScalarSubqueryTypeContextAlloc(alloc, type_context, scalar_subqueries.items);
+        defer synthetic_type_context.deinit(alloc);
+        _ = try synthetic_type_context.context.caseExpressionOutputType(owned_branches, fallback);
+
+        branches_transferred = true;
+        fallback_initialized = false;
+        return .{
+            .kind = .case,
+            .case_branches = owned_branches,
+            .case_else = fallback,
+        };
+    }
+
+    if (expression.kind == .function_call and generatedExpressionContainsSubquery(expression.*)) {
+        if (try generatedArgumentFunctionExpressionSpec(tokens, expression.*)) |spec| {
+            return try lowerGeneratedScalarSubqueryArgumentListFunctionAlloc(
+                alloc,
+                tokens,
+                params,
+                schema,
+                type_context,
+                available_ctes,
+                expression,
+                scalar_subqueries,
+                realtime_ns,
+                fixed_binary_hooks,
+                bare_boolean_hooks,
+                expression_alternatives_hooks,
+                expression_condition_hooks,
+                spec,
+            );
+        }
+
+        if (try generatedConcatFunctionExpressionKind(tokens, expression.*)) |function_kind| {
+            if (expression.argument_items.count == 0 or
+                expression.argument_items.items.len != expression.argument_items.count or
+                expression.argument_items.expression_items.len != expression.argument_items.count or
+                expression.argument_items.expressions.len != expression.argument_items.count)
+            {
+                return error.UnsupportedSqlShape;
+            }
+            if (function_kind == .concat_ws and expression.argument_items.count < 2) return error.UnsupportedSqlShape;
+
+            const operands = try alloc.alloc(db_mod.types.RelationalRowsExpression, expression.argument_items.count);
+            var initialized_operands: usize = 0;
+            errdefer {
+                for (operands[0..initialized_operands]) |operand| freeExpression(alloc, operand);
+                alloc.free(operands);
+            }
+            for (expression.argument_items.expressions, 0..) |*argument_expression, argument_index| {
+                const argument_item_range = expression.argument_items.items[argument_index];
+                const argument_expression_range = expression.argument_items.expression_items[argument_index];
+                if (argument_expression_range.start < argument_item_range.start or argument_expression_range.end > argument_item_range.end) return error.UnsupportedSqlShape;
+                operands[initialized_operands] = try parseGeneratedScalarSubqueryExpressionAlloc(
+                    alloc,
+                    tokens,
+                    params,
+                    schema,
+                    type_context,
+                    available_ctes,
+                    argument_expression,
+                    argument_expression_range,
+                    scalar_subqueries,
+                    realtime_ns,
+                    fixed_binary_hooks,
+                    bare_boolean_hooks,
+                    expression_alternatives_hooks,
+                    expression_condition_hooks,
+                );
+                initialized_operands += 1;
+            }
+
+            const lowered = db_mod.types.RelationalRowsExpression{
+                .kind = function_kind,
+                .operands = operands,
+            };
+            var lowered_transferred = false;
+            errdefer if (!lowered_transferred) freeExpression(alloc, lowered);
+            initialized_operands = 0;
+            var synthetic_type_context = try generatedScalarSubqueryTypeContextAlloc(alloc, type_context, scalar_subqueries.items);
+            defer synthetic_type_context.deinit(alloc);
+            try synthetic_type_context.context.validateTextRowExpression(lowered);
+            lowered_transferred = true;
+            return lowered;
+        }
+
+        if (try generatedBinaryFunctionExpressionKind(tokens, expression.*)) |function_kind| {
+            if (expression.argument_items.count != 2 or
+                expression.argument_items.items.len != 2 or
+                expression.argument_items.expression_items.len != 2 or
+                expression.argument_items.expressions.len != 2)
+            {
+                return error.UnsupportedSqlShape;
+            }
+            const lhs_item_range = expression.argument_items.items[0];
+            const lhs_expression_range = expression.argument_items.expression_items[0];
+            if (lhs_expression_range.start < lhs_item_range.start or lhs_expression_range.end > lhs_item_range.end) return error.UnsupportedSqlShape;
+            const lhs = try parseGeneratedScalarSubqueryExpressionAlloc(
+                alloc,
+                tokens,
+                params,
+                schema,
+                type_context,
+                available_ctes,
+                &expression.argument_items.expressions[0],
+                lhs_expression_range,
+                scalar_subqueries,
+                realtime_ns,
+                fixed_binary_hooks,
+                bare_boolean_hooks,
+                expression_alternatives_hooks,
+                expression_condition_hooks,
+            );
+            var lhs_transferred = false;
+            errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
+
+            const rhs_item_range = expression.argument_items.items[1];
+            const rhs_expression_range = expression.argument_items.expression_items[1];
+            if (rhs_expression_range.start < rhs_item_range.start or rhs_expression_range.end > rhs_item_range.end) return error.UnsupportedSqlShape;
+            const rhs = try parseGeneratedScalarSubqueryExpressionAlloc(
+                alloc,
+                tokens,
+                params,
+                schema,
+                type_context,
+                available_ctes,
+                &expression.argument_items.expressions[1],
+                rhs_expression_range,
+                scalar_subqueries,
+                realtime_ns,
+                fixed_binary_hooks,
+                bare_boolean_hooks,
+                expression_alternatives_hooks,
+                expression_condition_hooks,
+            );
+            var rhs_transferred = false;
+            errdefer if (!rhs_transferred) freeExpression(alloc, rhs);
+
+            const lowered = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, function_kind, lhs, rhs);
+            var lowered_transferred = false;
+            errdefer if (!lowered_transferred) freeExpression(alloc, lowered);
+            lhs_transferred = true;
+            rhs_transferred = true;
+            var synthetic_type_context = try generatedScalarSubqueryTypeContextAlloc(alloc, type_context, scalar_subqueries.items);
+            defer synthetic_type_context.deinit(alloc);
+            switch (function_kind) {
+                .power => try synthetic_type_context.context.validateNumericRowExpression(lowered),
+                .strpos => try synthetic_type_context.context.validateNumericRowExpression(lowered),
+                else => unreachable,
+            }
+            lowered_transferred = true;
+            return lowered;
+        }
+
+        if (try generatedUnaryTextNumericFunctionExpressionKind(tokens, expression.*)) |function_kind| {
+            if (expression.argument_items.count != 1 or
+                expression.argument_items.items.len != 1 or
+                expression.argument_items.expression_items.len != 1 or
+                expression.argument_items.expressions.len != 1)
+            {
+                return error.UnsupportedSqlShape;
+            }
+            const argument_item_range = expression.argument_items.items[0];
+            const argument_expression_range = expression.argument_items.expression_items[0];
+            if (argument_expression_range.start < argument_item_range.start or argument_expression_range.end > argument_item_range.end) return error.UnsupportedSqlShape;
+            const operand = try parseGeneratedScalarSubqueryExpressionAlloc(
+                alloc,
+                tokens,
+                params,
+                schema,
+                type_context,
+                available_ctes,
+                &expression.argument_items.expressions[0],
+                argument_expression_range,
+                scalar_subqueries,
+                realtime_ns,
+                fixed_binary_hooks,
+                bare_boolean_hooks,
+                expression_alternatives_hooks,
+                expression_condition_hooks,
+            );
+            var operand_transferred = false;
+            errdefer if (!operand_transferred) freeExpression(alloc, operand);
+            const lowered = try expr_build.buildUnaryFunctionExpressionAlloc(alloc, function_kind, operand);
+            var lowered_transferred = false;
+            errdefer if (!lowered_transferred) freeExpression(alloc, lowered);
+            operand_transferred = true;
+            var synthetic_type_context = try generatedScalarSubqueryTypeContextAlloc(alloc, type_context, scalar_subqueries.items);
+            defer synthetic_type_context.deinit(alloc);
+            try synthetic_type_context.context.validateNumericRowExpression(lowered);
+            lowered_transferred = true;
+            return lowered;
+        }
+
+        if (try generatedUnaryNumericFunctionExpressionKind(tokens, expression.*)) |function_kind| {
+            if (expression.argument_items.count != 1 or
+                expression.argument_items.items.len != 1 or
+                expression.argument_items.expression_items.len != 1 or
+                expression.argument_items.expressions.len != 1)
+            {
+                return error.UnsupportedSqlShape;
+            }
+            const argument_item_range = expression.argument_items.items[0];
+            const argument_expression_range = expression.argument_items.expression_items[0];
+            if (argument_expression_range.start < argument_item_range.start or argument_expression_range.end > argument_item_range.end) return error.UnsupportedSqlShape;
+            const operand = try parseGeneratedScalarSubqueryExpressionAlloc(
+                alloc,
+                tokens,
+                params,
+                schema,
+                type_context,
+                available_ctes,
+                &expression.argument_items.expressions[0],
+                argument_expression_range,
+                scalar_subqueries,
+                realtime_ns,
+                fixed_binary_hooks,
+                bare_boolean_hooks,
+                expression_alternatives_hooks,
+                expression_condition_hooks,
+            );
+            var operand_transferred = false;
+            errdefer if (!operand_transferred) freeExpression(alloc, operand);
+            const lowered = try expr_build.buildUnaryFunctionExpressionAlloc(alloc, function_kind, operand);
+            var lowered_transferred = false;
+            errdefer if (!lowered_transferred) freeExpression(alloc, lowered);
+            operand_transferred = true;
+            var synthetic_type_context = try generatedScalarSubqueryTypeContextAlloc(alloc, type_context, scalar_subqueries.items);
+            defer synthetic_type_context.deinit(alloc);
+            try synthetic_type_context.context.validateNumericRowExpression(lowered);
+            lowered_transferred = true;
+            return lowered;
+        }
+
+        if (try generatedUnaryTextFunctionExpressionKind(tokens, expression.*)) |function_kind| {
+            if (expression.argument_items.count != 1 or
+                expression.argument_items.items.len != 1 or
+                expression.argument_items.expression_items.len != 1 or
+                expression.argument_items.expressions.len != 1)
+            {
+                return error.UnsupportedSqlShape;
+            }
+            const argument_item_range = expression.argument_items.items[0];
+            const argument_expression_range = expression.argument_items.expression_items[0];
+            if (argument_expression_range.start < argument_item_range.start or argument_expression_range.end > argument_item_range.end) return error.UnsupportedSqlShape;
+            const operand = try parseGeneratedScalarSubqueryExpressionAlloc(
+                alloc,
+                tokens,
+                params,
+                schema,
+                type_context,
+                available_ctes,
+                &expression.argument_items.expressions[0],
+                argument_expression_range,
+                scalar_subqueries,
+                realtime_ns,
+                fixed_binary_hooks,
+                bare_boolean_hooks,
+                expression_alternatives_hooks,
+                expression_condition_hooks,
+            );
+            var operand_transferred = false;
+            errdefer if (!operand_transferred) freeExpression(alloc, operand);
+            const lowered = try expr_build.buildUnaryFunctionExpressionAlloc(alloc, function_kind, operand);
+            var lowered_transferred = false;
+            errdefer if (!lowered_transferred) freeExpression(alloc, lowered);
+            operand_transferred = true;
+            var synthetic_type_context = try generatedScalarSubqueryTypeContextAlloc(alloc, type_context, scalar_subqueries.items);
+            defer synthetic_type_context.deinit(alloc);
+            try synthetic_type_context.context.validateTextRowExpression(lowered);
+            lowered_transferred = true;
+            return lowered;
+        }
+
+        const function_kind = try generatedSameDomainFunctionExpressionKind(tokens, expression.*);
+        if (expression.argument_items.count == 0 or
+            (expression.argument_items.items.len != 0 and expression.argument_items.items.len != expression.argument_items.count) or
+            expression.argument_items.expression_items.len != expression.argument_items.count or
+            expression.argument_items.expressions.len != expression.argument_items.count)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        const has_argument_item_ranges = expression.argument_items.items.len == expression.argument_items.count;
+
+        const operands = try alloc.alloc(db_mod.types.RelationalRowsExpression, expression.argument_items.count);
+        var initialized_operands: usize = 0;
+        errdefer {
+            for (operands[0..initialized_operands]) |operand| freeExpression(alloc, operand);
+            alloc.free(operands);
+        }
+        for (expression.argument_items.expressions, 0..) |*argument_expression, argument_index| {
+            const argument_expression_range = expression.argument_items.expression_items[argument_index];
+            if (has_argument_item_ranges) {
+                const argument_item_range = expression.argument_items.items[argument_index];
+                if (argument_expression_range.start < argument_item_range.start or argument_expression_range.end > argument_item_range.end) return error.UnsupportedSqlShape;
+            }
+            operands[initialized_operands] = try parseGeneratedScalarSubqueryExpressionAlloc(
+                alloc,
+                tokens,
+                params,
+                schema,
+                type_context,
+                available_ctes,
+                argument_expression,
+                argument_expression_range,
+                scalar_subqueries,
+                realtime_ns,
+                fixed_binary_hooks,
+                bare_boolean_hooks,
+                expression_alternatives_hooks,
+                expression_condition_hooks,
+            );
+            initialized_operands += 1;
+        }
+        const lowered = db_mod.types.RelationalRowsExpression{
+            .kind = function_kind,
+            .operands = operands,
+        };
+        var lowered_transferred = false;
+        errdefer if (!lowered_transferred) freeExpression(alloc, lowered);
+        initialized_operands = 0;
+        var synthetic_type_context = try generatedScalarSubqueryTypeContextAlloc(alloc, type_context, scalar_subqueries.items);
+        defer synthetic_type_context.deinit(alloc);
+        try synthetic_type_context.context.validateExpressionOperandDomains(lowered);
+        lowered_transferred = true;
+        return lowered;
+    }
+
+    if (expression.kind == .token_range) {
+        var value_pos = expression_range.start;
+        if (value_mod.parseSqlUntypedValueJsonAlloc(alloc, tokens, &value_pos)) |value_json| {
+            errdefer alloc.free(value_json);
+            if (value_pos == expression_range.end) {
+                return .{
+                    .kind = .value,
+                    .value_json = value_json,
+                };
+            }
+            alloc.free(value_json);
+        } else |err| switch (err) {
+            error.UnsupportedSqlShape => {},
+            else => return err,
+        }
+        if (expression_range.end == expression_range.start + 1 and expression_range.end <= tokens.len and tokens[expression_range.start].kind == .identifier) {
+            const parsed_field = try grammar.normalizeSqlObjectIdentifierAlloc(alloc, tokens[expression_range.start].text);
+            defer alloc.free(parsed_field);
+            const resolved = try binder.resolveRowExpressionFieldAlloc(
+                alloc,
+                type_context.schema,
+                type_context.joined_source_schema,
+                parsed_field,
+                &.{},
+                &.{},
+                &.{},
+                &.{},
+                type_context.defer_row_expression_field_validation,
+                .row,
+            );
+            return .{
+                .kind = .field,
+                .field = resolved.field,
+                .field_source = resolved.source,
+            };
+        }
+    }
+
+    var pos = expression_range.start;
+    const lowered = try expr_row_parse.parseRowExpressionAlloc(
+        alloc,
+        tokens,
+        &pos,
+        type_context,
+        fixed_binary_hooks.row_expression_hooks,
+        fixed_binary_hooks.arithmetic_hooks,
+        fixed_binary_hooks.variadic_hooks,
+    );
+    errdefer freeExpression(alloc, lowered);
+    if (pos != expression_range.end) return error.UnsupportedSqlShape;
+    return lowered;
+}
+
+fn parseGeneratedScalarSubqueryExpressionProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    params: []const value_mod.SqlValue,
+    schema: runtime_schema.TableSchema,
+    type_context: expr_type.RowExpressionTypeContext,
+    available_ctes: []const db_mod.types.RelationalRowsCte,
+    list: generated_parser.GeneratedSqlListAst,
+    item_range: generated_parser.GeneratedSqlTokenRange,
+    expression_range: generated_parser.GeneratedSqlTokenRange,
+    index: usize,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+    scalar_subqueries: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection),
+    realtime_ns: u64,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
+) !?db_mod.types.RelationalRowsExpressionProjection {
+    if (!generatedExpressionContainsSubquery(expression.*)) return null;
+    if (expression.kind == .subquery) return null;
+    const lowered = try parseGeneratedScalarSubqueryExpressionAlloc(
+        alloc,
+        tokens,
+        params,
+        schema,
+        type_context,
+        available_ctes,
+        expression,
+        expression_range,
+        scalar_subqueries,
+        realtime_ns,
+        fixed_binary_hooks,
+        bare_boolean_hooks,
+        expression_alternatives_hooks,
+        expression_condition_hooks,
+    );
+    var lowered_transferred = false;
+    errdefer if (!lowered_transferred) freeExpression(alloc, lowered);
+
+    const output = (try generatedProjectionAliasOutputAlloc(alloc, tokens, list, index, item_range, expression_range)) orelse
+        try alloc.dupe(u8, expr_type.rowExpressionDefaultOutputName(lowered.kind));
+    errdefer alloc.free(output);
+    lowered_transferred = true;
+    return .{
+        .output = output,
+        .expression = lowered,
+    };
 }
 
 fn parseGeneratedScalarSubquerySelectListAlloc(
@@ -1197,7 +3077,7 @@ fn parseGeneratedScalarSubquerySelectListAlloc(
 
     var has_scalar_subquery = false;
     for (read.projection_items.expressions) |expression| {
-        if (expression.kind == .subquery) has_scalar_subquery = true;
+        if (generatedExpressionContainsSubquery(expression)) has_scalar_subquery = true;
     }
     if (!has_scalar_subquery) return null;
     if (read.projection_items.count != read.projection_items.items.len or
@@ -1213,6 +3093,11 @@ fn parseGeneratedScalarSubquerySelectListAlloc(
     errdefer {
         plan_mod.freeFieldAliasProjections(alloc, field_aliases.items);
         field_aliases.deinit(alloc);
+    }
+    var expressions = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionProjection).empty;
+    errdefer {
+        freeExpressionProjections(alloc, expressions.items);
+        expressions.deinit(alloc);
     }
     var scalar_subqueries = std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection).empty;
     errdefer {
@@ -1278,6 +3163,34 @@ fn parseGeneratedScalarSubquerySelectListAlloc(
             }
             continue;
         }
+
+        if (try parseGeneratedScalarSubqueryExpressionProjectionAlloc(
+            alloc,
+            tokens,
+            params,
+            schema,
+            type_context,
+            available_ctes,
+            read.projection_items,
+            item_range,
+            expression_range,
+            index,
+            expression,
+            &scalar_subqueries,
+            realtime_ns,
+            fixed_binary_hooks,
+            bare_boolean_hooks,
+            expression_alternatives_hooks,
+            expression_condition_hooks,
+        )) |projection| {
+            var projection_transferred = false;
+            errdefer if (!projection_transferred) freeExpressionProjection(alloc, projection);
+            try outputs.append(alloc, .{ .kind = .expression, .index = expressions.items.len });
+            try expressions.append(alloc, projection);
+            projection_transferred = true;
+            continue;
+        }
+
         if (expression.kind != .subquery) return error.UnsupportedSqlShape;
 
         const output = (try generatedProjectionAliasOutputAlloc(alloc, tokens, read.projection_items, index, item_range, expression_range)) orelse return error.UnsupportedSqlShape;
@@ -1315,7 +3228,7 @@ fn parseGeneratedScalarSubquerySelectListAlloc(
         try scalar_subqueries.append(alloc, projection);
     }
 
-    try expr_projection.validateSelectListOutputs(schema, false, fields.items, &.{}, &.{}, &.{}, field_aliases.items, &.{}, scalar_subqueries.items);
+    try expr_projection.validateSelectListOutputs(schema, false, fields.items, &.{}, &.{}, &.{}, field_aliases.items, expressions.items, scalar_subqueries.items);
 
     const owned_fields = try fields.toOwnedSlice(alloc);
     var fields_transferred = false;
@@ -1323,6 +3236,9 @@ fn parseGeneratedScalarSubquerySelectListAlloc(
     const owned_field_aliases = try field_aliases.toOwnedSlice(alloc);
     var field_aliases_transferred = false;
     errdefer if (!field_aliases_transferred) plan_mod.freeFieldAliasProjections(alloc, owned_field_aliases);
+    const owned_expressions = try expressions.toOwnedSlice(alloc);
+    var expressions_transferred = false;
+    errdefer if (!expressions_transferred) freeExpressionProjections(alloc, owned_expressions);
     const owned_scalar_subqueries = try scalar_subqueries.toOwnedSlice(alloc);
     var scalar_transferred = false;
     errdefer if (!scalar_transferred) plan_mod.freeScalarSubqueryProjections(alloc, owned_scalar_subqueries);
@@ -1330,14 +3246,142 @@ fn parseGeneratedScalarSubquerySelectListAlloc(
 
     fields_transferred = true;
     field_aliases_transferred = true;
+    expressions_transferred = true;
     pos.* = projection_tokens.end;
     scalar_transferred = true;
     return .{
         .fields = owned_fields,
         .field_aliases = owned_field_aliases,
+        .expressions = owned_expressions,
         .scalar_subqueries = owned_scalar_subqueries,
         .outputs = owned_outputs,
     };
+}
+
+fn parseGeneratedScalarSubqueryOrderByAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    schema: runtime_schema.TableSchema,
+    type_context: expr_type.RowExpressionTypeContext,
+    available_ctes: []const db_mod.types.RelationalRowsCte,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+    select: *plan_mod.SelectList,
+    order_by: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder),
+    function_bindings: expr_row_parse.SqlFunctionBindings,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+    realtime_ns: u64,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
+    order_expression_hooks: expr_order.OrderExpressionParserOptions,
+) !bool {
+    const read = generated_read_ast orelse return false;
+    const order_tokens = read.order_tokens orelse return false;
+    if (order_tokens.start != pos.*) return false;
+    try generated_read_validate.validateGeneratedOrderListForClause(tokens, order_tokens, read.order_items);
+
+    var has_scalar_subquery = false;
+    for (read.order_items.expressions) |expression| {
+        if (generatedExpressionContainsSubquery(expression)) has_scalar_subquery = true;
+    }
+    if (!has_scalar_subquery) return false;
+    if (read.order_items.items.len != read.order_items.count or
+        read.order_items.expression_items.len != read.order_items.count or
+        read.order_items.expressions.len != read.order_items.count)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    var scalar_subqueries = std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection).empty;
+    const original_scalar_count = select.scalar_subqueries.len;
+    try scalar_subqueries.appendSlice(alloc, select.scalar_subqueries);
+    var scalar_subqueries_transferred = false;
+    errdefer if (!scalar_subqueries_transferred) {
+        for (scalar_subqueries.items[original_scalar_count..]) |projection| plan_mod.freeScalarSubqueryProjection(alloc, projection);
+        scalar_subqueries.deinit(alloc);
+    };
+
+    while (pos.* < order_tokens.end) {
+        const item_start = pos.*;
+        const generated_item = (try expr_generated_validate.generatedOrderItemAtStart(tokens, item_start, generated_read_ast)) orelse return error.UnsupportedSqlShape;
+        const generated_expression = generated_item.expression;
+        const expression_range = generated_expression.tokens orelse return error.UnsupportedSqlShape;
+
+        var order: db_mod.types.RelationalRowsQueryOrder = if (generatedExpressionContainsSubquery(generated_expression.*)) blk: {
+            if (expression_range.start != item_start or expression_range.end > generated_item.tokens.end) return error.UnsupportedSqlShape;
+            const lowered = try parseGeneratedScalarSubqueryExpressionAlloc(
+                alloc,
+                tokens,
+                params,
+                schema,
+                type_context,
+                available_ctes,
+                generated_expression,
+                expression_range,
+                &scalar_subqueries,
+                realtime_ns,
+                fixed_binary_hooks,
+                bare_boolean_hooks,
+                expression_alternatives_hooks,
+                expression_condition_hooks,
+            );
+            var lowered_transferred = false;
+            errdefer if (!lowered_transferred) freeExpression(alloc, lowered);
+            var synthetic_type_context = try generatedScalarSubqueryTypeContextAlloc(alloc, type_context, scalar_subqueries.items);
+            defer synthetic_type_context.deinit(alloc);
+            try synthetic_type_context.context.validateOrderableRowExpression(lowered);
+            pos.* = expression_range.end;
+            lowered_transferred = true;
+            break :blk .{ .expression = lowered };
+        } else blk: {
+            var item_hooks = order_expression_hooks;
+            item_hooks.generated_expression_ast = generated_expression;
+            if (parser.matchToken(tokens, pos, .number)) |token| {
+                try expr_order.validateGeneratedSimpleOrderExpression(tokens, generated_expression);
+                const ordinal = std.fmt.parseInt(u32, token.text, 10) catch return error.UnsupportedSqlShape;
+                break :blk try expr_projection.selectOutputOrderByOrdinalAlloc(alloc, schema, select.*, ordinal);
+            } else if (try expr_projection.parseSelectOutputOrderByNameMaybeAlloc(alloc, tokens, pos, schema, select.*)) |named_order| {
+                try expr_order.validateGeneratedSimpleOrderExpression(tokens, generated_expression);
+                break :blk named_order;
+            } else {
+                break :blk try expr_order.parseExpressionAlloc(
+                    alloc,
+                    tokens,
+                    pos,
+                    schema,
+                    function_bindings,
+                    field_expression_qualifiers,
+                    returning_expression_qualifiers,
+                    defer_row_expression_field_validation,
+                    type_context,
+                    item_hooks,
+                );
+            }
+        };
+        var order_transferred = false;
+        errdefer if (!order_transferred) {
+            if (order.field.len > 0) alloc.free(order.field);
+            if (order.expression) |expression| freeExpression(alloc, expression);
+            if (order.collation) |collation| alloc.free(collation);
+        };
+        const explicit_nulls_first = try expr_order.parseModifiers(tokens, pos, &order);
+        try expr_generated_validate.validateGeneratedExpressionItemEnd(generated_item, pos.*);
+        try expr_order.appendWithNullPlacement(alloc, order_by, order, explicit_nulls_first);
+        order_transferred = true;
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+    if (pos.* != order_tokens.end) return error.UnsupportedSqlShape;
+
+    const owned_scalar_subqueries = try scalar_subqueries.toOwnedSlice(alloc);
+    scalar_subqueries_transferred = true;
+    if (select.scalar_subqueries.len > 0) alloc.free(select.scalar_subqueries);
+    select.scalar_subqueries = owned_scalar_subqueries;
+    return true;
 }
 
 pub fn parseWhereAlloc(
@@ -2108,7 +4152,7 @@ pub fn parseSelectAlloc(
     _ = parser.matchKeyword(tokens, pos, "all");
 
     const generated_projection_end = try generated_read_validate.generatedProjectionClauseEnd(tokens, pos.*, options.generated_read_ast, options.allow_select_set_result_tail_boundary);
-    const select = (try parseGeneratedScalarSubquerySelectListAlloc(
+    var select = (try parseGeneratedScalarSubquerySelectListAlloc(
         alloc,
         tokens,
         pos,
@@ -2336,23 +4380,46 @@ pub fn parseSelectAlloc(
             try parser.expectKeyword(tokens, pos, "by");
             const generated_order_end = try generated_read_validate.generatedOrderClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast);
             const order_context = options.context_hooks.get_context(options.context_hooks.ptr);
-            try expr_order.parseSelectOutputByAlloc(
+            if (!try parseGeneratedScalarSubqueryOrderByAlloc(
                 alloc,
                 tokens,
                 pos,
+                options.params,
+                order_context.schema,
+                options.context_hooks.row_expression_type_context(options.context_hooks.ptr),
+                options.available_ctes,
+                options.generated_read_ast,
+                &select,
                 &order_by,
-                select,
-                .{
-                    .schema = order_context.schema,
-                    .function_bindings = options.function_bindings,
-                    .field_expression_qualifiers = order_context.field_expression_qualifiers,
-                    .returning_expression_qualifiers = order_context.returning_expression_qualifiers,
-                    .defer_row_expression_field_validation = order_context.defer_row_expression_field_validation,
-                    .type_context = options.context_hooks.row_expression_type_context(options.context_hooks.ptr),
-                    .order_expression_hooks = options.order_expression_hooks,
-                    .generated_read_ast = options.generated_read_ast,
-                },
-            );
+                options.function_bindings,
+                order_context.field_expression_qualifiers,
+                order_context.returning_expression_qualifiers,
+                order_context.defer_row_expression_field_validation,
+                options.realtime_ns,
+                options.fixed_binary_hooks,
+                options.bare_boolean_hooks,
+                options.expression_alternatives_hooks,
+                options.expression_condition_hooks,
+                options.order_expression_hooks,
+            )) {
+                try expr_order.parseSelectOutputByAlloc(
+                    alloc,
+                    tokens,
+                    pos,
+                    &order_by,
+                    select,
+                    .{
+                        .schema = order_context.schema,
+                        .function_bindings = options.function_bindings,
+                        .field_expression_qualifiers = order_context.field_expression_qualifiers,
+                        .returning_expression_qualifiers = order_context.returning_expression_qualifiers,
+                        .defer_row_expression_field_validation = order_context.defer_row_expression_field_validation,
+                        .type_context = options.context_hooks.row_expression_type_context(options.context_hooks.ptr),
+                        .order_expression_hooks = options.order_expression_hooks,
+                        .generated_read_ast = options.generated_read_ast,
+                    },
+                );
+            }
             if (generated_order_end) |end| {
                 if (pos.* != end) return error.UnsupportedSqlShape;
             }
@@ -13028,6 +15095,207 @@ fn corruptGeneratedReadWhereLeftFunctionNameToFirstProjection(parsed_sql: *token
     return error.TestUnexpectedResult;
 }
 
+fn corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(
+    expression: *generated_parser.GeneratedSqlExpressionAst,
+    replacement: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (expression.subquery_where_expression) |subquery_where| {
+        if (subquery_where.tokens == null) return false;
+        subquery_where.tokens = replacement;
+        return true;
+    }
+    if (expression.inner_expression) |inner| {
+        if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(inner, replacement)) return true;
+    }
+    if (expression.left_expression) |left| {
+        if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(left, replacement)) return true;
+    }
+    if (expression.right_expression) |right| {
+        if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(right, replacement)) return true;
+    }
+    if (expression.filter_expression) |filter| {
+        if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(filter, replacement)) return true;
+    }
+    if (expression.escape_expression) |escape| {
+        if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(escape, replacement)) return true;
+    }
+    if (expression.cast_expression) |cast_expression| {
+        if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(cast_expression, replacement)) return true;
+    }
+    if (expression.between_lower_expression) |between_lower| {
+        if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(between_lower, replacement)) return true;
+    }
+    if (expression.between_upper_expression) |between_upper| {
+        if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(between_upper, replacement)) return true;
+    }
+    if (expression.case_first_condition) |condition| {
+        if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(condition, replacement)) return true;
+    }
+    if (expression.case_first_result) |result| {
+        if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(result, replacement)) return true;
+    }
+    if (expression.case_else_expression) |case_else| {
+        if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(case_else, replacement)) return true;
+    }
+    if (expression.boolean_first_condition) |condition| {
+        if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(condition, replacement)) return true;
+    }
+    if (expression.boolean_last_condition) |condition| {
+        if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(condition, replacement)) return true;
+    }
+    if (expression.extract_source_expression) |source| {
+        if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(source, replacement)) return true;
+    }
+    for (expression.subquery_projection_items.expressions) |*item| {
+        if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(item, replacement)) return true;
+    }
+    for (expression.boolean_condition_items.expressions) |*item| {
+        if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(item, replacement)) return true;
+    }
+    for (expression.argument_items.expressions) |*item| {
+        if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(item, replacement)) return true;
+    }
+    for (expression.argument_order_items.expressions) |*item| {
+        if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(item, replacement)) return true;
+    }
+    for (expression.within_group_order_items.expressions) |*item| {
+        if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(item, replacement)) return true;
+    }
+    for (expression.over_partition_items.expressions) |*item| {
+        if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(item, replacement)) return true;
+    }
+    for (expression.over_order_items.expressions) |*item| {
+        if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(item, replacement)) return true;
+    }
+    for (expression.array_items.expressions) |*item| {
+        if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(item, replacement)) return true;
+    }
+    return false;
+}
+
+fn corruptGeneratedReadWhereFirstSubqueryWhereExpressionRange(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.projection_items.items.len == 0) return error.TestUnexpectedResult;
+                    if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(&read.where_expression, read.projection_items.items[0])) return;
+                    return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadProjectionFirstSubqueryWhereExpressionRange(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    const source_tokens = read.source_tokens orelse return error.TestUnexpectedResult;
+                    for (read.projection_items.expressions) |*expression| {
+                        if (corruptGeneratedExpressionFirstSubqueryWhereExpressionRange(expression, source_tokens)) return;
+                    }
+                    return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedExpressionFirstSubqueryProjectionCount(expression: *generated_parser.GeneratedSqlExpressionAst) bool {
+    if (expression.subquery_projection_tokens != null) {
+        expression.subquery_projection_items.count = 0;
+        return true;
+    }
+    if (expression.inner_expression) |inner| {
+        if (corruptGeneratedExpressionFirstSubqueryProjectionCount(inner)) return true;
+    }
+    if (expression.left_expression) |left| {
+        if (corruptGeneratedExpressionFirstSubqueryProjectionCount(left)) return true;
+    }
+    if (expression.right_expression) |right| {
+        if (corruptGeneratedExpressionFirstSubqueryProjectionCount(right)) return true;
+    }
+    if (expression.filter_expression) |filter| {
+        if (corruptGeneratedExpressionFirstSubqueryProjectionCount(filter)) return true;
+    }
+    if (expression.escape_expression) |escape| {
+        if (corruptGeneratedExpressionFirstSubqueryProjectionCount(escape)) return true;
+    }
+    if (expression.cast_expression) |cast_expression| {
+        if (corruptGeneratedExpressionFirstSubqueryProjectionCount(cast_expression)) return true;
+    }
+    if (expression.between_lower_expression) |between_lower| {
+        if (corruptGeneratedExpressionFirstSubqueryProjectionCount(between_lower)) return true;
+    }
+    if (expression.between_upper_expression) |between_upper| {
+        if (corruptGeneratedExpressionFirstSubqueryProjectionCount(between_upper)) return true;
+    }
+    if (expression.case_first_condition) |condition| {
+        if (corruptGeneratedExpressionFirstSubqueryProjectionCount(condition)) return true;
+    }
+    if (expression.case_first_result) |result| {
+        if (corruptGeneratedExpressionFirstSubqueryProjectionCount(result)) return true;
+    }
+    if (expression.case_else_expression) |case_else| {
+        if (corruptGeneratedExpressionFirstSubqueryProjectionCount(case_else)) return true;
+    }
+    if (expression.boolean_first_condition) |condition| {
+        if (corruptGeneratedExpressionFirstSubqueryProjectionCount(condition)) return true;
+    }
+    if (expression.boolean_last_condition) |condition| {
+        if (corruptGeneratedExpressionFirstSubqueryProjectionCount(condition)) return true;
+    }
+    if (expression.extract_source_expression) |source| {
+        if (corruptGeneratedExpressionFirstSubqueryProjectionCount(source)) return true;
+    }
+    for (expression.subquery_projection_items.expressions) |*item| {
+        if (corruptGeneratedExpressionFirstSubqueryProjectionCount(item)) return true;
+    }
+    for (expression.boolean_condition_items.expressions) |*item| {
+        if (corruptGeneratedExpressionFirstSubqueryProjectionCount(item)) return true;
+    }
+    for (expression.argument_items.expressions) |*item| {
+        if (corruptGeneratedExpressionFirstSubqueryProjectionCount(item)) return true;
+    }
+    for (expression.argument_order_items.expressions) |*item| {
+        if (corruptGeneratedExpressionFirstSubqueryProjectionCount(item)) return true;
+    }
+    for (expression.within_group_order_items.expressions) |*item| {
+        if (corruptGeneratedExpressionFirstSubqueryProjectionCount(item)) return true;
+    }
+    for (expression.over_partition_items.expressions) |*item| {
+        if (corruptGeneratedExpressionFirstSubqueryProjectionCount(item)) return true;
+    }
+    for (expression.over_order_items.expressions) |*item| {
+        if (corruptGeneratedExpressionFirstSubqueryProjectionCount(item)) return true;
+    }
+    for (expression.array_items.expressions) |*item| {
+        if (corruptGeneratedExpressionFirstSubqueryProjectionCount(item)) return true;
+    }
+    return false;
+}
+
+fn corruptGeneratedReadWhereFirstSubqueryProjectionCount(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (corruptGeneratedExpressionFirstSubqueryProjectionCount(&read.where_expression)) return;
+                    return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn corruptGeneratedSubqueryTailLimitExpressionRange(
     expression: *generated_parser.GeneratedSqlExpressionAst,
     replacement: generated_parser.GeneratedSqlTokenRange,
@@ -13138,6 +15406,41 @@ fn corruptGeneratedReadWhereSubqueryTailFetchEndBeforeInnerEnd(parsed_sql: *toke
             switch (generated_ast.*) {
                 .read => |read| {
                     if (corruptGeneratedSubqueryTailFetchEndBeforeInnerEnd(&read.where_expression)) return;
+                    return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadProjectionSubqueryTailLimitExpressionRange(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    const source_tokens = read.source_tokens orelse return error.TestUnexpectedResult;
+                    for (read.projection_items.expressions) |*expression| {
+                        if (corruptGeneratedSubqueryTailLimitExpressionRange(expression, source_tokens)) return;
+                    }
+                    return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadProjectionSubqueryTailFetchEndBeforeInnerEnd(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    for (read.projection_items.expressions) |*expression| {
+                        if (corruptGeneratedSubqueryTailFetchEndBeforeInnerEnd(expression)) return;
+                    }
                     return error.TestUnexpectedResult;
                 },
                 else => return error.TestUnexpectedResult,
@@ -15975,7 +18278,7 @@ test "sql adapter lower expr lowers array function projections" {
 test "sql adapter lower expr lowers generated subquery predicates" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"status":{"type":"keyword"},"active":{"type":"boolean"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"account_id":{"type":"keyword"},"status":{"type":"keyword"},"scope":{"type":"keyword"},"active":{"type":"boolean"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
     defer runtime_schema.freeSchema(alloc, schema);
@@ -16038,15 +18341,93 @@ test "sql adapter lower expr lowers generated subquery predicates" {
         }
     }
 
+    const quantified_subquery_payload_cases = [_][]const u8{
+        "SELECT id FROM usage_records WHERE status = ANY (SELECT status FROM usage_records)",
+        "SELECT id FROM usage_records WHERE status = SOME (SELECT status FROM usage_records)",
+        "SELECT id FROM usage_records WHERE status <> ALL (SELECT status FROM usage_records)",
+        "SELECT id FROM usage_records WHERE amount > ANY (SELECT amount FROM usage_records)",
+        "SELECT id FROM usage_records WHERE amount >= SOME (SELECT amount FROM usage_records)",
+        "SELECT id FROM usage_records WHERE status LIKE ANY (SELECT status FROM usage_records)",
+        "SELECT id FROM usage_records WHERE status ILIKE SOME (SELECT status FROM usage_records)",
+        "SELECT id FROM usage_records WHERE status NOT LIKE ALL (SELECT status FROM usage_records)",
+        "SELECT id FROM usage_records WHERE status NOT ILIKE ANY (SELECT status FROM usage_records)",
+    };
+    for (quantified_subquery_payload_cases) |sql| {
+        var malformed_quantifier = try tokenized.ParsedSql.initAlloc(alloc, sql);
+        defer malformed_quantifier.deinit(alloc);
+        try corruptGeneratedReadWhereQuantifierRange(&malformed_quantifier);
+        try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+            alloc,
+            &malformed_quantifier,
+            schema,
+            &.{},
+            .{},
+        ));
+
+        var malformed_right_kind = try tokenized.ParsedSql.initAlloc(alloc, sql);
+        defer malformed_right_kind.deinit(alloc);
+        try setGeneratedReadWhereRightExpressionKind(&malformed_right_kind, .token_range);
+        try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+            alloc,
+            &malformed_right_kind,
+            schema,
+            &.{},
+            .{},
+        ));
+
+        var malformed_subquery_projection = try tokenized.ParsedSql.initAlloc(alloc, sql);
+        defer malformed_subquery_projection.deinit(alloc);
+        try corruptGeneratedReadWhereFirstSubqueryProjectionCount(&malformed_subquery_projection);
+        try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+            alloc,
+            &malformed_subquery_projection,
+            schema,
+            &.{},
+            .{},
+        ));
+    }
+
+    var tailed_subquery = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status IN (SELECT status FROM usage_records ORDER BY status DESC NULLS LAST LIMIT +2 OFFSET +1 ROW)",
+        schema,
+        &.{},
+    );
+    defer tailed_subquery.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), tailed_subquery.plan.query.subquery_predicates.len);
+    const tailed_predicate = tailed_subquery.plan.query.subquery_predicates[0];
+    try std.testing.expectEqual(@as(usize, 2), tailed_predicate.query.order_by.len);
+    try std.testing.expectEqualStrings("status", tailed_predicate.query.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderNullTest.is_null, tailed_predicate.query.order_by[0].null_test.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, tailed_predicate.query.order_by[0].direction);
+    try std.testing.expectEqualStrings("status", tailed_predicate.query.order_by[1].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, tailed_predicate.query.order_by[1].direction);
+    try std.testing.expectEqual(@as(u32, 2), tailed_predicate.query.limit.?);
+    try std.testing.expectEqual(@as(u32, 1), tailed_predicate.query.offset);
+
+    var fetched_subquery = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status IN (SELECT status FROM usage_records ORDER BY status FETCH NEXT +3 ROWS ONLY)",
+        schema,
+        &.{},
+    );
+    defer fetched_subquery.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), fetched_subquery.plan.query.subquery_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), fetched_subquery.plan.query.subquery_predicates[0].query.order_by.len);
+    try std.testing.expectEqualStrings("status", fetched_subquery.plan.query.subquery_predicates[0].query.order_by[0].field);
+    try std.testing.expectEqual(@as(u32, 3), fetched_subquery.plan.query.subquery_predicates[0].query.limit.?);
+
     const correlated_predicates = [_]struct {
         sql: []const u8,
         kind: db_mod.types.RelationalRowsSubqueryPredicateKind,
+        op: runtime_schema.RelationalCheckOp = .eq,
         negated: bool = false,
         quantifier: ?db_mod.types.RelationalRowsSubqueryQuantifier = null,
         output_field: []const u8 = "",
         child_predicates: usize = 0,
     }{
         .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id)", .kind = .exists },
+        .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE outer_usage.customer_id = usage_records.customer_id)", .kind = .exists },
         .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE NOT EXISTS (SELECT 1 FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id)", .kind = .exists, .negated = true },
         .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE outer_usage.status = (SELECT status FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id)", .kind = .scalar, .output_field = "status" },
         .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE outer_usage.status IN (SELECT status FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id)", .kind = .in, .output_field = "status" },
@@ -16059,6 +18440,9 @@ test "sql adapter lower expr lowers generated subquery predicates" {
         .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE outer_usage.status IN (SELECT status FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id AND active IS TRUE)", .kind = .in, .output_field = "status", .child_predicates = 1 },
         .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE outer_usage.status NOT IN (SELECT status FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id AND active IS TRUE)", .kind = .in, .negated = true, .output_field = "status", .child_predicates = 1 },
         .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE outer_usage.amount = ANY (SELECT amount FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id AND active IS TRUE)", .kind = .quantified, .quantifier = .any, .output_field = "amount", .child_predicates = 1 },
+        .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE usage_records.amount > outer_usage.amount)", .kind = .exists, .op = .gt },
+        .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE outer_usage.amount < usage_records.amount)", .kind = .exists, .op = .gt },
+        .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE outer_usage.amount < ANY (SELECT amount FROM usage_records WHERE usage_records.amount >= outer_usage.amount)", .kind = .quantified, .op = .gte, .quantifier = .any, .output_field = "amount" },
     };
     for (correlated_predicates) |case| {
         var lowered = try lowerQueryPlanForLowerExprTestAlloc(
@@ -16075,9 +18459,201 @@ test "sql adapter lower expr lowers generated subquery predicates" {
         try std.testing.expectEqual(case.quantifier, correlated_predicate.quantifier);
         try std.testing.expectEqualStrings(case.output_field, correlated_predicate.output_field);
         try std.testing.expectEqual(@as(usize, 1), correlated_predicate.correlations.len);
-        try std.testing.expectEqualStrings("customer_id", correlated_predicate.correlations[0].left_field);
-        try std.testing.expectEqualStrings("customer_id", correlated_predicate.correlations[0].right_field);
+        const expected_correlation_field = if (case.op == .eq) "customer_id" else "amount";
+        try std.testing.expectEqualStrings(expected_correlation_field, correlated_predicate.correlations[0].left_field);
+        try std.testing.expectEqualStrings(expected_correlation_field, correlated_predicate.correlations[0].right_field);
+        try std.testing.expectEqual(case.op, correlated_predicate.correlations[0].op);
         try std.testing.expectEqual(case.child_predicates, correlated_predicate.query.predicates.len);
+    }
+
+    var or_correlated = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE usage_records.amount > outer_usage.amount OR lower(status) = 'open')",
+        schema,
+        &.{},
+    );
+    defer or_correlated.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), or_correlated.plan.query.subquery_predicates.len);
+    const or_predicate = or_correlated.plan.query.subquery_predicates[0];
+    try std.testing.expectEqual(@as(usize, 0), or_predicate.correlations.len);
+    try std.testing.expectEqual(@as(usize, 0), or_predicate.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), or_predicate.correlation_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), or_predicate.correlation_or_predicates[0].correlations.len);
+    try std.testing.expectEqualStrings("amount", or_predicate.correlation_or_predicates[0].correlations[0].left_field);
+    try std.testing.expectEqualStrings("amount", or_predicate.correlation_or_predicates[0].correlations[0].right_field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, or_predicate.correlation_or_predicates[0].correlations[0].op);
+    try std.testing.expectEqual(@as(usize, 1), or_predicate.correlation_or_predicates[1].expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, or_predicate.correlation_or_predicates[1].expression_predicates[0].lhs.kind);
+    try std.testing.expectEqualStrings("status", or_predicate.correlation_or_predicates[1].expression_predicates[0].lhs.operands[0].field);
+    try std.testing.expectEqualStrings("\"open\"", or_predicate.correlation_or_predicates[1].expression_predicates[0].rhs[0].value_json);
+
+    var access_or_correlated = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE usage_records.amount > outer_usage.amount OR status IN ('open', 'pending'))",
+        schema,
+        &.{},
+    );
+    defer access_or_correlated.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), access_or_correlated.plan.query.subquery_predicates.len);
+    const access_or_predicate = access_or_correlated.plan.query.subquery_predicates[0];
+    try std.testing.expectEqual(@as(usize, 0), access_or_predicate.correlations.len);
+    try std.testing.expectEqual(@as(usize, 0), access_or_predicate.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), access_or_predicate.correlation_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), access_or_predicate.correlation_or_predicates[0].correlations.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, access_or_predicate.correlation_or_predicates[0].correlations[0].op);
+    try std.testing.expectEqual(@as(usize, 1), access_or_predicate.correlation_or_predicates[1].access_predicates.in_predicates.len);
+    try std.testing.expectEqualStrings("status", access_or_predicate.correlation_or_predicates[1].access_predicates.in_predicates[0].field);
+    try std.testing.expectEqualStrings("[\"open\",\"pending\"]", access_or_predicate.correlation_or_predicates[1].access_predicates.in_predicates[0].values_json);
+
+    var mixed_access_expression_or_correlated = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE usage_records.amount > outer_usage.amount OR (status IN ('open', 'pending') AND lower(status) = 'open'))",
+        schema,
+        &.{},
+    );
+    defer mixed_access_expression_or_correlated.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), mixed_access_expression_or_correlated.plan.query.subquery_predicates.len);
+    const mixed_access_expression_predicate = mixed_access_expression_or_correlated.plan.query.subquery_predicates[0];
+    try std.testing.expectEqual(@as(usize, 0), mixed_access_expression_predicate.correlations.len);
+    try std.testing.expectEqual(@as(usize, 2), mixed_access_expression_predicate.correlation_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), mixed_access_expression_predicate.correlation_or_predicates[0].correlations.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, mixed_access_expression_predicate.correlation_or_predicates[0].correlations[0].op);
+    try std.testing.expectEqual(@as(usize, 1), mixed_access_expression_predicate.correlation_or_predicates[1].access_predicates.in_predicates.len);
+    try std.testing.expectEqualStrings("status", mixed_access_expression_predicate.correlation_or_predicates[1].access_predicates.in_predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 1), mixed_access_expression_predicate.correlation_or_predicates[1].expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, mixed_access_expression_predicate.correlation_or_predicates[1].expression_predicates[0].lhs.kind);
+    try std.testing.expectEqualStrings("status", mixed_access_expression_predicate.correlation_or_predicates[1].expression_predicates[0].lhs.operands[0].field);
+
+    var expression_array_or_correlated = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE usage_records.amount > outer_usage.amount OR string_to_array(scope, ' ') @> ARRAY['read']::text[])",
+        schema,
+        &.{},
+    );
+    defer expression_array_or_correlated.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), expression_array_or_correlated.plan.query.subquery_predicates.len);
+    const expression_array_or_predicate = expression_array_or_correlated.plan.query.subquery_predicates[0];
+    try std.testing.expectEqual(@as(usize, 0), expression_array_or_predicate.correlations.len);
+    try std.testing.expectEqual(@as(usize, 2), expression_array_or_predicate.correlation_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), expression_array_or_predicate.correlation_or_predicates[0].correlations.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, expression_array_or_predicate.correlation_or_predicates[0].correlations[0].op);
+    try std.testing.expectEqual(@as(usize, 1), expression_array_or_predicate.correlation_or_predicates[1].expression_array_contains.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.string_to_array, expression_array_or_predicate.correlation_or_predicates[1].expression_array_contains[0].expression.kind);
+    try std.testing.expectEqualStrings("scope", expression_array_or_predicate.correlation_or_predicates[1].expression_array_contains[0].expression.operands[0].field);
+    try std.testing.expectEqualStrings("[\"read\"]", expression_array_or_predicate.correlation_or_predicates[1].expression_array_contains[0].value_json);
+
+    var not_payload_or_correlated = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE usage_records.amount > outer_usage.amount OR (NOT (status = 'closed') AND NOT (status IN ('archived')) AND NOT (lower(status) = 'blocked')))",
+        schema,
+        &.{},
+    );
+    defer not_payload_or_correlated.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), not_payload_or_correlated.plan.query.subquery_predicates.len);
+    const not_payload_or_predicate = not_payload_or_correlated.plan.query.subquery_predicates[0];
+    try std.testing.expectEqual(@as(usize, 0), not_payload_or_predicate.correlations.len);
+    try std.testing.expectEqual(@as(usize, 2), not_payload_or_predicate.correlation_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), not_payload_or_predicate.correlation_or_predicates[0].correlations.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, not_payload_or_predicate.correlation_or_predicates[0].correlations[0].op);
+    try std.testing.expectEqual(@as(usize, 1), not_payload_or_predicate.correlation_or_predicates[1].not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), not_payload_or_predicate.correlation_or_predicates[1].not_predicates[0].predicates.len);
+    try std.testing.expectEqualStrings("status", not_payload_or_predicate.correlation_or_predicates[1].not_predicates[0].predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 1), not_payload_or_predicate.correlation_or_predicates[1].access_not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), not_payload_or_predicate.correlation_or_predicates[1].access_not_predicates[0].in_predicates.len);
+    try std.testing.expectEqualStrings("status", not_payload_or_predicate.correlation_or_predicates[1].access_not_predicates[0].in_predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 1), not_payload_or_predicate.correlation_or_predicates[1].expression_not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), not_payload_or_predicate.correlation_or_predicates[1].expression_not_predicates[0].conditions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, not_payload_or_predicate.correlation_or_predicates[1].expression_not_predicates[0].conditions[0].lhs.kind);
+
+    var nested_or_payload_or_correlated = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE usage_records.amount > outer_usage.amount OR ((status = 'open' OR status = 'pending') AND (status IN ('open') OR status IN ('pending')) AND (lower(status) = 'open' OR lower(status) = 'pending')))",
+        schema,
+        &.{},
+    );
+    defer nested_or_payload_or_correlated.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), nested_or_payload_or_correlated.plan.query.subquery_predicates.len);
+    const nested_or_payload_predicate = nested_or_payload_or_correlated.plan.query.subquery_predicates[0];
+    try std.testing.expectEqual(@as(usize, 0), nested_or_payload_predicate.correlations.len);
+    try std.testing.expectEqual(@as(usize, 2), nested_or_payload_predicate.correlation_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), nested_or_payload_predicate.correlation_or_predicates[0].correlations.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, nested_or_payload_predicate.correlation_or_predicates[0].correlations[0].op);
+    try std.testing.expectEqual(@as(usize, 2), nested_or_payload_predicate.correlation_or_predicates[1].or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), nested_or_payload_predicate.correlation_or_predicates[1].or_predicates[0].predicates.len);
+    try std.testing.expectEqualStrings("status", nested_or_payload_predicate.correlation_or_predicates[1].or_predicates[0].predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 2), nested_or_payload_predicate.correlation_or_predicates[1].access_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), nested_or_payload_predicate.correlation_or_predicates[1].access_or_predicates[0].in_predicates.len);
+    try std.testing.expectEqualStrings("status", nested_or_payload_predicate.correlation_or_predicates[1].access_or_predicates[0].in_predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 2), nested_or_payload_predicate.correlation_or_predicates[1].expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), nested_or_payload_predicate.correlation_or_predicates[1].expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, nested_or_payload_predicate.correlation_or_predicates[1].expression_or_predicates[0].conditions[0].lhs.kind);
+
+    var nested_or_correlated = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE usage_records.amount > outer_usage.amount OR status IN (SELECT status FROM usage_records WHERE enabled IS TRUE))",
+        schema,
+        &.{},
+    );
+    defer nested_or_correlated.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), nested_or_correlated.plan.query.subquery_predicates.len);
+    const nested_or_predicate = nested_or_correlated.plan.query.subquery_predicates[0];
+    try std.testing.expectEqual(@as(usize, 0), nested_or_predicate.correlations.len);
+    try std.testing.expectEqual(@as(usize, 2), nested_or_predicate.correlation_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), nested_or_predicate.correlation_or_predicates[0].correlations.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, nested_or_predicate.correlation_or_predicates[0].correlations[0].op);
+    try std.testing.expectEqual(@as(usize, 1), nested_or_predicate.correlation_or_predicates[1].subquery_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsSubqueryPredicateKind.in, nested_or_predicate.correlation_or_predicates[1].subquery_predicates[0].kind);
+    try std.testing.expectEqualStrings("status", nested_or_predicate.correlation_or_predicates[1].subquery_predicates[0].output_field);
+
+    var grouped_or_correlated = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE (usage_records.customer_id = outer_usage.customer_id OR usage_records.account_id = outer_usage.account_id))",
+        schema,
+        &.{},
+    );
+    defer grouped_or_correlated.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), grouped_or_correlated.plan.query.subquery_predicates.len);
+    const grouped_or_predicate = grouped_or_correlated.plan.query.subquery_predicates[0];
+    try std.testing.expectEqual(@as(usize, 2), grouped_or_predicate.correlation_or_predicates.len);
+    try std.testing.expectEqualStrings("customer_id", grouped_or_predicate.correlation_or_predicates[0].correlations[0].left_field);
+    try std.testing.expectEqualStrings("account_id", grouped_or_predicate.correlation_or_predicates[1].correlations[0].left_field);
+
+    var nested_correlated = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE (usage_records.customer_id = outer_usage.customer_id AND usage_records.account_id = outer_usage.account_id) AND active IS TRUE)",
+        schema,
+        &.{},
+    );
+    defer nested_correlated.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), nested_correlated.plan.query.subquery_predicates.len);
+    const nested_predicate = nested_correlated.plan.query.subquery_predicates[0];
+    try std.testing.expectEqual(@as(usize, 2), nested_predicate.correlations.len);
+    try std.testing.expectEqualStrings("customer_id", nested_predicate.correlations[0].left_field);
+    try std.testing.expectEqualStrings("customer_id", nested_predicate.correlations[0].right_field);
+    try std.testing.expectEqualStrings("account_id", nested_predicate.correlations[1].left_field);
+    try std.testing.expectEqualStrings("account_id", nested_predicate.correlations[1].right_field);
+    try std.testing.expectEqual(@as(usize, 1), nested_predicate.query.predicates.len);
+    try std.testing.expectEqualStrings("active", nested_predicate.query.predicates[0].field);
+
+    const malformed_correlated_predicates = [_][]const u8{
+        "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id)",
+        "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE NOT EXISTS (SELECT 1 FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id)",
+        "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE outer_usage.status = (SELECT status FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id)",
+        "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE outer_usage.status IN (SELECT status FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id)",
+        "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE outer_usage.status NOT IN (SELECT status FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id)",
+        "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE outer_usage.amount = ANY (SELECT amount FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id)",
+    };
+    for (malformed_correlated_predicates) |sql| {
+        var malformed_correlated = try tokenized.ParsedSql.initAlloc(alloc, sql);
+        defer malformed_correlated.deinit(alloc);
+        try corruptGeneratedReadWhereFirstSubqueryWhereExpressionRange(&malformed_correlated);
+        try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+            alloc,
+            &malformed_correlated,
+            schema,
+            &.{},
+            .{},
+        ));
     }
 
     var malformed_exists_operator = try tokenized.ParsedSql.initAlloc(
@@ -16122,6 +18698,34 @@ test "sql adapter lower expr lowers generated subquery predicates" {
         .{},
     ));
 
+    var malformed_nested_compound_correlated_subquery = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE (usage_records.customer_id = outer_usage.customer_id AND usage_records.account_id = outer_usage.account_id) AND active IS TRUE)",
+    );
+    defer malformed_nested_compound_correlated_subquery.deinit(alloc);
+    try corruptGeneratedReadWhereSubqueryFirstBooleanConditionInnerKind(&malformed_nested_compound_correlated_subquery);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_nested_compound_correlated_subquery,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_or_correlated_subquery = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id OR status = 'open')",
+    );
+    defer malformed_or_correlated_subquery.deinit(alloc);
+    try corruptGeneratedReadWhereSubqueryFirstBooleanConditionRange(&malformed_or_correlated_subquery);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_or_correlated_subquery,
+        schema,
+        &.{},
+        .{},
+    ));
+
     var malformed_quantified_subquery = try tokenized.ParsedSql.initAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE status = ANY (SELECT status FROM usage_records)",
@@ -16140,7 +18744,7 @@ test "sql adapter lower expr lowers generated subquery predicates" {
 test "sql adapter lower expr lowers generated scalar subquery projections" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"active":{"type":"boolean"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"active":{"type":"boolean"},"amount":{"type":"number"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
     defer runtime_schema.freeSchema(alloc, schema);
@@ -16197,6 +18801,647 @@ test "sql adapter lower expr lowers generated scalar subquery projections" {
     try std.testing.expectEqualStrings("id", correlated_projection.correlations[0].left_field);
     try std.testing.expectEqualStrings("id", correlated_projection.correlations[0].right_field);
 
+    var tailed_projection = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT (SELECT status FROM usage_records WHERE active IS TRUE ORDER BY status DESC LIMIT 1) AS first_status FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer tailed_projection.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), tailed_projection.plan.query.scalar_subqueries.len);
+    try std.testing.expectEqual(@as(usize, 1), tailed_projection.plan.query.scalar_subqueries[0].query.order_by.len);
+    try std.testing.expectEqualStrings("status", tailed_projection.plan.query.scalar_subqueries[0].query.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, tailed_projection.plan.query.scalar_subqueries[0].query.order_by[0].direction);
+    try std.testing.expectEqual(@as(u32, 1), tailed_projection.plan.query.scalar_subqueries[0].query.limit.?);
+
+    var coalesced_scalar_projection = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT coalesce((SELECT status FROM usage_records WHERE active IS TRUE ORDER BY status LIMIT 1), 'missing') AS first_status FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer coalesced_scalar_projection.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), coalesced_scalar_projection.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("first_status", coalesced_scalar_projection.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.coalesce, coalesced_scalar_projection.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), coalesced_scalar_projection.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), coalesced_scalar_projection.plan.query.scalar_subqueries.len);
+    try std.testing.expect(coalesced_scalar_projection.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqualStrings(
+        coalesced_scalar_projection.plan.query.scalar_subqueries[0].output,
+        coalesced_scalar_projection.plan.query.expressions[0].expression.operands[0].field,
+    );
+    try std.testing.expectEqualStrings("\"missing\"", coalesced_scalar_projection.plan.query.expressions[0].expression.operands[1].value_json);
+    const coalesced_output_columns = try expr_projection.selectOutputColumnsAlloc(alloc, .{ .alloc = alloc, .schema = schema }, .{
+        .expressions = coalesced_scalar_projection.plan.query.expressions,
+        .scalar_subqueries = coalesced_scalar_projection.plan.query.scalar_subqueries,
+        .outputs = &.{.{ .kind = .expression, .index = 0 }},
+        .select_all = false,
+    });
+    defer ddl_plan.freeDdlRelationalColumns(alloc, coalesced_output_columns);
+    try std.testing.expectEqual(@as(usize, 1), coalesced_output_columns.len);
+    try std.testing.expectEqualStrings("first_status", coalesced_output_columns[0].name);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, coalesced_output_columns[0].field_type);
+
+    var greatest_scalar_projection = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT greatest((SELECT status FROM usage_records WHERE active IS TRUE ORDER BY status LIMIT 1), 'fallback') AS status_floor FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer greatest_scalar_projection.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), greatest_scalar_projection.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_floor", greatest_scalar_projection.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.greatest, greatest_scalar_projection.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), greatest_scalar_projection.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), greatest_scalar_projection.plan.query.scalar_subqueries.len);
+    try std.testing.expect(greatest_scalar_projection.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqualStrings(
+        greatest_scalar_projection.plan.query.scalar_subqueries[0].output,
+        greatest_scalar_projection.plan.query.expressions[0].expression.operands[0].field,
+    );
+    const greatest_output_columns = try expr_projection.selectOutputColumnsAlloc(alloc, .{ .alloc = alloc, .schema = schema }, .{
+        .expressions = greatest_scalar_projection.plan.query.expressions,
+        .scalar_subqueries = greatest_scalar_projection.plan.query.scalar_subqueries,
+        .outputs = &.{.{ .kind = .expression, .index = 0 }},
+        .select_all = false,
+    });
+    defer ddl_plan.freeDdlRelationalColumns(alloc, greatest_output_columns);
+    try std.testing.expectEqual(@as(usize, 1), greatest_output_columns.len);
+    try std.testing.expectEqualStrings("status_floor", greatest_output_columns[0].name);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, greatest_output_columns[0].field_type);
+
+    var nullif_scalar_projection = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT nullif((SELECT status FROM usage_records WHERE active IS TRUE ORDER BY status LIMIT 1), 'inactive') AS nullable_status FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer nullif_scalar_projection.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), nullif_scalar_projection.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("nullable_status", nullif_scalar_projection.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.nullif, nullif_scalar_projection.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), nullif_scalar_projection.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), nullif_scalar_projection.plan.query.scalar_subqueries.len);
+    try std.testing.expect(nullif_scalar_projection.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqualStrings(
+        nullif_scalar_projection.plan.query.scalar_subqueries[0].output,
+        nullif_scalar_projection.plan.query.expressions[0].expression.operands[0].field,
+    );
+    const nullif_output_columns = try expr_projection.selectOutputColumnsAlloc(alloc, .{ .alloc = alloc, .schema = schema }, .{
+        .expressions = nullif_scalar_projection.plan.query.expressions,
+        .scalar_subqueries = nullif_scalar_projection.plan.query.scalar_subqueries,
+        .outputs = &.{.{ .kind = .expression, .index = 0 }},
+        .select_all = false,
+    });
+    defer ddl_plan.freeDdlRelationalColumns(alloc, nullif_output_columns);
+    try std.testing.expectEqual(@as(usize, 1), nullif_output_columns.len);
+    try std.testing.expectEqualStrings("nullable_status", nullif_output_columns[0].name);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, nullif_output_columns[0].field_type);
+
+    var least_scalar_projection = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT least((SELECT status FROM usage_records WHERE active IS TRUE ORDER BY status LIMIT 1), 'zzz') AS status_ceiling FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer least_scalar_projection.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), least_scalar_projection.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_ceiling", least_scalar_projection.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.least, least_scalar_projection.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), least_scalar_projection.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), least_scalar_projection.plan.query.scalar_subqueries.len);
+    try std.testing.expect(least_scalar_projection.plan.query.scalar_subqueries[0].hidden);
+
+    var concat_scalar_projection = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT concat((SELECT status FROM usage_records WHERE active IS TRUE ORDER BY status LIMIT 1), '-copy') AS copied_status FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer concat_scalar_projection.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), concat_scalar_projection.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("copied_status", concat_scalar_projection.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.concat, concat_scalar_projection.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), concat_scalar_projection.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), concat_scalar_projection.plan.query.scalar_subqueries.len);
+    try std.testing.expect(concat_scalar_projection.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqualStrings(
+        concat_scalar_projection.plan.query.scalar_subqueries[0].output,
+        concat_scalar_projection.plan.query.expressions[0].expression.operands[0].field,
+    );
+    try std.testing.expectEqualStrings("\"-copy\"", concat_scalar_projection.plan.query.expressions[0].expression.operands[1].value_json);
+    const concat_output_columns = try expr_projection.selectOutputColumnsAlloc(alloc, .{ .alloc = alloc, .schema = schema }, .{
+        .expressions = concat_scalar_projection.plan.query.expressions,
+        .scalar_subqueries = concat_scalar_projection.plan.query.scalar_subqueries,
+        .outputs = &.{.{ .kind = .expression, .index = 0 }},
+        .select_all = false,
+    });
+    defer ddl_plan.freeDdlRelationalColumns(alloc, concat_output_columns);
+    try std.testing.expectEqual(@as(usize, 1), concat_output_columns.len);
+    try std.testing.expectEqualStrings("copied_status", concat_output_columns[0].name);
+    try std.testing.expectEqual(runtime_schema.AntflyType.text, concat_output_columns[0].field_type);
+
+    var replace_scalar_projection = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT replace((SELECT status FROM usage_records WHERE active IS TRUE ORDER BY status LIMIT 1), '-', ' ') AS normalized_status FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer replace_scalar_projection.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), replace_scalar_projection.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("normalized_status", replace_scalar_projection.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.replace, replace_scalar_projection.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 3), replace_scalar_projection.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), replace_scalar_projection.plan.query.scalar_subqueries.len);
+    try std.testing.expect(replace_scalar_projection.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqualStrings(
+        replace_scalar_projection.plan.query.scalar_subqueries[0].output,
+        replace_scalar_projection.plan.query.expressions[0].expression.operands[0].field,
+    );
+    try std.testing.expectEqualStrings("\"-\"", replace_scalar_projection.plan.query.expressions[0].expression.operands[1].value_json);
+    try std.testing.expectEqualStrings("\" \"", replace_scalar_projection.plan.query.expressions[0].expression.operands[2].value_json);
+
+    var regexp_count_scalar_projection = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT regexp_count((SELECT status FROM usage_records WHERE active IS TRUE ORDER BY status LIMIT 1), '[0-9]+') AS status_digit_groups FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer regexp_count_scalar_projection.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), regexp_count_scalar_projection.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_digit_groups", regexp_count_scalar_projection.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_count, regexp_count_scalar_projection.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), regexp_count_scalar_projection.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), regexp_count_scalar_projection.plan.query.scalar_subqueries.len);
+    try std.testing.expect(regexp_count_scalar_projection.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqualStrings(
+        regexp_count_scalar_projection.plan.query.scalar_subqueries[0].output,
+        regexp_count_scalar_projection.plan.query.expressions[0].expression.operands[0].field,
+    );
+    const regexp_count_output_columns = try expr_projection.selectOutputColumnsAlloc(alloc, .{ .alloc = alloc, .schema = schema }, .{
+        .expressions = regexp_count_scalar_projection.plan.query.expressions,
+        .scalar_subqueries = regexp_count_scalar_projection.plan.query.scalar_subqueries,
+        .outputs = &.{.{ .kind = .expression, .index = 0 }},
+        .select_all = false,
+    });
+    defer ddl_plan.freeDdlRelationalColumns(alloc, regexp_count_output_columns);
+    try std.testing.expectEqual(@as(usize, 1), regexp_count_output_columns.len);
+    try std.testing.expectEqualStrings("status_digit_groups", regexp_count_output_columns[0].name);
+    try std.testing.expectEqual(runtime_schema.AntflyType.numeric, regexp_count_output_columns[0].field_type);
+
+    var arithmetic_scalar_projection = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT (SELECT amount FROM usage_records WHERE active IS TRUE ORDER BY amount LIMIT 1) + 5 AS raised_amount FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer arithmetic_scalar_projection.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), arithmetic_scalar_projection.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("raised_amount", arithmetic_scalar_projection.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, arithmetic_scalar_projection.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), arithmetic_scalar_projection.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), arithmetic_scalar_projection.plan.query.scalar_subqueries.len);
+    try std.testing.expect(arithmetic_scalar_projection.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqualStrings("amount", arithmetic_scalar_projection.plan.query.scalar_subqueries[0].output_field);
+    try std.testing.expectEqualStrings(
+        arithmetic_scalar_projection.plan.query.scalar_subqueries[0].output,
+        arithmetic_scalar_projection.plan.query.expressions[0].expression.operands[0].field,
+    );
+    const arithmetic_output_columns = try expr_projection.selectOutputColumnsAlloc(alloc, .{ .alloc = alloc, .schema = schema }, .{
+        .expressions = arithmetic_scalar_projection.plan.query.expressions,
+        .scalar_subqueries = arithmetic_scalar_projection.plan.query.scalar_subqueries,
+        .outputs = &.{.{ .kind = .expression, .index = 0 }},
+        .select_all = false,
+    });
+    defer ddl_plan.freeDdlRelationalColumns(alloc, arithmetic_output_columns);
+    try std.testing.expectEqual(@as(usize, 1), arithmetic_output_columns.len);
+    try std.testing.expectEqualStrings("raised_amount", arithmetic_output_columns[0].name);
+    try std.testing.expectEqual(runtime_schema.AntflyType.numeric, arithmetic_output_columns[0].field_type);
+
+    var grouped_unary_scalar_projection = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT -((SELECT amount FROM usage_records WHERE active IS TRUE ORDER BY amount LIMIT 1) + 5) AS negated_amount FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer grouped_unary_scalar_projection.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), grouped_unary_scalar_projection.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("negated_amount", grouped_unary_scalar_projection.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.mul, grouped_unary_scalar_projection.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), grouped_unary_scalar_projection.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, grouped_unary_scalar_projection.plan.query.expressions[0].expression.operands[1].kind);
+    try std.testing.expectEqual(@as(usize, 1), grouped_unary_scalar_projection.plan.query.scalar_subqueries.len);
+    try std.testing.expect(grouped_unary_scalar_projection.plan.query.scalar_subqueries[0].hidden);
+
+    var cast_scalar_projection = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT CAST((SELECT amount FROM usage_records WHERE active IS TRUE ORDER BY amount LIMIT 1) AS text) AS amount_text FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer cast_scalar_projection.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), cast_scalar_projection.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("amount_text", cast_scalar_projection.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.cast, cast_scalar_projection.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionCastType.text, cast_scalar_projection.plan.query.expressions[0].expression.cast_type.?);
+    try std.testing.expectEqual(@as(usize, 1), cast_scalar_projection.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), cast_scalar_projection.plan.query.scalar_subqueries.len);
+    try std.testing.expect(cast_scalar_projection.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqualStrings(
+        cast_scalar_projection.plan.query.scalar_subqueries[0].output,
+        cast_scalar_projection.plan.query.expressions[0].expression.operands[0].field,
+    );
+    const cast_output_columns = try expr_projection.selectOutputColumnsAlloc(alloc, .{ .alloc = alloc, .schema = schema }, .{
+        .expressions = cast_scalar_projection.plan.query.expressions,
+        .scalar_subqueries = cast_scalar_projection.plan.query.scalar_subqueries,
+        .outputs = &.{.{ .kind = .expression, .index = 0 }},
+        .select_all = false,
+    });
+    defer ddl_plan.freeDdlRelationalColumns(alloc, cast_output_columns);
+    try std.testing.expectEqual(@as(usize, 1), cast_output_columns.len);
+    try std.testing.expectEqualStrings("amount_text", cast_output_columns[0].name);
+    try std.testing.expectEqual(runtime_schema.AntflyType.text, cast_output_columns[0].field_type);
+
+    var unary_text_scalar_projection = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT lower((SELECT status FROM usage_records WHERE active IS TRUE ORDER BY status LIMIT 1)) AS lowered_status FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer unary_text_scalar_projection.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), unary_text_scalar_projection.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("lowered_status", unary_text_scalar_projection.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, unary_text_scalar_projection.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), unary_text_scalar_projection.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), unary_text_scalar_projection.plan.query.scalar_subqueries.len);
+    try std.testing.expect(unary_text_scalar_projection.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqualStrings(
+        unary_text_scalar_projection.plan.query.scalar_subqueries[0].output,
+        unary_text_scalar_projection.plan.query.expressions[0].expression.operands[0].field,
+    );
+
+    var unary_numeric_scalar_projection = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT abs((SELECT amount FROM usage_records WHERE active IS TRUE ORDER BY amount LIMIT 1)) AS absolute_amount FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer unary_numeric_scalar_projection.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), unary_numeric_scalar_projection.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("absolute_amount", unary_numeric_scalar_projection.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.abs, unary_numeric_scalar_projection.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), unary_numeric_scalar_projection.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), unary_numeric_scalar_projection.plan.query.scalar_subqueries.len);
+    try std.testing.expect(unary_numeric_scalar_projection.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqualStrings(
+        unary_numeric_scalar_projection.plan.query.scalar_subqueries[0].output,
+        unary_numeric_scalar_projection.plan.query.expressions[0].expression.operands[0].field,
+    );
+    const unary_numeric_output_columns = try expr_projection.selectOutputColumnsAlloc(alloc, .{ .alloc = alloc, .schema = schema }, .{
+        .expressions = unary_numeric_scalar_projection.plan.query.expressions,
+        .scalar_subqueries = unary_numeric_scalar_projection.plan.query.scalar_subqueries,
+        .outputs = &.{.{ .kind = .expression, .index = 0 }},
+        .select_all = false,
+    });
+    defer ddl_plan.freeDdlRelationalColumns(alloc, unary_numeric_output_columns);
+    try std.testing.expectEqual(@as(usize, 1), unary_numeric_output_columns.len);
+    try std.testing.expectEqualStrings("absolute_amount", unary_numeric_output_columns[0].name);
+    try std.testing.expectEqual(runtime_schema.AntflyType.numeric, unary_numeric_output_columns[0].field_type);
+
+    var case_scalar_projection = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT CASE WHEN active = true THEN (SELECT status FROM usage_records WHERE active IS TRUE ORDER BY status LIMIT 1) ELSE 'missing' END AS resolved_status FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer case_scalar_projection.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), case_scalar_projection.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("resolved_status", case_scalar_projection.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.case, case_scalar_projection.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), case_scalar_projection.plan.query.expressions[0].expression.case_branches.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, case_scalar_projection.plan.query.expressions[0].expression.case_branches[0].when.op);
+    try std.testing.expectEqualStrings("active", case_scalar_projection.plan.query.expressions[0].expression.case_branches[0].when.lhs.field);
+    try std.testing.expectEqual(@as(usize, 1), case_scalar_projection.plan.query.scalar_subqueries.len);
+    try std.testing.expect(case_scalar_projection.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqualStrings(
+        case_scalar_projection.plan.query.scalar_subqueries[0].output,
+        case_scalar_projection.plan.query.expressions[0].expression.case_branches[0].then.field,
+    );
+    try std.testing.expectEqualStrings("\"missing\"", case_scalar_projection.plan.query.expressions[0].expression.case_else[0].value_json);
+    const case_output_columns = try expr_projection.selectOutputColumnsAlloc(alloc, .{ .alloc = alloc, .schema = schema }, .{
+        .expressions = case_scalar_projection.plan.query.expressions,
+        .scalar_subqueries = case_scalar_projection.plan.query.scalar_subqueries,
+        .outputs = &.{.{ .kind = .expression, .index = 0 }},
+        .select_all = false,
+    });
+    defer ddl_plan.freeDdlRelationalColumns(alloc, case_output_columns);
+    try std.testing.expectEqual(@as(usize, 1), case_output_columns.len);
+    try std.testing.expectEqualStrings("resolved_status", case_output_columns[0].name);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, case_output_columns[0].field_type);
+
+    var boolean_scalar_projection = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT (SELECT active FROM usage_records WHERE active IS TRUE ORDER BY id LIMIT 1) AND active AS both_active FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer boolean_scalar_projection.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), boolean_scalar_projection.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("both_active", boolean_scalar_projection.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_and, boolean_scalar_projection.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), boolean_scalar_projection.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), boolean_scalar_projection.plan.query.scalar_subqueries.len);
+    try std.testing.expect(boolean_scalar_projection.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqualStrings(
+        boolean_scalar_projection.plan.query.scalar_subqueries[0].output,
+        boolean_scalar_projection.plan.query.expressions[0].expression.operands[0].field,
+    );
+    try std.testing.expectEqualStrings("active", boolean_scalar_projection.plan.query.expressions[0].expression.operands[1].field);
+    const boolean_output_columns = try expr_projection.selectOutputColumnsAlloc(alloc, .{ .alloc = alloc, .schema = schema }, .{
+        .expressions = boolean_scalar_projection.plan.query.expressions,
+        .scalar_subqueries = boolean_scalar_projection.plan.query.scalar_subqueries,
+        .outputs = &.{.{ .kind = .expression, .index = 0 }},
+        .select_all = false,
+    });
+    defer ddl_plan.freeDdlRelationalColumns(alloc, boolean_output_columns);
+    try std.testing.expectEqual(@as(usize, 1), boolean_output_columns.len);
+    try std.testing.expectEqualStrings("both_active", boolean_output_columns[0].name);
+    try std.testing.expectEqual(runtime_schema.AntflyType.boolean, boolean_output_columns[0].field_type);
+
+    var unary_text_numeric_scalar_projection = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT length((SELECT status FROM usage_records WHERE active IS TRUE ORDER BY status LIMIT 1)) AS status_length FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer unary_text_numeric_scalar_projection.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), unary_text_numeric_scalar_projection.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_length", unary_text_numeric_scalar_projection.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.length, unary_text_numeric_scalar_projection.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), unary_text_numeric_scalar_projection.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), unary_text_numeric_scalar_projection.plan.query.scalar_subqueries.len);
+    try std.testing.expect(unary_text_numeric_scalar_projection.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqualStrings(
+        unary_text_numeric_scalar_projection.plan.query.scalar_subqueries[0].output,
+        unary_text_numeric_scalar_projection.plan.query.expressions[0].expression.operands[0].field,
+    );
+    const unary_text_numeric_output_columns = try expr_projection.selectOutputColumnsAlloc(alloc, .{ .alloc = alloc, .schema = schema }, .{
+        .expressions = unary_text_numeric_scalar_projection.plan.query.expressions,
+        .scalar_subqueries = unary_text_numeric_scalar_projection.plan.query.scalar_subqueries,
+        .outputs = &.{.{ .kind = .expression, .index = 0 }},
+        .select_all = false,
+    });
+    defer ddl_plan.freeDdlRelationalColumns(alloc, unary_text_numeric_output_columns);
+    try std.testing.expectEqual(@as(usize, 1), unary_text_numeric_output_columns.len);
+    try std.testing.expectEqualStrings("status_length", unary_text_numeric_output_columns[0].name);
+    try std.testing.expectEqual(runtime_schema.AntflyType.numeric, unary_text_numeric_output_columns[0].field_type);
+
+    var binary_numeric_scalar_projection = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT power((SELECT amount FROM usage_records WHERE active IS TRUE ORDER BY amount LIMIT 1), 2) AS squared_amount FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer binary_numeric_scalar_projection.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), binary_numeric_scalar_projection.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("squared_amount", binary_numeric_scalar_projection.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.power, binary_numeric_scalar_projection.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), binary_numeric_scalar_projection.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), binary_numeric_scalar_projection.plan.query.scalar_subqueries.len);
+    try std.testing.expect(binary_numeric_scalar_projection.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqualStrings(
+        binary_numeric_scalar_projection.plan.query.scalar_subqueries[0].output,
+        binary_numeric_scalar_projection.plan.query.expressions[0].expression.operands[0].field,
+    );
+    try std.testing.expectEqualStrings("2", binary_numeric_scalar_projection.plan.query.expressions[0].expression.operands[1].value_json);
+
+    var ordered_expression_alias = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT coalesce((SELECT status FROM usage_records WHERE active IS TRUE ORDER BY status LIMIT 1), 'missing') AS first_status FROM usage_records ORDER BY first_status ASC",
+        schema,
+        &.{},
+    );
+    defer ordered_expression_alias.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ordered_expression_alias.plan.query.expressions.len);
+    try std.testing.expectEqual(@as(usize, 1), ordered_expression_alias.plan.query.scalar_subqueries.len);
+    try std.testing.expectEqual(@as(usize, 1), ordered_expression_alias.plan.query.order_by.len);
+    try std.testing.expectEqualStrings("first_status", ordered_expression_alias.plan.query.order_by[0].field);
+    try std.testing.expect(ordered_expression_alias.plan.query.order_by[0].expression == null);
+
+    var ordered_hidden_scalar_function = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records ORDER BY coalesce((SELECT status FROM usage_records WHERE active IS TRUE ORDER BY status LIMIT 1), 'missing') ASC",
+        schema,
+        &.{},
+    );
+    defer ordered_hidden_scalar_function.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_function.plan.query.select.len);
+    try std.testing.expectEqualStrings("id", ordered_hidden_scalar_function.plan.query.select[0]);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_function.plan.query.scalar_subqueries.len);
+    try std.testing.expect(ordered_hidden_scalar_function.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_function.plan.query.order_by.len);
+    const hidden_function_order = ordered_hidden_scalar_function.plan.query.order_by[0].expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.coalesce, hidden_function_order.kind);
+    try std.testing.expectEqualStrings(
+        ordered_hidden_scalar_function.plan.query.scalar_subqueries[0].output,
+        hidden_function_order.operands[0].field,
+    );
+
+    var ordered_hidden_scalar_arithmetic = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records ORDER BY (SELECT amount FROM usage_records WHERE active IS TRUE ORDER BY amount LIMIT 1) + 5 DESC",
+        schema,
+        &.{},
+    );
+    defer ordered_hidden_scalar_arithmetic.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_arithmetic.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_arithmetic.plan.query.scalar_subqueries.len);
+    try std.testing.expect(ordered_hidden_scalar_arithmetic.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_arithmetic.plan.query.order_by.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, ordered_hidden_scalar_arithmetic.plan.query.order_by[0].direction);
+    const hidden_arithmetic_order = ordered_hidden_scalar_arithmetic.plan.query.order_by[0].expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, hidden_arithmetic_order.kind);
+    try std.testing.expectEqualStrings(
+        ordered_hidden_scalar_arithmetic.plan.query.scalar_subqueries[0].output,
+        hidden_arithmetic_order.operands[0].field,
+    );
+
+    var ordered_hidden_scalar_cast = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records ORDER BY CAST((SELECT amount FROM usage_records WHERE active IS TRUE ORDER BY amount LIMIT 1) AS text) DESC",
+        schema,
+        &.{},
+    );
+    defer ordered_hidden_scalar_cast.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_cast.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_cast.plan.query.scalar_subqueries.len);
+    try std.testing.expect(ordered_hidden_scalar_cast.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_cast.plan.query.order_by.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, ordered_hidden_scalar_cast.plan.query.order_by[0].direction);
+    const hidden_cast_order = ordered_hidden_scalar_cast.plan.query.order_by[0].expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.cast, hidden_cast_order.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionCastType.text, hidden_cast_order.cast_type.?);
+    try std.testing.expectEqualStrings(
+        ordered_hidden_scalar_cast.plan.query.scalar_subqueries[0].output,
+        hidden_cast_order.operands[0].field,
+    );
+
+    var ordered_hidden_scalar_unary_text = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records ORDER BY md5((SELECT status FROM usage_records WHERE active IS TRUE ORDER BY status LIMIT 1)) ASC",
+        schema,
+        &.{},
+    );
+    defer ordered_hidden_scalar_unary_text.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_unary_text.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_unary_text.plan.query.scalar_subqueries.len);
+    try std.testing.expect(ordered_hidden_scalar_unary_text.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_unary_text.plan.query.order_by.len);
+    const hidden_unary_text_order = ordered_hidden_scalar_unary_text.plan.query.order_by[0].expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.md5, hidden_unary_text_order.kind);
+    try std.testing.expectEqualStrings(
+        ordered_hidden_scalar_unary_text.plan.query.scalar_subqueries[0].output,
+        hidden_unary_text_order.operands[0].field,
+    );
+
+    var ordered_hidden_scalar_unary_numeric = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records ORDER BY sqrt((SELECT amount FROM usage_records WHERE active IS TRUE ORDER BY amount LIMIT 1)) ASC",
+        schema,
+        &.{},
+    );
+    defer ordered_hidden_scalar_unary_numeric.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_unary_numeric.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_unary_numeric.plan.query.scalar_subqueries.len);
+    try std.testing.expect(ordered_hidden_scalar_unary_numeric.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_unary_numeric.plan.query.order_by.len);
+    const hidden_unary_numeric_order = ordered_hidden_scalar_unary_numeric.plan.query.order_by[0].expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sqrt, hidden_unary_numeric_order.kind);
+    try std.testing.expectEqualStrings(
+        ordered_hidden_scalar_unary_numeric.plan.query.scalar_subqueries[0].output,
+        hidden_unary_numeric_order.operands[0].field,
+    );
+
+    var ordered_hidden_scalar_case = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records ORDER BY CASE WHEN active = true THEN (SELECT amount FROM usage_records WHERE active IS TRUE ORDER BY amount LIMIT 1) ELSE 0 END DESC",
+        schema,
+        &.{},
+    );
+    defer ordered_hidden_scalar_case.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_case.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_case.plan.query.scalar_subqueries.len);
+    try std.testing.expect(ordered_hidden_scalar_case.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_case.plan.query.order_by.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, ordered_hidden_scalar_case.plan.query.order_by[0].direction);
+    const hidden_case_order = ordered_hidden_scalar_case.plan.query.order_by[0].expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.case, hidden_case_order.kind);
+    try std.testing.expectEqualStrings(
+        ordered_hidden_scalar_case.plan.query.scalar_subqueries[0].output,
+        hidden_case_order.case_branches[0].then.field,
+    );
+
+    var ordered_hidden_scalar_boolean = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records ORDER BY NOT (SELECT active FROM usage_records WHERE active IS TRUE ORDER BY id LIMIT 1) ASC",
+        schema,
+        &.{},
+    );
+    defer ordered_hidden_scalar_boolean.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_boolean.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_boolean.plan.query.scalar_subqueries.len);
+    try std.testing.expect(ordered_hidden_scalar_boolean.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_boolean.plan.query.order_by.len);
+    const hidden_boolean_order = ordered_hidden_scalar_boolean.plan.query.order_by[0].expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_not, hidden_boolean_order.kind);
+    try std.testing.expectEqualStrings(
+        ordered_hidden_scalar_boolean.plan.query.scalar_subqueries[0].output,
+        hidden_boolean_order.operands[0].field,
+    );
+
+    var ordered_hidden_scalar_unary_text_numeric = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records ORDER BY ascii((SELECT status FROM usage_records WHERE active IS TRUE ORDER BY status LIMIT 1)) DESC",
+        schema,
+        &.{},
+    );
+    defer ordered_hidden_scalar_unary_text_numeric.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_unary_text_numeric.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_unary_text_numeric.plan.query.scalar_subqueries.len);
+    try std.testing.expect(ordered_hidden_scalar_unary_text_numeric.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_unary_text_numeric.plan.query.order_by.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, ordered_hidden_scalar_unary_text_numeric.plan.query.order_by[0].direction);
+    const hidden_unary_text_numeric_order = ordered_hidden_scalar_unary_text_numeric.plan.query.order_by[0].expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.ascii, hidden_unary_text_numeric_order.kind);
+    try std.testing.expectEqualStrings(
+        ordered_hidden_scalar_unary_text_numeric.plan.query.scalar_subqueries[0].output,
+        hidden_unary_text_numeric_order.operands[0].field,
+    );
+
+    var ordered_hidden_scalar_binary_text_numeric = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records ORDER BY strpos((SELECT status FROM usage_records WHERE active IS TRUE ORDER BY status LIMIT 1), 'o') DESC",
+        schema,
+        &.{},
+    );
+    defer ordered_hidden_scalar_binary_text_numeric.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_binary_text_numeric.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_binary_text_numeric.plan.query.scalar_subqueries.len);
+    try std.testing.expect(ordered_hidden_scalar_binary_text_numeric.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_binary_text_numeric.plan.query.order_by.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, ordered_hidden_scalar_binary_text_numeric.plan.query.order_by[0].direction);
+    const hidden_binary_text_numeric_order = ordered_hidden_scalar_binary_text_numeric.plan.query.order_by[0].expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.strpos, hidden_binary_text_numeric_order.kind);
+    try std.testing.expectEqualStrings(
+        ordered_hidden_scalar_binary_text_numeric.plan.query.scalar_subqueries[0].output,
+        hidden_binary_text_numeric_order.operands[0].field,
+    );
+    try std.testing.expectEqualStrings("\"o\"", hidden_binary_text_numeric_order.operands[1].value_json);
+
+    var ordered_hidden_scalar_concat_ws = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records ORDER BY concat_ws(':', (SELECT status FROM usage_records WHERE active IS TRUE ORDER BY status LIMIT 1), id) DESC",
+        schema,
+        &.{},
+    );
+    defer ordered_hidden_scalar_concat_ws.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_concat_ws.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_concat_ws.plan.query.scalar_subqueries.len);
+    try std.testing.expect(ordered_hidden_scalar_concat_ws.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_concat_ws.plan.query.order_by.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, ordered_hidden_scalar_concat_ws.plan.query.order_by[0].direction);
+    const hidden_concat_ws_order = ordered_hidden_scalar_concat_ws.plan.query.order_by[0].expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.concat_ws, hidden_concat_ws_order.kind);
+    try std.testing.expectEqual(@as(usize, 3), hidden_concat_ws_order.operands.len);
+    try std.testing.expectEqualStrings("\":\"", hidden_concat_ws_order.operands[0].value_json);
+    try std.testing.expectEqualStrings(
+        ordered_hidden_scalar_concat_ws.plan.query.scalar_subqueries[0].output,
+        hidden_concat_ws_order.operands[1].field,
+    );
+    try std.testing.expectEqualStrings("id", hidden_concat_ws_order.operands[2].field);
+
+    var ordered_hidden_scalar_split_part = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records ORDER BY split_part((SELECT status FROM usage_records WHERE active IS TRUE ORDER BY status LIMIT 1), '-', 1) ASC",
+        schema,
+        &.{},
+    );
+    defer ordered_hidden_scalar_split_part.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_split_part.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_split_part.plan.query.scalar_subqueries.len);
+    try std.testing.expect(ordered_hidden_scalar_split_part.plan.query.scalar_subqueries[0].hidden);
+    try std.testing.expectEqual(@as(usize, 1), ordered_hidden_scalar_split_part.plan.query.order_by.len);
+    const hidden_split_part_order = ordered_hidden_scalar_split_part.plan.query.order_by[0].expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.split_part, hidden_split_part_order.kind);
+    try std.testing.expectEqual(@as(usize, 3), hidden_split_part_order.operands.len);
+    try std.testing.expectEqualStrings(
+        ordered_hidden_scalar_split_part.plan.query.scalar_subqueries[0].output,
+        hidden_split_part_order.operands[0].field,
+    );
+    try std.testing.expectEqualStrings("\"-\"", hidden_split_part_order.operands[1].value_json);
+    try std.testing.expectEqualStrings("1", hidden_split_part_order.operands[2].value_json);
+
     var malformed_scalar_projection = try tokenized.ParsedSql.initAlloc(
         alloc,
         "SELECT (SELECT status FROM usage_records WHERE id = 'u1') AS first_status FROM usage_records",
@@ -16210,6 +19455,90 @@ test "sql adapter lower expr lowers generated scalar subquery projections" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
         alloc,
         &malformed_scalar_projection,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_correlated_scalar_projection = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT outer_usage.id, (SELECT status FROM usage_records AS child_usage WHERE child_usage.id = outer_usage.id) AS same_status FROM usage_records AS outer_usage",
+    );
+    defer malformed_correlated_scalar_projection.deinit(alloc);
+    try corruptGeneratedReadProjectionFirstSubqueryWhereExpressionRange(&malformed_correlated_scalar_projection);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_correlated_scalar_projection,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_correlated_hidden_scalar_projection = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT coalesce((SELECT status FROM usage_records AS child_usage WHERE child_usage.id = outer_usage.id), 'missing') AS same_status FROM usage_records AS outer_usage",
+    );
+    defer malformed_correlated_hidden_scalar_projection.deinit(alloc);
+    try corruptGeneratedReadProjectionFirstSubqueryWhereExpressionRange(&malformed_correlated_hidden_scalar_projection);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_correlated_hidden_scalar_projection,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_scalar_projection_tail_limit = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT (SELECT status FROM usage_records WHERE active IS TRUE ORDER BY status DESC LIMIT 1) AS first_status FROM usage_records",
+    );
+    defer malformed_scalar_projection_tail_limit.deinit(alloc);
+    try corruptGeneratedReadProjectionSubqueryTailLimitExpressionRange(&malformed_scalar_projection_tail_limit);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_scalar_projection_tail_limit,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_coalesced_scalar_projection_tail = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT coalesce((SELECT status FROM usage_records WHERE active IS TRUE ORDER BY status LIMIT 1), 'missing') AS first_status FROM usage_records",
+    );
+    defer malformed_coalesced_scalar_projection_tail.deinit(alloc);
+    try corruptGeneratedReadProjectionSubqueryTailLimitExpressionRange(&malformed_coalesced_scalar_projection_tail);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_coalesced_scalar_projection_tail,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_arithmetic_scalar_projection_tail = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT (SELECT amount FROM usage_records WHERE active IS TRUE ORDER BY amount LIMIT 1) + 5 AS raised_amount FROM usage_records",
+    );
+    defer malformed_arithmetic_scalar_projection_tail.deinit(alloc);
+    try corruptGeneratedReadProjectionSubqueryTailLimitExpressionRange(&malformed_arithmetic_scalar_projection_tail);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_arithmetic_scalar_projection_tail,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_scalar_projection_tail_fetch = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT (SELECT status FROM usage_records WHERE active IS TRUE ORDER BY status FETCH FIRST 1 ROW ONLY) AS first_status FROM usage_records",
+    );
+    defer malformed_scalar_projection_tail_fetch.deinit(alloc);
+    try corruptGeneratedReadProjectionSubqueryTailFetchEndBeforeInnerEnd(&malformed_scalar_projection_tail_fetch);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_scalar_projection_tail_fetch,
         schema,
         &.{},
         .{},

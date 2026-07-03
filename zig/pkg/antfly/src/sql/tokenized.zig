@@ -371,16 +371,13 @@ pub const ParsedSql = struct {
     }
 
     pub fn readStatementKindIncludingGeneratedAst(self: *const ParsedSql) ?sql_statement_kind.SqlReadStatementKind {
-        if (self.generated_statement) |generated_statement| {
-            if (generated_statement.kind() == .read) {
-                const generated_kind = self.generatedReadStatementKind() orelse return null;
-                return switch (self.statement) {
-                    .read => |statement| if (statement.kind == generated_kind or statement.kind == .query) generated_kind else null,
-                    else => null,
-                };
-            }
-        }
-        return self.readStatementKind();
+        const generated_statement = self.generated_statement orelse return null;
+        if (generated_statement.kind() != .read) return null;
+        const generated_kind = self.generatedReadStatementKind() orelse return null;
+        return switch (self.statement) {
+            .read => |statement| if (statement.kind == generated_kind or statement.kind == .query) generated_kind else null,
+            else => null,
+        };
     }
 
     pub fn generatedReadStatementKind(self: *const ParsedSql) ?sql_statement_kind.SqlReadStatementKind {
@@ -396,22 +393,16 @@ pub const ParsedSql = struct {
     }
 
     pub fn writeStatementIncludingGeneratedAst(self: *const ParsedSql) ?PublishedWriteStatement {
-        if (self.generated_statement) |generated_statement| {
-            if (generated_statement.kind() == .dml) {
-                const generated_kind = generatedDmlStatementKind(self.items(), generated_statement) orelse return null;
-                switch (self.statement) {
-                    .write => |statement| {
-                        if (statement.kind != generated_kind.write_kind or statement.recursive != generated_kind.recursive) return null;
-                    },
-                    else => return null,
-                }
-                return .{ .kind = generated_kind.write_kind, .recursive = generated_kind.recursive };
-            }
+        const generated_statement = self.generated_statement orelse return null;
+        if (generated_statement.kind() != .dml) return null;
+        const generated_kind = generatedDmlStatementKind(self.items(), generated_statement) orelse return null;
+        switch (self.statement) {
+            .write => |statement| {
+                if (statement.kind != generated_kind.write_kind or statement.recursive != generated_kind.recursive) return null;
+            },
+            else => return null,
         }
-        return .{
-            .kind = self.writeStatementKind() orelse return null,
-            .recursive = self.isRecursiveWriteStatement(),
-        };
+        return .{ .kind = generated_kind.write_kind, .recursive = generated_kind.recursive };
     }
 
     pub fn isRecursiveWriteStatement(self: *const ParsedSql) bool {
@@ -8245,6 +8236,15 @@ test "sql adapter parsed sql owns typed statement variants" {
     read.statement = .{ .unknown = read.raw_statement };
     try std.testing.expect(read.readStatementKindIncludingGeneratedAst() == null);
 
+    var missing_generated_read = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records");
+    defer missing_generated_read.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, missing_generated_read.readStatementKind().?);
+    var missing_generated_read_metadata = missing_generated_read.generated_statement.?;
+    defer missing_generated_read_metadata.deinit(alloc);
+    missing_generated_read.generated_statement = null;
+    try std.testing.expect(missing_generated_read.generatedReadStatementKind() == null);
+    try std.testing.expect(missing_generated_read.readStatementKindIncludingGeneratedAst() == null);
+
     var mismatched_generated_read = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records");
     defer mismatched_generated_read.deinit(alloc);
     try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, mismatched_generated_read.generatedReadStatementKind().?);
@@ -8297,6 +8297,15 @@ test "sql adapter parsed sql owns typed statement variants" {
     write.statement = .{ .unknown = write.raw_statement };
     try std.testing.expect(write.writeStatementKindIncludingGeneratedAst() == null);
     try std.testing.expect(write.writeStatementIncludingGeneratedAst() == null);
+
+    var missing_generated_write = try ParsedSql.initAlloc(alloc, "UPDATE usage_records SET status = 'done' WHERE id = 'u1'");
+    defer missing_generated_write.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.update, missing_generated_write.writeStatementKind().?);
+    var missing_generated_write_metadata = missing_generated_write.generated_statement.?;
+    defer missing_generated_write_metadata.deinit(alloc);
+    missing_generated_write.generated_statement = null;
+    try std.testing.expect(missing_generated_write.writeStatementKindIncludingGeneratedAst() == null);
+    try std.testing.expect(missing_generated_write.writeStatementIncludingGeneratedAst() == null);
 
     var mismatched_generated_write = try ParsedSql.initAlloc(alloc, "UPDATE usage_records SET status = 'done' WHERE id = 'u1'");
     defer mismatched_generated_write.deinit(alloc);

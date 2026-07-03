@@ -5307,12 +5307,13 @@ pub fn validateMutationSourceRequest(
     if (req.kind == .update and req.operations.len == 0 and req.patch_expressions.len == 0 and req.increment_expressions.len == 0 and req.json_set_expressions.len == 0) return error.InvalidQueryRequest;
     if (req.kind == .delete and (req.rewrite_identity or req.operations.len != 0 or req.patch_expressions.len != 0 or req.increment_expressions.len != 0 or req.json_set_expressions.len != 0)) return error.InvalidQueryRequest;
     try validateMutationUpdateTargetPaths(req.operations, req.patch_expressions, req.increment_expressions, req.json_set_expressions, &.{});
+    try validateMutationSourceExpressionAssignmentsAgainstSchema(runtime_schema, req);
     const touches_primary_key = mutationTouchesPrimaryKey(runtime_schema.primary_key.?, req);
     if (touches_primary_key != req.rewrite_identity) return error.InvalidQueryRequest;
     if (req.rewrite_identity and runtime_schema.primary_key.?.without_overlaps_period != null) return error.UnsupportedQueryRequest;
     if (req.temporal_portion) |portion| try validateTemporalPortionRequest(alloc, runtime_schema, portion, req);
     try validateMutationReturningRequestOutputs(runtime_schema, req.returning, req.returning_all, req.returning_expressions);
-    try validateMutationReturningTargetExpressions(runtime_schema, req.returning_expressions);
+    try validateMutationReturningTargetExpressionsWithScalarOutputs(runtime_schema, req.returning_expressions, req.source.scalar_subqueries);
     return claim;
 }
 
@@ -7778,7 +7779,7 @@ fn lateralCorrelationPredicatesAlloc(
         predicates[initialized] = .{
             .name = name,
             .field = try alloc.dupe(u8, correlation.right_field),
-            .op = .eq,
+            .op = correlation.op,
             .value_json = value_json,
         };
         initialized += 1;
@@ -7813,6 +7814,636 @@ fn concatRelationalChecksAlloc(
         initialized += 1;
     }
     return out;
+}
+
+fn freePredicateGroups(alloc: Allocator, groups: []const types.RelationalRowsPredicateGroup) void {
+    for (groups) |group| {
+        freeRelationalChecks(alloc, group.predicates);
+        if (group.predicates.len > 0) alloc.free(group.predicates);
+    }
+}
+
+fn freeExpressionConditions(alloc: Allocator, conditions: []const types.RelationalRowsExpressionCondition) void {
+    for (conditions) |condition| schema_mod.freeRelationalRowsExpressionCondition(alloc, condition);
+}
+
+fn freeExpressionPredicateGroups(alloc: Allocator, groups: []const types.RelationalRowsExpressionPredicateGroup) void {
+    for (groups) |group| {
+        freeExpressionConditions(alloc, group.conditions);
+        if (group.conditions.len > 0) alloc.free(group.conditions);
+    }
+}
+
+fn freeAccessPredicateGroup(alloc: Allocator, group: types.RelationalRowsAccessPredicateGroup) void {
+    freeRelationalChecks(alloc, group.predicates);
+    if (group.predicates.len > 0) alloc.free(group.predicates);
+    for (group.array_any) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.value_json);
+    }
+    if (group.array_any.len > 0) alloc.free(group.array_any);
+    for (group.array_contains) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.value_json);
+    }
+    if (group.array_contains.len > 0) alloc.free(group.array_contains);
+    for (group.array_eq) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.value_json);
+    }
+    if (group.array_eq.len > 0) alloc.free(group.array_eq);
+    for (group.in_predicates) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.values_json);
+        if (predicate.collation) |collation| alloc.free(collation);
+    }
+    if (group.in_predicates.len > 0) alloc.free(group.in_predicates);
+    for (group.json_contains) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.value_json);
+    }
+    if (group.json_contains.len > 0) alloc.free(group.json_contains);
+    for (group.json_path_eq) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.path);
+        alloc.free(predicate.value_json);
+    }
+    if (group.json_path_eq.len > 0) alloc.free(group.json_path_eq);
+    for (group.json_path_exists) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.path);
+    }
+    if (group.json_path_exists.len > 0) alloc.free(group.json_path_exists);
+    for (group.text_patterns) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.pattern);
+    }
+    if (group.text_patterns.len > 0) alloc.free(group.text_patterns);
+}
+
+fn freeAccessPredicateGroups(alloc: Allocator, groups: []const types.RelationalRowsAccessPredicateGroup) void {
+    for (groups) |group| freeAccessPredicateGroup(alloc, group);
+}
+
+fn accessPredicateGroupIsEmpty(group: types.RelationalRowsAccessPredicateGroup) bool {
+    return group.predicates.len == 0 and
+        group.array_any.len == 0 and
+        group.array_contains.len == 0 and
+        group.array_eq.len == 0 and
+        group.in_predicates.len == 0 and
+        group.json_contains.len == 0 and
+        group.json_path_eq.len == 0 and
+        group.json_path_exists.len == 0 and
+        group.text_patterns.len == 0;
+}
+
+fn cloneArrayAnyPredicatesAlloc(
+    alloc: Allocator,
+    values: []const types.RelationalRowsArrayAnyPredicate,
+) ![]const types.RelationalRowsArrayAnyPredicate {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(types.RelationalRowsArrayAnyPredicate, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.value_json);
+        }
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        const field = try alloc.dupe(u8, value.field);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        const value_json = try alloc.dupe(u8, value.value_json);
+        var value_transferred = false;
+        errdefer if (!value_transferred) alloc.free(value_json);
+        out[i] = .{
+            .field = field,
+            .value_json = value_json,
+        };
+        field_transferred = true;
+        value_transferred = true;
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneArrayContainsPredicatesAlloc(
+    alloc: Allocator,
+    values: []const types.RelationalRowsArrayContainsPredicate,
+) ![]const types.RelationalRowsArrayContainsPredicate {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(types.RelationalRowsArrayContainsPredicate, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.value_json);
+        }
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        const field = try alloc.dupe(u8, value.field);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        const value_json = try alloc.dupe(u8, value.value_json);
+        var value_transferred = false;
+        errdefer if (!value_transferred) alloc.free(value_json);
+        out[i] = .{
+            .field = field,
+            .value_json = value_json,
+        };
+        field_transferred = true;
+        value_transferred = true;
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneArrayEqPredicatesAlloc(
+    alloc: Allocator,
+    values: []const types.RelationalRowsArrayEqPredicate,
+) ![]const types.RelationalRowsArrayEqPredicate {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(types.RelationalRowsArrayEqPredicate, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.value_json);
+        }
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        const field = try alloc.dupe(u8, value.field);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        const value_json = try alloc.dupe(u8, value.value_json);
+        var value_transferred = false;
+        errdefer if (!value_transferred) alloc.free(value_json);
+        out[i] = .{
+            .field = field,
+            .value_json = value_json,
+        };
+        field_transferred = true;
+        value_transferred = true;
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneInPredicatesAlloc(
+    alloc: Allocator,
+    values: []const types.RelationalRowsInPredicate,
+) ![]const types.RelationalRowsInPredicate {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(types.RelationalRowsInPredicate, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.values_json);
+            if (predicate.collation) |collation| alloc.free(collation);
+        }
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        const field = try alloc.dupe(u8, value.field);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        const values_json = try alloc.dupe(u8, value.values_json);
+        var values_transferred = false;
+        errdefer if (!values_transferred) alloc.free(values_json);
+        const collation = if (value.collation) |source| try alloc.dupe(u8, source) else null;
+        var collation_transferred = false;
+        errdefer if (!collation_transferred) if (collation) |owned| alloc.free(owned);
+        out[i] = .{
+            .field = field,
+            .values_json = values_json,
+            .negated = value.negated,
+            .collation = collation,
+        };
+        field_transferred = true;
+        values_transferred = true;
+        collation_transferred = true;
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneJsonContainsPredicatesAlloc(
+    alloc: Allocator,
+    values: []const types.RelationalRowsJsonContainsPredicate,
+) ![]const types.RelationalRowsJsonContainsPredicate {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(types.RelationalRowsJsonContainsPredicate, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.value_json);
+        }
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        const field = try alloc.dupe(u8, value.field);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        const value_json = try alloc.dupe(u8, value.value_json);
+        var value_transferred = false;
+        errdefer if (!value_transferred) alloc.free(value_json);
+        out[i] = .{
+            .field = field,
+            .value_json = value_json,
+        };
+        field_transferred = true;
+        value_transferred = true;
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneJsonPathEqPredicatesAlloc(
+    alloc: Allocator,
+    values: []const types.RelationalRowsJsonPathEqPredicate,
+) ![]const types.RelationalRowsJsonPathEqPredicate {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(types.RelationalRowsJsonPathEqPredicate, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.path);
+            alloc.free(predicate.value_json);
+        }
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        const field = try alloc.dupe(u8, value.field);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        const path = try alloc.dupe(u8, value.path);
+        var path_transferred = false;
+        errdefer if (!path_transferred) alloc.free(path);
+        const value_json = try alloc.dupe(u8, value.value_json);
+        var value_transferred = false;
+        errdefer if (!value_transferred) alloc.free(value_json);
+        out[i] = .{
+            .field = field,
+            .path = path,
+            .value_json = value_json,
+        };
+        field_transferred = true;
+        path_transferred = true;
+        value_transferred = true;
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneJsonPathExistsPredicatesAlloc(
+    alloc: Allocator,
+    values: []const types.RelationalRowsJsonPathExistsPredicate,
+) ![]const types.RelationalRowsJsonPathExistsPredicate {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(types.RelationalRowsJsonPathExistsPredicate, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.path);
+        }
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        const field = try alloc.dupe(u8, value.field);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        const path = try alloc.dupe(u8, value.path);
+        var path_transferred = false;
+        errdefer if (!path_transferred) alloc.free(path);
+        out[i] = .{
+            .field = field,
+            .path = path,
+        };
+        field_transferred = true;
+        path_transferred = true;
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneTextPatternPredicatesAlloc(
+    alloc: Allocator,
+    values: []const types.RelationalRowsTextPatternPredicate,
+) ![]const types.RelationalRowsTextPatternPredicate {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(types.RelationalRowsTextPatternPredicate, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.pattern);
+        }
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        const field = try alloc.dupe(u8, value.field);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        const pattern = try alloc.dupe(u8, value.pattern);
+        var pattern_transferred = false;
+        errdefer if (!pattern_transferred) alloc.free(pattern);
+        out[i] = .{
+            .field = field,
+            .pattern = pattern,
+            .case_insensitive = value.case_insensitive,
+            .negated = value.negated,
+        };
+        field_transferred = true;
+        pattern_transferred = true;
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneAccessPredicateGroupWithPredicatesAlloc(
+    alloc: Allocator,
+    group: types.RelationalRowsAccessPredicateGroup,
+    predicates: []const schema_mod.RelationalCheck,
+) !types.RelationalRowsAccessPredicateGroup {
+    var out = types.RelationalRowsAccessPredicateGroup{};
+    errdefer freeAccessPredicateGroup(alloc, out);
+    out.predicates = try concatRelationalChecksAlloc(alloc, group.predicates, predicates);
+    out.array_any = try cloneArrayAnyPredicatesAlloc(alloc, group.array_any);
+    out.array_contains = try cloneArrayContainsPredicatesAlloc(alloc, group.array_contains);
+    out.array_eq = try cloneArrayEqPredicatesAlloc(alloc, group.array_eq);
+    out.in_predicates = try cloneInPredicatesAlloc(alloc, group.in_predicates);
+    out.json_contains = try cloneJsonContainsPredicatesAlloc(alloc, group.json_contains);
+    out.json_path_eq = try cloneJsonPathEqPredicatesAlloc(alloc, group.json_path_eq);
+    out.json_path_exists = try cloneJsonPathExistsPredicatesAlloc(alloc, group.json_path_exists);
+    out.text_patterns = try cloneTextPatternPredicatesAlloc(alloc, group.text_patterns);
+    return out;
+}
+
+fn cloneAccessPredicateGroupsAlloc(
+    alloc: Allocator,
+    groups: []const types.RelationalRowsAccessPredicateGroup,
+) ![]types.RelationalRowsAccessPredicateGroup {
+    if (groups.len == 0) return &.{};
+    const out = try alloc.alloc(types.RelationalRowsAccessPredicateGroup, groups.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeAccessPredicateGroups(alloc, out[0..initialized]);
+        alloc.free(out);
+    }
+    for (groups, 0..) |group, i| {
+        out[i] = try cloneAccessPredicateGroupWithPredicatesAlloc(alloc, group, &.{});
+        initialized += 1;
+    }
+    return out;
+}
+
+fn concatAccessPredicateGroupsAlloc(
+    alloc: Allocator,
+    base: []const types.RelationalRowsAccessPredicateGroup,
+    extra: []const types.RelationalRowsAccessPredicateGroup,
+) ![]types.RelationalRowsAccessPredicateGroup {
+    const out = try alloc.alloc(types.RelationalRowsAccessPredicateGroup, base.len + extra.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeAccessPredicateGroups(alloc, out[0..initialized]);
+        alloc.free(out);
+    }
+    for (base) |group| {
+        out[initialized] = try cloneAccessPredicateGroupWithPredicatesAlloc(alloc, group, &.{});
+        initialized += 1;
+    }
+    for (extra) |group| {
+        out[initialized] = try cloneAccessPredicateGroupWithPredicatesAlloc(alloc, group, &.{});
+        initialized += 1;
+    }
+    return out;
+}
+
+fn relationalCheckAsExpressionConditionAlloc(
+    alloc: Allocator,
+    predicate: schema_mod.RelationalCheck,
+) !types.RelationalRowsExpressionCondition {
+    const field = try alloc.dupe(u8, predicate.field);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    const lhs = types.RelationalRowsExpression{
+        .kind = .field,
+        .field = field,
+    };
+    field_transferred = true;
+    errdefer schema_mod.freeRelationalRowsExpression(alloc, lhs);
+    const rhs = if (predicate.value_json) |value_json| blk: {
+        const values = try alloc.alloc(types.RelationalRowsExpression, 1);
+        errdefer alloc.free(values);
+        values[0] = .{
+            .kind = .value,
+            .value_json = try alloc.dupe(u8, value_json),
+        };
+        break :blk values;
+    } else &.{};
+    var rhs_transferred = false;
+    errdefer if (!rhs_transferred) {
+        for (rhs) |expression| schema_mod.freeRelationalRowsExpression(alloc, expression);
+        if (rhs.len > 0) alloc.free(rhs);
+    };
+    rhs_transferred = true;
+    return .{
+        .lhs = lhs,
+        .op = predicate.op,
+        .rhs = rhs,
+    };
+}
+
+fn cloneExpressionConditionsConcatAlloc(
+    alloc: Allocator,
+    checks: []const schema_mod.RelationalCheck,
+    expressions: []const types.RelationalRowsExpressionCondition,
+) ![]types.RelationalRowsExpressionCondition {
+    const out = try alloc.alloc(types.RelationalRowsExpressionCondition, checks.len + expressions.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeExpressionConditions(alloc, out[0..initialized]);
+        alloc.free(out);
+    }
+    for (checks) |check| {
+        out[initialized] = try relationalCheckAsExpressionConditionAlloc(alloc, check);
+        initialized += 1;
+    }
+    for (expressions) |condition| {
+        out[initialized] = try schema_mod.cloneRelationalRowsExpressionConditionAlloc(alloc, condition);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneExpressionPredicateGroupsAlloc(
+    alloc: Allocator,
+    groups: []const types.RelationalRowsExpressionPredicateGroup,
+) ![]types.RelationalRowsExpressionPredicateGroup {
+    const out = try alloc.alloc(types.RelationalRowsExpressionPredicateGroup, groups.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeExpressionPredicateGroups(alloc, out[0..initialized]);
+        alloc.free(out);
+    }
+    for (groups) |group| {
+        out[initialized] = .{
+            .conditions = try cloneExpressionConditionsConcatAlloc(alloc, &.{}, group.conditions),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn concatExpressionPredicateGroupsAlloc(
+    alloc: Allocator,
+    base: []const types.RelationalRowsExpressionPredicateGroup,
+    extra: []const types.RelationalRowsExpressionPredicateGroup,
+) ![]types.RelationalRowsExpressionPredicateGroup {
+    const out = try alloc.alloc(types.RelationalRowsExpressionPredicateGroup, base.len + extra.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeExpressionPredicateGroups(alloc, out[0..initialized]);
+        alloc.free(out);
+    }
+    for (base) |group| {
+        out[initialized] = .{
+            .conditions = try cloneExpressionConditionsConcatAlloc(alloc, &.{}, group.conditions),
+        };
+        initialized += 1;
+    }
+    for (extra) |group| {
+        out[initialized] = .{
+            .conditions = try cloneExpressionConditionsConcatAlloc(alloc, &.{}, group.conditions),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn materializedSubqueryCorrelationOrExpressionGroupsAlloc(
+    alloc: Allocator,
+    outer_row: std.json.Value,
+    groups: []const types.RelationalRowsSubqueryCorrelationGroup,
+) ![]types.RelationalRowsExpressionPredicateGroup {
+    var out = std.ArrayListUnmanaged(types.RelationalRowsExpressionPredicateGroup).empty;
+    errdefer {
+        freeExpressionPredicateGroups(alloc, out.items);
+        out.deinit(alloc);
+    }
+    for (groups) |group| {
+        var correlated_predicates: []schema_mod.RelationalCheck = &.{};
+        defer {
+            freeRelationalChecks(alloc, correlated_predicates);
+            if (correlated_predicates.len > 0) alloc.free(correlated_predicates);
+        }
+        if (group.correlations.len != 0) {
+            correlated_predicates = try lateralCorrelationPredicatesAlloc(alloc, outer_row, group.correlations);
+            if (correlated_predicates.len != group.correlations.len) continue;
+        }
+        const checks = try concatRelationalChecksAlloc(alloc, group.predicates, correlated_predicates);
+        defer {
+            freeRelationalChecks(alloc, checks);
+            if (checks.len > 0) alloc.free(checks);
+        }
+        const conditions = try cloneExpressionConditionsConcatAlloc(alloc, checks, group.expression_predicates);
+        var conditions_transferred = false;
+        errdefer if (!conditions_transferred) {
+            freeExpressionConditions(alloc, conditions);
+            if (conditions.len > 0) alloc.free(conditions);
+        };
+        try out.append(alloc, .{ .conditions = conditions });
+        conditions_transferred = true;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn materializedSubqueryCorrelationOrAccessGroupsAlloc(
+    alloc: Allocator,
+    outer_row: std.json.Value,
+    groups: []const types.RelationalRowsSubqueryCorrelationGroup,
+) ![]types.RelationalRowsAccessPredicateGroup {
+    var out = std.ArrayListUnmanaged(types.RelationalRowsAccessPredicateGroup).empty;
+    errdefer {
+        freeAccessPredicateGroups(alloc, out.items);
+        out.deinit(alloc);
+    }
+    for (groups) |group| {
+        var correlated_predicates: []schema_mod.RelationalCheck = &.{};
+        defer {
+            freeRelationalChecks(alloc, correlated_predicates);
+            if (correlated_predicates.len > 0) alloc.free(correlated_predicates);
+        }
+        if (group.correlations.len != 0) {
+            correlated_predicates = try lateralCorrelationPredicatesAlloc(alloc, outer_row, group.correlations);
+            if (correlated_predicates.len != group.correlations.len) continue;
+        }
+        const checks = try concatRelationalChecksAlloc(alloc, group.predicates, correlated_predicates);
+        defer {
+            freeRelationalChecks(alloc, checks);
+            if (checks.len > 0) alloc.free(checks);
+        }
+        const access_group = try cloneAccessPredicateGroupWithPredicatesAlloc(alloc, group.access_predicates, checks);
+        var access_group_transferred = false;
+        errdefer if (!access_group_transferred) freeAccessPredicateGroup(alloc, access_group);
+        try out.append(alloc, access_group);
+        access_group_transferred = true;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn subqueryCorrelationGroupsContainAccessPayload(groups: []const types.RelationalRowsSubqueryCorrelationGroup) bool {
+    for (groups) |group| {
+        if (!accessPredicateGroupIsEmpty(group.access_predicates)) return true;
+    }
+    return false;
+}
+
+fn subqueryCorrelationGroupsContainExpressionPayload(groups: []const types.RelationalRowsSubqueryCorrelationGroup) bool {
+    for (groups) |group| {
+        if (group.expression_predicates.len != 0 or group.expression_array_contains.len != 0) return true;
+    }
+    return false;
+}
+
+fn subqueryCorrelationGroupsContainExpressionArrayPayload(groups: []const types.RelationalRowsSubqueryCorrelationGroup) bool {
+    for (groups) |group| {
+        if (group.expression_array_contains.len != 0) return true;
+    }
+    return false;
+}
+
+fn subqueryCorrelationGroupsContainNotPayload(groups: []const types.RelationalRowsSubqueryCorrelationGroup) bool {
+    for (groups) |group| {
+        if (group.not_predicates.len != 0 or
+            group.access_not_predicates.len != 0 or
+            group.expression_not_predicates.len != 0) return true;
+    }
+    return false;
+}
+
+fn subqueryCorrelationGroupsContainOrPayload(groups: []const types.RelationalRowsSubqueryCorrelationGroup) bool {
+    for (groups) |group| {
+        if (group.or_predicates.len != 0 or
+            group.access_or_predicates.len != 0 or
+            group.expression_or_predicates.len != 0) return true;
+    }
+    return false;
+}
+
+fn subqueryCorrelationGroupsContainSubqueryPayload(groups: []const types.RelationalRowsSubqueryCorrelationGroup) bool {
+    for (groups) |group| {
+        if (group.subquery_predicates.len != 0) return true;
+    }
+    return false;
 }
 
 fn freeRelationalChecks(alloc: Allocator, predicates: []const schema_mod.RelationalCheck) void {
@@ -7942,6 +8573,16 @@ pub fn validateMutationReturningTargetExpressions(
     for (expressions) |projection| try validateMutationReturningTargetExpression(runtime_schema, projection.expression);
 }
 
+fn validateMutationReturningTargetExpressionsWithScalarOutputs(
+    runtime_schema: schema_mod.TableSchema,
+    expressions: []const types.RelationalRowsExpressionProjection,
+    scalar_subqueries: []const types.RelationalRowsScalarSubqueryProjection,
+) !void {
+    for (expressions) |projection| {
+        try validateMutationReturningTargetExpressionWithScalarOutputs(runtime_schema, projection.expression, scalar_subqueries);
+    }
+}
+
 fn validateMutationReturningTargetExpressionCondition(
     runtime_schema: schema_mod.TableSchema,
     condition: types.RelationalRowsExpressionCondition,
@@ -7964,6 +8605,33 @@ fn validateMutationReturningTargetExpression(
         try validateMutationReturningTargetExpression(runtime_schema, branch.then);
     }
     for (expression.case_else) |case_else| try validateMutationReturningTargetExpression(runtime_schema, case_else);
+}
+
+fn validateMutationReturningTargetExpressionConditionWithScalarOutputs(
+    runtime_schema: schema_mod.TableSchema,
+    condition: types.RelationalRowsExpressionCondition,
+    scalar_subqueries: []const types.RelationalRowsScalarSubqueryProjection,
+) anyerror!void {
+    try validateMutationReturningTargetExpressionWithScalarOutputs(runtime_schema, condition.lhs, scalar_subqueries);
+    for (condition.rhs) |rhs| try validateMutationReturningTargetExpressionWithScalarOutputs(runtime_schema, rhs, scalar_subqueries);
+}
+
+fn validateMutationReturningTargetExpressionWithScalarOutputs(
+    runtime_schema: schema_mod.TableSchema,
+    expression: types.RelationalRowsExpression,
+    scalar_subqueries: []const types.RelationalRowsScalarSubqueryProjection,
+) anyerror!void {
+    if (expression.kind == .field) {
+        if (expression.field_source == .source or expression.field_source == .proposed) return error.InvalidQueryRequest;
+        if (findColumn(runtime_schema.relational_columns, expression.field) == null and
+            !hiddenScalarSubqueryOutputCoversField(scalar_subqueries, expression.field)) return error.InvalidQueryRequest;
+    }
+    for (expression.operands) |operand| try validateMutationReturningTargetExpressionWithScalarOutputs(runtime_schema, operand, scalar_subqueries);
+    for (expression.case_branches) |branch| {
+        try validateMutationReturningTargetExpressionConditionWithScalarOutputs(runtime_schema, branch.when, scalar_subqueries);
+        try validateMutationReturningTargetExpressionWithScalarOutputs(runtime_schema, branch.then, scalar_subqueries);
+    }
+    for (expression.case_else) |case_else| try validateMutationReturningTargetExpressionWithScalarOutputs(runtime_schema, case_else, scalar_subqueries);
 }
 
 pub fn validateJoinedMutationReturningExpressions(
@@ -8204,7 +8872,7 @@ pub fn validateInsertSourceRequestWithSchemas(
         }
         try validateInsertSourceExpression(source_schema, req.source, assignment.expression);
     }
-    if (req.on_conflict) |conflict| try validateOnConflict(target_schema, conflict);
+    if (req.on_conflict) |conflict| try validateOnConflictForInsertSource(target_schema, source_schema, req.source, conflict);
     try validateMutationReturningRequestOutputs(target_schema, req.returning, req.returning_all, req.returning_expressions);
     try validateMutationReturningTargetExpressions(target_schema, req.returning_expressions);
 }
@@ -8263,8 +8931,10 @@ fn insertSourceQueryOutputFieldExists(
     return false;
 }
 
-fn validateOnConflict(
-    runtime_schema: schema_mod.TableSchema,
+fn validateOnConflictForInsertSource(
+    target_schema: schema_mod.TableSchema,
+    source_schema: schema_mod.TableSchema,
+    source_query: types.RelationalRowsQueryRequest,
     conflict: types.RelationalRowsOnConflict,
 ) anyerror!void {
     switch (conflict.target.kind) {
@@ -8280,10 +8950,10 @@ fn validateOnConflict(
         },
         .unique => {
             if (conflict.target.unique_name.len == 0) return error.InvalidQueryRequest;
-            const constraint = findUniqueConstraintByName(runtime_schema.unique_constraints, conflict.target.unique_name) orelse return error.InvalidQueryRequest;
+            const constraint = findUniqueConstraintByName(target_schema.unique_constraints, conflict.target.unique_name) orelse return error.InvalidQueryRequest;
             if (constraint.validation_state != .enforced) return error.InvalidQueryRequest;
             try validateConflictTargetPredicates(conflict.target.unique_predicates, constraint);
-            try validateConflictTargetExpressionPredicates(runtime_schema, conflict.target.unique_predicate_expressions, constraint);
+            try validateConflictTargetExpressionPredicates(target_schema, conflict.target.unique_predicate_expressions, constraint);
         },
     }
     switch (conflict.action) {
@@ -8301,49 +8971,60 @@ fn validateOnConflict(
             if (conflict.target.kind == .any) return error.InvalidQueryRequest;
             if (conflict.operations.len == 0 and conflict.patch_expressions.len == 0 and conflict.increment_expressions.len == 0 and conflict.json_set_expressions.len == 0) return error.InvalidQueryRequest;
             try validateMutationUpdateTargetPaths(conflict.operations, conflict.patch_expressions, conflict.increment_expressions, conflict.json_set_expressions, &.{});
-            for (conflict.patch_expressions) |assignment| try validateConflictExpression(runtime_schema, assignment.expression);
-            for (conflict.increment_expressions) |assignment| try validateConflictExpression(runtime_schema, assignment.expression);
-            for (conflict.json_set_expressions) |assignment| try validateConflictExpression(runtime_schema, assignment.expression);
-            if (conflict.where_expression) |condition| try validateConflictExpressionCondition(runtime_schema, condition);
-            for (conflict.where_expressions) |condition| try validateConflictExpressionCondition(runtime_schema, condition);
-            try validateConflictExpressionPredicateGroups(runtime_schema, conflict.where_any);
-            try validateConflictExpressionPredicateGroups(runtime_schema, conflict.where_not);
+            for (conflict.patch_expressions) |assignment| try validateInsertSourceConflictExpression(target_schema, source_schema, source_query, assignment.expression);
+            for (conflict.increment_expressions) |assignment| try validateInsertSourceConflictExpression(target_schema, source_schema, source_query, assignment.expression);
+            for (conflict.json_set_expressions) |assignment| try validateInsertSourceConflictExpression(target_schema, source_schema, source_query, assignment.expression);
+            if (conflict.where_expression) |condition| try validateInsertSourceConflictExpressionCondition(target_schema, source_schema, source_query, condition);
+            for (conflict.where_expressions) |condition| try validateInsertSourceConflictExpressionCondition(target_schema, source_schema, source_query, condition);
+            try validateInsertSourceConflictExpressionPredicateGroups(target_schema, source_schema, source_query, conflict.where_any);
+            try validateInsertSourceConflictExpressionPredicateGroups(target_schema, source_schema, source_query, conflict.where_not);
         },
     }
 }
 
-fn validateConflictExpressionPredicateGroups(
-    runtime_schema: schema_mod.TableSchema,
+fn validateInsertSourceConflictExpressionPredicateGroups(
+    target_schema: schema_mod.TableSchema,
+    source_schema: schema_mod.TableSchema,
+    source_query: types.RelationalRowsQueryRequest,
     groups: []const types.RelationalRowsExpressionPredicateGroup,
 ) !void {
     for (groups) |group| {
         if (group.conditions.len == 0) return error.InvalidQueryRequest;
-        for (group.conditions) |condition| try validateConflictExpressionCondition(runtime_schema, condition);
+        for (group.conditions) |condition| try validateInsertSourceConflictExpressionCondition(target_schema, source_schema, source_query, condition);
     }
 }
 
-fn validateConflictExpression(
-    runtime_schema: schema_mod.TableSchema,
+fn validateInsertSourceConflictExpression(
+    target_schema: schema_mod.TableSchema,
+    source_schema: schema_mod.TableSchema,
+    source_query: types.RelationalRowsQueryRequest,
     expression: types.RelationalRowsExpression,
 ) anyerror!void {
     if (expression.kind == .field) {
-        if (expression.field_source != .existing and expression.field_source != .proposed) return error.InvalidQueryRequest;
-        _ = findColumn(runtime_schema.relational_columns, expression.field) orelse return error.InvalidQueryRequest;
+        switch (expression.field_source) {
+            .existing, .proposed => _ = findColumn(target_schema.relational_columns, expression.field) orelse return error.InvalidQueryRequest,
+            .source => {
+                if (findColumn(source_schema.relational_columns, expression.field) == null and !insertSourceQueryOutputFieldExists(source_query, expression.field)) return error.InvalidQueryRequest;
+            },
+            .row => return error.InvalidQueryRequest,
+        }
     }
-    for (expression.operands) |operand| try validateConflictExpression(runtime_schema, operand);
+    for (expression.operands) |operand| try validateInsertSourceConflictExpression(target_schema, source_schema, source_query, operand);
     for (expression.case_branches) |branch| {
-        try validateConflictExpressionCondition(runtime_schema, branch.when);
-        try validateConflictExpression(runtime_schema, branch.then);
+        try validateInsertSourceConflictExpressionCondition(target_schema, source_schema, source_query, branch.when);
+        try validateInsertSourceConflictExpression(target_schema, source_schema, source_query, branch.then);
     }
-    for (expression.case_else) |case_else| try validateConflictExpression(runtime_schema, case_else);
+    for (expression.case_else) |case_else| try validateInsertSourceConflictExpression(target_schema, source_schema, source_query, case_else);
 }
 
-fn validateConflictExpressionCondition(
-    runtime_schema: schema_mod.TableSchema,
+fn validateInsertSourceConflictExpressionCondition(
+    target_schema: schema_mod.TableSchema,
+    source_schema: schema_mod.TableSchema,
+    source_query: types.RelationalRowsQueryRequest,
     condition: types.RelationalRowsExpressionCondition,
 ) anyerror!void {
-    try validateConflictExpression(runtime_schema, condition.lhs);
-    for (condition.rhs) |rhs| try validateConflictExpression(runtime_schema, rhs);
+    try validateInsertSourceConflictExpression(target_schema, source_schema, source_query, condition.lhs);
+    for (condition.rhs) |rhs| try validateInsertSourceConflictExpression(target_schema, source_schema, source_query, rhs);
 }
 
 fn validateConflictTargetPredicates(
@@ -8728,6 +9409,54 @@ fn validateExpressionAgainstSchemaWithScalarOutputs(
         try validateExpressionAgainstSchemaWithScalarOutputs(runtime_schema, branch.then, scalar_subqueries);
     }
     for (expression.case_else) |fallback| try validateExpressionAgainstSchemaWithScalarOutputs(runtime_schema, fallback, scalar_subqueries);
+}
+
+fn validateMutationSourceExpressionAssignmentsAgainstSchema(
+    runtime_schema: schema_mod.TableSchema,
+    req: types.RelationalRowsMutationSourceRequest,
+) anyerror!void {
+    for (req.patch_expressions) |assignment| {
+        try validateMutationExpressionAgainstSchemaWithScalarOutputs(runtime_schema, assignment.expression, req.source.scalar_subqueries);
+    }
+    for (req.increment_expressions) |assignment| {
+        try validateMutationExpressionAgainstSchemaWithScalarOutputs(runtime_schema, assignment.expression, req.source.scalar_subqueries);
+    }
+    for (req.json_set_expressions) |assignment| {
+        try validateMutationExpressionAgainstSchemaWithScalarOutputs(runtime_schema, assignment.expression, req.source.scalar_subqueries);
+    }
+}
+
+fn validateMutationExpressionConditionAgainstSchemaWithScalarOutputs(
+    runtime_schema: schema_mod.TableSchema,
+    condition: types.RelationalRowsExpressionCondition,
+    scalar_subqueries: []const types.RelationalRowsScalarSubqueryProjection,
+) anyerror!void {
+    try validateMutationExpressionAgainstSchemaWithScalarOutputs(runtime_schema, condition.lhs, scalar_subqueries);
+    for (condition.rhs) |expression| {
+        try validateMutationExpressionAgainstSchemaWithScalarOutputs(runtime_schema, expression, scalar_subqueries);
+    }
+}
+
+fn validateMutationExpressionAgainstSchemaWithScalarOutputs(
+    runtime_schema: schema_mod.TableSchema,
+    expression: types.RelationalRowsExpression,
+    scalar_subqueries: []const types.RelationalRowsScalarSubqueryProjection,
+) anyerror!void {
+    if (expression.kind == .field) {
+        switch (expression.field_source) {
+            .row, .existing => {
+                if (!schemaCoversField(runtime_schema, expression.field) and
+                    !hiddenScalarSubqueryOutputCoversField(scalar_subqueries, expression.field)) return error.InvalidQueryRequest;
+            },
+            .source, .proposed => return error.InvalidQueryRequest,
+        }
+    }
+    for (expression.operands) |operand| try validateMutationExpressionAgainstSchemaWithScalarOutputs(runtime_schema, operand, scalar_subqueries);
+    for (expression.case_branches) |branch| {
+        try validateMutationExpressionConditionAgainstSchemaWithScalarOutputs(runtime_schema, branch.when, scalar_subqueries);
+        try validateMutationExpressionAgainstSchemaWithScalarOutputs(runtime_schema, branch.then, scalar_subqueries);
+    }
+    for (expression.case_else) |fallback| try validateMutationExpressionAgainstSchemaWithScalarOutputs(runtime_schema, fallback, scalar_subqueries);
 }
 
 fn hiddenScalarSubqueryOutputCoversField(
@@ -12306,6 +13035,114 @@ pub fn Impl(comptime DB: type) type {
             }
         }
 
+        fn mutationSourceExpressionAssignmentsNeedHiddenScalarOutputs(req: types.RelationalRowsMutationSourceRequest) bool {
+            if (req.source.scalar_subqueries.len == 0) return false;
+            for (req.patch_expressions) |assignment| {
+                if (expressionReferencesHiddenScalarOutput(assignment.expression, req.source.scalar_subqueries)) return true;
+            }
+            for (req.increment_expressions) |assignment| {
+                if (expressionReferencesHiddenScalarOutput(assignment.expression, req.source.scalar_subqueries)) return true;
+            }
+            for (req.json_set_expressions) |assignment| {
+                if (expressionReferencesHiddenScalarOutput(assignment.expression, req.source.scalar_subqueries)) return true;
+            }
+            return false;
+        }
+
+        fn mutationSourceReturningExpressionsNeedHiddenScalarOutputs(req: types.RelationalRowsMutationSourceRequest) bool {
+            if (req.source.scalar_subqueries.len == 0) return false;
+            for (req.returning_expressions) |projection| {
+                if (expressionReferencesHiddenScalarOutput(projection.expression, req.source.scalar_subqueries)) return true;
+            }
+            return false;
+        }
+
+        fn expressionReferencesScalarSubqueryOutput(
+            expression: types.RelationalRowsExpression,
+            projection: types.RelationalRowsScalarSubqueryProjection,
+        ) bool {
+            if (expression.kind == .field and projection.hidden and std.mem.eql(u8, expression.field, projection.output)) return true;
+            for (expression.operands) |operand| {
+                if (expressionReferencesScalarSubqueryOutput(operand, projection)) return true;
+            }
+            for (expression.case_branches) |branch| {
+                if (expressionConditionReferencesScalarSubqueryOutput(branch.when, projection)) return true;
+                if (expressionReferencesScalarSubqueryOutput(branch.then, projection)) return true;
+            }
+            for (expression.case_else) |fallback| {
+                if (expressionReferencesScalarSubqueryOutput(fallback, projection)) return true;
+            }
+            return false;
+        }
+
+        fn expressionConditionReferencesScalarSubqueryOutput(
+            condition: types.RelationalRowsExpressionCondition,
+            projection: types.RelationalRowsScalarSubqueryProjection,
+        ) bool {
+            if (expressionReferencesScalarSubqueryOutput(condition.lhs, projection)) return true;
+            for (condition.rhs) |expression| {
+                if (expressionReferencesScalarSubqueryOutput(expression, projection)) return true;
+            }
+            return false;
+        }
+
+        fn scalarSubqueryOutputReferencedByReturningExpressions(
+            projection: types.RelationalRowsScalarSubqueryProjection,
+            returning_expressions: []const types.RelationalRowsExpressionProjection,
+        ) bool {
+            for (returning_expressions) |returning_projection| {
+                if (expressionReferencesScalarSubqueryOutput(returning_projection.expression, projection)) return true;
+            }
+            return false;
+        }
+
+        fn rowJsonWithReturningHiddenScalarSubqueriesAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            row_json: []const u8,
+            req: types.RelationalRowsMutationSourceRequest,
+        ) ![]const u8 {
+            var scalar_subqueries = std.ArrayListUnmanaged(types.RelationalRowsScalarSubqueryProjection).empty;
+            defer scalar_subqueries.deinit(alloc);
+            for (req.source.scalar_subqueries) |projection| {
+                if (scalarSubqueryOutputReferencedByReturningExpressions(projection, req.returning_expressions)) {
+                    try scalar_subqueries.append(alloc, projection);
+                }
+            }
+            if (scalar_subqueries.items.len == 0) return row_json;
+            return try @This().rowJsonWithHiddenScalarSubqueriesAlloc(self, alloc, runtime_schema, &.{}, row_json, scalar_subqueries.items);
+        }
+
+        fn expressionConditionReferencesHiddenScalarOutput(
+            condition: types.RelationalRowsExpressionCondition,
+            scalar_subqueries: []const types.RelationalRowsScalarSubqueryProjection,
+        ) bool {
+            if (expressionReferencesHiddenScalarOutput(condition.lhs, scalar_subqueries)) return true;
+            for (condition.rhs) |expression| {
+                if (expressionReferencesHiddenScalarOutput(expression, scalar_subqueries)) return true;
+            }
+            return false;
+        }
+
+        fn expressionReferencesHiddenScalarOutput(
+            expression: types.RelationalRowsExpression,
+            scalar_subqueries: []const types.RelationalRowsScalarSubqueryProjection,
+        ) bool {
+            if (expression.kind == .field and hiddenScalarSubqueryOutputCoversField(scalar_subqueries, expression.field)) return true;
+            for (expression.operands) |operand| {
+                if (expressionReferencesHiddenScalarOutput(operand, scalar_subqueries)) return true;
+            }
+            for (expression.case_branches) |branch| {
+                if (expressionConditionReferencesHiddenScalarOutput(branch.when, scalar_subqueries)) return true;
+                if (expressionReferencesHiddenScalarOutput(branch.then, scalar_subqueries)) return true;
+            }
+            for (expression.case_else) |fallback| {
+                if (expressionReferencesHiddenScalarOutput(fallback, scalar_subqueries)) return true;
+            }
+            return false;
+        }
+
         pub fn stagePlannedRelationalRowsMutationSourceAlloc(
             self: *DB,
             alloc: Allocator,
@@ -12421,7 +13258,12 @@ pub fn Impl(comptime DB: type) type {
 
                 switch (req.kind) {
                     .update => {
-                        const operations = try relationalRowsMutationSourceOperationsAlloc(alloc, runtime_schema, row.json, req);
+                        const expression_row_json = if (@This().mutationSourceExpressionAssignmentsNeedHiddenScalarOutputs(req))
+                            try @This().rowJsonWithHiddenScalarSubqueriesAlloc(self, alloc, runtime_schema, &.{}, row.json, req.source.scalar_subqueries)
+                        else
+                            row.json;
+                        defer if (expression_row_json.ptr != row.json.ptr) alloc.free(@constCast(expression_row_json));
+                        const operations = try relationalRowsMutationSourceOperationsAlloc(alloc, runtime_schema, expression_row_json, req);
                         var operations_transferred = false;
                         errdefer if (!operations_transferred) relationalRowsFreeTransformOps(alloc, operations);
                         if (req.rewrite_identity) {
@@ -12449,7 +13291,12 @@ pub fn Impl(comptime DB: type) type {
                             new_key_transferred = true;
                             planned_transferred = true;
                             if (req.returning_all or req.returning.len > 0 or req.returning_expressions.len > 0) {
-                                const projected = try relationalRowsMutationReturningJsonAlloc(alloc, planned, req);
+                                const returning_row_json = if (@This().mutationSourceReturningExpressionsNeedHiddenScalarOutputs(req))
+                                    try @This().rowJsonWithReturningHiddenScalarSubqueriesAlloc(self, alloc, runtime_schema, planned, req)
+                                else
+                                    planned;
+                                defer if (returning_row_json.ptr != planned.ptr) alloc.free(@constCast(returning_row_json));
+                                const projected = try relationalRowsMutationReturningJsonAlloc(alloc, returning_row_json, req);
                                 var projected_transferred = false;
                                 errdefer if (!projected_transferred) alloc.free(projected);
                                 try returning_rows.append(alloc, projected);
@@ -12469,7 +13316,12 @@ pub fn Impl(comptime DB: type) type {
                                 .operations = operations,
                             })) orelse return error.InvalidQueryRequest;
                             defer alloc.free(planned);
-                            const projected = try relationalRowsMutationReturningJsonAlloc(alloc, planned, req);
+                            const returning_row_json = if (@This().mutationSourceReturningExpressionsNeedHiddenScalarOutputs(req))
+                                try @This().rowJsonWithReturningHiddenScalarSubqueriesAlloc(self, alloc, runtime_schema, planned, req)
+                            else
+                                planned;
+                            defer if (returning_row_json.ptr != planned.ptr) alloc.free(@constCast(returning_row_json));
+                            const projected = try relationalRowsMutationReturningJsonAlloc(alloc, returning_row_json, req);
                             var projected_transferred = false;
                             errdefer if (!projected_transferred) alloc.free(projected);
                             try returning_rows.append(alloc, projected);
@@ -12480,7 +13332,12 @@ pub fn Impl(comptime DB: type) type {
                     .delete => {
                         try deletes.append(alloc, row.doc_key);
                         if (req.returning_all or req.returning.len > 0 or req.returning_expressions.len > 0) {
-                            const projected = try relationalRowsMutationReturningJsonAlloc(alloc, row.json, req);
+                            const returning_row_json = if (@This().mutationSourceReturningExpressionsNeedHiddenScalarOutputs(req))
+                                try @This().rowJsonWithReturningHiddenScalarSubqueriesAlloc(self, alloc, runtime_schema, row.json, req)
+                            else
+                                row.json;
+                            defer if (returning_row_json.ptr != row.json.ptr) alloc.free(@constCast(returning_row_json));
+                            const projected = try relationalRowsMutationReturningJsonAlloc(alloc, returning_row_json, req);
                             var projected_transferred = false;
                             errdefer if (!projected_transferred) alloc.free(projected);
                             try returning_rows.append(alloc, projected);
@@ -14225,6 +15082,100 @@ pub fn Impl(comptime DB: type) type {
             return true;
         }
 
+        fn relationalRowsSubqueryCorrelationGroupPassesAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
+            outer_row: std.json.Value,
+            child_row_json: []const u8,
+            group: types.RelationalRowsSubqueryCorrelationGroup,
+            now_ns: u64,
+        ) !bool {
+            var child_row = std.json.parseFromSlice(std.json.Value, alloc, child_row_json, .{}) catch return error.InvalidQueryRequest;
+            defer child_row.deinit();
+            if (child_row.value != .object) return error.InvalidQueryRequest;
+
+            var correlated_predicates: []schema_mod.RelationalCheck = &.{};
+            defer {
+                freeRelationalChecks(alloc, correlated_predicates);
+                if (correlated_predicates.len > 0) alloc.free(correlated_predicates);
+            }
+            if (group.correlations.len != 0) {
+                correlated_predicates = try lateralCorrelationPredicatesAlloc(alloc, outer_row, group.correlations);
+                if (correlated_predicates.len != group.correlations.len) return false;
+            }
+            for (group.predicates) |predicate| {
+                if (!(try queryPredicatePassesWithColumns(alloc, child_row.value, predicate, runtime_schema.relational_columns))) return false;
+            }
+            if (!(try queryOrPredicateGroupsPassWithColumns(alloc, child_row.value, group.or_predicates, runtime_schema.relational_columns))) return false;
+            if (!(try queryNotPredicateGroupsPassWithColumns(alloc, child_row.value, group.not_predicates, runtime_schema.relational_columns))) return false;
+            for (correlated_predicates) |predicate| {
+                if (!(try queryPredicatePassesWithColumns(alloc, child_row.value, predicate, runtime_schema.relational_columns))) return false;
+            }
+            if (!accessPredicateGroupIsEmpty(group.access_predicates) and
+                !(try queryAccessPredicateGroupPassesWithColumns(alloc, child_row.value, group.access_predicates, runtime_schema.relational_columns))) return false;
+            if (!(try queryAccessOrPredicateGroupsPassWithColumns(alloc, child_row.value, group.access_or_predicates, runtime_schema.relational_columns))) return false;
+            if (!(try queryAccessNotPredicateGroupsPassWithColumns(alloc, child_row.value, group.access_not_predicates, runtime_schema.relational_columns))) return false;
+            for (group.expression_predicates) |condition| {
+                if (!(try expressionConditionMatchesWithColumns(alloc, child_row.value, condition, runtime_schema.relational_columns, now_ns))) return false;
+            }
+            if (!(try queryExpressionOrPredicateGroupsPassWithColumns(alloc, child_row.value, group.expression_or_predicates, runtime_schema.relational_columns, now_ns))) return false;
+            if (!(try queryExpressionNotPredicateGroupsPassWithColumns(alloc, child_row.value, group.expression_not_predicates, runtime_schema.relational_columns, now_ns))) return false;
+            for (group.expression_array_contains) |predicate| {
+                if (!(try queryExpressionArrayContainsPredicatePassesWithSourcesAndColumnSets(alloc, child_row.value, null, null, predicate, runtime_schema.relational_columns, runtime_schema.relational_columns, now_ns))) return false;
+            }
+            if (!(try @This().relationalRowsSubqueryPredicatesPassAlloc(self, alloc, runtime_schema, materialized_ctes, child_row_json, group.subquery_predicates, now_ns))) return false;
+            return true;
+        }
+
+        fn relationalRowsSubqueryCorrelationGroupsPassAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
+            outer_row: std.json.Value,
+            child_row_json: []const u8,
+            groups: []const types.RelationalRowsSubqueryCorrelationGroup,
+            now_ns: u64,
+        ) !bool {
+            if (groups.len == 0) return true;
+            for (groups) |group| {
+                if (try @This().relationalRowsSubqueryCorrelationGroupPassesAlloc(self, alloc, runtime_schema, materialized_ctes, outer_row, child_row_json, group, now_ns)) return true;
+            }
+            return false;
+        }
+
+        fn filterRelationalRowsSubqueryCorrelationGroupsAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
+            outer_row: std.json.Value,
+            result: types.RelationalRowsQueryResult,
+            groups: []const types.RelationalRowsSubqueryCorrelationGroup,
+            now_ns: u64,
+        ) !types.RelationalRowsQueryResult {
+            var rows = std.ArrayListUnmanaged([]const u8).empty;
+            errdefer {
+                for (rows.items) |row| alloc.free(@constCast(row));
+                rows.deinit(alloc);
+            }
+            for (result.rows) |row| {
+                if (!(try @This().relationalRowsSubqueryCorrelationGroupsPassAlloc(self, alloc, runtime_schema, materialized_ctes, outer_row, row, groups, now_ns))) continue;
+                const owned = try alloc.dupe(u8, row);
+                var owned_transferred = false;
+                errdefer if (!owned_transferred) alloc.free(owned);
+                try rows.append(alloc, owned);
+                owned_transferred = true;
+            }
+            const total: u32 = @intCast(rows.items.len);
+            return .{
+                .rows = try rows.toOwnedSlice(alloc),
+                .total = total,
+            };
+        }
+
         fn relationalRowsSubqueryPredicatePassesAlloc(
             self: *DB,
             alloc: Allocator,
@@ -14245,13 +15196,83 @@ pub fn Impl(comptime DB: type) type {
                 freeRelationalChecks(alloc, combined_predicates);
                 if (combined_predicates.len > 0) alloc.free(combined_predicates);
             }
-            const child_is_empty = if (predicate.correlations.len != 0) blk: {
+            var materialized_correlation_or_predicates: []types.RelationalRowsExpressionPredicateGroup = &.{};
+            defer {
+                freeExpressionPredicateGroups(alloc, materialized_correlation_or_predicates);
+                if (materialized_correlation_or_predicates.len > 0) alloc.free(materialized_correlation_or_predicates);
+            }
+            var combined_or_predicates: []types.RelationalRowsExpressionPredicateGroup = &.{};
+            defer {
+                freeExpressionPredicateGroups(alloc, combined_or_predicates);
+                if (combined_or_predicates.len > 0) alloc.free(combined_or_predicates);
+            }
+            var materialized_correlation_or_access_predicates: []types.RelationalRowsAccessPredicateGroup = &.{};
+            defer {
+                freeAccessPredicateGroups(alloc, materialized_correlation_or_access_predicates);
+                if (materialized_correlation_or_access_predicates.len > 0) alloc.free(materialized_correlation_or_access_predicates);
+            }
+            var combined_access_or_predicates: []types.RelationalRowsAccessPredicateGroup = &.{};
+            defer {
+                freeAccessPredicateGroups(alloc, combined_access_or_predicates);
+                if (combined_access_or_predicates.len > 0) alloc.free(combined_access_or_predicates);
+            }
+            var branch_filtered_result = types.RelationalRowsQueryResult{};
+            defer branch_filtered_result.deinit(alloc);
+            var child_is_empty = false;
+            if (predicate.correlations.len != 0) {
                 correlated_predicates = try lateralCorrelationPredicatesAlloc(alloc, outer_row, predicate.correlations);
-                if (correlated_predicates.len != predicate.correlations.len) break :blk true;
-                combined_predicates = try concatRelationalChecksAlloc(alloc, predicate.query.predicates, correlated_predicates);
-                local_query.predicates = combined_predicates;
-                break :blk false;
-            } else false;
+                if (correlated_predicates.len != predicate.correlations.len) {
+                    child_is_empty = true;
+                } else {
+                    combined_predicates = try concatRelationalChecksAlloc(alloc, predicate.query.predicates, correlated_predicates);
+                    local_query.predicates = combined_predicates;
+                }
+            }
+            const contains_subquery_payload = subqueryCorrelationGroupsContainSubqueryPayload(predicate.correlation_or_predicates);
+            var needs_branch_filtering = contains_subquery_payload;
+            if (!child_is_empty and predicate.correlation_or_predicates.len != 0) {
+                const contains_access_payload = subqueryCorrelationGroupsContainAccessPayload(predicate.correlation_or_predicates);
+                const contains_expression_payload = subqueryCorrelationGroupsContainExpressionPayload(predicate.correlation_or_predicates);
+                const contains_expression_array_payload = subqueryCorrelationGroupsContainExpressionArrayPayload(predicate.correlation_or_predicates);
+                const contains_not_payload = subqueryCorrelationGroupsContainNotPayload(predicate.correlation_or_predicates);
+                const contains_or_payload = subqueryCorrelationGroupsContainOrPayload(predicate.correlation_or_predicates);
+                needs_branch_filtering = needs_branch_filtering or contains_or_payload or contains_not_payload or contains_expression_array_payload or (contains_access_payload and contains_expression_payload);
+                if (needs_branch_filtering) {
+                    if (predicate.query.limit != null or
+                        predicate.query.offset != 0 or
+                        predicate.query.distinct_on.len != 0 or
+                        predicate.query.distinct_on_expressions.len != 0) return error.InvalidQueryRequest;
+                    local_query.select_all = true;
+                    local_query.select = &.{};
+                } else if (contains_access_payload) {
+                    if (predicate.query.expression_or_predicates.len != 0) return error.InvalidQueryRequest;
+                    materialized_correlation_or_access_predicates = try materializedSubqueryCorrelationOrAccessGroupsAlloc(alloc, outer_row, predicate.correlation_or_predicates);
+                    if (materialized_correlation_or_access_predicates.len == 0 and predicate.query.access_or_predicates.len == 0) {
+                        child_is_empty = true;
+                    } else if (predicate.query.access_or_predicates.len == 0) {
+                        local_query.access_or_predicates = materialized_correlation_or_access_predicates;
+                    } else if (materialized_correlation_or_access_predicates.len == 0) {
+                        combined_access_or_predicates = try cloneAccessPredicateGroupsAlloc(alloc, predicate.query.access_or_predicates);
+                        local_query.access_or_predicates = combined_access_or_predicates;
+                    } else {
+                        combined_access_or_predicates = try concatAccessPredicateGroupsAlloc(alloc, predicate.query.access_or_predicates, materialized_correlation_or_access_predicates);
+                        local_query.access_or_predicates = combined_access_or_predicates;
+                    }
+                } else {
+                    materialized_correlation_or_predicates = try materializedSubqueryCorrelationOrExpressionGroupsAlloc(alloc, outer_row, predicate.correlation_or_predicates);
+                    if (materialized_correlation_or_predicates.len == 0 and predicate.query.expression_or_predicates.len == 0) {
+                        child_is_empty = true;
+                    } else if (predicate.query.expression_or_predicates.len == 0) {
+                        local_query.expression_or_predicates = materialized_correlation_or_predicates;
+                    } else if (materialized_correlation_or_predicates.len == 0) {
+                        combined_or_predicates = try cloneExpressionPredicateGroupsAlloc(alloc, predicate.query.expression_or_predicates);
+                        local_query.expression_or_predicates = combined_or_predicates;
+                    } else {
+                        combined_or_predicates = try concatExpressionPredicateGroupsAlloc(alloc, predicate.query.expression_or_predicates, materialized_correlation_or_predicates);
+                        local_query.expression_or_predicates = combined_or_predicates;
+                    }
+                }
+            }
 
             var empty_result = types.RelationalRowsQueryResult{};
             var queried_result = if (child_is_empty)
@@ -14259,7 +15280,19 @@ pub fn Impl(comptime DB: type) type {
             else
                 try @This().queryRelationalRowsWithMaterializedCtesAlloc(self, alloc, runtime_schema, materialized_ctes, local_query);
             defer queried_result.deinit(alloc);
-            const result = if (child_is_empty) &empty_result else &queried_result;
+            if (!child_is_empty and needs_branch_filtering) {
+                branch_filtered_result = try @This().filterRelationalRowsSubqueryCorrelationGroupsAlloc(
+                    self,
+                    alloc,
+                    runtime_schema,
+                    materialized_ctes,
+                    outer_row,
+                    queried_result,
+                    predicate.correlation_or_predicates,
+                    now_ns,
+                );
+            }
+            const result = if (child_is_empty) &empty_result else if (needs_branch_filtering) &branch_filtered_result else &queried_result;
 
             switch (predicate.kind) {
                 .exists => return if (predicate.negated) result.rows.len == 0 else result.rows.len != 0,
@@ -23478,7 +24511,7 @@ test "relational rows subquery predicates use sql null and empty-set semantics" 
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"pattern":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"pattern":{"type":"keyword"},"scope":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -23488,9 +24521,9 @@ test "relational rows subquery predicates use sql null and empty-set semantics" 
 
     try db.batch(.{
         .writes = &.{
-            .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"open\",\"pattern\":\"OP%\",\"rank\":1}" },
-            .{ .key = "row:b", .value = "{\"id\":\"b\",\"status\":null,\"pattern\":null,\"rank\":2}" },
-            .{ .key = "row:c", .value = "{\"id\":\"c\",\"status\":\"closed\",\"pattern\":\"cl%\",\"rank\":3}" },
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"open\",\"pattern\":\"OP%\",\"scope\":\"read write\",\"rank\":1}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"status\":null,\"pattern\":null,\"scope\":\"write\",\"rank\":2}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"status\":\"closed\",\"pattern\":\"cl%\",\"scope\":\"archive\",\"rank\":3}" },
         },
         .sync_level = .write,
     });
@@ -23529,6 +24562,108 @@ test "relational rows subquery predicates use sql null and empty-set semantics" 
         .op = .eq,
         .value_json = "99",
     }};
+    const lower_status_is_open_rhs = [_]types.RelationalRowsExpression{.{
+        .kind = .value,
+        .value_json = "\"open\"",
+    }};
+    const lower_status_operands = [_]types.RelationalRowsExpression{.{
+        .kind = .field,
+        .field = "status",
+    }};
+    const lower_status_is_open = [_]types.RelationalRowsExpressionCondition{.{
+        .lhs = .{
+            .kind = .lower,
+            .operands = lower_status_operands[0..],
+        },
+        .op = .eq,
+        .rhs = lower_status_is_open_rhs[0..],
+    }};
+    const status_in_open = [_]types.RelationalRowsInPredicate{.{
+        .field = "status",
+        .values_json = "[\"open\"]",
+    }};
+    const status_is_closed = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "status",
+        .op = .eq,
+        .value_json = "\"closed\"",
+    }};
+    const status_closed_not_group = [_]types.RelationalRowsPredicateGroup{.{
+        .predicates = status_is_closed[0..],
+    }};
+    const status_in_archived = [_]types.RelationalRowsInPredicate{.{
+        .field = "status",
+        .values_json = "[\"archived\"]",
+    }};
+    const status_archived_not_group = [_]types.RelationalRowsAccessPredicateGroup{.{
+        .in_predicates = status_in_archived[0..],
+    }};
+    const lower_status_is_blocked_rhs = [_]types.RelationalRowsExpression{.{
+        .kind = .value,
+        .value_json = "\"blocked\"",
+    }};
+    const lower_status_is_blocked = [_]types.RelationalRowsExpressionCondition{.{
+        .lhs = .{
+            .kind = .lower,
+            .operands = lower_status_operands[0..],
+        },
+        .op = .eq,
+        .rhs = lower_status_is_blocked_rhs[0..],
+    }};
+    const lower_status_blocked_not_group = [_]types.RelationalRowsExpressionPredicateGroup{.{
+        .conditions = lower_status_is_blocked[0..],
+    }};
+    const status_is_open = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "status",
+        .op = .eq,
+        .value_json = "\"open\"",
+    }};
+    const status_is_pending = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "status",
+        .op = .eq,
+        .value_json = "\"pending\"",
+    }};
+    const status_open_or_pending = [_]types.RelationalRowsPredicateGroup{
+        .{ .predicates = status_is_open[0..] },
+        .{ .predicates = status_is_pending[0..] },
+    };
+    const status_in_pending = [_]types.RelationalRowsInPredicate{.{
+        .field = "status",
+        .values_json = "[\"pending\"]",
+    }};
+    const status_open_or_pending_access = [_]types.RelationalRowsAccessPredicateGroup{
+        .{ .in_predicates = status_in_open[0..] },
+        .{ .in_predicates = status_in_pending[0..] },
+    };
+    const lower_status_is_pending_rhs = [_]types.RelationalRowsExpression{.{
+        .kind = .value,
+        .value_json = "\"pending\"",
+    }};
+    const lower_status_is_pending = [_]types.RelationalRowsExpressionCondition{.{
+        .lhs = .{
+            .kind = .lower,
+            .operands = lower_status_operands[0..],
+        },
+        .op = .eq,
+        .rhs = lower_status_is_pending_rhs[0..],
+    }};
+    const lower_status_open_or_pending = [_]types.RelationalRowsExpressionPredicateGroup{
+        .{ .conditions = lower_status_is_open[0..] },
+        .{ .conditions = lower_status_is_pending[0..] },
+    };
+    const scope_array_expression_operands = [_]types.RelationalRowsExpression{
+        .{ .kind = .field, .field = "scope" },
+        .{ .kind = .value, .value_json = "\" \"" },
+    };
+    const scope_contains_read = [_]types.RelationalRowsExpressionArrayContainsPredicate{.{
+        .expression = .{
+            .kind = .string_to_array,
+            .operands = scope_array_expression_operands[0..],
+        },
+        .value_json = "[\"read\"]",
+    }};
 
     const in_closed = [_]types.RelationalRowsSubqueryPredicate{.{
         .kind = .in,
@@ -23554,6 +24689,11 @@ test "relational rows subquery predicates use sql null and empty-set semantics" 
         .left_field = "status",
         .right_field = "status",
     }};
+    const greater_rank_correlation = [_]types.RelationalRowsLateralCorrelation{.{
+        .left_field = "rank",
+        .right_field = "rank",
+        .op = .gt,
+    }};
     const correlated_exists = [_]types.RelationalRowsSubqueryPredicate{.{
         .kind = .exists,
         .query = .{},
@@ -23569,6 +24709,210 @@ test "relational rows subquery predicates use sql null and empty-set semantics" 
     try std.testing.expectEqual(@as(u32, 2), correlated_exists_result.total);
     try std.testing.expectEqualStrings("{\"id\":\"a\"}", correlated_exists_result.rows[0]);
     try std.testing.expectEqualStrings("{\"id\":\"c\"}", correlated_exists_result.rows[1]);
+
+    const correlated_greater_exists = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .exists,
+        .query = .{},
+        .correlations = greater_rank_correlation[0..],
+    }};
+    var correlated_greater_exists_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = correlated_greater_exists[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer correlated_greater_exists_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), correlated_greater_exists_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", correlated_greater_exists_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", correlated_greater_exists_result.rows[1]);
+
+    const correlated_greater_or_missing_status = [_]types.RelationalRowsSubqueryCorrelationGroup{
+        .{ .correlations = greater_rank_correlation[0..] },
+        .{ .expression_predicates = lower_status_is_open[0..] },
+    };
+    const correlated_greater_or_missing_exists = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .exists,
+        .query = .{},
+        .correlation_or_predicates = correlated_greater_or_missing_status[0..],
+    }};
+    var correlated_greater_or_missing_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = correlated_greater_or_missing_exists[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer correlated_greater_or_missing_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), correlated_greater_or_missing_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", correlated_greater_or_missing_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", correlated_greater_or_missing_result.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", correlated_greater_or_missing_result.rows[2]);
+
+    const correlated_greater_or_open_status_access = [_]types.RelationalRowsSubqueryCorrelationGroup{
+        .{ .correlations = greater_rank_correlation[0..] },
+        .{ .access_predicates = .{ .in_predicates = status_in_open[0..] } },
+    };
+    const correlated_greater_or_open_status_access_exists = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .exists,
+        .query = .{},
+        .correlation_or_predicates = correlated_greater_or_open_status_access[0..],
+    }};
+    var correlated_greater_or_open_status_access_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = correlated_greater_or_open_status_access_exists[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer correlated_greater_or_open_status_access_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), correlated_greater_or_open_status_access_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", correlated_greater_or_open_status_access_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", correlated_greater_or_open_status_access_result.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", correlated_greater_or_open_status_access_result.rows[2]);
+
+    const correlated_greater_or_open_status_mixed = [_]types.RelationalRowsSubqueryCorrelationGroup{
+        .{ .correlations = greater_rank_correlation[0..] },
+        .{
+            .access_predicates = .{ .in_predicates = status_in_open[0..] },
+            .expression_predicates = lower_status_is_open[0..],
+        },
+    };
+    const correlated_greater_or_open_status_mixed_exists = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .exists,
+        .query = .{},
+        .correlation_or_predicates = correlated_greater_or_open_status_mixed[0..],
+    }};
+    var correlated_greater_or_open_status_mixed_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = correlated_greater_or_open_status_mixed_exists[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer correlated_greater_or_open_status_mixed_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), correlated_greater_or_open_status_mixed_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", correlated_greater_or_open_status_mixed_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", correlated_greater_or_open_status_mixed_result.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", correlated_greater_or_open_status_mixed_result.rows[2]);
+
+    const correlated_greater_or_scope_array = [_]types.RelationalRowsSubqueryCorrelationGroup{
+        .{ .correlations = greater_rank_correlation[0..] },
+        .{ .expression_array_contains = scope_contains_read[0..] },
+    };
+    const correlated_greater_or_scope_array_exists = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .exists,
+        .query = .{},
+        .correlation_or_predicates = correlated_greater_or_scope_array[0..],
+    }};
+    var correlated_greater_or_scope_array_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = correlated_greater_or_scope_array_exists[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer correlated_greater_or_scope_array_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), correlated_greater_or_scope_array_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", correlated_greater_or_scope_array_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", correlated_greater_or_scope_array_result.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", correlated_greater_or_scope_array_result.rows[2]);
+
+    const correlated_greater_or_not_payloads = [_]types.RelationalRowsSubqueryCorrelationGroup{
+        .{ .correlations = greater_rank_correlation[0..] },
+        .{
+            .not_predicates = status_closed_not_group[0..],
+            .access_not_predicates = status_archived_not_group[0..],
+            .expression_not_predicates = lower_status_blocked_not_group[0..],
+        },
+    };
+    const correlated_greater_or_not_payloads_exists = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .exists,
+        .query = .{},
+        .correlation_or_predicates = correlated_greater_or_not_payloads[0..],
+    }};
+    var correlated_greater_or_not_payloads_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = correlated_greater_or_not_payloads_exists[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer correlated_greater_or_not_payloads_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), correlated_greater_or_not_payloads_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", correlated_greater_or_not_payloads_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", correlated_greater_or_not_payloads_result.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", correlated_greater_or_not_payloads_result.rows[2]);
+
+    const correlated_greater_or_nested_or_payloads = [_]types.RelationalRowsSubqueryCorrelationGroup{
+        .{ .correlations = greater_rank_correlation[0..] },
+        .{
+            .or_predicates = status_open_or_pending[0..],
+            .access_or_predicates = status_open_or_pending_access[0..],
+            .expression_or_predicates = lower_status_open_or_pending[0..],
+        },
+    };
+    const correlated_greater_or_nested_or_payloads_exists = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .exists,
+        .query = .{},
+        .correlation_or_predicates = correlated_greater_or_nested_or_payloads[0..],
+    }};
+    var correlated_greater_or_nested_or_payloads_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = correlated_greater_or_nested_or_payloads_exists[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer correlated_greater_or_nested_or_payloads_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), correlated_greater_or_nested_or_payloads_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", correlated_greater_or_nested_or_payloads_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", correlated_greater_or_nested_or_payloads_result.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", correlated_greater_or_nested_or_payloads_result.rows[2]);
+
+    const status_in_rank_one_subquery = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .in,
+        .lhs = lhs_status,
+        .query = .{
+            .predicates = rank_is_one[0..],
+            .select = select_status[0..],
+            .select_all = false,
+        },
+        .output_field = "status",
+    }};
+    const correlated_greater_or_nested_status = [_]types.RelationalRowsSubqueryCorrelationGroup{
+        .{ .correlations = greater_rank_correlation[0..] },
+        .{ .subquery_predicates = status_in_rank_one_subquery[0..] },
+    };
+    const correlated_greater_or_nested_status_exists = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .exists,
+        .query = .{},
+        .correlation_or_predicates = correlated_greater_or_nested_status[0..],
+    }};
+    var correlated_greater_or_nested_status_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = correlated_greater_or_nested_status_exists[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer correlated_greater_or_nested_status_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), correlated_greater_or_nested_status_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", correlated_greater_or_nested_status_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", correlated_greater_or_nested_status_result.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", correlated_greater_or_nested_status_result.rows[2]);
+
+    const status_or_missing_rank = [_]types.RelationalRowsSubqueryCorrelationGroup{
+        .{ .correlations = status_correlation[0..] },
+        .{ .predicates = rank_is_missing[0..] },
+    };
+    const correlated_status_or_missing_rank_exists = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .exists,
+        .query = .{},
+        .correlation_or_predicates = status_or_missing_rank[0..],
+    }};
+    var correlated_status_or_missing_rank_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = correlated_status_or_missing_rank_exists[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer correlated_status_or_missing_rank_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), correlated_status_or_missing_rank_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", correlated_status_or_missing_rank_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", correlated_status_or_missing_rank_result.rows[1]);
 
     const filtered_correlated_exists = [_]types.RelationalRowsSubqueryPredicate{.{
         .kind = .exists,
@@ -24139,6 +25483,21 @@ test "relational rows scalar subquery projections enforce scalar cardinality" {
     try std.testing.expectEqual(@as(u32, 3), hidden_result.total);
     try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"open\",\"rank\":1,\"same_rank_id\":\"a\"}", hidden_result.rows[0]);
 
+    const hidden_id_order = [_]types.RelationalRowsQueryOrder{.{
+        .expression = .{ .kind = .coalesce, .operands = hidden_id_operands[0..] },
+        .direction = .desc,
+    }};
+    var hidden_order_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .select = select_id[0..],
+        .select_all = false,
+        .scalar_subqueries = hidden_projection[0..],
+        .order_by = hidden_id_order[0..],
+        .limit = 1,
+    });
+    defer hidden_order_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), hidden_order_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", hidden_order_result.rows[0]);
+
     const multi_projection = [_]types.RelationalRowsScalarSubqueryProjection{.{
         .output = "too_many_statuses",
         .query = .{
@@ -24151,6 +25510,138 @@ test "relational rows scalar subquery projections enforce scalar cardinality" {
         .select = select_id[0..],
         .select_all = false,
         .scalar_subqueries = multi_projection[0..],
+    }));
+}
+
+test "relational rows mutation source expressions use hidden scalar subquery outputs" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"},"metadata":{"type":"object","additionalProperties":true}},"required":["id","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"open\",\"rank\":1,\"metadata\":{}}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"status\":\"pending\",\"rank\":2,\"metadata\":{}}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"status\":\"closed\",\"rank\":3,\"metadata\":{}}" },
+        },
+        .sync_level = .write,
+    });
+
+    const select_status = [_][]const u8{"status"};
+    const target_a = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "id",
+        .op = .eq,
+        .value_json = "\"a\"",
+    }};
+    const rank_is_three = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "rank",
+        .op = .eq,
+        .value_json = "3",
+    }};
+    const hidden_status_projection = [_]types.RelationalRowsScalarSubqueryProjection{.{
+        .output = "__antfly_hidden_status",
+        .query = .{
+            .predicates = rank_is_three[0..],
+            .select = select_status[0..],
+            .select_all = false,
+        },
+        .output_field = "status",
+        .hidden = true,
+    }};
+    const hidden_status_operand = [_]types.RelationalRowsExpression{.{
+        .kind = .field,
+        .field = "__antfly_hidden_status",
+        .field_source = .existing,
+    }};
+    const patch_expressions = [_]types.RelationalRowsExpressionAssignment{.{
+        .field = "status",
+        .expression = .{ .kind = .coalesce, .operands = hidden_status_operand[0..] },
+    }};
+    const metadata_path = [_][]const u8{ "copy", "status" };
+    const json_set_expressions = [_]types.RelationalRowsJsonSetExpressionAssignment{.{
+        .field = "metadata",
+        .path = metadata_path[0..],
+        .expression = .{ .kind = .coalesce, .operands = hidden_status_operand[0..] },
+    }};
+    const returning = [_][]const u8{ "id", "status", "metadata" };
+    const returning_expressions = [_]types.RelationalRowsExpressionProjection{.{
+        .output = "copied_status",
+        .expression = .{
+            .kind = .field,
+            .field = "__antfly_hidden_status",
+        },
+    }};
+
+    const txn = try db.beginTransaction(2_000);
+    var mutation = try db.mutateRelationalRowsFromSource(alloc, runtime_schema, .{
+        .kind = .update,
+        .source = .{
+            .predicates = target_a[0..],
+            .scalar_subqueries = hidden_status_projection[0..],
+            .row_claim = .{
+                .mode = .for_update,
+                .owner_id = "session:hidden-scalar-assignment",
+                .txn_id = txn,
+            },
+        },
+        .patch_expressions = patch_expressions[0..],
+        .json_set_expressions = json_set_expressions[0..],
+        .returning = returning[0..],
+        .returning_expressions = returning_expressions[0..],
+    });
+    defer mutation.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), mutation.matched);
+    try std.testing.expectEqual(@as(u32, 1), mutation.staged);
+    try std.testing.expectEqual(@as(usize, 1), mutation.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"closed\",\"metadata\":{\"copy\":{\"status\":\"closed\"}},\"copied_status\":\"closed\"}", mutation.returning_rows[0]);
+
+    const target_b = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "id",
+        .op = .eq,
+        .value_json = "\"b\"",
+    }};
+    const multi_projection = [_]types.RelationalRowsScalarSubqueryProjection{.{
+        .output = "__antfly_hidden_status",
+        .query = .{
+            .select = select_status[0..],
+            .select_all = false,
+        },
+        .output_field = "status",
+        .hidden = true,
+    }};
+    const cardinality_txn = try db.beginTransaction(2_001);
+    try std.testing.expectError(error.InvalidQueryRequest, db.mutateRelationalRowsFromSource(alloc, runtime_schema, .{
+        .kind = .update,
+        .source = .{
+            .predicates = target_b[0..],
+            .scalar_subqueries = multi_projection[0..],
+            .row_claim = .{
+                .mode = .for_update,
+                .owner_id = "session:hidden-scalar-cardinality",
+                .txn_id = cardinality_txn,
+            },
+        },
+        .patch_expressions = patch_expressions[0..],
     }));
 }
 

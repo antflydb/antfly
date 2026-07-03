@@ -78,6 +78,10 @@ pub const InsertSourceParserHooks = struct {
     generated_insert_column_items: ?*const generated_parser.GeneratedSqlListAst = null,
     conflict_condition_options: ConflictAssignmentExpressionParserOptions,
     conflict_dispatch_options: ConflictExpressionDispatchOptions,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
     returning_hooks: expr_projection.ReturningProjectionParserOptions,
     parse_select: *const fn (
         *anyopaque,
@@ -242,6 +246,11 @@ pub const ConflictClauseParserOptions = struct {
     generated_assignments_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
     generated_action_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
     generated_action_kind: ?generated_parser.GeneratedSqlConflictActionKind = null,
+    scalar_subqueries: ?*std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection) = null,
+    fixed_binary_hooks: ?expr_row_parse.FixedBinaryRowExpressionParserOptions = null,
+    bare_boolean_hooks: ?expr_predicate.BareBooleanWhereExpressionParserOptions = null,
+    expression_alternatives_hooks: ?expr_where_condition.ExpressionWhereConditionAlternativesParserOptions = null,
+    expression_condition_hooks: ?expr_where_condition.ExpressionWhereConditionsParserOptions = null,
     condition_options: ConflictAssignmentExpressionParserOptions,
     dispatch_options: ConflictExpressionDispatchOptions,
 };
@@ -944,6 +953,18 @@ pub fn parseInsertSourceWithCtesAlloc(
 
     clearInsertSourceQueryProjection(alloc, &source.query);
 
+    var conflict_scalar_subqueries = std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection).empty;
+    var conflict_scalar_subqueries_transferred = false;
+    errdefer {
+        if (!conflict_scalar_subqueries_transferred) {
+            for (conflict_scalar_subqueries.items[source.query.scalar_subqueries.len..]) |projection| {
+                plan_mod.freeScalarSubqueryProjection(alloc, projection);
+            }
+        }
+        conflict_scalar_subqueries.deinit(alloc);
+    }
+    try conflict_scalar_subqueries.appendSlice(alloc, source.query.scalar_subqueries);
+
     var conflict: ?db_mod.types.RelationalRowsOnConflict = null;
     errdefer if (conflict) |value| freeRowsOnConflictValue(alloc, value);
     var conflict_where = false;
@@ -965,12 +986,27 @@ pub fn parseInsertSourceWithCtesAlloc(
             .generated_assignments_tokens = hooks.generated_conflict_assignments_tokens,
             .generated_action_tokens = hooks.generated_conflict_action_tokens,
             .generated_action_kind = hooks.generated_conflict_action_kind,
+            .scalar_subqueries = &conflict_scalar_subqueries,
+            .fixed_binary_hooks = hooks.fixed_binary_hooks,
+            .bare_boolean_hooks = hooks.bare_boolean_hooks,
+            .expression_alternatives_hooks = hooks.expression_alternatives_hooks,
+            .expression_condition_hooks = hooks.expression_condition_hooks,
             .condition_options = hooks.conflict_condition_options,
             .dispatch_options = hooks.conflict_dispatch_options,
         });
         defer freeConflictClause(alloc, parsed_conflict);
         if (parsed_conflict.where_expression != null or parsed_conflict.where_expressions.len != 0 or parsed_conflict.where_any.len != 0 or parsed_conflict.where_not.len != 0) conflict_where = true;
         conflict = try insertSourceOnConflictFromClauseAlloc(alloc, hooks.schema, parsed_conflict);
+    }
+    if (conflict_scalar_subqueries.items.len != source.query.scalar_subqueries.len) {
+        const combined_scalar_subqueries = try conflict_scalar_subqueries.toOwnedSlice(alloc);
+        conflict_scalar_subqueries_transferred = true;
+        if (source.query.scalar_subqueries.len > 0) alloc.free(source.query.scalar_subqueries);
+        source.query.scalar_subqueries = combined_scalar_subqueries;
+    } else {
+        conflict_scalar_subqueries.deinit(alloc);
+        conflict_scalar_subqueries = .empty;
+        conflict_scalar_subqueries_transferred = true;
     }
 
     var returning: ReturningProjection = .{};
@@ -4396,6 +4432,12 @@ fn parseGeneratedConflictUpdateSetAssignmentsAlloc(
     json_set: *std.ArrayListUnmanaged(JsonSetValue),
     array_update: *std.ArrayListUnmanaged(ArrayTransformValue),
     hooks: ConflictUpdateSetAssignmentParserOptions,
+    type_context: expr_type.RowExpressionTypeContext,
+    scalar_subqueries: ?*std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection),
+    fixed_binary_hooks: ?expr_row_parse.FixedBinaryRowExpressionParserOptions,
+    bare_boolean_hooks: ?expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: ?expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: ?expr_where_condition.ExpressionWhereConditionsParserOptions,
 ) !void {
     const first_tokens = items.first_tokens orelse return error.UnsupportedSqlShape;
     const last_tokens = items.last_tokens orelse return error.UnsupportedSqlShape;
@@ -4404,6 +4446,29 @@ fn parseGeneratedConflictUpdateSetAssignmentsAlloc(
     for (items.items, 0..) |assignment, index| {
         if (assignment.start >= assignment.end or assignment.end > tokens.len) return error.UnsupportedSqlShape;
         pos.* = assignment.start;
+        if (generatedDmlExpressionContainsSubquery(items.expressions[index])) {
+            const scalar_subquery_list = scalar_subqueries orelse return error.UnsupportedSqlShape;
+            if (try parseGeneratedInsertSourceConflictScalarSubqueryAssignmentAlloc(
+                alloc,
+                tokens,
+                assignment,
+                items.expressions[index],
+                schema,
+                params,
+                patch_expr,
+                scalar_subquery_list,
+                hooks.primary_key_assignment,
+                type_context,
+                hooks.value.realtime_ns,
+                fixed_binary_hooks orelse return error.UnsupportedSqlShape,
+                bare_boolean_hooks orelse return error.UnsupportedSqlShape,
+                expression_alternatives_hooks orelse return error.UnsupportedSqlShape,
+                expression_condition_hooks orelse return error.UnsupportedSqlShape,
+            )) {
+                pos.* = assignment.end;
+                continue;
+            }
+        }
         const use_generated_assignment_expression = try validateGeneratedDmlAssignmentExpressionMetadata(tokens, assignment, items.expressions[index]);
         var hooks_with_generated = hooks;
         hooks_with_generated.value.expression_options.assignment_options.generated_expression_ast = if (use_generated_assignment_expression) &items.expressions[index] else null;
@@ -4424,6 +4489,476 @@ fn parseGeneratedConflictUpdateSetAssignmentsAlloc(
             array_update,
             hooks_with_generated,
         );
+        if (pos.* != assignment.end) return error.UnsupportedSqlShape;
+    }
+}
+
+fn generatedDmlAssignmentComparisonRanges(
+    tokens: []const Token,
+    assignment_item: generated_parser.GeneratedSqlTokenRange,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !struct {
+    left: generated_parser.GeneratedSqlTokenRange,
+    right: generated_parser.GeneratedSqlTokenRange,
+    right_expression: *const generated_parser.GeneratedSqlExpressionAst,
+} {
+    if (expression.kind != .comparison) return error.UnsupportedSqlShape;
+    const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
+    if (operator_tokens.start >= tokens.len or
+        operator_tokens.end != operator_tokens.start + 1 or
+        tokens[operator_tokens.start].kind != .eq)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    const left_tokens = expression.left_tokens orelse return error.UnsupportedSqlShape;
+    const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
+    if (left_tokens.start != assignment_item.start or
+        left_tokens.end != operator_tokens.start or
+        right_tokens.start != operator_tokens.end or
+        right_tokens.end != assignment_item.end)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    const right_expression = expression.right_expression orelse return error.UnsupportedSqlShape;
+    if (!generatedDmlTokenRangeEql(right_expression.tokens orelse return error.UnsupportedSqlShape, right_tokens)) return error.UnsupportedSqlShape;
+    try generated_read_validate.validateGeneratedOptionalExpression(tokens, right_tokens, right_expression.*);
+    return .{
+        .left = left_tokens,
+        .right = right_tokens,
+        .right_expression = right_expression,
+    };
+}
+
+fn validateGeneratedScalarSubqueryAssignmentTargetExpression(
+    type_context: expr_type.RowExpressionTypeContext,
+    column: runtime_schema.RelationalColumn,
+    expression: db_mod.types.RelationalRowsExpression,
+) !void {
+    if (expr_type.sqlExpressionIsInterval(expression)) return error.UnsupportedSqlShape;
+    switch (column.field_type) {
+        .numeric => try type_context.validateNumericRowExpression(expression),
+        .datetime => try type_context.validateNumericOrDatetimeRowExpression(expression),
+        .boolean => try type_context.validateBooleanRowExpression(expression),
+        .keyword, .text, .link => try type_context.validateTextRowExpression(expression),
+        else => {},
+    }
+}
+
+fn appendGeneratedMutationSourceScalarSubqueryPatchExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    field: []const u8,
+    column: runtime_schema.RelationalColumn,
+    field_transferred: *bool,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+    expression_range: generated_parser.GeneratedSqlTokenRange,
+    patch_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
+    scalar_subqueries: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection),
+    options: MutationSourceParserOptions,
+) !void {
+    const type_context: expr_type.RowExpressionTypeContext = .{
+        .alloc = alloc,
+        .schema = schema,
+        .defer_row_expression_field_validation = options.defer_row_expression_field_validation,
+    };
+    const lowered = try lower_expr.parseGeneratedScalarSubqueryExpressionAlloc(
+        alloc,
+        tokens,
+        params,
+        schema,
+        type_context,
+        &.{},
+        expression,
+        expression_range,
+        scalar_subqueries,
+        options.realtime_ns,
+        options.fixed_binary_hooks,
+        options.bare_boolean_hooks,
+        options.expression_alternatives_hooks,
+        options.expression_condition_hooks,
+    );
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, lowered);
+    var synthetic_type_context = try lower_expr.generatedScalarSubqueryTypeContextAlloc(alloc, type_context, scalar_subqueries.items);
+    defer synthetic_type_context.deinit(alloc);
+    try validateGeneratedScalarSubqueryAssignmentTargetExpression(synthetic_type_context.context, column, lowered);
+
+    try patch_expr.append(alloc, .{
+        .field = field,
+        .expression = lowered,
+    });
+    field_transferred.* = true;
+    expression_transferred = true;
+}
+
+fn appendGeneratedInsertSourceConflictScalarSubqueryPatchExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    field: []const u8,
+    column: runtime_schema.RelationalColumn,
+    field_transferred: *bool,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+    expression_range: generated_parser.GeneratedSqlTokenRange,
+    patch_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
+    scalar_subqueries: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection),
+    type_context: expr_type.RowExpressionTypeContext,
+    realtime_ns: u64,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
+) !void {
+    const original_scalar_subquery_len = scalar_subqueries.items.len;
+    var lowered = try lower_expr.parseGeneratedScalarSubqueryExpressionAlloc(
+        alloc,
+        tokens,
+        params,
+        schema,
+        type_context,
+        &.{},
+        expression,
+        expression_range,
+        scalar_subqueries,
+        realtime_ns,
+        fixed_binary_hooks,
+        bare_boolean_hooks,
+        expression_alternatives_hooks,
+        expression_condition_hooks,
+    );
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, lowered);
+    plan_mod.rewriteExpressionFieldsToSource(&lowered);
+    var synthetic_source_type_context: ?lower_expr.GeneratedScalarSubqueryTypeContext = null;
+    defer if (synthetic_source_type_context) |*synthetic| synthetic.deinit(alloc);
+    var validation_type_context = type_context;
+    if (type_context.joined_source_schema) |source_schema| {
+        synthetic_source_type_context = try lower_expr.generatedScalarSubqueryTypeContextAlloc(
+            alloc,
+            .{
+                .alloc = type_context.alloc,
+                .schema = source_schema,
+                .joined_source_schema = null,
+                .defer_row_expression_field_validation = type_context.defer_row_expression_field_validation,
+            },
+            scalar_subqueries.items[original_scalar_subquery_len..],
+        );
+        validation_type_context.joined_source_schema = synthetic_source_type_context.?.context.schema;
+    }
+    try validateGeneratedScalarSubqueryAssignmentTargetExpression(validation_type_context, column, lowered);
+
+    try patch_expr.append(alloc, .{
+        .field = field,
+        .expression = lowered,
+    });
+    field_transferred.* = true;
+    expression_transferred = true;
+}
+
+fn parseGeneratedMutationSourceScalarSubqueryAssignmentAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    assignment_item: generated_parser.GeneratedSqlTokenRange,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    patch_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
+    scalar_subqueries: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection),
+    primary_key_assignment: PrimaryKeyAssignmentPolicy,
+    options: MutationSourceParserOptions,
+) !bool {
+    if (!generatedDmlExpressionContainsSubquery(expression)) return false;
+    const ranges = generatedDmlAssignmentComparisonRanges(tokens, assignment_item, expression) catch |err| switch (err) {
+        error.UnsupportedSqlShape => return false,
+        else => |other| return other,
+    };
+
+    var lhs_pos = ranges.left.start;
+    const field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens[0..ranges.left.end], &lhs_pos);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    if (lhs_pos != ranges.left.end) return false;
+    const column = binder.relationalColumnForField(schema, field, null) orelse return error.InvalidSqlCatalog;
+    try notePrimaryKeyAssignment(schema, field, primary_key_assignment);
+
+    try appendGeneratedMutationSourceScalarSubqueryPatchExpressionAlloc(
+        alloc,
+        tokens,
+        schema,
+        params,
+        field,
+        column,
+        &field_transferred,
+        ranges.right_expression,
+        ranges.right,
+        patch_expr,
+        scalar_subqueries,
+        options,
+    );
+    return true;
+}
+
+fn parseGeneratedInsertSourceConflictScalarSubqueryAssignmentAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    assignment_item: generated_parser.GeneratedSqlTokenRange,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    patch_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
+    scalar_subqueries: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection),
+    primary_key_assignment: PrimaryKeyAssignmentPolicy,
+    type_context: expr_type.RowExpressionTypeContext,
+    realtime_ns: u64,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
+) !bool {
+    if (!generatedDmlExpressionContainsSubquery(expression)) return false;
+    const ranges = generatedDmlAssignmentComparisonRanges(tokens, assignment_item, expression) catch |err| switch (err) {
+        error.UnsupportedSqlShape => return false,
+        else => |other| return other,
+    };
+
+    var lhs_pos = ranges.left.start;
+    const field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens[0..ranges.left.end], &lhs_pos);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    if (lhs_pos != ranges.left.end) return false;
+    const column = binder.relationalColumnForField(schema, field, null) orelse return error.InvalidSqlCatalog;
+    try notePrimaryKeyAssignment(schema, field, primary_key_assignment);
+
+    try appendGeneratedInsertSourceConflictScalarSubqueryPatchExpressionAlloc(
+        alloc,
+        tokens,
+        schema,
+        params,
+        field,
+        column,
+        &field_transferred,
+        ranges.right_expression,
+        ranges.right,
+        patch_expr,
+        scalar_subqueries,
+        type_context,
+        realtime_ns,
+        fixed_binary_hooks,
+        bare_boolean_hooks,
+        expression_alternatives_hooks,
+        expression_condition_hooks,
+    );
+    return true;
+}
+
+fn parseGeneratedMutationSourceScalarSubqueryRowAssignmentAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    assignment_item: generated_parser.GeneratedSqlTokenRange,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    patch: *std.ArrayListUnmanaged(FieldJsonValue),
+    patch_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
+    increment: *std.ArrayListUnmanaged(FieldJsonValue),
+    increment_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
+    json_set: *std.ArrayListUnmanaged(JsonSetValue),
+    array_update: *std.ArrayListUnmanaged(ArrayTransformValue),
+    scalar_subqueries: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection),
+    hooks: ConflictUpdateSetAssignmentParserOptions,
+    options: MutationSourceParserOptions,
+) !bool {
+    if (!generatedDmlExpressionContainsSubquery(expression)) return false;
+    const ranges = generatedDmlAssignmentComparisonRanges(tokens, assignment_item, expression) catch |err| switch (err) {
+        error.UnsupportedSqlShape => return false,
+        else => |other| return other,
+    };
+    if (ranges.left.start >= ranges.left.end or
+        tokens[ranges.left.start].kind != .lparen or
+        tokens[ranges.left.end - 1].kind != .rparen)
+    {
+        return false;
+    }
+    if (ranges.right_expression.kind != .function_call) return false;
+    const function_name = ranges.right_expression.function_name_tokens orelse return error.UnsupportedSqlShape;
+    if (function_name.start + 1 != function_name.end or
+        function_name.end > tokens.len or
+        !std.ascii.eqlIgnoreCase(tokens[function_name.start].text, "row"))
+    {
+        return false;
+    }
+    if (ranges.right_expression.argument_items.count == 0 or
+        ranges.right_expression.argument_items.items.len != ranges.right_expression.argument_items.count or
+        ranges.right_expression.argument_items.expression_items.len != ranges.right_expression.argument_items.count or
+        ranges.right_expression.argument_items.expressions.len != ranges.right_expression.argument_items.count)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    var fields = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (fields.items) |field| {
+            if (field.len != 0) alloc.free(field);
+        }
+        fields.deinit(alloc);
+    }
+    var field_pos = ranges.left.start + 1;
+    while (field_pos < ranges.left.end - 1) {
+        const field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens[0 .. ranges.left.end - 1], &field_pos);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        try fields.append(alloc, field);
+        field_transferred = true;
+        if (field_pos == ranges.left.end - 1) break;
+        if (tokens[field_pos].kind != .comma) return error.UnsupportedSqlShape;
+        field_pos += 1;
+    }
+    if (fields.items.len == 0 or fields.items.len != ranges.right_expression.argument_items.count) return error.UnsupportedSqlShape;
+    try grammar.validateSqlIdentifierListUnique(fields.items);
+
+    for (fields.items, 0..) |field, index| {
+        const column = binder.relationalColumnForField(schema, field, null) orelse return error.InvalidSqlCatalog;
+        try notePrimaryKeyAssignment(schema, field, hooks.primary_key_assignment);
+        var field_transferred = false;
+        const rhs_expression = &ranges.right_expression.argument_items.expressions[index];
+        const rhs_expression_range = ranges.right_expression.argument_items.expression_items[index];
+        const rhs_item = ranges.right_expression.argument_items.items[index];
+        if (rhs_expression_range.start < rhs_item.start or rhs_expression_range.end > rhs_item.end) return error.UnsupportedSqlShape;
+
+        if (generatedDmlExpressionContainsSubquery(rhs_expression.*)) {
+            try appendGeneratedMutationSourceScalarSubqueryPatchExpressionAlloc(
+                alloc,
+                tokens,
+                schema,
+                params,
+                field,
+                column,
+                &field_transferred,
+                rhs_expression,
+                rhs_expression_range,
+                patch_expr,
+                scalar_subqueries,
+                options,
+            );
+        } else {
+            var rhs_pos = rhs_item.start;
+            var value_hooks = hooks.value;
+            value_hooks.expression_options.assignment_options.generated_expression_ast = rhs_expression;
+            try parseConflictUpdateAssignmentValueAlloc(
+                alloc,
+                tokens[0..rhs_item.end],
+                &rhs_pos,
+                schema,
+                params,
+                &.{},
+                field,
+                column,
+                patch,
+                patch_expr,
+                increment,
+                increment_expr,
+                json_set,
+                array_update,
+                &field_transferred,
+                .{
+                    .schema = hooks.value.schema,
+                    .params = hooks.value.params,
+                    .insert_columns = &.{},
+                    .insert_values = &.{},
+                    .realtime_ns = hooks.value.realtime_ns,
+                    .default_context = hooks.value.default_context,
+                    .json_set = hooks.value.json_set,
+                    .expression_options = value_hooks.expression_options,
+                },
+            );
+            if (rhs_pos != rhs_item.end) return error.UnsupportedSqlShape;
+        }
+        if (field_transferred) fields.items[index] = "";
+    }
+    pos.* = assignment_item.end;
+    return true;
+}
+
+fn parseGeneratedMutationSourceUpdateSetAssignmentsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    items: *const generated_parser.GeneratedSqlListAst,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    patch: *std.ArrayListUnmanaged(FieldJsonValue),
+    patch_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
+    increment: *std.ArrayListUnmanaged(FieldJsonValue),
+    increment_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
+    json_set: *std.ArrayListUnmanaged(JsonSetValue),
+    array_update: *std.ArrayListUnmanaged(ArrayTransformValue),
+    scalar_subqueries: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection),
+    hooks: ConflictUpdateSetAssignmentParserOptions,
+    options: MutationSourceParserOptions,
+) !void {
+    const first_tokens = items.first_tokens orelse return error.UnsupportedSqlShape;
+    const last_tokens = items.last_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedDmlListItemsRange(tokens, .{ .start = first_tokens.start, .end = last_tokens.end }, items);
+    if (pos.* != items.items[0].start) return error.UnsupportedSqlShape;
+    for (items.items, 0..) |assignment, index| {
+        if (assignment.start >= assignment.end or assignment.end > tokens.len) return error.UnsupportedSqlShape;
+        pos.* = assignment.start;
+        if (try parseGeneratedMutationSourceScalarSubqueryRowAssignmentAlloc(
+            alloc,
+            tokens,
+            pos,
+            assignment,
+            items.expressions[index],
+            schema,
+            params,
+            patch,
+            patch_expr,
+            increment,
+            increment_expr,
+            json_set,
+            array_update,
+            scalar_subqueries,
+            hooks,
+            options,
+        )) {} else if (try parseGeneratedMutationSourceScalarSubqueryAssignmentAlloc(
+            alloc,
+            tokens,
+            assignment,
+            items.expressions[index],
+            schema,
+            params,
+            patch_expr,
+            scalar_subqueries,
+            hooks.primary_key_assignment,
+            options,
+        )) {
+            pos.* = assignment.end;
+        } else {
+            const use_generated_assignment_expression = try validateGeneratedDmlAssignmentExpressionMetadata(tokens, assignment, items.expressions[index]);
+            var hooks_with_generated = hooks;
+            hooks_with_generated.value.expression_options.assignment_options.generated_expression_ast = if (use_generated_assignment_expression) &items.expressions[index] else null;
+            try parseConflictUpdateSetAssignmentAlloc(
+                alloc,
+                tokens[0..assignment.end],
+                pos,
+                schema,
+                params,
+                &.{},
+                &.{},
+                &.{},
+                patch,
+                patch_expr,
+                increment,
+                increment_expr,
+                json_set,
+                array_update,
+                hooks_with_generated,
+            );
+        }
         if (pos.* != assignment.end) return error.UnsupportedSqlShape;
     }
 }
@@ -4460,6 +4995,11 @@ pub fn parseConflictClauseAlloc(
     generated_assignments_tokens: ?generated_parser.GeneratedSqlTokenRange,
     generated_action_tokens: ?generated_parser.GeneratedSqlTokenRange,
     generated_action_kind: ?generated_parser.GeneratedSqlConflictActionKind,
+    scalar_subqueries: ?*std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection),
+    fixed_binary_hooks: ?expr_row_parse.FixedBinaryRowExpressionParserOptions,
+    bare_boolean_hooks: ?expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: ?expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: ?expr_where_condition.ExpressionWhereConditionsParserOptions,
     condition_options: ConflictAssignmentExpressionParserOptions,
     dispatch_options: ConflictExpressionDispatchOptions,
 ) !ConflictClause {
@@ -4594,6 +5134,12 @@ pub fn parseConflictClauseAlloc(
             &json_set,
             &array_update,
             assignment_hooks,
+            type_context,
+            scalar_subqueries,
+            fixed_binary_hooks,
+            bare_boolean_hooks,
+            expression_alternatives_hooks,
+            expression_condition_hooks,
         );
     } else {
         while (true) {
@@ -4707,6 +5253,11 @@ pub fn parseConflictClauseWithContextAlloc(
         options.generated_assignments_tokens,
         options.generated_action_tokens,
         options.generated_action_kind,
+        options.scalar_subqueries,
+        options.fixed_binary_hooks,
+        options.bare_boolean_hooks,
+        options.expression_alternatives_hooks,
+        options.expression_condition_hooks,
         condition_options,
         dispatch_options,
     );
@@ -4790,6 +5341,14 @@ fn parseConflictUpdateRowAssignmentAlloc(
         const column = binder.relationalColumnForField(schema, field, null) orelse return error.InvalidSqlCatalog;
         try notePrimaryKeyAssignment(schema, field, hooks.primary_key_assignment);
         var field_transferred = false;
+        var value_hooks = hooks.value;
+        value_hooks.expression_options.assignment_options.generated_expression_ast =
+            try generatedDmlRowAssignmentRhsExpressionAt(
+                tokens,
+                hooks.value.expression_options.assignment_options.generated_expression_ast,
+                pos.*,
+                i,
+            );
         try parseConflictUpdateAssignmentValueAlloc(
             alloc,
             tokens,
@@ -4814,7 +5373,7 @@ fn parseConflictUpdateRowAssignmentAlloc(
                 .realtime_ns = hooks.value.realtime_ns,
                 .default_context = hooks.value.default_context,
                 .json_set = jsonSetSqlValueOptionsWithInsertColumns(hooks.value.json_set, insert_columns),
-                .expression_options = hooks.value.expression_options,
+                .expression_options = value_hooks.expression_options,
             },
         );
         if (field_transferred) fields.items[i] = "";
@@ -5349,6 +5908,19 @@ fn parseJoinedMutationRowAssignmentAlloc(
         const target_column = binder.relationalColumnForField(schema, target, null) orelse return error.InvalidSqlCatalog;
         if (binder.primaryKeyContains(primary_key, target)) saw_primary_key_assignment.* = true;
         var target_transferred = false;
+        var value_options = options;
+        const generated_rhs_expression = try generatedDmlRowAssignmentRhsExpressionAt(
+            tokens,
+            options.assignment_expression.row_expression_options.generated_expression_ast,
+            pos.*,
+            i,
+        );
+        value_options.assignment_expression.row_expression_options.generated_expression_ast = generated_rhs_expression;
+        value_options.assignment_expression.boolean_expression_options.generated_expression_ast = generated_rhs_expression;
+        if (generated_rhs_expression != null) {
+            value_options.assignment_expression.row_expression_options.require_exact_generated_expression = true;
+            value_options.assignment_expression.boolean_expression_options.require_exact_generated_expression = true;
+        }
         try parseJoinedMutationAssignmentValueAlloc(
             alloc,
             tokens,
@@ -5366,7 +5938,7 @@ fn parseJoinedMutationRowAssignmentAlloc(
             patch_expr,
             json_set,
             &target_transferred,
-            options,
+            value_options,
         );
         if (target_transferred) targets.items[i] = "";
         if (i + 1 < targets.items.len) {
@@ -9033,6 +9605,7 @@ fn parseGeneratedMergeInsertMappingsAlloc(
     if (columns.end >= values.start or !tokens[columns.end].matchesKeywordTag(.values)) return error.UnsupportedSqlShape;
     try validateGeneratedDmlListItemsRange(tokens, .{ .start = columns.start + 1, .end = columns.end - 1 }, &arm.insert_column_items);
     try validateGeneratedDmlListItemsRange(tokens, .{ .start = values.start + 1, .end = values.end - 1 }, &arm.insert_value_items);
+    try validateGeneratedDmlListExpressionsContainNoSubqueries(&arm.insert_value_items);
     if (arm.insert_column_items.count != arm.insert_value_items.count) return error.UnsupportedSqlShape;
     if (arm.insert_value_items.expressions.len != arm.insert_value_items.count) return error.UnsupportedSqlShape;
 
@@ -11184,6 +11757,18 @@ fn freeSubqueryPredicates(alloc: std.mem.Allocator, values: []const db_mod.types
         if (value.output_field.len > 0) alloc.free(value.output_field);
         plan_mod.freeLateralCorrelations(alloc, value.correlations);
         if (value.correlations.len > 0) alloc.free(value.correlations);
+        for (value.correlation_or_predicates) |group| {
+            plan_mod.freeRelationalChecks(alloc, group.predicates);
+            if (group.predicates.len > 0) alloc.free(group.predicates);
+            plan_mod.freeExpressionConditions(alloc, group.expression_predicates);
+            if (group.expression_predicates.len > 0) alloc.free(group.expression_predicates);
+            plan_mod.freeAccessPredicateGroup(alloc, group.access_predicates);
+            freeSubqueryPredicates(alloc, group.subquery_predicates);
+            if (group.subquery_predicates.len > 0) alloc.free(group.subquery_predicates);
+            plan_mod.freeLateralCorrelations(alloc, group.correlations);
+            if (group.correlations.len > 0) alloc.free(group.correlations);
+        }
+        if (value.correlation_or_predicates.len > 0) alloc.free(value.correlation_or_predicates);
         if (value.collation) |collation| alloc.free(collation);
     }
 }
@@ -12027,6 +12612,7 @@ pub fn parseMutationSourceQueryTailAlloc(
     order_expression_hooks: expr_order.OrderExpressionParserOptions,
     returning_hooks: expr_projection.ReturningProjectionParserOptions,
     generated_dml_ast: ?*const generated_parser.GeneratedSqlDmlAst,
+    mutation_scalar_subqueries: ?*std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection),
 ) !ParsedMutationSourceQuery {
     var owned_row_claim = row_claim;
     errdefer if (owned_row_claim.owner_id.len > 0) alloc.free(owned_row_claim.owner_id);
@@ -12245,13 +12831,50 @@ pub fn parseMutationSourceQueryTailAlloc(
         } else if (parser.matchKeywordTag(tokens, pos, .returning)) {
             if (saw_returning) return error.UnsupportedSqlShape;
             saw_returning = true;
-            const generated_returning_range = try validateGeneratedDmlReturningHookRange(
-                tokens,
-                pos.*,
-                generated_dml_ast,
-                returning_hooks.generated_returning_items,
-            );
-            returning = try expr_projection.parseReturningProjectionAlloc(alloc, tokens, pos, schema, returning_qualifiers, returning_hooks);
+            const generated_returning_range = if (mutation_scalar_subqueries != null)
+                try validateGeneratedDmlReturningHookRangeWithPolicy(
+                    tokens,
+                    pos.*,
+                    generated_dml_ast,
+                    returning_hooks.generated_returning_items,
+                    true,
+                )
+            else
+                try validateGeneratedDmlReturningHookRange(
+                    tokens,
+                    pos.*,
+                    generated_dml_ast,
+                    returning_hooks.generated_returning_items,
+                );
+            if (generated_returning_range) |range| {
+                if (mutation_scalar_subqueries) |scalar_subqueries| {
+                    if (try parseGeneratedMutationSourceReturningProjectionAlloc(
+                        alloc,
+                        tokens,
+                        pos,
+                        schema,
+                        params,
+                        returning_qualifiers,
+                        returning_hooks,
+                        range,
+                        returning_hooks.generated_returning_items orelse return error.UnsupportedSqlShape,
+                        scalar_subqueries,
+                        realtime_ns,
+                        fixed_binary_hooks,
+                        bare_boolean_hooks,
+                        expression_alternatives_hooks,
+                        expression_condition_hooks,
+                    )) |generated_returning| {
+                        returning = generated_returning;
+                    } else {
+                        returning = try expr_projection.parseReturningProjectionAlloc(alloc, tokens, pos, schema, returning_qualifiers, returning_hooks);
+                    }
+                } else {
+                    returning = try expr_projection.parseReturningProjectionAlloc(alloc, tokens, pos, schema, returning_qualifiers, returning_hooks);
+                }
+            } else {
+                returning = try expr_projection.parseReturningProjectionAlloc(alloc, tokens, pos, schema, returning_qualifiers, returning_hooks);
+            }
             if (generated_returning_range) |range| {
                 if (pos.* != range.end) return error.UnsupportedSqlShape;
             }
@@ -12702,6 +13325,11 @@ fn parseInsertConflictClauseAlloc(
         options.generated_conflict_assignments_tokens,
         options.generated_conflict_action_tokens,
         options.generated_conflict_action_kind,
+        null,
+        null,
+        null,
+        null,
+        null,
         conflictAssignmentExpressionOptionsWithExistingQualifiers(options.condition_options, existing_qualifiers),
         conflictDispatchOptionsWithExistingQualifiers(options.dispatch_options, existing_qualifiers),
     );
@@ -12945,6 +13573,165 @@ fn setMutationSourceFieldExpressionQualifiers(
     return previous_context;
 }
 
+fn appendMutationSourceScalarSubqueriesAlloc(
+    alloc: std.mem.Allocator,
+    source_query: *db_mod.types.RelationalRowsQueryRequest,
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
+) !void {
+    if (scalar_subqueries.len == 0) return;
+    const combined = try alloc.alloc(db_mod.types.RelationalRowsScalarSubqueryProjection, source_query.scalar_subqueries.len + scalar_subqueries.len);
+    errdefer alloc.free(combined);
+    @memcpy(combined[0..source_query.scalar_subqueries.len], source_query.scalar_subqueries);
+    @memcpy(combined[source_query.scalar_subqueries.len..], scalar_subqueries);
+    if (source_query.scalar_subqueries.len > 0) alloc.free(source_query.scalar_subqueries);
+    source_query.scalar_subqueries = combined;
+}
+
+fn generatedReturningItemsContainSubquery(items: generated_parser.GeneratedSqlListAst) bool {
+    for (items.expressions) |expression| {
+        if (generatedDmlExpressionContainsSubquery(expression)) return true;
+    }
+    return false;
+}
+
+fn appendReturningProjectionAlloc(
+    alloc: std.mem.Allocator,
+    fields: *std.ArrayListUnmanaged([]const u8),
+    expressions: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionProjection),
+    returning: *ReturningProjection,
+) !void {
+    for (returning.fields) |field| try fields.append(alloc, field);
+    if (returning.fields.len > 0) alloc.free(returning.fields);
+    returning.fields = &.{};
+    for (returning.expressions) |projection| try expressions.append(alloc, projection);
+    if (returning.expressions.len > 0) alloc.free(returning.expressions);
+    returning.expressions = &.{};
+}
+
+fn parseGeneratedMutationSourceReturningProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    returning_qualifiers: []const []const u8,
+    returning_hooks: expr_projection.ReturningProjectionParserOptions,
+    range: generated_parser.GeneratedSqlTokenRange,
+    generated_returning_items: *const generated_parser.GeneratedSqlListAst,
+    scalar_subqueries: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection),
+    realtime_ns: u64,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
+) !?ReturningProjection {
+    if (!generatedReturningItemsContainSubquery(generated_returning_items.*)) return null;
+    if (range.start != pos.* or range.end > tokens.len) return error.UnsupportedSqlShape;
+    try validateGeneratedDmlReturningItemsRangeWithPolicy(tokens, range, generated_returning_items, true);
+    if (generated_returning_items.count != generated_returning_items.items.len or
+        generated_returning_items.count != generated_returning_items.expression_items.len or
+        generated_returning_items.count != generated_returning_items.expressions.len)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    var fields = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        strings.freeStringSlice(alloc, fields.items);
+        fields.deinit(alloc);
+    }
+    var expressions = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionProjection).empty;
+    errdefer {
+        freeExpressionProjections(alloc, expressions.items);
+        expressions.deinit(alloc);
+    }
+
+    const type_context: expr_type.RowExpressionTypeContext = .{
+        .alloc = alloc,
+        .schema = schema,
+        .defer_row_expression_field_validation = returning_hooks.context_hooks.get_context(returning_hooks.context_hooks.ptr).defer_row_expression_field_validation,
+    };
+    var expected_start = range.start;
+    for (generated_returning_items.items, 0..) |item_range, index| {
+        if (item_range.start != expected_start or item_range.start >= item_range.end or item_range.end > range.end) return error.UnsupportedSqlShape;
+        const expression = &generated_returning_items.expressions[index];
+        try expr_generated_validate.validateGeneratedExpressionPayloads(tokens, expression.*);
+        const expression_range = generated_returning_items.expression_items[index];
+        const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+        if (!generatedDmlTokenRangeEql(expression_tokens, expression_range)) return error.UnsupportedSqlShape;
+        if (expression_range.start < item_range.start or expression_range.end > item_range.end) return error.UnsupportedSqlShape;
+
+        if (generatedDmlExpressionContainsSubquery(expression.*)) {
+            const lowered = try lower_expr.parseGeneratedScalarSubqueryExpressionAlloc(
+                alloc,
+                tokens,
+                params,
+                schema,
+                type_context,
+                &.{},
+                expression,
+                expression_range,
+                scalar_subqueries,
+                realtime_ns,
+                fixed_binary_hooks,
+                bare_boolean_hooks,
+                expression_alternatives_hooks,
+                expression_condition_hooks,
+            );
+            var lowered_transferred = false;
+            errdefer if (!lowered_transferred) freeExpression(alloc, lowered);
+            const output = (try lower_expr.generatedProjectionAliasOutputAlloc(alloc, tokens, generated_returning_items.*, index, item_range, expression_range)) orelse blk: {
+                if (expression.kind == .subquery) return error.UnsupportedSqlShape;
+                break :blk try alloc.dupe(u8, expr_type.rowExpressionDefaultOutputName(lowered.kind));
+            };
+            errdefer alloc.free(output);
+            try expressions.append(alloc, .{
+                .output = output,
+                .expression = lowered,
+            });
+            lowered_transferred = true;
+        } else {
+            var item_pos = item_range.start;
+            var item_hooks = returning_hooks;
+            item_hooks.generated_returning_items = null;
+            var item_returning = try expr_projection.parseReturningProjectionAlloc(
+                alloc,
+                tokens[0..item_range.end],
+                &item_pos,
+                schema,
+                returning_qualifiers,
+                item_hooks,
+            );
+            errdefer item_returning.deinit(alloc);
+            if (item_pos != item_range.end) return error.UnsupportedSqlShape;
+            try appendReturningProjectionAlloc(alloc, &fields, &expressions, &item_returning);
+        }
+
+        if (index + 1 == generated_returning_items.items.len) {
+            expected_start = item_range.end;
+        } else {
+            if (item_range.end >= range.end or tokens[item_range.end].kind != .comma) return error.UnsupportedSqlShape;
+            expected_start = item_range.end + 1;
+        }
+    }
+    if (expected_start != range.end) return error.UnsupportedSqlShape;
+
+    const owned_fields = try fields.toOwnedSlice(alloc);
+    var fields_transferred = false;
+    errdefer if (!fields_transferred) strings.freeStringSlice(alloc, owned_fields);
+    const owned_expressions = try expressions.toOwnedSlice(alloc);
+    var expressions_transferred = false;
+    errdefer if (!expressions_transferred) freeExpressionProjections(alloc, owned_expressions);
+    try expr_projection.validateReturningProjectionOutputs(schema, owned_fields, owned_expressions);
+    pos.* = range.end;
+    fields_transferred = true;
+    expressions_transferred = true;
+    return .{
+        .fields = owned_fields,
+        .expressions = owned_expressions,
+    };
+}
+
 pub fn parseUpdateMutationSourceAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -13003,6 +13790,14 @@ pub fn parseUpdateMutationSourceAlloc(
         freeArrayTransformValues(alloc, array_update.items);
         array_update.deinit(alloc);
     }
+    var scalar_subqueries = std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection).empty;
+    var scalar_subqueries_transferred = false;
+    errdefer {
+        if (!scalar_subqueries_transferred) {
+            for (scalar_subqueries.items) |projection| plan_mod.freeScalarSubqueryProjection(alloc, projection);
+        }
+        scalar_subqueries.deinit(alloc);
+    }
 
     var rewrite_identity = false;
     const assignment_hooks: ConflictUpdateSetAssignmentParserOptions = .{
@@ -13011,23 +13806,22 @@ pub fn parseUpdateMutationSourceAlloc(
     };
     if (options.generated_assignment_items) |generated_assignment_items| {
         const generated_assignments = try validateGeneratedUpdateAssignmentHookRange(tokens, pos.*, options.generated_dml_ast, generated_assignment_items);
-        try parseGeneratedConflictUpdateSetAssignmentsAlloc(
+        try parseGeneratedMutationSourceUpdateSetAssignmentsAlloc(
             alloc,
             tokens,
             pos,
             generated_assignment_items,
             options.schema,
             options.params,
-            &.{},
-            &.{},
-            &.{},
             &patch,
             &patch_expr,
             &increment,
             &increment_expr,
             &json_set,
             &array_update,
+            &scalar_subqueries,
             assignment_hooks,
+            options,
         );
         if (pos.* != generated_assignments.end) return error.UnsupportedSqlShape;
     } else {
@@ -13080,8 +13874,13 @@ pub fn parseUpdateMutationSourceAlloc(
         options.order_expression_hooks,
         options.returning_hooks,
         options.generated_dml_ast,
+        &scalar_subqueries,
     );
     defer source.deinit(alloc);
+    try appendMutationSourceScalarSubqueriesAlloc(alloc, &source.query, scalar_subqueries.items);
+    scalar_subqueries_transferred = true;
+    scalar_subqueries.deinit(alloc);
+    scalar_subqueries = .empty;
 
     const body_json = try mutationSourceBodyJsonAlloc(alloc, "update", source.query, rewrite_identity, temporal_portion, patch.items, patch_expr.items, increment.items, increment_expr.items, json_set.items, array_update.items, source.returning);
     defer alloc.free(body_json);
@@ -13140,6 +13939,14 @@ pub fn parseDeleteMutationSourceAlloc(
     const previous_context = setMutationSourceFieldExpressionQualifiers(options.context_hooks, returning_qualifiers[0..]);
     defer options.context_hooks.set_context(options.context_hooks.ptr, previous_context);
     const source_context = options.context_hooks.get_context(options.context_hooks.ptr);
+    var scalar_subqueries = std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection).empty;
+    var scalar_subqueries_transferred = false;
+    defer {
+        if (!scalar_subqueries_transferred) {
+            for (scalar_subqueries.items) |projection| plan_mod.freeScalarSubqueryProjection(alloc, projection);
+        }
+        scalar_subqueries.deinit(alloc);
+    }
     row_claim_transferred = true;
     var source = try parseMutationSourceQueryTailAlloc(
         alloc,
@@ -13161,8 +13968,13 @@ pub fn parseDeleteMutationSourceAlloc(
         options.order_expression_hooks,
         options.returning_hooks,
         options.generated_dml_ast,
+        &scalar_subqueries,
     );
     defer source.deinit(alloc);
+    try appendMutationSourceScalarSubqueriesAlloc(alloc, &source.query, scalar_subqueries.items);
+    scalar_subqueries_transferred = true;
+    scalar_subqueries.deinit(alloc);
+    scalar_subqueries = .empty;
 
     const body_json = try mutationSourceBodyJsonAlloc(alloc, "delete", source.query, false, temporal_portion, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, source.returning);
     defer alloc.free(body_json);
@@ -13848,6 +14660,24 @@ pub fn writeMutationSourceQueryJson(
             try expr_type.writeRowExpressionJson(writer, predicate.expression);
             try writer.writeAll(",\"value\":");
             try writer.writeAll(predicate.value_json);
+            try writer.writeByte('}');
+        }
+        try writer.writeByte(']');
+        wrote = true;
+    }
+    if (source.scalar_subqueries.len > 0) {
+        if (wrote) try writer.writeByte(',');
+        try writer.writeAll("\"scalar_subqueries\":[");
+        for (source.scalar_subqueries, 0..) |projection, i| {
+            if (projection.output.len == 0 or projection.output_field.len == 0 or projection.correlations.len != 0) return error.UnsupportedSqlShape;
+            if (i != 0) try writer.writeByte(',');
+            try writer.print("{{\"output\":{f},\"output_field\":{f}", .{
+                std.json.fmt(projection.output, .{}),
+                std.json.fmt(projection.output_field, .{}),
+            });
+            if (projection.hidden) try writer.writeAll(",\"hidden\":true");
+            try writer.writeAll(",\"query\":");
+            try writeMutationSourceQueryJson(writer, projection.query);
             try writer.writeByte('}');
         }
         try writer.writeByte(']');
@@ -16805,7 +17635,15 @@ pub fn lowerWritePlanFromGeneratedDmlAstDirectWithFunctionBindingsAlloc(
     if (dml_ast.kind == .update) {
         switch (write_kind) {
             .update => switch (try classifyGeneratedUpdateSelectorFromDmlAstAlloc(alloc, parsed_sql.items(), dml_ast, schema, params, options.unique_resolver)) {
-                .point => return .{ .update = try updatePointFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast, schema, params, options) },
+                .point => {
+                    if (options.row_claim != null and
+                        ((try generatedDmlListExpressionsContainSubquery(&dml_ast.assignment_items)) or
+                            (try generatedDmlListExpressionsContainSubquery(&dml_ast.returning_items))))
+                    {
+                        return .{ .update_source = try updateSourceFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast, schema, params, options, write_kind) };
+                    }
+                    return .{ .update = try updatePointFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast, schema, params, options) };
+                },
                 .source => return .{ .update_source = try updateSourceFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast, schema, params, options, write_kind) },
             },
             .update_source => return .{ .update_source = try updateSourceFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast, schema, params, options, write_kind) },
@@ -16816,7 +17654,12 @@ pub fn lowerWritePlanFromGeneratedDmlAstDirectWithFunctionBindingsAlloc(
     if (dml_ast.kind == .delete) {
         switch (write_kind) {
             .delete => switch (try classifyGeneratedDeleteSelectorFromDmlAstAlloc(alloc, parsed_sql.items(), dml_ast, schema, params, options.unique_resolver)) {
-                .point => return .{ .delete = try deletePointFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast, schema, params, options) },
+                .point => {
+                    if (options.row_claim != null and try generatedDmlListExpressionsContainSubquery(&dml_ast.returning_items)) {
+                        return .{ .delete_source = try deleteSourceFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast, schema, params, options, write_kind) };
+                    }
+                    return .{ .delete = try deletePointFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast, schema, params, options) };
+                },
                 .source => return .{ .delete_source = try deleteSourceFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast, schema, params, options, write_kind) },
             },
             .delete_source => return .{ .delete_source = try deleteSourceFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast, schema, params, options, write_kind) },
@@ -17923,6 +18766,15 @@ fn validateGeneratedDmlReturningItemsRange(
     returning_tokens: ?generated_parser.GeneratedSqlTokenRange,
     returning_items: *const generated_parser.GeneratedSqlListAst,
 ) !void {
+    try validateGeneratedDmlReturningItemsRangeWithPolicy(tokens, returning_tokens, returning_items, false);
+}
+
+fn validateGeneratedDmlReturningItemsRangeWithPolicy(
+    tokens: []const Token,
+    returning_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    returning_items: *const generated_parser.GeneratedSqlListAst,
+    allow_subqueries: bool,
+) !void {
     if (returning_tokens) |range| {
         if (range.start == 0 or
             range.start >= range.end or
@@ -17932,6 +18784,9 @@ fn validateGeneratedDmlReturningItemsRange(
             return error.UnsupportedSqlShape;
         }
         try generated_read_validate.validateGeneratedProjectionListForClause(tokens, range, returning_items.*);
+        for (returning_items.expressions) |expression| {
+            if (!allow_subqueries and generatedDmlExpressionContainsSubquery(expression)) return error.UnsupportedSqlShape;
+        }
     } else {
         try validateGeneratedDmlEmptyList(returning_items);
     }
@@ -17951,6 +18806,24 @@ fn validateGeneratedDmlReturningHookRange(
     const range = ast.returning_tokens orelse return error.UnsupportedSqlShape;
     if (range.start != pos) return error.UnsupportedSqlShape;
     try validateGeneratedDmlReturningItemsRange(tokens, range, returning_items);
+    return range;
+}
+
+fn validateGeneratedDmlReturningHookRangeWithPolicy(
+    tokens: []const Token,
+    pos: usize,
+    generated_dml_ast: ?*const generated_parser.GeneratedSqlDmlAst,
+    generated_returning_items: ?*const generated_parser.GeneratedSqlListAst,
+    allow_subqueries: bool,
+) !?generated_parser.GeneratedSqlTokenRange {
+    const ast = generated_dml_ast orelse {
+        if (generated_returning_items != null) return error.UnsupportedSqlShape;
+        return null;
+    };
+    const returning_items = generated_returning_items orelse return error.UnsupportedSqlShape;
+    const range = ast.returning_tokens orelse return error.UnsupportedSqlShape;
+    if (range.start != pos) return error.UnsupportedSqlShape;
+    try validateGeneratedDmlReturningItemsRangeWithPolicy(tokens, range, returning_items, allow_subqueries);
     return range;
 }
 
@@ -18578,7 +19451,10 @@ fn updateSourceFromGeneratedDmlAstAlloc(
         .generated_assignment_items = &ast.assignment_items,
         .generated_dml_ast = &ast,
     };
-    var lowered = try parser_context.ParserState.ContextAccessors.parseUpdateMutationSource(&parser_state);
+    var lowered = parser_context.ParserState.ContextAccessors.parseUpdateMutationSource(&parser_state) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
     errdefer lowered.deinit(alloc);
     if (!generatedDmlParserConsumedStatement(tokens, end, parser_state.pos)) return error.UnsupportedSqlShape;
     lowered.sync_level = options.sync_level;
@@ -18615,7 +19491,10 @@ fn deleteSourceFromGeneratedDmlAstAlloc(
         .generated_dml_ast = &ast,
         .generated_returning_items = generatedDmlTopLevelReturningItems(&ast),
     };
-    var lowered = try parser_context.ParserState.ContextAccessors.parseDeleteMutationSource(&parser_state);
+    var lowered = parser_context.ParserState.ContextAccessors.parseDeleteMutationSource(&parser_state) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
     errdefer lowered.deinit(alloc);
     if (!generatedDmlParserConsumedStatement(tokens, end, parser_state.pos)) return error.UnsupportedSqlShape;
     lowered.sync_level = options.sync_level;
@@ -18644,7 +19523,7 @@ fn validateGeneratedUpdateSourceRanges(
     try validateGeneratedDmlListItemsRange(tokens, assignments_range, &ast.assignment_items);
     const target_alias_end = try generatedDmlTargetAliasEnd(tokens, target_range, ast.target_alias_tokens, ast.target_alias_name_tokens, end);
     _ = try generatedDmlOptionalTemporalPortionEnd(tokens, target_alias_end, assignments_range.start - 1);
-    try validateGeneratedDmlTailRanges(tokens, end, assignments_range.end, ast.where_tokens, ast.returning_tokens, &ast.returning_items);
+    try validateGeneratedDmlTailRanges(tokens, end, assignments_range.end, ast.where_tokens, ast.returning_tokens, &ast.returning_items, true);
     try validateGeneratedDmlWhereExpressionMetadata(tokens, end, ast);
     try validateGeneratedDmlMutationTailMetadata(tokens, end, assignments_range.end, ast);
 }
@@ -18667,7 +19546,7 @@ fn validateGeneratedDeleteSourceRanges(
         break :blk returning_range.start - 1;
     } else end;
     const after_portion = try generatedDmlOptionalTemporalPortionEnd(tokens, target_alias_end, tail_start);
-    try validateGeneratedDmlTailRanges(tokens, end, after_portion, ast.where_tokens, ast.returning_tokens, &ast.returning_items);
+    try validateGeneratedDmlTailRanges(tokens, end, after_portion, ast.where_tokens, ast.returning_tokens, &ast.returning_items, true);
     try validateGeneratedDmlWhereExpressionMetadata(tokens, end, ast);
     try validateGeneratedDmlMutationTailMetadata(tokens, end, after_portion, ast);
 }
@@ -18712,6 +19591,7 @@ fn validateGeneratedDmlTailRanges(
     where_tokens: ?generated_parser.GeneratedSqlTokenRange,
     returning_tokens: ?generated_parser.GeneratedSqlTokenRange,
     returning_items: *const generated_parser.GeneratedSqlListAst,
+    allow_returning_subqueries: bool,
 ) !void {
     if (tail_start > end) return error.UnsupportedSqlShape;
     const returning_keyword = if (returning_tokens) |returning_range| blk: {
@@ -18734,7 +19614,7 @@ fn validateGeneratedDmlTailRanges(
     } else if (returning_keyword) |returning_start| {
         if (tail_start != returning_start) return error.UnsupportedSqlShape;
     } else if (tail_start != end) return error.UnsupportedSqlShape;
-    try validateGeneratedDmlReturningItemsRange(tokens, returning_tokens, returning_items);
+    try validateGeneratedDmlReturningItemsRangeWithPolicy(tokens, returning_tokens, returning_items, allow_returning_subqueries);
 }
 
 fn generatedDmlWhereExpressionRange(
@@ -19257,7 +20137,7 @@ fn validateGeneratedJoinedTailRanges(
     if (where_range.start == 0 or where_range.start >= where_range.end or where_range.end > end) return error.UnsupportedSqlShape;
     if (!tokens[where_range.start - 1].matchesKeywordTag(.where)) return error.UnsupportedSqlShape;
     if (where_range.start - 1 != source_end) return error.UnsupportedSqlShape;
-    try validateGeneratedDmlTailRanges(tokens, end, source_end, ast.where_tokens, ast.returning_tokens, &ast.returning_items);
+    try validateGeneratedDmlTailRanges(tokens, end, source_end, ast.where_tokens, ast.returning_tokens, &ast.returning_items, false);
     try validateGeneratedDmlMutationTailMetadata(tokens, end, source_end, ast);
 }
 
@@ -19454,6 +20334,7 @@ fn validateGeneratedMergeArmMetadata(
             if (values.start != values_start + 1 or values.start >= values.end or values.end != arm.action_tokens.end or !tokens[values_start].matchesKeywordTag(.values)) return error.UnsupportedSqlShape;
             if (tokens[values.start].kind != .lparen or tokens[values.end - 1].kind != .rparen) return error.UnsupportedSqlShape;
             try validateGeneratedDmlListItemsRange(tokens, .{ .start = values.start + 1, .end = values.end - 1 }, &arm.insert_value_items);
+            try validateGeneratedDmlListExpressionsContainNoSubqueries(&arm.insert_value_items);
         },
     }
 }
@@ -19485,6 +20366,7 @@ fn validateGeneratedDmlAssignmentExpressionMetadata(
 ) !bool {
     if (!generatedDmlTokenRangeEql(expression.tokens orelse return error.UnsupportedSqlShape, assignment_item)) return error.UnsupportedSqlShape;
     try generated_read_validate.validateGeneratedOptionalExpression(tokens, assignment_item, expression);
+    if (generatedDmlExpressionContainsSubquery(expression)) return error.UnsupportedSqlShape;
     if (expression.kind != .comparison) {
         const operator_index = generatedDmlTopLevelAssignmentEqToken(tokens, assignment_item) orelse return error.UnsupportedSqlShape;
         if (operator_index == assignment_item.start or operator_index + 1 >= assignment_item.end) return error.UnsupportedSqlShape;
@@ -19513,6 +20395,68 @@ fn validateGeneratedDmlAssignmentExpressionMetadata(
     return true;
 }
 
+fn generatedDmlExpressionContainsSubquery(expression: generated_parser.GeneratedSqlExpressionAst) bool {
+    if (expression.kind == .subquery) return true;
+    if (expression.inner_expression) |inner| {
+        if (generatedDmlExpressionContainsSubquery(inner.*)) return true;
+    }
+    if (expression.left_expression) |left| {
+        if (generatedDmlExpressionContainsSubquery(left.*)) return true;
+    }
+    if (expression.right_expression) |right| {
+        if (generatedDmlExpressionContainsSubquery(right.*)) return true;
+    }
+    if (expression.between_lower_expression) |lower| {
+        if (generatedDmlExpressionContainsSubquery(lower.*)) return true;
+    }
+    if (expression.between_upper_expression) |upper| {
+        if (generatedDmlExpressionContainsSubquery(upper.*)) return true;
+    }
+    if (expression.escape_expression) |escape| {
+        if (generatedDmlExpressionContainsSubquery(escape.*)) return true;
+    }
+    if (expression.cast_expression) |cast_expression| {
+        if (generatedDmlExpressionContainsSubquery(cast_expression.*)) return true;
+    }
+    if (expression.filter_expression) |filter_expression| {
+        if (generatedDmlExpressionContainsSubquery(filter_expression.*)) return true;
+    }
+    if (expression.extract_source_expression) |source_expression| {
+        if (generatedDmlExpressionContainsSubquery(source_expression.*)) return true;
+    }
+    for (expression.argument_items.expressions) |argument_expression| {
+        if (generatedDmlExpressionContainsSubquery(argument_expression)) return true;
+    }
+    for (expression.array_items.expressions) |array_expression| {
+        if (generatedDmlExpressionContainsSubquery(array_expression)) return true;
+    }
+    for (expression.case_condition_items.expressions) |condition_expression| {
+        if (generatedDmlExpressionContainsSubquery(condition_expression)) return true;
+    }
+    for (expression.case_result_items.expressions) |result_expression| {
+        if (generatedDmlExpressionContainsSubquery(result_expression)) return true;
+    }
+    if (expression.case_else_expression) |else_expression| {
+        if (generatedDmlExpressionContainsSubquery(else_expression.*)) return true;
+    }
+    return false;
+}
+
+fn validateGeneratedDmlListExpressionsContainNoSubqueries(list: *const generated_parser.GeneratedSqlListAst) !void {
+    if (list.expressions.len != list.count) return error.UnsupportedSqlShape;
+    for (list.expressions) |expression| {
+        if (generatedDmlExpressionContainsSubquery(expression)) return error.UnsupportedSqlShape;
+    }
+}
+
+fn generatedDmlListExpressionsContainSubquery(list: *const generated_parser.GeneratedSqlListAst) !bool {
+    if (list.expressions.len != list.count) return error.UnsupportedSqlShape;
+    for (list.expressions) |expression| {
+        if (generatedDmlExpressionContainsSubquery(expression)) return true;
+    }
+    return false;
+}
+
 fn validateGeneratedDmlAssignmentRhsMetadata(
     tokens: []const Token,
     rhs_start: usize,
@@ -19521,6 +20465,7 @@ fn validateGeneratedDmlAssignmentRhsMetadata(
 ) !void {
     const expression = generated_expression_ast orelse return;
     const rhs_tokens: generated_parser.GeneratedSqlTokenRange = .{ .start = rhs_start, .end = rhs_end };
+    if (generatedDmlExpressionContainsSubquery(expression.*)) return error.UnsupportedSqlShape;
     if (expression.kind != .comparison) {
         if (!generatedDmlTokenRangeEql(expression.tokens orelse return error.UnsupportedSqlShape, rhs_tokens)) return error.UnsupportedSqlShape;
         try generated_read_validate.validateGeneratedOptionalExpression(tokens, rhs_tokens, expression.*);
@@ -19534,6 +20479,34 @@ fn validateGeneratedDmlAssignmentRhsMetadata(
     }
     if (!generatedDmlTokenRangeEql(right_expression.tokens orelse return error.UnsupportedSqlShape, right_tokens)) return error.UnsupportedSqlShape;
     try generated_read_validate.validateGeneratedOptionalExpression(tokens, right_tokens, right_expression.*);
+}
+
+fn generatedDmlRowAssignmentRhsExpressionAt(
+    tokens: []const Token,
+    assignment_expression: ?*const generated_parser.GeneratedSqlExpressionAst,
+    rhs_start: usize,
+    rhs_index: usize,
+) !?*const generated_parser.GeneratedSqlExpressionAst {
+    const expression = assignment_expression orelse return null;
+    if (expression.kind != .comparison) return null;
+    const right_expression = expression.right_expression orelse return error.UnsupportedSqlShape;
+    if (right_expression.kind != .function_call) return null;
+    const function_name = right_expression.function_name_tokens orelse return error.UnsupportedSqlShape;
+    if (function_name.start + 1 != function_name.end or
+        function_name.end > tokens.len or
+        !std.ascii.eqlIgnoreCase(tokens[function_name.start].text, "row"))
+    {
+        return null;
+    }
+    if (right_expression.argument_items.count != right_expression.argument_items.items.len or
+        right_expression.argument_items.count != right_expression.argument_items.expressions.len)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (rhs_index >= right_expression.argument_items.count) return error.UnsupportedSqlShape;
+    const item = right_expression.argument_items.items[rhs_index];
+    if (item.start != rhs_start) return error.UnsupportedSqlShape;
+    return &right_expression.argument_items.expressions[rhs_index];
 }
 
 fn updatePointFromGeneratedDmlAstAlloc(
@@ -19566,7 +20539,7 @@ fn updatePointFromGeneratedDmlAstAlloc(
     if (where_range.start >= where_range.end or where_range.end > end) return error.UnsupportedSqlShape;
     if (where_range.start == 0 or where_range.start - 1 != assignments_range.end) return error.UnsupportedSqlShape;
     try validateGeneratedDmlListItemsRange(tokens, assignments_range, &ast.assignment_items);
-    try validateGeneratedDmlTailRanges(tokens, end, assignments_range.end, ast.where_tokens, ast.returning_tokens, &ast.returning_items);
+    try validateGeneratedDmlTailRanges(tokens, end, assignments_range.end, ast.where_tokens, ast.returning_tokens, &ast.returning_items, false);
     try validateGeneratedDmlWhereExpressionMetadata(tokens, end, ast);
 
     const parser_context = @import("parser_context.zig");
@@ -19732,7 +20705,7 @@ fn deletePointFromGeneratedDmlAstAlloc(
     if (where_range.start >= where_range.end or where_range.end > end) return error.UnsupportedSqlShape;
     const tail_start = if (where_range.start == 0) return error.UnsupportedSqlShape else where_range.start - 1;
     const after_portion = try generatedDmlOptionalTemporalPortionEnd(tokens, target_alias_end, tail_start);
-    try validateGeneratedDmlTailRanges(tokens, end, after_portion, ast.where_tokens, ast.returning_tokens, &ast.returning_items);
+    try validateGeneratedDmlTailRanges(tokens, end, after_portion, ast.where_tokens, ast.returning_tokens, &ast.returning_items, false);
     try validateGeneratedDmlWhereExpressionMetadata(tokens, end, ast);
 
     const parser_context = @import("parser_context.zig");
@@ -19799,6 +20772,7 @@ fn generatedReturningProjectionAlloc(
     returning_hooks: expr_projection.ReturningProjectionParserOptions,
 ) !plan_mod.ReturningProjection {
     if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    try validateGeneratedDmlReturningItemsRange(tokens, range, generated_returning_items);
     const scoped_tokens = tokens[0..range.end];
     pos.* = range.start;
     var generated_returning_hooks = returning_hooks;
@@ -19880,6 +20854,7 @@ fn generatedInsertValueRowsAlloc(
     if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
     if (columns.len == 0 or column_specs.len == 0) return error.UnsupportedSqlShape;
     try validateGeneratedDmlListItemsRange(tokens, range, value_rows);
+    try validateGeneratedDmlListExpressionsContainNoSubqueries(value_rows);
     if (value_rows.count == 0 or value_rows.items.len != value_rows.count) return error.UnsupportedSqlShape;
     var rows = std.ArrayListUnmanaged([]const []const u8).empty;
     errdefer {
@@ -25578,7 +26553,7 @@ test "sql adapter lower dml rejects stale generated CTE column alias expression 
 test "sql adapter lower dml lowers generated DML AST through typed write plans" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"kind":{"type":"keyword"},"source_id":{"type":"keyword"},"status":{"type":"keyword"},"organization_id":{"type":"keyword"},"quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"kind":{"type":"keyword"},"source_id":{"type":"keyword"},"status":{"type":"keyword"},"organization_id":{"type":"keyword"},"quantity":{"type":"numeric"},"active":{"type":"boolean"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
     defer runtime_schema.freeSchema(alloc, schema);
@@ -25632,7 +26607,7 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
 test "sql adapter lower dml rejects stale generated DML typed write-plan metadata" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"kind":{"type":"keyword"},"source_id":{"type":"keyword"},"status":{"type":"keyword"},"organization_id":{"type":"keyword"},"quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"kind":{"type":"keyword"},"source_id":{"type":"keyword"},"status":{"type":"keyword"},"organization_id":{"type":"keyword"},"quantity":{"type":"numeric"},"active":{"type":"boolean"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
     defer runtime_schema.freeSchema(alloc, schema);
@@ -25653,6 +26628,75 @@ test "sql adapter lower dml rejects stale generated DML typed write-plan metadat
         .row_claim = claim,
         .sync_level = .full_text,
     };
+
+    var generated_point_scalar_assignment_plan = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET quantity = (SELECT quantity FROM usage_records WHERE id = 'u1') WHERE id = 'u1' RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    generated_point_scalar_assignment_plan.deinit(alloc);
+    var generated_point_scalar_returning_update_plan = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'ready' WHERE id = 'u1' RETURNING (SELECT status FROM usage_records WHERE id = 'u1') AS returned_status",
+        schema,
+        &.{},
+        options,
+    );
+    defer generated_point_scalar_returning_update_plan.deinit(alloc);
+    switch (generated_point_scalar_returning_update_plan) {
+        .update_source => |source| {
+            try std.testing.expectEqual(@as(usize, 1), source.mutation.req.source.predicates.len);
+            try std.testing.expectEqualStrings("id", source.mutation.req.source.predicates[0].field);
+            try std.testing.expect(source.mutation.req.source.row_claim != null);
+            try std.testing.expectEqual(@as(usize, 1), source.mutation.req.source.scalar_subqueries.len);
+            try std.testing.expectEqual(@as(usize, 1), source.mutation.req.returning_expressions.len);
+            const projection = source.mutation.req.source.scalar_subqueries[0];
+            try std.testing.expect(projection.hidden);
+            try std.testing.expectEqualStrings("status", projection.output_field);
+            try std.testing.expectEqualStrings("returned_status", source.mutation.req.returning_expressions[0].output);
+            try std.testing.expectEqualStrings(projection.output, source.mutation.req.returning_expressions[0].expression.field);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    var generated_point_scalar_returning_delete_plan = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE id = 'u1' RETURNING (SELECT status FROM usage_records WHERE id = 'u1') AS returned_status",
+        schema,
+        &.{},
+        options,
+    );
+    defer generated_point_scalar_returning_delete_plan.deinit(alloc);
+    switch (generated_point_scalar_returning_delete_plan) {
+        .delete_source => |source| {
+            try std.testing.expectEqual(@as(usize, 1), source.mutation.req.source.predicates.len);
+            try std.testing.expectEqualStrings("id", source.mutation.req.source.predicates[0].field);
+            try std.testing.expect(source.mutation.req.source.row_claim != null);
+            try std.testing.expectEqual(@as(usize, 1), source.mutation.req.source.scalar_subqueries.len);
+            try std.testing.expectEqual(@as(usize, 1), source.mutation.req.returning_expressions.len);
+            const projection = source.mutation.req.source.scalar_subqueries[0];
+            try std.testing.expect(projection.hidden);
+            try std.testing.expectEqualStrings("status", projection.output_field);
+            try std.testing.expectEqualStrings("returned_status", source.mutation.req.returning_expressions[0].output);
+            try std.testing.expectEqualStrings(projection.output, source.mutation.req.returning_expressions[0].expression.field);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerGeneratedDmlWritePlanForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', 'ready', 1) ON CONFLICT (id) DO UPDATE SET quantity = (SELECT quantity FROM usage_records WHERE id = 'u1') RETURNING id",
+        schema,
+        &.{},
+        options,
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerGeneratedDmlWritePlanForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', (SELECT status FROM usage_records WHERE id = 'u2'), 1) RETURNING id",
+        schema,
+        &.{},
+        options,
+    ));
 
     var parsed_stale_no_conflict_expression = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -25794,6 +26838,33 @@ test "sql adapter lower dml rejects stale generated DML typed write-plan metadat
         ),
     );
 
+    const malformed_correlated_semijoin_update_sqls = [_][]const u8{
+        "UPDATE usage_records SET status = 'archived' WHERE usage_records.id IN (SELECT archived_records.organization_id FROM archived_records WHERE archived_records.status = usage_records.status) FOR UPDATE SKIP LOCKED RETURNING id",
+        "UPDATE usage_records SET status = 'archived' WHERE EXISTS (SELECT 1 FROM archived_records WHERE archived_records.organization_id = usage_records.id AND archived_records.status = 'archived') FOR UPDATE SKIP LOCKED RETURNING id",
+    };
+    for (malformed_correlated_semijoin_update_sqls) |sql| {
+        var parsed_malformed_correlated_semijoin_update = try tokenized.ParsedSql.initAlloc(alloc, sql);
+        defer parsed_malformed_correlated_semijoin_update.deinit(alloc);
+        const malformed_correlated_semijoin_update_ast = switch ((parsed_malformed_correlated_semijoin_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+            .dml => |ast| ast,
+            else => return error.TestUnexpectedResult,
+        };
+        const subquery = malformed_correlated_semijoin_update_ast.where_expression.right_expression orelse return error.TestUnexpectedResult;
+        const source_where = subquery.subquery_where_expression orelse return error.TestUnexpectedResult;
+        source_where.kind = .function_call;
+        try std.testing.expectError(
+            error.UnsupportedSqlShape,
+            updateJoinedSourceFromGeneratedDmlAstAlloc(
+                alloc,
+                &parsed_malformed_correlated_semijoin_update,
+                malformed_correlated_semijoin_update_ast,
+                schema,
+                &.{},
+                options,
+            ),
+        );
+    }
+
     var parsed_stale_generated_semijoin_update_without_source_where = try tokenized.ParsedSql.initAlloc(
         alloc,
         "UPDATE usage_records SET status = 'archived' WHERE usage_records.id IN (SELECT archived_records.id FROM archived_records) FOR UPDATE SKIP LOCKED RETURNING id",
@@ -25890,6 +26961,33 @@ test "sql adapter lower dml rejects stale generated DML typed write-plan metadat
             options,
         ),
     );
+
+    const malformed_correlated_semijoin_delete_sqls = [_][]const u8{
+        "DELETE FROM usage_records WHERE usage_records.id IN (SELECT archived_records.organization_id FROM archived_records WHERE archived_records.status = usage_records.status) FOR UPDATE SKIP LOCKED RETURNING id",
+        "DELETE FROM usage_records WHERE EXISTS (SELECT 1 FROM archived_records WHERE archived_records.organization_id = usage_records.id AND archived_records.status = 'archived') FOR UPDATE SKIP LOCKED RETURNING id",
+    };
+    for (malformed_correlated_semijoin_delete_sqls) |sql| {
+        var parsed_malformed_correlated_semijoin_delete = try tokenized.ParsedSql.initAlloc(alloc, sql);
+        defer parsed_malformed_correlated_semijoin_delete.deinit(alloc);
+        const malformed_correlated_semijoin_delete_ast = switch ((parsed_malformed_correlated_semijoin_delete.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+            .dml => |ast| ast,
+            else => return error.TestUnexpectedResult,
+        };
+        const subquery = malformed_correlated_semijoin_delete_ast.where_expression.right_expression orelse return error.TestUnexpectedResult;
+        const source_where = subquery.subquery_where_expression orelse return error.TestUnexpectedResult;
+        source_where.kind = .function_call;
+        try std.testing.expectError(
+            error.UnsupportedSqlShape,
+            deleteJoinedSourceFromGeneratedDmlAstAlloc(
+                alloc,
+                &parsed_malformed_correlated_semijoin_delete,
+                malformed_correlated_semijoin_delete_ast,
+                schema,
+                &.{},
+                options,
+            ),
+        );
+    }
 
     var missing_generated_dml_ast = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -27588,6 +28686,670 @@ test "sql adapter lower dml rejects stale generated DML insert-source write-plan
     try std.testing.expectEqual(@as(usize, 1), generated_source_update.mutation.req.operations.len);
     try std.testing.expectEqual(@as(usize, 1), generated_source_update.mutation.req.returning.len);
     try std.testing.expectEqual(@as(usize, 1), generated_source_update.mutation.req.returning_expressions.len);
+
+    var parsed_generated_scalar_assignment_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET quantity = (SELECT quantity FROM usage_records WHERE id = 'u1') WHERE organization_id = 'o1' FOR UPDATE SKIP LOCKED RETURNING id",
+    );
+    defer parsed_generated_scalar_assignment_update.deinit(alloc);
+    const generated_scalar_assignment_update_ast = switch ((parsed_generated_scalar_assignment_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_scalar_assignment_update = try updateSourceFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_scalar_assignment_update,
+        generated_scalar_assignment_update_ast,
+        schema,
+        &.{},
+        options,
+        .update_source,
+    );
+    defer generated_scalar_assignment_update.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), generated_scalar_assignment_update.mutation.req.operations.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_scalar_assignment_update.mutation.req.patch_expressions.len);
+    try std.testing.expectEqualStrings("quantity", generated_scalar_assignment_update.mutation.req.patch_expressions[0].field);
+    const scalar_assignment_expression = generated_scalar_assignment_update.mutation.req.patch_expressions[0].expression;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, scalar_assignment_expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), generated_scalar_assignment_update.mutation.req.source.scalar_subqueries.len);
+    const scalar_assignment_projection = generated_scalar_assignment_update.mutation.req.source.scalar_subqueries[0];
+    try std.testing.expect(scalar_assignment_projection.hidden);
+    try std.testing.expectEqualStrings(scalar_assignment_projection.output, scalar_assignment_expression.field);
+    try std.testing.expectEqualStrings("quantity", scalar_assignment_projection.output_field);
+    try std.testing.expectEqual(@as(usize, 1), scalar_assignment_projection.query.predicates.len);
+    try std.testing.expectEqualStrings("id", scalar_assignment_projection.query.predicates[0].field);
+
+    var generated_point_scalar_assignment_plan = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET quantity = (SELECT quantity FROM usage_records WHERE id = 'u1') WHERE id = 'u2' RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer generated_point_scalar_assignment_plan.deinit(alloc);
+    switch (generated_point_scalar_assignment_plan) {
+        .update_source => |generated_point_scalar_assignment| {
+            try std.testing.expectEqualStrings("usage_records", generated_point_scalar_assignment.table_name);
+            try std.testing.expectEqual(@as(usize, 1), generated_point_scalar_assignment.mutation.req.source.predicates.len);
+            try std.testing.expectEqualStrings("id", generated_point_scalar_assignment.mutation.req.source.predicates[0].field);
+            try std.testing.expect(generated_point_scalar_assignment.mutation.req.source.row_claim != null);
+            try std.testing.expectEqual(@as(usize, 0), generated_point_scalar_assignment.mutation.req.operations.len);
+            try std.testing.expectEqual(@as(usize, 1), generated_point_scalar_assignment.mutation.req.patch_expressions.len);
+            try std.testing.expectEqualStrings("quantity", generated_point_scalar_assignment.mutation.req.patch_expressions[0].field);
+            const point_scalar_assignment_expression = generated_point_scalar_assignment.mutation.req.patch_expressions[0].expression;
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, point_scalar_assignment_expression.kind);
+            try std.testing.expectEqual(@as(usize, 1), generated_point_scalar_assignment.mutation.req.source.scalar_subqueries.len);
+            const point_scalar_assignment_projection = generated_point_scalar_assignment.mutation.req.source.scalar_subqueries[0];
+            try std.testing.expect(point_scalar_assignment_projection.hidden);
+            try std.testing.expectEqualStrings(point_scalar_assignment_projection.output, point_scalar_assignment_expression.field);
+            try std.testing.expectEqualStrings("quantity", point_scalar_assignment_projection.output_field);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_point_scalar_row_assignment_plan = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET (quantity, status) = ROW((SELECT quantity FROM usage_records WHERE id = 'u1'), 'copied') WHERE id = 'u2' RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer generated_point_scalar_row_assignment_plan.deinit(alloc);
+    switch (generated_point_scalar_row_assignment_plan) {
+        .update_source => |generated_point_scalar_row_assignment| {
+            try std.testing.expectEqualStrings("usage_records", generated_point_scalar_row_assignment.table_name);
+            try std.testing.expectEqual(@as(usize, 1), generated_point_scalar_row_assignment.mutation.req.source.predicates.len);
+            try std.testing.expectEqualStrings("id", generated_point_scalar_row_assignment.mutation.req.source.predicates[0].field);
+            try std.testing.expect(generated_point_scalar_row_assignment.mutation.req.source.row_claim != null);
+            try std.testing.expectEqual(@as(usize, 1), generated_point_scalar_row_assignment.mutation.req.operations.len);
+            try std.testing.expectEqualStrings("status", generated_point_scalar_row_assignment.mutation.req.operations[0].path);
+            try std.testing.expectEqualStrings("\"copied\"", generated_point_scalar_row_assignment.mutation.req.operations[0].value_json.?);
+            try std.testing.expectEqual(@as(usize, 1), generated_point_scalar_row_assignment.mutation.req.patch_expressions.len);
+            try std.testing.expectEqualStrings("quantity", generated_point_scalar_row_assignment.mutation.req.patch_expressions[0].field);
+            const point_scalar_row_expression = generated_point_scalar_row_assignment.mutation.req.patch_expressions[0].expression;
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, point_scalar_row_expression.kind);
+            try std.testing.expectEqual(@as(usize, 1), generated_point_scalar_row_assignment.mutation.req.source.scalar_subqueries.len);
+            const point_scalar_row_projection = generated_point_scalar_row_assignment.mutation.req.source.scalar_subqueries[0];
+            try std.testing.expect(point_scalar_row_projection.hidden);
+            try std.testing.expectEqualStrings(point_scalar_row_projection.output, point_scalar_row_expression.field);
+            try std.testing.expectEqualStrings("quantity", point_scalar_row_projection.output_field);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_point_scalar_returning_plan = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'ready' WHERE id = 'u1' RETURNING (SELECT status FROM usage_records WHERE id = 'u1') AS returned_status",
+        schema,
+        &.{},
+        options,
+    );
+    defer generated_point_scalar_returning_plan.deinit(alloc);
+    switch (generated_point_scalar_returning_plan) {
+        .update_source => |generated_point_scalar_returning| {
+            try std.testing.expectEqualStrings("usage_records", generated_point_scalar_returning.table_name);
+            try std.testing.expectEqual(@as(usize, 1), generated_point_scalar_returning.mutation.req.source.predicates.len);
+            try std.testing.expectEqualStrings("id", generated_point_scalar_returning.mutation.req.source.predicates[0].field);
+            try std.testing.expect(generated_point_scalar_returning.mutation.req.source.row_claim != null);
+            try std.testing.expectEqual(@as(usize, 1), generated_point_scalar_returning.mutation.req.source.scalar_subqueries.len);
+            try std.testing.expectEqual(@as(usize, 1), generated_point_scalar_returning.mutation.req.returning_expressions.len);
+            const projection = generated_point_scalar_returning.mutation.req.source.scalar_subqueries[0];
+            try std.testing.expect(projection.hidden);
+            try std.testing.expectEqualStrings("status", projection.output_field);
+            try std.testing.expectEqualStrings("returned_status", generated_point_scalar_returning.mutation.req.returning_expressions[0].output);
+            try std.testing.expectEqualStrings(projection.output, generated_point_scalar_returning.mutation.req.returning_expressions[0].expression.field);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var parsed_generated_function_scalar_assignment_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET status = coalesce((SELECT status FROM usage_records WHERE id = 'u1'), 'missing') WHERE organization_id = 'o1' FOR UPDATE SKIP LOCKED RETURNING id",
+    );
+    defer parsed_generated_function_scalar_assignment_update.deinit(alloc);
+    const generated_function_scalar_assignment_update_ast = switch ((parsed_generated_function_scalar_assignment_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_function_scalar_assignment_update = try updateSourceFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_function_scalar_assignment_update,
+        generated_function_scalar_assignment_update_ast,
+        schema,
+        &.{},
+        options,
+        .update_source,
+    );
+    defer generated_function_scalar_assignment_update.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), generated_function_scalar_assignment_update.mutation.req.patch_expressions.len);
+    try std.testing.expectEqualStrings("status", generated_function_scalar_assignment_update.mutation.req.patch_expressions[0].field);
+    const function_scalar_expression = generated_function_scalar_assignment_update.mutation.req.patch_expressions[0].expression;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.coalesce, function_scalar_expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), function_scalar_expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_function_scalar_assignment_update.mutation.req.source.scalar_subqueries.len);
+    const function_scalar_projection = generated_function_scalar_assignment_update.mutation.req.source.scalar_subqueries[0];
+    try std.testing.expect(function_scalar_projection.hidden);
+    try std.testing.expectEqualStrings(function_scalar_projection.output, function_scalar_expression.operands[0].field);
+    try std.testing.expectEqualStrings("status", function_scalar_projection.output_field);
+
+    var parsed_generated_nullif_scalar_assignment_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET status = nullif((SELECT status FROM usage_records WHERE id = 'u1'), 'blocked') WHERE organization_id = 'o1' FOR UPDATE SKIP LOCKED RETURNING id",
+    );
+    defer parsed_generated_nullif_scalar_assignment_update.deinit(alloc);
+    const generated_nullif_scalar_assignment_update_ast = switch ((parsed_generated_nullif_scalar_assignment_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_nullif_scalar_assignment_update = try updateSourceFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_nullif_scalar_assignment_update,
+        generated_nullif_scalar_assignment_update_ast,
+        schema,
+        &.{},
+        options,
+        .update_source,
+    );
+    defer generated_nullif_scalar_assignment_update.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), generated_nullif_scalar_assignment_update.mutation.req.patch_expressions.len);
+    try std.testing.expectEqualStrings("status", generated_nullif_scalar_assignment_update.mutation.req.patch_expressions[0].field);
+    const nullif_scalar_expression = generated_nullif_scalar_assignment_update.mutation.req.patch_expressions[0].expression;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.nullif, nullif_scalar_expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), nullif_scalar_expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_nullif_scalar_assignment_update.mutation.req.source.scalar_subqueries.len);
+    const nullif_scalar_projection = generated_nullif_scalar_assignment_update.mutation.req.source.scalar_subqueries[0];
+    try std.testing.expect(nullif_scalar_projection.hidden);
+    try std.testing.expectEqualStrings(nullif_scalar_projection.output, nullif_scalar_expression.operands[0].field);
+    try std.testing.expectEqualStrings("status", nullif_scalar_projection.output_field);
+
+    var parsed_generated_greatest_scalar_assignment_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET quantity = greatest((SELECT quantity FROM usage_records WHERE id = 'u1'), 1) WHERE organization_id = 'o1' FOR UPDATE SKIP LOCKED RETURNING id",
+    );
+    defer parsed_generated_greatest_scalar_assignment_update.deinit(alloc);
+    const generated_greatest_scalar_assignment_update_ast = switch ((parsed_generated_greatest_scalar_assignment_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_greatest_scalar_assignment_update = try updateSourceFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_greatest_scalar_assignment_update,
+        generated_greatest_scalar_assignment_update_ast,
+        schema,
+        &.{},
+        options,
+        .update_source,
+    );
+    defer generated_greatest_scalar_assignment_update.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), generated_greatest_scalar_assignment_update.mutation.req.patch_expressions.len);
+    try std.testing.expectEqualStrings("quantity", generated_greatest_scalar_assignment_update.mutation.req.patch_expressions[0].field);
+    const greatest_scalar_expression = generated_greatest_scalar_assignment_update.mutation.req.patch_expressions[0].expression;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.greatest, greatest_scalar_expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), greatest_scalar_expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_greatest_scalar_assignment_update.mutation.req.source.scalar_subqueries.len);
+    const greatest_scalar_projection = generated_greatest_scalar_assignment_update.mutation.req.source.scalar_subqueries[0];
+    try std.testing.expect(greatest_scalar_projection.hidden);
+    try std.testing.expectEqualStrings(greatest_scalar_projection.output, greatest_scalar_expression.operands[0].field);
+    try std.testing.expectEqualStrings("quantity", greatest_scalar_projection.output_field);
+
+    var parsed_generated_least_scalar_assignment_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET quantity = least((SELECT quantity FROM usage_records WHERE id = 'u1'), 99) WHERE organization_id = 'o1' FOR UPDATE SKIP LOCKED RETURNING id",
+    );
+    defer parsed_generated_least_scalar_assignment_update.deinit(alloc);
+    const generated_least_scalar_assignment_update_ast = switch ((parsed_generated_least_scalar_assignment_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_least_scalar_assignment_update = try updateSourceFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_least_scalar_assignment_update,
+        generated_least_scalar_assignment_update_ast,
+        schema,
+        &.{},
+        options,
+        .update_source,
+    );
+    defer generated_least_scalar_assignment_update.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), generated_least_scalar_assignment_update.mutation.req.patch_expressions.len);
+    try std.testing.expectEqualStrings("quantity", generated_least_scalar_assignment_update.mutation.req.patch_expressions[0].field);
+    const least_scalar_expression = generated_least_scalar_assignment_update.mutation.req.patch_expressions[0].expression;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.least, least_scalar_expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), least_scalar_expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_least_scalar_assignment_update.mutation.req.source.scalar_subqueries.len);
+    const least_scalar_projection = generated_least_scalar_assignment_update.mutation.req.source.scalar_subqueries[0];
+    try std.testing.expect(least_scalar_projection.hidden);
+    try std.testing.expectEqualStrings(least_scalar_projection.output, least_scalar_expression.operands[0].field);
+    try std.testing.expectEqualStrings("quantity", least_scalar_projection.output_field);
+
+    var parsed_generated_arithmetic_scalar_assignment_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET quantity = -((SELECT quantity FROM usage_records WHERE id = 'u1') + 1) WHERE organization_id = 'o1' FOR UPDATE SKIP LOCKED RETURNING id",
+    );
+    defer parsed_generated_arithmetic_scalar_assignment_update.deinit(alloc);
+    const generated_arithmetic_scalar_assignment_update_ast = switch ((parsed_generated_arithmetic_scalar_assignment_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_arithmetic_scalar_assignment_update = try updateSourceFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_arithmetic_scalar_assignment_update,
+        generated_arithmetic_scalar_assignment_update_ast,
+        schema,
+        &.{},
+        options,
+        .update_source,
+    );
+    defer generated_arithmetic_scalar_assignment_update.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), generated_arithmetic_scalar_assignment_update.mutation.req.patch_expressions.len);
+    try std.testing.expectEqualStrings("quantity", generated_arithmetic_scalar_assignment_update.mutation.req.patch_expressions[0].field);
+    const arithmetic_scalar_expression = generated_arithmetic_scalar_assignment_update.mutation.req.patch_expressions[0].expression;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.mul, arithmetic_scalar_expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), arithmetic_scalar_expression.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, arithmetic_scalar_expression.operands[1].kind);
+    try std.testing.expectEqual(@as(usize, 1), generated_arithmetic_scalar_assignment_update.mutation.req.source.scalar_subqueries.len);
+    const arithmetic_scalar_projection = generated_arithmetic_scalar_assignment_update.mutation.req.source.scalar_subqueries[0];
+    try std.testing.expect(arithmetic_scalar_projection.hidden);
+    try std.testing.expectEqualStrings(arithmetic_scalar_projection.output, arithmetic_scalar_expression.operands[1].operands[0].field);
+    try std.testing.expectEqualStrings("quantity", arithmetic_scalar_projection.output_field);
+
+    var parsed_generated_cast_scalar_assignment_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET status = CAST((SELECT quantity FROM usage_records WHERE id = 'u1') AS text) WHERE organization_id = 'o1' FOR UPDATE SKIP LOCKED RETURNING id",
+    );
+    defer parsed_generated_cast_scalar_assignment_update.deinit(alloc);
+    const generated_cast_scalar_assignment_update_ast = switch ((parsed_generated_cast_scalar_assignment_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_cast_scalar_assignment_update = try updateSourceFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_cast_scalar_assignment_update,
+        generated_cast_scalar_assignment_update_ast,
+        schema,
+        &.{},
+        options,
+        .update_source,
+    );
+    defer generated_cast_scalar_assignment_update.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), generated_cast_scalar_assignment_update.mutation.req.patch_expressions.len);
+    try std.testing.expectEqualStrings("status", generated_cast_scalar_assignment_update.mutation.req.patch_expressions[0].field);
+    const cast_scalar_expression = generated_cast_scalar_assignment_update.mutation.req.patch_expressions[0].expression;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.cast, cast_scalar_expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionCastType.text, cast_scalar_expression.cast_type.?);
+    try std.testing.expectEqual(@as(usize, 1), cast_scalar_expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_cast_scalar_assignment_update.mutation.req.source.scalar_subqueries.len);
+    const cast_scalar_projection = generated_cast_scalar_assignment_update.mutation.req.source.scalar_subqueries[0];
+    try std.testing.expect(cast_scalar_projection.hidden);
+    try std.testing.expectEqualStrings(cast_scalar_projection.output, cast_scalar_expression.operands[0].field);
+    try std.testing.expectEqualStrings("quantity", cast_scalar_projection.output_field);
+
+    var parsed_generated_unary_text_scalar_assignment_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET status = upper((SELECT status FROM usage_records WHERE id = 'u1')) WHERE organization_id = 'o1' FOR UPDATE SKIP LOCKED RETURNING id",
+    );
+    defer parsed_generated_unary_text_scalar_assignment_update.deinit(alloc);
+    const generated_unary_text_scalar_assignment_update_ast = switch ((parsed_generated_unary_text_scalar_assignment_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_unary_text_scalar_assignment_update = try updateSourceFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_unary_text_scalar_assignment_update,
+        generated_unary_text_scalar_assignment_update_ast,
+        schema,
+        &.{},
+        options,
+        .update_source,
+    );
+    defer generated_unary_text_scalar_assignment_update.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), generated_unary_text_scalar_assignment_update.mutation.req.patch_expressions.len);
+    try std.testing.expectEqualStrings("status", generated_unary_text_scalar_assignment_update.mutation.req.patch_expressions[0].field);
+    const unary_text_scalar_expression = generated_unary_text_scalar_assignment_update.mutation.req.patch_expressions[0].expression;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.upper, unary_text_scalar_expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), unary_text_scalar_expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_unary_text_scalar_assignment_update.mutation.req.source.scalar_subqueries.len);
+    const unary_text_scalar_projection = generated_unary_text_scalar_assignment_update.mutation.req.source.scalar_subqueries[0];
+    try std.testing.expect(unary_text_scalar_projection.hidden);
+    try std.testing.expectEqualStrings(unary_text_scalar_projection.output, unary_text_scalar_expression.operands[0].field);
+    try std.testing.expectEqualStrings("status", unary_text_scalar_projection.output_field);
+
+    var parsed_generated_unary_numeric_scalar_assignment_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET quantity = round((SELECT quantity FROM usage_records WHERE id = 'u1')) WHERE organization_id = 'o1' FOR UPDATE SKIP LOCKED RETURNING id",
+    );
+    defer parsed_generated_unary_numeric_scalar_assignment_update.deinit(alloc);
+    const generated_unary_numeric_scalar_assignment_update_ast = switch ((parsed_generated_unary_numeric_scalar_assignment_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_unary_numeric_scalar_assignment_update = try updateSourceFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_unary_numeric_scalar_assignment_update,
+        generated_unary_numeric_scalar_assignment_update_ast,
+        schema,
+        &.{},
+        options,
+        .update_source,
+    );
+    defer generated_unary_numeric_scalar_assignment_update.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), generated_unary_numeric_scalar_assignment_update.mutation.req.patch_expressions.len);
+    try std.testing.expectEqualStrings("quantity", generated_unary_numeric_scalar_assignment_update.mutation.req.patch_expressions[0].field);
+    const unary_numeric_scalar_expression = generated_unary_numeric_scalar_assignment_update.mutation.req.patch_expressions[0].expression;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.round, unary_numeric_scalar_expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), unary_numeric_scalar_expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_unary_numeric_scalar_assignment_update.mutation.req.source.scalar_subqueries.len);
+    const unary_numeric_scalar_projection = generated_unary_numeric_scalar_assignment_update.mutation.req.source.scalar_subqueries[0];
+    try std.testing.expect(unary_numeric_scalar_projection.hidden);
+    try std.testing.expectEqualStrings(unary_numeric_scalar_projection.output, unary_numeric_scalar_expression.operands[0].field);
+    try std.testing.expectEqualStrings("quantity", unary_numeric_scalar_projection.output_field);
+
+    var parsed_generated_case_scalar_assignment_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET status = CASE WHEN status = 'active' THEN (SELECT status FROM usage_records WHERE id = 'u1') ELSE 'missing' END WHERE organization_id = 'o1' FOR UPDATE SKIP LOCKED RETURNING id",
+    );
+    defer parsed_generated_case_scalar_assignment_update.deinit(alloc);
+    const generated_case_scalar_assignment_update_ast = switch ((parsed_generated_case_scalar_assignment_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_case_scalar_assignment_update = try updateSourceFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_case_scalar_assignment_update,
+        generated_case_scalar_assignment_update_ast,
+        schema,
+        &.{},
+        options,
+        .update_source,
+    );
+    defer generated_case_scalar_assignment_update.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), generated_case_scalar_assignment_update.mutation.req.patch_expressions.len);
+    try std.testing.expectEqualStrings("status", generated_case_scalar_assignment_update.mutation.req.patch_expressions[0].field);
+    const case_scalar_expression = generated_case_scalar_assignment_update.mutation.req.patch_expressions[0].expression;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.case, case_scalar_expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), case_scalar_expression.case_branches.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, case_scalar_expression.case_branches[0].when.op);
+    try std.testing.expectEqualStrings("status", case_scalar_expression.case_branches[0].when.lhs.field);
+    try std.testing.expectEqual(@as(usize, 1), generated_case_scalar_assignment_update.mutation.req.source.scalar_subqueries.len);
+    const case_scalar_projection = generated_case_scalar_assignment_update.mutation.req.source.scalar_subqueries[0];
+    try std.testing.expect(case_scalar_projection.hidden);
+    try std.testing.expectEqualStrings(case_scalar_projection.output, case_scalar_expression.case_branches[0].then.field);
+    try std.testing.expectEqualStrings("status", case_scalar_projection.output_field);
+
+    var parsed_generated_unary_text_numeric_scalar_assignment_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET quantity = length((SELECT status FROM usage_records WHERE id = 'u1')) WHERE organization_id = 'o1' FOR UPDATE SKIP LOCKED RETURNING id",
+    );
+    defer parsed_generated_unary_text_numeric_scalar_assignment_update.deinit(alloc);
+    const generated_unary_text_numeric_scalar_assignment_update_ast = switch ((parsed_generated_unary_text_numeric_scalar_assignment_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_unary_text_numeric_scalar_assignment_update = try updateSourceFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_unary_text_numeric_scalar_assignment_update,
+        generated_unary_text_numeric_scalar_assignment_update_ast,
+        schema,
+        &.{},
+        options,
+        .update_source,
+    );
+    defer generated_unary_text_numeric_scalar_assignment_update.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), generated_unary_text_numeric_scalar_assignment_update.mutation.req.patch_expressions.len);
+    try std.testing.expectEqualStrings("quantity", generated_unary_text_numeric_scalar_assignment_update.mutation.req.patch_expressions[0].field);
+    const unary_text_numeric_scalar_expression = generated_unary_text_numeric_scalar_assignment_update.mutation.req.patch_expressions[0].expression;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.length, unary_text_numeric_scalar_expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), unary_text_numeric_scalar_expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_unary_text_numeric_scalar_assignment_update.mutation.req.source.scalar_subqueries.len);
+    const unary_text_numeric_scalar_projection = generated_unary_text_numeric_scalar_assignment_update.mutation.req.source.scalar_subqueries[0];
+    try std.testing.expect(unary_text_numeric_scalar_projection.hidden);
+    try std.testing.expectEqualStrings(unary_text_numeric_scalar_projection.output, unary_text_numeric_scalar_expression.operands[0].field);
+    try std.testing.expectEqualStrings("status", unary_text_numeric_scalar_projection.output_field);
+
+    var parsed_generated_binary_scalar_assignment_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET quantity = power((SELECT quantity FROM usage_records WHERE id = 'u1'), 2) WHERE organization_id = 'o1' FOR UPDATE SKIP LOCKED RETURNING id",
+    );
+    defer parsed_generated_binary_scalar_assignment_update.deinit(alloc);
+    const generated_binary_scalar_assignment_update_ast = switch ((parsed_generated_binary_scalar_assignment_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_binary_scalar_assignment_update = try updateSourceFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_binary_scalar_assignment_update,
+        generated_binary_scalar_assignment_update_ast,
+        schema,
+        &.{},
+        options,
+        .update_source,
+    );
+    defer generated_binary_scalar_assignment_update.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), generated_binary_scalar_assignment_update.mutation.req.patch_expressions.len);
+    try std.testing.expectEqualStrings("quantity", generated_binary_scalar_assignment_update.mutation.req.patch_expressions[0].field);
+    const binary_scalar_expression = generated_binary_scalar_assignment_update.mutation.req.patch_expressions[0].expression;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.power, binary_scalar_expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), binary_scalar_expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_binary_scalar_assignment_update.mutation.req.source.scalar_subqueries.len);
+    const binary_scalar_projection = generated_binary_scalar_assignment_update.mutation.req.source.scalar_subqueries[0];
+    try std.testing.expect(binary_scalar_projection.hidden);
+    try std.testing.expectEqualStrings(binary_scalar_projection.output, binary_scalar_expression.operands[0].field);
+    try std.testing.expectEqualStrings("quantity", binary_scalar_projection.output_field);
+
+    var parsed_generated_concat_scalar_assignment_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET status = concat((SELECT status FROM usage_records WHERE id = 'u1'), '-copy') WHERE organization_id = 'o1' FOR UPDATE SKIP LOCKED RETURNING id",
+    );
+    defer parsed_generated_concat_scalar_assignment_update.deinit(alloc);
+    const generated_concat_scalar_assignment_update_ast = switch ((parsed_generated_concat_scalar_assignment_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_concat_scalar_assignment_update = try updateSourceFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_concat_scalar_assignment_update,
+        generated_concat_scalar_assignment_update_ast,
+        schema,
+        &.{},
+        options,
+        .update_source,
+    );
+    defer generated_concat_scalar_assignment_update.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), generated_concat_scalar_assignment_update.mutation.req.patch_expressions.len);
+    try std.testing.expectEqualStrings("status", generated_concat_scalar_assignment_update.mutation.req.patch_expressions[0].field);
+    const concat_scalar_expression = generated_concat_scalar_assignment_update.mutation.req.patch_expressions[0].expression;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.concat, concat_scalar_expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), concat_scalar_expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_concat_scalar_assignment_update.mutation.req.source.scalar_subqueries.len);
+    const concat_scalar_projection = generated_concat_scalar_assignment_update.mutation.req.source.scalar_subqueries[0];
+    try std.testing.expect(concat_scalar_projection.hidden);
+    try std.testing.expectEqualStrings(concat_scalar_projection.output, concat_scalar_expression.operands[0].field);
+    try std.testing.expectEqualStrings("status", concat_scalar_projection.output_field);
+    try std.testing.expectEqualStrings("\"-copy\"", concat_scalar_expression.operands[1].value_json);
+
+    var parsed_generated_split_part_scalar_assignment_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET status = split_part((SELECT status FROM usage_records WHERE id = 'u1'), '-', 1) WHERE organization_id = 'o1' FOR UPDATE SKIP LOCKED RETURNING id",
+    );
+    defer parsed_generated_split_part_scalar_assignment_update.deinit(alloc);
+    const generated_split_part_scalar_assignment_update_ast = switch ((parsed_generated_split_part_scalar_assignment_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_split_part_scalar_assignment_update = try updateSourceFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_split_part_scalar_assignment_update,
+        generated_split_part_scalar_assignment_update_ast,
+        schema,
+        &.{},
+        options,
+        .update_source,
+    );
+    defer generated_split_part_scalar_assignment_update.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), generated_split_part_scalar_assignment_update.mutation.req.patch_expressions.len);
+    try std.testing.expectEqualStrings("status", generated_split_part_scalar_assignment_update.mutation.req.patch_expressions[0].field);
+    const split_part_scalar_expression = generated_split_part_scalar_assignment_update.mutation.req.patch_expressions[0].expression;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.split_part, split_part_scalar_expression.kind);
+    try std.testing.expectEqual(@as(usize, 3), split_part_scalar_expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_split_part_scalar_assignment_update.mutation.req.source.scalar_subqueries.len);
+    const split_part_scalar_projection = generated_split_part_scalar_assignment_update.mutation.req.source.scalar_subqueries[0];
+    try std.testing.expect(split_part_scalar_projection.hidden);
+    try std.testing.expectEqualStrings(split_part_scalar_projection.output, split_part_scalar_expression.operands[0].field);
+    try std.testing.expectEqualStrings("status", split_part_scalar_projection.output_field);
+    try std.testing.expectEqualStrings("\"-\"", split_part_scalar_expression.operands[1].value_json);
+    try std.testing.expectEqualStrings("1", split_part_scalar_expression.operands[2].value_json);
+
+    var parsed_generated_regexp_count_scalar_assignment_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET quantity = regexp_count((SELECT status FROM usage_records WHERE id = 'u1'), '[0-9]+') WHERE organization_id = 'o1' FOR UPDATE SKIP LOCKED RETURNING id",
+    );
+    defer parsed_generated_regexp_count_scalar_assignment_update.deinit(alloc);
+    const generated_regexp_count_scalar_assignment_update_ast = switch ((parsed_generated_regexp_count_scalar_assignment_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_regexp_count_scalar_assignment_update = try updateSourceFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_regexp_count_scalar_assignment_update,
+        generated_regexp_count_scalar_assignment_update_ast,
+        schema,
+        &.{},
+        options,
+        .update_source,
+    );
+    defer generated_regexp_count_scalar_assignment_update.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), generated_regexp_count_scalar_assignment_update.mutation.req.patch_expressions.len);
+    try std.testing.expectEqualStrings("quantity", generated_regexp_count_scalar_assignment_update.mutation.req.patch_expressions[0].field);
+    const regexp_count_scalar_expression = generated_regexp_count_scalar_assignment_update.mutation.req.patch_expressions[0].expression;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_count, regexp_count_scalar_expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), regexp_count_scalar_expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_regexp_count_scalar_assignment_update.mutation.req.source.scalar_subqueries.len);
+    const regexp_count_scalar_projection = generated_regexp_count_scalar_assignment_update.mutation.req.source.scalar_subqueries[0];
+    try std.testing.expect(regexp_count_scalar_projection.hidden);
+    try std.testing.expectEqualStrings(regexp_count_scalar_projection.output, regexp_count_scalar_expression.operands[0].field);
+    try std.testing.expectEqualStrings("status", regexp_count_scalar_projection.output_field);
+    try std.testing.expectEqualStrings("\"[0-9]+\"", regexp_count_scalar_expression.operands[1].value_json);
+
+    var parsed_generated_scalar_row_assignment_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET (quantity, status) = ROW((SELECT quantity FROM usage_records WHERE id = 'u1'), 'copied') WHERE organization_id = 'o1' FOR UPDATE SKIP LOCKED RETURNING id",
+    );
+    defer parsed_generated_scalar_row_assignment_update.deinit(alloc);
+    const generated_scalar_row_assignment_update_ast = switch ((parsed_generated_scalar_row_assignment_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_scalar_row_assignment_update = try updateSourceFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_scalar_row_assignment_update,
+        generated_scalar_row_assignment_update_ast,
+        schema,
+        &.{},
+        options,
+        .update_source,
+    );
+    defer generated_scalar_row_assignment_update.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), generated_scalar_row_assignment_update.mutation.req.operations.len);
+    try std.testing.expectEqualStrings("status", generated_scalar_row_assignment_update.mutation.req.operations[0].path);
+    try std.testing.expectEqualStrings("\"copied\"", generated_scalar_row_assignment_update.mutation.req.operations[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), generated_scalar_row_assignment_update.mutation.req.patch_expressions.len);
+    try std.testing.expectEqualStrings("quantity", generated_scalar_row_assignment_update.mutation.req.patch_expressions[0].field);
+    const scalar_row_expression = generated_scalar_row_assignment_update.mutation.req.patch_expressions[0].expression;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, scalar_row_expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), generated_scalar_row_assignment_update.mutation.req.source.scalar_subqueries.len);
+    const scalar_row_projection = generated_scalar_row_assignment_update.mutation.req.source.scalar_subqueries[0];
+    try std.testing.expect(scalar_row_projection.hidden);
+    try std.testing.expectEqualStrings(scalar_row_projection.output, scalar_row_expression.field);
+    try std.testing.expectEqualStrings("quantity", scalar_row_projection.output_field);
+
+    var parsed_generated_scalar_returning_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'copied' WHERE organization_id = 'o1' FOR UPDATE SKIP LOCKED RETURNING (SELECT status FROM usage_records WHERE id = 'u1') AS returned_status",
+    );
+    defer parsed_generated_scalar_returning_update.deinit(alloc);
+    const generated_scalar_returning_update_ast = switch ((parsed_generated_scalar_returning_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_scalar_returning_update = try updateSourceFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_scalar_returning_update,
+        generated_scalar_returning_update_ast,
+        schema,
+        &.{},
+        options,
+        .update_source,
+    );
+    defer generated_scalar_returning_update.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), generated_scalar_returning_update.mutation.req.source.scalar_subqueries.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_scalar_returning_update.mutation.req.returning_expressions.len);
+    const scalar_returning_projection = generated_scalar_returning_update.mutation.req.source.scalar_subqueries[0];
+    try std.testing.expect(scalar_returning_projection.hidden);
+    try std.testing.expectEqualStrings("status", scalar_returning_projection.output_field);
+    try std.testing.expectEqualStrings("returned_status", generated_scalar_returning_update.mutation.req.returning_expressions[0].output);
+    try std.testing.expectEqualStrings(scalar_returning_projection.output, generated_scalar_returning_update.mutation.req.returning_expressions[0].expression.field);
+
+    var parsed_generated_function_scalar_returning_delete = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE organization_id = 'o1' FOR UPDATE SKIP LOCKED RETURNING upper((SELECT status FROM usage_records WHERE id = 'u1')) AS returned_status",
+    );
+    defer parsed_generated_function_scalar_returning_delete.deinit(alloc);
+    const generated_function_scalar_returning_delete_ast = switch ((parsed_generated_function_scalar_returning_delete.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_function_scalar_returning_delete = try deleteSourceFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_function_scalar_returning_delete,
+        generated_function_scalar_returning_delete_ast,
+        schema,
+        &.{},
+        options,
+        parsed_generated_function_scalar_returning_delete.writeStatementKindIncludingGeneratedAst() orelse return error.TestUnexpectedResult,
+    );
+    defer generated_function_scalar_returning_delete.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), generated_function_scalar_returning_delete.mutation.req.source.scalar_subqueries.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_function_scalar_returning_delete.mutation.req.returning_expressions.len);
+    const function_scalar_returning_projection = generated_function_scalar_returning_delete.mutation.req.source.scalar_subqueries[0];
+    const function_scalar_returning_expression = generated_function_scalar_returning_delete.mutation.req.returning_expressions[0].expression;
+    try std.testing.expect(function_scalar_returning_projection.hidden);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.upper, function_scalar_returning_expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), function_scalar_returning_expression.operands.len);
+    try std.testing.expectEqualStrings(function_scalar_returning_projection.output, function_scalar_returning_expression.operands[0].field);
+
+    const stale_generated_scalar_row_assignment_ast = generated_scalar_row_assignment_update_ast;
+    const stale_row_assignment_rhs = stale_generated_scalar_row_assignment_ast.assignment_items.expressions[0].right_expression orelse return error.TestUnexpectedResult;
+    if (stale_row_assignment_rhs.argument_items.expressions.len == 0) return error.TestUnexpectedResult;
+    stale_row_assignment_rhs.argument_items.expressions[0].kind = .current_date;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        updateSourceFromGeneratedDmlAstAlloc(
+            alloc,
+            &parsed_generated_scalar_row_assignment_update,
+            stale_generated_scalar_row_assignment_ast,
+            schema,
+            &.{},
+            options,
+            .update_source,
+        ),
+    );
+
+    const stale_generated_scalar_assignment_ast = generated_scalar_assignment_update_ast;
+    const stale_scalar_assignment_rhs = stale_generated_scalar_assignment_ast.assignment_items.expressions[0].right_expression orelse return error.TestUnexpectedResult;
+    stale_scalar_assignment_rhs.kind = .function_call;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        updateSourceFromGeneratedDmlAstAlloc(
+            alloc,
+            &parsed_generated_scalar_assignment_update,
+            stale_generated_scalar_assignment_ast,
+            schema,
+            &.{},
+            options,
+            .update_source,
+        ),
+    );
+
     var stale_generated_source_update_where_expression_ast = generated_source_update_ast;
     stale_generated_source_update_where_expression_ast.where_expression.kind = .function_call;
     try std.testing.expectError(
@@ -29399,6 +31161,11 @@ test "sql adapter lower dml rejects stale generated targetless conflict do nothi
         ast.conflict_assignments_tokens,
         ast.conflict_action_tokens,
         ast.conflict_action_kind,
+        null,
+        null,
+        null,
+        null,
+        null,
         parser_context.ParserState.ContextAccessors.conflictAssignmentExpressionParserOptions(&parser_state),
         parser_context.ParserState.ContextAccessors.conflictExpressionDispatchOptions(&parser_state),
     );
@@ -29424,6 +31191,11 @@ test "sql adapter lower dml rejects stale generated targetless conflict do nothi
         ast.conflict_assignments_tokens,
         ast.conflict_action_tokens,
         .update,
+        null,
+        null,
+        null,
+        null,
+        null,
         parser_context.ParserState.ContextAccessors.conflictAssignmentExpressionParserOptions(&parser_state),
         parser_context.ParserState.ContextAccessors.conflictExpressionDispatchOptions(&parser_state),
     ));
@@ -29458,6 +31230,11 @@ test "sql adapter lower dml rejects stale generated targetless conflict do nothi
         stale_target_ast.conflict_assignments_tokens,
         stale_target_ast.conflict_action_tokens,
         stale_target_ast.conflict_action_kind,
+        null,
+        null,
+        null,
+        null,
+        null,
         parser_context.ParserState.ContextAccessors.conflictAssignmentExpressionParserOptions(&stale_target_state),
         parser_context.ParserState.ContextAccessors.conflictExpressionDispatchOptions(&stale_target_state),
     ));
@@ -29492,6 +31269,11 @@ test "sql adapter lower dml rejects stale generated targetless conflict do nothi
         stale_assignment_ast.conflict_assignments_tokens,
         stale_assignment_ast.conflict_action_tokens,
         stale_assignment_ast.conflict_action_kind,
+        null,
+        null,
+        null,
+        null,
+        null,
         parser_context.ParserState.ContextAccessors.conflictAssignmentExpressionParserOptions(&stale_assignment_state),
         parser_context.ParserState.ContextAccessors.conflictExpressionDispatchOptions(&stale_assignment_state),
     ));
@@ -29552,6 +31334,11 @@ test "sql adapter lower dml rejects stale generated conflict update assignment h
         ast.conflict_assignments_tokens,
         ast.conflict_action_tokens,
         ast.conflict_action_kind,
+        null,
+        null,
+        null,
+        null,
+        null,
         parser_context.ParserState.ContextAccessors.conflictAssignmentExpressionParserOptions(&parser_state),
         parser_context.ParserState.ContextAccessors.conflictExpressionDispatchOptions(&parser_state),
     );
@@ -29577,6 +31364,11 @@ test "sql adapter lower dml rejects stale generated conflict update assignment h
         ast.conflict_assignments_tokens,
         ast.conflict_action_tokens,
         .nothing,
+        null,
+        null,
+        null,
+        null,
+        null,
         parser_context.ParserState.ContextAccessors.conflictAssignmentExpressionParserOptions(&parser_state),
         parser_context.ParserState.ContextAccessors.conflictExpressionDispatchOptions(&parser_state),
     ));
@@ -29600,6 +31392,11 @@ test "sql adapter lower dml rejects stale generated conflict update assignment h
         null,
         ast.conflict_action_tokens,
         ast.conflict_action_kind,
+        null,
+        null,
+        null,
+        null,
+        null,
         parser_context.ParserState.ContextAccessors.conflictAssignmentExpressionParserOptions(&parser_state),
         parser_context.ParserState.ContextAccessors.conflictExpressionDispatchOptions(&parser_state),
     ));
@@ -29621,6 +31418,11 @@ test "sql adapter lower dml rejects stale generated conflict update assignment h
         parser_context.ParserState.ContextAccessors.conflictUpdateSetAssignmentParserOptions(&parser_state, insert_columns[0..], &.{}),
         &ast.conflict_assignment_items,
         ast.conflict_assignments_tokens,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         parser_context.ParserState.ContextAccessors.conflictAssignmentExpressionParserOptions(&parser_state),
@@ -29757,6 +31559,11 @@ test "sql adapter lower dml rejects stale generated conflict predicate parent ho
         action_ast.conflict_assignments_tokens,
         action_ast.conflict_action_tokens,
         action_ast.conflict_action_kind,
+        null,
+        null,
+        null,
+        null,
+        null,
         parser_context.ParserState.ContextAccessors.conflictAssignmentExpressionParserOptions(&action_state),
         parser_context.ParserState.ContextAccessors.conflictExpressionDispatchOptions(&action_state),
     );
@@ -29781,6 +31588,11 @@ test "sql adapter lower dml rejects stale generated conflict predicate parent ho
         parser_context.ParserState.ContextAccessors.conflictUpdateSetAssignmentParserOptions(&stale_action_state, insert_columns[0..], &.{}),
         &action_ast.conflict_assignment_items,
         action_ast.conflict_assignments_tokens,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         parser_context.ParserState.ContextAccessors.conflictAssignmentExpressionParserOptions(&stale_action_state),
@@ -29808,6 +31620,11 @@ test "sql adapter lower dml rejects stale generated conflict predicate parent ho
         action_ast.conflict_assignments_tokens,
         action_ast.conflict_action_tokens,
         action_ast.conflict_action_kind,
+        null,
+        null,
+        null,
+        null,
+        null,
         parser_context.ParserState.ContextAccessors.conflictAssignmentExpressionParserOptions(&stale_action_where_state),
         parser_context.ParserState.ContextAccessors.conflictExpressionDispatchOptions(&stale_action_where_state),
     ));
@@ -30589,6 +32406,30 @@ test "sql adapter lower dml rejects stale generated insert value row list adornm
             options,
         ),
     );
+
+    var stale_subquery_parsed = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', 'ready', 1), ('u2', 'queued', 2) RETURNING id",
+    );
+    defer stale_subquery_parsed.deinit(alloc);
+    var stale_subquery_ast = switch ((stale_subquery_parsed.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |generated_ast| generated_ast,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 2), stale_subquery_ast.insert_value_rows.count);
+    if (stale_subquery_ast.insert_value_rows.expressions.len < 1) return error.TestUnexpectedResult;
+    stale_subquery_ast.insert_value_rows.expressions[0].kind = .subquery;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        insertValuesFromGeneratedDmlAstAlloc(
+            alloc,
+            stale_subquery_parsed.items(),
+            stale_subquery_ast,
+            schema,
+            &.{},
+            options,
+        ),
+    );
 }
 
 test "sql adapter lower dml rejects stale generated truncate target list adornment metadata" {
@@ -30972,13 +32813,28 @@ test "sql adapter lower dml rejects stale generated conflict default assignment 
 
     var stale_ast = ast;
     stale_ast.conflict_assignment_items.expressions[0].right_expression = null;
-    defer stale_ast.conflict_assignment_items.expressions[0].right_expression = original_right_expression;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         insertValuesFromGeneratedDmlAstAlloc(
             alloc,
             parsed.items(),
             stale_ast,
+            schema,
+            &.{},
+            options,
+        ),
+    );
+    stale_ast.conflict_assignment_items.expressions[0].right_expression = original_right_expression;
+
+    const original_right_kind = original_right_expression.kind;
+    original_right_expression.kind = .subquery;
+    defer original_right_expression.kind = original_right_kind;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        insertValuesFromGeneratedDmlAstAlloc(
+            alloc,
+            parsed.items(),
+            ast,
             schema,
             &.{},
             options,
@@ -31315,6 +33171,55 @@ test "sql adapter lower dml rejects stale generated point update assignment rhs 
     );
 }
 
+test "sql adapter lower dml rejects stale generated row assignment rhs child metadata" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","default":"active"},"quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"status\":\"queued\",\"quantity\":1}", .version = 9 };
+    const options = plan_mod.LowerWritePlanOptions{
+        .unique_resolver = resolver_ctx.resolver(),
+        .sync_level = .full_text,
+    };
+
+    var parsed = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET (status, quantity) = ROW(DEFAULT, quantity + 1) WHERE id = 'u1' RETURNING id",
+    );
+    defer parsed.deinit(alloc);
+    const ast = switch ((parsed.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |generated_ast| generated_ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var lowered = try updatePointFromGeneratedDmlAstAlloc(alloc, parsed.items(), ast, schema, &.{}, options);
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ast.assignment_items.count);
+
+    const row_rhs = ast.assignment_items.expressions[0].right_expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.function_call, row_rhs.kind);
+    try std.testing.expectEqual(@as(usize, 2), row_rhs.argument_items.count);
+    if (row_rhs.argument_items.items.len != 2 or row_rhs.argument_items.expressions.len != 2) return error.TestUnexpectedResult;
+    const original_second_item = row_rhs.argument_items.items[1];
+
+    const stale_ast = ast;
+    stale_ast.assignment_items.expressions[0].right_expression.?.argument_items.items[1].start =
+        stale_ast.assignment_items.expressions[0].right_expression.?.argument_items.items[0].start;
+    defer stale_ast.assignment_items.expressions[0].right_expression.?.argument_items.items[1] = original_second_item;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        updatePointFromGeneratedDmlAstAlloc(
+            alloc,
+            parsed.items(),
+            stale_ast,
+            schema,
+            &.{},
+            options,
+        ),
+    );
+}
+
 test "sql adapter lower dml rejects stale generated merge update assignment rhs metadata" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -31444,13 +33349,28 @@ test "sql adapter lower dml rejects stale generated merge default assignment rhs
 
     var stale_ast = ast;
     stale_ast.merge_arms.items[0].assignment_items.expressions[0].right_expression = null;
-    defer stale_ast.merge_arms.items[0].assignment_items.expressions[0].right_expression = original_right_expression;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         mergeMutationFromGeneratedDmlAstAlloc(
             alloc,
             &parsed,
             stale_ast,
+            schema,
+            &.{},
+            options,
+        ),
+    );
+    stale_ast.merge_arms.items[0].assignment_items.expressions[0].right_expression = original_right_expression;
+
+    const original_right_kind = original_right_expression.kind;
+    original_right_expression.kind = .subquery;
+    defer original_right_expression.kind = original_right_kind;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        mergeMutationFromGeneratedDmlAstAlloc(
+            alloc,
+            &parsed,
+            ast,
             schema,
             &.{},
             options,
@@ -31940,6 +33860,31 @@ test "sql adapter lower dml rejects stale generated merge insert value expressio
             options,
         ),
     );
+
+    var stale_subquery_parsed = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "MERGE INTO usage_records USING usage_records AS source ON usage_records.id = source.id WHEN NOT MATCHED THEN INSERT (id, status, quantity) VALUES (source.id, source.status, source.quantity) RETURNING id",
+    );
+    defer stale_subquery_parsed.deinit(alloc);
+    var stale_subquery_ast = switch ((stale_subquery_parsed.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |generated_ast| generated_ast,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), stale_subquery_ast.merge_arms.count);
+    try std.testing.expectEqual(@as(usize, 3), stale_subquery_ast.merge_arms.items[0].insert_value_items.count);
+    if (stale_subquery_ast.merge_arms.items[0].insert_value_items.expressions.len < 3) return error.TestUnexpectedResult;
+    stale_subquery_ast.merge_arms.items[0].insert_value_items.expressions[1].kind = .subquery;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        mergeMutationFromGeneratedDmlAstAlloc(
+            alloc,
+            &stale_subquery_parsed,
+            stale_subquery_ast,
+            schema,
+            &.{},
+            options,
+        ),
+    );
 }
 
 test "sql adapter lower dml rejects stale generated merge arm predicate expression metadata" {
@@ -32254,6 +34199,65 @@ test "sql adapter lower dml rejects stale generated returning function argument 
             schema,
             &.{},
             options,
+        ),
+    );
+}
+
+test "sql adapter lower dml rejects stale generated returning helper subquery metadata" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var parsed = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ('u2', 'ready') RETURNING lower(status) AS status_key",
+    );
+    defer parsed.deinit(alloc);
+    const ast = switch ((parsed.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |generated_ast| generated_ast,
+        else => return error.TestUnexpectedResult,
+    };
+    const returning_range = ast.returning_tokens orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), ast.returning_items.count);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.function_call, ast.returning_items.expressions[0].kind);
+
+    const parser_context = @import("parser_context.zig");
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = parsed.items(),
+        .schema = schema,
+    };
+    const returning_qualifiers = [_][]const u8{ "usage_records", "" };
+    var returning = try generatedReturningProjectionAlloc(
+        alloc,
+        parsed.items(),
+        returning_range,
+        schema,
+        &returning_qualifiers,
+        &parser_state.pos,
+        &ast.returning_items,
+        parser_context.ParserState.ContextAccessors.returningProjectionParserOptions(&parser_state),
+    );
+    defer returning.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), returning.expressions.len);
+
+    var stale_ast = ast;
+    stale_ast.returning_items.expressions[0].kind = .subquery;
+    parser_state.pos = 0;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        generatedReturningProjectionAlloc(
+            alloc,
+            parsed.items(),
+            returning_range,
+            schema,
+            &returning_qualifiers,
+            &parser_state.pos,
+            &stale_ast.returning_items,
+            parser_context.ParserState.ContextAccessors.returningProjectionParserOptions(&parser_state),
         ),
     );
 }
@@ -37839,6 +39843,31 @@ test "sql adapter lower dml lowers insert source write plans" {
             try std.testing.expectEqual(@as(usize, 1), where_expression.rhs.len);
             try std.testing.expectEqualStrings("amount", where_expression.rhs[0].field);
             try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.existing, where_expression.rhs[0].field_source);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var insert_source_scalar_conflict_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, amount) SELECT id, status, amount FROM usage_records WHERE status = 'ready' ON CONFLICT (id) DO UPDATE SET status = (SELECT status FROM usage_records WHERE id = 'u1') RETURNING id, status",
+        schema,
+        &.{},
+        .{ .unique_resolver = multi_conflict_resolver.resolver() },
+    );
+    defer insert_source_scalar_conflict_plan.deinit(alloc);
+    switch (insert_source_scalar_conflict_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.scalar_subqueries.len);
+            const scalar_projection = insert_source.insert_source.req.source.scalar_subqueries[0];
+            try std.testing.expect(scalar_projection.hidden);
+            try std.testing.expectEqualStrings("status", scalar_projection.output_field);
+            const conflict = insert_source.insert_source.req.on_conflict orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(db_mod.types.RelationalRowsConflictAction.update, conflict.action);
+            try std.testing.expectEqual(@as(usize, 1), conflict.patch_expressions.len);
+            try std.testing.expectEqualStrings("status", conflict.patch_expressions[0].field);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, conflict.patch_expressions[0].expression.kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, conflict.patch_expressions[0].expression.field_source);
+            try std.testing.expectEqualStrings(scalar_projection.output, conflict.patch_expressions[0].expression.field);
         },
         else => return error.TestUnexpectedResult,
     }

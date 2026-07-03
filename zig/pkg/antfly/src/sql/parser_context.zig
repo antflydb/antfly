@@ -304,6 +304,10 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .generated_insert_column_items = ptr.generated_insert_column_items,
                 .conflict_condition_options = Accessors.conflictAssignmentExpressionParserOptions(ptr),
                 .conflict_dispatch_options = Accessors.conflictExpressionDispatchOptions(ptr),
+                .fixed_binary_hooks = Accessors.fixedBinaryRowExpressionParserOptions(ptr),
+                .bare_boolean_hooks = Accessors.bareBooleanWhereExpressionParserOptions(ptr),
+                .expression_alternatives_hooks = Accessors.expressionWhereConditionAlternativesParserHooks(ptr),
+                .expression_condition_hooks = Accessors.expressionWhereConditionsParserHooks(ptr),
                 .returning_hooks = Accessors.returningProjectionParserOptions(ptr),
                 .parse_select = Accessors.parseInsertSourceSelectHook,
             };

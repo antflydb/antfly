@@ -215,7 +215,7 @@ test "document SQL corpus fixture parses" {
     var parsed = try parseDocumentSqlCorpusAlloc(std.testing.allocator);
     defer parsed.deinit();
     try std.testing.expect(parsed.value.residual_filter_cases.len > 0);
-    try std.testing.expect(parsed.value.unsupported_residual_expression_cases.len > 0);
+    try std.testing.expect(parsed.value.unsupported_residual_expression_cases.len == 0);
     try std.testing.expect(parsed.value.document_write_plan_cases.len > 0);
     try std.testing.expect(parsed.value.document_read_plan_cases.len > 0);
 }

@@ -1,13 +1,14 @@
 {
   "reason_format": 1,
   "required": [
+    "backup_lifecycle_sql_unavailable",
     "bulk_io_plan",
     "conversion_catalog_plan",
+    "default_scalar_subquery_plan",
     "document_sql_bounded_scan_incomplete_topk",
     "document_sql_bounded_scan_missing_exact_producer",
     "document_sql_bounded_scan_unbounded_source",
     "document_sql_bounded_scan_unsupported_residual",
-    "document_sql_lateral_requires_native_producer",
     "document_sql_unnest_unsupported",
     "document_sql_unsupported_join",
     "document_sql_view_mapping_catalog",
@@ -50,6 +51,7 @@
     "multi_output_subquery_delete_selector",
     "multi_output_subquery_update_selector",
     "operator_catalog_plan",
+    "row_batch_scalar_subquery_plan",
     "row_lock_mode_plan",
     "rule_catalog_plan",
     "schema_namespace",

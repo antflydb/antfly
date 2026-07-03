@@ -178,6 +178,7 @@ fn validateGeneratedOrderExpressionStartForExpression(
 ) !void {
     const expression = generated_expression orelse return;
     try expr_generated_validate.validateGeneratedExpressionPayloads(tokens, expression.*);
+    if (generatedOrderExpressionContainsSubquery(expression.*)) return error.UnsupportedSqlShape;
     if (!generatedOrderExpressionStartAllowsExpressionKind(start, expression.kind)) return error.UnsupportedSqlShape;
     switch (start) {
         .generated_or_case_fold => {
@@ -201,6 +202,53 @@ fn validateGeneratedOrderExpressionStartForExpression(
         },
         else => {},
     }
+}
+
+fn generatedOrderExpressionContainsSubquery(expression: generated_parser.GeneratedSqlExpressionAst) bool {
+    if (expression.kind == .subquery) return true;
+    if (expression.inner_expression) |inner| {
+        if (generatedOrderExpressionContainsSubquery(inner.*)) return true;
+    }
+    if (expression.left_expression) |left| {
+        if (generatedOrderExpressionContainsSubquery(left.*)) return true;
+    }
+    if (expression.right_expression) |right| {
+        if (generatedOrderExpressionContainsSubquery(right.*)) return true;
+    }
+    if (expression.between_lower_expression) |lower| {
+        if (generatedOrderExpressionContainsSubquery(lower.*)) return true;
+    }
+    if (expression.between_upper_expression) |upper| {
+        if (generatedOrderExpressionContainsSubquery(upper.*)) return true;
+    }
+    if (expression.escape_expression) |escape| {
+        if (generatedOrderExpressionContainsSubquery(escape.*)) return true;
+    }
+    if (expression.cast_expression) |cast_expression| {
+        if (generatedOrderExpressionContainsSubquery(cast_expression.*)) return true;
+    }
+    if (expression.filter_expression) |filter_expression| {
+        if (generatedOrderExpressionContainsSubquery(filter_expression.*)) return true;
+    }
+    if (expression.extract_source_expression) |source_expression| {
+        if (generatedOrderExpressionContainsSubquery(source_expression.*)) return true;
+    }
+    for (expression.argument_items.expressions) |argument_expression| {
+        if (generatedOrderExpressionContainsSubquery(argument_expression)) return true;
+    }
+    for (expression.array_items.expressions) |array_expression| {
+        if (generatedOrderExpressionContainsSubquery(array_expression)) return true;
+    }
+    for (expression.case_condition_items.expressions) |condition_expression| {
+        if (generatedOrderExpressionContainsSubquery(condition_expression)) return true;
+    }
+    for (expression.case_result_items.expressions) |result_expression| {
+        if (generatedOrderExpressionContainsSubquery(result_expression)) return true;
+    }
+    if (expression.case_else_expression) |else_expression| {
+        if (generatedOrderExpressionContainsSubquery(else_expression.*)) return true;
+    }
+    return false;
 }
 
 pub fn validateGeneratedSimpleOrderExpression(

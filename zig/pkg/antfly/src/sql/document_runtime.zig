@@ -9,8 +9,10 @@ const db_mod = @import("../storage/db/mod.zig");
 const relational_rows = @import("../storage/db/relational_rows.zig");
 const raft_mod = @import("../raft/mod.zig");
 const json_helpers = @import("../common/json_helpers.zig");
+const regex_mod = @import("../search/regex.zig");
 const document_sql_corpus = @import("document_sql_corpus.zig");
 const document_write = @import("document_write.zig");
+const expr_text = @import("expr/text.zig");
 const sql_adapter = @import("document_plan.zig");
 const sql_plan = @import("plan.zig");
 const source_binding = @import("source_binding.zig");
@@ -323,7 +325,10 @@ pub fn executeReadPlanAlloc(
                 if (lookup_plan.residual_filter_json) |filter| {
                     if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
                 }
-                try rows.append(alloc, try documentSqlProjectedRowJsonAlloc(alloc, id, lookup.json, lowered.projection));
+                var lateral_match = try documentSqlLateralSubqueryMatchesAlloc(alloc, source, native_table_name, public_table_name, lookup.json, lowered.lateral_subquery, consistency);
+                defer lateral_match.deinitOwned(alloc);
+                if (!lateral_match.matched and lowered.lateral_subquery.?.join_kind != .left) continue;
+                try rows.append(alloc, try documentSqlProjectedRowJsonWithLateralAlloc(alloc, id, lookup.json, lowered.projection, lateral_match));
                 if (lowered.limit) |limit| {
                     if (rows.items.len >= limit) break;
                 }
@@ -333,7 +338,7 @@ pub fn executeReadPlanAlloc(
             const query_limit = query.max_candidate_rows orelse lowered.limit;
             var query_response = (try documentSqlIndexQueryAlloc(alloc, source, native_table_name, public_table_name, query, query_limit, false, false, consistency)) orelse return null;
             defer query_response.deinit(alloc);
-            try appendDocumentSqlRowsFromQueryResponseAlloc(alloc, source, native_table_name, public_table_name, query_response.json, lowered.projection, query.residual_filter_json, lowered.limit, consistency, &rows);
+            try appendDocumentSqlRowsFromQueryResponseAlloc(alloc, source, native_table_name, public_table_name, query_response.json, lowered.projection, query.residual_filter_json, lowered.lateral_subquery, lowered.limit, consistency, &rows);
             if (query.residual_filter_json != null and rows.items.len < (lowered.limit orelse std.math.maxInt(u32))) {
                 const max_candidate_rows = query.max_candidate_rows orelse return error.DocumentSqlRequiresBoundedScan;
                 const total_hits = try documentSqlTotalHitsFromQueryResponse(alloc, query_response.json);
@@ -365,7 +370,10 @@ pub fn executeReadPlanAlloc(
                 if (scan_plan.residual_filter_json) |filter| {
                     if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
                 }
-                try rows.append(alloc, try documentSqlProjectedRowJsonAlloc(alloc, key_value.string, lookup.json, lowered.projection));
+                var lateral_match = try documentSqlLateralSubqueryMatchesAlloc(alloc, source, native_table_name, public_table_name, lookup.json, lowered.lateral_subquery, consistency);
+                defer lateral_match.deinitOwned(alloc);
+                if (!lateral_match.matched and lowered.lateral_subquery.?.join_kind != .left) continue;
+                try rows.append(alloc, try documentSqlProjectedRowJsonWithLateralAlloc(alloc, key_value.string, lookup.json, lowered.projection, lateral_match));
                 if (lowered.limit) |limit| {
                     if (rows.items.len >= limit) break;
                 }
@@ -2955,12 +2963,39 @@ const DocumentSqlSortKey = union(enum) {
 const OrderedDocumentSqlCandidate = struct {
     id: []u8,
     doc_json: []u8,
+    lateral_branch_doc_json: ?[]u8 = null,
     sort_key: DocumentSqlSortKey,
+    lateral_matched: bool = true,
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.id);
         alloc.free(self.doc_json);
+        if (self.lateral_branch_doc_json) |json| alloc.free(json);
         self.sort_key.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+const DocumentSqlLateralMatch = struct {
+    matched: bool = true,
+    branch_doc_json: ?[]const u8 = null,
+
+    fn deinitOwned(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.branch_doc_json) |json| alloc.free(@constCast(json));
+        self.* = undefined;
+    }
+};
+
+const DocumentSqlBranchCandidate = struct {
+    id: []u8,
+    doc_json: []u8,
+    sort_keys: []DocumentSqlSortKey,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.id);
+        alloc.free(self.doc_json);
+        for (self.sort_keys) |*sort_key| sort_key.deinit(alloc);
+        if (self.sort_keys.len > 0) alloc.free(self.sort_keys);
         self.* = undefined;
     }
 };
@@ -3062,7 +3097,10 @@ fn executeOrderedLoweredDocumentSqlReadPlanAlloc(
                 if (lookup_plan.residual_filter_json) |filter| {
                     if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
                 }
-                try appendOrderedDocumentSqlCandidateAlloc(alloc, &candidates, id, lookup.json, order_by);
+                var lateral_match = try documentSqlLateralSubqueryMatchesAlloc(alloc, source, native_table_name, public_table_name, lookup.json, lowered.lateral_subquery, consistency);
+                defer lateral_match.deinitOwned(alloc);
+                if (!lateral_match.matched and lowered.lateral_subquery.?.join_kind != .left) continue;
+                try appendOrderedDocumentSqlCandidateAlloc(alloc, &candidates, id, lookup.json, order_by, lateral_match);
             }
         },
         .bounded_scan => |scan_plan| {
@@ -3090,7 +3128,10 @@ fn executeOrderedLoweredDocumentSqlReadPlanAlloc(
                 if (scan_plan.residual_filter_json) |filter| {
                     if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
                 }
-                try appendOrderedDocumentSqlCandidateAlloc(alloc, &candidates, key_value.string, lookup.json, order_by);
+                var lateral_match = try documentSqlLateralSubqueryMatchesAlloc(alloc, source, native_table_name, public_table_name, lookup.json, lowered.lateral_subquery, consistency);
+                defer lateral_match.deinitOwned(alloc);
+                if (!lateral_match.matched and lowered.lateral_subquery.?.join_kind != .left) continue;
+                try appendOrderedDocumentSqlCandidateAlloc(alloc, &candidates, key_value.string, lookup.json, order_by, lateral_match);
             }
             try documentSqlAdmitBoundedRowProbeCount(scanned, scan_plan.max_rows);
         },
@@ -3107,6 +3148,7 @@ fn executeOrderedLoweredDocumentSqlReadPlanAlloc(
                 public_table_name,
                 query_response.json,
                 query.residual_filter_json,
+                lowered.lateral_subquery,
                 order_by,
                 consistency,
                 &candidates,
@@ -3124,7 +3166,10 @@ fn executeOrderedLoweredDocumentSqlReadPlanAlloc(
     const row_limit = lowered.limit orelse @as(u32, @intCast(candidates.items.len));
     for (candidates.items) |candidate| {
         if (rows.items.len >= row_limit) break;
-        try rows.append(alloc, try documentSqlProjectedRowJsonAlloc(alloc, candidate.id, candidate.doc_json, lowered.projection));
+        try rows.append(alloc, try documentSqlProjectedRowJsonWithLateralAlloc(alloc, candidate.id, candidate.doc_json, lowered.projection, .{
+            .matched = candidate.lateral_matched,
+            .branch_doc_json = candidate.lateral_branch_doc_json,
+        }));
     }
 
     for (candidates.items) |*candidate| candidate.deinit(alloc);
@@ -3144,6 +3189,7 @@ fn appendOrderedDocumentSqlCandidatesFromQueryResponseAlloc(
     public_table_name: []const u8,
     response_json: []const u8,
     residual_filter_json: ?[]const u8,
+    lateral_subquery: ?sql_adapter.DocumentLateralSubquery,
     order_by: sql_adapter.DocumentOrderBy,
     consistency: raft_mod.ReadConsistency,
     candidates: *std.ArrayListUnmanaged(OrderedDocumentSqlCandidate),
@@ -3171,7 +3217,10 @@ fn appendOrderedDocumentSqlCandidatesFromQueryResponseAlloc(
                 if (residual_filter_json) |filter| {
                     if (!try residualFilterMatchesAlloc(alloc, doc_json, filter)) continue;
                 }
-                try appendOrderedDocumentSqlCandidateAlloc(alloc, candidates, id_value.string, doc_json, order_by);
+                var lateral_match = try documentSqlLateralSubqueryMatchesAlloc(alloc, source, native_table_name, public_table_name, doc_json, lateral_subquery, consistency);
+                defer lateral_match.deinitOwned(alloc);
+                if (!lateral_match.matched and lateral_subquery.?.join_kind != .left) continue;
+                try appendOrderedDocumentSqlCandidateAlloc(alloc, candidates, id_value.string, doc_json, order_by, lateral_match);
                 continue;
             }
             if (source_value != .null) return error.InvalidRowsRequest;
@@ -3182,7 +3231,10 @@ fn appendOrderedDocumentSqlCandidatesFromQueryResponseAlloc(
         if (residual_filter_json) |filter| {
             if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
         }
-        try appendOrderedDocumentSqlCandidateAlloc(alloc, candidates, id_value.string, lookup.json, order_by);
+        var lateral_match = try documentSqlLateralSubqueryMatchesAlloc(alloc, source, native_table_name, public_table_name, lookup.json, lateral_subquery, consistency);
+        defer lateral_match.deinitOwned(alloc);
+        if (!lateral_match.matched and lateral_subquery.?.join_kind != .left) continue;
+        try appendOrderedDocumentSqlCandidateAlloc(alloc, candidates, id_value.string, lookup.json, order_by, lateral_match);
     }
 }
 
@@ -3192,17 +3244,22 @@ fn appendOrderedDocumentSqlCandidateAlloc(
     id: []const u8,
     doc_json: []const u8,
     order_by: sql_adapter.DocumentOrderBy,
+    lateral_match: DocumentSqlLateralMatch,
 ) !void {
     const owned_id = try alloc.dupe(u8, id);
     errdefer alloc.free(owned_id);
     const owned_doc = try alloc.dupe(u8, doc_json);
     errdefer alloc.free(owned_doc);
+    const owned_lateral_branch_doc = if (lateral_match.branch_doc_json) |json| try alloc.dupe(u8, json) else null;
+    errdefer if (owned_lateral_branch_doc) |json| alloc.free(json);
     var sort_key = try documentSqlSortKeyAlloc(alloc, id, doc_json, order_by);
     errdefer sort_key.deinit(alloc);
     try candidates.append(alloc, .{
         .id = owned_id,
         .doc_json = owned_doc,
+        .lateral_branch_doc_json = owned_lateral_branch_doc,
         .sort_key = sort_key,
+        .lateral_matched = lateral_match.matched,
     });
 }
 
@@ -3684,6 +3741,118 @@ fn documentSqlTotalHitsFromQueryResponse(alloc: std.mem.Allocator, response_json
         .number_string => |text| try std.fmt.parseUnsigned(u32, text, 10),
         else => error.InvalidRowsRequest,
     };
+}
+
+fn documentSqlFirstSourceFromQueryResponseAlloc(alloc: std.mem.Allocator, response_json: []const u8) !?[]const u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, response_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRowsRequest;
+    const responses_value = parsed.value.object.get("responses") orelse return error.InvalidRowsRequest;
+    if (responses_value != .array or responses_value.array.items.len == 0) return error.InvalidRowsRequest;
+    const first_response = responses_value.array.items[0];
+    if (first_response != .object) return error.InvalidRowsRequest;
+    const hits_value = first_response.object.get("hits") orelse return error.InvalidRowsRequest;
+    if (hits_value != .object) return error.InvalidRowsRequest;
+    const hit_items = hits_value.object.get("hits") orelse return error.InvalidRowsRequest;
+    if (hit_items != .array) return error.InvalidRowsRequest;
+    if (hit_items.array.items.len == 0) return null;
+    const first_hit = hit_items.array.items[0];
+    if (first_hit != .object) return error.InvalidRowsRequest;
+    const source_value = first_hit.object.get("_source") orelse return error.InvalidRowsRequest;
+    if (source_value == .null) return null;
+    if (source_value != .object) return error.InvalidRowsRequest;
+    return try std.json.Stringify.valueAlloc(alloc, source_value, .{});
+}
+
+fn documentSqlOrderedFirstSourceFromQueryResponseAlloc(
+    alloc: std.mem.Allocator,
+    response_json: []const u8,
+    max_candidate_rows: u32,
+    order_by: []const sql_adapter.DocumentOrderBy,
+) !?[]const u8 {
+    if (order_by.len == 0) return error.InvalidRowsRequest;
+    try documentSqlAdmitBoundedRowCount(try documentSqlTotalHitsFromQueryResponse(alloc, response_json), max_candidate_rows);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, response_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRowsRequest;
+    const responses_value = parsed.value.object.get("responses") orelse return error.InvalidRowsRequest;
+    if (responses_value != .array or responses_value.array.items.len == 0) return error.InvalidRowsRequest;
+    const first_response = responses_value.array.items[0];
+    if (first_response != .object) return error.InvalidRowsRequest;
+    const hits_value = first_response.object.get("hits") orelse return error.InvalidRowsRequest;
+    if (hits_value != .object) return error.InvalidRowsRequest;
+    const hit_items = hits_value.object.get("hits") orelse return error.InvalidRowsRequest;
+    if (hit_items != .array) return error.InvalidRowsRequest;
+    if (hit_items.array.items.len == 0) return null;
+
+    var candidates = std.ArrayListUnmanaged(DocumentSqlBranchCandidate).empty;
+    defer {
+        for (candidates.items) |*candidate| candidate.deinit(alloc);
+        candidates.deinit(alloc);
+    }
+    for (hit_items.array.items) |hit_value| {
+        if (hit_value != .object) return error.InvalidRowsRequest;
+        const id_value = hit_value.object.get("_id") orelse return error.InvalidRowsRequest;
+        if (id_value != .string) return error.InvalidRowsRequest;
+        const source_value = hit_value.object.get("_source") orelse return error.InvalidRowsRequest;
+        if (source_value != .object) return error.InvalidRowsRequest;
+        var doc_json: ?[]u8 = try std.json.Stringify.valueAlloc(alloc, source_value, .{});
+        errdefer if (doc_json) |json| alloc.free(json);
+        var owned_id: ?[]u8 = try alloc.dupe(u8, id_value.string);
+        errdefer if (owned_id) |id| alloc.free(id);
+        var sort_keys: ?[]DocumentSqlSortKey = try documentSqlSortKeysAlloc(alloc, id_value.string, doc_json.?, order_by);
+        errdefer if (sort_keys) |keys| {
+            for (keys) |*sort_key| sort_key.deinit(alloc);
+            if (keys.len > 0) alloc.free(keys);
+        };
+        try candidates.append(alloc, .{
+            .id = owned_id.?,
+            .doc_json = doc_json.?,
+            .sort_keys = sort_keys.?,
+        });
+        doc_json = null;
+        owned_id = null;
+        sort_keys = null;
+    }
+    if (candidates.items.len == 0) return null;
+    std.mem.sort(DocumentSqlBranchCandidate, candidates.items, DocumentSqlBranchSortContext{ .order_by = order_by }, documentSqlBranchCandidateLessThan);
+    const out = try alloc.dupe(u8, candidates.items[0].doc_json);
+    return out;
+}
+
+const DocumentSqlBranchSortContext = struct {
+    order_by: []const sql_adapter.DocumentOrderBy,
+};
+
+fn documentSqlBranchCandidateLessThan(ctx: DocumentSqlBranchSortContext, lhs: DocumentSqlBranchCandidate, rhs: DocumentSqlBranchCandidate) bool {
+    for (ctx.order_by, 0..) |order_by, i| {
+        const order = documentSqlSortKeyOrder(lhs.sort_keys[i], rhs.sort_keys[i]);
+        if (order == .eq) continue;
+        return switch (order_by.direction) {
+            .asc => order == .lt,
+            .desc => order == .gt,
+        };
+    }
+    return std.mem.order(u8, lhs.id, rhs.id) == .lt;
+}
+
+fn documentSqlSortKeysAlloc(
+    alloc: std.mem.Allocator,
+    id: []const u8,
+    doc_json: []const u8,
+    order_by: []const sql_adapter.DocumentOrderBy,
+) ![]DocumentSqlSortKey {
+    const sort_keys = try alloc.alloc(DocumentSqlSortKey, order_by.len);
+    errdefer alloc.free(sort_keys);
+    var initialized: usize = 0;
+    errdefer {
+        for (sort_keys[0..initialized]) |*sort_key| sort_key.deinit(alloc);
+    }
+    for (order_by, 0..) |order, i| {
+        sort_keys[i] = try documentSqlSortKeyAlloc(alloc, id, doc_json, order);
+        initialized += 1;
+    }
+    return sort_keys;
 }
 
 fn documentSqlCountAggregateResultAlloc(
@@ -4368,6 +4537,7 @@ fn appendDocumentSqlRowsFromQueryResponseAlloc(
     response_json: []const u8,
     projection: []const sql_adapter.DocumentProjection,
     residual_filter_json: ?[]const u8,
+    lateral_subquery: ?sql_adapter.DocumentLateralSubquery,
     row_limit: ?u32,
     consistency: raft_mod.ReadConsistency,
     rows: *std.ArrayListUnmanaged([]const u8),
@@ -4395,7 +4565,10 @@ fn appendDocumentSqlRowsFromQueryResponseAlloc(
                 if (residual_filter_json) |filter| {
                     if (!try residualFilterMatchesAlloc(alloc, doc_json, filter)) continue;
                 }
-                try rows.append(alloc, try documentSqlProjectedParsedRowJsonAlloc(alloc, id_value.string, source_value, doc_json, projection));
+                var lateral_match = try documentSqlLateralSubqueryMatchesAlloc(alloc, source, native_table_name, public_table_name, doc_json, lateral_subquery, consistency);
+                defer lateral_match.deinitOwned(alloc);
+                if (!lateral_match.matched and lateral_subquery.?.join_kind != .left) continue;
+                try rows.append(alloc, try documentSqlProjectedParsedRowJsonWithLateralAlloc(alloc, id_value.string, source_value, doc_json, projection, lateral_match));
                 if (row_limit) |limit| {
                     if (rows.items.len >= limit) return;
                 }
@@ -4409,7 +4582,10 @@ fn appendDocumentSqlRowsFromQueryResponseAlloc(
         if (residual_filter_json) |filter| {
             if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
         }
-        try rows.append(alloc, try documentSqlProjectedRowJsonAlloc(alloc, id_value.string, lookup.json, projection));
+        var lateral_match = try documentSqlLateralSubqueryMatchesAlloc(alloc, source, native_table_name, public_table_name, lookup.json, lateral_subquery, consistency);
+        defer lateral_match.deinitOwned(alloc);
+        if (!lateral_match.matched and lateral_subquery.?.join_kind != .left) continue;
+        try rows.append(alloc, try documentSqlProjectedRowJsonWithLateralAlloc(alloc, id_value.string, lookup.json, projection, lateral_match));
         if (row_limit) |limit| {
             if (rows.items.len >= limit) return;
         }
@@ -4476,10 +4652,26 @@ fn documentSqlProjectedRowJsonAlloc(
     doc_json: []const u8,
     projection: []const sql_adapter.DocumentProjection,
 ) ![]const u8 {
+    return try documentSqlProjectedRowJsonWithLateralAlloc(alloc, key, doc_json, projection, .{});
+}
+
+fn documentSqlProjectedRowJsonWithLateralAlloc(
+    alloc: std.mem.Allocator,
+    key: []const u8,
+    doc_json: []const u8,
+    projection: []const sql_adapter.DocumentProjection,
+    lateral_match: DocumentSqlLateralMatch,
+) ![]const u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidRowsRequest;
-    return try documentSqlProjectedParsedRowJsonWithUnnestAlloc(alloc, key, parsed.value, doc_json, projection, null);
+    var branch_parsed = if (lateral_match.branch_doc_json) |branch_doc_json|
+        try std.json.parseFromSlice(std.json.Value, alloc, branch_doc_json, .{ .allocate = .alloc_always })
+    else
+        null;
+    defer if (branch_parsed) |*value| value.deinit();
+    const lateral_row = if (branch_parsed) |value| value.value else null;
+    return try documentSqlProjectedParsedRowJsonWithUnnestAndLateralAlloc(alloc, key, parsed.value, doc_json, projection, null, lateral_match, lateral_row);
 }
 
 fn documentSqlProjectedParsedRowJsonAlloc(
@@ -4489,7 +4681,24 @@ fn documentSqlProjectedParsedRowJsonAlloc(
     full_doc_json: ?[]const u8,
     projection: []const sql_adapter.DocumentProjection,
 ) ![]const u8 {
-    return try documentSqlProjectedParsedRowJsonWithUnnestAlloc(alloc, key, row, full_doc_json, projection, null);
+    return try documentSqlProjectedParsedRowJsonWithUnnestAndLateralAlloc(alloc, key, row, full_doc_json, projection, null, .{}, null);
+}
+
+fn documentSqlProjectedParsedRowJsonWithLateralAlloc(
+    alloc: std.mem.Allocator,
+    key: []const u8,
+    row: std.json.Value,
+    full_doc_json: ?[]const u8,
+    projection: []const sql_adapter.DocumentProjection,
+    lateral_match: DocumentSqlLateralMatch,
+) ![]const u8 {
+    var branch_parsed = if (lateral_match.branch_doc_json) |branch_doc_json|
+        try std.json.parseFromSlice(std.json.Value, alloc, branch_doc_json, .{ .allocate = .alloc_always })
+    else
+        null;
+    defer if (branch_parsed) |*value| value.deinit();
+    const lateral_row = if (branch_parsed) |value| value.value else null;
+    return try documentSqlProjectedParsedRowJsonWithUnnestAndLateralAlloc(alloc, key, row, full_doc_json, projection, null, lateral_match, lateral_row);
 }
 
 fn documentSqlProjectedParsedRowJsonWithUnnestAlloc(
@@ -4500,7 +4709,23 @@ fn documentSqlProjectedParsedRowJsonWithUnnestAlloc(
     projection: []const sql_adapter.DocumentProjection,
     unnest_value: ?std.json.Value,
 ) ![]const u8 {
+    return try documentSqlProjectedParsedRowJsonWithUnnestAndLateralAlloc(alloc, key, row, full_doc_json, projection, unnest_value, .{}, null);
+}
+
+fn documentSqlProjectedParsedRowJsonWithUnnestAndLateralAlloc(
+    alloc: std.mem.Allocator,
+    key: []const u8,
+    row: std.json.Value,
+    full_doc_json: ?[]const u8,
+    projection: []const sql_adapter.DocumentProjection,
+    unnest_value: ?std.json.Value,
+    lateral_match: DocumentSqlLateralMatch,
+    lateral_row: ?std.json.Value,
+) ![]const u8 {
     if (row != .object) return error.InvalidRowsRequest;
+    if (lateral_row) |branch| {
+        if (branch != .object) return error.InvalidRowsRequest;
+    }
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const writer = &out.writer;
@@ -4515,13 +4740,534 @@ fn documentSqlProjectedParsedRowJsonWithUnnestAlloc(
                 try writer.writeAll(doc_json);
             },
             .field => {
-                if (documentSqlProjectedValue(row, item.field)) |value| {
+                if (item.lateral and !lateral_match.matched) {
+                    try writer.writeAll("null");
+                } else if (documentSqlProjectedValue(if (item.lateral) (lateral_row orelse row) else row, item.field)) |value| {
                     const value_json = try std.json.Stringify.valueAlloc(alloc, value, .{});
                     defer alloc.free(value_json);
                     try writer.writeAll(value_json);
                 } else {
                     try writer.writeAll("null");
                 }
+            },
+            .scalar_text_cast => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const text = try documentSqlTextCastValueAlloc(alloc, value);
+                defer alloc.free(text);
+                try writer.print("{f}", .{std.json.fmt(text, .{})});
+            },
+            .scalar_numeric_cast => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const number = try documentSqlJsonNumber(value);
+                try writer.print("{d}", .{number});
+            },
+            .scalar_boolean_cast => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                try writer.writeAll(if (try documentSqlBooleanCastValue(value)) "true" else "false");
+            },
+            .scalar_datetime_cast => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                try writer.print("{d}", .{try documentSqlDatetimeCastValue(value)});
+            },
+            .temporal_date_utc => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const date = try documentSqlUtcDateFromDatetimeAlloc(alloc, value);
+                defer alloc.free(date);
+                try writer.print("{f}", .{std.json.fmt(date, .{})});
+            },
+            .array_append, .array_cat, .array_prepend, .array_remove, .array_replace => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const array_json = try documentSqlArrayTransformJsonAlloc(alloc, value, item.kind, item.pattern, item.numeric_operand);
+                defer alloc.free(array_json);
+                try writer.writeAll(array_json);
+            },
+            .array_cardinality => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                if (value != .array) return error.InvalidRowsRequest;
+                try writer.print("{d}", .{value.array.items.len});
+            },
+            .array_position => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const position = try documentSqlArrayPosition(value, item.pattern);
+                if (position) |index| {
+                    try writer.print("{d}", .{index});
+                } else {
+                    try writer.writeAll("null");
+                }
+            },
+            .array_positions => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const positions_json = try documentSqlArrayPositionsJsonAlloc(alloc, value, item.pattern);
+                defer alloc.free(positions_json);
+                try writer.writeAll(positions_json);
+            },
+            .json_typeof => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                try writer.print("{f}", .{std.json.fmt(documentSqlJsonTypeofName(value), .{})});
+            },
+            .json_array_length => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                switch (value) {
+                    .null => try writer.writeAll("null"),
+                    .array => |array| try writer.print("{d}", .{array.items.len}),
+                    else => return error.InvalidRowsRequest,
+                }
+            },
+            .numeric_abs => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const number = try documentSqlJsonNumber(value);
+                try writer.print("{d}", .{@abs(number)});
+            },
+            .numeric_round, .numeric_trunc, .numeric_floor, .numeric_ceil, .numeric_sqrt, .numeric_sign => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const number = try documentSqlJsonNumber(value);
+                const result = try documentSqlNumericUnaryResult(number, item.kind);
+                try writer.print("{d}", .{result});
+            },
+            .numeric_arithmetic => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const number = try documentSqlJsonNumber(value);
+                const operand = std.fmt.parseFloat(f64, item.numeric_operand) catch return error.InvalidRowsRequest;
+                const result = switch (item.numeric_operator) {
+                    .add => number + operand,
+                    .sub => number - operand,
+                    .mul => number * operand,
+                    .div => if (operand == 0) return error.InvalidRowsRequest else number / operand,
+                    .mod => if (operand == 0) return error.InvalidRowsRequest else number - @trunc(number / operand) * operand,
+                    .power => std.math.pow(f64, number, operand),
+                };
+                if (!std.math.isFinite(result)) return error.InvalidRowsRequest;
+                try writer.print("{d}", .{result});
+            },
+            .regexp_count, .regexp_instr, .regexp_substr => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const text = try documentSqlFilterStringValue(value);
+                switch (item.kind) {
+                    .regexp_count => {
+                        const count = try documentSqlRegexpCountText(alloc, text, item.pattern);
+                        try writer.print("{d}", .{count});
+                    },
+                    .regexp_instr => {
+                        const position = try documentSqlRegexpInstrText(alloc, text, item.pattern);
+                        try writer.print("{d}", .{position});
+                    },
+                    .regexp_substr => {
+                        const matched = try documentSqlRegexpSubstrTextAlloc(alloc, text, item.pattern);
+                        defer if (matched) |value_text| alloc.free(value_text);
+                        if (matched) |value_text| {
+                            try writer.print("{f}", .{std.json.fmt(value_text, .{})});
+                        } else {
+                            try writer.writeAll("null");
+                        }
+                    },
+                    else => unreachable,
+                }
+            },
+            .text_starts_with, .text_ends_with, .text_strpos => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const text = try documentSqlFilterStringValue(value);
+                switch (item.kind) {
+                    .text_starts_with => try writer.writeAll(if (std.mem.startsWith(u8, text, item.pattern)) "true" else "false"),
+                    .text_ends_with => try writer.writeAll(if (std.mem.endsWith(u8, text, item.pattern)) "true" else "false"),
+                    .text_strpos => {
+                        const position = try documentSqlStrposTextCodepointPosition(text, item.pattern);
+                        try writer.print("{d}", .{position});
+                    },
+                    else => unreachable,
+                }
+            },
+            .text_split_part => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const text = try documentSqlFilterStringValue(value);
+                const index = std.fmt.parseInt(i64, item.numeric_operand, 10) catch return error.InvalidRowsRequest;
+                const part = try documentSqlSplitPartTextAlloc(alloc, text, item.pattern, index);
+                defer alloc.free(part);
+                try writer.print("{f}", .{std.json.fmt(part, .{})});
+            },
+            .text_substring => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const text = try documentSqlFilterStringValue(value);
+                const start = std.fmt.parseInt(i64, item.numeric_operand, 10) catch return error.InvalidRowsRequest;
+                const length: ?i64 = if (item.numeric_operand2.len == 0)
+                    null
+                else
+                    std.fmt.parseInt(i64, item.numeric_operand2, 10) catch return error.InvalidRowsRequest;
+                const substring = try documentSqlSubstringTextAlloc(alloc, text, start, length);
+                defer alloc.free(substring);
+                try writer.print("{f}", .{std.json.fmt(substring, .{})});
+            },
+            .text_overlay => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const text = try documentSqlFilterStringValue(value);
+                const start = std.fmt.parseInt(i64, item.numeric_operand, 10) catch return error.InvalidRowsRequest;
+                const length: ?i64 = if (item.numeric_operand2.len == 0)
+                    null
+                else
+                    std.fmt.parseInt(i64, item.numeric_operand2, 10) catch return error.InvalidRowsRequest;
+                const overlayed = try documentSqlOverlayTextAlloc(alloc, text, item.pattern, start, length);
+                defer alloc.free(overlayed);
+                try writer.print("{f}", .{std.json.fmt(overlayed, .{})});
+            },
+            .text_left, .text_right => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const text = try documentSqlFilterStringValue(value);
+                const count = std.fmt.parseInt(i64, item.numeric_operand, 10) catch return error.InvalidRowsRequest;
+                const sliced = try documentSqlLeftRightTextAlloc(alloc, text, count, item.kind == .text_left);
+                defer alloc.free(sliced);
+                try writer.print("{f}", .{std.json.fmt(sliced, .{})});
+            },
+            .text_repeat => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const text = try documentSqlFilterStringValue(value);
+                const count = std.fmt.parseInt(i64, item.numeric_operand, 10) catch return error.InvalidRowsRequest;
+                const repeated = try documentSqlRepeatTextAlloc(alloc, text, count);
+                defer alloc.free(repeated);
+                try writer.print("{f}", .{std.json.fmt(repeated, .{})});
+            },
+            .text_reverse => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const text = try documentSqlFilterStringValue(value);
+                const reversed = try documentSqlReverseTextAlloc(alloc, text);
+                defer alloc.free(reversed);
+                try writer.print("{f}", .{std.json.fmt(reversed, .{})});
+            },
+            .text_btrim, .text_ltrim, .text_rtrim => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const text = try documentSqlFilterStringValue(value);
+                const trimmed = documentSqlTrimText(text, item.kind);
+                try writer.print("{f}", .{std.json.fmt(trimmed, .{})});
+            },
+            .text_ascii => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const text = try documentSqlFilterStringValue(value);
+                const first_codepoint = try documentSqlAsciiFirstCodepoint(text);
+                try writer.print("{d}", .{first_codepoint});
+            },
+            .text_replace => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const text = try documentSqlFilterStringValue(value);
+                const replaced = try documentSqlReplaceTextAlloc(alloc, text, item.pattern, item.numeric_operand);
+                defer alloc.free(replaced);
+                try writer.print("{f}", .{std.json.fmt(replaced, .{})});
+            },
+            .text_nullif => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const text = try documentSqlFilterStringValue(value);
+                if (std.mem.eql(u8, text, item.pattern)) {
+                    try writer.writeAll("null");
+                } else {
+                    try writer.print("{f}", .{std.json.fmt(text, .{})});
+                }
+            },
+            .text_concat_ws => {
+                const left = try documentSqlOptionalProjectedStringValue(row, item.field);
+                const right = try documentSqlOptionalProjectedStringValue(row, item.field2);
+                const joined = try documentSqlConcatWsTextAlloc(alloc, item.pattern, left, right);
+                defer alloc.free(joined);
+                try writer.print("{f}", .{std.json.fmt(joined, .{})});
+            },
+            .text_array_to_string => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const joined = try documentSqlArrayToStringTextAlloc(alloc, value, item.pattern);
+                defer alloc.free(joined);
+                try writer.print("{f}", .{std.json.fmt(joined, .{})});
+            },
+            .text_string_to_array => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const text = try documentSqlFilterStringValue(value);
+                const array_json = try documentSqlStringToArrayJsonAlloc(alloc, text, item.pattern);
+                defer alloc.free(array_json);
+                try writer.writeAll(array_json);
+            },
+            .text_translate => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const text = try documentSqlFilterStringValue(value);
+                const translated = try documentSqlTranslateTextAlloc(alloc, text, item.pattern, item.numeric_operand);
+                defer alloc.free(translated);
+                try writer.print("{f}", .{std.json.fmt(translated, .{})});
+            },
+            .text_lpad, .text_rpad => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const text = try documentSqlFilterStringValue(value);
+                const width = std.fmt.parseInt(i64, item.numeric_operand, 10) catch return error.InvalidRowsRequest;
+                const padded = try documentSqlPadTextAlloc(alloc, text, width, item.pattern, item.kind == .text_lpad);
+                defer alloc.free(padded);
+                try writer.print("{f}", .{std.json.fmt(padded, .{})});
+            },
+            .text_length => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                const text = try documentSqlFilterStringValue(value);
+                const length = std.unicode.utf8CountCodepoints(text) catch return error.InvalidRowsRequest;
+                try writer.print("{d}", .{length});
+            },
+            .text_octet_length, .text_bit_length => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                const text = try documentSqlFilterStringValue(value);
+                const length = if (item.kind == .text_bit_length) text.len * 8 else text.len;
+                try writer.print("{d}", .{length});
+            },
+            .text_initcap => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                const text = try documentSqlFilterStringValue(value);
+                if (!documentSqlAsciiOnly(text)) return error.UnsupportedSqlShape;
+                const titled = try documentSqlInitcapAsciiAlloc(alloc, text);
+                defer alloc.free(titled);
+                try writer.print("{f}", .{std.json.fmt(titled, .{})});
+            },
+            .text_md5 => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const text = try documentSqlFilterStringValue(value);
+                const digest = try expr_text.md5HexTextAlloc(alloc, text);
+                defer alloc.free(digest);
+                try writer.print("{f}", .{std.json.fmt(digest, .{})});
+            },
+            .text_chr => {
+                const codepoint = if (item.field.len > 0) blk: {
+                    const value = documentSqlProjectedValue(row, item.field) orelse {
+                        try writer.writeAll("null");
+                        continue;
+                    };
+                    if (value == .null) {
+                        try writer.writeAll("null");
+                        continue;
+                    }
+                    break :blk try documentSqlIntegerCodepointFromJson(value);
+                } else std.fmt.parseInt(i64, item.numeric_operand, 10) catch return error.InvalidRowsRequest;
+                const encoded = try documentSqlChrTextAlloc(alloc, codepoint);
+                defer alloc.free(encoded);
+                try writer.print("{f}", .{std.json.fmt(encoded, .{})});
+            },
+            .text_lower, .text_upper => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                const text = try documentSqlFilterStringValue(value);
+                if (!documentSqlAsciiOnly(text)) return error.UnsupportedSqlShape;
+                const folded = if (item.kind == .text_lower)
+                    try std.ascii.allocLowerString(alloc, text)
+                else
+                    try std.ascii.allocUpperString(alloc, text);
+                defer alloc.free(folded);
+                try writer.print("{f}", .{std.json.fmt(folded, .{})});
             },
             .unnest_value => {
                 const value = unnest_value orelse return error.InvalidRowsRequest;
@@ -4533,6 +5279,190 @@ fn documentSqlProjectedParsedRowJsonWithUnnestAlloc(
     }
     try writer.writeByte('}');
     return try out.toOwnedSlice();
+}
+
+fn documentSqlLateralSubqueryMatchesAlloc(
+    alloc: std.mem.Allocator,
+    source: Source,
+    native_table_name: []const u8,
+    public_table_name: []const u8,
+    doc_json: []const u8,
+    lateral_subquery: ?sql_adapter.DocumentLateralSubquery,
+    consistency: raft_mod.ReadConsistency,
+) !DocumentSqlLateralMatch {
+    const lateral = lateral_subquery orelse return .{};
+    if (lateral.branch_lookup_required) {
+        return try documentSqlLateralBranchLookupMatchesAlloc(alloc, source, native_table_name, public_table_name, doc_json, lateral, consistency);
+    }
+    if (lateral.correlation_nullable or lateral.field_residuals.len > 0) {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+        defer parsed.deinit();
+        if (lateral.correlation_nullable) {
+            const correlation_value = documentSqlProjectedValue(parsed.value, lateral.correlation_path) orelse return .{ .matched = false };
+            if (correlation_value == .null) return .{ .matched = false };
+        }
+        for (lateral.field_residuals) |residual| {
+            if (!try documentSqlLateralFieldResidualMatches(parsed.value, residual)) return .{ .matched = false };
+        }
+    }
+    const filter = lateral.residual_filter_json orelse return .{};
+    return .{ .matched = try residualFilterMatchesAlloc(alloc, doc_json, filter) };
+}
+
+fn documentSqlLateralBranchLookupMatchesAlloc(
+    alloc: std.mem.Allocator,
+    source: Source,
+    native_table_name: []const u8,
+    public_table_name: []const u8,
+    doc_json: []const u8,
+    lateral: sql_adapter.DocumentLateralSubquery,
+    consistency: raft_mod.ReadConsistency,
+) !DocumentSqlLateralMatch {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRowsRequest;
+    const correlation_value = documentSqlProjectedValue(parsed.value, lateral.correlation_path) orelse return .{ .matched = false };
+    if (correlation_value == .null) return .{ .matched = false };
+
+    const filter_json = try documentSqlLateralBranchFilterJsonAlloc(alloc, parsed.value, lateral, correlation_value);
+    const branch_limit = if (lateral.branch_order_by.len > 0) documentSqlIndexedCandidateProbeLimit(1) else 1;
+    var query = sql_adapter.DocumentIndexQuery{
+        .filter_query_json = filter_json,
+        .max_candidate_rows = branch_limit,
+    };
+    defer query.deinit(alloc);
+
+    var response = (try documentSqlIndexQueryAlloc(alloc, source, native_table_name, public_table_name, query, branch_limit, true, false, consistency)) orelse return .{ .matched = false };
+    defer response.deinit(alloc);
+    const branch_doc_json = if (lateral.branch_order_by.len > 0)
+        (try documentSqlOrderedFirstSourceFromQueryResponseAlloc(alloc, response.json, branch_limit, lateral.branch_order_by)) orelse return .{ .matched = false }
+    else
+        (try documentSqlFirstSourceFromQueryResponseAlloc(alloc, response.json)) orelse return .{ .matched = false };
+    return .{ .matched = true, .branch_doc_json = branch_doc_json };
+}
+
+fn documentSqlLateralBranchFilterJsonAlloc(
+    alloc: std.mem.Allocator,
+    outer_row: std.json.Value,
+    lateral: sql_adapter.DocumentLateralSubquery,
+    correlation_value: std.json.Value,
+) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"bool\":{\"filter\":[");
+    try documentSqlAppendLateralTermFilterAlloc(alloc, &out, lateral.correlation_path, correlation_value);
+    if (lateral.residual_filter_json) |filter| {
+        try out.append(alloc, ',');
+        try out.appendSlice(alloc, filter);
+    }
+    for (lateral.field_residuals) |residual| {
+        const outer_value = documentSqlProjectedValue(outer_row, residual.outer_path) orelse {
+            out.deinit(alloc);
+            return try alloc.dupe(u8, "{\"match_none\":{}}");
+        };
+        if (outer_value == .null) {
+            out.deinit(alloc);
+            return try alloc.dupe(u8, "{\"match_none\":{}}");
+        }
+        try out.append(alloc, ',');
+        try documentSqlAppendLateralFieldResidualFilterAlloc(alloc, &out, residual, outer_value);
+    }
+    try out.appendSlice(alloc, "]}}");
+    return try out.toOwnedSlice(alloc);
+}
+
+fn documentSqlAppendLateralTermFilterAlloc(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    path: []const u8,
+    value: std.json.Value,
+) !void {
+    try out.appendSlice(alloc, "{\"term\":{\"path\":");
+    try appendJsonString(alloc, out, path);
+    try out.appendSlice(alloc, ",\"value\":");
+    try documentSqlAppendJsonValueAlloc(alloc, out, value);
+    try out.appendSlice(alloc, "}}");
+}
+
+fn documentSqlAppendLateralFieldResidualFilterAlloc(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    residual: sql_adapter.DocumentLateralFieldResidual,
+    outer_value: std.json.Value,
+) !void {
+    switch (residual.op) {
+        .eq => try documentSqlAppendLateralTermFilterAlloc(alloc, out, residual.branch_path, outer_value),
+        .neq => {
+            try out.appendSlice(alloc, "{\"bool\":{\"must_not\":[");
+            try documentSqlAppendLateralTermFilterAlloc(alloc, out, residual.branch_path, outer_value);
+            try out.appendSlice(alloc, "]}}");
+        },
+        .gt, .gte, .lt, .lte => {
+            const range_op = switch (residual.field_type) {
+                .numeric => "numeric_range",
+                .datetime => "date_range",
+                .keyword, .text, .html, .search_as_you_type => "term_range",
+                else => return error.DocumentSqlLateralRequiresNativeProducer,
+            };
+            try out.append(alloc, '{');
+            try appendJsonString(alloc, out, range_op);
+            try out.appendSlice(alloc, ":{\"path\":");
+            try appendJsonString(alloc, out, residual.branch_path);
+            switch (residual.op) {
+                .gt, .gte => {
+                    try out.appendSlice(alloc, ",\"min\":");
+                    try documentSqlAppendJsonValueAlloc(alloc, out, outer_value);
+                    try out.appendSlice(alloc, ",\"inclusive_min\":");
+                    try out.appendSlice(alloc, if (residual.op == .gte) "true" else "false");
+                },
+                .lt, .lte => {
+                    try out.appendSlice(alloc, ",\"max\":");
+                    try documentSqlAppendJsonValueAlloc(alloc, out, outer_value);
+                    try out.appendSlice(alloc, ",\"inclusive_max\":");
+                    try out.appendSlice(alloc, if (residual.op == .lte) "true" else "false");
+                },
+                .eq, .neq => unreachable,
+            }
+            try out.appendSlice(alloc, "}}");
+        },
+    }
+}
+
+fn documentSqlAppendJsonValueAlloc(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    value: std.json.Value,
+) !void {
+    const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(encoded);
+    try out.appendSlice(alloc, encoded);
+}
+
+fn documentSqlLateralFieldResidualMatches(
+    row: std.json.Value,
+    residual: sql_adapter.DocumentLateralFieldResidual,
+) !bool {
+    const branch_value = documentSqlProjectedValue(row, residual.branch_path) orelse return false;
+    const outer_value = documentSqlProjectedValue(row, residual.outer_path) orelse return false;
+    if (branch_value == .null or outer_value == .null) return false;
+    return switch (residual.op) {
+        .eq => documentSqlJsonValuesEqual(branch_value, outer_value),
+        .neq => !documentSqlJsonValuesEqual(branch_value, outer_value),
+        .gt, .gte, .lt, .lte => blk: {
+            const comparison = documentSqlJsonCompare(branch_value, outer_value) orelse break :blk false;
+            break :blk switch (residual.op) {
+                .gt => comparison == .gt,
+                .gte => comparison == .gt or comparison == .eq,
+                .lt => comparison == .lt,
+                .lte => comparison == .lt or comparison == .eq,
+                .eq, .neq => unreachable,
+            };
+        },
+    };
+}
+
+fn documentSqlJsonCompare(left: std.json.Value, right: std.json.Value) ?DocumentMergeScalarComparison {
+    return documentMergeJsonCompare(left, right);
 }
 
 fn appendOrderedDocumentSqlUnnestCandidatesAlloc(
@@ -4570,6 +5500,11 @@ fn appendOrderedDocumentSqlUnnestCandidatesAlloc(
     else
         null;
     defer if (filter_not_value) |*value| value.deinit();
+    var filter_not_values = if (unnest.filter_not_values_json) |filter_json|
+        try std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{})
+    else
+        null;
+    defer if (filter_not_values) |*value| value.deinit();
     var filter_pattern = if (unnest.filter_pattern_json) |filter_json|
         try std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{})
     else
@@ -4590,6 +5525,9 @@ fn appendOrderedDocumentSqlUnnestCandidatesAlloc(
         }
         if (filter_not_value) |value| {
             if (item == .null or documentSqlJsonValuesEqual(item, value.value)) continue;
+        }
+        if (filter_not_values) |values| {
+            if (item == .null or documentSqlJsonValueInArray(item, values.value)) continue;
         }
         if (filter_pattern) |pattern| {
             if (!documentSqlUnnestItemPatternMatches(item, pattern.value, unnest.filter_pattern_case_insensitive)) continue;
@@ -4766,6 +5704,11 @@ fn appendDocumentSqlUnnestRowsAlloc(
     else
         null;
     defer if (filter_not_value) |*value| value.deinit();
+    var filter_not_values = if (unnest.filter_not_values_json) |filter_json|
+        try std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{})
+    else
+        null;
+    defer if (filter_not_values) |*value| value.deinit();
     var filter_pattern = if (unnest.filter_pattern_json) |filter_json|
         try std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{})
     else
@@ -4786,6 +5729,9 @@ fn appendDocumentSqlUnnestRowsAlloc(
         }
         if (filter_not_value) |value| {
             if (item == .null or documentSqlJsonValuesEqual(item, value.value)) continue;
+        }
+        if (filter_not_values) |values| {
+            if (item == .null or documentSqlJsonValueInArray(item, values.value)) continue;
         }
         if (filter_pattern) |pattern| {
             if (!documentSqlUnnestItemPatternMatches(item, pattern.value, unnest.filter_pattern_case_insensitive)) continue;
@@ -4896,6 +5842,357 @@ fn documentSqlFilterValueMatches(
         const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
         return try documentSqlAsciiUpperEqualsAlloc(alloc, actual, field_value.value.string);
     }
+    if (filter.object.get("scalar_text_cast_term")) |term| {
+        const field_value = try documentSqlFilterFieldValue(term, "value");
+        if (field_value.value != .string) return error.InvalidRowsRequest;
+        const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
+        if (actual == .null) return false;
+        const text = try documentSqlTextCastValueAlloc(alloc, actual);
+        defer alloc.free(text);
+        return std.mem.eql(u8, text, field_value.value.string);
+    }
+    if (filter.object.get("scalar_numeric_cast_range")) |range| {
+        const path = try documentSqlFilterPath(range);
+        const actual = documentSqlProjectedValue(doc, path) orelse return false;
+        if (actual == .null) return false;
+        const number = try documentSqlJsonNumber(actual);
+        return try documentSqlNumericRangeValueMatches(number, range);
+    }
+    if (filter.object.get("scalar_boolean_cast_term")) |term| {
+        const field_value = try documentSqlFilterFieldValue(term, "value");
+        if (field_value.value != .bool) return error.InvalidRowsRequest;
+        const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
+        if (actual == .null) return false;
+        return (try documentSqlBooleanCastValue(actual)) == field_value.value.bool;
+    }
+    if (filter.object.get("scalar_datetime_cast_range")) |range| {
+        const path = try documentSqlFilterPath(range);
+        const actual = documentSqlProjectedValue(doc, path) orelse return false;
+        if (actual == .null) return false;
+        const timestamp = try documentSqlDatetimeCastValue(actual);
+        return try documentSqlNumericRangeValueMatches(@floatFromInt(timestamp), range);
+    }
+    if (filter.object.get("text_nullif_term")) |term| {
+        const field_value = try documentSqlFilterFieldValue(term, "value");
+        if (field_value.value != .string) return error.InvalidRowsRequest;
+        const nullif_value = try documentSqlFilterNamedValue(term, "nullif");
+        if (nullif_value != .string) return error.InvalidRowsRequest;
+        const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
+        if (actual == .null) return false;
+        const text = try documentSqlFilterStringValue(actual);
+        if (std.mem.eql(u8, text, nullif_value.string)) return false;
+        return std.mem.eql(u8, text, field_value.value.string);
+    }
+    if (filter.object.get("text_replace_term")) |term| {
+        const field_value = try documentSqlFilterFieldValue(term, "value");
+        if (field_value.value != .string) return error.InvalidRowsRequest;
+        const needle = try documentSqlFilterNamedValue(term, "needle");
+        if (needle != .string) return error.InvalidRowsRequest;
+        const replacement = try documentSqlFilterNamedValue(term, "replacement");
+        if (replacement != .string) return error.InvalidRowsRequest;
+        const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
+        if (actual == .null) return false;
+        const text = try documentSqlFilterStringValue(actual);
+        const replaced = try documentSqlReplaceTextAlloc(alloc, text, needle.string, replacement.string);
+        defer alloc.free(replaced);
+        return std.mem.eql(u8, replaced, field_value.value.string);
+    }
+    if (filter.object.get("text_translate_term")) |term| {
+        const field_value = try documentSqlFilterFieldValue(term, "value");
+        if (field_value.value != .string) return error.InvalidRowsRequest;
+        const from = try documentSqlFilterNamedValue(term, "from");
+        if (from != .string) return error.InvalidRowsRequest;
+        const to = try documentSqlFilterNamedValue(term, "to");
+        if (to != .string) return error.InvalidRowsRequest;
+        const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
+        if (actual == .null) return false;
+        const text = try documentSqlFilterStringValue(actual);
+        const translated = try documentSqlTranslateTextAlloc(alloc, text, from.string, to.string);
+        defer alloc.free(translated);
+        return std.mem.eql(u8, translated, field_value.value.string);
+    }
+    if (filter.object.get("text_concat_ws_term")) |term| {
+        const field_value = try documentSqlFilterFieldValue(term, "value");
+        if (field_value.value != .string) return error.InvalidRowsRequest;
+        const path2_value = try documentSqlFilterNamedValue(term, "path2");
+        if (path2_value != .string) return error.InvalidRowsRequest;
+        const separator = try documentSqlFilterNamedValue(term, "separator");
+        if (separator != .string) return error.InvalidRowsRequest;
+        const left = try documentSqlOptionalProjectedStringValue(doc, field_value.path);
+        const right = try documentSqlOptionalProjectedStringValue(doc, path2_value.string);
+        const joined = try documentSqlConcatWsTextAlloc(alloc, separator.string, left, right);
+        defer alloc.free(joined);
+        return std.mem.eql(u8, joined, field_value.value.string);
+    }
+    if (filter.object.get("text_pad_term")) |term| {
+        const field_value = try documentSqlFilterFieldValue(term, "value");
+        if (field_value.value != .string) return error.InvalidRowsRequest;
+        const side = try documentSqlFilterNamedValue(term, "side");
+        if (side != .string) return error.InvalidRowsRequest;
+        const width_value = try documentSqlFilterNamedValue(term, "width");
+        if (width_value != .integer) return error.InvalidRowsRequest;
+        const fill = try documentSqlFilterNamedValue(term, "fill");
+        if (fill != .string) return error.InvalidRowsRequest;
+        const left = if (std.mem.eql(u8, side.string, "left"))
+            true
+        else if (std.mem.eql(u8, side.string, "right"))
+            false
+        else
+            return error.InvalidRowsRequest;
+        const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
+        if (actual == .null) return false;
+        const text = try documentSqlFilterStringValue(actual);
+        const padded = try documentSqlPadTextAlloc(alloc, text, width_value.integer, fill.string, left);
+        defer alloc.free(padded);
+        return std.mem.eql(u8, padded, field_value.value.string);
+    }
+    if (filter.object.get("text_repeat_term")) |term| {
+        const field_value = try documentSqlFilterFieldValue(term, "value");
+        if (field_value.value != .string) return error.InvalidRowsRequest;
+        const count_value = try documentSqlFilterNamedValue(term, "count");
+        if (count_value != .integer) return error.InvalidRowsRequest;
+        const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
+        if (actual == .null) return false;
+        const text = try documentSqlFilterStringValue(actual);
+        const repeated = try documentSqlRepeatTextAlloc(alloc, text, count_value.integer);
+        defer alloc.free(repeated);
+        return std.mem.eql(u8, repeated, field_value.value.string);
+    }
+    if (filter.object.get("text_slice_term")) |term| {
+        const field_value = try documentSqlFilterFieldValue(term, "value");
+        if (field_value.value != .string) return error.InvalidRowsRequest;
+        const side = try documentSqlFilterNamedValue(term, "side");
+        if (side != .string) return error.InvalidRowsRequest;
+        const count_value = try documentSqlFilterNamedValue(term, "count");
+        if (count_value != .integer) return error.InvalidRowsRequest;
+        const from_left = if (std.mem.eql(u8, side.string, "left"))
+            true
+        else if (std.mem.eql(u8, side.string, "right"))
+            false
+        else
+            return error.InvalidRowsRequest;
+        const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
+        if (actual == .null) return false;
+        const text = try documentSqlFilterStringValue(actual);
+        const sliced = try documentSqlLeftRightTextAlloc(alloc, text, count_value.integer, from_left);
+        defer alloc.free(sliced);
+        return std.mem.eql(u8, sliced, field_value.value.string);
+    }
+    if (filter.object.get("text_substring_term")) |term| {
+        const field_value = try documentSqlFilterFieldValue(term, "value");
+        if (field_value.value != .string) return error.InvalidRowsRequest;
+        const start_value = try documentSqlFilterNamedValue(term, "start");
+        if (start_value != .integer) return error.InvalidRowsRequest;
+        const length_value = if (term == .object) term.object.get("length") else return error.InvalidRowsRequest;
+        const length: ?i64 = if (length_value) |value| blk: {
+            if (value != .integer) return error.InvalidRowsRequest;
+            break :blk value.integer;
+        } else null;
+        const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
+        if (actual == .null) return false;
+        const text = try documentSqlFilterStringValue(actual);
+        const substring = try documentSqlSubstringTextAlloc(alloc, text, start_value.integer, length);
+        defer alloc.free(substring);
+        return std.mem.eql(u8, substring, field_value.value.string);
+    }
+    if (filter.object.get("text_overlay_term")) |term| {
+        const field_value = try documentSqlFilterFieldValue(term, "value");
+        if (field_value.value != .string) return error.InvalidRowsRequest;
+        const replacement = try documentSqlFilterNamedValue(term, "replacement");
+        if (replacement != .string) return error.InvalidRowsRequest;
+        const start_value = try documentSqlFilterNamedValue(term, "start");
+        if (start_value != .integer) return error.InvalidRowsRequest;
+        const length_value = if (term == .object) term.object.get("length") else return error.InvalidRowsRequest;
+        const length: ?i64 = if (length_value) |value| blk: {
+            if (value != .integer) return error.InvalidRowsRequest;
+            break :blk value.integer;
+        } else null;
+        const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
+        if (actual == .null) return false;
+        const text = try documentSqlFilterStringValue(actual);
+        const overlayed = try documentSqlOverlayTextAlloc(alloc, text, replacement.string, start_value.integer, length);
+        defer alloc.free(overlayed);
+        return std.mem.eql(u8, overlayed, field_value.value.string);
+    }
+    if (filter.object.get("text_split_part_term")) |term| {
+        const field_value = try documentSqlFilterFieldValue(term, "value");
+        if (field_value.value != .string) return error.InvalidRowsRequest;
+        const delimiter = try documentSqlFilterNamedValue(term, "delimiter");
+        if (delimiter != .string) return error.InvalidRowsRequest;
+        const index_value = try documentSqlFilterNamedValue(term, "index");
+        if (index_value != .integer) return error.InvalidRowsRequest;
+        const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
+        if (actual == .null) return false;
+        const text = try documentSqlFilterStringValue(actual);
+        const part = try documentSqlSplitPartTextAlloc(alloc, text, delimiter.string, index_value.integer);
+        defer alloc.free(part);
+        return std.mem.eql(u8, part, field_value.value.string);
+    }
+    if (filter.object.get("text_affix_term")) |term| {
+        const field_value = try documentSqlFilterFieldValue(term, "value");
+        if (field_value.value != .string) return error.InvalidRowsRequest;
+        const side = try documentSqlFilterNamedValue(term, "side");
+        if (side != .string) return error.InvalidRowsRequest;
+        const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
+        if (actual == .null) return false;
+        const text = try documentSqlFilterStringValue(actual);
+        if (std.mem.eql(u8, side.string, "prefix")) {
+            return std.mem.startsWith(u8, text, field_value.value.string);
+        }
+        if (std.mem.eql(u8, side.string, "suffix")) {
+            return std.mem.endsWith(u8, text, field_value.value.string);
+        }
+        return error.InvalidRowsRequest;
+    }
+    if (filter.object.get("text_lower_prefix")) |prefix| {
+        const field_value = try documentSqlFilterFieldValue(prefix, "value");
+        if (field_value.value != .string) return error.InvalidRowsRequest;
+        if (!documentSqlAsciiOnly(field_value.value.string)) return error.UnsupportedSqlShape;
+        const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
+        return try documentSqlAsciiLowerStartsWithAlloc(alloc, actual, field_value.value.string);
+    }
+    if (filter.object.get("text_upper_prefix")) |prefix| {
+        const field_value = try documentSqlFilterFieldValue(prefix, "value");
+        if (field_value.value != .string) return error.InvalidRowsRequest;
+        if (!documentSqlAsciiOnly(field_value.value.string)) return error.UnsupportedSqlShape;
+        const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
+        return try documentSqlAsciiUpperStartsWithAlloc(alloc, actual, field_value.value.string);
+    }
+    if (filter.object.get("text_lower_wildcard")) |wildcard| {
+        const field_value = try documentSqlFilterFieldValue(wildcard, "pattern");
+        if (field_value.value != .string) return error.InvalidRowsRequest;
+        if (!documentSqlAsciiOnly(field_value.value.string)) return error.UnsupportedSqlShape;
+        const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
+        return try documentSqlAsciiLowerWildcardMatchesAlloc(alloc, actual, field_value.value.string);
+    }
+    if (filter.object.get("text_upper_wildcard")) |wildcard| {
+        const field_value = try documentSqlFilterFieldValue(wildcard, "pattern");
+        if (field_value.value != .string) return error.InvalidRowsRequest;
+        if (!documentSqlAsciiOnly(field_value.value.string)) return error.UnsupportedSqlShape;
+        const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
+        return try documentSqlAsciiUpperWildcardMatchesAlloc(alloc, actual, field_value.value.string);
+    }
+    if (filter.object.get("text_length_range")) |range| {
+        const path = try documentSqlFilterPath(range);
+        const actual = documentSqlProjectedValue(doc, path) orelse return false;
+        return try documentSqlTextLengthRangeMatches(actual, range);
+    }
+    if (filter.object.get("text_octet_length_range")) |range| {
+        const path = try documentSqlFilterPath(range);
+        const actual = documentSqlProjectedValue(doc, path) orelse return false;
+        return try documentSqlTextByteLengthRangeMatches(actual, range, false);
+    }
+    if (filter.object.get("text_bit_length_range")) |range| {
+        const path = try documentSqlFilterPath(range);
+        const actual = documentSqlProjectedValue(doc, path) orelse return false;
+        return try documentSqlTextByteLengthRangeMatches(actual, range, true);
+    }
+    if (filter.object.get("text_strpos_range")) |range| {
+        const path = try documentSqlFilterPath(range);
+        const needle = try documentSqlFilterNamedValue(range, "needle");
+        if (needle != .string) return error.InvalidRowsRequest;
+        const actual = documentSqlProjectedValue(doc, path) orelse return false;
+        if (actual == .null) return false;
+        const text = try documentSqlFilterStringValue(actual);
+        const position = try documentSqlStrposTextCodepointPosition(text, needle.string);
+        return try documentSqlNumericRangeValueMatches(@floatFromInt(position), range);
+    }
+    if (filter.object.get("text_ascii_range")) |range| {
+        const path = try documentSqlFilterPath(range);
+        const actual = documentSqlProjectedValue(doc, path) orelse return false;
+        if (actual == .null) return false;
+        const text = try documentSqlFilterStringValue(actual);
+        const codepoint = try documentSqlAsciiFirstCodepoint(text);
+        return try documentSqlNumericRangeValueMatches(@floatFromInt(codepoint), range);
+    }
+    if (filter.object.get("regexp_count_range")) |range| {
+        return try documentSqlRegexpNumericRangeMatches(alloc, doc, range, .regexp_count);
+    }
+    if (filter.object.get("regexp_instr_range")) |range| {
+        return try documentSqlRegexpNumericRangeMatches(alloc, doc, range, .regexp_instr);
+    }
+    if (filter.object.get("regexp_substr_term")) |term| {
+        const field_value = try documentSqlFilterFieldValue(term, "value");
+        if (field_value.value != .string) return error.InvalidRowsRequest;
+        const pattern = try documentSqlFilterNamedValue(term, "pattern");
+        if (pattern != .string) return error.InvalidRowsRequest;
+        const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
+        if (actual == .null) return false;
+        const text = try documentSqlFilterStringValue(actual);
+        const matched = try documentSqlRegexpSubstrTextAlloc(alloc, text, pattern.string);
+        defer if (matched) |value_text| alloc.free(value_text);
+        return if (matched) |value_text| std.mem.eql(u8, value_text, field_value.value.string) else false;
+    }
+    if (filter.object.get("text_chr_term")) |term| {
+        if (term != .object) return error.InvalidRowsRequest;
+        const expected = try documentSqlFilterNamedValue(term, "value");
+        if (expected != .string) return error.InvalidRowsRequest;
+        const path_value = term.object.get("path") orelse term.object.get("field");
+        const codepoint_value = term.object.get("codepoint");
+        if (path_value != null and codepoint_value != null) return error.InvalidRowsRequest;
+        const codepoint = if (path_value) |path| blk: {
+            if (path != .string) return error.InvalidRowsRequest;
+            const actual = documentSqlProjectedValue(doc, path.string) orelse return false;
+            if (actual == .null) return false;
+            break :blk try documentSqlIntegerCodepointFromJson(actual);
+        } else if (codepoint_value) |value| try documentSqlIntegerCodepointFromJson(value) else return error.InvalidRowsRequest;
+        const encoded = try documentSqlChrTextAlloc(alloc, codepoint);
+        defer alloc.free(encoded);
+        return std.mem.eql(u8, encoded, expected.string);
+    }
+    if (filter.object.get("text_unary_term")) |term| {
+        const field_value = try documentSqlFilterFieldValue(term, "value");
+        if (field_value.value != .string) return error.InvalidRowsRequest;
+        const operator = try documentSqlFilterNamedValue(term, "operator");
+        if (operator != .string) return error.InvalidRowsRequest;
+        const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
+        if (actual == .null) return false;
+        const text = try documentSqlFilterStringValue(actual);
+        if (std.mem.eql(u8, operator.string, "initcap")) {
+            if (!documentSqlAsciiOnly(text)) return error.UnsupportedSqlShape;
+            const titled = try documentSqlInitcapAsciiAlloc(alloc, text);
+            defer alloc.free(titled);
+            return std.mem.eql(u8, titled, field_value.value.string);
+        }
+        if (std.mem.eql(u8, operator.string, "md5")) {
+            const digest = try expr_text.md5HexTextAlloc(alloc, text);
+            defer alloc.free(digest);
+            return std.mem.eql(u8, digest, field_value.value.string);
+        }
+        if (std.mem.eql(u8, operator.string, "reverse")) {
+            const reversed = try documentSqlReverseTextAlloc(alloc, text);
+            defer alloc.free(reversed);
+            return std.mem.eql(u8, reversed, field_value.value.string);
+        }
+        if (std.mem.eql(u8, operator.string, "btrim") or std.mem.eql(u8, operator.string, "ltrim") or std.mem.eql(u8, operator.string, "rtrim")) {
+            const kind: sql_adapter.DocumentProjectionKind = if (std.mem.eql(u8, operator.string, "btrim"))
+                .text_btrim
+            else if (std.mem.eql(u8, operator.string, "ltrim"))
+                .text_ltrim
+            else
+                .text_rtrim;
+            const trimmed = documentSqlTrimText(text, kind);
+            return std.mem.eql(u8, trimmed, field_value.value.string);
+        }
+        return error.InvalidRowsRequest;
+    }
+    if (filter.object.get("array_length_range")) |range| {
+        const path = try documentSqlFilterPath(range);
+        const actual = documentSqlProjectedValue(doc, path) orelse return false;
+        return try documentSqlArrayLengthRangeMatches(actual, range);
+    }
+    if (filter.object.get("json_array_length_range")) |range| {
+        const path = try documentSqlFilterPath(range);
+        const actual = documentSqlProjectedValue(doc, path) orelse return false;
+        return try documentSqlArrayLengthRangeMatches(actual, range);
+    }
+    if (filter.object.get("json_typeof_term")) |term| {
+        const path = try documentSqlFilterPath(term);
+        const expected = try documentSqlFilterNamedValue(term, "value");
+        if (expected != .string) return error.InvalidRowsRequest;
+        const actual = documentSqlProjectedValue(doc, path) orelse return false;
+        return std.mem.eql(u8, documentSqlJsonTypeofName(actual), expected.string);
+    }
     if (filter.object.get("terms")) |terms| {
         const field_value = try documentSqlFilterFieldValue(terms, "values");
         if (field_value.value != .array) return error.InvalidRowsRequest;
@@ -4921,6 +6218,14 @@ fn documentSqlFilterValueMatches(
         const text = try documentSqlFilterStringValue(actual);
         return documentSqlWildcardMatches(expected.string, text);
     }
+    if (filter.object.get("text_regex")) |regex| {
+        const field_value = try documentSqlFilterFieldValue(regex, "pattern");
+        if (field_value.value != .string) return error.InvalidRowsRequest;
+        const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
+        const text = try documentSqlFilterStringValue(actual);
+        const case_insensitive = documentSqlFilterBool(regex, "case_insensitive", false);
+        return try documentSqlRegexMatchesAlloc(alloc, text, field_value.value.string, case_insensitive);
+    }
     if (filter.object.get("numeric_range")) |range| {
         const path = try documentSqlFilterPath(range);
         const actual = documentSqlProjectedValue(doc, path) orelse return false;
@@ -4930,6 +6235,16 @@ fn documentSqlFilterValueMatches(
         const path = try documentSqlFilterPath(range);
         const actual = documentSqlProjectedValue(doc, path) orelse return false;
         return try documentSqlNumericAbsRangeMatches(actual, range);
+    }
+    if (filter.object.get("numeric_arithmetic_range")) |range| {
+        const path = try documentSqlFilterPath(range);
+        const actual = documentSqlProjectedValue(doc, path) orelse return false;
+        return try documentSqlNumericArithmeticRangeMatches(actual, range);
+    }
+    if (filter.object.get("numeric_unary_range")) |range| {
+        const path = try documentSqlFilterPath(range);
+        const actual = documentSqlProjectedValue(doc, path) orelse return false;
+        return try documentSqlNumericUnaryRangeMatches(actual, range);
     }
     if (filter.object.get("date_range")) |range| {
         const path = try documentSqlFilterPath(range);
@@ -5063,15 +6378,32 @@ fn documentSqlJsonValueInArray(actual: std.json.Value, expected_values: std.json
 fn documentSqlUnnestItemRangeMatches(item: std.json.Value, filter: std.json.Value) !bool {
     if (filter != .object) return error.InvalidRowsRequest;
     if (filter.object.get("numeric_range")) |range| {
+        if (!documentSqlJsonValueIsNumber(item)) return false;
         return try documentSqlNumericRangeMatches(item, range);
     }
     if (filter.object.get("date_range")) |range| {
+        if (!documentSqlJsonValueIsStringLike(item)) return false;
         return try documentSqlStringRangeMatches(item, range, "start", "end", "inclusive_start", "inclusive_end");
     }
     if (filter.object.get("term_range")) |range| {
+        if (!documentSqlJsonValueIsStringLike(item)) return false;
         return try documentSqlStringRangeMatches(item, range, "min", "max", "inclusive_min", "inclusive_max");
     }
     return error.InvalidRowsRequest;
+}
+
+fn documentSqlJsonValueIsNumber(value: std.json.Value) bool {
+    return switch (value) {
+        .integer, .float, .number_string => true,
+        else => false,
+    };
+}
+
+fn documentSqlJsonValueIsStringLike(value: std.json.Value) bool {
+    return switch (value) {
+        .string, .number_string => true,
+        else => false,
+    };
 }
 
 fn documentSqlUnnestItemPatternMatches(item: std.json.Value, pattern: std.json.Value, case_insensitive: bool) bool {
@@ -5092,12 +6424,264 @@ fn documentSqlJsonNumber(value: std.json.Value) !f64 {
     };
 }
 
+fn documentSqlNumericUnaryResult(number: f64, kind: sql_adapter.DocumentProjectionKind) !f64 {
+    const result = switch (kind) {
+        .numeric_round => @round(number),
+        .numeric_trunc => @trunc(number),
+        .numeric_floor => @floor(number),
+        .numeric_ceil => @ceil(number),
+        .numeric_sqrt => if (number < 0) return error.InvalidRowsRequest else @sqrt(number),
+        .numeric_sign => if (number < 0) @as(f64, -1) else if (number > 0) @as(f64, 1) else @as(f64, 0),
+        else => unreachable,
+    };
+    if (!std.math.isFinite(result)) return error.InvalidRowsRequest;
+    return result;
+}
+
+fn documentSqlTextCastValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]const u8 {
+    return switch (value) {
+        .string => |text| try alloc.dupe(u8, text),
+        .integer => |number| try std.fmt.allocPrint(alloc, "{d}", .{number}),
+        .float => |number| try std.fmt.allocPrint(alloc, "{d}", .{number}),
+        .number_string => |text| try alloc.dupe(u8, text),
+        .bool => |boolean| try alloc.dupe(u8, if (boolean) "true" else "false"),
+        else => error.InvalidRowsRequest,
+    };
+}
+
+fn documentSqlBooleanCastValue(value: std.json.Value) !bool {
+    return switch (value) {
+        .bool => |enabled| enabled,
+        .string => |text| if (std.mem.eql(u8, text, "true"))
+            true
+        else if (std.mem.eql(u8, text, "false"))
+            false
+        else
+            error.InvalidRowsRequest,
+        else => error.InvalidRowsRequest,
+    };
+}
+
+fn documentSqlDatetimeCastValue(value: std.json.Value) !u64 {
+    return switch (value) {
+        .integer => |integer| if (integer >= 0) @as(u64, @intCast(integer)) else error.InvalidRowsRequest,
+        .number_string => |text| std.fmt.parseInt(u64, text, 10) catch return error.InvalidRowsRequest,
+        .string => |text| std.fmt.parseInt(u64, text, 10) catch return error.InvalidRowsRequest,
+        else => error.InvalidRowsRequest,
+    };
+}
+
+const document_sql_nanoseconds_per_day: u64 = 86_400_000_000_000;
+
+fn documentSqlUtcDateFromDatetimeAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]const u8 {
+    const timestamp_ns = try documentSqlDatetimeCastValue(value);
+    const epoch_days = timestamp_ns / document_sql_nanoseconds_per_day;
+    if (epoch_days > std.math.maxInt(i64)) return error.InvalidRowsRequest;
+    const day = documentSqlUtcDateFromEpochDays(@intCast(epoch_days));
+    return try std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}", .{ day.year, day.month, day.day });
+}
+
+const DocumentSqlUtcDate = struct {
+    year: i64,
+    month: i64,
+    day: i64,
+};
+
+fn documentSqlUtcDateFromEpochDays(epoch_days: i64) DocumentSqlUtcDate {
+    const z = epoch_days + 719468;
+    const era = @divFloor(z, 146097);
+    const doe = z - era * 146097;
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+    var year = yoe + era * 400;
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const day = doy - @divFloor(153 * mp + 2, 5) + 1;
+    const month = mp + if (mp < 10) @as(i64, 3) else @as(i64, -9);
+    if (month <= 2) year += 1;
+    return .{ .year = year, .month = month, .day = day };
+}
+
+fn documentSqlJsonTypeofName(value: std.json.Value) []const u8 {
+    return switch (value) {
+        .object => "object",
+        .array => "array",
+        .string => "string",
+        .integer, .float, .number_string => "number",
+        .bool => "boolean",
+        .null => "null",
+    };
+}
+
 fn documentSqlFilterStringValue(value: std.json.Value) ![]const u8 {
     return switch (value) {
         .string => |text| text,
         .number_string => |text| text,
         else => error.InvalidRowsRequest,
     };
+}
+
+fn documentSqlOptionalProjectedStringValue(row: std.json.Value, field: []const u8) !?[]const u8 {
+    const value = documentSqlProjectedValue(row, field) orelse return null;
+    if (value == .null) return null;
+    return try documentSqlFilterStringValue(value);
+}
+
+fn documentSqlConcatWsTextAlloc(
+    alloc: std.mem.Allocator,
+    separator: []const u8,
+    left: ?[]const u8,
+    right: ?[]const u8,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var wrote = false;
+    if (left) |text| {
+        try out.appendSlice(alloc, text);
+        wrote = true;
+    }
+    if (right) |text| {
+        if (wrote) try out.appendSlice(alloc, separator);
+        try out.appendSlice(alloc, text);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn documentSqlArrayToStringTextAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    separator: []const u8,
+) ![]u8 {
+    if (value != .array) return error.InvalidRowsRequest;
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var wrote = false;
+    for (value.array.items) |item| {
+        if (item == .null) continue;
+        const text = try documentSqlFilterStringValue(item);
+        if (wrote) try out.appendSlice(alloc, separator);
+        try out.appendSlice(alloc, text);
+        wrote = true;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn documentSqlArrayPosition(value: std.json.Value, needle: []const u8) !?usize {
+    if (value != .array) return error.InvalidRowsRequest;
+    for (value.array.items, 0..) |item, i| {
+        if (item == .null) continue;
+        const text = try documentSqlFilterStringValue(item);
+        if (std.mem.eql(u8, text, needle)) return i + 1;
+    }
+    return null;
+}
+
+fn documentSqlArrayPositionsJsonAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    needle: []const u8,
+) ![]u8 {
+    if (value != .array) return error.InvalidRowsRequest;
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '[');
+    var wrote = false;
+    for (value.array.items, 0..) |item, i| {
+        if (item == .null) continue;
+        const text = try documentSqlFilterStringValue(item);
+        if (!std.mem.eql(u8, text, needle)) continue;
+        if (wrote) try out.append(alloc, ',');
+        const position_text = try std.fmt.allocPrint(alloc, "{d}", .{i + 1});
+        defer alloc.free(position_text);
+        try out.appendSlice(alloc, position_text);
+        wrote = true;
+    }
+    try out.append(alloc, ']');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn documentSqlArrayTransformJsonAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    kind: sql_adapter.DocumentProjectionKind,
+    pattern: []const u8,
+    replacement: []const u8,
+) ![]u8 {
+    if (value != .array) return error.InvalidRowsRequest;
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '[');
+    var wrote = false;
+    if (kind == .array_prepend) {
+        try documentSqlAppendArrayTransformItem(alloc, &out, &wrote, pattern);
+    }
+    for (value.array.items) |item| {
+        if (item == .null) {
+            try documentSqlAppendArrayTransformItem(alloc, &out, &wrote, null);
+            continue;
+        }
+        const text = try documentSqlFilterStringValue(item);
+        switch (kind) {
+            .array_append, .array_cat, .array_prepend => try documentSqlAppendArrayTransformItem(alloc, &out, &wrote, text),
+            .array_remove => if (!std.mem.eql(u8, text, pattern)) try documentSqlAppendArrayTransformItem(alloc, &out, &wrote, text),
+            .array_replace => try documentSqlAppendArrayTransformItem(
+                alloc,
+                &out,
+                &wrote,
+                if (std.mem.eql(u8, text, pattern)) replacement else text,
+            ),
+            else => unreachable,
+        }
+    }
+    if (kind == .array_append) {
+        try documentSqlAppendArrayTransformItem(alloc, &out, &wrote, pattern);
+    } else if (kind == .array_cat) {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, pattern, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+        defer parsed.deinit();
+        if (parsed.value != .array) return error.InvalidRowsRequest;
+        for (parsed.value.array.items) |item| {
+            const text = try documentSqlFilterStringValue(item);
+            try documentSqlAppendArrayTransformItem(alloc, &out, &wrote, text);
+        }
+    }
+    try out.append(alloc, ']');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn documentSqlAppendArrayTransformItem(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    wrote: *bool,
+    text: ?[]const u8,
+) !void {
+    if (wrote.*) try out.append(alloc, ',');
+    if (text) |value| {
+        try appendJsonString(alloc, out, value);
+    } else {
+        try out.appendSlice(alloc, "null");
+    }
+    wrote.* = true;
+}
+
+fn documentSqlStringToArrayJsonAlloc(
+    alloc: std.mem.Allocator,
+    text: []const u8,
+    separator: []const u8,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '[');
+    if (separator.len == 0) {
+        try appendJsonString(alloc, &out, text);
+    } else {
+        var split = std.mem.splitSequence(u8, text, separator);
+        var index: usize = 0;
+        while (split.next()) |part| : (index += 1) {
+            if (index > 0) try out.append(alloc, ',');
+            try appendJsonString(alloc, &out, part);
+        }
+    }
+    try out.append(alloc, ']');
+    return try out.toOwnedSlice(alloc);
 }
 
 fn documentSqlAsciiLowerEqualsAlloc(alloc: std.mem.Allocator, actual: std.json.Value, expected: []const u8) !bool {
@@ -5116,11 +6700,417 @@ fn documentSqlAsciiUpperEqualsAlloc(alloc: std.mem.Allocator, actual: std.json.V
     return std.mem.eql(u8, uppered, expected);
 }
 
+fn documentSqlAsciiLowerStartsWithAlloc(alloc: std.mem.Allocator, actual: std.json.Value, expected: []const u8) !bool {
+    const text = try documentSqlFilterStringValue(actual);
+    if (!documentSqlAsciiOnly(text)) return error.UnsupportedSqlShape;
+    const lowered = try std.ascii.allocLowerString(alloc, text);
+    defer alloc.free(lowered);
+    return std.mem.startsWith(u8, lowered, expected);
+}
+
+fn documentSqlAsciiUpperStartsWithAlloc(alloc: std.mem.Allocator, actual: std.json.Value, expected: []const u8) !bool {
+    const text = try documentSqlFilterStringValue(actual);
+    if (!documentSqlAsciiOnly(text)) return error.UnsupportedSqlShape;
+    const uppered = try std.ascii.allocUpperString(alloc, text);
+    defer alloc.free(uppered);
+    return std.mem.startsWith(u8, uppered, expected);
+}
+
+fn documentSqlAsciiLowerWildcardMatchesAlloc(alloc: std.mem.Allocator, actual: std.json.Value, pattern: []const u8) !bool {
+    const text = try documentSqlFilterStringValue(actual);
+    if (!documentSqlAsciiOnly(text)) return error.UnsupportedSqlShape;
+    const lowered = try std.ascii.allocLowerString(alloc, text);
+    defer alloc.free(lowered);
+    return documentSqlWildcardMatches(pattern, lowered);
+}
+
+fn documentSqlAsciiUpperWildcardMatchesAlloc(alloc: std.mem.Allocator, actual: std.json.Value, pattern: []const u8) !bool {
+    const text = try documentSqlFilterStringValue(actual);
+    if (!documentSqlAsciiOnly(text)) return error.UnsupportedSqlShape;
+    const uppered = try std.ascii.allocUpperString(alloc, text);
+    defer alloc.free(uppered);
+    return documentSqlWildcardMatches(pattern, uppered);
+}
+
+fn documentSqlRegexMatchesAlloc(alloc: std.mem.Allocator, text: []const u8, pattern: []const u8, case_insensitive: bool) !bool {
+    if (!case_insensitive) {
+        var regex = regex_mod.compile(alloc, pattern) catch return error.InvalidRowsRequest;
+        defer regex.deinit();
+        return regex_mod.matchesCompiled(pattern, &regex, text);
+    }
+    if (!documentSqlAsciiOnly(pattern) or !documentSqlAsciiOnly(text)) return error.UnsupportedSqlShape;
+    const folded_pattern = try std.ascii.allocLowerString(alloc, pattern);
+    defer alloc.free(folded_pattern);
+    const folded_text = try std.ascii.allocLowerString(alloc, text);
+    defer alloc.free(folded_text);
+    var regex = regex_mod.compile(alloc, folded_pattern) catch return error.InvalidRowsRequest;
+    defer regex.deinit();
+    return regex_mod.matchesCompiled(folded_pattern, &regex, folded_text);
+}
+
+const DocumentSqlRegexpMatchSpan = struct {
+    start: usize,
+    end: usize,
+};
+
+fn documentSqlRegexpCountText(alloc: std.mem.Allocator, source: []const u8, pattern: []const u8) !u64 {
+    var compiled = regex_mod.compile(alloc, pattern) catch return error.InvalidRowsRequest;
+    defer compiled.deinit();
+
+    var count: u64 = 0;
+    var cursor: usize = 0;
+    while (cursor <= source.len) {
+        const span = documentSqlRegexpFindLeftmostMatch(&compiled, source, cursor) orelse break;
+        if (span.end <= span.start) return error.InvalidRowsRequest;
+        count += 1;
+        cursor = span.end;
+    }
+    return count;
+}
+
+fn documentSqlRegexpInstrText(alloc: std.mem.Allocator, source: []const u8, pattern: []const u8) !usize {
+    var compiled = regex_mod.compile(alloc, pattern) catch return error.InvalidRowsRequest;
+    defer compiled.deinit();
+
+    const span = documentSqlRegexpFindLeftmostMatch(&compiled, source, 0) orelse return 0;
+    if (span.end <= span.start) return error.InvalidRowsRequest;
+    const codepoints_before = std.unicode.utf8CountCodepoints(source[0..span.start]) catch return error.InvalidRowsRequest;
+    return codepoints_before + 1;
+}
+
+fn documentSqlRegexpSubstrTextAlloc(alloc: std.mem.Allocator, source: []const u8, pattern: []const u8) !?[]u8 {
+    var compiled = regex_mod.compile(alloc, pattern) catch return error.InvalidRowsRequest;
+    defer compiled.deinit();
+
+    const span = documentSqlRegexpFindLeftmostMatch(&compiled, source, 0) orelse return null;
+    if (span.end <= span.start) return error.InvalidRowsRequest;
+    return try alloc.dupe(u8, source[span.start..span.end]);
+}
+
+fn documentSqlRegexpNumericRangeMatches(alloc: std.mem.Allocator, doc: std.json.Value, range: std.json.Value, kind: sql_adapter.DocumentProjectionKind) !bool {
+    if (range != .object) return error.InvalidRowsRequest;
+    const path = try documentSqlFilterPath(range);
+    const pattern = try documentSqlFilterNamedValue(range, "pattern");
+    if (pattern != .string) return error.InvalidRowsRequest;
+    const actual = documentSqlProjectedValue(doc, path) orelse return false;
+    if (actual == .null) return false;
+    const text = try documentSqlFilterStringValue(actual);
+    const value = switch (kind) {
+        .regexp_count => @as(f64, @floatFromInt(try documentSqlRegexpCountText(alloc, text, pattern.string))),
+        .regexp_instr => @as(f64, @floatFromInt(try documentSqlRegexpInstrText(alloc, text, pattern.string))),
+        else => return error.InvalidRowsRequest,
+    };
+    return try documentSqlNumericRangeValueMatches(value, range);
+}
+
+fn documentSqlRegexpFindLeftmostMatch(compiled: *regex_mod.RegexAutomaton, text: []const u8, start_at: usize) ?DocumentSqlRegexpMatchSpan {
+    if (start_at > text.len) return null;
+    const start_limit: usize = if (compiled.anchored_start) 1 else text.len + 1;
+    if (start_at >= start_limit) return null;
+    var start = start_at;
+    while (start < start_limit) : (start += 1) {
+        if (documentSqlRegexpMatchEndFrom(compiled, text, start)) |end| {
+            return .{ .start = start, .end = end };
+        }
+    }
+    return null;
+}
+
+fn documentSqlRegexpMatchEndFrom(compiled: *regex_mod.RegexAutomaton, text: []const u8, start: usize) ?usize {
+    const automaton = compiled.automaton();
+    var state = automaton.start();
+    var latest_match: ?usize = null;
+    if (automaton.isMatch(state) and (!compiled.anchored_end or start == text.len)) latest_match = start;
+    for (text[start..], 0..) |byte, offset| {
+        state = automaton.accept(state, byte);
+        if (!automaton.canMatch(state)) break;
+        if (automaton.isMatch(state)) {
+            const end = start + offset + 1;
+            if (!compiled.anchored_end or end == text.len) latest_match = end;
+        }
+    }
+    return latest_match;
+}
+
+fn documentSqlStrposTextCodepointPosition(text: []const u8, needle: []const u8) !usize {
+    if (needle.len == 0) return 1;
+    const byte_index = std.mem.indexOf(u8, text, needle) orelse return 0;
+    const codepoints_before = std.unicode.utf8CountCodepoints(text[0..byte_index]) catch return error.InvalidRowsRequest;
+    return codepoints_before + 1;
+}
+
+fn documentSqlSplitPartTextAlloc(alloc: std.mem.Allocator, text: []const u8, delimiter: []const u8, field_index: i64) ![]u8 {
+    if (field_index == 0) return error.InvalidRowsRequest;
+    if (delimiter.len == 0) return try alloc.dupe(u8, if (field_index == 1 or field_index == -1) text else "");
+
+    if (field_index > 0) {
+        var split = std.mem.splitSequence(u8, text, delimiter);
+        var current: i64 = 1;
+        while (split.next()) |part| : (current += 1) {
+            if (current == field_index) return try alloc.dupe(u8, part);
+        }
+        return try alloc.dupe(u8, "");
+    }
+
+    var parts = std.ArrayListUnmanaged([]const u8).empty;
+    defer parts.deinit(alloc);
+    var split = std.mem.splitSequence(u8, text, delimiter);
+    while (split.next()) |part| try parts.append(alloc, part);
+    const from_end: usize = @intCast(-field_index);
+    if (from_end == 0 or from_end > parts.items.len) return try alloc.dupe(u8, "");
+    return try alloc.dupe(u8, parts.items[parts.items.len - from_end]);
+}
+
+fn documentSqlSubstringTextAlloc(alloc: std.mem.Allocator, text: []const u8, start_index: i64, length_count: ?i64) ![]u8 {
+    if (start_index < 1) return error.InvalidRowsRequest;
+    if (length_count) |count| if (count < 0) return error.InvalidRowsRequest;
+    const start_codepoint: usize = @intCast(start_index - 1);
+    const end_codepoint: ?usize = if (length_count) |count| start_codepoint + @as(usize, @intCast(count)) else null;
+    const start_byte = try documentSqlUtf8ByteOffsetForCodepointIndex(text, start_codepoint);
+    const end_byte = if (end_codepoint) |index| try documentSqlUtf8ByteOffsetForCodepointIndex(text, index) else text.len;
+    return try alloc.dupe(u8, text[start_byte..end_byte]);
+}
+
+fn documentSqlOverlayTextAlloc(alloc: std.mem.Allocator, text: []const u8, replacement: []const u8, start_index: i64, length_count: ?i64) ![]u8 {
+    if (start_index < 1) return error.InvalidRowsRequest;
+    if (length_count) |count| if (count < 0) return error.InvalidRowsRequest;
+    const replacement_codepoints = std.unicode.utf8CountCodepoints(replacement) catch return error.InvalidRowsRequest;
+    const start_codepoint: usize = @intCast(start_index - 1);
+    const replaced_codepoints: usize = if (length_count) |count| @intCast(count) else replacement_codepoints;
+    const end_codepoint = start_codepoint + replaced_codepoints;
+    const start_byte = try documentSqlUtf8ByteOffsetForCodepointIndex(text, start_codepoint);
+    const end_byte = try documentSqlUtf8ByteOffsetForCodepointIndex(text, end_codepoint);
+    var out = try std.ArrayListUnmanaged(u8).initCapacity(alloc, start_byte + replacement.len + (text.len - end_byte));
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, text[0..start_byte]);
+    try out.appendSlice(alloc, replacement);
+    try out.appendSlice(alloc, text[end_byte..]);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn documentSqlLeftRightTextAlloc(alloc: std.mem.Allocator, text: []const u8, count: i64, from_left: bool) ![]u8 {
+    const total_codepoints = std.unicode.utf8CountCodepoints(text) catch return error.InvalidRowsRequest;
+    const abs_count: usize = if (count < 0) @intCast(-count) else @intCast(count);
+    const slice_start: usize, const slice_end: usize = if (from_left) blk: {
+        if (count >= 0) {
+            break :blk .{ 0, @min(abs_count, total_codepoints) };
+        }
+        break :blk .{ 0, total_codepoints - @min(abs_count, total_codepoints) };
+    } else blk: {
+        if (count >= 0) {
+            const kept = @min(abs_count, total_codepoints);
+            break :blk .{ total_codepoints - kept, total_codepoints };
+        }
+        break :blk .{ @min(abs_count, total_codepoints), total_codepoints };
+    };
+    const start_byte = try documentSqlUtf8ByteOffsetForCodepointIndex(text, slice_start);
+    const end_byte = try documentSqlUtf8ByteOffsetForCodepointIndex(text, slice_end);
+    return try alloc.dupe(u8, text[start_byte..end_byte]);
+}
+
+fn documentSqlRepeatTextAlloc(alloc: std.mem.Allocator, text: []const u8, count: i64) ![]u8 {
+    if (count < 0) return error.InvalidRowsRequest;
+    const repeat_count: usize = @intCast(count);
+    if (repeat_count == 0 or text.len == 0) return try alloc.dupe(u8, "");
+    if (text.len > std.math.maxInt(usize) / repeat_count) return error.InvalidRowsRequest;
+    const total_len = text.len * repeat_count;
+    var out = try alloc.alloc(u8, total_len);
+    var offset: usize = 0;
+    while (offset < total_len) : (offset += text.len) {
+        @memcpy(out[offset .. offset + text.len], text);
+    }
+    return out;
+}
+
+fn documentSqlReverseTextAlloc(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
+    const total_codepoints = std.unicode.utf8CountCodepoints(text) catch return error.InvalidRowsRequest;
+    var out = try alloc.alloc(u8, text.len);
+    var out_offset: usize = 0;
+    var index = total_codepoints;
+    while (index > 0) {
+        index -= 1;
+        const start_byte = try documentSqlUtf8ByteOffsetForCodepointIndex(text, index);
+        const end_byte = try documentSqlUtf8ByteOffsetForCodepointIndex(text, index + 1);
+        @memcpy(out[out_offset .. out_offset + (end_byte - start_byte)], text[start_byte..end_byte]);
+        out_offset += end_byte - start_byte;
+    }
+    return out;
+}
+
+fn documentSqlTrimText(text: []const u8, kind: sql_adapter.DocumentProjectionKind) []const u8 {
+    var start: usize = 0;
+    var end: usize = text.len;
+    if (kind == .text_btrim or kind == .text_ltrim) {
+        while (start < end and text[start] == ' ') : (start += 1) {}
+    }
+    if (kind == .text_btrim or kind == .text_rtrim) {
+        while (end > start and text[end - 1] == ' ') : (end -= 1) {}
+    }
+    return text[start..end];
+}
+
+fn documentSqlAsciiFirstCodepoint(text: []const u8) !u21 {
+    if (text.len == 0) return 0;
+    const width = std.unicode.utf8ByteSequenceLength(text[0]) catch return error.InvalidRowsRequest;
+    if (width > text.len) return error.InvalidRowsRequest;
+    return std.unicode.utf8Decode(text[0..width]) catch return error.InvalidRowsRequest;
+}
+
+fn documentSqlReplaceTextAlloc(alloc: std.mem.Allocator, text: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
+    if (needle.len == 0) return try alloc.dupe(u8, text);
+    var replacement_count: usize = 0;
+    var scan_start: usize = 0;
+    while (std.mem.indexOf(u8, text[scan_start..], needle)) |relative_index| {
+        replacement_count += 1;
+        scan_start += relative_index + needle.len;
+    }
+    if (replacement_count == 0) return try alloc.dupe(u8, text);
+
+    const removed_len = replacement_count * needle.len;
+    const added_len = replacement_count * replacement.len;
+    const total_len = text.len - removed_len + added_len;
+    var out = try alloc.alloc(u8, total_len);
+    var input_offset: usize = 0;
+    var output_offset: usize = 0;
+    while (std.mem.indexOf(u8, text[input_offset..], needle)) |relative_index| {
+        const match_start = input_offset + relative_index;
+        @memcpy(out[output_offset .. output_offset + (match_start - input_offset)], text[input_offset..match_start]);
+        output_offset += match_start - input_offset;
+        @memcpy(out[output_offset .. output_offset + replacement.len], replacement);
+        output_offset += replacement.len;
+        input_offset = match_start + needle.len;
+    }
+    @memcpy(out[output_offset..], text[input_offset..]);
+    return out;
+}
+
+fn documentSqlTranslateTextAlloc(alloc: std.mem.Allocator, text: []const u8, from: []const u8, to: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var offset: usize = 0;
+    while (offset < text.len) {
+        const width = std.unicode.utf8ByteSequenceLength(text[offset]) catch return error.InvalidRowsRequest;
+        if (offset + width > text.len) return error.InvalidRowsRequest;
+        const codepoint = std.unicode.utf8Decode(text[offset .. offset + width]) catch return error.InvalidRowsRequest;
+        if (try documentSqlTranslateSourceIndex(from, codepoint)) |source_index| {
+            if (try documentSqlCodepointSliceAt(to, source_index)) |replacement| {
+                try out.appendSlice(alloc, replacement);
+            }
+        } else {
+            try out.appendSlice(alloc, text[offset .. offset + width]);
+        }
+        offset += width;
+    }
+    _ = try documentSqlTranslateSourceIndex(from, 0);
+    _ = try documentSqlCodepointSliceAt(to, std.math.maxInt(usize));
+    return try out.toOwnedSlice(alloc);
+}
+
+fn documentSqlTranslateSourceIndex(source: []const u8, target: u21) !?usize {
+    var offset: usize = 0;
+    var index: usize = 0;
+    while (offset < source.len) : (index += 1) {
+        const width = std.unicode.utf8ByteSequenceLength(source[offset]) catch return error.InvalidRowsRequest;
+        if (offset + width > source.len) return error.InvalidRowsRequest;
+        const codepoint = std.unicode.utf8Decode(source[offset .. offset + width]) catch return error.InvalidRowsRequest;
+        if (codepoint == target) return index;
+        offset += width;
+    }
+    return null;
+}
+
+fn documentSqlCodepointSliceAt(text: []const u8, target_index: usize) !?[]const u8 {
+    var offset: usize = 0;
+    var index: usize = 0;
+    while (offset < text.len) : (index += 1) {
+        const width = std.unicode.utf8ByteSequenceLength(text[offset]) catch return error.InvalidRowsRequest;
+        if (offset + width > text.len) return error.InvalidRowsRequest;
+        _ = std.unicode.utf8Decode(text[offset .. offset + width]) catch return error.InvalidRowsRequest;
+        if (index == target_index) return text[offset .. offset + width];
+        offset += width;
+    }
+    return null;
+}
+
+fn documentSqlPadTextAlloc(alloc: std.mem.Allocator, text: []const u8, width: i64, fill: []const u8, left: bool) ![]u8 {
+    if (width < 0 or fill.len == 0) return error.InvalidRowsRequest;
+    const target_codepoints: usize = @intCast(width);
+    const text_codepoints = std.unicode.utf8CountCodepoints(text) catch return error.InvalidRowsRequest;
+    if (text_codepoints >= target_codepoints) {
+        const end_byte = try documentSqlUtf8ByteOffsetForCodepointIndex(text, target_codepoints);
+        return try alloc.dupe(u8, text[0..end_byte]);
+    }
+    _ = std.unicode.utf8CountCodepoints(fill) catch return error.InvalidRowsRequest;
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    const pad_codepoints = target_codepoints - text_codepoints;
+    if (left) try documentSqlAppendFillCodepoints(alloc, &out, fill, pad_codepoints);
+    try out.appendSlice(alloc, text);
+    if (!left) try documentSqlAppendFillCodepoints(alloc, &out, fill, pad_codepoints);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn documentSqlAppendFillCodepoints(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), fill: []const u8, count: usize) !void {
+    var remaining = count;
+    while (remaining > 0) {
+        var offset: usize = 0;
+        while (offset < fill.len and remaining > 0) : (remaining -= 1) {
+            const width = std.unicode.utf8ByteSequenceLength(fill[offset]) catch return error.InvalidRowsRequest;
+            if (offset + width > fill.len) return error.InvalidRowsRequest;
+            _ = std.unicode.utf8Decode(fill[offset .. offset + width]) catch return error.InvalidRowsRequest;
+            try out.appendSlice(alloc, fill[offset .. offset + width]);
+            offset += width;
+        }
+    }
+}
+
+fn documentSqlUtf8ByteOffsetForCodepointIndex(text: []const u8, codepoint_index: usize) !usize {
+    var offset: usize = 0;
+    var current: usize = 0;
+    while (offset < text.len and current < codepoint_index) : (current += 1) {
+        const width = std.unicode.utf8ByteSequenceLength(text[offset]) catch return error.InvalidRowsRequest;
+        if (offset + width > text.len) return error.InvalidRowsRequest;
+        _ = std.unicode.utf8Decode(text[offset .. offset + width]) catch return error.InvalidRowsRequest;
+        offset += width;
+    }
+    return offset;
+}
+
 fn documentSqlAsciiOnly(text: []const u8) bool {
     for (text) |ch| {
         if (ch >= 0x80) return false;
     }
     return true;
+}
+
+fn documentSqlInitcapAsciiAlloc(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out = try alloc.dupe(u8, text);
+    var in_word = false;
+    for (out, 0..) |ch, index| {
+        if (std.ascii.isAlphanumeric(ch)) {
+            out[index] = if (!in_word) std.ascii.toUpper(ch) else std.ascii.toLower(ch);
+            in_word = true;
+        } else {
+            in_word = false;
+        }
+    }
+    return out;
+}
+
+fn documentSqlIntegerCodepointFromJson(value: std.json.Value) !i64 {
+    const number = try documentSqlJsonNumber(value);
+    if (!std.math.isFinite(number)) return error.InvalidRowsRequest;
+    const truncated = @trunc(number);
+    if (truncated != number) return error.InvalidRowsRequest;
+    return @intFromFloat(number);
+}
+
+fn documentSqlChrTextAlloc(alloc: std.mem.Allocator, codepoint: i64) ![]u8 {
+    if (codepoint < 0 or codepoint > std.math.maxInt(u21)) return error.InvalidRowsRequest;
+    var buf: [4]u8 = undefined;
+    const len = std.unicode.utf8Encode(@intCast(codepoint), &buf) catch return error.InvalidRowsRequest;
+    return try alloc.dupe(u8, buf[0..len]);
 }
 
 fn documentSqlNumericRangeMatches(actual: std.json.Value, range: std.json.Value) !bool {
@@ -5133,6 +7123,71 @@ fn documentSqlNumericAbsRangeMatches(actual: std.json.Value, range: std.json.Val
     if (range != .object) return error.InvalidRowsRequest;
     const value = try documentSqlJsonNumber(actual);
     return try documentSqlNumericRangeValueMatches(@abs(value), range);
+}
+
+fn documentSqlNumericArithmeticRangeMatches(actual: std.json.Value, range: std.json.Value) !bool {
+    if (range != .object) return error.InvalidRowsRequest;
+    const value = try documentSqlJsonNumber(actual);
+    const operator = try documentSqlFilterNamedValue(range, "operator");
+    if (operator != .string) return error.InvalidRowsRequest;
+    const operand = try documentSqlJsonNumber(try documentSqlFilterNamedValue(range, "operand"));
+    const computed = if (std.mem.eql(u8, operator.string, "add"))
+        value + operand
+    else if (std.mem.eql(u8, operator.string, "sub"))
+        value - operand
+    else if (std.mem.eql(u8, operator.string, "mul"))
+        value * operand
+    else if (std.mem.eql(u8, operator.string, "div"))
+        if (operand == 0) return error.InvalidRowsRequest else value / operand
+    else if (std.mem.eql(u8, operator.string, "mod"))
+        if (operand == 0) return error.InvalidRowsRequest else value - @trunc(value / operand) * operand
+    else if (std.mem.eql(u8, operator.string, "power"))
+        std.math.pow(f64, value, operand)
+    else
+        return error.InvalidRowsRequest;
+    if (!std.math.isFinite(computed)) return error.InvalidRowsRequest;
+    return try documentSqlNumericRangeValueMatches(computed, range);
+}
+
+fn documentSqlNumericUnaryRangeMatches(actual: std.json.Value, range: std.json.Value) !bool {
+    if (range != .object) return error.InvalidRowsRequest;
+    const value = try documentSqlJsonNumber(actual);
+    const operator = try documentSqlFilterNamedValue(range, "operator");
+    if (operator != .string) return error.InvalidRowsRequest;
+    const kind = documentSqlNumericUnaryProjectionKind(operator.string) orelse return error.InvalidRowsRequest;
+    const computed = try documentSqlNumericUnaryResult(value, kind);
+    return try documentSqlNumericRangeValueMatches(computed, range);
+}
+
+fn documentSqlNumericUnaryProjectionKind(operator: []const u8) ?sql_adapter.DocumentProjectionKind {
+    if (std.mem.eql(u8, operator, "round")) return .numeric_round;
+    if (std.mem.eql(u8, operator, "trunc")) return .numeric_trunc;
+    if (std.mem.eql(u8, operator, "floor")) return .numeric_floor;
+    if (std.mem.eql(u8, operator, "ceil")) return .numeric_ceil;
+    if (std.mem.eql(u8, operator, "sqrt")) return .numeric_sqrt;
+    if (std.mem.eql(u8, operator, "sign")) return .numeric_sign;
+    return null;
+}
+
+fn documentSqlTextLengthRangeMatches(actual: std.json.Value, range: std.json.Value) !bool {
+    if (range != .object) return error.InvalidRowsRequest;
+    const text = try documentSqlFilterStringValue(actual);
+    const length = std.unicode.utf8CountCodepoints(text) catch return error.InvalidRowsRequest;
+    return try documentSqlNumericRangeValueMatches(@floatFromInt(length), range);
+}
+
+fn documentSqlTextByteLengthRangeMatches(actual: std.json.Value, range: std.json.Value, bits: bool) !bool {
+    if (range != .object) return error.InvalidRowsRequest;
+    const text = try documentSqlFilterStringValue(actual);
+    const length = if (bits) text.len * 8 else text.len;
+    return try documentSqlNumericRangeValueMatches(@floatFromInt(length), range);
+}
+
+fn documentSqlArrayLengthRangeMatches(actual: std.json.Value, range: std.json.Value) !bool {
+    if (range != .object) return error.InvalidRowsRequest;
+    if (actual == .null) return false;
+    if (actual != .array) return error.InvalidRowsRequest;
+    return try documentSqlNumericRangeValueMatches(@floatFromInt(actual.array.items.len), range);
 }
 
 fn documentSqlNumericRangeValueMatches(value: f64, range: std.json.Value) !bool {
@@ -5461,6 +7516,1495 @@ test "document SQL residual filters match corpus cases" {
             return error.InvalidSqlCorpusFixture;
         }
     }
+}
+
+test "document SQL residual scalar text cast term filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"amount\":12}",
+        "{\"scalar_text_cast_term\":{\"path\":\"/amount\",\"value\":\"12\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"active\":true}",
+        "{\"scalar_text_cast_term\":{\"path\":\"/active\",\"value\":\"true\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"created_at\":123456}",
+        "{\"scalar_text_cast_term\":{\"path\":\"/created_at\",\"value\":\"123456\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"active\"}",
+        "{\"scalar_text_cast_term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"amount\":13}",
+        "{\"scalar_text_cast_term\":{\"path\":\"/amount\",\"value\":\"12\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"amount\":null}",
+        "{\"scalar_text_cast_term\":{\"path\":\"/amount\",\"value\":\"12\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"active\"}",
+        "{\"scalar_text_cast_term\":{\"path\":\"/amount\",\"value\":\"12\"}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"tags\":[\"a\"]}",
+            "{\"scalar_text_cast_term\":{\"path\":\"/tags\",\"value\":\"a\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"amount\":12}",
+            "{\"scalar_text_cast_term\":{\"path\":\"/amount\",\"value\":12}}",
+        ),
+    );
+}
+
+test "document SQL residual scalar numeric cast range filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"amount\":12}",
+        "{\"scalar_numeric_cast_range\":{\"path\":\"/amount\",\"min\":12,\"max\":12,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"encoded\":\"12.5\"}",
+        "{\"scalar_numeric_cast_range\":{\"path\":\"/encoded\",\"min\":12,\"inclusive_min\":false,\"max\":13,\"inclusive_max\":false}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"amount\":11}",
+        "{\"scalar_numeric_cast_range\":{\"path\":\"/amount\",\"min\":12,\"inclusive_min\":true}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"amount\":null}",
+        "{\"scalar_numeric_cast_range\":{\"path\":\"/amount\",\"min\":12,\"inclusive_min\":true}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"12\"}",
+        "{\"scalar_numeric_cast_range\":{\"path\":\"/amount\",\"min\":12,\"inclusive_min\":true}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"encoded\":\"not-number\"}",
+            "{\"scalar_numeric_cast_range\":{\"path\":\"/encoded\",\"min\":12,\"inclusive_min\":true}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"active\":true}",
+            "{\"scalar_numeric_cast_range\":{\"path\":\"/active\",\"min\":1,\"inclusive_min\":true}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"amount\":12}",
+            "{\"scalar_numeric_cast_range\":{\"path\":\"/amount\",\"min\":\"12\",\"inclusive_min\":true}}",
+        ),
+    );
+}
+
+test "document SQL residual scalar boolean cast term filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"active\":true}",
+        "{\"scalar_boolean_cast_term\":{\"path\":\"/active\",\"value\":true}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"encoded\":\"false\"}",
+        "{\"scalar_boolean_cast_term\":{\"path\":\"/encoded\",\"value\":false}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"active\":false}",
+        "{\"scalar_boolean_cast_term\":{\"path\":\"/active\",\"value\":true}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"active\":null}",
+        "{\"scalar_boolean_cast_term\":{\"path\":\"/active\",\"value\":true}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"true\"}",
+        "{\"scalar_boolean_cast_term\":{\"path\":\"/active\",\"value\":true}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"encoded\":\"TRUE\"}",
+            "{\"scalar_boolean_cast_term\":{\"path\":\"/encoded\",\"value\":true}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"amount\":1}",
+            "{\"scalar_boolean_cast_term\":{\"path\":\"/amount\",\"value\":true}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"active\":true}",
+            "{\"scalar_boolean_cast_term\":{\"path\":\"/active\",\"value\":\"true\"}}",
+        ),
+    );
+}
+
+test "document SQL residual scalar datetime cast range filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"created_at\":123456}",
+        "{\"scalar_datetime_cast_range\":{\"path\":\"/created_at\",\"min\":123456,\"max\":123456,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"encoded\":\"987654\"}",
+        "{\"scalar_datetime_cast_range\":{\"path\":\"/encoded\",\"min\":987000,\"inclusive_min\":true,\"max\":988000,\"inclusive_max\":false}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"created_at\":123455}",
+        "{\"scalar_datetime_cast_range\":{\"path\":\"/created_at\",\"min\":123456,\"inclusive_min\":true}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"created_at\":null}",
+        "{\"scalar_datetime_cast_range\":{\"path\":\"/created_at\",\"min\":123456,\"inclusive_min\":true}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"123456\"}",
+        "{\"scalar_datetime_cast_range\":{\"path\":\"/created_at\",\"min\":123456,\"inclusive_min\":true}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"encoded\":\"2026-07-03T12:34:56Z\"}",
+            "{\"scalar_datetime_cast_range\":{\"path\":\"/encoded\",\"min\":1,\"inclusive_min\":true}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"created_at\":-1}",
+            "{\"scalar_datetime_cast_range\":{\"path\":\"/created_at\",\"min\":0,\"inclusive_min\":true}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"active\":true}",
+            "{\"scalar_datetime_cast_range\":{\"path\":\"/active\",\"min\":1,\"inclusive_min\":true}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"created_at\":123456}",
+            "{\"scalar_datetime_cast_range\":{\"path\":\"/created_at\",\"min\":\"123456\",\"inclusive_min\":true}}",
+        ),
+    );
+}
+
+test "document SQL residual nullif term filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"active\"}",
+        "{\"text_nullif_term\":{\"path\":\"/status\",\"nullif\":\"archived\",\"value\":\"active\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"archived\"}",
+        "{\"text_nullif_term\":{\"path\":\"/status\",\"nullif\":\"archived\",\"value\":\"active\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"pending\"}",
+        "{\"text_nullif_term\":{\"path\":\"/status\",\"nullif\":\"archived\",\"value\":\"active\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":null}",
+        "{\"text_nullif_term\":{\"path\":\"/status\",\"nullif\":\"archived\",\"value\":\"active\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"category\":\"release\"}",
+        "{\"text_nullif_term\":{\"path\":\"/status\",\"nullif\":\"archived\",\"value\":\"active\"}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"active\"}",
+            "{\"text_nullif_term\":{\"path\":\"/status\",\"nullif\":0,\"value\":\"active\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"active\"}",
+            "{\"text_nullif_term\":{\"path\":\"/status\",\"nullif\":\"archived\",\"value\":true}}",
+        ),
+    );
+}
+
+test "document SQL residual replace term filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"ready-ready\"}",
+        "{\"text_replace_term\":{\"path\":\"/status\",\"needle\":\"-\",\"replacement\":\" \",\"value\":\"ready ready\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"ready-ready\"}",
+        "{\"text_replace_term\":{\"path\":\"/status\",\"needle\":\"ready\",\"replacement\":\"\",\"value\":\"-\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"ready-ready\"}",
+        "{\"text_replace_term\":{\"path\":\"/status\",\"needle\":\"\",\"replacement\":\"x\",\"value\":\"ready-ready\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"pending\"}",
+        "{\"text_replace_term\":{\"path\":\"/status\",\"needle\":\"-\",\"replacement\":\" \",\"value\":\"ready ready\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":null}",
+        "{\"text_replace_term\":{\"path\":\"/status\",\"needle\":\"-\",\"replacement\":\" \",\"value\":\"ready ready\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"category\":\"ready-ready\"}",
+        "{\"text_replace_term\":{\"path\":\"/status\",\"needle\":\"-\",\"replacement\":\" \",\"value\":\"ready ready\"}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"ready-ready\"}",
+            "{\"text_replace_term\":{\"path\":\"/status\",\"needle\":1,\"replacement\":\" \",\"value\":\"ready ready\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"ready-ready\"}",
+            "{\"text_replace_term\":{\"path\":\"/status\",\"needle\":\"-\",\"replacement\":false,\"value\":\"ready ready\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"ready-ready\"}",
+            "{\"text_replace_term\":{\"path\":\"/status\",\"needle\":\"-\",\"replacement\":\" \",\"value\":42}}",
+        ),
+    );
+}
+
+test "document SQL residual translate term filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abc-de\"}",
+        "{\"text_translate_term\":{\"path\":\"/status\",\"from\":\"abc\",\"to\":\"xyz\",\"value\":\"xyz-de\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abc-de\"}",
+        "{\"text_translate_term\":{\"path\":\"/status\",\"from\":\"abcd\",\"to\":\"XY\",\"value\":\"XY-e\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abc-de\"}",
+        "{\"text_translate_term\":{\"path\":\"/status\",\"from\":\"\",\"to\":\"x\",\"value\":\"abc-de\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"hé-hé\"}",
+        "{\"text_translate_term\":{\"path\":\"/status\",\"from\":\"é\",\"to\":\"e\",\"value\":\"he-he\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"pending\"}",
+        "{\"text_translate_term\":{\"path\":\"/status\",\"from\":\"abc\",\"to\":\"xyz\",\"value\":\"xyz-de\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":null}",
+        "{\"text_translate_term\":{\"path\":\"/status\",\"from\":\"abc\",\"to\":\"xyz\",\"value\":\"xyz-de\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"category\":\"abc-de\"}",
+        "{\"text_translate_term\":{\"path\":\"/status\",\"from\":\"abc\",\"to\":\"xyz\",\"value\":\"xyz-de\"}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"abc-de\"}",
+            "{\"text_translate_term\":{\"path\":\"/status\",\"from\":1,\"to\":\"xyz\",\"value\":\"xyz-de\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"abc-de\"}",
+            "{\"text_translate_term\":{\"path\":\"/status\",\"from\":\"abc\",\"to\":false,\"value\":\"xyz-de\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"abc-de\"}",
+            "{\"text_translate_term\":{\"path\":\"/status\",\"from\":\"abc\",\"to\":\"xyz\",\"value\":42}}",
+        ),
+    );
+}
+
+test "document SQL residual concat_ws term filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"active\",\"next_status\":\"queued\"}",
+        "{\"text_concat_ws_term\":{\"path\":\"/status\",\"path2\":\"/next_status\",\"separator\":\"-\",\"value\":\"active-queued\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"active\",\"next_status\":null}",
+        "{\"text_concat_ws_term\":{\"path\":\"/status\",\"path2\":\"/next_status\",\"separator\":\"-\",\"value\":\"active\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"next_status\":\"queued\"}",
+        "{\"text_concat_ws_term\":{\"path\":\"/status\",\"path2\":\"/next_status\",\"separator\":\"-\",\"value\":\"queued\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":null,\"next_status\":null}",
+        "{\"text_concat_ws_term\":{\"path\":\"/status\",\"path2\":\"/next_status\",\"separator\":\"-\",\"value\":\"\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"active\",\"next_status\":\"queued\"}",
+        "{\"text_concat_ws_term\":{\"path\":\"/status\",\"path2\":\"/next_status\",\"separator\":\":\",\"value\":\"active-queued\"}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"active\",\"next_status\":42}",
+            "{\"text_concat_ws_term\":{\"path\":\"/status\",\"path2\":\"/next_status\",\"separator\":\"-\",\"value\":\"active-queued\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"active\",\"next_status\":\"queued\"}",
+            "{\"text_concat_ws_term\":{\"path\":\"/status\",\"path2\":42,\"separator\":\"-\",\"value\":\"active-queued\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"active\",\"next_status\":\"queued\"}",
+            "{\"text_concat_ws_term\":{\"path\":\"/status\",\"path2\":\"/next_status\",\"separator\":false,\"value\":\"active-queued\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"active\",\"next_status\":\"queued\"}",
+            "{\"text_concat_ws_term\":{\"path\":\"/status\",\"path2\":\"/next_status\",\"separator\":\"-\",\"value\":42}}",
+        ),
+    );
+}
+
+test "document SQL residual pad term filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abc\"}",
+        "{\"text_pad_term\":{\"path\":\"/status\",\"side\":\"left\",\"width\":5,\"fill\":\"0\",\"value\":\"00abc\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abc\"}",
+        "{\"text_pad_term\":{\"path\":\"/status\",\"side\":\"right\",\"width\":6,\"fill\":\"-+\",\"value\":\"abc-+a\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abc\"}",
+        "{\"text_pad_term\":{\"path\":\"/status\",\"side\":\"left\",\"width\":5,\"fill\":\" \",\"value\":\"  abc\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abcdef\"}",
+        "{\"text_pad_term\":{\"path\":\"/status\",\"side\":\"right\",\"width\":3,\"fill\":\"-\",\"value\":\"abc\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"hé\"}",
+        "{\"text_pad_term\":{\"path\":\"/status\",\"side\":\"left\",\"width\":4,\"fill\":\"é\",\"value\":\"ééhé\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abc\"}",
+        "{\"text_pad_term\":{\"path\":\"/status\",\"side\":\"left\",\"width\":5,\"fill\":\"0\",\"value\":\"abc00\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":null}",
+        "{\"text_pad_term\":{\"path\":\"/status\",\"side\":\"left\",\"width\":5,\"fill\":\"0\",\"value\":\"00abc\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"category\":\"abc\"}",
+        "{\"text_pad_term\":{\"path\":\"/status\",\"side\":\"left\",\"width\":5,\"fill\":\"0\",\"value\":\"00abc\"}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"abc\"}",
+            "{\"text_pad_term\":{\"path\":\"/status\",\"side\":\"middle\",\"width\":5,\"fill\":\"0\",\"value\":\"00abc\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"abc\"}",
+            "{\"text_pad_term\":{\"path\":\"/status\",\"side\":\"left\",\"width\":\"5\",\"fill\":\"0\",\"value\":\"00abc\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"abc\"}",
+            "{\"text_pad_term\":{\"path\":\"/status\",\"side\":\"left\",\"width\":5,\"fill\":\"\",\"value\":\"00abc\"}}",
+        ),
+    );
+}
+
+test "document SQL residual split_part term filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"first:middle:last\"}",
+        "{\"text_split_part_term\":{\"path\":\"/status\",\"delimiter\":\":\",\"index\":2,\"value\":\"middle\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"first:middle:last\"}",
+        "{\"text_split_part_term\":{\"path\":\"/status\",\"delimiter\":\":\",\"index\":-1,\"value\":\"last\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"release\"}",
+        "{\"text_split_part_term\":{\"path\":\"/status\",\"delimiter\":\"\",\"index\":1,\"value\":\"release\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"first:middle:last\"}",
+        "{\"text_split_part_term\":{\"path\":\"/status\",\"delimiter\":\":\",\"index\":9,\"value\":\"\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"first:middle:last\"}",
+        "{\"text_split_part_term\":{\"path\":\"/status\",\"delimiter\":\":\",\"index\":2,\"value\":\"last\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":null}",
+        "{\"text_split_part_term\":{\"path\":\"/status\",\"delimiter\":\":\",\"index\":2,\"value\":\"middle\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"category\":\"first:middle:last\"}",
+        "{\"text_split_part_term\":{\"path\":\"/status\",\"delimiter\":\":\",\"index\":2,\"value\":\"middle\"}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"first:middle:last\"}",
+            "{\"text_split_part_term\":{\"path\":\"/status\",\"delimiter\":\":\",\"index\":0,\"value\":\"middle\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"first:middle:last\"}",
+            "{\"text_split_part_term\":{\"path\":\"/status\",\"delimiter\":\":\",\"index\":\"2\",\"value\":\"middle\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"first:middle:last\"}",
+            "{\"text_split_part_term\":{\"path\":\"/status\",\"delimiter\":42,\"index\":2,\"value\":\"middle\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"first:middle:last\"}",
+            "{\"text_split_part_term\":{\"path\":\"/status\",\"delimiter\":\":\",\"index\":2,\"value\":42}}",
+        ),
+    );
+}
+
+test "document SQL residual text affix term filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"open-tail\"}",
+        "{\"text_affix_term\":{\"path\":\"/status\",\"side\":\"prefix\",\"value\":\"open\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"open-tail\"}",
+        "{\"text_affix_term\":{\"path\":\"/status\",\"side\":\"suffix\",\"value\":\"tail\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"open-tail\"}",
+        "{\"text_affix_term\":{\"path\":\"/status\",\"side\":\"prefix\",\"value\":\"\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"open-tail\"}",
+        "{\"text_affix_term\":{\"path\":\"/status\",\"side\":\"suffix\",\"value\":\"open\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":null}",
+        "{\"text_affix_term\":{\"path\":\"/status\",\"side\":\"prefix\",\"value\":\"open\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"category\":\"open-tail\"}",
+        "{\"text_affix_term\":{\"path\":\"/status\",\"side\":\"prefix\",\"value\":\"open\"}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"open-tail\"}",
+            "{\"text_affix_term\":{\"path\":\"/status\",\"side\":\"middle\",\"value\":\"open\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"open-tail\"}",
+            "{\"text_affix_term\":{\"path\":\"/status\",\"side\":1,\"value\":\"open\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"open-tail\"}",
+            "{\"text_affix_term\":{\"path\":\"/status\",\"side\":\"prefix\",\"value\":true}}",
+        ),
+    );
+}
+
+test "document SQL residual text position range filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"opén-tail\"}",
+        "{\"text_strpos_range\":{\"path\":\"/status\",\"needle\":\"é\",\"min\":3,\"max\":3,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"open-tail\"}",
+        "{\"text_strpos_range\":{\"path\":\"/status\",\"needle\":\"tail\",\"min\":0,\"inclusive_min\":false}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"open-tail\"}",
+        "{\"text_strpos_range\":{\"path\":\"/status\",\"needle\":\"missing\",\"min\":0,\"max\":0,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"open-tail\"}",
+        "{\"text_strpos_range\":{\"path\":\"/status\",\"needle\":\"\",\"min\":1,\"max\":1,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"open-tail\"}",
+        "{\"text_strpos_range\":{\"path\":\"/status\",\"needle\":\"tail\",\"max\":4,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":null}",
+        "{\"text_strpos_range\":{\"path\":\"/status\",\"needle\":\"tail\",\"min\":0,\"inclusive_min\":false}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"category\":\"open-tail\"}",
+        "{\"text_strpos_range\":{\"path\":\"/status\",\"needle\":\"tail\",\"min\":0,\"inclusive_min\":false}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"open-tail\"}",
+            "{\"text_strpos_range\":{\"path\":\"/status\",\"needle\":1,\"min\":0,\"inclusive_min\":false}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"open-tail\"}",
+            "{\"text_strpos_range\":{\"path\":\"/status\",\"needle\":\"tail\",\"min\":\"0\",\"inclusive_min\":false}}",
+        ),
+    );
+}
+
+test "document SQL residual text ascii range filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"Active\"}",
+        "{\"text_ascii_range\":{\"path\":\"/status\",\"min\":65,\"max\":65,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"éclair\"}",
+        "{\"text_ascii_range\":{\"path\":\"/status\",\"min\":233,\"max\":233,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"\"}",
+        "{\"text_ascii_range\":{\"path\":\"/status\",\"min\":0,\"max\":0,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"Active\"}",
+        "{\"text_ascii_range\":{\"path\":\"/status\",\"min\":66,\"inclusive_min\":true}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":null}",
+        "{\"text_ascii_range\":{\"path\":\"/status\",\"min\":65,\"max\":65,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"category\":\"Active\"}",
+        "{\"text_ascii_range\":{\"path\":\"/status\",\"min\":65,\"max\":65,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"Active\"}",
+            "{\"text_ascii_range\":{\"path\":\"/status\",\"min\":\"65\",\"inclusive_min\":true}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":true}",
+            "{\"text_ascii_range\":{\"path\":\"/status\",\"min\":65,\"inclusive_min\":true}}",
+        ),
+    );
+}
+
+test "document SQL residual regexp function filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"a12 b34\"}",
+        "{\"regexp_count_range\":{\"path\":\"/status\",\"pattern\":\"[0-9]+\",\"min\":2,\"max\":2,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abc DEF\"}",
+        "{\"regexp_instr_range\":{\"path\":\"/status\",\"pattern\":\"[A-Z]+\",\"min\":5,\"max\":5,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abc DEF\"}",
+        "{\"regexp_substr_term\":{\"path\":\"/status\",\"pattern\":\"[A-Z]+\",\"value\":\"DEF\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abc DEF\"}",
+        "{\"regexp_count_range\":{\"path\":\"/status\",\"pattern\":\"[0-9]+\",\"min\":1,\"inclusive_min\":true}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abc DEF\"}",
+        "{\"regexp_substr_term\":{\"path\":\"/status\",\"pattern\":\"[0-9]+\",\"value\":\"123\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":null}",
+        "{\"regexp_count_range\":{\"path\":\"/status\",\"pattern\":\"[0-9]+\",\"min\":1,\"inclusive_min\":true}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"abc DEF\"}",
+            "{\"regexp_count_range\":{\"path\":\"/status\",\"pattern\":\"[\",\"min\":1,\"inclusive_min\":true}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"abc DEF\"}",
+            "{\"regexp_count_range\":{\"path\":\"/status\",\"pattern\":42,\"min\":1,\"inclusive_min\":true}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"abc DEF\"}",
+            "{\"regexp_substr_term\":{\"path\":\"/status\",\"pattern\":\"[A-Z]+\",\"value\":42}}",
+        ),
+    );
+}
+
+test "document SQL residual chr term filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"amount\":65}",
+        "{\"text_chr_term\":{\"path\":\"/amount\",\"value\":\"A\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"amount\":65}",
+        "{\"text_chr_term\":{\"codepoint\":233,\"value\":\"\\u00e9\"}}",
+    ) == false);
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{}",
+        "{\"text_chr_term\":{\"codepoint\":233,\"value\":\"\\u00e9\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"amount\":66}",
+        "{\"text_chr_term\":{\"path\":\"/amount\",\"value\":\"A\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"amount\":null}",
+        "{\"text_chr_term\":{\"path\":\"/amount\",\"value\":\"A\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":65}",
+        "{\"text_chr_term\":{\"path\":\"/amount\",\"value\":\"A\"}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"amount\":\"65\"}",
+            "{\"text_chr_term\":{\"path\":\"/amount\",\"value\":\"A\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{}",
+            "{\"text_chr_term\":{\"codepoint\":65.5,\"value\":\"A\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{}",
+            "{\"text_chr_term\":{\"codepoint\":1114112,\"value\":\"A\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"amount\":65}",
+            "{\"text_chr_term\":{\"path\":\"/amount\",\"codepoint\":65,\"value\":\"A\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{}",
+            "{\"text_chr_term\":{\"codepoint\":65,\"value\":65}}",
+        ),
+    );
+}
+
+test "document SQL residual text unary term filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"open tail\"}",
+        "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"initcap\",\"value\":\"Open Tail\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"hello\"}",
+        "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"md5\",\"value\":\"5d41402abc4b2a76b9719d911017c592\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"héllo\"}",
+        "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"md5\",\"value\":\"9f6ec78061f7655b2782d3e5b8cd77a2\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"héllo\"}",
+        "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"reverse\",\"value\":\"olléh\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"  ready  \"}",
+        "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"btrim\",\"value\":\"ready\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"  ready  \"}",
+        "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"ltrim\",\"value\":\"ready  \"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"  ready  \"}",
+        "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"rtrim\",\"value\":\"  ready\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"open tail\"}",
+        "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"initcap\",\"value\":\"Open tail\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":null}",
+        "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"md5\",\"value\":\"5d41402abc4b2a76b9719d911017c592\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"category\":\"hello\"}",
+        "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"md5\",\"value\":\"5d41402abc4b2a76b9719d911017c592\"}}",
+    ));
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"caf\xc3\xa9\"}",
+            "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"initcap\",\"value\":\"Caf\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"hello\"}",
+            "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"reverse\",\"value\":\"olleh\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"hello\"}",
+            "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":1,\"value\":\"hello\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"hello\"}",
+            "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"md5\",\"value\":42}}",
+        ),
+    );
+}
+
+test "document SQL residual repeat term filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"ab\"}",
+        "{\"text_repeat_term\":{\"path\":\"/status\",\"count\":2,\"value\":\"abab\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"ab\"}",
+        "{\"text_repeat_term\":{\"path\":\"/status\",\"count\":0,\"value\":\"\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"hé\"}",
+        "{\"text_repeat_term\":{\"path\":\"/status\",\"count\":2,\"value\":\"héhé\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"ab\"}",
+        "{\"text_repeat_term\":{\"path\":\"/status\",\"count\":2,\"value\":\"ab\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":null}",
+        "{\"text_repeat_term\":{\"path\":\"/status\",\"count\":2,\"value\":\"abab\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"category\":\"ab\"}",
+        "{\"text_repeat_term\":{\"path\":\"/status\",\"count\":2,\"value\":\"abab\"}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"ab\"}",
+            "{\"text_repeat_term\":{\"path\":\"/status\",\"count\":-1,\"value\":\"\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"ab\"}",
+            "{\"text_repeat_term\":{\"path\":\"/status\",\"count\":\"2\",\"value\":\"abab\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"ab\"}",
+            "{\"text_repeat_term\":{\"path\":\"/status\",\"count\":2,\"value\":42}}",
+        ),
+    );
+}
+
+test "document SQL residual text slice term filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abcdef\"}",
+        "{\"text_slice_term\":{\"path\":\"/status\",\"side\":\"left\",\"count\":2,\"value\":\"ab\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abcdef\"}",
+        "{\"text_slice_term\":{\"path\":\"/status\",\"side\":\"right\",\"count\":3,\"value\":\"def\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abcdef\"}",
+        "{\"text_slice_term\":{\"path\":\"/status\",\"side\":\"left\",\"count\":-1,\"value\":\"abcde\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"héllo\"}",
+        "{\"text_slice_term\":{\"path\":\"/status\",\"side\":\"right\",\"count\":4,\"value\":\"éllo\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abcdef\"}",
+        "{\"text_slice_term\":{\"path\":\"/status\",\"side\":\"right\",\"count\":3,\"value\":\"abc\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":null}",
+        "{\"text_slice_term\":{\"path\":\"/status\",\"side\":\"left\",\"count\":2,\"value\":\"ab\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"category\":\"abcdef\"}",
+        "{\"text_slice_term\":{\"path\":\"/status\",\"side\":\"left\",\"count\":2,\"value\":\"ab\"}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"abcdef\"}",
+            "{\"text_slice_term\":{\"path\":\"/status\",\"side\":\"middle\",\"count\":2,\"value\":\"ab\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"abcdef\"}",
+            "{\"text_slice_term\":{\"path\":\"/status\",\"side\":\"left\",\"count\":\"2\",\"value\":\"ab\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"abcdef\"}",
+            "{\"text_slice_term\":{\"path\":\"/status\",\"side\":\"left\",\"count\":2,\"value\":42}}",
+        ),
+    );
+}
+
+test "document SQL residual substring term filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abcdef\"}",
+        "{\"text_substring_term\":{\"path\":\"/status\",\"start\":2,\"length\":3,\"value\":\"bcd\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abcdef\"}",
+        "{\"text_substring_term\":{\"path\":\"/status\",\"start\":4,\"value\":\"def\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"héllo\"}",
+        "{\"text_substring_term\":{\"path\":\"/status\",\"start\":2,\"length\":2,\"value\":\"él\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abcdef\"}",
+        "{\"text_substring_term\":{\"path\":\"/status\",\"start\":1,\"length\":0,\"value\":\"\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abcdef\"}",
+        "{\"text_substring_term\":{\"path\":\"/status\",\"start\":2,\"length\":3,\"value\":\"abc\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":null}",
+        "{\"text_substring_term\":{\"path\":\"/status\",\"start\":2,\"length\":3,\"value\":\"bcd\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"category\":\"abcdef\"}",
+        "{\"text_substring_term\":{\"path\":\"/status\",\"start\":2,\"length\":3,\"value\":\"bcd\"}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"abcdef\"}",
+            "{\"text_substring_term\":{\"path\":\"/status\",\"start\":0,\"length\":3,\"value\":\"abc\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"abcdef\"}",
+            "{\"text_substring_term\":{\"path\":\"/status\",\"start\":2,\"length\":-1,\"value\":\"\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"abcdef\"}",
+            "{\"text_substring_term\":{\"path\":\"/status\",\"start\":\"2\",\"length\":3,\"value\":\"bcd\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"abcdef\"}",
+            "{\"text_substring_term\":{\"path\":\"/status\",\"start\":2,\"length\":3,\"value\":42}}",
+        ),
+    );
+}
+
+test "document SQL residual overlay term filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abcdef\"}",
+        "{\"text_overlay_term\":{\"path\":\"/status\",\"replacement\":\"XX\",\"start\":2,\"length\":3,\"value\":\"aXXef\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abcdef\"}",
+        "{\"text_overlay_term\":{\"path\":\"/status\",\"replacement\":\"YY\",\"start\":4,\"value\":\"abcYYf\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abcdef\"}",
+        "{\"text_overlay_term\":{\"path\":\"/status\",\"replacement\":\"!\",\"start\":3,\"length\":0,\"value\":\"ab!cdef\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"héllo\"}",
+        "{\"text_overlay_term\":{\"path\":\"/status\",\"replacement\":\"YY\",\"start\":2,\"length\":2,\"value\":\"hYYlo\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"abcdef\"}",
+        "{\"text_overlay_term\":{\"path\":\"/status\",\"replacement\":\"XX\",\"start\":2,\"length\":3,\"value\":\"abcXX\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":null}",
+        "{\"text_overlay_term\":{\"path\":\"/status\",\"replacement\":\"XX\",\"start\":2,\"length\":3,\"value\":\"aXXef\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"category\":\"abcdef\"}",
+        "{\"text_overlay_term\":{\"path\":\"/status\",\"replacement\":\"XX\",\"start\":2,\"length\":3,\"value\":\"aXXef\"}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"abcdef\"}",
+            "{\"text_overlay_term\":{\"path\":\"/status\",\"replacement\":\"XX\",\"start\":0,\"length\":3,\"value\":\"XXdef\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"abcdef\"}",
+            "{\"text_overlay_term\":{\"path\":\"/status\",\"replacement\":\"XX\",\"start\":2,\"length\":-1,\"value\":\"\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"abcdef\"}",
+            "{\"text_overlay_term\":{\"path\":\"/status\",\"replacement\":42,\"start\":2,\"length\":3,\"value\":\"aXXef\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"abcdef\"}",
+            "{\"text_overlay_term\":{\"path\":\"/status\",\"replacement\":\"XX\",\"start\":\"2\",\"length\":3,\"value\":\"aXXef\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":\"abcdef\"}",
+            "{\"text_overlay_term\":{\"path\":\"/status\",\"replacement\":\"XX\",\"start\":2,\"length\":3,\"value\":42}}",
+        ),
+    );
+}
+
+test "document SQL residual array length range filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"tags\":[\"a\",\"b\",\"c\"]}",
+        "{\"array_length_range\":{\"path\":\"/tags\",\"min\":2,\"inclusive_min\":true}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"tags\":[\"a\"]}",
+        "{\"array_length_range\":{\"path\":\"/tags\",\"min\":2,\"inclusive_min\":true}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"tags\":[\"a\",\"b\"]}",
+        "{\"array_length_range\":{\"path\":\"/tags\",\"min\":2,\"max\":2,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"tags\":null}",
+        "{\"array_length_range\":{\"path\":\"/tags\",\"min\":1,\"inclusive_min\":true}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"tags\":\"a\"}",
+            "{\"array_length_range\":{\"path\":\"/tags\",\"min\":1,\"inclusive_min\":true}}",
+        ),
+    );
+}
+
+test "document SQL residual JSON array length range filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"metadata\":{\"flags\":[\"a\",\"b\",\"c\"]}}",
+        "{\"json_array_length_range\":{\"path\":\"/metadata/flags\",\"min\":2,\"inclusive_min\":true}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"metadata\":{\"flags\":[\"a\"]}}",
+        "{\"json_array_length_range\":{\"path\":\"/metadata/flags\",\"min\":2,\"inclusive_min\":true}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"metadata\":{\"flags\":[\"a\",\"b\"]}}",
+        "{\"json_array_length_range\":{\"path\":\"/metadata/flags\",\"min\":2,\"max\":2,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"metadata\":{\"flags\":null}}",
+        "{\"json_array_length_range\":{\"path\":\"/metadata/flags\",\"min\":1,\"inclusive_min\":true}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"metadata\":{}}",
+        "{\"json_array_length_range\":{\"path\":\"/metadata/flags\",\"min\":1,\"inclusive_min\":true}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"metadata\":{\"flags\":\"a\"}}",
+            "{\"json_array_length_range\":{\"path\":\"/metadata/flags\",\"min\":1,\"inclusive_min\":true}}",
+        ),
+    );
+}
+
+test "document SQL residual JSON typeof term filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"metadata\":{\"flags\":[\"a\",\"b\"]}}",
+        "{\"json_typeof_term\":{\"path\":\"/metadata/flags\",\"value\":\"array\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"metadata\":{\"billing\":{\"plan\":\"pro\"}}}",
+        "{\"json_typeof_term\":{\"path\":\"/metadata/billing\",\"value\":\"object\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"metadata\":{\"source\":\"api\"}}",
+        "{\"json_typeof_term\":{\"path\":\"/metadata/source\",\"value\":\"string\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"metadata\":{\"count\":3}}",
+        "{\"json_typeof_term\":{\"path\":\"/metadata/count\",\"value\":\"number\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"metadata\":{\"active\":true}}",
+        "{\"json_typeof_term\":{\"path\":\"/metadata/active\",\"value\":\"boolean\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"metadata\":{\"deleted_at\":null}}",
+        "{\"json_typeof_term\":{\"path\":\"/metadata/deleted_at\",\"value\":\"null\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"metadata\":{\"flags\":\"not-array\"}}",
+        "{\"json_typeof_term\":{\"path\":\"/metadata/flags\",\"value\":\"array\"}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"metadata\":{}}",
+        "{\"json_typeof_term\":{\"path\":\"/metadata/flags\",\"value\":\"null\"}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"metadata\":{\"flags\":[]}}",
+            "{\"json_typeof_term\":{\"path\":\"/metadata/flags\",\"value\":1}}",
+        ),
+    );
+}
+
+test "document SQL residual byte and bit length filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"caf\xc3\xa9\"}",
+        "{\"text_octet_length_range\":{\"path\":\"/status\",\"min\":5,\"max\":5,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"caf\xc3\xa9\"}",
+        "{\"text_octet_length_range\":{\"path\":\"/status\",\"min\":4,\"max\":4,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"caf\xc3\xa9\"}",
+        "{\"text_bit_length_range\":{\"path\":\"/status\",\"min\":40,\"inclusive_min\":true}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"caf\xc3\xa9\"}",
+        "{\"text_bit_length_range\":{\"path\":\"/status\",\"max\":39,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"status\":42}",
+            "{\"text_octet_length_range\":{\"path\":\"/status\",\"min\":1,\"inclusive_min\":true}}",
+        ),
+    );
+}
+
+test "document SQL residual numeric unary range filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"delta\":8.6}",
+        "{\"numeric_unary_range\":{\"path\":\"/delta\",\"operator\":\"round\",\"min\":9,\"max\":9,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"delta\":8.4}",
+        "{\"numeric_unary_range\":{\"path\":\"/delta\",\"operator\":\"round\",\"min\":9,\"max\":9,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"delta\":-3.25}",
+        "{\"numeric_unary_range\":{\"path\":\"/delta\",\"operator\":\"floor\",\"max\":-4,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"delta\":-3.25}",
+        "{\"numeric_unary_range\":{\"path\":\"/delta\",\"operator\":\"sign\",\"min\":-1,\"max\":-1,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"delta\":16}",
+        "{\"numeric_unary_range\":{\"path\":\"/delta\",\"operator\":\"sqrt\",\"max\":4,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"amount\":16}",
+        "{\"numeric_unary_range\":{\"path\":\"/delta\",\"operator\":\"sqrt\",\"max\":4,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"delta\":-1}",
+            "{\"numeric_unary_range\":{\"path\":\"/delta\",\"operator\":\"sqrt\",\"max\":4,\"inclusive_max\":true}}",
+        ),
+    );
+}
+
+test "document SQL residual numeric power range filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"delta\":3}",
+        "{\"numeric_arithmetic_range\":{\"path\":\"/delta\",\"operator\":\"power\",\"operand\":2,\"min\":9,\"max\":9,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"delta\":2}",
+        "{\"numeric_arithmetic_range\":{\"path\":\"/delta\",\"operator\":\"power\",\"operand\":2,\"min\":9,\"max\":9,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"delta\":4}",
+        "{\"numeric_arithmetic_range\":{\"path\":\"/delta\",\"operator\":\"power\",\"operand\":0.5,\"max\":2,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"delta\":-3}",
+            "{\"numeric_arithmetic_range\":{\"path\":\"/delta\",\"operator\":\"power\",\"operand\":0.5,\"max\":2,\"inclusive_max\":true}}",
+        ),
+    );
+}
+
+test "document SQL residual numeric modulo range filters match rows" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"delta\":10}",
+        "{\"numeric_arithmetic_range\":{\"path\":\"/delta\",\"operator\":\"mod\",\"operand\":3,\"min\":1,\"max\":1,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"delta\":-10}",
+        "{\"numeric_arithmetic_range\":{\"path\":\"/delta\",\"operator\":\"mod\",\"operand\":3,\"min\":-1,\"max\":-1,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expect(!try residualFilterMatchesAlloc(
+        alloc,
+        "{\"delta\":11}",
+        "{\"numeric_arithmetic_range\":{\"path\":\"/delta\",\"operator\":\"mod\",\"operand\":3,\"min\":1,\"max\":1,\"inclusive_min\":true,\"inclusive_max\":true}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        residualFilterMatchesAlloc(
+            alloc,
+            "{\"delta\":10}",
+            "{\"numeric_arithmetic_range\":{\"path\":\"/delta\",\"operator\":\"mod\",\"operand\":0,\"min\":0,\"max\":0,\"inclusive_min\":true,\"inclusive_max\":true}}",
+        ),
+    );
 }
 
 test "document SQL producer mutation materializes bounded residual transform batch" {
@@ -6470,6 +10014,903 @@ test "document SQL bounded residual scan fails closed only when the scan cap is 
     defer partial.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 0), partial.total);
     try std.testing.expectEqual(@as(usize, 0), partial.rows.len);
+}
+
+test "document SQL materializes scalar text cast projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"amount\":12.5,\"active\":true,\"created_at\":\"2026-07-03T12:34:56Z\",\"status\":\"ready\",\"encoded\":\"7\",\"missing\":null,\"tags\":[\"hot\"]}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .scalar_text_cast, .field = "amount", .output = "amount_text" },
+        .{ .kind = .scalar_text_cast, .field = "active", .output = "active_text" },
+        .{ .kind = .scalar_text_cast, .field = "created_at", .output = "created_text" },
+        .{ .kind = .scalar_text_cast, .field = "status", .output = "status_text" },
+        .{ .kind = .scalar_text_cast, .field = "encoded", .output = "encoded_text" },
+        .{ .kind = .scalar_text_cast, .field = "missing", .output = "missing_text" },
+        .{ .kind = .scalar_text_cast, .field = "absent", .output = "absent_text" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"amount_text\":\"12.5\",\"active_text\":\"true\",\"created_text\":\"2026-07-03T12:34:56Z\",\"status_text\":\"ready\",\"encoded_text\":\"7\",\"missing_text\":null,\"absent_text\":null}", row);
+
+    var wrong_type = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .scalar_text_cast, .field = "tags", .output = "tags_text" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, wrong_type[0..]));
+}
+
+test "document SQL materializes scalar numeric cast projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"amount\":12.5,\"encoded\":\"7\",\"description\":\"8.25\",\"missing\":null,\"active\":true}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .scalar_numeric_cast, .field = "amount", .output = "amount_num" },
+        .{ .kind = .scalar_numeric_cast, .field = "encoded", .output = "encoded_num" },
+        .{ .kind = .scalar_numeric_cast, .field = "description", .output = "description_num" },
+        .{ .kind = .scalar_numeric_cast, .field = "missing", .output = "missing_num" },
+        .{ .kind = .scalar_numeric_cast, .field = "absent", .output = "absent_num" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"amount_num\":12.5,\"encoded_num\":7,\"description_num\":8.25,\"missing_num\":null,\"absent_num\":null}", row);
+
+    var invalid_text = try std.json.parseFromSlice(std.json.Value, alloc, "{\"encoded\":\"ready\"}", .{ .allocate = .alloc_always });
+    defer invalid_text.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", invalid_text.value, null, projection[1..2]));
+
+    var wrong_type = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .scalar_numeric_cast, .field = "active", .output = "active_num" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, wrong_type[0..]));
+}
+
+test "document SQL materializes scalar boolean cast projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"active\":true,\"disabled\":false,\"encoded_true\":\"true\",\"encoded_false\":\"false\",\"missing\":null,\"amount\":1}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .scalar_boolean_cast, .field = "active", .output = "active_bool" },
+        .{ .kind = .scalar_boolean_cast, .field = "disabled", .output = "disabled_bool" },
+        .{ .kind = .scalar_boolean_cast, .field = "encoded_true", .output = "encoded_true_bool" },
+        .{ .kind = .scalar_boolean_cast, .field = "encoded_false", .output = "encoded_false_bool" },
+        .{ .kind = .scalar_boolean_cast, .field = "missing", .output = "missing_bool" },
+        .{ .kind = .scalar_boolean_cast, .field = "absent", .output = "absent_bool" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"active_bool\":true,\"disabled_bool\":false,\"encoded_true_bool\":true,\"encoded_false_bool\":false,\"missing_bool\":null,\"absent_bool\":null}", row);
+
+    var invalid_text = try std.json.parseFromSlice(std.json.Value, alloc, "{\"encoded\":\"TRUE\"}", .{ .allocate = .alloc_always });
+    defer invalid_text.deinit();
+    var invalid_projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .scalar_boolean_cast, .field = "encoded", .output = "encoded_bool" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", invalid_text.value, null, invalid_projection[0..]));
+
+    var wrong_type = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .scalar_boolean_cast, .field = "amount", .output = "amount_bool" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, wrong_type[0..]));
+}
+
+test "document SQL materializes scalar datetime cast projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"created_at\":123456789,\"encoded\":\"987654321\",\"missing\":null,\"active\":true,\"negative\":-1,\"float_value\":1.5}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .scalar_datetime_cast, .field = "created_at", .output = "created_ts" },
+        .{ .kind = .scalar_datetime_cast, .field = "encoded", .output = "encoded_ts" },
+        .{ .kind = .scalar_datetime_cast, .field = "missing", .output = "missing_ts" },
+        .{ .kind = .scalar_datetime_cast, .field = "absent", .output = "absent_ts" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"created_ts\":123456789,\"encoded_ts\":987654321,\"missing_ts\":null,\"absent_ts\":null}", row);
+
+    var iso_text = try std.json.parseFromSlice(std.json.Value, alloc, "{\"encoded\":\"2026-07-03T12:34:56Z\"}", .{ .allocate = .alloc_always });
+    defer iso_text.deinit();
+    var text_projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .scalar_datetime_cast, .field = "encoded", .output = "encoded_ts" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", iso_text.value, null, text_projection[0..]));
+
+    var negative_projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .scalar_datetime_cast, .field = "negative", .output = "negative_ts" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, negative_projection[0..]));
+
+    var float_projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .scalar_datetime_cast, .field = "float_value", .output = "float_ts" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, float_projection[0..]));
+
+    var wrong_type = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .scalar_datetime_cast, .field = "active", .output = "active_ts" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, wrong_type[0..]));
+}
+
+test "document SQL materializes UTC date helper projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"epoch\":0,\"end_of_day\":86399999999999,\"next_day\":86400000000000,\"leap_day\":1709164800000000000,\"encoded\":\"1709251200000000000\",\"missing\":null,\"bad\":\"2026-01-01T00:00:00Z\"}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .temporal_date_utc, .field = "epoch", .output = "epoch_day" },
+        .{ .kind = .temporal_date_utc, .field = "end_of_day", .output = "end_day" },
+        .{ .kind = .temporal_date_utc, .field = "next_day", .output = "next_day" },
+        .{ .kind = .temporal_date_utc, .field = "leap_day", .output = "leap_day" },
+        .{ .kind = .temporal_date_utc, .field = "encoded", .output = "encoded_day" },
+        .{ .kind = .temporal_date_utc, .field = "missing", .output = "missing_day" },
+        .{ .kind = .temporal_date_utc, .field = "absent", .output = "absent_day" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"epoch_day\":\"1970-01-01\",\"end_day\":\"1970-01-01\",\"next_day\":\"1970-01-02\",\"leap_day\":\"2024-02-29\",\"encoded_day\":\"2024-03-01\",\"missing_day\":null,\"absent_day\":null}", row);
+
+    var bad_projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .temporal_date_utc, .field = "bad", .output = "bad_day" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, bad_projection[0..]));
+}
+
+test "document SQL materializes case-fold projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"Active\"}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_lower, .field = "status", .output = "status_lower" },
+        .{ .kind = .text_upper, .field = "status", .output = "status_upper" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"status_lower\":\"active\",\"status_upper\":\"ACTIVE\"}", row);
+
+    var non_ascii = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"CAF\xc3\x89\"}", .{ .allocate = .alloc_always });
+    defer non_ascii.deinit();
+    try std.testing.expectError(error.UnsupportedSqlShape, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", non_ascii.value, null, projection[0..]));
+}
+
+test "document SQL materializes initcap projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"ready FOR-review_2026\",\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_initcap, .field = "status", .output = "status_title" },
+        .{ .kind = .text_initcap, .field = "missing", .output = "missing_title" },
+        .{ .kind = .text_initcap, .field = "absent", .output = "absent_title" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"status_title\":\"Ready For-Review_2026\",\"missing_title\":null,\"absent_title\":null}", row);
+
+    var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":42}", .{ .allocate = .alloc_always });
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", wrong_type.value, null, projection[0..1]));
+
+    var non_ascii = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"h\xc3\xa9llo\"}", .{ .allocate = .alloc_always });
+    defer non_ascii.deinit();
+    try std.testing.expectError(error.UnsupportedSqlShape, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", non_ascii.value, null, projection[0..1]));
+}
+
+test "document SQL materializes md5 projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"hello\",\"accent\":\"h\xc3\xa9llo\",\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_md5, .field = "status", .output = "status_md5" },
+        .{ .kind = .text_md5, .field = "accent", .output = "accent_md5" },
+        .{ .kind = .text_md5, .field = "missing", .output = "missing_md5" },
+        .{ .kind = .text_md5, .field = "absent", .output = "absent_md5" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"status_md5\":\"5d41402abc4b2a76b9719d911017c592\",\"accent_md5\":\"9f6ec78061f7655b2782d3e5b8cd77a2\",\"missing_md5\":null,\"absent_md5\":null}", row);
+
+    var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":42}", .{ .allocate = .alloc_always });
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", wrong_type.value, null, projection[0..1]));
+}
+
+test "document SQL materializes text length projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"caf\xc3\xa9\",\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_length, .field = "status", .output = "status_len" },
+        .{ .kind = .text_octet_length, .field = "status", .output = "status_bytes" },
+        .{ .kind = .text_bit_length, .field = "status", .output = "status_bits" },
+        .{ .kind = .text_length, .field = "missing", .output = "missing_len" },
+        .{ .kind = .text_octet_length, .field = "missing", .output = "missing_bytes" },
+        .{ .kind = .text_length, .field = "absent", .output = "absent_len" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"status_len\":4,\"status_bytes\":5,\"status_bits\":40,\"missing_len\":null,\"missing_bytes\":null,\"absent_len\":null}", row);
+}
+
+test "document SQL materializes JSON typeof projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"metadata\":{\"flags\":[\"hot\"],\"source\":\"api\",\"count\":2,\"active\":true,\"missing\":null}}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .json_typeof, .field = "/metadata", .output = "metadata_type" },
+        .{ .kind = .json_typeof, .field = "/metadata/flags", .output = "flags_type" },
+        .{ .kind = .json_typeof, .field = "/metadata/source", .output = "source_type" },
+        .{ .kind = .json_typeof, .field = "/metadata/count", .output = "count_type" },
+        .{ .kind = .json_typeof, .field = "/metadata/active", .output = "active_type" },
+        .{ .kind = .json_typeof, .field = "/metadata/missing", .output = "missing_type" },
+        .{ .kind = .json_typeof, .field = "/metadata/absent", .output = "absent_type" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"metadata_type\":\"object\",\"flags_type\":\"array\",\"source_type\":\"string\",\"count_type\":\"number\",\"active_type\":\"boolean\",\"missing_type\":\"null\",\"absent_type\":null}", row);
+}
+
+test "document SQL materializes JSON array length projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"metadata\":{\"flags\":[\"hot\",\"new\"],\"events\":[],\"missing\":null,\"source\":\"api\"}}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .json_array_length, .field = "/metadata/flags", .output = "flag_count" },
+        .{ .kind = .json_array_length, .field = "/metadata/events", .output = "event_count" },
+        .{ .kind = .json_array_length, .field = "/metadata/missing", .output = "missing_count" },
+        .{ .kind = .json_array_length, .field = "/metadata/absent", .output = "absent_count" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"flag_count\":2,\"event_count\":0,\"missing_count\":null,\"absent_count\":null}", row);
+
+    var scalar_projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .json_array_length, .field = "/metadata/source", .output = "source_count" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, scalar_projection[0..]));
+}
+
+test "document SQL materializes numeric abs projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"delta\":-12.5,\"encoded\":\"-3.25\",\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .numeric_abs, .field = "delta", .output = "delta_abs" },
+        .{ .kind = .numeric_abs, .field = "encoded", .output = "encoded_abs" },
+        .{ .kind = .numeric_abs, .field = "missing", .output = "missing_abs" },
+        .{ .kind = .numeric_abs, .field = "absent", .output = "absent_abs" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"delta_abs\":12.5,\"encoded_abs\":3.25,\"missing_abs\":null,\"absent_abs\":null}", row);
+
+    var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"delta\":\"ready\"}", .{ .allocate = .alloc_always });
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", wrong_type.value, null, projection[0..1]));
+}
+
+test "document SQL materializes numeric unary projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"amount\":12.6,\"delta\":-3.25,\"zero\":0,\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .numeric_round, .field = "amount", .output = "amount_round" },
+        .{ .kind = .numeric_trunc, .field = "delta", .output = "delta_trunc" },
+        .{ .kind = .numeric_floor, .field = "delta", .output = "delta_floor" },
+        .{ .kind = .numeric_ceil, .field = "delta", .output = "delta_ceil" },
+        .{ .kind = .numeric_sqrt, .field = "amount", .output = "amount_sqrt" },
+        .{ .kind = .numeric_sign, .field = "delta", .output = "delta_sign" },
+        .{ .kind = .numeric_sign, .field = "zero", .output = "zero_sign" },
+        .{ .kind = .numeric_round, .field = "missing", .output = "missing_round" },
+        .{ .kind = .numeric_round, .field = "absent", .output = "absent_round" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"amount_round\":13,\"delta_trunc\":-3,\"delta_floor\":-4,\"delta_ceil\":-3,\"amount_sqrt\":3.5496478698597698,\"delta_sign\":-1,\"zero_sign\":0,\"missing_round\":null,\"absent_round\":null}", row);
+
+    var bad_sqrt = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .numeric_sqrt, .field = "delta", .output = "bad_sqrt" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, bad_sqrt[0..]));
+
+    var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"amount\":\"ready\"}", .{ .allocate = .alloc_always });
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", wrong_type.value, null, projection[0..1]));
+}
+
+test "document SQL materializes numeric arithmetic projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"amount\":10,\"delta\":-10,\"encoded\":\"8\",\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .numeric_arithmetic, .field = "amount", .output = "plus_two", .numeric_operator = .add, .numeric_operand = "2" },
+        .{ .kind = .numeric_arithmetic, .field = "amount", .output = "minus_three", .numeric_operator = .sub, .numeric_operand = "3" },
+        .{ .kind = .numeric_arithmetic, .field = "amount", .output = "times_four", .numeric_operator = .mul, .numeric_operand = "4" },
+        .{ .kind = .numeric_arithmetic, .field = "amount", .output = "divided", .numeric_operator = .div, .numeric_operand = "5" },
+        .{ .kind = .numeric_arithmetic, .field = "amount", .output = "remainder", .numeric_operator = .mod, .numeric_operand = "3" },
+        .{ .kind = .numeric_arithmetic, .field = "delta", .output = "negative_remainder", .numeric_operator = .mod, .numeric_operand = "3" },
+        .{ .kind = .numeric_arithmetic, .field = "encoded", .output = "encoded_plus", .numeric_operator = .add, .numeric_operand = "0.5" },
+        .{ .kind = .numeric_arithmetic, .field = "missing", .output = "missing_plus", .numeric_operator = .add, .numeric_operand = "2" },
+        .{ .kind = .numeric_arithmetic, .field = "absent", .output = "absent_plus", .numeric_operator = .add, .numeric_operand = "2" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"plus_two\":12,\"minus_three\":7,\"times_four\":40,\"divided\":2,\"remainder\":1,\"negative_remainder\":-1,\"encoded_plus\":8.5,\"missing_plus\":null,\"absent_plus\":null}", row);
+
+    var zero_divisor = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .numeric_arithmetic, .field = "amount", .output = "bad_divide", .numeric_operator = .div, .numeric_operand = "0" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, zero_divisor[0..]));
+
+    var zero_modulus = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .numeric_arithmetic, .field = "amount", .output = "bad_mod", .numeric_operator = .mod, .numeric_operand = "0" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, zero_modulus[0..]));
+
+    var malformed_operand = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .numeric_arithmetic, .field = "amount", .output = "bad_operand", .numeric_operator = .add, .numeric_operand = "nan" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, malformed_operand[0..]));
+}
+
+test "document SQL materializes numeric power projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"amount\":4,\"delta\":-3,\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .numeric_arithmetic, .field = "amount", .output = "amount_squared", .numeric_operator = .power, .numeric_operand = "2" },
+        .{ .kind = .numeric_arithmetic, .field = "delta", .output = "delta_squared", .numeric_operator = .power, .numeric_operand = "2" },
+        .{ .kind = .numeric_arithmetic, .field = "missing", .output = "missing_power", .numeric_operator = .power, .numeric_operand = "2" },
+        .{ .kind = .numeric_arithmetic, .field = "absent", .output = "absent_power", .numeric_operator = .power, .numeric_operand = "2" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"amount_squared\":16,\"delta_squared\":9,\"missing_power\":null,\"absent_power\":null}", row);
+
+    var invalid_result = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .numeric_arithmetic, .field = "delta", .output = "bad_power", .numeric_operator = .power, .numeric_operand = "0.5" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, invalid_result[0..]));
+}
+
+test "document SQL materializes regexp projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"A1B22 caf\xc3\xa97\",\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .regexp_count, .field = "status", .output = "digit_groups", .pattern = "[0-9]+" },
+        .{ .kind = .regexp_instr, .field = "status", .output = "first_digit_pos", .pattern = "[0-9]" },
+        .{ .kind = .regexp_substr, .field = "status", .output = "first_lower", .pattern = "[a-z]+" },
+        .{ .kind = .regexp_substr, .field = "status", .output = "no_match", .pattern = "z+" },
+        .{ .kind = .regexp_count, .field = "missing", .output = "missing_count", .pattern = "[0-9]+" },
+        .{ .kind = .regexp_instr, .field = "absent", .output = "absent_pos", .pattern = "[0-9]" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"digit_groups\":3,\"first_digit_pos\":2,\"first_lower\":\"caf\",\"no_match\":null,\"missing_count\":null,\"absent_pos\":null}", row);
+
+    var bad_pattern = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .regexp_count, .field = "status", .output = "bad_pattern", .pattern = "[" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, bad_pattern[0..]));
+
+    var empty_pattern = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .regexp_count, .field = "status", .output = "empty_pattern", .pattern = "" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, empty_pattern[0..]));
+
+    var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":42}", .{ .allocate = .alloc_always });
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", wrong_type.value, null, projection[0..1]));
+}
+
+test "document SQL materializes text binary projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"op\xc3\xa9ned\",\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_starts_with, .field = "status", .output = "has_prefix", .pattern = "op" },
+        .{ .kind = .text_ends_with, .field = "status", .output = "has_suffix", .pattern = "ed" },
+        .{ .kind = .text_starts_with, .field = "status", .output = "bad_prefix", .pattern = "closed" },
+        .{ .kind = .text_strpos, .field = "status", .output = "accent_pos", .pattern = "é" },
+        .{ .kind = .text_strpos, .field = "status", .output = "missing_pos", .pattern = "z" },
+        .{ .kind = .text_strpos, .field = "status", .output = "empty_pos", .pattern = "" },
+        .{ .kind = .text_strpos, .field = "status", .output = "position_equivalent", .pattern = "ned" },
+        .{ .kind = .text_starts_with, .field = "missing", .output = "missing_prefix", .pattern = "op" },
+        .{ .kind = .text_ends_with, .field = "absent", .output = "absent_suffix", .pattern = "ed" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"has_prefix\":true,\"has_suffix\":true,\"bad_prefix\":false,\"accent_pos\":3,\"missing_pos\":0,\"empty_pos\":1,\"position_equivalent\":5,\"missing_prefix\":null,\"absent_suffix\":null}", row);
+
+    var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":42}", .{ .allocate = .alloc_always });
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", wrong_type.value, null, projection[0..1]));
+}
+
+test "document SQL materializes split part projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"tenant:plan:region\",\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_split_part, .field = "status", .output = "first_part", .pattern = ":", .numeric_operand = "1" },
+        .{ .kind = .text_split_part, .field = "status", .output = "middle_part", .pattern = ":", .numeric_operand = "2" },
+        .{ .kind = .text_split_part, .field = "status", .output = "tail_part", .pattern = ":", .numeric_operand = "-1" },
+        .{ .kind = .text_split_part, .field = "status", .output = "out_of_range", .pattern = ":", .numeric_operand = "9" },
+        .{ .kind = .text_split_part, .field = "status", .output = "whole_value", .pattern = "", .numeric_operand = "1" },
+        .{ .kind = .text_split_part, .field = "status", .output = "empty_delimiter_out_of_range", .pattern = "", .numeric_operand = "2" },
+        .{ .kind = .text_split_part, .field = "missing", .output = "missing_part", .pattern = ":", .numeric_operand = "1" },
+        .{ .kind = .text_split_part, .field = "absent", .output = "absent_part", .pattern = ":", .numeric_operand = "1" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"first_part\":\"tenant\",\"middle_part\":\"plan\",\"tail_part\":\"region\",\"out_of_range\":\"\",\"whole_value\":\"tenant:plan:region\",\"empty_delimiter_out_of_range\":\"\",\"missing_part\":null,\"absent_part\":null}", row);
+
+    var zero_index = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_split_part, .field = "status", .output = "bad_part", .pattern = ":", .numeric_operand = "0" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, zero_index[0..]));
+
+    var malformed_index = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_split_part, .field = "status", .output = "bad_part", .pattern = ":", .numeric_operand = "1.5" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, malformed_index[0..]));
+
+    var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":42}", .{ .allocate = .alloc_always });
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", wrong_type.value, null, projection[0..1]));
+}
+
+test "document SQL materializes overlay projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"h\xc3\xa9llo-world\",\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_overlay, .field = "status", .output = "middle", .pattern = "XX", .numeric_operand = "2", .numeric_operand2 = "4" },
+        .{ .kind = .text_overlay, .field = "status", .output = "default_len", .pattern = "YY", .numeric_operand = "7" },
+        .{ .kind = .text_overlay, .field = "status", .output = "inserted", .pattern = "!", .numeric_operand = "3", .numeric_operand2 = "0" },
+        .{ .kind = .text_overlay, .field = "status", .output = "past_end", .pattern = "?", .numeric_operand = "99", .numeric_operand2 = "2" },
+        .{ .kind = .text_overlay, .field = "missing", .output = "missing_overlay", .pattern = "X", .numeric_operand = "1", .numeric_operand2 = "1" },
+        .{ .kind = .text_overlay, .field = "absent", .output = "absent_overlay", .pattern = "X", .numeric_operand = "1", .numeric_operand2 = "1" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"middle\":\"hXX-world\",\"default_len\":\"héllo-YYrld\",\"inserted\":\"hé!llo-world\",\"past_end\":\"héllo-world?\",\"missing_overlay\":null,\"absent_overlay\":null}", row);
+
+    var zero_start = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_overlay, .field = "status", .output = "bad_overlay", .pattern = "X", .numeric_operand = "0", .numeric_operand2 = "1" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, zero_start[0..]));
+
+    var malformed_length = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_overlay, .field = "status", .output = "bad_overlay", .pattern = "X", .numeric_operand = "1", .numeric_operand2 = "1.5" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, malformed_length[0..]));
+
+    var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":42}", .{ .allocate = .alloc_always });
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", wrong_type.value, null, projection[0..1]));
+}
+
+test "document SQL materializes substring projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"h\xc3\xa9llo-world\",\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_substring, .field = "status", .output = "middle", .numeric_operand = "2", .numeric_operand2 = "4" },
+        .{ .kind = .text_substring, .field = "status", .output = "tail", .numeric_operand = "7" },
+        .{ .kind = .text_substring, .field = "status", .output = "empty", .numeric_operand = "1", .numeric_operand2 = "0" },
+        .{ .kind = .text_substring, .field = "status", .output = "past_end", .numeric_operand = "99", .numeric_operand2 = "2" },
+        .{ .kind = .text_substring, .field = "missing", .output = "missing_part", .numeric_operand = "1", .numeric_operand2 = "2" },
+        .{ .kind = .text_substring, .field = "absent", .output = "absent_part", .numeric_operand = "1", .numeric_operand2 = "2" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"middle\":\"éllo\",\"tail\":\"world\",\"empty\":\"\",\"past_end\":\"\",\"missing_part\":null,\"absent_part\":null}", row);
+
+    var zero_start = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_substring, .field = "status", .output = "bad_part", .numeric_operand = "0", .numeric_operand2 = "2" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, zero_start[0..]));
+
+    var malformed_length = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_substring, .field = "status", .output = "bad_part", .numeric_operand = "1", .numeric_operand2 = "1.5" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, malformed_length[0..]));
+
+    var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":42}", .{ .allocate = .alloc_always });
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", wrong_type.value, null, projection[0..1]));
+}
+
+test "document SQL materializes left right projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"h\xc3\xa9llo\",\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_left, .field = "status", .output = "prefix", .numeric_operand = "2" },
+        .{ .kind = .text_right, .field = "status", .output = "suffix", .numeric_operand = "3" },
+        .{ .kind = .text_left, .field = "status", .output = "without_tail", .numeric_operand = "-1" },
+        .{ .kind = .text_right, .field = "status", .output = "without_head", .numeric_operand = "-2" },
+        .{ .kind = .text_left, .field = "status", .output = "all_left", .numeric_operand = "99" },
+        .{ .kind = .text_right, .field = "status", .output = "empty_right", .numeric_operand = "0" },
+        .{ .kind = .text_left, .field = "missing", .output = "missing_part", .numeric_operand = "2" },
+        .{ .kind = .text_right, .field = "absent", .output = "absent_part", .numeric_operand = "2" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"prefix\":\"hé\",\"suffix\":\"llo\",\"without_tail\":\"héll\",\"without_head\":\"llo\",\"all_left\":\"héllo\",\"empty_right\":\"\",\"missing_part\":null,\"absent_part\":null}", row);
+
+    var malformed_count = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_left, .field = "status", .output = "bad_part", .numeric_operand = "1.5" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, malformed_count[0..]));
+
+    var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":42}", .{ .allocate = .alloc_always });
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", wrong_type.value, null, projection[0..1]));
+}
+
+test "document SQL materializes repeat reverse projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"h\xc3\xa9!\",\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_reverse, .field = "status", .output = "reversed" },
+        .{ .kind = .text_repeat, .field = "status", .output = "doubled", .numeric_operand = "2" },
+        .{ .kind = .text_repeat, .field = "status", .output = "empty_repeat", .numeric_operand = "0" },
+        .{ .kind = .text_reverse, .field = "missing", .output = "missing_reverse" },
+        .{ .kind = .text_repeat, .field = "absent", .output = "absent_repeat", .numeric_operand = "2" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"reversed\":\"!éh\",\"doubled\":\"hé!hé!\",\"empty_repeat\":\"\",\"missing_reverse\":null,\"absent_repeat\":null}", row);
+
+    var malformed_count = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_repeat, .field = "status", .output = "bad_repeat", .numeric_operand = "1.5" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, malformed_count[0..]));
+
+    var negative_count = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_repeat, .field = "status", .output = "bad_repeat", .numeric_operand = "-1" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, negative_count[0..]));
+
+    var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":42}", .{ .allocate = .alloc_always });
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", wrong_type.value, null, projection[0..1]));
+}
+
+test "document SQL materializes trim projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"  h\xc3\xa9!  \",\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_btrim, .field = "status", .output = "both" },
+        .{ .kind = .text_ltrim, .field = "status", .output = "left" },
+        .{ .kind = .text_rtrim, .field = "status", .output = "right" },
+        .{ .kind = .text_btrim, .field = "missing", .output = "missing_trim" },
+        .{ .kind = .text_ltrim, .field = "absent", .output = "absent_trim" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"both\":\"hé!\",\"left\":\"hé!  \",\"right\":\"  hé!\",\"missing_trim\":null,\"absent_trim\":null}", row);
+
+    var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":42}", .{ .allocate = .alloc_always });
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", wrong_type.value, null, projection[0..1]));
+}
+
+test "document SQL materializes ascii projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"Active\",\"accent\":\"\xc3\xa9lan\",\"empty\":\"\",\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_ascii, .field = "status", .output = "status_code" },
+        .{ .kind = .text_ascii, .field = "accent", .output = "accent_code" },
+        .{ .kind = .text_ascii, .field = "empty", .output = "empty_code" },
+        .{ .kind = .text_ascii, .field = "missing", .output = "missing_code" },
+        .{ .kind = .text_ascii, .field = "absent", .output = "absent_code" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"status_code\":65,\"accent_code\":233,\"empty_code\":0,\"missing_code\":null,\"absent_code\":null}", row);
+
+    var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":42}", .{ .allocate = .alloc_always });
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", wrong_type.value, null, projection[0..1]));
+}
+
+test "document SQL materializes chr projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"amount\":65,\"accent\":233,\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_chr, .field = "amount", .output = "amount_char" },
+        .{ .kind = .text_chr, .field = "accent", .output = "accent_char" },
+        .{ .kind = .text_chr, .output = "literal_char", .numeric_operand = "90" },
+        .{ .kind = .text_chr, .field = "missing", .output = "missing_char" },
+        .{ .kind = .text_chr, .field = "absent", .output = "absent_char" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"amount_char\":\"A\",\"accent_char\":\"é\",\"literal_char\":\"Z\",\"missing_char\":null,\"absent_char\":null}", row);
+
+    var decimal_value = try std.json.parseFromSlice(std.json.Value, alloc, "{\"amount\":65.5}", .{ .allocate = .alloc_always });
+    defer decimal_value.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", decimal_value.value, null, projection[0..1]));
+
+    var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"amount\":\"65\"}", .{ .allocate = .alloc_always });
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", wrong_type.value, null, projection[0..1]));
+
+    var invalid_codepoint = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_chr, .output = "bad_char", .numeric_operand = "1114112" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, invalid_codepoint[0..]));
+}
+
+test "document SQL materializes replace projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"ready-ready\",\"accent\":\"h\xc3\xa9-h\xc3\xa9\",\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_replace, .field = "status", .output = "words", .pattern = "-", .numeric_operand = " " },
+        .{ .kind = .text_replace, .field = "status", .output = "deleted", .pattern = "ready", .numeric_operand = "" },
+        .{ .kind = .text_replace, .field = "status", .output = "unchanged", .pattern = "", .numeric_operand = "x" },
+        .{ .kind = .text_replace, .field = "accent", .output = "accent_words", .pattern = "é", .numeric_operand = "e" },
+        .{ .kind = .text_replace, .field = "missing", .output = "missing_replace", .pattern = "-", .numeric_operand = " " },
+        .{ .kind = .text_replace, .field = "absent", .output = "absent_replace", .pattern = "-", .numeric_operand = " " },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"words\":\"ready ready\",\"deleted\":\"-\",\"unchanged\":\"ready-ready\",\"accent_words\":\"he-he\",\"missing_replace\":null,\"absent_replace\":null}", row);
+
+    var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":42}", .{ .allocate = .alloc_always });
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", wrong_type.value, null, projection[0..1]));
+}
+
+test "document SQL materializes nullif projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"active\",\"empty\":\"\",\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_nullif, .field = "status", .output = "status_value", .pattern = "archived" },
+        .{ .kind = .text_nullif, .field = "status", .output = "status_null", .pattern = "active" },
+        .{ .kind = .text_nullif, .field = "empty", .output = "empty_null", .pattern = "" },
+        .{ .kind = .text_nullif, .field = "missing", .output = "missing_null", .pattern = "" },
+        .{ .kind = .text_nullif, .field = "absent", .output = "absent_null", .pattern = "" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"status_value\":\"active\",\"status_null\":null,\"empty_null\":null,\"missing_null\":null,\"absent_null\":null}", row);
+
+    var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":42}", .{ .allocate = .alloc_always });
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", wrong_type.value, null, projection[0..1]));
+}
+
+test "document SQL materializes concat_ws projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"active\",\"next\":{\"status\":\"queued\"},\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_concat_ws, .field = "status", .field2 = "next.status", .output = "path", .pattern = "-" },
+        .{ .kind = .text_concat_ws, .field = "status", .field2 = "missing", .output = "left_only", .pattern = "-" },
+        .{ .kind = .text_concat_ws, .field = "missing", .field2 = "next.status", .output = "right_only", .pattern = "-" },
+        .{ .kind = .text_concat_ws, .field = "missing", .field2 = "absent", .output = "empty", .pattern = "-" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"path\":\"active-queued\",\"left_only\":\"active\",\"right_only\":\"queued\",\"empty\":\"\"}", row);
+
+    var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"active\",\"next\":{\"status\":42}}", .{ .allocate = .alloc_always });
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", wrong_type.value, null, projection[0..1]));
+}
+
+test "document SQL materializes array_to_string projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"tags\":[\"urgent\",null,\"vip\"],\"empty\":[],\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_array_to_string, .field = "tags", .output = "tag_list", .pattern = "," },
+        .{ .kind = .text_array_to_string, .field = "empty", .output = "empty_list", .pattern = "," },
+        .{ .kind = .text_array_to_string, .field = "missing", .output = "missing_list", .pattern = "," },
+        .{ .kind = .text_array_to_string, .field = "absent", .output = "absent_list", .pattern = "," },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"tag_list\":\"urgent,vip\",\"empty_list\":\"\",\"missing_list\":null,\"absent_list\":null}", row);
+
+    var non_array = try std.json.parseFromSlice(std.json.Value, alloc, "{\"tags\":\"urgent\"}", .{ .allocate = .alloc_always });
+    defer non_array.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", non_array.value, null, projection[0..1]));
+
+    var non_string_item = try std.json.parseFromSlice(std.json.Value, alloc, "{\"tags\":[\"urgent\",42]}", .{ .allocate = .alloc_always });
+    defer non_string_item.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", non_string_item.value, null, projection[0..1]));
+}
+
+test "document SQL materializes string_to_array projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"active,,queued\",\"body\":\"hello\",\"empty\":\"\",\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_string_to_array, .field = "status", .output = "status_parts", .pattern = "," },
+        .{ .kind = .text_string_to_array, .field = "body", .output = "body_parts", .pattern = "" },
+        .{ .kind = .text_string_to_array, .field = "empty", .output = "empty_parts", .pattern = "," },
+        .{ .kind = .text_string_to_array, .field = "missing", .output = "missing_parts", .pattern = "," },
+        .{ .kind = .text_string_to_array, .field = "absent", .output = "absent_parts", .pattern = "," },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"status_parts\":[\"active\",\"\",\"queued\"],\"body_parts\":[\"hello\"],\"empty_parts\":[\"\"],\"missing_parts\":null,\"absent_parts\":null}", row);
+
+    var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":42}", .{ .allocate = .alloc_always });
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", wrong_type.value, null, projection[0..1]));
+}
+
+test "document SQL materializes cardinality projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"tags\":[\"urgent\",null,\"vip\"],\"empty\":[],\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .array_cardinality, .field = "tags", .output = "tag_count" },
+        .{ .kind = .array_cardinality, .field = "empty", .output = "empty_count" },
+        .{ .kind = .array_cardinality, .field = "missing", .output = "missing_count" },
+        .{ .kind = .array_cardinality, .field = "absent", .output = "absent_count" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"tag_count\":3,\"empty_count\":0,\"missing_count\":null,\"absent_count\":null}", row);
+
+    var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"tags\":\"urgent\"}", .{ .allocate = .alloc_always });
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", wrong_type.value, null, projection[0..1]));
+}
+
+test "document SQL materializes array position projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"tags\":[\"urgent\",\"vip\",\"urgent\",null],\"empty\":[],\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .array_position, .field = "tags", .output = "first_urgent", .pattern = "urgent" },
+        .{ .kind = .array_position, .field = "tags", .output = "first_missing", .pattern = "missing" },
+        .{ .kind = .array_positions, .field = "tags", .output = "urgent_positions", .pattern = "urgent" },
+        .{ .kind = .array_positions, .field = "empty", .output = "empty_positions", .pattern = "urgent" },
+        .{ .kind = .array_positions, .field = "missing", .output = "missing_positions", .pattern = "urgent" },
+        .{ .kind = .array_position, .field = "absent", .output = "absent_position", .pattern = "urgent" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"first_urgent\":1,\"first_missing\":null,\"urgent_positions\":[1,3],\"empty_positions\":[],\"missing_positions\":null,\"absent_position\":null}", row);
+
+    var non_array = try std.json.parseFromSlice(std.json.Value, alloc, "{\"tags\":\"urgent\"}", .{ .allocate = .alloc_always });
+    defer non_array.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", non_array.value, null, projection[0..1]));
+
+    var non_string_item = try std.json.parseFromSlice(std.json.Value, alloc, "{\"tags\":[\"urgent\",42]}", .{ .allocate = .alloc_always });
+    defer non_string_item.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", non_string_item.value, null, projection[2..3]));
+}
+
+test "document SQL materializes array transform projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"tags\":[\"old\",null,\"keep\",\"old\"],\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .array_append, .field = "tags", .output = "appended", .pattern = "new" },
+        .{ .kind = .array_prepend, .field = "tags", .output = "prepended", .pattern = "first" },
+        .{ .kind = .array_cat, .field = "tags", .output = "catted", .pattern = "[\"cat\",\"dog\"]" },
+        .{ .kind = .array_remove, .field = "tags", .output = "removed", .pattern = "old" },
+        .{ .kind = .array_replace, .field = "tags", .output = "replaced", .pattern = "old", .numeric_operand = "new" },
+        .{ .kind = .array_prepend, .field = "missing", .output = "missing_prepend", .pattern = "new" },
+        .{ .kind = .array_append, .field = "missing", .output = "missing_append", .pattern = "new" },
+        .{ .kind = .array_remove, .field = "absent", .output = "absent_remove", .pattern = "old" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"appended\":[\"old\",null,\"keep\",\"old\",\"new\"],\"prepended\":[\"first\",\"old\",null,\"keep\",\"old\"],\"catted\":[\"old\",null,\"keep\",\"old\",\"cat\",\"dog\"],\"removed\":[null,\"keep\"],\"replaced\":[\"new\",null,\"keep\",\"new\"],\"missing_prepend\":null,\"missing_append\":null,\"absent_remove\":null}", row);
+
+    var non_array = try std.json.parseFromSlice(std.json.Value, alloc, "{\"tags\":\"old\"}", .{ .allocate = .alloc_always });
+    defer non_array.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", non_array.value, null, projection[0..1]));
+
+    var non_string_item = try std.json.parseFromSlice(std.json.Value, alloc, "{\"tags\":[\"old\",42]}", .{ .allocate = .alloc_always });
+    defer non_string_item.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", non_string_item.value, null, projection[3..4]));
+
+    var malformed_literal = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .array_cat, .field = "tags", .output = "bad_cat", .pattern = "{\"bad\":true}" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, malformed_literal[0..]));
+}
+
+test "document SQL materializes translate projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"abc-de\",\"accent\":\"h\xc3\xa9-h\xc3\xa9\",\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_translate, .field = "status", .output = "mapped", .pattern = "abc", .numeric_operand = "xyz" },
+        .{ .kind = .text_translate, .field = "status", .output = "deleted", .pattern = "abcd", .numeric_operand = "XY" },
+        .{ .kind = .text_translate, .field = "status", .output = "unchanged", .pattern = "", .numeric_operand = "x" },
+        .{ .kind = .text_translate, .field = "accent", .output = "accent_mapped", .pattern = "é", .numeric_operand = "e" },
+        .{ .kind = .text_translate, .field = "missing", .output = "missing_translate", .pattern = "a", .numeric_operand = "b" },
+        .{ .kind = .text_translate, .field = "absent", .output = "absent_translate", .pattern = "a", .numeric_operand = "b" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"mapped\":\"xyz-de\",\"deleted\":\"XY-e\",\"unchanged\":\"abc-de\",\"accent_mapped\":\"he-he\",\"missing_translate\":null,\"absent_translate\":null}", row);
+
+    var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":42}", .{ .allocate = .alloc_always });
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", wrong_type.value, null, projection[0..1]));
+}
+
+test "document SQL materializes pad projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"h\xc3\xa9\",\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_lpad, .field = "status", .output = "left_padded", .numeric_operand = "5", .pattern = "0" },
+        .{ .kind = .text_rpad, .field = "status", .output = "right_padded", .numeric_operand = "6", .pattern = "-+" },
+        .{ .kind = .text_lpad, .field = "status", .output = "default_left", .numeric_operand = "4", .pattern = " " },
+        .{ .kind = .text_rpad, .field = "status", .output = "truncated", .numeric_operand = "1", .pattern = "-" },
+        .{ .kind = .text_lpad, .field = "status", .output = "empty", .numeric_operand = "0", .pattern = "0" },
+        .{ .kind = .text_lpad, .field = "missing", .output = "missing_pad", .numeric_operand = "5", .pattern = "0" },
+        .{ .kind = .text_rpad, .field = "absent", .output = "absent_pad", .numeric_operand = "5", .pattern = "0" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"left_padded\":\"000hé\",\"right_padded\":\"hé-+-+\",\"default_left\":\"  hé\",\"truncated\":\"h\",\"empty\":\"\",\"missing_pad\":null,\"absent_pad\":null}", row);
+
+    var malformed_width = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_lpad, .field = "status", .output = "bad_pad", .numeric_operand = "1.5", .pattern = "0" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, malformed_width[0..]));
+
+    var empty_fill = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_lpad, .field = "status", .output = "bad_pad", .numeric_operand = "5", .pattern = "" },
+    };
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, empty_fill[0..]));
+
+    var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":42}", .{ .allocate = .alloc_always });
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", wrong_type.value, null, projection[0..1]));
 }
 
 test "document SQL ordered bounded residual scan fails closed only when top-k completeness is unknown" {

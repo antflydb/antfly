@@ -5672,6 +5672,49 @@ test "postgres sql adapter typed write plans execute through relational storage"
         else => return error.TestUnexpectedResult,
     }
 
+    const u3_copy_scalar_conflict_version = try db.getTimestamp(alloc, u3_copy_key);
+    var insert_source_scalar_conflict_resolver = TestPrimaryResolver{
+        .row_json = "{\"id\":\"u3_copy\",\"status\":\"QUEUED\",\"organization_id\":\"o2\"}",
+        .version = u3_copy_scalar_conflict_version,
+    };
+    var insert_source_scalar_conflict_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, organization_id) SELECT id || '_copy' AS id, upper(status) AS status, organization_id FROM usage_records WHERE id = 'u3' ON CONFLICT (id) DO UPDATE SET status = (SELECT status FROM usage_records WHERE id = 'u3') RETURNING id, status",
+        schema,
+        &.{},
+        .{ .unique_resolver = insert_source_scalar_conflict_resolver.resolver() },
+    );
+    defer insert_source_scalar_conflict_plan.deinit(alloc);
+
+    switch (insert_source_scalar_conflict_plan) {
+        .insert_source => |insert_source| {
+            const conflict = insert_source.insert_source.req.on_conflict orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(db_mod.types.RelationalRowsConflictAction.update, conflict.action);
+            try std.testing.expectEqual(@as(usize, 1), conflict.patch_expressions.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, conflict.patch_expressions[0].expression.field_source);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.scalar_subqueries.len);
+            var source_result = try db.queryRelationalRows(alloc, schema, insert_source.insert_source.req.source);
+            defer source_result.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 1), source_result.total);
+
+            var batch = try relational_rows.buildRowsInsertSourceBatchAlloc(
+                alloc,
+                insert_source.table_name,
+                schema,
+                insert_source.insert_source.req,
+                source_result.rows,
+                insert_source_scalar_conflict_resolver.resolver(),
+            );
+            defer batch.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 0), batch.inserted);
+            try std.testing.expectEqual(@as(u32, 1), batch.transformed);
+            try std.testing.expectEqual(@as(usize, 1), batch.returning_rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"u3_copy\",\"status\":\"queued\"}", batch.returning_rows[0]);
+            try db.batch(batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     try db.batch(.{
         .writes = &.{
             .{ .key = "row:dup_a", .value = "{\"id\":\"dup_a\",\"status\":\"dupe\",\"organization_id\":\"dup_target\"}" },

@@ -3135,6 +3135,9 @@ pub fn Impl(comptime DB: type) type {
             generation: ?u64,
         ) !?doc_set.ResolvedDocSet {
             const column = relational_store_mod.columnForField(runtime_schema, range.field) orelse return null;
+            if (column.field_type == .array) {
+                return try Self.resolveRelationalArrayTermRangeFilterDocSetAlloc(self, alloc, runtime_schema, column, range, implications, generation);
+            }
             if (column.field_type != .keyword) return null;
             return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, runtime_schema.relational_columns, column, implications, generation, struct {
                 min: ?[]const u8,
@@ -3163,6 +3166,71 @@ pub fn Impl(comptime DB: type) type {
                 .inclusive_max = range.inclusive_max,
                 .collation = range.collation,
             });
+        }
+
+        fn resolveRelationalArrayTermRangeFilterDocSetAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            column: schema_mod.RelationalColumn,
+            range: search_mod.TermRangeQuery,
+            implications: relational_store_mod.PredicateImplications,
+            generation: ?u64,
+        ) !?doc_set.ResolvedDocSet {
+            var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
+            errdefer {
+                for (doc_ids.items) |doc_id| alloc.free(@constCast(doc_id));
+                doc_ids.deinit(alloc);
+            }
+
+            if (try Self.relationalColumnIndexUsableForQueryWithColumns(self, alloc, column, implications, runtime_schema.relational_columns)) {
+                const indexed_doc_ids = try relational_store_mod.scanArrayElementTermRangeDocKeysAlloc(
+                    alloc,
+                    self.core.store,
+                    column.path,
+                    range.min,
+                    range.max,
+                    range.inclusive_min,
+                    range.inclusive_max,
+                    range.collation,
+                    "",
+                    "",
+                );
+                defer relational_store_mod.freeDocKeys(alloc, indexed_doc_ids);
+                for (indexed_doc_ids) |doc_id| {
+                    const owned_doc_id = try alloc.dupe(u8, doc_id);
+                    errdefer alloc.free(owned_doc_id);
+                    try doc_ids.append(alloc, owned_doc_id);
+                }
+            } else {
+                const rows = try relational_store_mod.scanRowsAlloc(alloc, self.core.store, "", "");
+                defer relational_store_mod.freeRows(alloc, rows);
+                for (rows) |row| {
+                    const cell = (try relational_row_codec.findCellByPath(row.row_value, column.path)) orelse continue;
+                    const value = relational_store_mod.OwnedColumnValue{
+                        .doc_key = row.doc_key,
+                        .value_type = cell.value_type,
+                        .is_json = cell.is_json,
+                        .value = cell.value,
+                    };
+                    if (!try relational_store_mod.arrayColumnValueContainsTermRange(
+                        alloc,
+                        value,
+                        range.min,
+                        range.max,
+                        range.inclusive_min,
+                        range.inclusive_max,
+                        range.collation,
+                    )) continue;
+                    const owned_doc_id = try alloc.dupe(u8, row.doc_key);
+                    errdefer alloc.free(owned_doc_id);
+                    try doc_ids.append(alloc, owned_doc_id);
+                }
+            }
+
+            _ = generation;
+            if (doc_ids.items.len == 0) return .none;
+            return .{ .doc_keys = try doc_ids.toOwnedSlice(alloc) };
         }
 
         fn resolveRelationalNumericFilterDocSetAlloc(

@@ -11,14 +11,17 @@
       "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
       "removal_gate": "Add raw generated-AST fixtures, binder/lowering diagnostics, and API parity for BACKUP/RESTORE before deleting token-tail fallback.",
       "removal_evidence": {
-        "raw_ast_fixtures": ["backups-backup-database-generated-rejection"],
-        "binder_fixtures": [],
-        "lowering_fixtures": [],
-        "runtime_fixtures": [],
-        "api_native_parity_fixtures": [],
-        "unsupported_shape_fixtures": [],
+        "raw_ast_fixtures": ["backups-backup-database-generated-rejection", "backups-restore-database-generated-rejection"],
+        "binder_fixtures": ["unsupported backup database sql unavailable", "unsupported restore database sql unavailable"],
+        "lowering_fixtures": ["unsupported backup database sql unavailable", "unsupported restore database sql unavailable"],
+        "runtime_fixtures": ["unsupported backup database sql unavailable", "unsupported restore database sql unavailable"],
+        "api_native_parity_fixtures": ["unsupported backup database sql unavailable", "unsupported restore database sql unavailable"],
+        "unsupported_shape_fixtures": ["unsupported backup database sql unavailable", "unsupported restore database sql unavailable"],
         "stale_metadata_tests": ["tokenized parsed sql retained AST corruption rejects generated unsupported DDL"],
-        "deleted_compatibility_paths": []
+        "deleted_compatibility_paths": [
+          "ddl_plan.parseLogicalDdlPlanAlloc missing-generated fallback",
+          "ddl_plan.parseLogicalDdlPlanTokensAlloc"
+        ]
       }
     },
     {
@@ -31,14 +34,17 @@
       "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
       "removal_gate": "Every supported DDL subfamily has raw generated-AST fixtures, generated-AST-to-plan parity, app-parity corpus coverage, and stale-AST fail-closed tests.",
       "removal_evidence": {
-        "raw_ast_fixtures": ["ddl-create-table-generated-ast"],
+        "raw_ast_fixtures": ["ddl-alter-table-add-primary-key-generated-ast", "ddl-create-table-generated-ast", "ddl-create-view-generated-ast", "ddl-drop-table-generated-ast"],
         "binder_fixtures": ["schema create table", "create view catalog ddl"],
         "lowering_fixtures": ["schema create table", "schema add primary key migration"],
         "runtime_fixtures": ["schema create table", "schema drop table catalog plan"],
         "api_native_parity_fixtures": ["schema create table", "create view catalog ddl"],
         "unsupported_shape_fixtures": ["unsupported document table ddl shorthand"],
         "stale_metadata_tests": ["sql adapter ddl plan rejects stale generated DDL AST metadata before logical planning"],
-        "deleted_compatibility_paths": []
+        "deleted_compatibility_paths": [
+          "ddl_plan.parseLogicalDdlPlanAlloc missing-generated fallback",
+          "ddl_plan.parseLogicalDdlPlanTokensAlloc"
+        ]
       }
     },
     {
@@ -51,14 +57,16 @@
       "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
       "removal_gate": "INSERT, UPDATE, DELETE, TRUNCATE, MERGE, and mutation-source writes have raw generated-AST fixtures, binder/lowering parity, runtime parity, and stale-AST diagnostics.",
       "removal_evidence": {
-        "raw_ast_fixtures": ["dml-insert-values-generated-ast"],
+        "raw_ast_fixtures": ["dml-delete-using-generated-ast", "dml-insert-on-conflict-generated-ast", "dml-insert-values-generated-ast", "dml-merge-generated-ast", "dml-truncate-generated-ast", "dml-update-from-generated-ast"],
         "binder_fixtures": ["conflict upsert", "joined update from", "merge mutation plan"],
         "lowering_fixtures": ["schema truncate table mutation-source plan", "joined delete using", "merge mutation plan"],
         "runtime_fixtures": ["conflict upsert", "joined update from", "joined delete using"],
         "api_native_parity_fixtures": ["conflict upsert", "joined update from", "merge mutation plan"],
         "unsupported_shape_fixtures": ["unsupported document sql full document insert on conflict"],
         "stale_metadata_tests": ["sql adapter DML lowerer rejects missing and malformed retained generated AST metadata"],
-        "deleted_compatibility_paths": []
+        "deleted_compatibility_paths": [
+          "tokenized.ParsedSql.writeStatementIncludingGeneratedAst missing-generated fallback"
+        ]
       }
     },
     {
@@ -71,14 +79,17 @@
       "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
       "removal_gate": "Extension DDL and extension-index DDL have generated-AST coverage, unsupported-shape diagnostics, and native/API parity.",
       "removal_evidence": {
-        "raw_ast_fixtures": ["extensions-create-extension-generated-ast"],
+        "raw_ast_fixtures": ["extensions-create-extension-generated-ast", "extensions-create-index-generated-ast", "extensions-drop-extension-generated-ast", "extensions-drop-index-generated-ast"],
         "binder_fixtures": ["create extension catalog ddl", "schema rich unique expression index"],
         "lowering_fixtures": ["create extension catalog ddl", "drop extension catalog ddl"],
         "runtime_fixtures": ["create extension catalog ddl", "drop extension catalog ddl"],
         "api_native_parity_fixtures": ["create versioned extension catalog ddl", "schema rich unique expression index"],
         "unsupported_shape_fixtures": ["unsupported document table ddl invalid antfly extension"],
         "stale_metadata_tests": ["sql adapter ddl plan rejects stale generated extension AST metadata before logical planning"],
-        "deleted_compatibility_paths": []
+        "deleted_compatibility_paths": [
+          "ddl_plan.parseLogicalDdlPlanAlloc missing-generated fallback",
+          "ddl_plan.parseLogicalDdlPlanTokensAlloc"
+        ]
       }
     },
     {
@@ -91,14 +102,17 @@
       "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
       "removal_gate": "Function, procedure, trigger, aggregate, operator, and cast catalog plans have generated-AST fixtures, binder/lowering parity, and stable unsupported diagnostics.",
       "removal_evidence": {
-        "raw_ast_fixtures": ["functions-create-function-generated-ast"],
+        "raw_ast_fixtures": ["functions-call-procedure-generated-unsupported-ast", "functions-create-aggregate-generated-ast", "functions-create-cast-generated-ast", "functions-create-function-generated-ast", "functions-create-procedure-generated-ast", "functions-create-trigger-generated-unsupported-ast", "functions-drop-aggregate-generated-ast", "functions-drop-cast-generated-ast", "functions-drop-function-generated-ast", "functions-drop-procedure-generated-ast"],
         "binder_fixtures": ["create function catalog ddl", "create procedure catalog ddl", "create aggregate catalog ddl"],
         "lowering_fixtures": ["create function catalog ddl", "create procedure catalog ddl", "create cast catalog ddl"],
         "runtime_fixtures": ["call noop procedure catalog runtime ddl", "drop function catalog ddl", "drop procedure catalog ddl"],
         "api_native_parity_fixtures": ["create function catalog ddl", "create aggregate catalog ddl", "create cast catalog ddl"],
         "unsupported_shape_fixtures": ["unsupported create trigger variant"],
         "stale_metadata_tests": ["sql adapter ddl plan rejects stale generated routine and type-system AST metadata"],
-        "deleted_compatibility_paths": []
+        "deleted_compatibility_paths": [
+          "ddl_plan.parseLogicalDdlPlanAlloc missing-generated fallback",
+          "ddl_plan.parseLogicalDdlPlanTokensAlloc"
+        ]
       }
     },
     {
@@ -111,14 +125,16 @@
       "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
       "removal_gate": "External lake reads and query functions have raw generated-read fixtures, bound source parity, runtime parity, and explicit unsupported diagnostics.",
       "removal_evidence": {
-        "raw_ast_fixtures": ["lakes-antfly-source-function-generated-read-ast"],
+        "raw_ast_fixtures": ["lakes-antfly-source-function-generated-read-ast", "lakes-full-text-source-function-generated-read-ast", "lakes-graph-k-shortest-paths-source-function-generated-read-ast", "lakes-graph-match-source-function-generated-read-ast", "lakes-graph-metric-rerank-source-function-generated-read-ast", "lakes-graph-metric-source-function-generated-read-ast", "lakes-graph-neighbors-source-function-generated-read-ast", "lakes-graph-shortest-path-source-function-generated-read-ast", "lakes-graph-traverse-source-function-generated-read-ast", "lakes-hybrid-source-function-generated-read-ast", "lakes-vector-source-function-generated-read-ast"],
         "binder_fixtures": ["query function semantic search request", "query function graph match request"],
         "lowering_fixtures": ["query function semantic search request", "query function graph traverse request"],
         "runtime_fixtures": ["query function semantic search request", "query function graph metric request"],
         "api_native_parity_fixtures": ["query function semantic search request", "query function hybrid search request"],
         "unsupported_shape_fixtures": ["unsupported document sql native semantic search missing producer"],
         "stale_metadata_tests": ["sql adapter parsed sql rejects malformed generated graph and antfly source metadata"],
-        "deleted_compatibility_paths": []
+        "deleted_compatibility_paths": [
+          "tokenized.ParsedSql.readStatementKindIncludingGeneratedAst missing-generated fallback"
+        ]
       }
     },
     {
@@ -131,14 +147,67 @@
       "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
       "removal_gate": "VACUUM, ANALYZE, REINDEX, CLUSTER, cursor, prepared statement, and transaction maintenance commands have generated-AST fixtures and app-parity coverage.",
       "removal_evidence": {
-        "raw_ast_fixtures": ["maintenance-vacuum-generated-unsupported-ast"],
-        "binder_fixtures": ["vacuum maintenance job", "analyze maintenance job", "declare cursor portal protocol plan"],
-        "lowering_fixtures": ["vacuum option maintenance job", "reindex maintenance job", "cluster maintenance job"],
-        "runtime_fixtures": ["vacuum maintenance job", "analyze maintenance job", "cluster maintenance job"],
-        "api_native_parity_fixtures": ["vacuum maintenance job", "analyze verbose column maintenance job", "cluster verbose maintenance job"],
+        "raw_ast_fixtures": [
+          "maintenance-analyze-generated-unsupported-ast",
+          "maintenance-cluster-generated-unsupported-ast",
+          "maintenance-cursor-declare-generated-ast",
+          "maintenance-cursor-fetch-generated-ast",
+          "maintenance-prepared-deallocate-generated-ast",
+          "maintenance-prepared-execute-generated-ast",
+          "maintenance-prepared-prepare-generated-ast",
+          "maintenance-prepared-transaction-commit-generated-ast",
+          "maintenance-prepared-transaction-prepare-generated-ast",
+          "maintenance-prepared-transaction-rollback-generated-ast",
+          "maintenance-reindex-generated-unsupported-ast",
+          "maintenance-transaction-begin-generated-ast",
+          "maintenance-transaction-commit-generated-ast",
+          "maintenance-transaction-rollback-generated-ast",
+          "maintenance-transaction-savepoint-generated-ast",
+          "maintenance-vacuum-generated-unsupported-ast"
+        ],
+        "binder_fixtures": [
+          "vacuum maintenance job",
+          "analyze maintenance job",
+          "declare cursor portal protocol plan",
+          "prepare statement protocol plan",
+          "adapter-only start transaction control syntax",
+          "prepare transaction durable recovery intent"
+        ],
+        "lowering_fixtures": [
+          "vacuum option maintenance job",
+          "reindex maintenance job",
+          "cluster maintenance job",
+          "execute prepared statement protocol plan",
+          "adapter-only commit transaction control syntax",
+          "commit prepared transaction durable recovery intent"
+        ],
+        "runtime_fixtures": [
+          "vacuum maintenance job",
+          "analyze maintenance job",
+          "cluster maintenance job",
+          "fetch cursor portal protocol plan",
+          "deallocate prepared statement protocol plan",
+          "adapter-only rollback transaction control syntax",
+          "rollback prepared transaction durable recovery intent"
+        ],
+        "api_native_parity_fixtures": [
+          "vacuum maintenance job",
+          "analyze verbose column maintenance job",
+          "cluster verbose maintenance job",
+          "close cursor portal protocol plan",
+          "prepare statement protocol plan",
+          "execute prepared statement protocol plan",
+          "deallocate prepared statement protocol plan",
+          "prepare transaction durable recovery intent",
+          "commit prepared transaction durable recovery intent",
+          "rollback prepared transaction durable recovery intent"
+        ],
         "unsupported_shape_fixtures": ["unsupported alter table cluster on"],
         "stale_metadata_tests": ["sql adapter logical ddl plan accepts validated generated unsupported maintenance without vacuum analyze wrapper fallback"],
-        "deleted_compatibility_paths": []
+        "deleted_compatibility_paths": [
+          "ddl_plan.parseLogicalDdlPlanAlloc missing-generated fallback",
+          "ddl_plan.parseLogicalDdlPlanTokensAlloc"
+        ]
       }
     },
     {
@@ -151,14 +220,60 @@
       "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
       "removal_gate": "Query, aggregate, join, lateral, window, recursive CTE, and set-operation plans have raw generated-read fixtures, binder/lowering parity, runtime parity, and stale-AST diagnostics.",
       "removal_evidence": {
-        "raw_ast_fixtures": ["query-join-generated-read-ast"],
-        "binder_fixtures": ["single table json query", "equality join", "row number window"],
-        "lowering_fixtures": ["single table expression query", "equality join", "grouped aggregate"],
-        "runtime_fixtures": ["single table json query", "equality join", "row number window"],
-        "api_native_parity_fixtures": ["single table json query", "grouped aggregate", "query function full text search request"],
+        "raw_ast_fixtures": [
+          "query-aggregate-generated-read-ast",
+          "query-join-generated-read-ast",
+          "query-lateral-generated-read-ast",
+          "query-recursive-cte-generated-read-ast",
+          "query-set-except-generated-read-ast",
+          "query-set-intersect-generated-read-ast",
+          "query-set-union-generated-read-ast",
+          "query-single-table-generated-read-ast",
+          "query-window-generated-read-ast"
+        ],
+        "binder_fixtures": [
+          "single table json query",
+          "equality join",
+          "bounded lateral",
+          "grouped aggregate",
+          "recursive cte read stream plan",
+          "read union set operation",
+          "row number window"
+        ],
+        "lowering_fixtures": [
+          "single table expression query",
+          "equality join",
+          "bounded lateral",
+          "grouped aggregate",
+          "recursive cte read ordered page",
+          "read intersect set operation",
+          "row number window"
+        ],
+        "runtime_fixtures": [
+          "single table json query",
+          "equality join",
+          "bounded lateral",
+          "grouped aggregate",
+          "recursive cte read stream plan",
+          "read except set operation",
+          "row number window"
+        ],
+        "api_native_parity_fixtures": [
+          "single table json query",
+          "grouped aggregate",
+          "query function full text search request",
+          "bounded lateral",
+          "recursive cte read stream plan",
+          "read union all boolean set operation",
+          "read intersect set operation",
+          "read except set operation",
+          "row number window"
+        ],
         "unsupported_shape_fixtures": ["unsupported read intersect mismatched type set operation"],
         "stale_metadata_tests": ["sql adapter parsed sql rejects malformed generated classification payloads"],
-        "deleted_compatibility_paths": []
+        "deleted_compatibility_paths": [
+          "tokenized.ParsedSql.readStatementKindIncludingGeneratedAst missing-generated fallback"
+        ]
       }
     },
     {
@@ -171,14 +286,63 @@
       "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
       "removal_gate": "Role, privilege, row-security, schema-namespace, and session-setting commands have generated-AST fixtures, native/API parity, and explicit no-op or unsupported classifications.",
       "removal_evidence": {
-        "raw_ast_fixtures": ["roles-create-role-generated-ast"],
-        "binder_fixtures": ["create role catalog ddl", "grant role catalog ddl", "row security create policy catalog ddl"],
-        "lowering_fixtures": ["alter role catalog ddl", "grant table privilege catalog ddl", "row security alter policy catalog ddl"],
-        "runtime_fixtures": ["create role catalog ddl", "revoke role catalog ddl", "row security drop policy catalog ddl"],
-        "api_native_parity_fixtures": ["create role catalog ddl", "grant table privilege catalog ddl", "alter default privileges grant catalog ddl"],
+        "raw_ast_fixtures": [
+          "roles-alter-default-privileges-generated-ast",
+          "roles-alter-policy-generated-ast",
+          "roles-alter-role-generated-ast",
+          "roles-create-policy-generated-ast",
+          "roles-create-role-generated-ast",
+          "roles-create-schema-generated-ast",
+          "roles-drop-policy-generated-ast",
+          "roles-drop-role-generated-ast",
+          "roles-drop-schema-generated-ast",
+          "roles-grant-role-generated-ast",
+          "roles-grant-table-generated-ast",
+          "roles-revoke-role-generated-ast",
+          "roles-revoke-table-generated-ast",
+          "roles-session-set-generated-ast",
+          "roles-unsupported-create-schema-options-generated-ast",
+          "roles-unsupported-drop-role-multi-generated-ast",
+          "roles-unsupported-grant-generated-ast"
+        ],
+        "binder_fixtures": [
+          "create role catalog ddl",
+          "grant role catalog ddl",
+          "grant table privilege catalog ddl",
+          "row security create policy catalog ddl",
+          "create schema namespace catalog ddl",
+          "adapter-only session setting syntax"
+        ],
+        "lowering_fixtures": [
+          "alter role catalog ddl",
+          "grant table privilege catalog ddl",
+          "revoke table privilege catalog ddl",
+          "row security alter policy catalog ddl",
+          "drop schema namespace catalog ddl",
+          "adapter-only reset session setting syntax"
+        ],
+        "runtime_fixtures": [
+          "create role catalog ddl",
+          "revoke role catalog ddl",
+          "row security drop policy catalog ddl",
+          "drop role catalog ddl",
+          "drop schema namespace cascade catalog ddl",
+          "adapter-only client encoding session setting syntax"
+        ],
+        "api_native_parity_fixtures": [
+          "create role catalog ddl",
+          "grant table privilege catalog ddl",
+          "alter default privileges grant catalog ddl",
+          "create schema namespace catalog ddl",
+          "row security create policy catalog ddl",
+          "adapter-only session setting syntax"
+        ],
         "unsupported_shape_fixtures": ["unsupported document table ddl invalid antfly extension"],
         "stale_metadata_tests": ["sql adapter generated utility unsupported AST rejects stale role privilege and policy metadata"],
-        "deleted_compatibility_paths": []
+        "deleted_compatibility_paths": [
+          "ddl_plan.parseLogicalDdlPlanAlloc missing-generated fallback",
+          "ddl_plan.parseLogicalDdlPlanTokensAlloc"
+        ]
       }
     }
   ]

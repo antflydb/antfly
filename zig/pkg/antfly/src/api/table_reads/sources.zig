@@ -9068,11 +9068,12 @@ test "api.table_reads.docid document sql view mapping runtime results match nati
         virtual_schema,
         capabilities,
         "SELECT _id, score FROM support_view WHERE score >= 5 LIMIT 10",
-        3,
+        4,
         &.{
             "{\"_id\":\"doc:a\",\"score\":9}",
             "{\"_id\":\"doc:c\",\"score\":7}",
             "{\"_id\":\"doc:d\",\"score\":5}",
+            "{\"_id\":\"doc:f\",\"score\":6}",
         },
     );
     defer range.deinit(alloc);
@@ -9085,11 +9086,12 @@ test "api.table_reads.docid document sql view mapping runtime results match nati
         virtual_schema,
         capabilities,
         "SELECT _id, score FROM support_view WHERE score BETWEEN 4 AND 7 LIMIT 10",
-        3,
+        4,
         &.{
             "{\"_id\":\"doc:c\",\"score\":7}",
             "{\"_id\":\"doc:d\",\"score\":5}",
             "{\"_id\":\"doc:e\",\"score\":4}",
+            "{\"_id\":\"doc:f\",\"score\":6}",
         },
     );
     defer between.deinit(alloc);
@@ -9339,10 +9341,12 @@ test "api.table_reads.docid document sql view mapping runtime results match nati
         virtual_schema,
         capabilities,
         "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag > 'u' LIMIT 10",
-        3,
+        5,
         &.{
             "{\"_id\":\"doc:a\",\"tag\":\"urgent\"}",
             "{\"_id\":\"doc:a\",\"tag\":\"vip\"}",
+            "{\"_id\":\"doc:c\",\"tag\":\"urgent\"}",
+            "{\"_id\":\"doc:d\",\"tag\":\"vip\"}",
             "{\"_id\":\"doc:f\",\"tag\":\"visible\"}",
         },
     );
@@ -9357,9 +9361,10 @@ test "api.table_reads.docid document sql view mapping runtime results match nati
         virtual_schema,
         capabilities,
         "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag LIKE 'v%' LIMIT 10",
-        2,
+        3,
         &.{
             "{\"_id\":\"doc:a\",\"tag\":\"vip\"}",
+            "{\"_id\":\"doc:d\",\"tag\":\"vip\"}",
             "{\"_id\":\"doc:f\",\"tag\":\"visible\"}",
         },
     );
@@ -9374,9 +9379,10 @@ test "api.table_reads.docid document sql view mapping runtime results match nati
         virtual_schema,
         capabilities,
         "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag ILIKE 'V%' LIMIT 10",
-        2,
+        3,
         &.{
             "{\"_id\":\"doc:a\",\"tag\":\"vip\"}",
+            "{\"_id\":\"doc:d\",\"tag\":\"vip\"}",
             "{\"_id\":\"doc:f\",\"tag\":\"visible\"}",
         },
     );
@@ -9411,9 +9417,9 @@ test "api.table_reads.docid document sql view mapping runtime results match nati
         &.{
             "{\"_id\":\"doc:a\",\"tag\":\"urgent\"}",
             "{\"_id\":\"doc:a\",\"tag\":\"vip\"}",
-            "{\"_id\":\"doc:b\",\"tag\":\"stale\"}",
+            "{\"_id\":\"doc:b\",\"tag\":\"normal\"}",
             "{\"_id\":\"doc:c\",\"tag\":\"urgent\"}",
-            "{\"_id\":\"doc:c\",\"tag\":\"review\"}",
+            "{\"_id\":\"doc:d\",\"tag\":\"vip\"}",
             "{\"_id\":\"doc:f\",\"tag\":\"visible\"}",
         },
     );
@@ -9431,8 +9437,8 @@ test "api.table_reads.docid document sql view mapping runtime results match nati
         4,
         &.{
             "{\"_id\":\"doc:a\",\"tag\":\"vip\"}",
-            "{\"_id\":\"doc:b\",\"tag\":\"stale\"}",
-            "{\"_id\":\"doc:c\",\"tag\":\"review\"}",
+            "{\"_id\":\"doc:b\",\"tag\":\"normal\"}",
+            "{\"_id\":\"doc:d\",\"tag\":\"vip\"}",
             "{\"_id\":\"doc:f\",\"tag\":\"visible\"}",
         },
     );
@@ -9484,9 +9490,9 @@ test "api.table_reads.docid document sql view mapping runtime results match nati
             if (std.mem.eql(u8, tag.string, "urgent") and !std.mem.eql(u8, tag.string, "stale")) mapped_compound_matches += 1;
         }
     }
-    try std.testing.expectEqual(@as(usize, 3), mapped_range_matches);
-    try std.testing.expectEqual(@as(usize, 2), mapped_pattern_matches);
-    try std.testing.expectEqual(@as(usize, 2), mapped_ilike_matches);
+    try std.testing.expectEqual(@as(usize, 5), mapped_range_matches);
+    try std.testing.expectEqual(@as(usize, 3), mapped_pattern_matches);
+    try std.testing.expectEqual(@as(usize, 3), mapped_ilike_matches);
     try std.testing.expectEqual(@as(usize, 1), mapped_null_matches);
     try std.testing.expectEqual(@as(usize, 6), mapped_not_null_matches);
     try std.testing.expectEqual(@as(usize, 4), mapped_not_equal_matches);

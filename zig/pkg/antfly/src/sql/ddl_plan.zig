@@ -743,289 +743,6 @@ fn parseLegacyDdlParserPlanAlloc(
     return error.UnsupportedSqlShape;
 }
 
-pub fn parseLogicalDdlPlanTokensAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-    options: DdlPlanParserOptions,
-) !binder.LogicalSqlPlan {
-    const cursor = parser.Cursor.init(tokens, pos);
-    if (cursor.matchKeyword("call")) return .{ .routine = .{ .procedure_call = try parseProcedureCallPlanTailAlloc(alloc, tokens, pos) } };
-    if (cursor.matchKeyword("create")) {
-        if (cursor.matchKeyword("or")) {
-            try cursor.expectKeyword("replace");
-            if (cursor.peekKeyword("trigger")) return try parseCreateTriggerLogicalDdlPlanTailAlloc(alloc, tokens, pos, true);
-            if (cursor.peekKeyword("materialized")) return .{ .table_ddl = .{ .materialized_view_catalog = .{ .create = try parseCreateMaterializedViewPlanTailAlloc(alloc, tokens, pos, true) } } };
-            if (cursor.peekKeyword("view")) return .{ .table_ddl = .{ .view_catalog = .{ .create = try parseCreateViewPlanTailAlloc(alloc, tokens, pos, true) } } };
-            if (cursor.peekKeyword("function") or cursor.peekKeyword("procedure")) return .{ .routine = .{ .function_catalog = .{ .create = try parseCreateRoutinePlanTailAlloc(alloc, tokens, pos, true) } } };
-            if (!cursor.peekKeyword("table")) return error.UnsupportedSqlShape;
-            var create_table = try parseCreateTablePlanAlloc(alloc, tokens, pos, options.column_definition_options);
-            create_table.replace_existing = true;
-            return .{ .table_ddl = .{ .create_table = create_table } };
-        }
-        const unique = cursor.matchKeyword("unique");
-        if (cursor.peekKeyword("index")) return .{ .table_ddl = .{ .create_index = try parseCreateIndexPlanAlloc(alloc, tokens, pos, unique, options.create_index_options) } };
-        if (cursor.peekKeyword("graph")) {
-            if (unique) return error.UnsupportedSqlShape;
-            if (pos.* + 1 < tokens.len and tokens[pos.* + 1].matchesKeyword("metric")) {
-                return .{ .table_ddl = .{ .create_index = try parseCreateGraphMetricPlanAlloc(alloc, tokens, pos) } };
-            }
-            return .{ .table_ddl = .{ .create_index = try parseCreateGraphIndexPlanAlloc(alloc, tokens, pos) } };
-        }
-        if (unique) return error.UnsupportedSqlShape;
-        if (cursor.peekKeyword("trigger")) return try parseCreateTriggerLogicalDdlPlanTailAlloc(alloc, tokens, pos, false);
-        if (cursor.peekKeyword("materialized")) return .{ .table_ddl = .{ .materialized_view_catalog = .{ .create = try parseCreateMaterializedViewPlanTailAlloc(alloc, tokens, pos, false) } } };
-        if (cursor.peekKeyword("view")) return .{ .table_ddl = .{ .view_catalog = .{ .create = try parseCreateViewPlanTailAlloc(alloc, tokens, pos, false) } } };
-        if (cursor.peekKeyword("domain")) return .{ .catalog_ddl = .{ .domain_catalog = .{ .create = try parseCreateDomainPlanAlloc(alloc, tokens, pos, options.domain_options) } } };
-        if (cursor.peekKeyword("sequence")) return .{ .catalog_ddl = .{ .sequence_catalog = .{ .create = try parseCreateSequencePlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("type")) return .{ .catalog_ddl = .{ .enum_type_catalog = .{ .create = try parseCreateEnumTypePlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("schema")) {
-            var create_schema = try parseCreateSchemaNamespacePlanTailAlloc(alloc, tokens, pos);
-            if (create_schema.if_not_exists and std.ascii.eqlIgnoreCase(create_schema.schema_name, "public")) {
-                create_schema.deinit(alloc);
-                return .{ .other_ddl = .{ .adapter_noop = .{ .reason = .schema_namespace } } };
-            }
-            return .{ .catalog_ddl = .{ .schema_namespace_catalog = .{ .create = create_schema } } };
-        }
-        if (cursor.peekKeyword("extension")) {
-            var create_extension = try parseCreateExtensionPlanTailAlloc(alloc, tokens, pos, catalog_resources.default_namespace_name);
-            if (create_extension.if_not_exists and isAdapterNoopExtensionName(create_extension.extension_name)) {
-                create_extension.deinit(alloc);
-                return .{ .other_ddl = .{ .adapter_noop = .{ .reason = .extension } } };
-            }
-            return .{ .extension = .{ .create = create_extension } };
-        }
-        if (cursor.peekKeyword("function") or cursor.peekKeyword("procedure")) return .{ .routine = .{ .function_catalog = .{ .create = try parseCreateRoutinePlanTailAlloc(alloc, tokens, pos, false) } } };
-        if (isRoleAliasKeywordAt(tokens, pos.*)) return .{ .auth = .{ .authorization_catalog = .{ .create_role = try parseCreateRolePlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("policy")) return .{ .auth = .{ .row_security_catalog = .{ .create_policy = try parseCreateRowSecurityPolicyPlanTailAllocWithOptions(alloc, tokens, pos, options.row_security_policy_options) } } };
-        if (cursor.peekKeyword("database")) return .{ .catalog_ddl = .{ .database_catalog = .{ .create = try parseCreateDatabasePlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("tablespace")) return .{ .catalog_ddl = .{ .tablespace_catalog = .{ .create = try parseCreateTablespacePlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("publication")) return .{ .catalog_ddl = .{ .logical_replication = .{ .publication = .{ .create = try parseCreatePublicationPlanTailAlloc(alloc, tokens, pos) } } } };
-        if (cursor.peekKeyword("subscription")) return .{ .catalog_ddl = .{ .logical_replication = .{ .subscription = .{ .create = try parseCreateSubscriptionPlanTailAlloc(alloc, tokens, pos) } } } };
-        if (cursor.peekKeyword("collation")) return .{ .catalog_ddl = .{ .type_system_catalog = .{ .collation = .{ .create = try parseCreateCollationPlanTailAlloc(alloc, tokens, pos) } } } };
-        if (cursor.peekKeyword("operator")) return .{ .catalog_ddl = .{ .type_system_catalog = .{ .operator = .{ .create = try parseCreateOperatorPlanTailAlloc(alloc, tokens, pos) } } } };
-        if (cursor.peekKeyword("aggregate")) return .{ .catalog_ddl = .{ .type_system_catalog = .{ .aggregate = .{ .create = try parseCreateAggregatePlanTailAlloc(alloc, tokens, pos) } } } };
-        if (cursor.peekKeyword("cast")) return .{ .catalog_ddl = .{ .type_system_catalog = .{ .cast = .{ .create = try parseCreateCastPlanTailAlloc(alloc, tokens, pos) } } } };
-        if (cursor.peekKeyword("temporary") or cursor.peekKeyword("temp") or cursor.peekKeyword("unlogged")) {
-            return .{ .table_ddl = .{ .relation_lifetime = try parseRelationLifetimePlanAlloc(alloc, tokens, pos, options.column_definition_options) } };
-        }
-        const checkpoint = pos.*;
-        if (parseIdentityAllocatorPlanAlloc(alloc, tokens, pos, options.column_definition_options)) |identity| {
-            return .{ .catalog_ddl = .{ .identity_allocator_catalog = identity } };
-        } else |err| switch (err) {
-            error.UnsupportedSqlShape => pos.* = checkpoint,
-            else => return err,
-        }
-        if (parseCreateTablePartitionPlanTailAlloc(alloc, tokens, pos)) |partition| {
-            return .{ .table_ddl = .{ .table_partition_catalog = .{ .create_partition = partition } } };
-        } else |err| switch (err) {
-            error.UnsupportedSqlShape => pos.* = checkpoint,
-            else => return err,
-        }
-        if (parseCreatePartitionedTablePlanAlloc(alloc, tokens, pos, options.column_definition_options)) |partitioned| {
-            return .{ .table_ddl = .{ .table_partition_catalog = .{ .create_partitioned = partitioned } } };
-        } else |err| switch (err) {
-            error.UnsupportedSqlShape => pos.* = checkpoint,
-            else => return err,
-        }
-        if (parseCreateTableClonePlanTailAlloc(alloc, tokens, pos)) |table_clone| {
-            return .{ .table_ddl = .{ .table_clone = table_clone } };
-        } else |err| switch (err) {
-            error.UnsupportedSqlShape => pos.* = checkpoint,
-            else => return err,
-        }
-        return .{ .table_ddl = .{ .create_table = try parseCreateTablePlanAlloc(alloc, tokens, pos, options.column_definition_options) } };
-    }
-    if (cursor.matchKeyword("alter")) {
-        if (cursor.peekKeyword("default")) return .{ .auth = .{ .authorization_catalog = .{ .alter_default_privileges = try parseDefaultPrivilegeChangePlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("graph")) return .{ .table_ddl = .{ .create_index = try parseAlterGraphIndexAddMetricPlanAlloc(alloc, tokens, pos) } };
-        if (cursor.peekKeyword("domain")) return .{ .catalog_ddl = .{ .domain_catalog = .{ .alter = try parseAlterDomainPlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("sequence")) return .{ .catalog_ddl = .{ .sequence_catalog = .{ .alter = try parseAlterSequencePlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("type")) return .{ .catalog_ddl = .{ .enum_type_catalog = .{ .add_value = try parseAlterEnumTypePlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("extension")) return .{ .extension = .{ .update = try parseUpdateExtensionPlanTailAlloc(alloc, tokens, pos) } };
-        if (cursor.peekKeyword("schema")) return .{ .catalog_ddl = .{ .schema_namespace_catalog = .{ .rename = try parseRenameSchemaNamespacePlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("database")) return .{ .catalog_ddl = .{ .database_catalog = .{ .alter = try parseAlterDatabasePlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("tablespace")) return .{ .catalog_ddl = .{ .tablespace_catalog = .{ .rename = try parseRenameTablespacePlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("publication")) return .{ .catalog_ddl = .{ .logical_replication = .{ .publication = .{ .alter = try parseAlterPublicationPlanTailAlloc(alloc, tokens, pos) } } } };
-        if (cursor.peekKeyword("subscription")) return .{ .catalog_ddl = .{ .logical_replication = .{ .subscription = .{ .alter = try parseAlterSubscriptionPlanTailAlloc(alloc, tokens, pos) } } } };
-        if (cursor.peekKeyword("collation")) return .{ .catalog_ddl = .{ .type_system_catalog = .{ .collation = .{ .rename = try parseRenameCollationPlanTailAlloc(alloc, tokens, pos) } } } };
-        if (cursor.peekKeyword("view")) return .{ .table_ddl = .{ .view_catalog = .{ .rename = try parseRenameViewPlanTailAlloc(alloc, tokens, pos) } } };
-        if (isRoleAliasKeywordAt(tokens, pos.*)) return .{ .auth = .{ .authorization_catalog = .{ .alter_role = try parseAlterRolePlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("policy")) return .{ .auth = .{ .row_security_catalog = .{ .alter_policy = try parseAlterRowSecurityPolicyPlanTailAllocWithOptions(alloc, tokens, pos, options.row_security_policy_options) } } };
-        if (cursor.peekKeyword("table")) {
-            const checkpoint = pos.*;
-            if (parseAlterRowSecurityPlanTailAlloc(alloc, tokens, pos)) |row_security| {
-                return .{ .auth = .{ .row_security_catalog = .{ .alter_table = row_security } } };
-            } else |err| switch (err) {
-                error.UnsupportedSqlShape => pos.* = checkpoint,
-                else => return err,
-            }
-        }
-        if (cursor.peekKeyword("table")) {
-            const checkpoint = pos.*;
-            if (parseAlterTablePartitionPlanTailAlloc(alloc, tokens, pos)) |partition| {
-                return .{ .table_ddl = .{ .table_partition_catalog = partition } };
-            } else |err| switch (err) {
-                error.UnsupportedSqlShape => pos.* = checkpoint,
-                else => return err,
-            }
-        }
-        return .{ .table_ddl = .{ .alter_table = try parseAlterTablePlanAlloc(alloc, tokens, pos, options.column_definition_options) } };
-    }
-    if (cursor.matchKeyword("drop")) {
-        if (cursor.peekKeyword("materialized")) return .{ .table_ddl = .{ .materialized_view_catalog = .{ .drop = try parseDropMaterializedViewPlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("view")) return .{ .table_ddl = .{ .view_catalog = .{ .drop = try parseDropViewPlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("domain")) return .{ .catalog_ddl = .{ .domain_catalog = .{ .drop = try parseDropDomainPlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("sequence")) return .{ .catalog_ddl = .{ .sequence_catalog = .{ .drop = try parseDropSequencePlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("type")) return .{ .catalog_ddl = .{ .enum_type_catalog = .{ .drop = try parseDropEnumTypePlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("schema")) return .{ .catalog_ddl = .{ .schema_namespace_catalog = .{ .drop = try parseDropSchemaNamespacePlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("extension")) return .{ .extension = .{ .drop = try parseDropExtensionPlanTailAlloc(alloc, tokens, pos) } };
-        if (cursor.peekKeyword("database")) return .{ .catalog_ddl = .{ .database_catalog = .{ .drop = try parseDropDatabasePlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("tablespace")) return .{ .catalog_ddl = .{ .tablespace_catalog = .{ .drop = try parseDropTablespacePlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("publication")) return .{ .catalog_ddl = .{ .logical_replication = .{ .publication = .{ .drop = try parseDropPublicationPlanTailAlloc(alloc, tokens, pos) } } } };
-        if (cursor.peekKeyword("subscription")) return .{ .catalog_ddl = .{ .logical_replication = .{ .subscription = .{ .drop = try parseDropSubscriptionPlanTailAlloc(alloc, tokens, pos) } } } };
-        if (cursor.peekKeyword("collation")) return .{ .catalog_ddl = .{ .type_system_catalog = .{ .collation = .{ .drop = try parseDropCollationPlanTailAlloc(alloc, tokens, pos) } } } };
-        if (cursor.peekKeyword("operator")) return .{ .catalog_ddl = .{ .type_system_catalog = .{ .operator = .{ .drop = try parseDropOperatorPlanTailAlloc(alloc, tokens, pos) } } } };
-        if (cursor.peekKeyword("aggregate")) return .{ .catalog_ddl = .{ .type_system_catalog = .{ .aggregate = .{ .drop = try parseDropAggregatePlanTailAlloc(alloc, tokens, pos) } } } };
-        if (cursor.peekKeyword("cast")) return .{ .catalog_ddl = .{ .type_system_catalog = .{ .cast = .{ .drop = try parseDropCastPlanTailAlloc(alloc, tokens, pos) } } } };
-        if (cursor.peekKeyword("function") or cursor.peekKeyword("procedure")) return .{ .routine = .{ .function_catalog = .{ .drop = try parseDropRoutinePlanTailAlloc(alloc, tokens, pos) } } };
-        if (isRoleAliasKeywordAt(tokens, pos.*)) return .{ .auth = .{ .authorization_catalog = .{ .drop_role = try parseDropRolePlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("policy")) return .{ .auth = .{ .row_security_catalog = .{ .drop_policy = try parseDropRowSecurityPolicyPlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("table")) return .{ .table_ddl = .{ .drop_table = try parseDropTablePlanTailAlloc(alloc, tokens, pos) } };
-        if (cursor.peekKeyword("trigger")) return try parseDropTriggerLogicalDdlPlanTailAlloc(alloc, tokens, pos);
-        return .{ .table_ddl = .{ .drop_index = try parseDropIndexPlanTailAlloc(alloc, tokens, pos) } };
-    }
-    if (cursor.matchKeyword("refresh")) return .{ .table_ddl = .{ .materialized_view_catalog = .{ .refresh = try parseRefreshMaterializedViewPlanTailAlloc(alloc, tokens, pos) } } };
-    if (cursor.matchKeyword("listen")) return .{ .notification = .{ .listen = try parseListenNotificationPlanTailAlloc(alloc, tokens, pos) } };
-    if (cursor.matchKeyword("notify")) return .{ .notification = .{ .notify = try parseNotifyNotificationPlanTailAlloc(alloc, tokens, pos) } };
-    if (cursor.matchKeyword("unlisten")) return .{ .notification = .{ .unlisten = try parseUnlistenNotificationPlanTailAlloc(alloc, tokens, pos) } };
-    if (cursor.matchKeyword("reindex")) return .{ .maintenance = .{ .reindex = try parseReindexMaintenancePlanTailAlloc(alloc, tokens, pos) } };
-    if (cursor.matchKeyword("cluster")) return .{ .maintenance = .{ .cluster = try parseClusterMaintenancePlanTailAlloc(alloc, tokens, pos) } };
-    if (cursor.matchKeyword("copy")) {
-        return .{ .bulk_io = try parseBulkIoPlanTailAlloc(
-            alloc,
-            tokens,
-            pos,
-            options.schema,
-            options.field_expression_qualifiers,
-            options.returning_expression_qualifiers,
-            options.defer_row_expression_field_validation,
-        ) };
-    }
-    if (cursor.matchKeyword("prepare")) {
-        if (cursor.peekKeyword("transaction")) return .{ .transaction = .{ .prepared = try grammar.parsePreparedTransactionTailAlloc(alloc, tokens, pos, .prepare) } };
-        return .{ .prepared_statement = .{ .prepare = try parsePrepareStatementPlanTailAlloc(alloc, tokens, pos) } };
-    }
-    if (cursor.matchKeyword("execute")) return .{ .prepared_statement = .{ .execute = try parseExecutePreparedStatementPlanTailAlloc(alloc, tokens, pos) } };
-    if (cursor.matchKeyword("deallocate")) return .{ .prepared_statement = .{ .deallocate = try parseDeallocatePreparedStatementPlanTailAlloc(alloc, tokens, pos) } };
-    if (cursor.matchKeyword("declare")) return .{ .cursor = .{ .declare = try parseDeclareCursorPortalPlanTailAlloc(alloc, tokens, pos) } };
-    if (cursor.matchKeyword("fetch")) return .{ .cursor = .{ .fetch = try parseFetchCursorPortalPlanTailAlloc(alloc, tokens, pos) } };
-    if (cursor.matchKeyword("move")) return .{ .cursor = .{ .move = try parseFetchCursorPortalPlanTailAlloc(alloc, tokens, pos) } };
-    if (cursor.matchKeyword("close")) return .{ .cursor = .{ .close = try parseCloseCursorPortalPlanTailAlloc(alloc, tokens, pos) } };
-    if (cursor.matchKeyword("savepoint")) return .{ .transaction = .{ .savepoint = .{ .savepoint = try parseSavepointTransactionPlanTailAlloc(alloc, tokens, pos) } } };
-    if (cursor.matchKeyword("release")) return .{ .transaction = .{ .savepoint = .{ .release = try parseReleaseSavepointPlanTailAlloc(alloc, tokens, pos) } } };
-    if (cursor.matchKeyword("rollback")) {
-        if (cursor.peekKeyword("prepared")) return .{ .transaction = .{ .prepared = try grammar.parsePreparedTransactionTailAlloc(alloc, tokens, pos, .rollback) } };
-        if (!cursor.peekKeyword("to") and !cursor.peekKeyword("savepoint")) {
-            if (!try grammar.matchAdapterNoopTransactionBoundaryTail(tokens, pos, .{ .work = true, .transaction = true })) return error.UnsupportedSqlShape;
-            return .{ .other_ddl = .{ .adapter_noop = .{ .reason = .transaction_control } } };
-        }
-        return .{ .transaction = .{ .savepoint = .{ .rollback_to = try parseRollbackToSavepointPlanTailAlloc(alloc, tokens, pos) } } };
-    }
-    if (cursor.matchKeyword("commit")) {
-        if (cursor.peekKeyword("prepared")) return .{ .transaction = .{ .prepared = try grammar.parsePreparedTransactionTailAlloc(alloc, tokens, pos, .commit) } };
-        if (!try grammar.matchAdapterNoopTransactionBoundaryTail(tokens, pos, .{ .work = true, .transaction = true })) return error.UnsupportedSqlShape;
-        return .{ .other_ddl = .{ .adapter_noop = .{ .reason = .transaction_control } } };
-    }
-    if (cursor.matchKeyword("comment")) return .{ .catalog_ddl = .{ .comment_metadata = try parseCommentMetadataPlanTailAlloc(alloc, tokens, pos) } };
-    if (cursor.matchKeyword("security")) return .{ .catalog_ddl = .{ .security_label = try parseSecurityLabelPlanTailAlloc(alloc, tokens, pos) } };
-    if (cursor.matchKeyword("grant")) return .{ .auth = .{ .authorization_catalog = try parseAuthorizationCatalogPrivilegeGrantTailAlloc(alloc, tokens, pos) } };
-    if (cursor.matchKeyword("revoke")) return .{ .auth = .{ .authorization_catalog = try parseAuthorizationCatalogPrivilegeRevokeTailAlloc(alloc, tokens, pos) } };
-    if (cursor.matchKeyword("lock")) return .{ .transaction = .{ .control = .{ .table_lock = try parseTableLockPlanTailAlloc(alloc, tokens, pos) } } };
-    if (cursor.matchKeyword("set")) {
-        if (cursor.peekKeyword("constraints")) return .{ .transaction = .{ .control = .{ .constraint_mode = try parseConstraintModePlanTailAlloc(alloc, tokens, pos) } } };
-        if (cursor.peekKeyword("transaction")) return .{ .transaction = .{ .control = .{ .transaction_mode = try parseTransactionModePlanTail(tokens, pos, .set_transaction) } } };
-        if (cursor.peekKeyword("session")) {
-            const checkpoint = pos.*;
-            if (parseSetSessionCharacteristicsPlanTailAlloc(alloc, tokens, pos)) |plan| {
-                return .{ .session = .{ .set_setting = plan } };
-            } else |err| switch (err) {
-                error.UnsupportedSqlShape => pos.* = checkpoint,
-                else => return err,
-            }
-        }
-        if (cursor.peekKeyword("local") or cursor.peekKeyword("session") or cursor.peekKeyword("search_path")) {
-            const checkpoint = pos.*;
-            if (parseSetSearchPathPlanTailAlloc(alloc, tokens, pos)) |plan| {
-                return .{ .session = .{ .set_search_path = plan } };
-            } else |err| switch (err) {
-                error.UnsupportedSqlShape => pos.* = checkpoint,
-                else => return err,
-            }
-        }
-        {
-            const checkpoint = pos.*;
-            if (grammar.parseSetSessionSettingTailAlloc(alloc, tokens, pos)) |plan| {
-                return .{ .session = .{ .set_setting = plan } };
-            } else |err| switch (err) {
-                error.UnsupportedSqlShape => pos.* = checkpoint,
-                else => return err,
-            }
-        }
-        try grammar.parseAdapterNoopSetStatementTail(tokens, pos);
-        return .{ .other_ddl = .{ .adapter_noop = .{ .reason = .session_setting } } };
-    }
-    if (cursor.matchKeyword("reset")) {
-        if (cursor.peekKeyword("search_path")) {
-            try grammar.parseResetSearchPathTail(tokens, pos);
-            return .{ .session = .reset_search_path };
-        }
-        if (cursor.peekKeyword("all")) {
-            try grammar.parseAdapterNoopResetStatementTail(tokens, pos);
-            return .{ .session = .discard_all };
-        }
-        {
-            const checkpoint = pos.*;
-            if (grammar.parseResetSessionSettingTailAlloc(alloc, tokens, pos)) |plan| {
-                return .{ .session = .{ .reset_setting = plan } };
-            } else |err| switch (err) {
-                error.UnsupportedSqlShape => pos.* = checkpoint,
-                else => return err,
-            }
-        }
-        try grammar.parseAdapterNoopResetStatementTail(tokens, pos);
-        return .{ .other_ddl = .{ .adapter_noop = .{ .reason = .session_setting } } };
-    }
-    if (cursor.matchKeyword("show")) {
-        if (cursor.peekKeyword("search_path")) {
-            try grammar.parseShowSearchPathTail(tokens, pos);
-            return .{ .session = .show_search_path };
-        }
-        try grammar.parseAdapterNoopShowStatementTail(tokens, pos);
-        return .{ .other_ddl = .{ .adapter_noop = .{ .reason = .session_setting } } };
-    }
-    if (cursor.matchKeyword("discard")) {
-        try grammar.parseDiscardAllTail(tokens, pos);
-        return .{ .session = .discard_all };
-    }
-    if (cursor.matchKeyword("start")) {
-        const checkpoint = pos.*;
-        if (cursor.matchKeyword("transaction") and try grammar.matchAdapterNoopTransactionBoundaryTail(tokens, pos, .{})) {
-            return .{ .other_ddl = .{ .adapter_noop = .{ .reason = .transaction_control } } };
-        }
-        pos.* = checkpoint;
-        return .{ .transaction = .{ .control = .{ .transaction_mode = try parseTransactionModePlanTail(tokens, pos, .start_transaction) } } };
-    }
-    if (cursor.matchKeyword("begin")) {
-        if (try grammar.matchAdapterNoopTransactionBoundaryTail(tokens, pos, .{ .work = true, .transaction = true })) {
-            return .{ .other_ddl = .{ .adapter_noop = .{ .reason = .transaction_control } } };
-        }
-        return .{ .transaction = .{ .control = .{ .transaction_mode = try parseTransactionModePlanTail(tokens, pos, .begin) } } };
-    }
-    if (cursor.matchKeyword("select")) return .{ .transaction = .{ .control = .{ .advisory_lock = try parseAdvisoryLockPlanTail(tokens, pos) } } };
-    return error.UnsupportedSqlShape;
-}
-
 pub const RelationLifetimePlan = struct {
     kind: RelationLifetimeKind,
     create_table: CreateTablePlan,
@@ -17482,7 +17199,7 @@ pub fn parseLogicalDdlPlanAlloc(
         const generated_ast = try generatedAstOrUnsupported(generated_statement);
         return try planGeneratedLogicalDdlAstAlloc(alloc, parsed_sql, tokens, &state, generated_statement, generated_ast, options);
     }
-    return try parseLogicalDdlPlanTokensAlloc(alloc, tokens, &state.pos, options);
+    return error.UnsupportedSqlShape;
 }
 
 fn generatedAstOrUnsupported(generated_statement: tokenized.GeneratedRawSqlStatement) !generated_parser.GeneratedSqlAst {
@@ -26097,6 +25814,33 @@ fn generatedDdlCompatibleAst(ast: generated_parser.GeneratedSqlAst) !generated_p
         .extension_index => |ddl| ddl,
         else => error.UnsupportedSqlShape,
     };
+}
+
+test "sql adapter ddl plan rejects scalar subquery defaults before expression fallback" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{
+        "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text DEFAULT (SELECT status FROM usage_records LIMIT 1));",
+        "ALTER TABLE usage_records ALTER COLUMN status SET DEFAULT (SELECT status FROM usage_records LIMIT 1);",
+    };
+
+    for (cases) |sql| {
+        if (legacyDdlParserPlanForTestAlloc(alloc, sql)) |plan| {
+            var mutable_plan = plan;
+            mutable_plan.deinit(alloc);
+            return error.TestUnexpectedResult;
+        } else |err| switch (err) {
+            error.UnsupportedSqlShape, error.UnexpectedToken => {},
+            else => return err,
+        }
+        if (generatedDdlPlanForTestAlloc(alloc, sql)) |plan| {
+            var mutable_plan = plan;
+            mutable_plan.deinit(alloc);
+            return error.TestUnexpectedResult;
+        } else |err| switch (err) {
+            error.UnsupportedSqlShape, error.UnexpectedToken => {},
+            else => return err,
+        }
+    }
 }
 
 const GeneratedUnsupportedTriggerAstMutation = enum {

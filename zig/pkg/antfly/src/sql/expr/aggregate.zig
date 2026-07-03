@@ -2428,6 +2428,14 @@ pub fn modeCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec)
     return count;
 }
 
+pub fn argumentOrderCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
+    var count: usize = 0;
+    for (aggregations) |aggregation| {
+        if (aggregation.array_order_by.len > 0) count += 1;
+    }
+    return count;
+}
+
 pub fn validateGroupBy(
     group_fields: []const []const u8,
     group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
@@ -3080,6 +3088,13 @@ test "sql expr_aggregate validates output type and filter ownership" {
     try std.testing.expectEqual(@as(usize, 1), descendingPercentileCount(&percentile_specs));
     try std.testing.expectEqual(@as(usize, 1), percentileArrayCount(&percentile_specs));
     try std.testing.expectEqual(@as(usize, 1), modeCount(&percentile_specs));
+    const ordered_specs = [_]db_mod.types.RelationalRowsAggregateSpec{.{
+        .name = "statuses",
+        .op = .string_agg,
+        .field = "status",
+        .array_order_by = &.{.{ .field = "created_at", .direction = .desc }},
+    }};
+    try std.testing.expectEqual(@as(usize, 1), argumentOrderCount(&ordered_specs));
 
     const schema = runtime_schema.TableSchema{
         .storage_mode = .relational,

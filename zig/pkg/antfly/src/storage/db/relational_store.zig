@@ -6089,6 +6089,50 @@ pub fn scanArrayElementDocKeysAlloc(
     return try out.toOwnedSlice(alloc);
 }
 
+pub fn scanArrayElementTermRangeDocKeysAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    column_path: []const u8,
+    min: ?[]const u8,
+    max: ?[]const u8,
+    inclusive_min: bool,
+    inclusive_max: bool,
+    collation: ?[]const u8,
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+) ![][]u8 {
+    const lower_doc_bound = try internal_keys.documentRangeLowerAlloc(alloc, lower_doc_key);
+    defer alloc.free(lower_doc_bound);
+    const upper_doc_bound = try internal_keys.documentRangeUpperAlloc(alloc, upper_doc_key);
+    defer if (upper_doc_bound) |buf| alloc.free(buf);
+
+    const lower = try internal_keys.relationalArrayElementIndexColumnPrefixAlloc(alloc, column_path);
+    defer alloc.free(lower);
+    const upper = try nextPrefixAlloc(alloc, lower);
+    defer if (upper) |buf| alloc.free(buf);
+
+    const scanned = try store.scanRange(alloc, lower, if (upper) |buf| buf else "");
+    defer docstore_mod.DocStore.freeResults(alloc, scanned);
+
+    var out = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (out.items) |doc_key| alloc.free(doc_key);
+        out.deinit(alloc);
+    }
+
+    for (scanned) |entry| {
+        var decoded = (try internal_keys.decodeRelationalArrayElementIndexKeyAlloc(alloc, entry.key)) orelse continue;
+        defer decoded.deinit(alloc);
+        if (!std.mem.eql(u8, decoded.column_path, column_path)) continue;
+        if (!try arrayElementIndexKeyStringInRange(alloc, decoded.element_key, min, max, inclusive_min, inclusive_max, collation)) continue;
+        if (!(try docKeyFallsInRange(alloc, decoded.doc_key, lower_doc_bound, upper_doc_bound))) continue;
+        if (!try currentRowHasArrayElementTermRange(alloc, store, decoded.doc_key, column_path, min, max, inclusive_min, inclusive_max, collation)) continue;
+        try appendUniqueDocKeyAlloc(alloc, &out, decoded.doc_key);
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
 pub fn scanArrayValueDocKeysAlloc(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
@@ -6129,6 +6173,13 @@ pub fn scanArrayValueDocKeysAlloc(
     return try out.toOwnedSlice(alloc);
 }
 
+fn appendUniqueDocKeyAlloc(alloc: Allocator, out: *std.ArrayListUnmanaged([]u8), doc_key: []const u8) !void {
+    for (out.items) |existing| {
+        if (std.mem.eql(u8, existing, doc_key)) return;
+    }
+    try out.append(alloc, try alloc.dupe(u8, doc_key));
+}
+
 fn currentRowHasArrayElementKey(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
@@ -6149,6 +6200,83 @@ fn currentRowHasArrayElementKey(
         if (std.mem.eql(u8, item_key, element_key)) return true;
     }
     return false;
+}
+
+fn currentRowHasArrayElementTermRange(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    doc_key: []const u8,
+    column_path: []const u8,
+    min: ?[]const u8,
+    max: ?[]const u8,
+    inclusive_min: bool,
+    inclusive_max: bool,
+    collation: ?[]const u8,
+) !bool {
+    const raw_row = try getRawAlloc(alloc, store, doc_key) orelse return false;
+    defer alloc.free(raw_row);
+    const cell = (try relational_row_codec.findCellByPath(raw_row, column_path)) orelse return false;
+    const value = OwnedColumnValue{
+        .doc_key = @constCast(doc_key),
+        .value_type = cell.value_type,
+        .is_json = cell.is_json,
+        .value = cell.value,
+    };
+    return try arrayColumnValueContainsTermRange(alloc, value, min, max, inclusive_min, inclusive_max, collation);
+}
+
+pub fn arrayColumnValueContainsTermRange(
+    alloc: Allocator,
+    value: OwnedColumnValue,
+    min: ?[]const u8,
+    max: ?[]const u8,
+    inclusive_min: bool,
+    inclusive_max: bool,
+    collation: ?[]const u8,
+) !bool {
+    if (value.value_type != .bytes_val or !value.is_json) return false;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value.value.bytes_val, .{});
+    defer parsed.deinit();
+    if (parsed.value != .array) return false;
+    for (parsed.value.array.items) |item| {
+        if (item != .string) continue;
+        if (stringInTermRange(item.string, min, max, inclusive_min, inclusive_max, collation)) return true;
+    }
+    return false;
+}
+
+fn arrayElementIndexKeyStringInRange(
+    alloc: Allocator,
+    element_key: []const u8,
+    min: ?[]const u8,
+    max: ?[]const u8,
+    inclusive_min: bool,
+    inclusive_max: bool,
+    collation: ?[]const u8,
+) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, element_key, .{});
+    defer parsed.deinit();
+    if (parsed.value != .string) return false;
+    return stringInTermRange(parsed.value.string, min, max, inclusive_min, inclusive_max, collation);
+}
+
+fn stringInTermRange(
+    value: []const u8,
+    min: ?[]const u8,
+    max: ?[]const u8,
+    inclusive_min: bool,
+    inclusive_max: bool,
+    collation: ?[]const u8,
+) bool {
+    const above_min = if (min) |lower| blk: {
+        const comparison = relational_collation.compareTextForScalar(value, lower, collation);
+        break :blk comparison == .gt or (inclusive_min and comparison == .eq);
+    } else true;
+    const below_max = if (max) |upper| blk: {
+        const comparison = relational_collation.compareTextForScalar(value, upper, collation);
+        break :blk comparison == .lt or (inclusive_max and comparison == .eq);
+    } else true;
+    return above_min and below_max;
 }
 
 fn currentRowArrayValueEquals(

@@ -2521,12 +2521,12 @@ fn searchQueryCanUseSnapshot(
         .bool_field => |item| try snapshot.hasInvertedField(item.field),
         .geo_distance => |item| try snapshot.hasInvertedField(item.field),
         .geo_bbox => |item| try snapshot.hasInvertedField(item.field),
-        .term_range => |item| try snapshot.hasInvertedField(item.field),
+        .term_range => |item| !queryFieldIsArray(item.field, runtime_schema) and try snapshot.hasInvertedField(item.field),
         .ip_range => |item| try snapshot.hasInvertedField(item.field),
         .geo_shape => |item| try snapshot.hasInvertedField(item.field),
-        .prefix => |item| try snapshot.hasInvertedField(item.field),
-        .wildcard => |item| try snapshot.hasInvertedField(item.field),
-        .regexp => |item| try snapshot.hasInvertedField(item.field),
+        .prefix => |item| !queryFieldIsArray(item.field, runtime_schema) and try snapshot.hasInvertedField(item.field),
+        .wildcard => |item| !queryFieldIsArray(item.field, runtime_schema) and try snapshot.hasInvertedField(item.field),
+        .regexp => |item| !queryFieldIsArray(item.field, runtime_schema) and try snapshot.hasInvertedField(item.field),
         .bool_query => |item| {
             for (item.must) |child| {
                 if (!(try searchQueryCanUseSnapshot(snapshot, child, text_analysis, runtime_schema))) return false;
@@ -2540,6 +2540,20 @@ fn searchQueryCanUseSnapshot(
             return true;
         },
     };
+}
+
+fn queryFieldIsArray(field: []const u8, runtime_schema: ?runtime_schema_mod.TableSchema) bool {
+    const schema = runtime_schema orelse return false;
+    if (runtime_schema_mod.resolveFieldType(schema, field)) |mapping| {
+        if (mapping.field_type == .array) return true;
+    }
+    const field_name = fieldNameFromPath(field);
+    if (!std.mem.eql(u8, field_name, field)) {
+        if (runtime_schema_mod.resolveFieldType(schema, field_name)) |mapping| {
+            if (mapping.field_type == .array) return true;
+        }
+    }
+    return false;
 }
 
 fn queryFieldUsesKeywordAnalyzer(

@@ -349,10 +349,12 @@ pub fn knownErrorDiagnostic(phase: SqlDiagnosticPhase, err: anyerror) ?SqlDiagno
 
 pub const SqlAdapterClassificationReason = enum {
     aggregate_duplicate_output_name,
+    backup_lifecycle_sql_unavailable,
     bulk_io_plan,
     conversion_catalog_plan,
     cte_body_join_plan,
     cte_mutation_source_plan,
+    default_scalar_subquery_plan,
     document_sql_bounded_scan_incomplete_topk,
     document_sql_bounded_scan_missing_exact_producer,
     document_sql_bounded_scan_unbounded_source,
@@ -416,6 +418,7 @@ pub const SqlAdapterClassificationReason = enum {
     routine_body_plan,
     routine_option_plan,
     set_operation_output_shape,
+    row_batch_scalar_subquery_plan,
     row_rewrite_expression_plan,
     row_lock_mode_plan,
     schema_namespace,
@@ -461,6 +464,8 @@ pub fn classificationReasonIsExpressionStructural(reason: SqlAdapterClassificati
         .document_sql_bounded_scan_unsupported_residual,
         .document_sql_write_returning_expression_unsupported,
         .invalid_expression_conflict_target,
+        .default_scalar_subquery_plan,
+        .row_batch_scalar_subquery_plan,
         .row_rewrite_expression_plan,
         .subquery_expression_plan,
         .subquery_quantified_plan,
@@ -493,6 +498,7 @@ pub fn classificationReasonIsUnsupportedRequirement(reason: SqlAdapterClassifica
 
 pub const NativeRequirementCategory = enum {
     auth_row_filter,
+    backup_lifecycle,
     bulk_io_route,
     catalog_lifecycle,
     conflict_target_validation,
@@ -519,8 +525,10 @@ pub const NativeExecutionRequirement = struct {
 
 pub fn nativeExecutionRequirement(reason: SqlAdapterClassificationReason) NativeExecutionRequirement {
     return switch (reason) {
+        .backup_lifecycle_sql_unavailable => .{ .category = .backup_lifecycle, .durable_metadata = true, .coordinator_recovery = true, .auth_and_audit = true },
         .bulk_io_plan => .{ .category = .bulk_io_route, .auth_and_audit = true },
         .cte_body_join_plan, .cte_mutation_source_plan => .{ .category = .stream_materialization, .materialization = true },
+        .default_scalar_subquery_plan => .{ .category = .stream_materialization, .materialization = true, .spill = true, .backpressure = true },
         .document_sql_bounded_scan_incomplete_topk => .{ .category = .stream_materialization },
         .document_sql_bounded_scan_missing_exact_producer => .{ .category = .stream_materialization },
         .document_sql_bounded_scan_unbounded_source => .{ .category = .stream_materialization },
@@ -603,6 +611,7 @@ pub fn nativeExecutionRequirement(reason: SqlAdapterClassificationReason) Native
         .multi_table_generation_barrier => .{ .category = .catalog_lifecycle, .durable_metadata = true },
         .prepared_transaction_plan => .{ .category = .prepared_transaction_recovery, .coordinator_recovery = true },
         .recursive_cte_stream_plan,
+        .row_batch_scalar_subquery_plan,
         .set_operation_plan,
         .subquery_expression_plan,
         .subquery_quantified_plan,
@@ -631,6 +640,7 @@ pub fn nativeExecutionRequirement(reason: SqlAdapterClassificationReason) Native
 }
 
 test "sql adapter diagnostics accept only stable known classification reasons" {
+    try std.testing.expectEqual(SqlAdapterClassificationReason.backup_lifecycle_sql_unavailable, classificationReasonFromToken("backup_lifecycle_sql_unavailable").?);
     try std.testing.expect(classificationReasonTokenIsKnown("set_operation_plan"));
     try std.testing.expect(classificationReasonTokenIsKnown("set_operation_output_shape"));
     try std.testing.expect(classificationReasonTokenIsKnown("set_operation_source_schema"));
@@ -638,6 +648,7 @@ test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expectEqual(SqlAdapterClassificationReason.conversion_catalog_plan, classificationReasonFromToken("conversion_catalog_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.cte_body_join_plan, classificationReasonFromToken("cte_body_join_plan").?);
     try std.testing.expect(classificationReasonTokenIsKnown("cte_mutation_source_plan"));
+    try std.testing.expectEqual(SqlAdapterClassificationReason.default_scalar_subquery_plan, classificationReasonFromToken("default_scalar_subquery_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_bounded_scan_incomplete_topk, classificationReasonFromToken("document_sql_bounded_scan_incomplete_topk").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_bounded_scan_missing_exact_producer, classificationReasonFromToken("document_sql_bounded_scan_missing_exact_producer").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_bounded_scan_unbounded_source, classificationReasonFromToken("document_sql_bounded_scan_unbounded_source").?);
@@ -686,6 +697,7 @@ test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expectEqual(SqlAdapterClassificationReason.rule_catalog_plan, classificationReasonFromToken("rule_catalog_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.routine_body_plan, classificationReasonFromToken("routine_body_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.routine_option_plan, classificationReasonFromToken("routine_option_plan").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.row_batch_scalar_subquery_plan, classificationReasonFromToken("row_batch_scalar_subquery_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.row_lock_mode_plan, classificationReasonFromToken("row_lock_mode_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.row_rewrite_expression_plan, classificationReasonFromToken("row_rewrite_expression_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.statistics_catalog_plan, classificationReasonFromToken("statistics_catalog_plan").?);
@@ -712,7 +724,9 @@ test "sql adapter diagnostics keep unsupported expression classifications struct
     const reasons = [_]SqlAdapterClassificationReason{
         .document_sql_bounded_scan_unsupported_residual,
         .document_sql_write_returning_expression_unsupported,
+        .default_scalar_subquery_plan,
         .invalid_expression_conflict_target,
+        .row_batch_scalar_subquery_plan,
         .row_rewrite_expression_plan,
         .subquery_expression_plan,
         .subquery_quantified_plan,
@@ -758,6 +772,12 @@ test "sql adapter diagnostics map unsupported classifications to native requirem
     const bulk = nativeExecutionRequirement(.bulk_io_plan);
     try std.testing.expectEqual(NativeRequirementCategory.bulk_io_route, bulk.category);
     try std.testing.expect(bulk.auth_and_audit);
+
+    const backup = nativeExecutionRequirement(.backup_lifecycle_sql_unavailable);
+    try std.testing.expectEqual(NativeRequirementCategory.backup_lifecycle, backup.category);
+    try std.testing.expect(backup.durable_metadata);
+    try std.testing.expect(backup.coordinator_recovery);
+    try std.testing.expect(backup.auth_and_audit);
 
     const prepared = nativeExecutionRequirement(.prepared_transaction_plan);
     try std.testing.expectEqual(NativeRequirementCategory.prepared_transaction_recovery, prepared.category);

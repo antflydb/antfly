@@ -1221,15 +1221,41 @@ fn projectedExpressionColumnAlloc(
     type_context: expr_type.RowExpressionTypeContext,
     output_name: []const u8,
     expression: db_mod.types.RelationalRowsExpression,
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
 ) !runtime_schema.RelationalColumn {
+    var type_context_with_hidden = type_context;
+    var synthetic_columns: []runtime_schema.RelationalColumn = &.{};
+    defer alloc.free(synthetic_columns);
+    var hidden_count: usize = 0;
+    for (scalar_subqueries) |projection| {
+        if (projection.hidden) hidden_count += 1;
+    }
+    if (hidden_count > 0) {
+        synthetic_columns = try alloc.alloc(runtime_schema.RelationalColumn, type_context.schema.relational_columns.len + hidden_count);
+        @memcpy(synthetic_columns[0..type_context.schema.relational_columns.len], type_context.schema.relational_columns);
+        var index = type_context.schema.relational_columns.len;
+        for (scalar_subqueries) |projection| {
+            if (!projection.hidden) continue;
+            const source = binder.relationalColumnForField(type_context.schema, projection.output_field, null);
+            synthetic_columns[index] = .{
+                .name = projection.output,
+                .path = projection.output,
+                .field_type = if (source) |column| column.field_type else .json,
+                .array_item_type = if (source) |column| column.array_item_type else null,
+            };
+            index += 1;
+        }
+        type_context_with_hidden.schema.relational_columns = synthetic_columns;
+    }
+
     if (expression.kind == .field) {
-        if (binder.relationalColumnForField(type_context.schemaForRowExpressionField(expression), expression.field, null)) |source| {
+        if (binder.relationalColumnForField(type_context_with_hidden.schemaForRowExpressionField(expression), expression.field, null)) |source| {
             return try projectedSourceColumnAlloc(alloc, output_name, source);
         }
-        if (!type_context.defer_row_expression_field_validation) return error.InvalidSqlCatalog;
+        if (!type_context_with_hidden.defer_row_expression_field_validation) return error.InvalidSqlCatalog;
     }
-    const field_type = try type_context.rowExpressionOutputType(expression);
-    const array_item_type = try type_context.rowExpressionOutputArrayItemType(expression);
+    const field_type = try type_context_with_hidden.rowExpressionOutputType(expression);
+    const array_item_type = try type_context_with_hidden.rowExpressionOutputArrayItemType(expression);
     return try projectedColumnAlloc(alloc, output_name, field_type, array_item_type, true);
 }
 
@@ -1315,7 +1341,7 @@ fn selectOutputColumnAlloc(
         .expression => blk: {
             if (output.index >= select.expressions.len) return error.UnsupportedSqlShape;
             const projection = select.expressions[output.index];
-            break :blk try projectedExpressionColumnAlloc(alloc, type_context, projection.output, projection.expression);
+            break :blk try projectedExpressionColumnAlloc(alloc, type_context, projection.output, projection.expression, select.scalar_subqueries);
         },
         .scalar_subquery => blk: {
             if (output.index >= select.scalar_subqueries.len) return error.UnsupportedSqlShape;

@@ -62,6 +62,7 @@ pub const DocumentSqlVirtualField = struct {
     field_type: ?runtime_schema.AntflyType = null,
     array_item_type: ?runtime_schema.AntflyType = null,
     nullable: ?bool = null,
+    unique: bool = false,
 };
 
 pub const DocumentSqlTypedPath = struct {
@@ -1094,7 +1095,7 @@ fn appendDocumentSqlVirtualFieldFromViewMappingNamedFieldValue(
     if (value == .string) {
         const path = try documentSqlViewMappingPathAlloc(alloc, value.string);
         defer alloc.free(path);
-        try appendDocumentSqlViewMappingVirtualFieldAlloc(alloc, fields, name, path, null, null, null);
+        try appendDocumentSqlViewMappingVirtualFieldAlloc(alloc, fields, name, path, null, null, null, false);
         return;
     }
     if (value != .object) return error.InvalidSqlCatalog;
@@ -1104,7 +1105,8 @@ fn appendDocumentSqlVirtualFieldFromViewMappingNamedFieldValue(
     const field_type = try documentSqlFieldTypeFromViewMappingFieldValue(value);
     const array_item_type = try documentSqlArrayItemTypeFromViewMappingFieldValue(value);
     const nullable = try documentSqlOptionalBoolField(value, "nullable");
-    try appendDocumentSqlViewMappingVirtualFieldAlloc(alloc, fields, name, path, field_type, array_item_type, nullable);
+    const unique = (try documentSqlOptionalBoolField(value, "unique")) orelse false;
+    try appendDocumentSqlViewMappingVirtualFieldAlloc(alloc, fields, name, path, field_type, array_item_type, nullable, unique);
 }
 
 fn appendDocumentSqlVirtualFieldFromViewMappingFieldValue(
@@ -1120,7 +1122,8 @@ fn appendDocumentSqlVirtualFieldFromViewMappingFieldValue(
     const field_type = try documentSqlFieldTypeFromViewMappingFieldValue(value);
     const array_item_type = try documentSqlArrayItemTypeFromViewMappingFieldValue(value);
     const nullable = try documentSqlOptionalBoolField(value, "nullable");
-    try appendDocumentSqlViewMappingVirtualFieldAlloc(alloc, fields, name, path, field_type, array_item_type, nullable);
+    const unique = (try documentSqlOptionalBoolField(value, "unique")) orelse false;
+    try appendDocumentSqlViewMappingVirtualFieldAlloc(alloc, fields, name, path, field_type, array_item_type, nullable, unique);
 }
 
 fn appendDocumentSqlVirtualFieldsFromPathValue(
@@ -1438,6 +1441,7 @@ fn appendDocumentSqlViewMappingVirtualFieldAlloc(
     field_type: ?runtime_schema.AntflyType,
     array_item_type: ?runtime_schema.AntflyType,
     nullable: ?bool,
+    unique: bool,
 ) !void {
     if (documentSqlDeclaredVirtualFieldCanBecomeViewMapping(fields, name, path, field_type, array_item_type, nullable)) |index| {
         if (!std.mem.eql(u8, fields.items[index].path, path)) {
@@ -1449,10 +1453,11 @@ fn appendDocumentSqlViewMappingVirtualFieldAlloc(
         if (field_type) |field_type_value| fields.items[index].field_type = field_type_value;
         if (array_item_type) |array_item_type_value| fields.items[index].array_item_type = array_item_type_value;
         if (nullable) |nullable_value| fields.items[index].nullable = nullable_value;
+        fields.items[index].unique = fields.items[index].unique or unique;
         return;
     }
     if (documentSqlVirtualFieldNameExists(fields.*, name)) return error.InvalidSqlCatalog;
-    try appendDocumentSqlVirtualFieldWithNullabilityAlloc(alloc, fields, name, path, .view_mapping, field_type, array_item_type, nullable);
+    try appendDocumentSqlVirtualFieldWithMetadataAlloc(alloc, fields, name, path, .view_mapping, field_type, array_item_type, nullable, unique);
 }
 
 fn documentSqlDeclaredVirtualFieldCanBecomeViewMapping(
@@ -1491,6 +1496,20 @@ fn appendDocumentSqlVirtualFieldWithNullabilityAlloc(
     array_item_type: ?runtime_schema.AntflyType,
     nullable: ?bool,
 ) !void {
+    try appendDocumentSqlVirtualFieldWithMetadataAlloc(alloc, fields, name, path, source, field_type, array_item_type, nullable, false);
+}
+
+fn appendDocumentSqlVirtualFieldWithMetadataAlloc(
+    alloc: std.mem.Allocator,
+    fields: *std.ArrayListUnmanaged(DocumentSqlVirtualField),
+    name: []const u8,
+    path: []const u8,
+    source: DocumentSqlVirtualFieldSource,
+    field_type: ?runtime_schema.AntflyType,
+    array_item_type: ?runtime_schema.AntflyType,
+    nullable: ?bool,
+    unique: bool,
+) !void {
     if (name.len == 0 or path.len == 0) return error.InvalidSqlCatalog;
     for (fields.items) |existing| {
         if (std.ascii.eqlIgnoreCase(existing.name, name)) return;
@@ -1506,6 +1525,7 @@ fn appendDocumentSqlVirtualFieldWithNullabilityAlloc(
         .field_type = field_type,
         .array_item_type = array_item_type,
         .nullable = nullable,
+        .unique = unique,
     });
 }
 
@@ -2267,7 +2287,7 @@ test "source binding classifies relational document and lake schemas" {
     var view_mapping_virtual_schema = try documentSqlSchemaForRuntimeSchemaAndIndexesJsonAlloc(
         alloc,
         unavailable_schema,
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"title_text\",\"path\":\"title\",\"type\":\"text\"},{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\",\"nullable\":false},{\"name\":\"region\",\"path\":\"metadata.region\",\"type\":\"keyword\",\"nullable\":true},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\",\"nullable\":true},{\"name\":\"published\",\"path\":\"published\",\"type\":\"boolean\",\"nullable\":true},{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}}}",
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"title_text\",\"path\":\"title\",\"type\":\"text\"},{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\",\"nullable\":false,\"unique\":true},{\"name\":\"region\",\"path\":\"metadata.region\",\"type\":\"keyword\",\"nullable\":true},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\",\"nullable\":true},{\"name\":\"published\",\"path\":\"published\",\"type\":\"boolean\",\"nullable\":true},{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}}}",
     );
     defer deinitDocumentSqlSchema(alloc, &view_mapping_virtual_schema);
     try std.testing.expectEqual(@as(usize, 8), view_mapping_virtual_schema.fields.len);
@@ -2302,6 +2322,7 @@ test "source binding classifies relational document and lake schemas" {
             try std.testing.expectEqualStrings("/metadata/plan", field.path);
             try std.testing.expectEqual(runtime_schema.AntflyType.keyword, field.field_type.?);
             try std.testing.expectEqual(false, field.nullable.?);
+            try std.testing.expect(field.unique);
         }
         if (std.mem.eql(u8, field.name, "region")) {
             saw_region_view_field = true;
@@ -2316,6 +2337,7 @@ test "source binding classifies relational document and lake schemas" {
             try std.testing.expectEqualStrings("/metrics/score", field.path);
             try std.testing.expectEqual(runtime_schema.AntflyType.numeric, field.field_type.?);
             try std.testing.expectEqual(true, field.nullable.?);
+            try std.testing.expect(!field.unique);
         }
         if (std.mem.eql(u8, field.name, "published")) {
             saw_published_view_field = true;

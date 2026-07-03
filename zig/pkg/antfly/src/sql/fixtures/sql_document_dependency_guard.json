@@ -33,8 +33,8 @@
       "durable_catalog": "unproven_migration_blocker",
       "durable_document": "unproven_migration_blocker",
       "durable_row": "none",
-      "evidence_file": "zig/SQL_SLICES.md",
-      "evidence_symbol": "Admit document table DDL through SQL",
+      "evidence_file": "zig/SQL.md",
+      "evidence_symbol": "Document-table DDL design",
       "release_gate": "relational-release-gate"
     },
     {
@@ -59,18 +59,18 @@
       "id": "document-view-mapping",
       "sql_slices_section": "Document SQL",
       "source_family": "document_view_mapping",
-      "admission": "unsupported_fail_closed",
-      "parser_guard": "explicit_unsupported_fixture",
+      "admission": "admitted_read_only",
+      "parser_guard": "shared_relational_evidence",
       "session_guard": "not_applicable",
-      "auth_guard": "shared_native_preflight_required",
-      "response_guard": "explicit_unsupported_fixture",
+      "auth_guard": "native_document_query_path",
+      "response_guard": "native_document_response_mapping",
       "expression_guard": "typed_document_expression_required",
-      "durable_storage_guard": "native_document_write_required",
-      "durable_catalog": "unproven_migration_blocker",
+      "durable_storage_guard": "native_document_query_path",
+      "durable_catalog": "none",
       "durable_document": "read_only",
       "durable_row": "none",
-      "evidence_file": "zig/pkg/antfly/src/api/http_server.zig",
-      "evidence_symbol": "public SQL rejects document view mapping with document_sql_view_mapping_unsupported",
+      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/document_sql_corpus.json",
+      "evidence_symbol": "document SQL view mapping read, boolean, pattern, JSON, and array residual, expression, lateral, and UNNEST corpus fixtures",
       "release_gate": "relational-release-gate"
     }
   ]

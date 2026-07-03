@@ -4,9 +4,10 @@ This is the design document for Antfly's SQL adapter. It records the durable
 architecture, ownership boundaries, phase contracts, and implementation rules
 needed to keep SQL aligned with Antfly-native services.
 
-Track remaining implementation work in `SQL_SLICES.md`. Do not use this file
-as a progress log; completed history that can be deduced from code, tests,
-fixtures, or git history should stay out of this document.
+Active implementation trackers should live beside the owning subsystem or
+fixture manifest. Do not use this file as a progress log; completed history
+that can be deduced from code, tests, fixtures, or git history should stay out
+of this document.
 
 ## Core Contract
 
@@ -341,6 +342,100 @@ can preserve semantics.
 Supported document read expansion should remain deliberate:
 
 - `_id`, `_doc`, declared field, and JSON-path projection
+- direct-table and simple mapped-view scalar projections for text length,
+  ASCII case folding, `substring`/`substr`, `overlay`, `left`, `right`,
+  `repeat`, `reverse`, default `btrim`/`ltrim`/`rtrim`/`trim`, `lpad`,
+  `rpad`, `split_part`, `starts_with`, `ends_with`, `strpos`, `position`,
+  `octet_length`, `bit_length`, `ascii`, `chr`, `initcap`, `md5`, `replace`,
+  `nullif`,
+  scalar `CAST(field AS text)` over direct-table and simple mapped-view scalar
+  fields, scalar `CAST(field AS numeric)` over direct-table and simple
+  mapped-view numeric/text-like scalar fields, scalar
+  `CAST(field AS boolean)` over direct-table and simple mapped-view
+  boolean/text-like scalar fields, scalar `CAST(field AS timestamp)`/
+  `datetime`/`date` over direct-table and simple mapped-view
+  integer-nanosecond scalar fields, direct-table and simple mapped-view
+  `date_utc(datetime_field)`,
+  `concat_ws`, regexp
+  count/instr/substr, `translate`, numeric `abs`, numeric literal arithmetic
+  including `%` modulo, numeric `MOD(field, literal)`, numeric
+  `round`/`trunc`/`floor`/`ceil`/`sqrt`/`sign`, and numeric `power`
+- direct-table and simple mapped-view scalar projections for
+  `json_typeof`/`jsonb_typeof` and `json_array_length`/
+  `jsonb_array_length` over JSON-valued fields and paths
+- direct-table and simple mapped-view array expression projections for
+  `cardinality`, `array_length(array_field, 1)`, `array_append`,
+  `array_prepend`, `array_cat`, `array_remove`, `array_replace`,
+  `array_position`, `array_positions`, `array_to_string`, and
+  `string_to_array`
+- direct-table and simple mapped-view `array_position(array_field, literal) >
+  0`, `IS NOT NULL`, and `IS NULL` membership predicates, plus
+  `array_field && ARRAY[...]` overlap predicates and `array_field @>
+  ARRAY[...]` contains predicates
+- residual/bounded-scan direct-table and simple mapped-view
+  `cardinality(array_field)` and `array_length(array_field, 1)` comparison
+  predicates
+- residual/bounded-scan direct-table and simple mapped-view scalar
+  `CAST(field AS text)` equality predicates over scalar fields
+- residual/bounded-scan direct-table and simple mapped-view scalar
+  `CAST(field AS numeric)` comparison predicates over numeric/text-like scalar
+  fields
+- residual/bounded-scan direct-table and simple mapped-view scalar
+  `CAST(field AS boolean)` equality predicates over boolean/text-like scalar
+  fields
+- residual/bounded-scan direct-table and simple mapped-view scalar
+  `CAST(field AS timestamp)`/`datetime`/`date` comparison predicates over
+  datetime, numeric, and text-like scalar fields
+- residual/bounded-scan direct-table and simple mapped-view text-length,
+  `octet_length`, and `bit_length` comparison predicates
+- residual/bounded-scan direct-table and simple mapped-view
+  `nullif(text_field, literal)` equality
+  predicates, `replace(text_field, literal, literal)` equality predicates, and
+  `translate(text_field, literal, literal)` equality predicates
+- residual/bounded-scan direct-table and simple mapped-view
+  `concat_ws(literal, text_field, text_field)` equality predicates
+- residual/bounded-scan direct-table and simple mapped-view
+  `regexp_count(text_field, literal)` and `regexp_instr(text_field, literal)`
+  comparison predicates plus
+  `regexp_substr(text_field, literal)` equality predicates
+- residual/bounded-scan direct-table and simple mapped-view
+  `chr(numeric_field_or_integer_literal)` equality predicates
+- residual/bounded-scan direct-table and simple mapped-view
+  `lpad(text_field, width[, fill])` and
+  `rpad(text_field, width[, fill])` equality predicates, plus
+  `split_part(text_field, literal, index)` equality predicates
+- residual/bounded-scan direct-table and simple mapped-view
+  `starts_with(text_field, literal)` and `ends_with(text_field, literal)`
+  boolean predicates
+- residual/bounded-scan direct-table and simple mapped-view
+  `strpos(text_field, literal)` and `position(literal in text_field)`
+  comparison predicates
+- residual/bounded-scan direct-table and simple mapped-view
+  `ascii(text_field)` comparison predicates
+- residual/bounded-scan direct-table and simple mapped-view `initcap(text_field)` and
+  `md5(text_field)` equality predicates
+- residual/bounded-scan direct-table and simple mapped-view
+  `reverse(text_field)` and default `trim`/`btrim`/`ltrim`/`rtrim` equality
+  predicates
+- residual/bounded-scan direct-table and simple mapped-view
+  `repeat(text_field, count)` equality predicates
+- residual/bounded-scan direct-table and simple mapped-view
+  `left(text_field, count)` and `right(text_field, count)` equality predicates
+- residual/bounded-scan direct-table and simple mapped-view
+  `substring`/`substr` equality predicates and
+  `overlay(text_field placing literal from start [for length])` equality
+  predicates
+- residual/bounded-scan direct-table and simple mapped-view numeric
+  `round`/`trunc`/`floor`/`ceil`/`sqrt`/`sign` comparison predicates
+- residual/bounded-scan direct-table and simple mapped-view numeric `power`,
+  `%` modulo, and `MOD(field, literal)` comparison predicates
+- residual/bounded-scan direct-table and simple mapped-view
+  `json_typeof`/`jsonb_typeof` equality predicates and
+  `json_array_length`/`jsonb_array_length` comparison predicates over
+  JSON-valued fields and paths
+- direct-table and simple mapped-view JSON key-exists predicates for
+  `json_field ? 'key'`, `json_field ?| ARRAY[...]`, and
+  `json_field ?& ARRAY[...]`
 - `SELECT *` expansion over the virtual document schema
 - table or alias qualification
 - `_id` equality and membership lookup
@@ -349,6 +444,21 @@ Supported document read expansion should remain deliberate:
 - bounded scans only through explicit bounded-scan policy
 - ordering, aggregation, and `UNNEST` only when backed by exact native/indexed
   producers, materialized sidecars, or explicit bounded contracts
+- mapped-view `LEFT JOIN LATERAL (...) LIMIT 1` only when the branch is a
+  same-view scalar equality lookup with `ON true`: echo-field projections are
+  exact because every matching branch row has the same selected value; alternate
+  scalar projections require the correlation field to be declared unique; if
+  that unique correlation is nullable, only `LEFT JOIN LATERAL` is admitted and
+  null/missing outer correlation values are treated as no branch row, producing
+  null lateral projections; default `JOIN LATERAL` and `CROSS JOIN LATERAL`
+  require non-null correlation proof so SQL row-dropping/no-match behavior is
+  equivalent to the native document producer; branch `ORDER BY ... LIMIT 1` is
+  admitted only for already deterministic shapes, where ordering cannot change
+  row identity; branch-only scalar residual predicates are admitted only with
+  unique correlation proof and SQL-compatible left null-extension or inner/cross
+  row-dropping behavior; source-relative branch residual predicates such as
+  `s.score > d.score` are admitted for those same unique-correlation shapes and
+  are evaluated before lateral projection/null-extension
 
 The following stay fail-closed until their native semantics are designed and
 proven: broad scans without bounded policy, unsupported joins, windows,

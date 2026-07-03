@@ -419,7 +419,7 @@ fn buildRowsInsertSourceBatchFromSelectedRowsWithSchemasAndDefaultContextAlloc(
                 switch (conflict.action) {
                     .nothing => continue,
                     .update => {
-                        try appendTypedConflictUpdateAlloc(alloc, table_name, schema, req, planned, conflict, key, conflict_resolver.?, &transforms, &predicates, &returning_rows);
+                        try appendTypedConflictUpdateAlloc(alloc, table_name, schema, req, source_row_json, planned, conflict, key, conflict_resolver.?, &transforms, &predicates, &returning_rows);
                         continue;
                     },
                 }
@@ -2084,7 +2084,7 @@ fn parseRowsQueryStreamRequest(
     alloc: std.mem.Allocator,
     body: []const u8,
     schema: runtime_schema.TableSchema,
-) !OwnedRowsQueryRequest {
+) anyerror!OwnedRowsQueryRequest {
     if (schema.storage_mode != .relational) return error.InvalidRowsRequest;
     if (body.len == 0) return error.InvalidRowsRequest;
 
@@ -2093,7 +2093,7 @@ fn parseRowsQueryStreamRequest(
     }) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidRowsRequest;
-    try requireJsonObjectOnlyKeys(parsed.value.object, &.{ "source_cte", "where", "expression_where", "expression_any", "expression_not", "expression_array_contains", "select", "json_extract", "array_length", "coalesce", "field_aliases", "expressions", "distinct_on", "distinct_on_expressions", "order_by", "limit", "offset", "row_claim", "doc_key_range" });
+    try requireJsonObjectOnlyKeys(parsed.value.object, &.{ "source_cte", "where", "expression_where", "expression_any", "expression_not", "expression_array_contains", "select", "json_extract", "array_length", "coalesce", "field_aliases", "expressions", "scalar_subqueries", "distinct_on", "distinct_on_expressions", "order_by", "limit", "offset", "row_claim", "doc_key_range" });
 
     const source_cte = try parseRowsQuerySourceCteAlloc(alloc, parsed.value.object.get("source_cte"));
     errdefer if (source_cte.len > 0) alloc.free(source_cte);
@@ -2170,6 +2170,9 @@ fn parseRowsQueryStreamRequest(
     const field_aliases = try parseRowsQueryFieldAliasProjectionsAlloc(alloc, schema, parsed.value.object.get("field_aliases"));
     errdefer freeRowsQueryFieldAliasProjections(alloc, field_aliases);
 
+    const scalar_subqueries = try parseRowsQueryScalarSubqueryProjectionsAlloc(alloc, schema, parsed.value.object.get("scalar_subqueries"));
+    errdefer freeRowsQueryScalarSubqueryProjections(alloc, scalar_subqueries);
+
     const order_by = try parseRowsQueryOrderAlloc(alloc, schema, parsed.value.object.get("order_by"));
     errdefer {
         freeRowsQueryOrder(alloc, order_by);
@@ -2198,7 +2201,7 @@ fn parseRowsQueryStreamRequest(
     };
     if (doc_key_range != null and schema.primary_key == null) return error.InvalidRowsRequest;
 
-    try validateRowsQueryProjectionOutputs(schema, select_parsed, json_extract, array_length, coalesce, field_aliases, expressions);
+    try validateRowsQueryProjectionOutputs(schema, select_parsed, json_extract, array_length, coalesce, field_aliases, expressions, scalar_subqueries);
 
     return .{
         .source_cte = source_cte,
@@ -2225,6 +2228,7 @@ fn parseRowsQueryStreamRequest(
         .coalesce = coalesce,
         .field_aliases = field_aliases,
         .expressions = expressions,
+        .scalar_subqueries = scalar_subqueries,
         .select_all = select_parsed.all,
         .distinct_on = distinct_on,
         .distinct_on_expressions = distinct_on_expressions,
@@ -2375,9 +2379,9 @@ pub fn parseRowsMutationSourceRequest(
     if (kind == .update) {
         operations = try staticUpdateTransformOperationsAlloc(alloc, schema, parsed.value, true, rewrite_identity);
         errdefer freeTransformOps(alloc, operations);
-        patch_expressions = try parseRowsMutationExpressionAssignmentsAlloc(alloc, schema, parsed.value.object.get("patch_expr"), false, false, rewrite_identity);
+        patch_expressions = try parseRowsMutationExpressionAssignmentsAlloc(alloc, schema, parsed.value.object.get("patch_expr"), false, false, rewrite_identity, source.scalar_subqueries);
         errdefer freeRowsExpressionAssignments(alloc, patch_expressions);
-        increment_expressions = try parseRowsMutationExpressionAssignmentsAlloc(alloc, schema, parsed.value.object.get("increment_expr"), true, false, false);
+        increment_expressions = try parseRowsMutationExpressionAssignmentsAlloc(alloc, schema, parsed.value.object.get("increment_expr"), true, false, false, source.scalar_subqueries);
         errdefer freeRowsExpressionAssignments(alloc, increment_expressions);
         json_set_expressions = try parseRowsMutationJsonSetExpressionAssignmentsAlloc(alloc, schema, parsed.value.object.get("json_set"), false);
         errdefer freeRowsJsonSetExpressionAssignments(alloc, json_set_expressions);
@@ -2395,7 +2399,7 @@ pub fn parseRowsMutationSourceRequest(
     errdefer if (temporal_portion) |portion| freeRowsTemporalPortion(alloc, portion);
     if (restart_identity and temporal_portion != null) return error.InvalidRowsRequest;
 
-    const returning = try parseMutationSourceReturningAlloc(alloc, schema, parsed.value.object.get("returning"), parsed.value.object.get("returning_expressions"));
+    const returning = try parseMutationSourceReturningAlloc(alloc, schema, parsed.value.object.get("returning"), parsed.value.object.get("returning_expressions"), source.scalar_subqueries);
     errdefer {
         for (returning.fields) |field| alloc.free(field);
         if (returning.fields.len > 0) alloc.free(returning.fields);
@@ -3009,7 +3013,7 @@ fn parseRowsInsertSourceRequestWithSchemasAndSourceCteMode(
     } else null;
     errdefer if (on_conflict) |conflict| freeRowsOnConflict(alloc, conflict);
 
-    const returning = try parseMutationSourceReturningAlloc(alloc, target_schema, parsed.value.object.get("returning"), parsed.value.object.get("returning_expressions"));
+    const returning = try parseMutationSourceReturningAlloc(alloc, target_schema, parsed.value.object.get("returning"), parsed.value.object.get("returning_expressions"), &.{});
     errdefer {
         for (returning.fields) |field| alloc.free(field);
         if (returning.fields.len > 0) alloc.free(returning.fields);
@@ -4348,6 +4352,7 @@ pub fn executeRowsQueryOnJsonRowsAlloc(
         request.coalesce,
         request.field_aliases,
         request.expressions,
+        request.scalar_subqueries,
     );
 
     var candidates = std.ArrayListUnmanaged(QueryCandidate).empty;
@@ -10054,9 +10059,14 @@ fn parseRowsJoinOnAllocWithSchemas(
     }
     for (on_value.array.items) |item| {
         if (item != .object) return error.InvalidRowsRequest;
-        try requireJsonObjectOnlyKeys(item.object, &.{ "left_field", "right_field" });
+        try requireJsonObjectOnlyKeys(item.object, &.{ "left_field", "right_field", "op" });
         const left_value = item.object.get("left_field") orelse return error.InvalidRowsRequest;
         const right_value = item.object.get("right_field") orelse return error.InvalidRowsRequest;
+        const op = if (item.object.get("op")) |op_value| blk: {
+            if (op_value != .string) return error.InvalidRowsRequest;
+            break :blk try parseRowsQueryPredicateOp(op_value.string);
+        } else runtime_schema.RelationalCheckOp.eq;
+        if (op != .eq) return error.InvalidRowsRequest;
         if (left_value != .string or left_value.string.len == 0) return error.InvalidRowsRequest;
         if (right_value != .string or right_value.string.len == 0) return error.InvalidRowsRequest;
         const left_column = findRelationalColumn(left_schema.relational_columns, left_value.string) orelse return error.InvalidRowsRequest;
@@ -10350,9 +10360,14 @@ fn parseRowsLateralCorrelationsAllocWithSchemas(
     }
     for (correlations_value.array.items) |item| {
         if (item != .object) return error.InvalidRowsRequest;
-        try requireJsonObjectOnlyKeys(item.object, &.{ "left_field", "right_field" });
+        try requireJsonObjectOnlyKeys(item.object, &.{ "left_field", "right_field", "op" });
         const left_value = item.object.get("left_field") orelse return error.InvalidRowsRequest;
         const right_value = item.object.get("right_field") orelse return error.InvalidRowsRequest;
+        const op = if (item.object.get("op")) |op_value| blk: {
+            if (op_value != .string) return error.InvalidRowsRequest;
+            break :blk try parseRowsQueryPredicateOp(op_value.string);
+        } else runtime_schema.RelationalCheckOp.eq;
+        if (op == .is_null or op == .is_not_null or op == .is_distinct or op == .is_not_distinct) return error.InvalidRowsRequest;
         if (left_value != .string or left_value.string.len == 0) return error.InvalidRowsRequest;
         if (right_value != .string or right_value.string.len == 0) return error.InvalidRowsRequest;
         const left_column = findRelationalColumn(left_schema.relational_columns, left_value.string) orelse return error.InvalidRowsRequest;
@@ -10367,6 +10382,7 @@ fn parseRowsLateralCorrelationsAllocWithSchemas(
         out[initialized] = .{
             .left_field = left_field,
             .right_field = right_field,
+            .op = op,
         };
         left_transferred = true;
         right_transferred = true;
@@ -12580,32 +12596,37 @@ fn validateRowsQueryProjectionOutputs(
     coalesce: []const db_mod.types.RelationalRowsCoalesceProjection,
     field_aliases: []const db_mod.types.RelationalRowsFieldAliasProjection,
     expressions: []const db_mod.types.RelationalRowsExpressionProjection,
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
 ) !void {
     if (!select_parsed.all) {
         for (select_parsed.fields) |field| {
             if (field.len == 0) return error.InvalidRowsRequest;
-            if (rowsQueryProjectionOutputCount(schema, select_parsed, json_extract, array_length, coalesce, field_aliases, expressions, field) > 1) return error.InvalidRowsRequest;
+            if (rowsQueryProjectionOutputCount(schema, select_parsed, json_extract, array_length, coalesce, field_aliases, expressions, scalar_subqueries, field) > 1) return error.InvalidRowsRequest;
         }
     }
     for (json_extract) |projection| {
         if (projection.output.len == 0) return error.InvalidRowsRequest;
-        if (rowsQueryProjectionOutputCount(schema, select_parsed, json_extract, array_length, coalesce, field_aliases, expressions, projection.output) > 1) return error.InvalidRowsRequest;
+        if (rowsQueryProjectionOutputCount(schema, select_parsed, json_extract, array_length, coalesce, field_aliases, expressions, scalar_subqueries, projection.output) > 1) return error.InvalidRowsRequest;
     }
     for (array_length) |projection| {
         if (projection.output.len == 0) return error.InvalidRowsRequest;
-        if (rowsQueryProjectionOutputCount(schema, select_parsed, json_extract, array_length, coalesce, field_aliases, expressions, projection.output) > 1) return error.InvalidRowsRequest;
+        if (rowsQueryProjectionOutputCount(schema, select_parsed, json_extract, array_length, coalesce, field_aliases, expressions, scalar_subqueries, projection.output) > 1) return error.InvalidRowsRequest;
     }
     for (coalesce) |projection| {
         if (projection.output.len == 0) return error.InvalidRowsRequest;
-        if (rowsQueryProjectionOutputCount(schema, select_parsed, json_extract, array_length, coalesce, field_aliases, expressions, projection.output) > 1) return error.InvalidRowsRequest;
+        if (rowsQueryProjectionOutputCount(schema, select_parsed, json_extract, array_length, coalesce, field_aliases, expressions, scalar_subqueries, projection.output) > 1) return error.InvalidRowsRequest;
     }
     for (field_aliases) |projection| {
         if (projection.output.len == 0) return error.InvalidRowsRequest;
-        if (rowsQueryProjectionOutputCount(schema, select_parsed, json_extract, array_length, coalesce, field_aliases, expressions, projection.output) > 1) return error.InvalidRowsRequest;
+        if (rowsQueryProjectionOutputCount(schema, select_parsed, json_extract, array_length, coalesce, field_aliases, expressions, scalar_subqueries, projection.output) > 1) return error.InvalidRowsRequest;
     }
     for (expressions) |projection| {
         if (projection.output.len == 0) return error.InvalidRowsRequest;
-        if (rowsQueryProjectionOutputCount(schema, select_parsed, json_extract, array_length, coalesce, field_aliases, expressions, projection.output) > 1) return error.InvalidRowsRequest;
+        if (rowsQueryProjectionOutputCount(schema, select_parsed, json_extract, array_length, coalesce, field_aliases, expressions, scalar_subqueries, projection.output) > 1) return error.InvalidRowsRequest;
+    }
+    for (scalar_subqueries) |projection| {
+        if (projection.output.len == 0) return error.InvalidRowsRequest;
+        if (rowsQueryProjectionOutputCount(schema, select_parsed, json_extract, array_length, coalesce, field_aliases, expressions, scalar_subqueries, projection.output) > 1) return error.InvalidRowsRequest;
     }
 }
 
@@ -12617,6 +12638,7 @@ fn rowsQueryProjectionOutputCount(
     coalesce: []const db_mod.types.RelationalRowsCoalesceProjection,
     field_aliases: []const db_mod.types.RelationalRowsFieldAliasProjection,
     expressions: []const db_mod.types.RelationalRowsExpressionProjection,
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
     output: []const u8,
 ) usize {
     var count: usize = 0;
@@ -12645,6 +12667,9 @@ fn rowsQueryProjectionOutputCount(
     for (expressions) |projection| {
         if (std.mem.eql(u8, projection.output, output)) count += 1;
     }
+    for (scalar_subqueries) |projection| {
+        if (std.mem.eql(u8, projection.output, output)) count += 1;
+    }
     return count;
 }
 
@@ -12653,8 +12678,9 @@ fn parseMutationSourceReturningAlloc(
     schema: runtime_schema.TableSchema,
     maybe_returning: ?std.json.Value,
     maybe_expressions: ?std.json.Value,
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
 ) !ParsedMutationSourceReturning {
-    const expressions = try parseRowsQueryExpressionProjectionsAlloc(alloc, schema, maybe_expressions);
+    const expressions = try parseRowsQueryExpressionProjectionsWithScalarOutputsAlloc(alloc, schema, maybe_expressions, scalar_subqueries);
     errdefer freeRowsQueryExpressionProjections(alloc, expressions);
     const returning_value = maybe_returning orelse {
         try validateMutationReturningOutputs(schema, &.{}, false, expressions);
@@ -13003,6 +13029,15 @@ fn parseRowsQueryExpressionProjectionsAlloc(
     schema: runtime_schema.TableSchema,
     maybe_projection: ?std.json.Value,
 ) ![]db_mod.types.RelationalRowsExpressionProjection {
+    return try parseRowsQueryExpressionProjectionsWithScalarOutputsAlloc(alloc, schema, maybe_projection, &.{});
+}
+
+fn parseRowsQueryExpressionProjectionsWithScalarOutputsAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    maybe_projection: ?std.json.Value,
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
+) ![]db_mod.types.RelationalRowsExpressionProjection {
     const projection_value = maybe_projection orelse return &.{};
     if (projection_value != .array) return error.InvalidRowsRequest;
 
@@ -13026,7 +13061,7 @@ fn parseRowsQueryExpressionProjectionsAlloc(
         const output = try alloc.dupe(u8, output_value.string);
         var output_transferred = false;
         errdefer if (!output_transferred) alloc.free(output);
-        const expression = try parseRowsQueryExpressionAlloc(alloc, schema, expression_value);
+        const expression = try parseRowsExpressionWithScalarOutputsAlloc(alloc, schema, null, expression_value, false, scalar_subqueries);
         var expression_transferred = false;
         errdefer if (!expression_transferred) freeRowsQueryExpression(alloc, expression);
 
@@ -13040,6 +13075,82 @@ fn parseRowsQueryExpressionProjectionsAlloc(
     }
 
     return projections;
+}
+
+fn parseRowsQueryScalarSubqueryProjectionsAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    maybe_projection: ?std.json.Value,
+) anyerror![]db_mod.types.RelationalRowsScalarSubqueryProjection {
+    const projection_value = maybe_projection orelse return &.{};
+    if (projection_value != .array) return error.InvalidRowsRequest;
+
+    const projections = try alloc.alloc(db_mod.types.RelationalRowsScalarSubqueryProjection, projection_value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (projections[0..initialized]) |projection| freeRowsQueryScalarSubqueryProjection(alloc, projection);
+        alloc.free(projections);
+    }
+
+    for (projection_value.array.items) |item| {
+        if (item != .object) return error.InvalidRowsRequest;
+        try requireJsonObjectOnlyKeys(item.object, &.{ "output", "output_field", "hidden", "query" });
+        const output_value = item.object.get("output") orelse return error.InvalidRowsRequest;
+        const output_field_value = item.object.get("output_field") orelse return error.InvalidRowsRequest;
+        const query_value = item.object.get("query") orelse return error.InvalidRowsRequest;
+        if (output_value != .string or output_value.string.len == 0) return error.InvalidRowsRequest;
+        if (output_field_value != .string or output_field_value.string.len == 0) return error.InvalidRowsRequest;
+        if (query_value != .object) return error.InvalidRowsRequest;
+
+        const output = try alloc.dupe(u8, output_value.string);
+        var output_transferred = false;
+        errdefer if (!output_transferred) alloc.free(output);
+        const output_field = try alloc.dupe(u8, output_field_value.string);
+        var output_field_transferred = false;
+        errdefer if (!output_field_transferred) alloc.free(output_field);
+        const query_json = try jsonValueStringifyAlloc(alloc, query_value);
+        defer alloc.free(query_json);
+        var query = try parseRowsQueryRequest(alloc, query_json, schema);
+        var query_transferred = false;
+        errdefer if (!query_transferred) query.deinit(alloc);
+        const hidden = (try parseOptionalBool(item.object.get("hidden"))) orelse false;
+
+        projections[initialized] = .{
+            .output = output,
+            .query = query,
+            .output_field = output_field,
+            .hidden = hidden,
+        };
+        output_transferred = true;
+        output_field_transferred = true;
+        query_transferred = true;
+        initialized += 1;
+    }
+
+    return projections;
+}
+
+fn freeRowsQueryScalarSubqueryProjection(
+    alloc: std.mem.Allocator,
+    projection: db_mod.types.RelationalRowsScalarSubqueryProjection,
+) void {
+    alloc.free(@constCast(projection.output));
+    var query = projection.query;
+    query.deinit(alloc);
+    if (projection.output_field.len > 0) alloc.free(@constCast(projection.output_field));
+    for (projection.correlations) |correlation| {
+        if (correlation.left_field.len > 0) alloc.free(@constCast(correlation.left_field));
+        if (correlation.right_field.len > 0) alloc.free(@constCast(correlation.right_field));
+    }
+    if (projection.correlations.len > 0) alloc.free(projection.correlations);
+}
+
+fn freeRowsQueryScalarSubqueryProjections(
+    alloc: std.mem.Allocator,
+    projections: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
+) void {
+    for (projections) |projection| freeRowsQueryScalarSubqueryProjection(alloc, projection);
+    if (projections.len > 0) alloc.free(projections);
 }
 
 fn requireJsonObjectOnlyKeys(object: std.json.ObjectMap, comptime allowed_keys: []const []const u8) !void {
@@ -13069,7 +13180,19 @@ fn parseRowsMutationExpressionAlloc(
     schema: runtime_schema.TableSchema,
     value: std.json.Value,
 ) anyerror!db_mod.types.RelationalRowsExpression {
-    const expression = try parseRowsExpressionAlloc(alloc, schema, value, true);
+    const expression = try parseRowsMutationExpressionWithScalarOutputsAlloc(alloc, schema, value, &.{});
+    errdefer freeRowsQueryExpression(alloc, expression);
+    if (rowsExpressionUsesFieldSource(expression, .source)) return error.InvalidRowsRequest;
+    return expression;
+}
+
+fn parseRowsMutationExpressionWithScalarOutputsAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    value: std.json.Value,
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
+) anyerror!db_mod.types.RelationalRowsExpression {
+    const expression = try parseRowsExpressionWithScalarOutputsAlloc(alloc, schema, null, value, true, scalar_subqueries);
     errdefer freeRowsQueryExpression(alloc, expression);
     if (rowsExpressionUsesFieldSource(expression, .source)) return error.InvalidRowsRequest;
     return expression;
@@ -13089,6 +13212,45 @@ fn rowsExpressionUsesFieldSource(
     }
     for (expression.case_else) |case_else| {
         if (rowsExpressionUsesFieldSource(case_else, field_source)) return true;
+    }
+    return false;
+}
+
+fn hiddenScalarSubqueryOutputCoversField(
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
+    field: []const u8,
+) bool {
+    for (scalar_subqueries) |projection| {
+        if (projection.hidden and std.mem.eql(u8, projection.output, field)) return true;
+    }
+    return false;
+}
+
+fn rowsExpressionReferencesScalarOutput(
+    expression: db_mod.types.RelationalRowsExpression,
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
+) bool {
+    if (expression.kind == .field and hiddenScalarSubqueryOutputCoversField(scalar_subqueries, expression.field)) return true;
+    for (expression.operands) |operand| {
+        if (rowsExpressionReferencesScalarOutput(operand, scalar_subqueries)) return true;
+    }
+    for (expression.case_branches) |branch| {
+        if (rowsExpressionConditionReferencesScalarOutput(branch.when, scalar_subqueries)) return true;
+        if (rowsExpressionReferencesScalarOutput(branch.then, scalar_subqueries)) return true;
+    }
+    for (expression.case_else) |case_else| {
+        if (rowsExpressionReferencesScalarOutput(case_else, scalar_subqueries)) return true;
+    }
+    return false;
+}
+
+fn rowsExpressionConditionReferencesScalarOutput(
+    condition: db_mod.types.RelationalRowsExpressionCondition,
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
+) bool {
+    if (rowsExpressionReferencesScalarOutput(condition.lhs, scalar_subqueries)) return true;
+    for (condition.rhs) |rhs| {
+        if (rowsExpressionReferencesScalarOutput(rhs, scalar_subqueries)) return true;
     }
     return false;
 }
@@ -13120,6 +13282,17 @@ fn parseRowsExpressionWithSourceSchemaAlloc(
     value: std.json.Value,
     allow_mutation_sources: bool,
 ) anyerror!db_mod.types.RelationalRowsExpression {
+    return try parseRowsExpressionWithScalarOutputsAlloc(alloc, schema, source_schema, value, allow_mutation_sources, &.{});
+}
+
+fn parseRowsExpressionWithScalarOutputsAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    source_schema: ?runtime_schema.TableSchema,
+    value: std.json.Value,
+    allow_mutation_sources: bool,
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
+) anyerror!db_mod.types.RelationalRowsExpression {
     if (value != .object) return error.InvalidRowsRequest;
     try requireJsonObjectOnlyKeys(value.object, &.{ "field", "source", "value", "op", "args", "to", "path", "as_text", "cases", "else" });
     const field_value = value.object.get("field");
@@ -13134,7 +13307,15 @@ fn parseRowsExpressionWithSourceSchemaAlloc(
         if (field != .string or field.string.len == 0) return error.InvalidRowsRequest;
         const field_source = try parseRowsExpressionFieldSource(value.object.get("source"), allow_mutation_sources);
         const field_schema = rowsExpressionSchemaForFieldSource(schema, source_schema, field_source);
-        _ = findRelationalColumn(field_schema.relational_columns, field.string) orelse return error.InvalidRowsRequest;
+        if (findRelationalColumn(field_schema.relational_columns, field.string) == null) {
+            if (source_schema != null or
+                (field_source != .existing and field_source != .source and field_source != .row) or
+                !hiddenScalarSubqueryOutputCoversField(scalar_subqueries, field.string))
+            {
+                return error.InvalidRowsRequest;
+            }
+            return .{ .kind = .field, .field = try alloc.dupe(u8, field.string), .field_source = .existing };
+        }
         return .{ .kind = .field, .field = try alloc.dupe(u8, field.string), .field_source = field_source };
     }
     if (literal_value) |literal| {
@@ -13146,7 +13327,7 @@ fn parseRowsExpressionWithSourceSchemaAlloc(
     if (op != .string) return error.InvalidRowsRequest;
     if (std.mem.eql(u8, op.string, "case")) {
         try requireJsonObjectOnlyKeys(value.object, &.{ "op", "cases", "else" });
-        return try parseRowsCaseExpressionWithSourceSchemaAlloc(alloc, schema, source_schema, value, allow_mutation_sources);
+        return try parseRowsCaseExpressionWithScalarOutputsAlloc(alloc, schema, source_schema, value, allow_mutation_sources, scalar_subqueries);
     }
     if (std.mem.eql(u8, op.string, "now")) {
         try requireJsonObjectOnlyKeys(value.object, &.{ "op", "args" });
@@ -13386,7 +13567,7 @@ fn parseRowsExpressionWithSourceSchemaAlloc(
         alloc.free(operands);
     }
     for (args_value.array.items) |arg| {
-        operands[initialized] = try parseRowsExpressionWithSourceSchemaAlloc(alloc, schema, source_schema, arg, allow_mutation_sources);
+        operands[initialized] = try parseRowsExpressionWithScalarOutputsAlloc(alloc, schema, source_schema, arg, allow_mutation_sources, scalar_subqueries);
         initialized += 1;
     }
     const cast_type: ?db_mod.types.RelationalRowsExpressionCastType = if (expression_kind == .cast) blk: {
@@ -13436,37 +13617,39 @@ fn parseRowsExpressionWithSourceSchemaAlloc(
         }
     }
     const expression: db_mod.types.RelationalRowsExpression = .{ .kind = expression_kind, .operands = operands, .cast_type = cast_type, .json_path = json_path, .json_as_text = json_as_text };
-    if (expression_kind == .length or expression_kind == .octet_length or expression_kind == .bit_length or expression_kind == .ascii or expression_kind == .regexp_count or expression_kind == .regexp_instr or expression_kind == .json_array_length or expression_kind == .abs or expression_kind == .round or expression_kind == .trunc or expression_kind == .floor or expression_kind == .ceil or expression_kind == .sqrt or expression_kind == .sign or expression_kind == .power or expression_kind == .add or expression_kind == .sub or expression_kind == .mul or expression_kind == .div or expression_kind == .mod or expression_kind == .interval_ns or expression_kind == .interval_months) try validateRowsQueryNumericExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .array_position or expression_kind == .array_positions) try validateRowsArrayPositionExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .chr or expression_kind == .md5 or expression_kind == .json_typeof or expression_kind == .array_to_string or expression_kind == .regexp_replace or expression_kind == .regexp_substr or expression_kind == .concat_ws) try validateRowsQueryTextExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .date_trunc) try validateRowsDateTruncExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .date_bin) try validateRowsDateBinExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .date_part) try validateRowsDatePartExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .array_append or expression_kind == .array_prepend or expression_kind == .array_remove) try validateRowsArrayElementTransformExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .array_replace) try validateRowsArrayReplaceExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .array_cat) try validateRowsArrayCatExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .coalesce or expression_kind == .nullif or expression_kind == .greatest or expression_kind == .least) try validateRowsExpressionOperandDomainsWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .trim or expression_kind == .ltrim or expression_kind == .rtrim) try validateRowsTrimExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .replace or expression_kind == .translate) try validateRowsReplaceExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .regexp_replace) try validateRowsRegexpReplaceExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .regexp_substr) try validateRowsRegexpSubstrExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .substring) try validateRowsSubstringExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .overlay) try validateRowsOverlayExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .split_part) try validateRowsSplitPartExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .strpos) try validateRowsStrposExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .left or expression_kind == .right) try validateRowsLeftRightExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .lpad or expression_kind == .rpad) try validateRowsPadExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .repeat) try validateRowsRepeatExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .reverse) try validateRowsReverseExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .starts_with or expression_kind == .ends_with) try validateRowsStringBoundaryExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .like or expression_kind == .ilike) try validateRowsLikeExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .regexp_match) try validateRowsRegexpMatchExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .regexp_count) try validateRowsRegexpCountExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .regexp_instr) try validateRowsRegexpInstrExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .bool_and or expression_kind == .bool_or or expression_kind == .bool_not) try validateRowsBooleanOpExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .json_path_exists) try validateRowsQueryBooleanExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .string_to_array) try validateRowsStringToArrayExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .json_build_object) try validateRowsJsonBuildObjectExpressionWithSources(alloc, schema, source_schema, expression);
+    if (!rowsExpressionReferencesScalarOutput(expression, scalar_subqueries)) {
+        if (expression_kind == .length or expression_kind == .octet_length or expression_kind == .bit_length or expression_kind == .ascii or expression_kind == .regexp_count or expression_kind == .regexp_instr or expression_kind == .json_array_length or expression_kind == .abs or expression_kind == .round or expression_kind == .trunc or expression_kind == .floor or expression_kind == .ceil or expression_kind == .sqrt or expression_kind == .sign or expression_kind == .power or expression_kind == .add or expression_kind == .sub or expression_kind == .mul or expression_kind == .div or expression_kind == .mod or expression_kind == .interval_ns or expression_kind == .interval_months) try validateRowsQueryNumericExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .array_position or expression_kind == .array_positions) try validateRowsArrayPositionExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .chr or expression_kind == .md5 or expression_kind == .json_typeof or expression_kind == .array_to_string or expression_kind == .regexp_replace or expression_kind == .regexp_substr or expression_kind == .concat_ws) try validateRowsQueryTextExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .date_trunc) try validateRowsDateTruncExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .date_bin) try validateRowsDateBinExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .date_part) try validateRowsDatePartExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .array_append or expression_kind == .array_prepend or expression_kind == .array_remove) try validateRowsArrayElementTransformExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .array_replace) try validateRowsArrayReplaceExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .array_cat) try validateRowsArrayCatExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .coalesce or expression_kind == .nullif or expression_kind == .greatest or expression_kind == .least) try validateRowsExpressionOperandDomainsWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .trim or expression_kind == .ltrim or expression_kind == .rtrim) try validateRowsTrimExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .replace or expression_kind == .translate) try validateRowsReplaceExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .regexp_replace) try validateRowsRegexpReplaceExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .regexp_substr) try validateRowsRegexpSubstrExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .substring) try validateRowsSubstringExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .overlay) try validateRowsOverlayExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .split_part) try validateRowsSplitPartExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .strpos) try validateRowsStrposExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .left or expression_kind == .right) try validateRowsLeftRightExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .lpad or expression_kind == .rpad) try validateRowsPadExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .repeat) try validateRowsRepeatExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .reverse) try validateRowsReverseExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .starts_with or expression_kind == .ends_with) try validateRowsStringBoundaryExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .like or expression_kind == .ilike) try validateRowsLikeExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .regexp_match) try validateRowsRegexpMatchExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .regexp_count) try validateRowsRegexpCountExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .regexp_instr) try validateRowsRegexpInstrExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .bool_and or expression_kind == .bool_or or expression_kind == .bool_not) try validateRowsBooleanOpExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .json_path_exists) try validateRowsQueryBooleanExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .string_to_array) try validateRowsStringToArrayExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .json_build_object) try validateRowsJsonBuildObjectExpressionWithSources(alloc, schema, source_schema, expression);
+    }
     return expression;
 }
 
@@ -13507,15 +13690,16 @@ fn parseRowsCaseExpressionAlloc(
     value: std.json.Value,
     allow_mutation_sources: bool,
 ) anyerror!db_mod.types.RelationalRowsExpression {
-    return try parseRowsCaseExpressionWithSourceSchemaAlloc(alloc, schema, null, value, allow_mutation_sources);
+    return try parseRowsCaseExpressionWithScalarOutputsAlloc(alloc, schema, null, value, allow_mutation_sources, &.{});
 }
 
-fn parseRowsCaseExpressionWithSourceSchemaAlloc(
+fn parseRowsCaseExpressionWithScalarOutputsAlloc(
     alloc: std.mem.Allocator,
     schema: runtime_schema.TableSchema,
     source_schema: ?runtime_schema.TableSchema,
     value: std.json.Value,
     allow_mutation_sources: bool,
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
 ) anyerror!db_mod.types.RelationalRowsExpression {
     try requireJsonObjectOnlyKeys(value.object, &.{ "op", "cases", "else" });
     const cases_value = value.object.get("cases") orelse return error.InvalidRowsRequest;
@@ -13532,10 +13716,10 @@ fn parseRowsCaseExpressionWithSourceSchemaAlloc(
         try requireJsonObjectOnlyKeys(branch_value.object, &.{ "when", "then" });
         const when_value = branch_value.object.get("when") orelse return error.InvalidRowsRequest;
         const then_value = branch_value.object.get("then") orelse return error.InvalidRowsRequest;
-        const when = try parseRowsExpressionConditionWithSourceSchemaAlloc(alloc, schema, source_schema, when_value, allow_mutation_sources);
+        const when = try parseRowsExpressionConditionWithScalarOutputsAlloc(alloc, schema, source_schema, when_value, allow_mutation_sources, scalar_subqueries);
         var when_transferred = false;
         errdefer if (!when_transferred) freeRowsQueryExpressionCondition(alloc, when);
-        const then = try parseRowsExpressionWithSourceSchemaAlloc(alloc, schema, source_schema, then_value, allow_mutation_sources);
+        const then = try parseRowsExpressionWithScalarOutputsAlloc(alloc, schema, source_schema, then_value, allow_mutation_sources, scalar_subqueries);
         var then_transferred = false;
         errdefer if (!then_transferred) freeRowsQueryExpression(alloc, then);
         branches[initialized] = .{ .when = when, .then = then };
@@ -13554,10 +13738,18 @@ fn parseRowsCaseExpressionWithSourceSchemaAlloc(
             alloc.free(fallback);
         }
     }
-    fallback[0] = try parseRowsExpressionWithSourceSchemaAlloc(alloc, schema, source_schema, else_value, allow_mutation_sources);
+    fallback[0] = try parseRowsExpressionWithScalarOutputsAlloc(alloc, schema, source_schema, else_value, allow_mutation_sources, scalar_subqueries);
     fallback_initialized = true;
 
-    _ = try rowsCaseExpressionOutputTypeWithSources(alloc, schema, source_schema, branches[0..initialized], fallback);
+    var references_scalar_output = false;
+    for (branches[0..initialized]) |branch| {
+        if (rowsExpressionReferencesScalarOutput(branch.then, scalar_subqueries)) {
+            references_scalar_output = true;
+            break;
+        }
+    }
+    if (!references_scalar_output and rowsExpressionReferencesScalarOutput(fallback[0], scalar_subqueries)) references_scalar_output = true;
+    if (!references_scalar_output) _ = try rowsCaseExpressionOutputTypeWithSources(alloc, schema, source_schema, branches[0..initialized], fallback);
 
     fallback_transferred = true;
     return .{
@@ -13581,7 +13773,7 @@ fn parseRowsExpressionConditionAlloc(
     value: std.json.Value,
     allow_mutation_sources: bool,
 ) anyerror!db_mod.types.RelationalRowsExpressionCondition {
-    return try parseRowsExpressionConditionWithSourceSchemaAlloc(alloc, schema, null, value, allow_mutation_sources);
+    return try parseRowsExpressionConditionWithScalarOutputsAlloc(alloc, schema, null, value, allow_mutation_sources, &.{});
 }
 
 fn parseRowsExpressionConditionWithSourceSchemaAlloc(
@@ -13590,6 +13782,17 @@ fn parseRowsExpressionConditionWithSourceSchemaAlloc(
     source_schema: ?runtime_schema.TableSchema,
     value: std.json.Value,
     allow_mutation_sources: bool,
+) anyerror!db_mod.types.RelationalRowsExpressionCondition {
+    return try parseRowsExpressionConditionWithScalarOutputsAlloc(alloc, schema, source_schema, value, allow_mutation_sources, &.{});
+}
+
+fn parseRowsExpressionConditionWithScalarOutputsAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    source_schema: ?runtime_schema.TableSchema,
+    value: std.json.Value,
+    allow_mutation_sources: bool,
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
 ) anyerror!db_mod.types.RelationalRowsExpressionCondition {
     if (value != .object) return error.InvalidRowsRequest;
     try requireJsonObjectOnlyKeys(value.object, &.{ "lhs", "op", "rhs" });
@@ -13602,7 +13805,7 @@ fn parseRowsExpressionConditionWithSourceSchemaAlloc(
     if (rhs_needed and rhs_value == null) return error.InvalidRowsRequest;
     if (!rhs_needed and rhs_value != null) return error.InvalidRowsRequest;
 
-    const lhs = try parseRowsExpressionWithSourceSchemaAlloc(alloc, schema, source_schema, lhs_value, allow_mutation_sources);
+    const lhs = try parseRowsExpressionWithScalarOutputsAlloc(alloc, schema, source_schema, lhs_value, allow_mutation_sources, scalar_subqueries);
     var lhs_transferred = false;
     errdefer if (!lhs_transferred) freeRowsQueryExpression(alloc, lhs);
 
@@ -13610,7 +13813,7 @@ fn parseRowsExpressionConditionWithSourceSchemaAlloc(
         const out = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
         var out_transferred = false;
         errdefer if (!out_transferred) alloc.free(out);
-        out[0] = try parseRowsExpressionWithSourceSchemaAlloc(alloc, schema, source_schema, rhs_json, allow_mutation_sources);
+        out[0] = try parseRowsExpressionWithScalarOutputsAlloc(alloc, schema, source_schema, rhs_json, allow_mutation_sources, scalar_subqueries);
         out_transferred = true;
         break :blk out;
     } else &.{};
@@ -18585,6 +18788,7 @@ fn appendTypedConflictUpdateAlloc(
     table_name: []const u8,
     schema: runtime_schema.TableSchema,
     req: db_mod.types.RelationalRowsInsertSourceRequest,
+    source_row_json: []const u8,
     proposed_row_json: []const u8,
     conflict: db_mod.types.RelationalRowsOnConflict,
     key: []const u8,
@@ -18602,10 +18806,13 @@ fn appendTypedConflictUpdateAlloc(
     var parsed_proposed = std.json.parseFromSlice(std.json.Value, alloc, proposed_row_json, .{}) catch return error.InvalidRowsRequest;
     defer parsed_proposed.deinit();
     if (parsed_proposed.value != .object) return error.InvalidRowsRequest;
+    var parsed_source = std.json.parseFromSlice(std.json.Value, alloc, source_row_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed_source.deinit();
+    if (parsed_source.value != .object) return error.InvalidRowsRequest;
 
-    if (!try typedConflictActionConditionsMatch(alloc, parsed_existing.value, parsed_proposed.value, conflict)) return;
+    if (!try typedConflictActionConditionsMatch(alloc, parsed_existing.value, parsed_proposed.value, parsed_source.value, conflict)) return;
 
-    var operations = try typedConflictUpdateOperationsAlloc(alloc, conflict, parsed_existing.value, parsed_proposed.value);
+    var operations = try typedConflictUpdateOperationsAlloc(alloc, conflict, parsed_existing.value, parsed_proposed.value, parsed_source.value);
     var operations_transferred = false;
     errdefer if (!operations_transferred) freeTransformOps(alloc, operations);
     operations = try extendOperationsWithOnUpdateAlloc(alloc, operations, schema);
@@ -18638,16 +18845,17 @@ fn typedConflictActionConditionsMatch(
     alloc: std.mem.Allocator,
     existing_row: std.json.Value,
     proposed_row: std.json.Value,
+    source_row: std.json.Value,
     conflict: db_mod.types.RelationalRowsOnConflict,
 ) !bool {
     if (conflict.where_expression) |condition| {
-        if (!try expressionConditionMatchesWithSources(alloc, existing_row, proposed_row, condition)) return false;
+        if (!try expressionConditionMatchesWithExplicitSource(alloc, existing_row, proposed_row, source_row, condition)) return false;
     }
     for (conflict.where_expressions) |condition| {
-        if (!try expressionConditionMatchesWithSources(alloc, existing_row, proposed_row, condition)) return false;
+        if (!try expressionConditionMatchesWithExplicitSource(alloc, existing_row, proposed_row, source_row, condition)) return false;
     }
-    if (!try conflictExpressionOrPredicateGroupsPass(alloc, existing_row, proposed_row, conflict.where_any)) return false;
-    if (!try conflictExpressionNotPredicateGroupsPass(alloc, existing_row, proposed_row, conflict.where_not)) return false;
+    if (!try conflictExpressionOrPredicateGroupsPass(alloc, existing_row, proposed_row, source_row, conflict.where_any)) return false;
+    if (!try conflictExpressionNotPredicateGroupsPass(alloc, existing_row, proposed_row, source_row, conflict.where_not)) return false;
     return true;
 }
 
@@ -18655,13 +18863,14 @@ fn conflictExpressionOrPredicateGroupsPass(
     alloc: std.mem.Allocator,
     existing_row: std.json.Value,
     proposed_row: ?std.json.Value,
+    source_row: ?std.json.Value,
     groups: []const db_mod.types.RelationalRowsExpressionPredicateGroup,
 ) !bool {
     if (groups.len == 0) return true;
     for (groups) |group| {
         var group_passes = true;
         for (group.conditions) |condition| {
-            if (!try expressionConditionMatchesWithSources(alloc, existing_row, proposed_row, condition)) {
+            if (!try expressionConditionMatchesWithExplicitSource(alloc, existing_row, proposed_row, source_row, condition)) {
                 group_passes = false;
                 break;
             }
@@ -18675,12 +18884,13 @@ fn conflictExpressionNotPredicateGroupsPass(
     alloc: std.mem.Allocator,
     existing_row: std.json.Value,
     proposed_row: ?std.json.Value,
+    source_row: ?std.json.Value,
     groups: []const db_mod.types.RelationalRowsExpressionPredicateGroup,
 ) !bool {
     for (groups) |group| {
         var group_passes = true;
         for (group.conditions) |condition| {
-            if (!try expressionConditionMatchesWithSources(alloc, existing_row, proposed_row, condition)) {
+            if (!try expressionConditionMatchesWithExplicitSource(alloc, existing_row, proposed_row, source_row, condition)) {
                 group_passes = false;
                 break;
             }
@@ -18695,6 +18905,7 @@ fn typedConflictUpdateOperationsAlloc(
     conflict: db_mod.types.RelationalRowsOnConflict,
     existing_row: std.json.Value,
     proposed_row: std.json.Value,
+    source_row: std.json.Value,
 ) ![]db_mod.types.TransformOp {
     var operations = std.ArrayListUnmanaged(db_mod.types.TransformOp).empty;
     errdefer {
@@ -18718,7 +18929,7 @@ fn typedConflictUpdateOperationsAlloc(
     }
 
     for (conflict.patch_expressions) |assignment| {
-        const value_json = try expressionValueJsonWithSourcesAlloc(alloc, existing_row, proposed_row, assignment.expression);
+        const value_json = try expressionValueJsonWithExplicitSourceAlloc(alloc, existing_row, proposed_row, source_row, assignment.expression);
         var value_transferred = false;
         errdefer if (!value_transferred) alloc.free(value_json);
         const path = try alloc.dupe(u8, assignment.field);
@@ -18730,7 +18941,7 @@ fn typedConflictUpdateOperationsAlloc(
     }
 
     for (conflict.increment_expressions) |assignment| {
-        const value_json = try expressionValueJsonWithSourcesAlloc(alloc, existing_row, proposed_row, assignment.expression);
+        const value_json = try expressionValueJsonWithExplicitSourceAlloc(alloc, existing_row, proposed_row, source_row, assignment.expression);
         var value_transferred = false;
         errdefer if (!value_transferred) alloc.free(value_json);
         try validateIncrementExpressionValueJson(alloc, value_json);
@@ -18746,7 +18957,7 @@ fn typedConflictUpdateOperationsAlloc(
         const transform_path = try jsonSetTypedTransformPathAlloc(alloc, assignment.field, assignment.path);
         var path_transferred = false;
         errdefer if (!path_transferred) alloc.free(transform_path);
-        const value_json = try expressionValueJsonWithSourcesAlloc(alloc, existing_row, proposed_row, assignment.expression);
+        const value_json = try expressionValueJsonWithExplicitSourceAlloc(alloc, existing_row, proposed_row, source_row, assignment.expression);
         var value_transferred = false;
         errdefer if (!value_transferred) alloc.free(value_json);
         try operations.append(alloc, .{ .op = .set, .path = transform_path, .value_json = value_json });
@@ -18847,12 +19058,12 @@ fn conflictActionConditionMatches(
     if (conflict_value.object.get("where_any")) |groups_value| {
         const groups = try parseRowsConflictWhereExpressionGroupsAlloc(alloc, schema, groups_value);
         defer freeRowsQueryExpressionPredicateGroups(alloc, groups);
-        if (!try conflictExpressionOrPredicateGroupsPass(alloc, existing_row, proposed_row, groups)) return false;
+        if (!try conflictExpressionOrPredicateGroupsPass(alloc, existing_row, proposed_row, null, groups)) return false;
     }
     if (conflict_value.object.get("where_not")) |groups_value| {
         const groups = try parseRowsConflictWhereExpressionGroupsAlloc(alloc, schema, groups_value);
         defer freeRowsQueryExpressionPredicateGroups(alloc, groups);
-        if (!try conflictExpressionNotPredicateGroupsPass(alloc, existing_row, proposed_row, groups)) return false;
+        if (!try conflictExpressionNotPredicateGroupsPass(alloc, existing_row, proposed_row, null, groups)) return false;
     }
     return true;
 }
@@ -19440,6 +19651,7 @@ fn parseRowsMutationExpressionAssignmentsAlloc(
     require_numeric: bool,
     allow_proposed_source: bool,
     allow_primary_key: bool,
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
 ) ![]db_mod.types.RelationalRowsExpressionAssignment {
     const assignments_value = maybe_assignments orelse return &.{};
     if (assignments_value != .object) return error.InvalidRowsRequest;
@@ -19461,13 +19673,14 @@ fn parseRowsMutationExpressionAssignmentsAlloc(
             if (!allow_primary_key and primaryKeyContains(primary_key, entry.key_ptr.*)) return error.InvalidRowsRequest;
         }
         if (require_numeric and column.field_type != .numeric) return error.InvalidRowsRequest;
-        const expression = try parseRowsMutationExpressionAlloc(alloc, schema, entry.value_ptr.*);
+        const expression = try parseRowsMutationExpressionWithScalarOutputsAlloc(alloc, schema, entry.value_ptr.*, scalar_subqueries);
         var expression_transferred = false;
         errdefer if (!expression_transferred) freeRowsQueryExpression(alloc, expression);
         if (!allow_proposed_source and expressionUsesProposedSource(expression)) return error.InvalidRowsRequest;
-        if (require_numeric or column.field_type == .numeric or column.field_type == .datetime) {
+        const references_scalar_output = rowsExpressionReferencesScalarOutput(expression, scalar_subqueries);
+        if (!references_scalar_output and (require_numeric or column.field_type == .numeric or column.field_type == .datetime)) {
             try validateRowsQueryNumericExpression(alloc, schema, expression);
-        } else if (column.field_type == .keyword or column.field_type == .text or column.field_type == .link) {
+        } else if (!references_scalar_output and (column.field_type == .keyword or column.field_type == .text or column.field_type == .link)) {
             try validateRowsQueryTextExpression(alloc, schema, expression);
         }
         const field = try alloc.dupe(u8, column.path);
@@ -19651,9 +19864,9 @@ fn parseRowsOnConflictAlloc(
 
     const operations = try staticUpdateTransformOperationsAlloc(alloc, schema, conflict_value, true, false);
     errdefer freeTransformOps(alloc, operations);
-    const patch_expressions = try parseRowsMutationExpressionAssignmentsAlloc(alloc, schema, conflict_value.object.get("patch_expr"), false, true, false);
+    const patch_expressions = try parseRowsMutationExpressionAssignmentsAlloc(alloc, schema, conflict_value.object.get("patch_expr"), false, true, false, &.{});
     errdefer freeRowsExpressionAssignments(alloc, patch_expressions);
-    const increment_expressions = try parseRowsMutationExpressionAssignmentsAlloc(alloc, schema, conflict_value.object.get("increment_expr"), true, true, false);
+    const increment_expressions = try parseRowsMutationExpressionAssignmentsAlloc(alloc, schema, conflict_value.object.get("increment_expr"), true, true, false, &.{});
     errdefer freeRowsExpressionAssignments(alloc, increment_expressions);
     const json_set_expressions = try parseRowsMutationJsonSetExpressionAssignmentsAlloc(alloc, schema, conflict_value.object.get("json_set"), true);
     errdefer freeRowsJsonSetExpressionAssignments(alloc, json_set_expressions);
@@ -25758,13 +25971,14 @@ test "relational rows lateral contract accepts bounded correlated plans" {
     try std.testing.expectEqual(@as(usize, 1), request.correlations.len);
     try std.testing.expectEqualStrings("id", request.correlations[0].left_field);
     try std.testing.expectEqualStrings("customer_id", request.correlations[0].right_field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, request.correlations[0].op);
     try std.testing.expectEqual(@as(usize, 2), request.select.len);
     try std.testing.expectEqual(@as(usize, 1), request.order_by.len);
     try std.testing.expectEqual(@as(u32, 10), request.limit.?);
 
     var rich_request = try parseRowsLateralRequest(
         std.testing.allocator,
-        "{\"left\":{\"expression_not\":[{\"all\":[{\"lhs\":{\"op\":\"mul\",\"args\":[{\"field\":\"rank\"},{\"value\":2}]},\"op\":\"gte\",\"rhs\":{\"value\":3}},{\"lhs\":{\"op\":\"mul\",\"args\":[{\"field\":\"rank\"},{\"value\":2}]},\"op\":\"lte\",\"rhs\":{\"value\":10}}]}]},\"right\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},\"expression_array_contains\":[{\"expr\":{\"op\":\"string_to_array\",\"args\":[{\"field\":\"scope\"},{\"value\":\" \"}]},\"value\":[\"read\"]}],\"order_by\":[{\"field\":\"created_at\",\"direction\":\"desc\"}],\"limit\":2},\"correlations\":[{\"left_field\":\"id\",\"right_field\":\"customer_id\"}],\"select\":[{\"as\":\"customer_id\",\"side\":\"left\",\"field\":\"id\"},{\"as\":\"latest_order_id\",\"side\":\"right\",\"field\":\"id\"}],\"order_by\":[{\"expr\":{\"op\":\"lower\",\"args\":[{\"field\":\"latest_order_id\"}]},\"direction\":\"desc\"},{\"field\":\"customer_id\",\"null_test\":\"is_not_null\"}],\"limit\":4}",
+        "{\"left\":{\"expression_not\":[{\"all\":[{\"lhs\":{\"op\":\"mul\",\"args\":[{\"field\":\"rank\"},{\"value\":2}]},\"op\":\"gte\",\"rhs\":{\"value\":3}},{\"lhs\":{\"op\":\"mul\",\"args\":[{\"field\":\"rank\"},{\"value\":2}]},\"op\":\"lte\",\"rhs\":{\"value\":10}}]}]},\"right\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},\"expression_array_contains\":[{\"expr\":{\"op\":\"string_to_array\",\"args\":[{\"field\":\"scope\"},{\"value\":\" \"}]},\"value\":[\"read\"]}],\"order_by\":[{\"field\":\"created_at\",\"direction\":\"desc\"}],\"limit\":2},\"correlations\":[{\"left_field\":\"id\",\"right_field\":\"customer_id\",\"op\":\"gt\"}],\"select\":[{\"as\":\"customer_id\",\"side\":\"left\",\"field\":\"id\"},{\"as\":\"latest_order_id\",\"side\":\"right\",\"field\":\"id\"}],\"order_by\":[{\"expr\":{\"op\":\"lower\",\"args\":[{\"field\":\"latest_order_id\"}]},\"direction\":\"desc\"},{\"field\":\"customer_id\",\"null_test\":\"is_not_null\"}],\"limit\":4}",
         schema,
     );
     defer rich_request.deinit(std.testing.allocator);
@@ -25778,6 +25992,7 @@ test "relational rows lateral contract accepts bounded correlated plans" {
     try std.testing.expectEqual(RowsQueryOrderNullTest.is_not_null, rich_request.order_by[1].null_test.?);
     try std.testing.expectEqual(@as(u32, 2), rich_request.right.limit.?);
     try std.testing.expectEqual(@as(u32, 4), rich_request.limit.?);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, rich_request.correlations[0].op);
 
     var residual_request = try parseRowsLateralRequest(
         std.testing.allocator,

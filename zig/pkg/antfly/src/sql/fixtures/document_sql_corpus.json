@@ -38,6 +38,54 @@
       "expected": {"error": "UnsupportedSqlShape"}
     },
     {
+      "name": "lower prefix helper matches ASCII uppercase row value",
+      "document_json": "{\"status\":\"ACTIVE\"}",
+      "filter_json": "{\"text_lower_prefix\":{\"path\":\"/status\",\"value\":\"act\"}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "lower wildcard helper matches ASCII uppercase row value",
+      "document_json": "{\"status\":\"ARCHIVED\"}",
+      "filter_json": "{\"text_lower_wildcard\":{\"path\":\"/status\",\"pattern\":\"a?ch*\"}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "lower prefix helper rejects unrelated row value",
+      "document_json": "{\"status\":\"pending\"}",
+      "filter_json": "{\"text_lower_prefix\":{\"path\":\"/status\",\"value\":\"act\"}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "lower wildcard helper fails closed on non-ASCII row value",
+      "document_json": "{\"status\":\"CAF\u00c9\"}",
+      "filter_json": "{\"text_lower_wildcard\":{\"path\":\"/status\",\"pattern\":\"caf*\"}}",
+      "expected": {"error": "UnsupportedSqlShape"}
+    },
+    {
+      "name": "text length range matches exact string length",
+      "document_json": "{\"status\":\"active\"}",
+      "filter_json": "{\"text_length_range\":{\"path\":\"/status\",\"min\":6,\"max\":6,\"inclusive_min\":true,\"inclusive_max\":true}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "text length range rejects shorter string",
+      "document_json": "{\"status\":\"open\"}",
+      "filter_json": "{\"text_length_range\":{\"path\":\"/status\",\"min\":6,\"max\":6,\"inclusive_min\":true,\"inclusive_max\":true}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "text length range counts UTF-8 codepoints",
+      "document_json": "{\"status\":\"caf\u00e9\"}",
+      "filter_json": "{\"text_length_range\":{\"path\":\"/status\",\"min\":4,\"inclusive_min\":true}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "text length range rejects non-string row value",
+      "document_json": "{\"status\":6}",
+      "filter_json": "{\"text_length_range\":{\"path\":\"/status\",\"min\":6,\"inclusive_min\":true}}",
+      "expected": {"error": "InvalidRowsRequest"}
+    },
+    {
       "name": "numeric abs range matches negative value against inclusive max",
       "document_json": "{\"delta\":-12}",
       "filter_json": "{\"numeric_abs_range\":{\"path\":\"/delta\",\"max\":12,\"inclusive_max\":true}}",
@@ -65,6 +113,114 @@
       "name": "numeric abs range rejects non-numeric row value",
       "document_json": "{\"delta\":\"large\"}",
       "filter_json": "{\"numeric_abs_range\":{\"path\":\"/delta\",\"max\":12,\"inclusive_max\":true}}",
+      "expected": {"error": "InvalidRowsRequest"}
+    },
+    {
+      "name": "numeric arithmetic range matches computed addition",
+      "document_json": "{\"amount\":10}",
+      "filter_json": "{\"numeric_arithmetic_range\":{\"path\":\"/amount\",\"operator\":\"add\",\"operand\":1,\"min\":10,\"inclusive_min\":false}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "numeric arithmetic range rejects computed addition below bound",
+      "document_json": "{\"amount\":9}",
+      "filter_json": "{\"numeric_arithmetic_range\":{\"path\":\"/amount\",\"operator\":\"add\",\"operand\":1,\"min\":10,\"inclusive_min\":false}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "numeric arithmetic range matches computed multiplication",
+      "document_json": "{\"amount\":5}",
+      "filter_json": "{\"numeric_arithmetic_range\":{\"path\":\"/amount\",\"operator\":\"mul\",\"operand\":2,\"min\":10,\"max\":10,\"inclusive_min\":true,\"inclusive_max\":true}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "numeric arithmetic range rejects non-numeric row value",
+      "document_json": "{\"amount\":\"large\"}",
+      "filter_json": "{\"numeric_arithmetic_range\":{\"path\":\"/amount\",\"operator\":\"add\",\"operand\":1,\"min\":10,\"inclusive_min\":false}}",
+      "expected": {"error": "InvalidRowsRequest"}
+    },
+    {
+      "name": "numeric arithmetic range rejects unknown operator",
+      "document_json": "{\"amount\":10}",
+      "filter_json": "{\"numeric_arithmetic_range\":{\"path\":\"/amount\",\"operator\":\"pow\",\"operand\":2,\"min\":10,\"inclusive_min\":false}}",
+      "expected": {"error": "InvalidRowsRequest"}
+    },
+    {
+      "name": "scalar text cast residual matches numeric value",
+      "document_json": "{\"amount\":12}",
+      "filter_json": "{\"scalar_text_cast_term\":{\"path\":\"/amount\",\"value\":\"12\"}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "scalar text cast residual rejects different numeric value",
+      "document_json": "{\"amount\":13}",
+      "filter_json": "{\"scalar_text_cast_term\":{\"path\":\"/amount\",\"value\":\"12\"}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "scalar numeric cast residual matches string value",
+      "document_json": "{\"encoded\":\"12.5\"}",
+      "filter_json": "{\"scalar_numeric_cast_range\":{\"path\":\"/encoded\",\"min\":12,\"inclusive_min\":false,\"max\":13,\"inclusive_max\":false}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "scalar numeric cast residual rejects value below bound",
+      "document_json": "{\"amount\":11}",
+      "filter_json": "{\"scalar_numeric_cast_range\":{\"path\":\"/amount\",\"min\":12,\"inclusive_min\":true}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "scalar boolean cast residual matches string value",
+      "document_json": "{\"encoded\":\"false\"}",
+      "filter_json": "{\"scalar_boolean_cast_term\":{\"path\":\"/encoded\",\"value\":false}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "scalar boolean cast residual rejects different value",
+      "document_json": "{\"active\":false}",
+      "filter_json": "{\"scalar_boolean_cast_term\":{\"path\":\"/active\",\"value\":true}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "scalar datetime cast residual matches string nanoseconds",
+      "document_json": "{\"encoded\":\"987654\"}",
+      "filter_json": "{\"scalar_datetime_cast_range\":{\"path\":\"/encoded\",\"min\":987000,\"inclusive_min\":true,\"max\":988000,\"inclusive_max\":false}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "scalar datetime cast residual rejects value below bound",
+      "document_json": "{\"created_at\":123455}",
+      "filter_json": "{\"scalar_datetime_cast_range\":{\"path\":\"/created_at\",\"min\":123456,\"inclusive_min\":true}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "text regex residual matches row value",
+      "document_json": "{\"status\":\"active\"}",
+      "filter_json": "{\"text_regex\":{\"path\":\"/status\",\"pattern\":\"act.*\",\"case_insensitive\":false}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "text regex residual rejects nonmatching row value",
+      "document_json": "{\"status\":\"archived\"}",
+      "filter_json": "{\"text_regex\":{\"path\":\"/status\",\"pattern\":\"act.*\",\"case_insensitive\":false}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "case-insensitive text regex residual matches uppercase row value",
+      "document_json": "{\"status\":\"ACTIVE\"}",
+      "filter_json": "{\"text_regex\":{\"path\":\"/status\",\"pattern\":\"act.*\",\"case_insensitive\":true}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "case-insensitive text regex residual fails closed on non-ASCII row value",
+      "document_json": "{\"status\":\"CAF\u00c9\"}",
+      "filter_json": "{\"text_regex\":{\"path\":\"/status\",\"pattern\":\"caf.*\",\"case_insensitive\":true}}",
+      "expected": {"error": "UnsupportedSqlShape"}
+    },
+    {
+      "name": "text regex residual rejects non-string row value",
+      "document_json": "{\"status\":12}",
+      "filter_json": "{\"text_regex\":{\"path\":\"/status\",\"pattern\":\"act.*\",\"case_insensitive\":false}}",
       "expected": {"error": "InvalidRowsRequest"}
     },
     {
@@ -143,6 +299,18 @@
       "name": "exclusion-only bool rejects matching row",
       "document_json": "{\"status\":\"archived\",\"region\":\"west\"}",
       "filter_json": "{\"bool\":{\"must_not\":[{\"term\":{\"path\":\"/status\",\"value\":\"archived\"}}]}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "exclusion-only bool terms admits nonmatching row",
+      "document_json": "{\"region\":\"west\"}",
+      "filter_json": "{\"bool\":{\"must_not\":[{\"terms\":{\"path\":\"/region\",\"values\":[\"internal\",\"legacy\"]}}]}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "exclusion-only bool terms rejects matching row",
+      "document_json": "{\"region\":\"legacy\"}",
+      "filter_json": "{\"bool\":{\"must_not\":[{\"terms\":{\"path\":\"/region\",\"values\":[\"internal\",\"legacy\"]}}]}}",
       "expected": {"matches": false}
     },
     {
@@ -240,35 +408,237 @@
       "document_json": "{\"status\":\"archived\",\"tenant_id\":\"tenant-b\"}",
       "filter_json": "{\"disjuncts\":[{\"term\":{\"path\":\"/status\",\"value\":\"active\"}},{\"term\":{\"path\":\"/tenant_id\",\"value\":\"tenant-a\"}}]}",
       "expected": {"matches": false}
+    },
+    {
+      "name": "case-insensitive prefix residual matches uppercase row value",
+      "document_json": "{\"category\":\"Alpha\"}",
+      "filter_json": "{\"disjuncts\":[{\"prefix\":{\"path\":\"/category\",\"value\":\"a\"}},{\"prefix\":{\"path\":\"/category\",\"value\":\"A\"}}]}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "case-insensitive prefix residual rejects unrelated row value",
+      "document_json": "{\"category\":\"beta\"}",
+      "filter_json": "{\"disjuncts\":[{\"prefix\":{\"path\":\"/category\",\"value\":\"a\"}},{\"prefix\":{\"path\":\"/category\",\"value\":\"A\"}}]}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "nullif residual matches non-null text result",
+      "document_json": "{\"status\":\"active\"}",
+      "filter_json": "{\"text_nullif_term\":{\"path\":\"/status\",\"nullif\":\"archived\",\"value\":\"active\"}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "nullif residual rejects nullified text result",
+      "document_json": "{\"status\":\"archived\"}",
+      "filter_json": "{\"text_nullif_term\":{\"path\":\"/status\",\"nullif\":\"archived\",\"value\":\"active\"}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "replace residual matches rewritten text result",
+      "document_json": "{\"status\":\"ready-ready\"}",
+      "filter_json": "{\"text_replace_term\":{\"path\":\"/status\",\"needle\":\"-\",\"replacement\":\" \",\"value\":\"ready ready\"}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "replace residual rejects unrelated rewritten text result",
+      "document_json": "{\"status\":\"pending\"}",
+      "filter_json": "{\"text_replace_term\":{\"path\":\"/status\",\"needle\":\"-\",\"replacement\":\" \",\"value\":\"ready ready\"}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "translate residual matches mapped text result",
+      "document_json": "{\"status\":\"abc-de\"}",
+      "filter_json": "{\"text_translate_term\":{\"path\":\"/status\",\"from\":\"abc\",\"to\":\"xyz\",\"value\":\"xyz-de\"}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "translate residual rejects unrelated mapped text result",
+      "document_json": "{\"status\":\"pending\"}",
+      "filter_json": "{\"text_translate_term\":{\"path\":\"/status\",\"from\":\"abc\",\"to\":\"xyz\",\"value\":\"xyz-de\"}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "pad residual matches left padded text result",
+      "document_json": "{\"status\":\"abc\"}",
+      "filter_json": "{\"text_pad_term\":{\"path\":\"/status\",\"side\":\"left\",\"width\":5,\"fill\":\"0\",\"value\":\"00abc\"}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "pad residual rejects wrong side padded text result",
+      "document_json": "{\"status\":\"abc\"}",
+      "filter_json": "{\"text_pad_term\":{\"path\":\"/status\",\"side\":\"right\",\"width\":5,\"fill\":\"0\",\"value\":\"00abc\"}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "split part residual matches selected text part",
+      "document_json": "{\"status\":\"first:middle:last\"}",
+      "filter_json": "{\"text_split_part_term\":{\"path\":\"/status\",\"delimiter\":\":\",\"index\":2,\"value\":\"middle\"}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "split part residual rejects different text part",
+      "document_json": "{\"status\":\"first:middle:last\"}",
+      "filter_json": "{\"text_split_part_term\":{\"path\":\"/status\",\"delimiter\":\":\",\"index\":2,\"value\":\"last\"}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "text affix residual matches prefix",
+      "document_json": "{\"status\":\"open-tail\"}",
+      "filter_json": "{\"text_affix_term\":{\"path\":\"/status\",\"side\":\"prefix\",\"value\":\"open\"}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "text affix residual rejects wrong suffix",
+      "document_json": "{\"status\":\"open-tail\"}",
+      "filter_json": "{\"text_affix_term\":{\"path\":\"/status\",\"side\":\"suffix\",\"value\":\"open\"}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "text position residual matches codepoint position",
+      "document_json": "{\"status\":\"opén-tail\"}",
+      "filter_json": "{\"text_strpos_range\":{\"path\":\"/status\",\"needle\":\"é\",\"min\":3,\"max\":3,\"inclusive_min\":true,\"inclusive_max\":true}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "text position residual rejects out of range position",
+      "document_json": "{\"status\":\"open-tail\"}",
+      "filter_json": "{\"text_strpos_range\":{\"path\":\"/status\",\"needle\":\"tail\",\"max\":4,\"inclusive_max\":true}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "text ascii residual matches first codepoint",
+      "document_json": "{\"status\":\"Active\"}",
+      "filter_json": "{\"text_ascii_range\":{\"path\":\"/status\",\"min\":65,\"max\":65,\"inclusive_min\":true,\"inclusive_max\":true}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "text ascii residual rejects different first codepoint",
+      "document_json": "{\"status\":\"Active\"}",
+      "filter_json": "{\"text_ascii_range\":{\"path\":\"/status\",\"min\":66,\"inclusive_min\":true}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "regexp count residual matches repeated digit groups",
+      "document_json": "{\"status\":\"a12 b34\"}",
+      "filter_json": "{\"regexp_count_range\":{\"path\":\"/status\",\"pattern\":\"[0-9]+\",\"min\":2,\"max\":2,\"inclusive_min\":true,\"inclusive_max\":true}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "regexp substr residual rejects missing match",
+      "document_json": "{\"status\":\"abc DEF\"}",
+      "filter_json": "{\"regexp_substr_term\":{\"path\":\"/status\",\"pattern\":\"[0-9]+\",\"value\":\"123\"}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "text chr residual matches numeric codepoint field",
+      "document_json": "{\"amount\":65}",
+      "filter_json": "{\"text_chr_term\":{\"path\":\"/amount\",\"value\":\"A\"}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "text chr residual rejects different codepoint result",
+      "document_json": "{\"amount\":66}",
+      "filter_json": "{\"text_chr_term\":{\"path\":\"/amount\",\"value\":\"A\"}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "text unary residual matches initcap result",
+      "document_json": "{\"status\":\"open tail\"}",
+      "filter_json": "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"initcap\",\"value\":\"Open Tail\"}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "text unary residual matches md5 result",
+      "document_json": "{\"status\":\"hello\"}",
+      "filter_json": "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"md5\",\"value\":\"5d41402abc4b2a76b9719d911017c592\"}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "text unary residual matches reverse result",
+      "document_json": "{\"status\":\"héllo\"}",
+      "filter_json": "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"reverse\",\"value\":\"olléh\"}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "text unary residual matches default trim result",
+      "document_json": "{\"status\":\"  ready  \"}",
+      "filter_json": "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"btrim\",\"value\":\"ready\"}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "text concat ws residual matches joined fields",
+      "document_json": "{\"status\":\"active\",\"next_status\":\"queued\"}",
+      "filter_json": "{\"text_concat_ws_term\":{\"path\":\"/status\",\"path2\":\"/next_status\",\"separator\":\"-\",\"value\":\"active-queued\"}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "text concat ws residual rejects different separator result",
+      "document_json": "{\"status\":\"active\",\"next_status\":\"queued\"}",
+      "filter_json": "{\"text_concat_ws_term\":{\"path\":\"/status\",\"path2\":\"/next_status\",\"separator\":\":\",\"value\":\"active-queued\"}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "text repeat residual matches repeated result",
+      "document_json": "{\"status\":\"ab\"}",
+      "filter_json": "{\"text_repeat_term\":{\"path\":\"/status\",\"count\":2,\"value\":\"abab\"}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "text repeat residual rejects different repeated result",
+      "document_json": "{\"status\":\"ab\"}",
+      "filter_json": "{\"text_repeat_term\":{\"path\":\"/status\",\"count\":2,\"value\":\"ab\"}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "text slice residual matches left result",
+      "document_json": "{\"status\":\"abcdef\"}",
+      "filter_json": "{\"text_slice_term\":{\"path\":\"/status\",\"side\":\"left\",\"count\":2,\"value\":\"ab\"}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "text slice residual rejects wrong right result",
+      "document_json": "{\"status\":\"abcdef\"}",
+      "filter_json": "{\"text_slice_term\":{\"path\":\"/status\",\"side\":\"right\",\"count\":3,\"value\":\"abc\"}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "text substring residual matches selected part",
+      "document_json": "{\"status\":\"abcdef\"}",
+      "filter_json": "{\"text_substring_term\":{\"path\":\"/status\",\"start\":2,\"length\":3,\"value\":\"bcd\"}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "text substring residual rejects different selected part",
+      "document_json": "{\"status\":\"abcdef\"}",
+      "filter_json": "{\"text_substring_term\":{\"path\":\"/status\",\"start\":2,\"length\":3,\"value\":\"abc\"}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "text overlay residual matches replacement result",
+      "document_json": "{\"status\":\"abcdef\"}",
+      "filter_json": "{\"text_overlay_term\":{\"path\":\"/status\",\"replacement\":\"XX\",\"start\":2,\"length\":3,\"value\":\"aXXef\"}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "text overlay residual rejects different replacement result",
+      "document_json": "{\"status\":\"abcdef\"}",
+      "filter_json": "{\"text_overlay_term\":{\"path\":\"/status\",\"replacement\":\"XX\",\"start\":2,\"length\":3,\"value\":\"abcXX\"}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "json typeof residual matches nested array value",
+      "document_json": "{\"metadata\":{\"flags\":[\"urgent\"]}}",
+      "filter_json": "{\"json_typeof_term\":{\"path\":\"/metadata/flags\",\"value\":\"array\"}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "json typeof residual rejects absent path",
+      "document_json": "{\"metadata\":{}}",
+      "filter_json": "{\"json_typeof_term\":{\"path\":\"/metadata/flags\",\"value\":\"null\"}}",
+      "expected": {"matches": false}
     }
   ],
-  "unsupported_residual_expression_cases": [
-    {
-      "name": "arbitrary string length helper",
-      "sql": "SELECT _id FROM docs WHERE length(status) = 6 LIMIT 10",
-      "expected_error": "DocumentSqlBoundedScanUnsupportedResidual"
-    },
-    {
-      "name": "case-fold helper with LIKE",
-      "sql": "SELECT _id FROM docs WHERE lower(status) LIKE 'act%' LIMIT 10",
-      "expected_error": "DocumentSqlBoundedScanUnsupportedResidual"
-    },
-    {
-      "name": "numeric arithmetic expression",
-      "sql": "SELECT _id FROM docs WHERE amount + 1 > 10 LIMIT 10",
-      "expected_error": "DocumentSqlBoundedScanUnsupportedResidual"
-    },
-    {
-      "name": "case-insensitive pattern predicate",
-      "sql": "SELECT _id FROM docs WHERE status ILIKE 'act%' LIMIT 10",
-      "expected_error": "DocumentSqlBoundedScanUnsupportedResidual"
-    },
-    {
-      "name": "regex predicate",
-      "sql": "SELECT _id FROM docs WHERE status ~ 'act.*' LIMIT 10",
-      "expected_error": "DocumentSqlBoundedScanUnsupportedResidual"
-    }
-  ],
+  "unsupported_residual_expression_cases": [],
   "document_write_plan_cases": [
     {
       "name": "projection update by exact document id lowers to transform batch",
@@ -2564,6 +2934,44 @@
       }
     },
     {
+      "name": "explicit unnest NOT IN over indexed array lowers to indexed array element producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"tags_array_element\":{\"type\":\"array_element\",\"path\":\"tags\"}}",
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag NOT IN ('stale', 'archived') LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"match_all\""
+        ]
+      }
+    },
+    {
+      "name": "explicit unnest IN plus NOT IN over indexed array lowers to exact remaining array element producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"tags_array_element\":{\"type\":\"array_element\",\"path\":\"tags\"}}",
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag IN ('urgent', 'vip') AND tag NOT IN ('vip') LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"array_any\"",
+          "\"/tags\"",
+          "\"urgent\""
+        ]
+      }
+    },
+    {
+      "name": "explicit unnest NOT IN with NULL over indexed array lowers to match-none producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"tags_array_element\":{\"type\":\"array_element\",\"path\":\"tags\"}}",
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag NOT IN ('urgent', NULL) LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"match_none\""
+        ]
+      }
+    },
+    {
       "name": "explicit unnest equality over unindexed array requires bounded scan policy",
       "schema": "array_unindexed",
       "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag = 'urgent' LIMIT 10",
@@ -2790,6 +3198,32 @@
       }
     },
     {
+      "name": "view-mapped unnest NOT IN over indexed array lowers to indexed array element producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"tags_array\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"tags_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag NOT IN ('stale', 'archived') LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"match_all\""
+        ]
+      }
+    },
+    {
+      "name": "view-mapped unnest IN plus NOT IN over indexed array lowers to exact remaining array element producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"tags_array\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"tags_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag IN ('urgent', 'vip') AND tag NOT IN ('vip') LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"array_any\"",
+          "\"/tags\"",
+          "\"urgent\""
+        ]
+      }
+    },
+    {
       "name": "view-mapped unnest not null predicate over indexed array lowers to indexed array element producer",
       "schema": "array_ready",
       "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"tags_array\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"tags_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
@@ -2881,10 +3315,91 @@
       }
     },
     {
-      "name": "view-mapped correlated lateral subquery remains unsupported until native producer contract exists",
+      "name": "view-mapped correlated lateral subquery lowers when branch echoes indexed correlation field",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"/metadata/plan\""
+        ]
+      }
+    },
+    {
+      "name": "view-mapped unique correlated lateral subquery projects alternate scalar field",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\",\"nullable\":false,\"unique\":true},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"/metadata/plan\""
+        ]
+      }
+    },
+    {
+      "name": "view-mapped ordered correlated lateral subquery lowers when branch row identity is deterministic",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\",\"nullable\":false,\"unique\":true},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, latest.score FROM support_view AS d JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan ORDER BY s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"/metadata/plan\""
+        ]
+      }
+    },
+    {
+      "name": "view-mapped inner correlated lateral subquery requires non-null correlation proof",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\",\"nullable\":false,\"unique\":true},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, latest.score FROM support_view AS d JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"/metadata/plan\""
+        ]
+      }
+    },
+    {
+      "name": "view-mapped cross correlated lateral subquery requires non-null correlation proof",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\",\"nullable\":false,\"unique\":true},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, latest.score FROM support_view AS d CROSS JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"/metadata/plan\""
+        ]
+      }
+    },
+    {
+      "name": "view-mapped correlated lateral alternate projection requires unique correlation proof",
       "schema": "text_only",
       "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}",
-      "sql": "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+      "sql": "SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "expected_error": "DocumentSqlLateralRequiresNativeProducer"
+      }
+    },
+    {
+      "name": "view-mapped left correlated lateral alternate projection admits unique nullable no-match",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\",\"unique\":true},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"/metadata/plan\""
+        ]
+      }
+    },
+    {
+      "name": "view-mapped inner correlated lateral subquery rejects nullable correlation field",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}",
+      "sql": "SELECT d._id, latest.plan FROM support_view AS d JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
       "expected": {
         "expected_error": "DocumentSqlLateralRequiresNativeProducer"
       }
@@ -2899,6 +3414,42 @@
       }
     },
     {
+      "name": "view-mapped correlated lateral subquery branch residual lowers to residual filter",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\",\"nullable\":false,\"unique\":true},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan AND s.score > 100 LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"/metadata/plan\""
+        ]
+      }
+    },
+    {
+      "name": "view-mapped non-unique echo lateral branch residual lowers to branch lookup",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}",
+      "sql": "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan AND s.score > 100 LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"/metadata/plan\""
+        ]
+      }
+    },
+    {
+      "name": "view-mapped correlated lateral subquery source-relative residual lowers with unique correlation proof",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\",\"nullable\":false,\"unique\":true},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan AND s.score > d.score LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"/metadata/plan\""
+        ]
+      }
+    },
+    {
       "name": "view-mapped correlated lateral subquery without branch limit requires cardinality proof",
       "schema": "text_only",
       "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}",
@@ -2908,10 +3459,28 @@
       }
     },
     {
-      "name": "view-mapped correlated lateral subquery ordered branch requires deterministic native ordering proof",
+      "name": "view-mapped correlated lateral subquery expression ordering requires deterministic native ordering proof",
       "schema": "text_only",
       "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}",
-      "sql": "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan ORDER BY s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+      "sql": "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan ORDER BY lower(s.plan) LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "expected_error": "DocumentSqlLateralRequiresNativeProducer"
+      }
+    },
+    {
+      "name": "view-mapped correlated lateral subquery compound ordering without a unique order key remains rejected",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}",
+      "sql": "SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan ORDER BY s.plan ASC, s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "expected_error": "DocumentSqlLateralRequiresNativeProducer"
+      }
+    },
+    {
+      "name": "view-mapped correlated lateral subquery mixed residual and order alternate projection remains rejected",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\",\"unique\":true}]}}}",
+      "sql": "SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan AND s.score > d.score ORDER BY s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
       "expected": {
         "expected_error": "DocumentSqlLateralRequiresNativeProducer"
       }
@@ -2926,12 +3495,63 @@
       }
     },
     {
-      "name": "view-mapped correlated lateral subquery residual predicate requires residual filtering proof",
+      "name": "view-mapped non-unique echo lateral source-relative residual lowers to branch lookup",
       "schema": "text_only",
       "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}",
       "sql": "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan AND s.score > d.score LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
       "expected": {
-        "expected_error": "DocumentSqlLateralRequiresNativeProducer"
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"/metadata/plan\""
+        ]
+      }
+    },
+    {
+      "name": "view-mapped non-unique pinned alternate lateral projection lowers to branch row lookup",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}",
+      "sql": "SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan AND s.score = 60 ORDER BY s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"/metadata/plan\""
+        ]
+      }
+    },
+    {
+      "name": "view-mapped non-unique ordered alternate lateral projection lowers to bounded branch row lookup",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\",\"unique\":true}]}}}",
+      "sql": "SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan ORDER BY s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"/metadata/plan\""
+        ]
+      }
+    },
+    {
+      "name": "view-mapped non-unique compound ordered alternate lateral projection lowers when leading order key is unique",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\",\"unique\":true}]}}}",
+      "sql": "SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan ORDER BY s.score DESC, s.plan ASC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"/metadata/plan\""
+        ]
+      }
+    },
+    {
+      "name": "view-mapped non-unique compound ordered alternate lateral projection lowers when later order key is unique",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\",\"unique\":true}]}}}",
+      "sql": "SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan ORDER BY s.plan ASC, s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"/metadata/plan\""
+        ]
       }
     },
     {
@@ -3020,6 +3640,135 @@
           "\"/metadata/region\"",
           "\"west\""
         ]
+      }
+    },
+    {
+      "name": "view-mapped grouped not predicate lowers to indexed residual",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"region\",\"path\":\"region\",\"type\":\"keyword\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, d.plan FROM support_view AS d WHERE d.plan = 'pro' AND NOT (d.region = 'internal') LIMIT 5",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"term\"",
+          "\"/metadata/plan\"",
+          "\"pro\""
+        ],
+        "residual_filter_contains": [
+          "\"must_not\"",
+          "\"/region\"",
+          "\"internal\""
+        ],
+        "max_candidate_rows": 10000
+      }
+    },
+    {
+      "name": "view-mapped ilike predicate lowers to indexed residual",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"region\",\"path\":\"region\",\"type\":\"keyword\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, d.plan FROM support_view AS d WHERE d.plan = 'pro' AND d.region ILIKE 'west%' LIMIT 5",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"term\"",
+          "\"/metadata/plan\"",
+          "\"pro\""
+        ],
+        "residual_filter_contains": [
+          "\"disjuncts\"",
+          "\"prefix\"",
+          "\"/region\"",
+          "\"west\"",
+          "\"West\""
+        ],
+        "max_candidate_rows": 10000
+      }
+    },
+    {
+      "name": "view-mapped regex predicate lowers to indexed residual",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"region\",\"path\":\"region\",\"type\":\"keyword\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, d.plan FROM support_view AS d WHERE d.plan = 'pro' AND d.plan ~ '^pro' LIMIT 5",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"term\"",
+          "\"/metadata/plan\"",
+          "\"pro\""
+        ],
+        "residual_filter_contains": [
+          "\"text_regex\"",
+          "\"/metadata/plan\"",
+          "\"^pro\"",
+          "\"case_insensitive\":false"
+        ],
+        "max_candidate_rows": 10000
+      }
+    },
+    {
+      "name": "view-mapped regex not imatch predicate lowers to indexed residual",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"region\",\"path\":\"region\",\"type\":\"keyword\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, d.plan FROM support_view AS d WHERE d.plan = 'pro' AND d.plan !~* 'internal' LIMIT 5",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"term\"",
+          "\"/metadata/plan\"",
+          "\"pro\""
+        ],
+        "residual_filter_contains": [
+          "\"must_not\"",
+          "\"text_regex\"",
+          "\"/metadata/plan\"",
+          "\"internal\"",
+          "\"case_insensitive\":true"
+        ],
+        "max_candidate_rows": 10000
+      }
+    },
+    {
+      "name": "view-mapped not in predicate lowers to indexed residual",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"region\",\"path\":\"region\",\"type\":\"keyword\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, d.plan FROM support_view AS d WHERE d.plan = 'pro' AND d.region NOT IN ('internal', 'legacy') LIMIT 5",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"term\"",
+          "\"/metadata/plan\"",
+          "\"pro\""
+        ],
+        "residual_filter_contains": [
+          "\"must_not\"",
+          "\"terms\"",
+          "\"/region\"",
+          "\"internal\"",
+          "\"legacy\""
+        ],
+        "max_candidate_rows": 10000
+      }
+    },
+    {
+      "name": "view-mapped grouped or predicate lowers to indexed residual",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"region\",\"path\":\"region\",\"type\":\"keyword\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, d.plan FROM support_view AS d WHERE d.plan = 'seed' AND (d.plan = 'pro' OR d.region = 'west') LIMIT 5",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"term\"",
+          "\"/metadata/plan\"",
+          "\"seed\""
+        ],
+        "residual_filter_contains": [
+          "\"disjuncts\"",
+          "\"/metadata/plan\"",
+          "\"pro\"",
+          "\"/region\"",
+          "\"west\""
+        ],
+        "max_candidate_rows": 10000
       }
     },
     {
@@ -3204,6 +3953,476 @@
       "sql": "SELECT _id, status FROM docs WHERE antfly.vector_search(table_name => 'docs', index => 'docs_embedding_hnsw', vector => '[0.1,0.2,0.3]', limit => 5) ORDER BY status ASC LIMIT 2",
       "expected": {
         "expected_error": "DocumentSqlBoundedScanPolicyRequired"
+      }
+    },
+    {
+      "name": "json typeof predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "json_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE status = 'active' AND jsonb_typeof(metadata->'flags') = 'array' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "residual_filter_json": "{\"json_typeof_term\":{\"path\":\"/metadata/flags\",\"value\":\"array\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "nullif predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "json_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE status = 'active' AND nullif(status, 'archived') = 'active' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "residual_filter_json": "{\"text_nullif_term\":{\"path\":\"/status\",\"nullif\":\"archived\",\"value\":\"active\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "replace predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "json_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE status = 'active' AND replace(status, '-', ' ') = 'active' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "residual_filter_json": "{\"text_replace_term\":{\"path\":\"/status\",\"needle\":\"-\",\"replacement\":\" \",\"value\":\"active\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "translate predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "json_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE status = 'active' AND translate(status, 'abc', 'xyz') = 'xyz-de' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "residual_filter_json": "{\"text_translate_term\":{\"path\":\"/status\",\"from\":\"abc\",\"to\":\"xyz\",\"value\":\"xyz-de\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "concat ws predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "json_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE status = 'active' AND concat_ws(':', status, status) = 'active:active' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "residual_filter_json": "{\"text_concat_ws_term\":{\"path\":\"/status\",\"path2\":\"/status\",\"separator\":\":\",\"value\":\"active:active\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "regexp count predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "json_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE status = 'active' AND regexp_count(status, '[a-z]+') >= 1 LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "residual_filter_json": "{\"regexp_count_range\":{\"path\":\"/status\",\"pattern\":\"[a-z]+\",\"min\":1,\"inclusive_min\":true}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "chr predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "json_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE status = 'active' AND chr(65) = 'A' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "residual_filter_json": "{\"text_chr_term\":{\"codepoint\":65,\"value\":\"A\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "scalar text cast predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "json_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE status = 'active' AND CAST(status AS text) = 'active' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "residual_filter_json": "{\"scalar_text_cast_term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "scalar numeric cast predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "json_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE status = '12' AND CAST(status AS numeric) >= 12 LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"12\"}}",
+        "residual_filter_json": "{\"scalar_numeric_cast_range\":{\"path\":\"/status\",\"min\":12,\"inclusive_min\":true}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "scalar boolean cast predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "json_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE status = 'true' AND CAST(status AS boolean) = true LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"true\"}}",
+        "residual_filter_json": "{\"scalar_boolean_cast_term\":{\"path\":\"/status\",\"value\":true}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "scalar datetime cast predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "json_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE status = '123456' AND CAST(status AS timestamp) >= 123456 LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"123456\"}}",
+        "residual_filter_json": "{\"scalar_datetime_cast_range\":{\"path\":\"/status\",\"min\":123456,\"inclusive_min\":true}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "view-mapped scalar cast projections lower through mapped paths",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"},{\"name\":\"created_at\",\"path\":\"created_at\",\"type\":\"datetime\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, CAST(d.score AS text) AS score_text, CAST(d.plan AS numeric) AS plan_num, CAST(d.created_at AS timestamp) AS created_ts FROM support_view AS d WHERE d.plan = '123456' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/metadata/plan\",\"value\":\"123456\"}}"
+      }
+    },
+    {
+      "name": "view-mapped scalar cast predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT d._id FROM support_view AS d WHERE d.plan = 'pro' AND CAST(d.score AS text) = '12' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/metadata/plan\",\"value\":\"pro\"}}",
+        "residual_filter_json": "{\"scalar_text_cast_term\":{\"path\":\"/metrics/score\",\"value\":\"12\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "view-mapped array expression projections lower through mapped paths",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, cardinality(d.tag_list) AS tag_count, array_append(d.tag_list, 'new') AS tag_append, array_to_string(d.tag_list, ',') AS tags_text, string_to_array(d.plan, '-') AS plan_parts FROM support_view AS d WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/metadata/plan\",\"value\":\"pro\"}}"
+      }
+    },
+    {
+      "name": "view-mapped array length predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT d._id FROM support_view AS d WHERE d.plan = 'pro' AND cardinality(d.tag_list) > 1 LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/metadata/plan\",\"value\":\"pro\"}}",
+        "residual_filter_json": "{\"array_length_range\":{\"path\":\"/tags\",\"min\":1,\"inclusive_min\":false}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "view-mapped array overlap predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT d._id FROM support_view AS d WHERE d.plan = 'pro' AND d.tag_list && ARRAY['urgent', 'vip'] LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/metadata/plan\",\"value\":\"pro\"}}",
+        "residual_filter_json": "{\"disjuncts\":[{\"array_any\":{\"path\":\"/tags\",\"value\":\"urgent\"}},{\"array_any\":{\"path\":\"/tags\",\"value\":\"vip\"}}]}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "view-mapped array contains predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT d._id FROM support_view AS d WHERE d.plan = 'pro' AND d.tag_list @> ARRAY['urgent', 'vip'] LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/metadata/plan\",\"value\":\"pro\"}}",
+        "residual_filter_json": "{\"conjuncts\":[{\"array_any\":{\"path\":\"/tags\",\"value\":\"urgent\"}},{\"array_any\":{\"path\":\"/tags\",\"value\":\"vip\"}}]}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "view-mapped JSON function projections lower through mapped paths",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"metadata\",\"path\":\"metadata\",\"type\":\"json\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, json_typeof(d.metadata->'flags') AS flags_type, json_array_length(json_extract_path(d.metadata, 'events')) AS event_count FROM support_view AS d WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/metadata/plan\",\"value\":\"pro\"}}"
+      }
+    },
+    {
+      "name": "view-mapped JSON typeof predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"metadata\",\"path\":\"metadata\",\"type\":\"json\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT d._id FROM support_view AS d WHERE d.plan = 'pro' AND json_typeof(d.metadata->'billing') = 'object' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/metadata/plan\",\"value\":\"pro\"}}",
+        "residual_filter_json": "{\"json_typeof_term\":{\"path\":\"/metadata/billing\",\"value\":\"object\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "view-mapped JSON array length predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"metadata\",\"path\":\"metadata\",\"type\":\"json\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT d._id FROM support_view AS d WHERE d.plan = 'pro' AND json_array_length(json_extract_path(d.metadata, 'events')) > 0 LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/metadata/plan\",\"value\":\"pro\"}}",
+        "residual_filter_json": "{\"json_array_length_range\":{\"path\":\"/metadata/events\",\"min\":0,\"inclusive_min\":false}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "view-mapped JSON key exists predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"metadata\",\"path\":\"metadata\",\"type\":\"json\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT d._id FROM support_view AS d WHERE d.plan = 'pro' AND d.metadata ? 'billing' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/metadata/plan\",\"value\":\"pro\"}}",
+        "residual_filter_json": "{\"exists\":{\"path\":\"/metadata/billing\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "view-mapped JSON key any predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"metadata\",\"path\":\"metadata\",\"type\":\"json\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT d._id FROM support_view AS d WHERE d.plan = 'pro' AND d.metadata ?| ARRAY['billing', 'flags'] LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/metadata/plan\",\"value\":\"pro\"}}",
+        "residual_filter_json": "{\"disjuncts\":[{\"exists\":{\"path\":\"/metadata/billing\"}},{\"exists\":{\"path\":\"/metadata/flags\"}}]}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "view-mapped JSON key all predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"metadata\",\"path\":\"metadata\",\"type\":\"json\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT d._id FROM support_view AS d WHERE d.plan = 'pro' AND d.metadata ?& ARRAY['billing', 'flags'] LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/metadata/plan\",\"value\":\"pro\"}}",
+        "residual_filter_json": "{\"conjuncts\":[{\"exists\":{\"path\":\"/metadata/billing\"}},{\"exists\":{\"path\":\"/metadata/flags\"}}]}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "view-mapped UTC date projection lowers through mapped datetime path",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"published_at\",\"path\":\"published_at\",\"type\":\"datetime\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT date_utc(published_at) AS published_day FROM support_view WHERE plan = 'pro' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/metadata/plan\",\"value\":\"pro\"}}"
+      }
+    },
+    {
+      "name": "view-mapped UTC date predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"published_at\",\"path\":\"published_at\",\"type\":\"datetime\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM support_view WHERE plan = 'pro' AND date_utc(published_at) = '2026-01-15' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/metadata/plan\",\"value\":\"pro\"}}",
+        "residual_filter_json": "{\"date_range\":{\"path\":\"/published_at\",\"start\":\"2026-01-15T00:00:00Z\",\"end\":\"2026-01-16T00:00:00Z\",\"inclusive_start\":true,\"inclusive_end\":false}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "view-mapped scalar function projections lower through mapped paths",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, lower(d.plan) AS plan_lower, length(d.plan) AS plan_len, replace(d.plan, 'p', 'P') AS plan_replace, regexp_count(d.plan, '[a-z]+') AS plan_tokens, abs(d.score) AS score_abs, d.score + 1 AS score_plus FROM support_view AS d WHERE d.plan = 'pro' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/metadata/plan\",\"value\":\"pro\"}}"
+      }
+    },
+    {
+      "name": "view-mapped text function predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT d._id FROM support_view AS d WHERE d.plan = 'pro' AND replace(d.plan, 'p', 'P') = 'Pro' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/metadata/plan\",\"value\":\"pro\"}}",
+        "residual_filter_json": "{\"text_replace_term\":{\"path\":\"/metadata/plan\",\"needle\":\"p\",\"replacement\":\"P\",\"value\":\"Pro\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "view-mapped numeric function predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT d._id FROM support_view AS d WHERE d.plan = 'pro' AND sqrt(d.score) >= 2 LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/metadata/plan\",\"value\":\"pro\"}}",
+        "residual_filter_json": "{\"numeric_unary_range\":{\"path\":\"/metrics/score\",\"function\":\"sqrt\",\"min\":2,\"inclusive_min\":true}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "pad predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "json_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE status = 'active' AND lpad(status, 5, '0') = '00abc' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "residual_filter_json": "{\"text_pad_term\":{\"path\":\"/status\",\"side\":\"left\",\"width\":5,\"fill\":\"0\",\"value\":\"00abc\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "split part predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "json_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE status = 'active' AND split_part(status, ':', 1) = 'active' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "residual_filter_json": "{\"text_split_part_term\":{\"path\":\"/status\",\"delimiter\":\":\",\"index\":1,\"value\":\"active\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "text affix predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "json_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE status = 'active' AND starts_with(status, 'act') = true LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "residual_filter_json": "{\"text_affix_term\":{\"path\":\"/status\",\"side\":\"prefix\",\"value\":\"act\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "text position predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "json_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE status = 'active' AND strpos(status, 'act') = 1 LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "residual_filter_json": "{\"text_strpos_range\":{\"path\":\"/status\",\"needle\":\"act\",\"min\":1,\"max\":1,\"inclusive_min\":true,\"inclusive_max\":true}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "text ascii predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "json_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE status = 'active' AND ascii(status) = 97 LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "residual_filter_json": "{\"text_ascii_range\":{\"path\":\"/status\",\"min\":97,\"max\":97,\"inclusive_min\":true,\"inclusive_max\":true}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "text unary predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "json_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE status = 'active' AND md5(status) = 'c76a5e84e4bdee527e274ea30c680d79' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "residual_filter_json": "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"md5\",\"value\":\"c76a5e84e4bdee527e274ea30c680d79\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "text trim predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "json_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE status = 'active' AND trim(status) = 'active' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "residual_filter_json": "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"btrim\",\"value\":\"active\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "text repeat predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "json_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE status = 'active' AND repeat(status, 2) = 'activeactive' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "residual_filter_json": "{\"text_repeat_term\":{\"path\":\"/status\",\"count\":2,\"value\":\"activeactive\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "text slice predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "json_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE status = 'active' AND left(status, 3) = 'act' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "residual_filter_json": "{\"text_slice_term\":{\"path\":\"/status\",\"side\":\"left\",\"count\":3,\"value\":\"act\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "text substring predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "json_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE status = 'active' AND substring(status FROM 1 FOR 3) = 'act' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "residual_filter_json": "{\"text_substring_term\":{\"path\":\"/status\",\"start\":1,\"length\":3,\"value\":\"act\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "text overlay predicate with indexed scalar conjunct lowers to bounded residual",
+      "schema": "json_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE status = 'active' AND overlay(status placing 'XX' from 2 for 2) = 'aXXive' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "residual_filter_json": "{\"text_overlay_term\":{\"path\":\"/status\",\"replacement\":\"XX\",\"start\":2,\"length\":2,\"value\":\"aXXive\"}}",
+        "max_candidate_rows": 25
       }
     },
     {

@@ -1057,6 +1057,21 @@ pub const RelationalRowsSubqueryPredicateOp = enum {
     ilike,
 };
 
+pub const RelationalRowsSubqueryCorrelationGroup = struct {
+    predicates: []const schema_mod.RelationalCheck = &.{},
+    or_predicates: []const RelationalRowsPredicateGroup = &.{},
+    not_predicates: []const RelationalRowsPredicateGroup = &.{},
+    expression_predicates: []const RelationalRowsExpressionCondition = &.{},
+    expression_or_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
+    expression_not_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
+    expression_array_contains: []const RelationalRowsExpressionArrayContainsPredicate = &.{},
+    access_predicates: RelationalRowsAccessPredicateGroup = .{},
+    access_or_predicates: []const RelationalRowsAccessPredicateGroup = &.{},
+    access_not_predicates: []const RelationalRowsAccessPredicateGroup = &.{},
+    subquery_predicates: []const RelationalRowsSubqueryPredicate = &.{},
+    correlations: []const RelationalRowsLateralCorrelation = &.{},
+};
+
 pub const RelationalRowsSubqueryPredicate = struct {
     kind: RelationalRowsSubqueryPredicateKind,
     lhs: ?RelationalRowsExpression = null,
@@ -1066,6 +1081,7 @@ pub const RelationalRowsSubqueryPredicate = struct {
     query: RelationalRowsQueryRequest = .{},
     output_field: []const u8 = "",
     correlations: []const RelationalRowsLateralCorrelation = &.{},
+    correlation_or_predicates: []const RelationalRowsSubqueryCorrelationGroup = &.{},
     collation: ?[]const u8 = null,
 };
 
@@ -1173,6 +1189,50 @@ fn freeRelationalRowsSubqueryPredicate(alloc: Allocator, predicate: RelationalRo
         alloc.free(correlation.right_field);
     }
     if (predicate.correlations.len > 0) alloc.free(predicate.correlations);
+    for (predicate.correlation_or_predicates) |group| {
+        for (group.predicates) |check| schema_mod.freeRelationalCheck(alloc, check);
+        if (group.predicates.len > 0) alloc.free(group.predicates);
+        for (group.or_predicates) |or_group| {
+            for (or_group.predicates) |check| freeRelationalRowsRequestPredicate(alloc, check);
+            if (or_group.predicates.len > 0) alloc.free(or_group.predicates);
+        }
+        if (group.or_predicates.len > 0) alloc.free(group.or_predicates);
+        for (group.not_predicates) |not_group| {
+            for (not_group.predicates) |check| freeRelationalRowsRequestPredicate(alloc, check);
+            if (not_group.predicates.len > 0) alloc.free(not_group.predicates);
+        }
+        if (group.not_predicates.len > 0) alloc.free(group.not_predicates);
+        for (group.expression_predicates) |condition| schema_mod.freeRelationalRowsExpressionCondition(alloc, condition);
+        if (group.expression_predicates.len > 0) alloc.free(group.expression_predicates);
+        for (group.expression_or_predicates) |or_group| {
+            for (or_group.conditions) |condition| schema_mod.freeRelationalRowsExpressionCondition(alloc, condition);
+            if (or_group.conditions.len > 0) alloc.free(or_group.conditions);
+        }
+        if (group.expression_or_predicates.len > 0) alloc.free(group.expression_or_predicates);
+        for (group.expression_not_predicates) |not_group| {
+            for (not_group.conditions) |condition| schema_mod.freeRelationalRowsExpressionCondition(alloc, condition);
+            if (not_group.conditions.len > 0) alloc.free(not_group.conditions);
+        }
+        if (group.expression_not_predicates.len > 0) alloc.free(group.expression_not_predicates);
+        for (group.expression_array_contains) |array_predicate| {
+            freeRelationalRowsExpression(alloc, array_predicate.expression);
+            alloc.free(array_predicate.value_json);
+        }
+        if (group.expression_array_contains.len > 0) alloc.free(group.expression_array_contains);
+        freeRelationalRowsAccessPredicateGroup(alloc, group.access_predicates);
+        for (group.access_or_predicates) |access_or_group| freeRelationalRowsAccessPredicateGroup(alloc, access_or_group);
+        if (group.access_or_predicates.len > 0) alloc.free(group.access_or_predicates);
+        for (group.access_not_predicates) |access_not_group| freeRelationalRowsAccessPredicateGroup(alloc, access_not_group);
+        if (group.access_not_predicates.len > 0) alloc.free(group.access_not_predicates);
+        for (group.subquery_predicates) |subquery| freeRelationalRowsSubqueryPredicate(alloc, subquery);
+        if (group.subquery_predicates.len > 0) alloc.free(group.subquery_predicates);
+        for (group.correlations) |correlation| {
+            alloc.free(correlation.left_field);
+            alloc.free(correlation.right_field);
+        }
+        if (group.correlations.len > 0) alloc.free(group.correlations);
+    }
+    if (predicate.correlation_or_predicates.len > 0) alloc.free(predicate.correlation_or_predicates);
     if (predicate.collation) |collation| alloc.free(collation);
 }
 
@@ -2915,6 +2975,7 @@ pub const RelationalRowsJoinPlan = struct {
 pub const RelationalRowsLateralCorrelation = struct {
     left_field: []const u8,
     right_field: []const u8,
+    op: schema_mod.RelationalCheckOp = .eq,
 };
 
 pub const RelationalRowsLateralRequest = struct {
