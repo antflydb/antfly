@@ -7283,7 +7283,8 @@ pub const ApiHttpServer = struct {
         const query_cursor = parseSimpleQueryParamDecodedAlloc(self.alloc, query, "cursor") catch return try textResponse(self.alloc, 400, "invalid cursor");
         defer if (query_cursor) |value| self.alloc.free(value);
         const cursor = query_cursor orelse parsed.value.cursor;
-        const raw_limit = (parseUnsignedQueryParam(query, "limit") catch return try textResponse(self.alloc, 400, "invalid limit")) orelse parsed.value.limit orelse 100;
+        const query_limit = parseUnsignedQueryParam(query, "limit") catch return try textResponse(self.alloc, 400, "invalid limit");
+        const raw_limit = query_limit orelse if (parsed.value.limit) |value| @as(u64, value) else 100;
         if (raw_limit == 0) return try textResponse(self.alloc, 400, "invalid limit");
         const limit: u32 = @intCast(@min(raw_limit, 1000));
         var result = (source.repairArtifactIssues(self.alloc, table_name, .{

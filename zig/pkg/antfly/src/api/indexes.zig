@@ -996,6 +996,7 @@ const AggregatedIndexStatus = struct {
     enrichment_failed: bool = false,
     repair_degraded: bool = false,
     repair_issue_count: u64 = 0,
+    repair_summary_ready: bool = true,
     table_doc_count: u64 = 0,
     doc_count: u64 = 0,
     term_count: u64 = 0,
@@ -1137,6 +1138,7 @@ fn aggregateIndexStatus(
         if (item.enrichment_failed) aggregate.enrichment_failed = true;
         if (item.repair_degraded) aggregate.repair_degraded = true;
         aggregate.repair_issue_count += item.repair_issue_count;
+        if (!item.repair_summary_ready) aggregate.repair_summary_ready = false;
         aggregate.catch_up_applied_sequence += item.catch_up_applied_sequence;
         aggregate.catch_up_target_sequence += item.catch_up_target_sequence;
         if (item.catch_up_active) aggregate.catch_up_active = true;
@@ -1730,6 +1732,10 @@ fn appendSingleIndexRuntimeStatus(
     if (@hasField(@TypeOf(item), "repair_issue_count")) {
         try out.appendSlice(alloc, ",\"repair_issue_count\":");
         try appendIntValue(alloc, out, item.repair_issue_count);
+    }
+    if (@hasField(@TypeOf(item), "repair_summary_ready")) {
+        try out.appendSlice(alloc, ",\"repair_summary_ready\":");
+        try out.appendSlice(alloc, if (item.repair_summary_ready) "true" else "false");
     }
     try out.appendSlice(alloc, ",\"runtime_present\":");
     try out.appendSlice(alloc, if (runtime_present) "true" else "false");

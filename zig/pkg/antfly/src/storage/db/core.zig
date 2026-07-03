@@ -55,6 +55,7 @@ pub const PendingWorkStats = struct {
     resolution: types.ReplayStageStats = .{},
     promotion: types.ReplayStageStats = .{},
     text_merge: types.TextMergeStats = .{},
+    repair_metadata_rebuild_pending: bool = false,
 };
 
 pub const MaintenanceDriver = struct {
