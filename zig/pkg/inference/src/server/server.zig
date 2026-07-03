@@ -84,6 +84,10 @@ fn shouldSkipAutoMtpDraftLoad(config: generation.GenerationConfig, draft_cfg: gp
     return requested_max_tokens < generation.gemma4MtpAutoMinGenerationTokens();
 }
 
+fn shouldDisableMetalAutoMtpDraft(config: generation.GenerationConfig, backend: backends_mod.BackendType, metal_auto_enabled: bool) bool {
+    return backend == .metal and config.speculation_policy == .auto and !metal_auto_enabled;
+}
+
 pub const BudgetOverrides = struct {
     host_limit_bytes: usize = 0,
     backend_limit_bytes: usize = 0,
@@ -2211,7 +2215,7 @@ pub const Node = struct {
             body.model.len > 0 and std.mem.eql(u8, draft_model_name, body.model)
         else
             false;
-        const effective_draft_model_name: ?[]const u8 = if (same_named_draft_model) null else body.draft_model;
+        var effective_draft_model_name: ?[]const u8 = if (same_named_draft_model) null else body.draft_model;
 
         const want_stream = body.stream orelse false;
         const configured_max_tokens: i32 = if (body.max_tokens) |mt| @intCast(mt) else 256;
@@ -2520,6 +2524,12 @@ pub const Node = struct {
             .onnx => return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unexpected ONNX backend in native generation path" }),
             .wasm => return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unexpected WASM backend in server generation path" }),
         };
+        if (shouldDisableMetalAutoMtpDraft(config, model.session.backend(), platform.env.getenvBool("ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO"))) {
+            effective_draft_model_name = null;
+            config.draft_model = null;
+            config.speculation_requested = false;
+            config.speculative_k = 4;
+        }
         const kv_dtype = if (config.cache_dtype) |name|
             runtime.kv.pool.parseKvDType(name) orelse
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid cache_dtype value" })
@@ -5898,6 +5908,14 @@ test "generate backend selection keeps compiled mode explicit" {
 
 test "singleBackendPreference is strict" {
     try std.testing.expectEqualSlices(backends_mod.BackendType, &.{.metal}, singleBackendPreference(.metal));
+}
+
+test "Metal auto MTP draft is disabled unless explicitly enabled" {
+    const config = generation.GenerationConfig{ .speculation_policy = .auto };
+    try std.testing.expect(shouldDisableMetalAutoMtpDraft(config, .metal, false));
+    try std.testing.expect(!shouldDisableMetalAutoMtpDraft(config, .metal, true));
+    try std.testing.expect(!shouldDisableMetalAutoMtpDraft(config, .native, false));
+    try std.testing.expect(!shouldDisableMetalAutoMtpDraft(.{ .speculation_policy = .force }, .metal, false));
 }
 
 test "download remote content accepts data uri" {

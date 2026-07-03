@@ -327,12 +327,21 @@ fn maskedEmbeddingArgmax(
 }
 
 fn hasMaskedEmbeddingWeights(cb: *const ops.ComputeBackend, draft_cfg: gpt_mod.Config) bool {
+    if (getenvBool("ANTFLY_GEMMA4_MTP_DISABLE_MASKED_EMBEDDING")) return false;
     if (!draft_cfg.mtp_use_ordered_embeddings or draft_cfg.mtp_num_centroids == 0 or draft_cfg.mtp_centroid_intermediate_top_k == 0) return false;
     const centroid_w = cb.getWeight("masked_embedding.centroids.weight") catch return false;
     cb.free(centroid_w);
     const ordering_w = cb.getWeight("masked_embedding.token_ordering") catch return false;
     cb.free(ordering_w);
     return true;
+}
+
+fn mtpPhaseNowNs() u64 {
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+        .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+        else => return 0,
+    }
 }
 
 fn getenvBool(comptime name: [*:0]const u8) bool {
@@ -660,9 +669,19 @@ pub fn draftTokenDevice(request: DraftDeviceRequest) !DraftDeviceResult {
     };
     defer request.draft_cb.free(concat_ct);
 
+    const phase_trace = getenvBool("ANTFLY_GEMMA4_MTP_DRAFT_PHASE_TRACE");
+    var phase_t0: u64 = if (phase_trace) mtpPhaseNowNs() else 0;
     const pre_w = try getMtpWeight(request.draft_cb, "pre_projection.weight");
     defer request.draft_cb.free(pre_w);
     const assistant_input = try request.draft_cb.linearNoBias(concat_ct, pre_w, 1, backbone_hidden * 2, draft_hidden);
+    if (phase_trace) { const now = mtpPhaseNowNs(); std.debug.print("mtp_phase: pre_proj_us={d}\n", .{(now - phase_t0) / 1000}); phase_t0 = now; }
+    var draft_frame_active = false;
+    if (request.draft_cb.kind() == .metal and !request.draft_cb.decoderRuntimeHasActiveFrame() and !getenvBool("ANTFLY_GEMMA4_MTP_DISABLE_DRAFT_FRAME")) {
+        draft_frame_active = request.draft_cb.decoderRuntimeBeginFrame() catch false;
+    }
+    errdefer if (draft_frame_active) {
+        request.draft_cb.decoderRuntimeCancelFrame() catch {};
+    };
 
     const assistant_hidden = if (mtpAssistantReplayEnabled()) blk: {
         const hidden_result = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesCudaReplay(
@@ -694,12 +713,18 @@ pub fn draftTokenDevice(request: DraftDeviceRequest) !DraftDeviceResult {
         null,
     );
     defer request.draft_cb.free(assistant_hidden);
+    if (phase_trace) { const now = mtpPhaseNowNs(); std.debug.print("mtp_phase: assistant_forward_us={d}\n", .{(now - phase_t0) / 1000}); phase_t0 = now; }
 
     const post_w = try getMtpWeight(request.draft_cb, "post_projection.weight");
     defer request.draft_cb.free(post_w);
     const projected = try request.draft_cb.linearNoBias(assistant_hidden, post_w, 1, draft_hidden, backbone_hidden);
     errdefer request.draft_cb.free(projected);
 
+    if (phase_trace) { const now = mtpPhaseNowNs(); std.debug.print("mtp_phase: post_proj_us={d}\n", .{(now - phase_t0) / 1000}); phase_t0 = now; }
+    if (draft_frame_active) {
+        draft_frame_active = false;
+        try request.draft_cb.decoderRuntimeSubmitAndWaitFrame();
+    }
     const draft_lm_w = try gpt_arch.getEmbeddingWeight(request.draft_cb, draft_cfg);
     defer request.draft_cb.free(draft_lm_w);
     const has_masked_embedding = hasMaskedEmbeddingWeights(request.draft_cb, draft_cfg);
@@ -727,9 +752,11 @@ pub fn draftTokenDevice(request: DraftDeviceRequest) !DraftDeviceResult {
         );
         defer request.draft_cb.free(logits_ct);
 
-        if (try maskedEmbeddingArgmaxForBackend(allocator, request.draft_cb, draft_cfg, assistant_hidden, logits_ct)) |token_id| {
-            logit_source = .masked_embedding;
-            break :blk token_id;
+        if (!getenvBool("ANTFLY_GEMMA4_MTP_DISABLE_MASKED_EMBEDDING")) {
+            if (try maskedEmbeddingArgmaxForBackend(allocator, request.draft_cb, draft_cfg, assistant_hidden, logits_ct)) |token_id| {
+                logit_source = .masked_embedding;
+                break :blk token_id;
+            }
         }
         if (try request.draft_cb.argmaxLastRow(logits_ct, 1, @intCast(draft_cfg.vocab_size))) |token_id| {
             logit_source = .backend_argmax;
@@ -744,6 +771,7 @@ pub fn draftTokenDevice(request: DraftDeviceRequest) !DraftDeviceResult {
         break :blk activations.argmax(logits[0..draft_cfg.vocab_size]);
     };
 
+    if (phase_trace) { std.debug.print("mtp_phase: lm_argmax_us={d} source={s}\n", .{ (mtpPhaseNowNs() - phase_t0) / 1000, @tagName(logit_source) }); }
     return .{
         .token = token,
         .projected_activation = projected,
