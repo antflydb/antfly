@@ -16089,7 +16089,7 @@ test "remote simple vector query uses vector worker route" {
             }
             return .{
                 .status = 200,
-                .body = try alloc_inner.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":0,\"hits\":[]},\"took\":0,\"status\":200,\"table\":\"docs\"}]}"),
+                .body = try alloc_inner.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":{\"value\":0,\"relation\":\"exact\"},\"hits\":[]},\"took\":0,\"status\":200,\"table\":\"docs\"}]}"),
             };
         }
     };
@@ -16120,6 +16120,8 @@ test "remote simple vector query uses vector worker route" {
     defer vector_result.deinit();
     try std.testing.expectEqual(@as(usize, 1), state.vector_worker_calls);
     try std.testing.expectEqual(@as(usize, 0), state.query_calls);
+    try std.testing.expectEqual(@as(u32, 0), vector_result.total_hits);
+    try std.testing.expectEqual(db_mod.types.TotalHitsRelation.exact, vector_result.total_hits_relation);
     try std.testing.expectEqual(@as(?u64, 77), vector_result.identity_read_generation);
 
     var fallback_result = try queryRemote(state.iface(), alloc, "http://remote.test", 11, "docs", .{
@@ -16131,6 +16133,8 @@ test "remote simple vector query uses vector worker route" {
     defer fallback_result.deinit();
     try std.testing.expectEqual(@as(usize, 1), state.vector_worker_calls);
     try std.testing.expectEqual(@as(usize, 1), state.query_calls);
+    try std.testing.expectEqual(@as(u32, 0), fallback_result.total_hits);
+    try std.testing.expectEqual(db_mod.types.TotalHitsRelation.exact, fallback_result.total_hits_relation);
     try std.testing.expectEqual(@as(?u64, 88), fallback_result.identity_read_generation);
 }
 

@@ -268,6 +268,7 @@ export {
   embedderProviders,
   generatorProviders,
   queryHitsTotalValue,
+  queryResultHitsTotal,
   queryResultTotalHits,
 } from "./types.js";
 

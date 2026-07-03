@@ -3229,10 +3229,13 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "dedupeSearchHitsById uses ordinals when hit page is complete",
+            "applyStoredSearchPatternFilters reports lower-bound total for filtered page window",
             "applyStoredSearchPatternFilters resolves native doc id constraints to hit ordinals",
             "applyStoredSearchPatternFilters uses hit ordinals for resolved doc filters",
             "applyStoredSearchPatternFilters fails closed without resolved ordinal projection",
             "applyStoredSearchPatternFilters fails closed when ordinal projection is unsupported",
+            "postprocessTextSearchResult preserves exact upstream total when page is unchanged",
+            "postprocessTextSearchResult forwards batch stored loader to pattern filters",
             "native dense constraints fail closed without ordinal vector mapping",
             "buildPatternDocumentHits preserves resolved binding ordinals",
             "executeSingleNonPatternQueryWithSets hydrates graph documents from include_documents",

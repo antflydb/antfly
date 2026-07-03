@@ -1,8 +1,8 @@
 /**
- * Unit tests for ResultsToolbar formatQueryTime function
+ * Unit tests for ResultsToolbar display formatters.
  */
 import { describe, expect, it } from "vitest";
-import { formatQueryTime } from "./ResultsToolbar";
+import { formatQueryTime, formatTotalHits } from "./ResultsToolbar";
 
 describe("formatQueryTime", () => {
   it("should return '< 1ms' for sub-millisecond values", () => {
@@ -29,5 +29,16 @@ describe("formatQueryTime", () => {
     const result = formatQueryTime(17_613_349);
     expect(result).toBe("18ms");
     expect(result).not.toBe("17613349ms");
+  });
+});
+
+describe("formatTotalHits", () => {
+  it("formats exact totals as ordinary hit counts", () => {
+    expect(formatTotalHits({ value: 1, relation: "exact" })).toBe("1 hit");
+    expect(formatTotalHits({ value: 1234, relation: "exact" })).toBe("1,234 hits");
+  });
+
+  it("formats lower-bound totals without implying exactness", () => {
+    expect(formatTotalHits({ value: 1234, relation: "gte" })).toBe(">= 1,234 hits");
   });
 });

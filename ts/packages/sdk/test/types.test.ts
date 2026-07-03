@@ -12,9 +12,11 @@ import type {
   MatchQuery,
   NumericRangeQuery,
   QueryRequest,
+  QueryResult,
   QueryStringQuery,
   TermQuery,
 } from "../src/types.js";
+import { queryResultHitsTotal, queryResultTotalHits } from "../src/types.js";
 
 describe("Antfly Query Type Integration", () => {
   describe("QueryRequest type safety", () => {
@@ -342,5 +344,19 @@ describe("Antfly Query Type Integration", () => {
       expect(query.order_by).toBeDefined();
       expect(query.count).toBe(true);
     });
+  });
+});
+
+describe("Query total helpers", () => {
+  it("preserves the structured total relation when callers need display semantics", () => {
+    const result: QueryResult = {
+      hits: {
+        total: { value: 42, relation: "gte" },
+        hits: [],
+      },
+    };
+
+    expect(queryResultHitsTotal(result)).toEqual({ value: 42, relation: "gte" });
+    expect(queryResultTotalHits(result)).toBe(42);
   });
 });

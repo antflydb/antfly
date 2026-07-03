@@ -20,7 +20,9 @@ pub fn expectSingleOpenapiTopHit(parsed: metadata_openapi.QueryResponses, doc_id
     const responses = parsed.responses orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 1), responses.len);
     const hits = responses[0].hits orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(i64, 1), hits.total);
+    const total = hits.total orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 1), total.value);
+    try std.testing.expectEqualStrings("exact", total.relation);
     const hit_items = hits.hits orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 1), hit_items.len);
     try std.testing.expectEqualStrings(doc_id, hit_items[0]._id);
