@@ -7202,8 +7202,10 @@ pub const ApiHttpServer = struct {
         const source = self.table_writes orelse return try textResponse(self.alloc, 405, "method not allowed");
         parseRepairTargetQuery(query) catch return try textResponse(self.alloc, 400, "invalid repair target");
         const artifact_kind = parseArtifactRepairKindQuery(query) catch return try textResponse(self.alloc, 400, "invalid artifact repair kind");
-        const index_name = parseSimpleQueryParam(query, "index");
-        const cursor = parseSimpleQueryParam(query, "cursor");
+        const index_name = parseSimpleQueryParamDecodedAlloc(self.alloc, query, "index") catch return try textResponse(self.alloc, 400, "invalid index");
+        defer if (index_name) |value| self.alloc.free(value);
+        const cursor = parseSimpleQueryParamDecodedAlloc(self.alloc, query, "cursor") catch return try textResponse(self.alloc, 400, "invalid cursor");
+        defer if (cursor) |value| self.alloc.free(value);
         const raw_limit = (parseUnsignedQueryParam(query, "limit") catch return try textResponse(self.alloc, 400, "invalid limit")) orelse 50;
         if (raw_limit == 0) return try textResponse(self.alloc, 400, "invalid limit");
         const limit: u32 = @intCast(@min(raw_limit, 500));
@@ -7254,8 +7256,12 @@ pub const ApiHttpServer = struct {
         if (!std.mem.eql(u8, parsed.value.target, "artifact")) return try textResponse(self.alloc, 400, "invalid repair target");
         const query_kind = parseArtifactRepairKindQuery(query) catch return try textResponse(self.alloc, 400, "invalid artifact repair kind");
         const artifact_kind = query_kind orelse parsed.value.kind orelse parsed.value.artifact_kind;
-        const index_name = parseSimpleQueryParam(query, "index") orelse parsed.value.index orelse parsed.value.index_name;
-        const cursor = parseSimpleQueryParam(query, "cursor") orelse parsed.value.cursor;
+        const query_index_name = parseSimpleQueryParamDecodedAlloc(self.alloc, query, "index") catch return try textResponse(self.alloc, 400, "invalid index");
+        defer if (query_index_name) |value| self.alloc.free(value);
+        const index_name = query_index_name orelse parsed.value.index orelse parsed.value.index_name;
+        const query_cursor = parseSimpleQueryParamDecodedAlloc(self.alloc, query, "cursor") catch return try textResponse(self.alloc, 400, "invalid cursor");
+        defer if (query_cursor) |value| self.alloc.free(value);
+        const cursor = query_cursor orelse parsed.value.cursor;
         const raw_limit = (parseUnsignedQueryParam(query, "limit") catch return try textResponse(self.alloc, 400, "invalid limit")) orelse parsed.value.limit orelse 100;
         if (raw_limit == 0) return try textResponse(self.alloc, 400, "invalid limit");
         const limit: u32 = @intCast(@min(raw_limit, 1000));
@@ -9946,6 +9952,11 @@ fn parseSimpleQueryParam(query: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+fn parseSimpleQueryParamDecodedAlloc(alloc: std.mem.Allocator, query: []const u8, key: []const u8) !?[]u8 {
+    const raw = parseSimpleQueryParam(query, key) orelse return null;
+    return try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, raw);
+}
+
 pub fn parseLookupReadConsistency(query: []const u8) !raft_mod.ReadConsistency {
     const value = parseSimpleQueryParam(query, "consistency") orelse
         parseSimpleQueryParam(query, "read_consistency") orelse
@@ -9976,6 +9987,17 @@ fn parseArtifactRepairKindQuery(query: []const u8) !?db_mod.types.ArtifactRepair
 fn parseRepairTargetQuery(query: []const u8) !void {
     const value = parseSimpleQueryParam(query, "target") orelse return;
     if (!std.mem.eql(u8, value, "artifact")) return error.InvalidRepairTarget;
+}
+
+test "artifact repair query params decode percent encoded values" {
+    const alloc = std.testing.allocator;
+    const index = (try parseSimpleQueryParamDecodedAlloc(alloc, "index=tenant%2Fembedding%20v1&cursor=7001%3Aabc%2Fdef", "index")).?;
+    defer alloc.free(index);
+    try std.testing.expectEqualStrings("tenant/embedding v1", index);
+
+    const cursor = (try parseSimpleQueryParamDecodedAlloc(alloc, "index=tenant%2Fembedding%20v1&cursor=7001%3Aabc%2Fdef", "cursor")).?;
+    defer alloc.free(cursor);
+    try std.testing.expectEqualStrings("7001:abc/def", cursor);
 }
 
 test "api http server serves status" {

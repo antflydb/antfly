@@ -8214,9 +8214,6 @@ pub const ProvisionedTableWriteSource = struct {
                 result.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, null);
                 break;
             }
-            self.beginGroupOperation(table_name, group_id);
-            defer self.endGroupOperation(table_name, group_id);
-
             const remaining: u32 = if (req.limit == 0) 0 else @intCast(req.limit - @as(u32, @intCast(out.items.len)));
             var group_result = (try listArtifactRepairIssuesGroupLocal(ptr, alloc, group_id, table_name, artifactRepairListRequestForShard(
                 req,
@@ -8280,9 +8277,6 @@ pub const ProvisionedTableWriteSource = struct {
                 total.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, null);
                 break;
             }
-            self.beginGroupOperation(table_name, group_id);
-            defer self.endGroupOperation(table_name, group_id);
-
             const remaining: u32 = if (req.limit == 0) 0 else @intCast(req.limit - @as(u32, @intCast(total.scanned)));
             var result = (try repairArtifactIssuesGroupLocal(ptr, alloc, group_id, table_name, artifactRepairRunRequestForShard(
                 req,
