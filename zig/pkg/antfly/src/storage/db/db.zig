@@ -16993,12 +16993,6 @@ fn chunkEmbeddingSourcesForRequest(
         sources.deinit(alloc);
     }
 
-    if (requestUsesMaterializedChunkArtifact(db, artifact_name)) {
-        try collectChunkEmbeddingSourcesFromWrites(alloc, &sources, artifact_writes, artifact_name, request.source_field);
-        try collectChunkEmbeddingSourcesFromStore(alloc, db, &sources, request.doc_key, artifact_name, request.source_field);
-        return try sources.toOwnedSlice(alloc);
-    }
-
     const chunks = try getOrCreateChunks(alloc, db, doc_value, request, cache);
     for (chunks) |chunk| {
         const chunk_text = chunk.text orelse continue;
@@ -34774,8 +34768,9 @@ test "db document extraction chunks units through source artifact enrichment" {
             .key = "doc:a",
             .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBkZWx0YQ==\",\"text\":\"updated source document decoy\"}",
         }},
-        .sync_level = .full_index,
+        .sync_level = .write,
     });
+    try db.waitForCurrentSyncLevel(.full_index);
     const updated_manifest = try db.core.store.get(alloc, manifest_key);
     defer alloc.free(updated_manifest);
     try std.testing.expect(std.mem.indexOf(u8, updated_manifest, "\"generation\":2") != null);

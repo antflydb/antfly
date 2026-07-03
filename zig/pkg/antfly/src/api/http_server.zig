@@ -6522,7 +6522,6 @@ pub const ApiHttpServer = struct {
         };
         if (self.table_writes) |table_writes_source| {
             _ = table_writes_source.putArtifactEnrichment(alloc, table_name, artifact_name, enrichment_json) catch |err| switch (err) {
-                error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
                 else => {
                     std.log.err("public artifact enrichment local apply failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
                 },
@@ -6561,7 +6560,6 @@ pub const ApiHttpServer = struct {
         };
         if (self.table_writes) |table_writes_source| {
             _ = table_writes_source.deleteArtifactEnrichment(alloc, table_name, artifact_name) catch |err| switch (err) {
-                error.EnrichmentInUse, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
                 else => {
                     std.log.err("public artifact enrichment local delete failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
                 },
