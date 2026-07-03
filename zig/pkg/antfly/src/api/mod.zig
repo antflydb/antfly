@@ -54,6 +54,7 @@ pub const http_server = @import("http_server.zig");
 pub const http_client = @import("http_client.zig");
 pub const httpx_handler = @import("httpx_handler.zig");
 pub const connections = @import("connections.zig");
+const protocol_adapters = @import("protocol_adapters.zig");
 
 pub const ClusterHealth = cluster.ClusterHealth;
 pub const ClusterStatus = cluster.ClusterStatus;
@@ -99,6 +100,14 @@ test "linear merge request parser accepts raw payload value under public request
 
     try std.testing.expectEqual(@as(usize, 1), req.writes.len);
     try std.testing.expect(std.mem.indexOf(u8, req.writes[0].value, "\"raw_payload\"") != null);
+}
+
+test "protocol adapters require extension runtime package digest identity" {
+    try protocol_adapters.testExtensionRuntimeBindingRequiresInstalledPackageDigestMatch();
+}
+
+test "protocol adapters carry matched extension runtime package digest" {
+    try protocol_adapters.testExtensionRuntimeBindingCarriesMatchedInstalledPackageDigest();
 }
 
 test "public batch default schema accepts docsaf doc_type row and rejects reserved _type" {

@@ -530,7 +530,7 @@ pub const Node = struct {
     pub const DirectSparseEmbedding = sparse_embedding_mod.SparseVector;
 
     pub fn init(allocator: std.mem.Allocator, config: NodeConfig) !Node {
-        return .{
+        var node: Node = .{
             .config = config,
             .allocator = allocator,
             .session_manager = backends_mod.SessionManager.init(allocator),
@@ -541,6 +541,8 @@ pub const Node = struct {
             .metrics = metrics_mod.Metrics.default,
             .request_queue = request_queue_mod.RequestQueue.init(config.max_concurrent_requests),
         };
+        node.updateQueueMetrics();
+        return node;
     }
 
     pub fn deinit(self: *Node) void {
@@ -558,6 +560,7 @@ pub const Node = struct {
     ) ![][]f32 {
         if (texts.len == 0) return try allocator.alloc([]f32, 0);
         try self.request_queue.acquire();
+        self.updateQueueMetrics();
         defer self.releaseSlot();
         self.metrics.incRequest("embed.local");
         defer self.metrics.decActive();
@@ -582,6 +585,7 @@ pub const Node = struct {
     ) ![]DirectSparseEmbedding {
         if (texts.len == 0) return try allocator.alloc(DirectSparseEmbedding, 0);
         try self.request_queue.acquire();
+        self.updateQueueMetrics();
         defer self.releaseSlot();
         self.metrics.incRequest("embed_sparse.local");
         defer self.metrics.decActive();
@@ -610,6 +614,7 @@ pub const Node = struct {
     ) ![]f32 {
         if (documents.len == 0) return try allocator.alloc(f32, 0);
         try self.request_queue.acquire();
+        self.updateQueueMetrics();
         defer self.releaseSlot();
         self.metrics.incRequest("rerank.local");
         defer self.metrics.decActive();
@@ -703,6 +708,7 @@ pub const Node = struct {
 
         const queue_units = self.estimateGenerateQueueUnits(messages, max_tokens);
         try self.request_queue.acquireUnits(queue_units);
+        self.updateQueueMetrics();
         defer self.releaseSlotUnits(queue_units);
         self.metrics.incRequest("generate.local");
         defer self.metrics.decActive();
@@ -787,7 +793,19 @@ pub const Node = struct {
             .head_dim = gpt_config.maxHeadDim(),
             .sliding_window_size = sliding_window_size,
         });
+        var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
+            .backend = backend_kind,
+            .dtype = kv_dtype,
+            .page_size_tokens = 16,
+            .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
+            .num_kv_heads = gpt_config.maxKvHeads(),
+            .head_dim = gpt_config.maxHeadDim(),
+            .sliding_window_size = sliding_window_size,
+        });
+        defer kv_storage.deinit();
+        try cb.provisionKvDeviceWriteHook(&kv_storage);
         var decode_state = generation.NativeDecodeState.initPaged(allocator, &kv_manager, pool_id, model.shared_moe_cache);
+        decode_state.kv_storage = &kv_storage;
         defer decode_state.deinit();
 
         const use_metal_whole_model = build_options.enable_metal and
@@ -971,6 +989,7 @@ pub const Node = struct {
         input: std.json.Value,
     ) ![][]f32 {
         try self.request_queue.acquire();
+        self.updateQueueMetrics();
         defer self.releaseSlot();
         self.metrics.incRequest("embed.local");
         defer self.metrics.decActive();
@@ -999,6 +1018,7 @@ pub const Node = struct {
     ) ![]readers_api.Result {
         if (request.images.len == 0) return try allocator.alloc(readers_api.Result, 0);
         try self.request_queue.acquire();
+        self.updateQueueMetrics();
         defer self.releaseSlot();
         self.metrics.incRequest("read.local");
         defer self.metrics.decActive();
@@ -1042,6 +1062,7 @@ pub const Node = struct {
         request: transcribing_api.Request,
     ) !transcribing_api.Response {
         try self.request_queue.acquire();
+        self.updateQueueMetrics();
         defer self.releaseSlot();
         self.metrics.incRequest("transcribe.local");
         defer self.metrics.decActive();
@@ -1082,6 +1103,7 @@ pub const Node = struct {
         request: extracting_api.Request,
     ) !extracting_api.Response {
         try self.request_queue.acquire();
+        self.updateQueueMetrics();
         defer self.releaseSlot();
         self.metrics.incRequest("extract.local");
         defer self.metrics.decActive();
@@ -1323,15 +1345,18 @@ pub const Node = struct {
     }
 
     fn acquireSlotUnits(self: *Node, ctx: *httpx.Context, units: usize) !?httpx.Response {
+        const requested_units = self.request_queue.capacityUnits(units);
         self.request_queue.acquireUnits(units) catch {
             self.metrics.incError();
+            self.metrics.recordQueueRejection(requested_units);
+            self.updateQueueMetrics();
             const resp = try ctx.status(503).json(.{
                 .@"error" = "SERVICE_UNAVAILABLE",
                 .message = "server at capacity, try again later",
             });
             return resp;
         };
-        self.metrics.setQueueDepth(self.request_queue.depth());
+        self.updateQueueMetrics();
         return null;
     }
 
@@ -1341,7 +1366,15 @@ pub const Node = struct {
 
     fn releaseSlotUnits(self: *Node, units: usize) void {
         self.request_queue.releaseUnits(units);
-        self.metrics.setQueueDepth(self.request_queue.depth());
+        self.updateQueueMetrics();
+    }
+
+    fn updateQueueMetrics(self: *Node) void {
+        self.metrics.setQueueState(
+            self.request_queue.depth(),
+            self.request_queue.max_concurrent,
+            self.request_queue.requests(),
+        );
     }
 
     fn estimateHttpRequestQueueUnits(self: *Node, ctx: *httpx.Context) usize {
@@ -2664,7 +2697,21 @@ pub const Node = struct {
             .sliding_window_size = sliding_window_size,
         }) catch |err|
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+        var kv_storage = runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, .{
+            .backend = backend_kind,
+            .dtype = kv_dtype,
+            .page_size_tokens = 16,
+            .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
+            .num_kv_heads = gpt_config.maxKvHeads(),
+            .head_dim = gpt_config.maxHeadDim(),
+            .sliding_window_size = sliding_window_size,
+        }) catch |err|
+            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+        defer kv_storage.deinit();
+        cb.provisionKvDeviceWriteHook(&kv_storage) catch |err|
+            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         var decode_state = generation.NativeDecodeState.initPaged(ctx.allocator, &kv_manager, pool_id, model.shared_moe_cache);
+        decode_state.kv_storage = &kv_storage;
         defer decode_state.deinit();
         var draft_decode_state: ?generation.NativeDecodeState = null;
         defer if (draft_decode_state) |*state| state.deinit();

@@ -48,7 +48,7 @@ pub fn getTimingStats() TimingStats {
 
 fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingStats, has_runtime: bool) void {
     std.debug.print(
-        "metal_executor_ms: runtime_prepare_calls={d} runtime_prepare={d} runtime_prepare_family={d} runtime_prepare_greedy={d} runtime_prepare_fast_hits={d} prefill_calls={d} prefill_prepare={d} prefill_direct_last={d} prefill_direct_family={d} prefill_family_project={d} prefill_family_span_prep={d} prefill_family_quant_attn={d} prefill_family_block_apply={d} prefill_family_frame_wait={d} prefill_family_frame_gpu={d} prefill_fallback={d} decode_begin={d} sample_calls={d} sample_direct={d} sample_fallback={d} greedy_calls={d} greedy_direct={d} greedy_fallback={d} ensure_prepared_calls={d} ensure_prepared={d} ensure_sync={d} ensure_family={d} ensure_greedy={d} ensure_fast_hits={d}\n",
+        "metal_executor_ms: runtime_prepare_calls={d} runtime_prepare={d} runtime_prepare_family={d} runtime_prepare_greedy={d} runtime_prepare_fast_hits={d} prefill_calls={d} prefill_prepare={d} prefill_direct_last={d} prefill_direct_family={d} prefill_family_project={d} prefill_family_span_prep={d} prefill_family_quant_attn={d} prefill_family_block_apply={d} prefill_family_frame_wait={d} prefill_family_frame_gpu={d} prefill_fallback={d} decode_begin={d} sample_calls={d} sample_direct={d} sample_fallback={d} greedy_calls={d} greedy_direct={d} greedy_fallback={d} greedy_token_handoff_attempts={d} greedy_token_handoff_hits={d} greedy_token_handoff_fallbacks={d} greedy_token_seeds={d} ensure_prepared_calls={d} ensure_prepared={d} ensure_sync={d} ensure_family={d} ensure_greedy={d} ensure_fast_hits={d}\n",
         .{
             metal_stats.runtime_prepare_calls,
             @divTrunc(metal_stats.runtime_prepare_nanos, std.time.ns_per_ms),
@@ -73,6 +73,10 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
             metal_stats.decode_greedy_calls,
             @divTrunc(metal_stats.decode_greedy_direct_nanos, std.time.ns_per_ms),
             @divTrunc(metal_stats.decode_greedy_fallback_nanos, std.time.ns_per_ms),
+            metal_stats.decode_greedy_device_token_handoff_attempts,
+            metal_stats.decode_greedy_device_token_handoff_hits,
+            metal_stats.decode_greedy_device_token_handoff_fallbacks,
+            metal_stats.decode_greedy_device_token_seeds,
             metal_stats.ensure_prepared_calls,
             @divTrunc(metal_stats.ensure_prepared_nanos, std.time.ns_per_ms),
             @divTrunc(metal_stats.ensure_prepared_sync_nanos, std.time.ns_per_ms),
@@ -1077,6 +1081,8 @@ const RuntimeContext = struct {
     mirrored_kv_view: ?generation.KvView,
     mirrored_kv_compacted: bool,
     raw_span_state: ?DecoderRuntimeSpanState,
+    greedy_device_token_tensor: ?ops.CT,
+    greedy_device_token_id: ?i64,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -1140,6 +1146,8 @@ const RuntimeContext = struct {
             .mirrored_kv_view = null,
             .mirrored_kv_compacted = false,
             .raw_span_state = null,
+            .greedy_device_token_tensor = null,
+            .greedy_device_token_id = null,
         };
         return ctx;
     }
@@ -1155,6 +1163,7 @@ const RuntimeContext = struct {
     }
 
     fn deinit(self: *RuntimeContext) void {
+        self.clearGreedyDeviceToken();
         self.moe_runtime.deinit();
         self.kv_metadata.deinit(&self.kv_storage);
         self.kv_storage.deinit();
@@ -1163,8 +1172,92 @@ const RuntimeContext = struct {
     }
 
     fn invalidateDecoderRuntimeSpanState(self: *RuntimeContext) !void {
+        self.clearGreedyDeviceToken();
         try self.cb.decoderRuntimeResetState();
         self.raw_span_state = null;
+    }
+
+    fn greedyDeviceTokenHandoffEnabled(self: *const RuntimeContext) bool {
+        return self.cb.kind() == .cuda and envFlag("ANTFLY_INFERENCE_CUDA_GREEDY_DEVICE_TOKEN_HANDOFF");
+    }
+
+    fn clearGreedyDeviceToken(self: *RuntimeContext) void {
+        if (self.greedy_device_token_tensor) |token| {
+            self.cb.free(token);
+        }
+        self.greedy_device_token_tensor = null;
+        self.greedy_device_token_id = null;
+    }
+
+    fn storeGreedyDeviceTokenResult(self: *RuntimeContext, result: gpt_arch.GreedyDeviceTokenResult) void {
+        const token_tensor = result.token_tensor;
+        self.clearGreedyDeviceToken();
+        if (token_tensor) |token| {
+            self.greedy_device_token_tensor = token;
+            self.greedy_device_token_id = @intCast(result.token_id);
+        }
+    }
+
+    fn seedGreedyDeviceToken(self: *RuntimeContext, token_id: i64) !void {
+        if (!self.greedyDeviceTokenHandoffEnabled()) return;
+        if (token_id < 0 or token_id > std.math.maxInt(i32)) {
+            self.clearGreedyDeviceToken();
+            return;
+        }
+        const data = [_]i32{@intCast(token_id)};
+        const shape = [_]i32{1};
+        const token = (try self.cb.fromInt32Shape(data[0..], shape[0..])) orelse {
+            self.clearGreedyDeviceToken();
+            return;
+        };
+        self.clearGreedyDeviceToken();
+        self.greedy_device_token_tensor = token;
+        self.greedy_device_token_id = token_id;
+        timing_stats.decode_greedy_device_token_seeds += 1;
+    }
+
+    fn forwardGreedyDeviceTokenHandoff(
+        self: *RuntimeContext,
+        allocator: std.mem.Allocator,
+        request: model_runtime.DecodeRequest,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+    ) !?i64 {
+        var token_tensor = request.input_token_tensor;
+        var using_stored = false;
+        if (token_tensor == null and self.greedyDeviceTokenHandoffEnabled()) {
+            if (self.greedy_device_token_tensor) |stored| {
+                if (self.greedy_device_token_id != null and self.greedy_device_token_id.? == request.token_id) {
+                    token_tensor = stored;
+                    using_stored = true;
+                }
+            }
+        }
+        const input_token = token_tensor orelse return null;
+
+        timing_stats.decode_greedy_device_token_handoff_attempts += 1;
+        const maybe_result = gpt_arch.forwardGreedyLastTokenFromTokenTensor(
+            &self.cb,
+            allocator,
+            self.gpt_config,
+            input_token,
+            1,
+            seq_len,
+            decode_context,
+        ) catch |err| switch (err) {
+            error.CudaGraphReplayRequired => null,
+            else => return err,
+        };
+        const result = maybe_result orelse {
+            timing_stats.decode_greedy_device_token_handoff_fallbacks += 1;
+            if (using_stored) self.clearGreedyDeviceToken();
+            return null;
+        };
+        timing_stats.decode_greedy_device_token_handoff_hits += 1;
+        const token_id: i64 = @intCast(result.token_id);
+        self.storeGreedyDeviceTokenResult(result);
+        self.noteDecoderRuntimeStateFromCurrentView();
+        return token_id;
     }
 
     fn applyKvMutationResult(self: *RuntimeContext, result: generation.KvMutationResult) !void {
@@ -1887,6 +1980,7 @@ fn runtimeDecode(
     request: model_runtime.DecodeRequest,
 ) !model_runtime.ModelOutput {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
+    runtime_ctx.clearGreedyDeviceToken();
     const step = try runtime_ctx.beginDecodeStep(request.position, request.attention_mode);
 
     if (runtime_ctx.decoderRuntimeExecutorEnabled()) {
@@ -1913,6 +2007,7 @@ fn runtimeDecodeSample(
     }
 
     timing_stats.decode_sample_calls += 1;
+    runtime_ctx.clearGreedyDeviceToken();
     const begin_started_at = monotonicNowNs();
     const step = try runtime_ctx.beginDecodeStep(request.decode.position, request.decode.attention_mode);
     timing_stats.decode_begin_step_nanos += @intCast(monotonicNowNs() - begin_started_at);
@@ -1993,7 +2088,14 @@ fn runtimeDecodeGreedy(
     timing_stats.decode_begin_step_nanos += @intCast(monotonicNowNs() - begin_started_at);
 
     const direct_started_at = monotonicNowNs();
+    if (request.input_token_tensor != null or runtime_ctx.greedyDeviceTokenHandoffEnabled()) {
+        if (try runtime_ctx.forwardGreedyDeviceTokenHandoff(allocator, request, step.seq_len, &step.decode_context)) |token_id| {
+            timing_stats.decode_greedy_direct_nanos += @intCast(monotonicNowNs() - direct_started_at);
+            return .{ .token_id = token_id };
+        }
+    }
     if (try runtime_ctx.forwardDecoderRuntimeGreedyToken(allocator, request.token_id, step.seq_len, &step.decode_context)) |token_id| {
+        try runtime_ctx.seedGreedyDeviceToken(token_id);
         timing_stats.decode_greedy_direct_nanos += @intCast(monotonicNowNs() - direct_started_at);
         return .{ .token_id = token_id };
     }
@@ -2003,6 +2105,7 @@ fn runtimeDecodeGreedy(
         if (owned_output.device_logits) |device_logits| {
             const backend = owned_output.device_logits_backend orelse return error.InvalidModelOutput;
             if (try backend.argmaxLastRow(device_logits, 1, runtime_ctx.gpt_config.vocab_size)) |token_id| {
+                try runtime_ctx.seedGreedyDeviceToken(@intCast(token_id));
                 timing_stats.decode_greedy_direct_nanos += @intCast(monotonicNowNs() - direct_started_at);
                 return .{ .token_id = @intCast(token_id) };
             }
@@ -2012,6 +2115,7 @@ fn runtimeDecodeGreedy(
         for (logits[1..], 1..) |value, idx| {
             if (value > logits[best_idx]) best_idx = idx;
         }
+        try runtime_ctx.seedGreedyDeviceToken(@intCast(best_idx));
         timing_stats.decode_greedy_direct_nanos += @intCast(monotonicNowNs() - direct_started_at);
         return .{ .token_id = @intCast(best_idx) };
     }
@@ -2029,6 +2133,7 @@ fn runtimeDecodeGreedy(
         &step.decode_context,
     );
     timing_stats.decode_greedy_fallback_nanos += @intCast(monotonicNowNs() - fallback_started_at);
+    try runtime_ctx.seedGreedyDeviceToken(@intCast(token_id));
     return .{
         .token_id = @intCast(token_id),
     };

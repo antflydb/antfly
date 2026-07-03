@@ -52,6 +52,9 @@ const data_raft_batch_leader_retry_sleep_ns: u64 = 50 * std.time.ns_per_ms;
 const data_raft_metadata_resync_interval_ns: u64 = 500 * std.time.ns_per_ms;
 const data_raft_campaign_retry_interval_ns: u64 = 500 * std.time.ns_per_ms;
 const data_raft_metadata_sync_interval_ms: u64 = 250;
+const metadata_bootstrap_retry_base_ms: u64 = 250;
+const metadata_bootstrap_retry_max_ms: u64 = 5 * std.time.ms_per_s;
+const metadata_bootstrap_retry_jitter_ms: u64 = 250;
 const trusted_principal_secret_key = "antfly.trusted_principal.secret";
 const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
 
@@ -1687,6 +1690,61 @@ fn isNonFatalHAStandbyReplicationError(err: anyerror) bool {
     };
 }
 
+fn isRetryableMetadataBootstrapError(err: anyerror) bool {
+    return switch (err) {
+        error.HttpConnectionClosing,
+        error.ConnectionResetByPeer,
+        error.ConnectionRefused,
+        error.BrokenPipe,
+        error.EndOfStream,
+        error.UnexpectedHttpStatus,
+        error.NotListening,
+        error.NotLeader,
+        error.ProposalDropped,
+        error.LeaderTransferInProgress,
+        => true,
+        else => false,
+    };
+}
+
+fn metadataBootstrapRetryDelayMs(registration: ?StoreRegistrationConfig, attempts: u32, now_ms: u64) u64 {
+    const capped_attempts = @min(attempts, 5);
+    const exponential = metadata_bootstrap_retry_base_ms << @intCast(capped_attempts -| 1);
+    const bounded = @min(exponential, metadata_bootstrap_retry_max_ms);
+    var hasher = std.hash.Wyhash.init(0x8d6a_2026_4c1f_b007);
+    hashU64(&hasher, now_ms);
+    hashU64(&hasher, attempts);
+    if (registration) |record| {
+        hashU64(&hasher, record.node_id);
+        hashU64(&hasher, record.store_id);
+    }
+    const jitter = hasher.final() % (metadata_bootstrap_retry_jitter_ms + 1);
+    return @min(bounded +| jitter, metadata_bootstrap_retry_max_ms + metadata_bootstrap_retry_jitter_ms);
+}
+
+test "data runtime treats metadata leadership churn as retryable bootstrap failure" {
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.NotLeader));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.ProposalDropped));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.LeaderTransferInProgress));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.ConnectionRefused));
+    try std.testing.expect(!isRetryableMetadataBootstrapError(error.InvalidArguments));
+}
+
+test "data runtime metadata bootstrap retry delay is bounded and jittered" {
+    const registration = StoreRegistrationConfig{
+        .node_id = 7,
+        .store_id = 11,
+        .role = "data",
+    };
+    const first = metadataBootstrapRetryDelayMs(registration, 1, 1000);
+    const later = metadataBootstrapRetryDelayMs(registration, 4, 1000);
+    const capped = metadataBootstrapRetryDelayMs(registration, 16, 1000);
+    try std.testing.expect(first >= metadata_bootstrap_retry_base_ms);
+    try std.testing.expect(first <= metadata_bootstrap_retry_base_ms + metadata_bootstrap_retry_jitter_ms);
+    try std.testing.expect(later >= first);
+    try std.testing.expect(capped <= metadata_bootstrap_retry_max_ms + metadata_bootstrap_retry_jitter_ms);
+}
+
 pub const StoreRegistrationConfig = struct {
     node_id: u64,
     store_id: u64,
@@ -1896,6 +1954,9 @@ pub const DataServer = struct {
     metadata_local_providers_registered: bool = false,
     store_registration: ?StoreRegistrationConfig = null,
     store_registration_confirmed: bool = false,
+    metadata_bootstrap_retry_mutex: std.atomic.Mutex = .unlocked,
+    metadata_bootstrap_retry_attempts: u32 = 0,
+    next_metadata_bootstrap_retry_at_ms: u64 = 0,
     group_leadership_source: ?GroupLeadershipSource = null,
     group_membership_source: ?GroupMembershipSource = null,
     local_transition_runtime: ?antfly.raft.TransitionRuntime = null,
@@ -2557,6 +2618,55 @@ pub const DataServer = struct {
         };
     }
 
+    fn metadataBootstrapRetryDue(self: *DataServer, now_ms: u64) bool {
+        lockAtomic(&self.metadata_bootstrap_retry_mutex);
+        defer self.metadata_bootstrap_retry_mutex.unlock();
+        return self.next_metadata_bootstrap_retry_at_ms == 0 or
+            now_ms >= self.next_metadata_bootstrap_retry_at_ms;
+    }
+
+    fn clearMetadataBootstrapRetry(self: *DataServer) void {
+        lockAtomic(&self.metadata_bootstrap_retry_mutex);
+        defer self.metadata_bootstrap_retry_mutex.unlock();
+        self.metadata_bootstrap_retry_attempts = 0;
+        self.next_metadata_bootstrap_retry_at_ms = 0;
+    }
+
+    fn deferMetadataBootstrapRetry(self: *DataServer, now_ms: u64) void {
+        lockAtomic(&self.metadata_bootstrap_retry_mutex);
+        defer self.metadata_bootstrap_retry_mutex.unlock();
+        self.metadata_bootstrap_retry_attempts = self.metadata_bootstrap_retry_attempts +| 1;
+        const delay_ms = metadataBootstrapRetryDelayMs(
+            self.store_registration,
+            self.metadata_bootstrap_retry_attempts,
+            now_ms,
+        );
+        self.next_metadata_bootstrap_retry_at_ms = now_ms +| delay_ms;
+    }
+
+    fn recordMetadataBootstrapError(self: *DataServer, err: anyerror, now_ms: u64) !void {
+        if (!isRetryableMetadataBootstrapError(err)) return err;
+        self.deferMetadataBootstrapRetry(now_ms);
+    }
+
+    fn recordProvisionedRootRefreshMetadataError(self: *DataServer, err: anyerror, now_ms: u64) !void {
+        if (!isRetryableMetadataBootstrapError(err)) return err;
+        self.provisioned_root_refresh_dirty.store(true, .release);
+        self.deferMetadataBootstrapRetry(now_ms);
+    }
+
+    fn metadataBootstrapRetryAttemptsForTest(self: *DataServer) u32 {
+        lockAtomic(&self.metadata_bootstrap_retry_mutex);
+        defer self.metadata_bootstrap_retry_mutex.unlock();
+        return self.metadata_bootstrap_retry_attempts;
+    }
+
+    fn nextMetadataBootstrapRetryAtMsForTest(self: *DataServer) u64 {
+        lockAtomic(&self.metadata_bootstrap_retry_mutex);
+        defer self.metadata_bootstrap_retry_mutex.unlock();
+        return self.next_metadata_bootstrap_retry_at_ms;
+    }
+
     pub fn runRound(self: *DataServer) !void {
         const ha_standby_replication_ok = blk: {
             self.runHAStandbyReplicationRound() catch |err| {
@@ -2590,83 +2700,65 @@ pub const DataServer = struct {
             }
         }
         if (self.remote_metadata != null and self.store_registration != null) {
-            if (!self.store_registration_confirmed) {
-                self.registerNodeIfConfigured() catch |register_err| switch (register_err) {
-                    error.HttpConnectionClosing,
-                    error.ConnectionResetByPeer,
-                    error.ConnectionRefused,
-                    error.BrokenPipe,
-                    error.EndOfStream,
-                    error.UnexpectedHttpStatus,
-                    error.NotListening,
-                    => {},
-                    else => return register_err,
-                };
-            }
-            self.store_status_ticks += 1;
             const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
-            const due_store_status_heartbeat = self.last_store_status_report_at_ms == 0 or
-                now_ms -| self.last_store_status_report_at_ms >= store_status_heartbeat_interval_ms;
-            const due_full_store_status = self.localGroupStatusCacheStale(now_ms);
-            const due_data_raft_status_refresh = self.data_raft != null;
-            if (self.store_status_ticks >= store_status_report_interval_ticks and
-                (self.store_status_dirty or due_store_status_heartbeat or due_full_store_status or due_data_raft_status_refresh))
-            {
-                self.store_status_ticks = 0;
-                const result = if (self.store_status_dirty or due_full_store_status or due_data_raft_status_refresh)
-                    self.reportStoreStatus()
-                else
-                    self.reportStoreStatusHeartbeat();
-                result catch |err| switch (err) {
-                    // Split runtime can briefly observe placement before the
-                    // local replica root is fully provisioned on disk.
-                    error.FileNotFound,
-                    error.UnknownGroup,
-                    error.LmdbUnexpected,
-                    error.Corrupted,
-                    error.HttpConnectionClosing,
-                    error.ConnectionResetByPeer,
-                    error.ConnectionRefused,
-                    error.BrokenPipe,
-                    error.EndOfStream,
-                    error.UnexpectedHttpStatus,
-                    => {},
-                    error.UnknownStore => {
-                        self.store_registration_confirmed = false;
-                        self.registerNodeIfConfigured() catch |register_err| switch (register_err) {
-                            error.HttpConnectionClosing,
-                            error.ConnectionResetByPeer,
-                            error.ConnectionRefused,
-                            error.BrokenPipe,
-                            error.EndOfStream,
-                            error.UnexpectedHttpStatus,
-                            => {},
-                            else => return register_err,
+            if (self.metadataBootstrapRetryDue(now_ms)) {
+                const registration_ready = blk: {
+                    if (!self.store_registration_confirmed) {
+                        self.registerNodeIfConfigured() catch |err| {
+                            try self.recordMetadataBootstrapError(err, now_ms);
+                            break :blk false;
                         };
-                    },
-                    else => return err,
+                    }
+                    break :blk true;
                 };
-            }
+                if (registration_ready) {
+                    self.store_status_ticks += 1;
+                    const due_store_status_heartbeat = self.last_store_status_report_at_ms == 0 or
+                        now_ms -| self.last_store_status_report_at_ms >= store_status_heartbeat_interval_ms;
+                    const due_full_store_status = self.localGroupStatusCacheStale(now_ms);
+                    const due_data_raft_status_refresh = self.data_raft != null;
+                    if (self.store_status_ticks >= store_status_report_interval_ticks and
+                        (self.store_status_dirty or due_store_status_heartbeat or due_full_store_status or due_data_raft_status_refresh))
+                    {
+                        self.store_status_ticks = 0;
+                        const result = if (self.store_status_dirty or due_full_store_status or due_data_raft_status_refresh)
+                            self.reportStoreStatus()
+                        else
+                            self.reportStoreStatusHeartbeat();
+                        result catch |err| switch (err) {
+                            // Split runtime can briefly observe placement before the
+                            // local replica root is fully provisioned on disk.
+                            error.FileNotFound,
+                            error.UnknownGroup,
+                            error.LmdbUnexpected,
+                            error.Corrupted,
+                            => {},
+                            error.UnknownStore => {
+                                self.store_registration_confirmed = false;
+                                self.registerNodeIfConfigured() catch |register_err| try self.recordMetadataBootstrapError(register_err, now_ms);
+                            },
+                            else => |retry_err| try self.recordMetadataBootstrapError(retry_err, now_ms),
+                        };
+                    }
+                }
 
-            self.provision_ticks += 1;
-            if (self.provision_ticks >= 4) {
-                self.provision_ticks = 0;
-                self.maybeRequestProvisionedRootRefresh() catch |err| switch (err) {
-                    // Local split-runtime provisioning can race with active writes.
-                    // Treat those as transient and retry on the next provision tick.
-                    error.WriterLocked,
-                    error.FileNotFound,
-                    error.UnknownGroup,
-                    error.LmdbUnexpected,
-                    error.Corrupted,
-                    error.HttpConnectionClosing,
-                    error.ConnectionResetByPeer,
-                    error.ConnectionRefused,
-                    error.BrokenPipe,
-                    error.EndOfStream,
-                    => {},
-                    else => return err,
-                };
+                if (self.metadataBootstrapRetryDue(now_ms)) {
+                    self.provision_ticks += 1;
+                    if (self.provision_ticks >= 4) {
+                        self.provision_ticks = 0;
+                        self.maybeRequestProvisionedRootRefresh() catch |err| switch (err) {
+                            // Local split-runtime provisioning can race with active writes.
+                            // Treat those as transient and retry on the next provision tick.
+                            error.WriterLocked,
+                            error.FileNotFound,
+                            error.UnknownGroup,
+                            error.LmdbUnexpected,
+                            error.Corrupted,
+                            => {},
+                            else => |retry_err| try self.recordProvisionedRootRefreshMetadataError(retry_err, now_ms),
+                        };
+                    }
+                }
             }
         }
         try self.maybeRequestRuntimeStatusRefresh();
@@ -4050,6 +4142,7 @@ pub const DataServer = struct {
             .live = true,
         });
         self.store_registration_confirmed = true;
+        self.clearMetadataBootstrapRetry();
         // Startup should not block on reopening every local group DB just to
         // compute an initial best-effort status report. Mark the store dirty
         // and let the main run loop publish status once listeners are up.
@@ -4583,6 +4676,7 @@ pub const DataServer = struct {
         try self.storeStatusHeartbeatCacheReplace(report);
         self.store_status_dirty = false;
         self.last_store_status_report_at_ms = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        self.clearMetadataBootstrapRetry();
     }
 
     fn syncDataRaftFromRemoteMetadata(self: *DataServer) !void {
@@ -4691,6 +4785,7 @@ pub const DataServer = struct {
         defer freeStoreStatusReportOwned(self.alloc, &report);
         try remote_metadata.reportNodeStatus(report);
         self.last_store_status_report_at_ms = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        self.clearMetadataBootstrapRetry();
     }
 
     fn cloneHeartbeatStoreStatusReport(
@@ -6149,11 +6244,15 @@ pub const DataServer = struct {
         defer self.provisioned_root_refresh_last_duration_ns.store(platform_time.monotonicNs() - started_ns, .monotonic);
 
         self.refreshProvisionedReplicaRoot() catch |err| {
-            self.provisioned_root_refresh_dirty.store(true, .release);
+            const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+            self.recordProvisionedRootRefreshMetadataError(err, now_ms) catch {
+                self.provisioned_root_refresh_dirty.store(true, .release);
+            };
             _ = self.provisioned_root_refresh_failed.fetchAdd(1, .monotonic);
             std.log.warn("provisioned replica-root refresh failed err={}", .{err});
             return;
         };
+        self.clearMetadataBootstrapRetry();
         _ = self.provisioned_root_refresh_completed.fetchAdd(1, .monotonic);
     }
 
@@ -6527,6 +6626,10 @@ fn appendOwnedPeerRouteUpsert(
 }
 
 const RemoteMetadataSource = struct {
+    const TestFaults = if (@import("builtin").is_test) struct {
+        fetch_head_error: ?anyerror = null,
+    } else struct {};
+
     alloc: std.mem.Allocator,
     base_uris: [][]u8,
     preferred_base_uri_index: usize = 0,
@@ -6535,6 +6638,7 @@ const RemoteMetadataSource = struct {
     cached_head_at_ms: u64 = 0,
     cached_snapshot: ?antfly.metadata_api.AdminSnapshot = null,
     cached_snapshot_at_ms: u64 = 0,
+    test_faults: TestFaults = .{},
 
     fn init(alloc: std.mem.Allocator, base_uris: []const []const u8) !RemoteMetadataSource {
         if (base_uris.len == 0) return error.MissingMetadataApi;
@@ -6577,6 +6681,9 @@ const RemoteMetadataSource = struct {
     }
 
     fn fetchHead(self: *RemoteMetadataSource) !antfly.metadata_api.MetadataHead {
+        if (@import("builtin").is_test) {
+            if (self.test_faults.fetch_head_error) |err| return err;
+        }
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
         lockAtomic(&self.cache_mutex);
         if (self.cached_head) |head| {
@@ -13544,7 +13651,7 @@ test "data runtime runRound does not refresh provisioned replica root inline whi
     defer alloc.free(replica_root_dir);
 
     const remote_metadata = try alloc.create(RemoteMetadataSource);
-    const metadata_api_urls = [_][]const u8{"http://127.0.0.1:1"};
+    const metadata_api_urls = [_][]const u8{"http://metadata.test"};
     remote_metadata.* = try RemoteMetadataSource.init(alloc, &metadata_api_urls);
 
     var server: DataServer = .{
@@ -13573,6 +13680,7 @@ test "data runtime runRound does not refresh provisioned replica root inline whi
     };
     defer server.deinit();
 
+    server.store_registration_confirmed = true;
     server.store_status_dirty = false;
     server.runtime_status_dirty.store(false, .release);
     server.provisioned_startup_catch_up_dirty.store(false, .release);
@@ -13586,6 +13694,136 @@ test "data runtime runRound does not refresh provisioned replica root inline whi
     try std.testing.expect(server.provisioned_root_refresh_dirty.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_root_refresh_started.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), server.last_provision_head_check_at_ms);
+}
+
+test "data runtime runRound backs off retryable provision metadata failures" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provision-metadata-backoff", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+
+    const remote_metadata = try alloc.create(RemoteMetadataSource);
+    const metadata_api_urls = [_][]const u8{"http://metadata.test"};
+    remote_metadata.* = try RemoteMetadataSource.init(alloc, &metadata_api_urls);
+    remote_metadata.test_faults.fetch_head_error = error.NotLeader;
+
+    var server: DataServer = .{
+        .alloc = alloc,
+        .remote_metadata = remote_metadata,
+        .store_registration = .{
+            .node_id = 9,
+            .store_id = 19,
+            .role = "data",
+            .failure_domain = "test",
+        },
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+        ),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    server.store_registration_confirmed = true;
+    server.store_status_dirty = false;
+    server.runtime_status_dirty.store(false, .release);
+    server.provisioned_startup_catch_up_dirty.store(false, .release);
+    server.provisioned_root_refresh_dirty.store(false, .release);
+    server.provision_ticks = 3;
+
+    try server.runRound();
+
+    try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+    try std.testing.expect(server.nextMetadataBootstrapRetryAtMsForTest() != 0);
+    try std.testing.expect(server.provisioned_root_refresh_dirty.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), server.provision_ticks);
+    try std.testing.expect(server.last_provision_head_check_at_ms != 0);
+
+    const next_retry_at_ms = server.nextMetadataBootstrapRetryAtMsForTest();
+    const last_head_check_at_ms = server.last_provision_head_check_at_ms;
+    server.provision_ticks = 3;
+
+    try server.runRound();
+
+    try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+    try std.testing.expectEqual(next_retry_at_ms, server.nextMetadataBootstrapRetryAtMsForTest());
+    try std.testing.expectEqual(last_head_check_at_ms, server.last_provision_head_check_at_ms);
+    try std.testing.expectEqual(@as(usize, 3), server.provision_ticks);
+}
+
+test "data runtime provisioned root refresh worker backs off retryable metadata failures" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provision-worker-backoff", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+
+    const remote_metadata = try alloc.create(RemoteMetadataSource);
+    const metadata_api_urls = [_][]const u8{"http://metadata.test"};
+    remote_metadata.* = try RemoteMetadataSource.init(alloc, &metadata_api_urls);
+    remote_metadata.test_faults.fetch_head_error = error.NotLeader;
+
+    var server: DataServer = .{
+        .alloc = alloc,
+        .remote_metadata = remote_metadata,
+        .store_registration = .{
+            .node_id = 9,
+            .store_id = 19,
+            .role = "data",
+            .failure_domain = "test",
+        },
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+        ),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    server.provisioned_root_refresh_dirty.store(true, .release);
+
+    server.runProvisionedRootRefresh();
+
+    try std.testing.expectEqual(@as(u64, 1), server.provisioned_root_refresh_failed.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+    try std.testing.expect(server.nextMetadataBootstrapRetryAtMsForTest() != 0);
+    try std.testing.expect(server.provisioned_root_refresh_dirty.load(.acquire));
+
+    const next_retry_at_ms = server.nextMetadataBootstrapRetryAtMsForTest();
+    server.store_registration_confirmed = true;
+    server.store_status_dirty = false;
+    server.runtime_status_dirty.store(false, .release);
+    server.provisioned_startup_catch_up_dirty.store(false, .release);
+    server.provision_ticks = 3;
+
+    try server.runRound();
+
+    try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+    try std.testing.expectEqual(next_retry_at_ms, server.nextMetadataBootstrapRetryAtMsForTest());
+    try std.testing.expectEqual(@as(usize, 3), server.provision_ticks);
 }
 
 test "data runtime provisioned root refresh spawn failure preserves retry bookkeeping" {

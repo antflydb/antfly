@@ -43,6 +43,7 @@ const NormRopeParityCase = struct {
 
 pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !void {
     var smoke = false;
+    var e4b_q8_prefill_smoke = false;
     var gemma4_parity_path: ?[]const u8 = null;
     var gemma4_hf_parity_path: ?[]const u8 = null;
     var gemma4_cross_gguf_path: ?[]const u8 = null;
@@ -57,6 +58,8 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--smoke")) {
             smoke = true;
+        } else if (std.mem.eql(u8, arg, "--e4b-q8-prefill-smoke")) {
+            e4b_q8_prefill_smoke = true;
         } else if (std.mem.eql(u8, arg, "--gguf-meta")) {
             i += 1;
             if (i >= args.len) {
@@ -232,6 +235,14 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
             }
         }
 
+        if (e4b_q8_prefill_smoke) {
+            cuda_kernels.smokeQ4_0E4BPairActivationQ8_1Rows(allocator) catch |err| {
+                print("smoke: e4b_q8_prefill_rows failed\nreason: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            print("smoke: e4b_q8_prefill_rows ok\n", .{});
+        }
+
         if (gemma4_parity_path) |path| {
             runGemma4Parity(allocator, path) catch |err| {
                 print("gemma4_parity: failed\nreason: {s}\n", .{@errorName(err)});
@@ -304,7 +315,7 @@ fn smokeCublasLtBf16(allocator: std.mem.Allocator) !bool {
     try input.copyFromHost(&ctx, std.mem.sliceAsBytes(&input_data));
     try weight.copyFromHost(&ctx, std.mem.sliceAsBytes(&weight_data));
     try module.launchF32ToBf16(&ctx, input_bf16, input, input_data.len);
-    try blas.matmulBf16WeightF32Out(&ctx, output, input_bf16, weight, rows, in_dim, out_dim);
+    try blas.matmulBf16WeightF32Out(&ctx, output, input_bf16, weight, .{}, rows, in_dim, out_dim);
     try ctx.synchronize();
 
     const actual = try allocator.alloc(f32, rows * out_dim);
@@ -327,6 +338,8 @@ fn printUsage() void {
         \\                                      [--gguf-meta <gguf>]
         \\
         \\  --smoke   Run CUDA smoke checks for fill, graph capture, dense/quant kernels, Gemma4 primitives, decoder-runtime slots, and cuBLASLt.
+        \\  --e4b-q8-prefill-smoke
+        \\            Run the Gemma 4 E4B row-aware Q4_0 gate/up Q8_1 prefill kernel smoke check.
         \\  --gguf-meta <gguf>
         \\            Dump raw GGUF header metadata and reconstructed GPT config.
         \\  --gemma4-parity <gguf>

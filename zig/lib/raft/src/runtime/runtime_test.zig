@@ -787,6 +787,63 @@ test "multi raft uses disk batcher and apply queue across a host round" {
     try std.testing.expectEqual(@as(usize, 1), metrics.apply_queue_drains);
 }
 
+test "multi raft skips persistence for message-only ready" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+
+    var storage_recorder = StorageRecorder{ .alloc = std.testing.allocator };
+    defer storage_recorder.deinit();
+    try storage_recorder.registerStore(155, &store);
+
+    var transport_recorder = TransportRecorder{ .alloc = std.testing.allocator };
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{}, .{
+        .group_storage = storage_recorder.iface(),
+        .transport = transport_recorder.iface(),
+    });
+    defer host.deinit();
+
+    var peers = [_]core.types.NodeId{ 1, 2 };
+    try host.addGroup(.{
+        .group_id = 155,
+        .local_node_id = 1,
+        .raft_config = .{
+            .id = 1,
+            .group_id = 155,
+            .peers = peers[0..],
+            .election_tick = 5,
+            .heartbeat_tick = 1,
+            .pre_vote = false,
+        },
+        .storage = store.storage(),
+    });
+
+    try host.group(155).?.campaign();
+    _ = try drainGroup(&host, 155);
+    try host.step(155, .{
+        .msg_type = .request_vote_response,
+        .from = 2,
+        .to = 1,
+        .term = 1,
+    });
+    _ = try drainGroup(&host, 155);
+    try std.testing.expectEqual(core.types.StateRole.leader, host.group(155).?.status().soft.role);
+
+    const persisted_before_heartbeat = storage_recorder.persist_calls;
+    transport_recorder.send_calls = 0;
+    transport_recorder.peer_batch_calls = 0;
+    transport_recorder.sent_messages = 0;
+    transport_recorder.batched_peer_count = 0;
+    transport_recorder.batched_group_count = 0;
+
+    const round = try host.runRound(1, 1);
+    try std.testing.expectEqual(@as(usize, 1), round.processed_groups);
+    try std.testing.expect(transport_recorder.sent_messages > 0);
+    try std.testing.expectEqual(persisted_before_heartbeat, storage_recorder.persist_calls);
+    try std.testing.expect(round.slowest_ready_group.persist_ready_detail.skipped_no_durable_state);
+    try std.testing.expect(!round.slowest_ready_group.persist_ready_detail.used_group_storage);
+    try std.testing.expect(!round.slowest_ready_group.persist_ready_detail.used_batch);
+}
+
 test "multi raft metrics track quiesced groups and throttle denials" {
     var store = core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();

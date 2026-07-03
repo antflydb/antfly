@@ -200,6 +200,7 @@ const gguf_quant_preference = [_][]const u8{
     "Q4_K_M",
     "UD-Q4_K_M",
     "UD-Q4_K_XL",
+    "Q4_0",
     "Q5_K_S",
     "Q5_K_M",
     "Q6_K",
@@ -305,24 +306,39 @@ pub fn noModelFilesAdviceAlloc(
 fn isGgufProjectorFile(path: []const u8) bool {
     if (!isGgufFile(path)) return false;
     const base = basename(path);
-    return std.mem.eql(u8, base, "mmproj.gguf") or
-        std.mem.startsWith(u8, base, "mmproj-") or
-        std.mem.startsWith(u8, base, "mmproj_");
+    const ext = ".gguf";
+    const stem = base[0 .. base.len - ext.len];
+    return std.mem.eql(u8, stem, "mmproj") or
+        std.mem.startsWith(u8, stem, "mmproj-") or
+        std.mem.startsWith(u8, stem, "mmproj_") or
+        std.mem.endsWith(u8, stem, "-mmproj") or
+        std.mem.endsWith(u8, stem, "_mmproj");
+}
+
+fn isGgufQuantBoundary(ch: u8) bool {
+    return switch (ch) {
+        '-', '_', '.' => true,
+        else => false,
+    };
 }
 
 fn ggufQuantSuffixMatches(path: []const u8, quant: []const u8) bool {
-    if (!isGgufFile(path)) return false;
+    if (!isGgufFile(path) or quant.len == 0) return false;
     const base = basename(path);
     const ext = ".gguf";
     if (base.len <= ext.len or !std.mem.endsWith(u8, base, ext)) return false;
     const stem = base[0 .. base.len - ext.len];
-    if (!std.mem.endsWith(u8, stem, quant)) return false;
-    const start = stem.len - quant.len;
-    if (start == 0) return true;
-    return switch (stem[start - 1]) {
-        '-', '_', '.' => true,
-        else => false,
-    };
+    if (stem.len < quant.len) return false;
+
+    var start: usize = 0;
+    while (start + quant.len <= stem.len) : (start += 1) {
+        if (!std.ascii.eqlIgnoreCase(stem[start .. start + quant.len], quant)) continue;
+        const has_left_boundary = start == 0 or isGgufQuantBoundary(stem[start - 1]);
+        const end = start + quant.len;
+        const has_right_boundary = end == stem.len or isGgufQuantBoundary(stem[end]);
+        if (has_left_boundary and has_right_boundary) return true;
+    }
+    return false;
 }
 
 fn isClipclapClipGgufFile(path: []const u8) bool {
@@ -1750,6 +1766,43 @@ test "gguf selection skips projector and appends it as companion artifact" {
     try std.testing.expectEqual(@as(usize, 2), to_download.items.len);
     try std.testing.expectEqualStrings("gemma-4-e2b-it-Q4_K_M.gguf", to_download.items[0].name);
     try std.testing.expectEqualStrings("mmproj-gemma-4-e2b-it-f16.gguf", to_download.items[1].name);
+}
+
+test "gguf selection handles google gemma4 e4b qat q4_0 layout" {
+    const allocator = std.testing.allocator;
+
+    const files = [_]HubFile{
+        .{ .name = "gemma-4-E4B-it-mmproj.gguf" },
+        .{ .name = "gemma-4-E4B-q4_0ish-it.gguf" },
+        .{ .name = "gemma-4-E4B_q4_0-it.gguf" },
+    };
+
+    var to_download = std.ArrayListUnmanaged(HubFile).empty;
+    defer to_download.deinit(allocator);
+
+    try std.testing.expect(try appendBestRequestedGgufPayload(allocator, &to_download, &files, "Q4_0", .auto));
+
+    try std.testing.expectEqual(@as(usize, 2), to_download.items.len);
+    try std.testing.expectEqualStrings("gemma-4-E4B_q4_0-it.gguf", to_download.items[0].name);
+    try std.testing.expectEqualStrings("gemma-4-E4B-it-mmproj.gguf", to_download.items[1].name);
+}
+
+test "gguf auto selection includes q4_0 qat model with trailing projector" {
+    const allocator = std.testing.allocator;
+
+    const files = [_]HubFile{
+        .{ .name = "gemma-4-E4B-it-mmproj.gguf" },
+        .{ .name = "gemma-4-E4B_q4_0-it.gguf" },
+    };
+
+    var to_download = std.ArrayListUnmanaged(HubFile).empty;
+    defer to_download.deinit(allocator);
+
+    try std.testing.expect(try appendBestRequestedGgufPayload(allocator, &to_download, &files, null, .auto));
+
+    try std.testing.expectEqual(@as(usize, 2), to_download.items.len);
+    try std.testing.expectEqualStrings("gemma-4-E4B_q4_0-it.gguf", to_download.items[0].name);
+    try std.testing.expectEqualStrings("gemma-4-E4B-it-mmproj.gguf", to_download.items[1].name);
 }
 
 test "gguf selection prefers smaller q4_k variants by default" {
