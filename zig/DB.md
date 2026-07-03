@@ -48,6 +48,161 @@ Current first implementation:
 - chunk artifacts are stored under `<doc>:e:chunk:<chunk_name>:<chunk_id>`
 - overwrites and deletes clear stale chunk artifacts before regeneration
 
+## Derived Coverage Accounting
+
+Derived artifacts and artifact-backed indexes need coverage accounting that is
+stronger than raw artifact or index-entry counts. A managed embeddings index can
+legitimately cover only a subset of table documents, for example a conditional
+media template over a mixed corpus, while a failed or lagging enrichment must
+not be hidden as "ready" simply because partial coverage is allowed.
+
+The DB-level invariant is:
+
+- coverage measures whether every source unit for a derived generation reached a
+  terminal outcome
+- readiness is separate from health
+- query correctness must know when an index is partial, and should not treat a
+  partial index as a full-table access path unless the query or caller accepts
+  that coverage
+
+This follows the database precedent for partial indexes: eligibility is explicit
+and planners avoid using a partial index when doing so would produce an
+incomplete result set. For derived work, the corresponding rule is that
+eligibility and terminal outcomes are explicit, not inferred from template
+syntax or artifact counts.
+
+### Coverage State
+
+Coverage is tracked per derived generation over source units, not just per table
+document. For simple document embeddings the source unit is a document. For
+chunked embeddings it may be a chunk artifact. For media extraction it may be an
+asset artifact. The coverage key should identify:
+
+- table or shard
+- derived artifact or index name
+- source artifact name, when the producer consumes another artifact stream
+- source unit identity
+- generation or config version
+
+Each source unit has one current outcome for that generation:
+
+- `pending`: not evaluated yet
+- `in_flight`: currently being evaluated
+- `produced`: artifact or index entry exists for the generation
+- `skipped`: evaluated and intentionally produced nothing
+- `terminal_failed`: evaluated and cannot produce after the configured policy
+  and retry budget
+- `stale`: an older generation result exists, but the current generation has not
+  completed for this source unit
+
+Aggregate status is derived from those durable per-source outcomes:
+
+- `source_total`
+- `eligible`
+- `produced`
+- `skipped`
+- `terminal_failed`
+- `retryable_failed`
+- `pending`
+- `in_flight`
+- `generation`
+- `complete`
+- `healthy`
+- `degraded`
+
+The core completion predicate is:
+
+```text
+complete =
+    produced + skipped + terminal_failed >= source_total
+    and pending == 0
+    and in_flight == 0
+```
+
+Health is stricter:
+
+```text
+healthy = complete and terminal_failed == 0
+degraded = complete and terminal_failed > 0
+```
+
+This keeps "no work remains" distinct from "all desired outputs exist".
+
+### Coverage Policy
+
+Derived configs should declare how missing or non-embeddable source units affect
+readiness:
+
+- `strict`: every eligible source unit must produce an output; skipped or failed
+  required units keep the derived artifact/index not ready
+- `partial`: intentional skips satisfy completion; terminal failures do not
+  satisfy healthy readiness
+- `best_effort`: intentional skips and terminal failures may satisfy completion,
+  but terminal failures make the status degraded
+
+The policy should be explicit in index and enrichment config, for example:
+
+```json
+{
+  "type": "embeddings",
+  "coverage_policy": "partial",
+  "applies_when": {
+    "exists": "image_url"
+  },
+  "template": "{{remoteMedia url=image_url}}"
+}
+```
+
+`applies_when` is preferred over syntax sniffing because it gives the planner,
+repair jobs, and operators a stable eligibility predicate. Templates may still
+produce `skipped` outcomes when rendering produces no input, but empty-template
+detection is an execution outcome, not the primary declaration of index
+coverage.
+
+### Readiness And Repair
+
+Runtime status must use coverage accounting instead of raw `doc_count >=
+table_doc_count` for managed derived indexes. In particular:
+
+- `rebuilding` and `backfill_active` remain true while coverage has pending or
+  in-flight source units
+- `replay_catch_up_required` reflects source/enrichment replay debt and must not
+  be cleared solely because at least one artifact or index entry exists
+- partial coverage can mark skipped units complete, but it cannot mask pending
+  enrichment work
+- terminal failures are visible through degraded status and reason counters
+
+Repair also needs durable source-unit outcomes. Aggregate counters are not
+enough, because repair must distinguish:
+
+- never evaluated
+- intentionally skipped
+- produced but lost
+- stale generation
+- terminal failure
+
+Coverage-gap repair should regenerate missing `produced` artifacts, leave
+current-generation `skipped` units alone, and retry or surface
+`terminal_failed` units according to policy.
+
+### Scope
+
+The coverage model should be shared by all derived artifact producers and
+artifact-backed indexes:
+
+- embeddings
+- chunks
+- summaries
+- image, audio, PDF, and OCR extraction artifacts
+- graph extraction
+- artifact-backed dense and sparse vector indexes
+- algebraic or materialized derived indexes where source-unit coverage matters
+
+Full-text indexes usually have trivial full coverage, but can still project the
+same status shape with `eligible == source_total` when useful. The shared model
+should live below the public API so each producer can report comparable lifecycle
+state without pretending every index is document-count based.
+
 ## Search Contract
 
 `DB.search()` is coordinator-style orchestration over named result sets.

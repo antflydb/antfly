@@ -425,6 +425,7 @@ fn runtimeStatusSnapshot(runtime: *EnrichmentRuntime) enrichment_state.RuntimeSt
         .error_count = runtime.error_count,
         .retryable_error_count = runtime.retryable_error_count,
         .fatal_error_count = runtime.fatal_error_count,
+        .skipped_source_count = runtime.skipped_source_count,
         .retrying = runtime.retrying,
         .worker_failed = runtime.worker_failed,
     };
@@ -434,6 +435,7 @@ fn restorePersistedRuntimeStatus(runtime: anytype, persisted_status: enrichment_
     runtime.error_count = persisted_status.error_count;
     runtime.retryable_error_count = persisted_status.retryable_error_count;
     runtime.fatal_error_count = persisted_status.fatal_error_count;
+    runtime.skipped_source_count = persisted_status.skipped_source_count;
     runtime.retrying = persisted_status.retrying and !persisted_status.worker_failed;
     runtime.worker_failed = persisted_status.worker_failed;
     runtime.target_sequence = @max(runtime.applied_sequence, persisted_status.target_sequence);
@@ -446,6 +448,7 @@ test "enrichment runtime restore preserves retry target across restart" {
         error_count: u64 = 0,
         retryable_error_count: u64 = 0,
         fatal_error_count: u64 = 0,
+        skipped_source_count: u64 = 0,
         retrying: bool = false,
         worker_failed: bool = false,
     }{};
@@ -473,6 +476,7 @@ test "enrichment runtime restore does not resume persisted fatal failure" {
         error_count: u64 = 0,
         retryable_error_count: u64 = 0,
         fatal_error_count: u64 = 0,
+        skipped_source_count: u64 = 0,
         retrying: bool = false,
         worker_failed: bool = false,
     }{};
@@ -926,6 +930,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     retrying: bool = false,
     worker_failed: bool = false,
     skip_by_hash_count: u64 = 0,
+    skipped_source_count: u64 = 0,
     codec_decode_failures: u64 = 0,
     embed_batches_started: u64 = 0,
     embed_batches_completed: u64 = 0,
@@ -1101,6 +1106,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .retrying = self.retrying,
             .worker_failed = self.worker_failed,
             .skip_by_hash_count = self.skip_by_hash_count,
+            .skipped_source_count = self.skipped_source_count,
             .codec_decode_failures = self.codec_decode_failures,
             .embed_batches_started = self.embed_batches_started,
             .embed_batches_completed = self.embed_batches_completed,
@@ -1151,6 +1157,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     retrying: bool = false,
     worker_failed: bool = false,
     skip_by_hash_count: u64 = 0,
+    skipped_source_count: u64 = 0,
     codec_decode_failures: u64 = 0,
     embed_batches_started: u64 = 0,
     embed_batches_completed: u64 = 0,
@@ -1386,6 +1393,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .retrying = self.retrying,
             .worker_failed = self.worker_failed,
             .skip_by_hash_count = self.skip_by_hash_count,
+            .skipped_source_count = self.skipped_source_count,
             .codec_decode_failures = self.codec_decode_failures,
             .embed_batches_started = self.embed_batches_started,
             .embed_batches_completed = self.embed_batches_completed,
@@ -3863,6 +3871,7 @@ fn flushChunkedDenseItems(
             .source_hash = item.source_hash,
             .vector = vector,
         });
+        try markDerivedCoverageProduced(runtime, item.request.doc_key, consumer_indexes);
         const artifact_key = try embeddingArtifactKey(runtime, item.chunk_key, item.artifact_name);
         var artifact_key_owned = true;
         errdefer if (artifact_key_owned) runtime.alloc.free(artifact_key);
@@ -3908,6 +3917,7 @@ fn processCachedChunkDenseItems(
     cached_items: *std.ArrayListUnmanaged(CachedChunkDenseWindowItem),
     max_window_items: usize,
 ) !void {
+    if (cached_items.items.len > 0) try markDerivedCoverageProduced(runtime, request.doc_key, consumer_indexes);
     for (cached_items.items) |item| {
         try appendCachedChunkDenseEmbeddingToWindow(runtime, window, request, item.chunk_key, item.embedding_key, consumer_indexes);
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
@@ -4086,6 +4096,7 @@ fn processMaterializedChunkDenseRequest(
         try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, embedding_key);
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
     }
+    if (desired_chunk_keys.count() == 0) try markDerivedCoverageSkipped(runtime, request.doc_key, consumer_indexes);
     try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
 }
 
@@ -4106,6 +4117,7 @@ fn flushMaterializedSparseChunkSources(
         if (chunk_embeddings.len > 0) runtime.alloc.free(chunk_embeddings);
     }
     if (chunk_embeddings.len == 0) return;
+    try markDerivedCoverageProduced(runtime, request.doc_key, consumer_indexes);
 
     var expanded = try expandSparseEmbeddingsForConsumers(runtime, chunk_embeddings, consumer_indexes);
     defer {
@@ -4117,11 +4129,13 @@ fn flushMaterializedSparseChunkSources(
 
 fn processCachedChunkSparseItems(
     runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
     consumer_indexes: []const []const u8,
     window: *GeneratedReplayWindow,
     cached_items: *std.ArrayListUnmanaged(CachedChunkDenseWindowItem),
     max_window_items: usize,
 ) !void {
+    if (cached_items.items.len > 0) try markDerivedCoverageProduced(runtime, request.doc_key, consumer_indexes);
     for (cached_items.items) |item| {
         try appendCachedSparseEmbeddingToWindow(runtime, window, item.chunk_key, item.embedding_key, consumer_indexes);
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
@@ -4268,7 +4282,7 @@ fn processMaterializedChunkSparseRequest(
         };
         try backend_scan.scanWithContext(&runtime.store, lower, upper_bound, .{}, &collect, Collect.scan);
 
-        try processCachedChunkSparseItems(runtime, consumer_indexes, window, &cached_items, max_window_items);
+        try processCachedChunkSparseItems(runtime, request, consumer_indexes, window, &cached_items, max_window_items);
         try flushMaterializedSparseChunkSources(runtime, request, sparse_embedder, consumer_indexes, &sources, window);
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
         batch_source_bytes = 0;
@@ -4288,6 +4302,7 @@ fn processMaterializedChunkSparseRequest(
         try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, embedding_key);
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
     }
+    if (desired_chunk_keys.count() == 0) try markDerivedCoverageSkipped(runtime, request.doc_key, consumer_indexes);
     try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
 }
 
@@ -4306,13 +4321,17 @@ fn collectPlainDenseBatchItem(
     };
     defer runtime.alloc.free(raw);
 
-    const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse return null;
+    const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse {
+        try markDerivedCoverageSkipped(runtime, request.doc_key, consumer_indexes);
+        return null;
+    };
     errdefer runtime.alloc.free(@constCast(source_text));
     const source_hash = enrichment_artifact_codec.hashSource(source_text);
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     errdefer runtime.alloc.free(artifact_key);
     if (try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) {
+        try markDerivedCoverageProduced(runtime, request.doc_key, consumer_indexes);
         try appendCachedDenseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes);
         runtime.alloc.free(@constCast(source_text));
         runtime.alloc.free(artifact_key);
@@ -4369,6 +4388,7 @@ fn flushPlainDenseItems(
             .source_hash = item.source_hash,
             .vector = vector,
         });
+        try markDerivedCoverageProduced(runtime, item.request.doc_key, consumer_indexes);
 
         var embeddings = try singleDenseEmbeddingForConsumers(runtime, item.request.doc_key, item.artifact_key, vector, consumer_indexes);
         defer {
@@ -4501,6 +4521,10 @@ fn processChunkedDenseWindow(
             errdefer stale_deletes.deinit(runtime.alloc);
             try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
             try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
+            if (source_set.sources.len == 0) {
+                try markDerivedCoverageSkipped(runtime, request.doc_key, consumer_indexes);
+                continue;
+            }
 
             for (source_set.sources) |source| {
                 const source_hash = enrichment_artifact_codec.hashSource(source.text);
@@ -4920,6 +4944,11 @@ fn processDenseEmbedding(
 
         var stale_deletes = try deleteStaleChunkEmbeddingArtifacts(runtime, request.doc_key, chunk_artifact_name, embedding_artifact_name, source_set.desired_chunk_keys);
         errdefer stale_deletes.deinit(runtime.alloc);
+        if (source_set.sources.len == 0) {
+            try markDerivedCoverageSkipped(runtime, request.doc_key, consumer_indexes);
+            try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
+            return;
+        }
 
         const chunk_embeddings = try buildChunkDenseEmbeddingsFromSources(runtime, request, dense_embedder, source_set.sources);
         defer {
@@ -4928,6 +4957,7 @@ fn processDenseEmbedding(
         }
 
         if (chunk_embeddings.len == 0) {
+            try markDerivedCoverageSkipped(runtime, request.doc_key, consumer_indexes);
             try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
             return;
         }
@@ -4936,6 +4966,7 @@ fn processDenseEmbedding(
             if (embedding.vector.len > 0) try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, embedding.doc_key);
         }
         try writeChunkEmbeddingArtifacts(runtime, request.doc_key, request.source_field, embedding_artifact_name, chunk_embeddings);
+        try markDerivedCoverageProduced(runtime, request.doc_key, consumer_indexes);
         var expanded = try expandDenseEmbeddingsForConsumers(runtime, chunk_embeddings, consumer_indexes);
         defer {
             for (expanded) |embedding| freeDerivedDenseEmbedding(runtime.alloc, embedding);
@@ -4971,6 +5002,7 @@ fn processDenseEmbedding(
                 .source_hash = null,
                 .vector = vector,
             });
+            try markDerivedCoverageProduced(runtime, request.doc_key, consumer_indexes);
             const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
             defer runtime.alloc.free(artifact_key);
 
@@ -4982,15 +5014,21 @@ fn processDenseEmbedding(
             try appendOwnedDenseEmbeddingsToWindow(runtime, window, &embeddings);
             return;
         }
+        try markDerivedCoverageSkipped(runtime, request.doc_key, consumer_indexes);
+        return;
     }
 
-    const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse return;
+    const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse {
+        try markDerivedCoverageSkipped(runtime, request.doc_key, consumer_indexes);
+        return;
+    };
     defer runtime.alloc.free(source_text);
     const source_hash = enrichment_artifact_codec.hashSource(source_text);
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     defer runtime.alloc.free(artifact_key);
     if (try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) {
+        try markDerivedCoverageProduced(runtime, request.doc_key, consumer_indexes);
         try appendCachedDenseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes);
         return;
     }
@@ -5007,6 +5045,7 @@ fn processDenseEmbedding(
         .source_hash = source_hash,
         .vector = vector,
     });
+    try markDerivedCoverageProduced(runtime, request.doc_key, consumer_indexes);
 
     var embeddings = try singleDenseEmbeddingForConsumers(runtime, request.doc_key, artifact_key, vector, consumer_indexes);
     defer {
@@ -5042,6 +5081,11 @@ fn processSparseEmbedding(
 
         var stale_deletes = try deleteStaleChunkEmbeddingArtifacts(runtime, request.doc_key, chunk_artifact_name, embedding_artifact_name, source_set.desired_chunk_keys);
         errdefer stale_deletes.deinit(runtime.alloc);
+        if (source_set.sources.len == 0) {
+            try markDerivedCoverageSkipped(runtime, request.doc_key, consumer_indexes);
+            try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
+            return;
+        }
 
         const chunk_embeddings = try buildChunkSparseEmbeddingsFromSources(runtime, request, sparse_embedder, source_set.sources);
         defer {
@@ -5050,10 +5094,12 @@ fn processSparseEmbedding(
         }
 
         if (chunk_embeddings.len == 0) {
+            try markDerivedCoverageSkipped(runtime, request.doc_key, consumer_indexes);
             try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
             return;
         }
 
+        try markDerivedCoverageProduced(runtime, request.doc_key, consumer_indexes);
         var expanded = try expandSparseEmbeddingsForConsumers(runtime, chunk_embeddings, consumer_indexes);
         defer {
             for (expanded) |embedding| freeDerivedSparseEmbedding(runtime.alloc, embedding);
@@ -5072,13 +5118,17 @@ fn processSparseEmbedding(
     };
     defer runtime.alloc.free(raw);
 
-    const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse return;
+    const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse {
+        try markDerivedCoverageSkipped(runtime, request.doc_key, consumer_indexes);
+        return;
+    };
     defer runtime.alloc.free(source_text);
     const source_hash = enrichment_artifact_codec.hashSource(source_text);
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     defer runtime.alloc.free(artifact_key);
     if (try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) {
+        try markDerivedCoverageProduced(runtime, request.doc_key, consumer_indexes);
         try appendCachedSparseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes);
         return;
     }
@@ -5086,6 +5136,7 @@ fn processSparseEmbedding(
     var sparse = try embedSparseWithRetry(sparse_embedder, runtime, embedding_artifact_name, source_text);
     defer sparse.deinit(runtime.alloc);
     try writeSparseEmbeddingArtifact(runtime, request.doc_key, embedding_artifact_name, source_hash, sparse.indices, sparse.values);
+    try markDerivedCoverageProduced(runtime, request.doc_key, consumer_indexes);
 
     var embeddings = try singleSparseEmbeddingForConsumers(runtime, request.doc_key, artifact_key, sparse.indices, sparse.values, consumer_indexes);
     defer {
@@ -6976,6 +7027,48 @@ fn saveRuntimeStatusWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, st
         };
         return;
     }
+}
+
+fn markDerivedCoverageSkippedForIndex(runtime: *EnrichmentRuntime, index_name: []const u8, doc_key: []const u8) !void {
+    const generation = runtime.index_manager.coverageGenerationForIndex(index_name) orelse return;
+    const key = try internal_keys.derivedCoverageOutcomeKeyAlloc(runtime.alloc, index_name, generation, doc_key, "skipped");
+    defer runtime.alloc.free(key);
+    const already_marked = blk: {
+        const existing = storeGetAlloc(runtime, key) catch |err| switch (err) {
+            error.NotFound => break :blk false,
+            std.mem.Allocator.Error.OutOfMemory => return err,
+            else => break :blk false,
+        };
+        runtime.alloc.free(existing);
+        break :blk true;
+    };
+    try storePutWithRetry(runtime, key, "skipped");
+    if (!already_marked) runtime.skipped_source_count += 1;
+}
+
+fn markDerivedCoverageProducedForIndex(runtime: *EnrichmentRuntime, index_name: []const u8, doc_key: []const u8) !void {
+    const generation = runtime.index_manager.coverageGenerationForIndex(index_name) orelse return;
+    const key = try internal_keys.derivedCoverageOutcomeKeyAlloc(runtime.alloc, index_name, generation, doc_key, "skipped");
+    defer runtime.alloc.free(key);
+    const had_marker = blk: {
+        const existing = storeGetAlloc(runtime, key) catch |err| switch (err) {
+            error.NotFound => break :blk false,
+            std.mem.Allocator.Error.OutOfMemory => return err,
+            else => break :blk false,
+        };
+        runtime.alloc.free(existing);
+        break :blk true;
+    };
+    try storePutBatchWithRetry(runtime, &.{}, &.{key});
+    if (had_marker and runtime.skipped_source_count > 0) runtime.skipped_source_count -= 1;
+}
+
+fn markDerivedCoverageSkipped(runtime: *EnrichmentRuntime, doc_key: []const u8, consumer_indexes: []const []const u8) !void {
+    for (consumer_indexes) |index_name| try markDerivedCoverageSkippedForIndex(runtime, index_name, doc_key);
+}
+
+fn markDerivedCoverageProduced(runtime: *EnrichmentRuntime, doc_key: []const u8, consumer_indexes: []const []const u8) !void {
+    for (consumer_indexes) |index_name| try markDerivedCoverageProducedForIndex(runtime, index_name, doc_key);
 }
 
 fn appendGeneratedBatchWithRetry(

@@ -2790,6 +2790,8 @@ pub fn build(b: *std.Build) void {
         "provisioned table write cache retires stale db when index metadata changes",
         "embeddings index status ignores inactive stale catch-up progress once dense coverage is visible",
         "managed embeddings readiness ignores inactive stale catch-up after rate-limit recovery",
+        "partial coverage embeddings readiness counts skipped source units",
+        "partial coverage embeddings readiness does not mask pending enrichment",
         "retrieval agent treats aggregations as first-class tool capability",
         "retrieval agent requires filter and aggregate tools for filtered aggregations",
         "retrieval agent ignores empty map-valued tool fields for policy and strategy",

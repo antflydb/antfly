@@ -8155,6 +8155,7 @@ pub const DB = struct {
         lockApply(self);
         defer self.core.unlockApply();
         const removed = try self.core.deleteIndex(name);
+        if (removed) try self.deleteDerivedCoverageForIndex(name);
         return removed;
     }
 
@@ -9944,6 +9945,9 @@ pub const DB = struct {
                         item.root_node = hbc_stats.root_node;
                         item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
                     }
+                    if (self.core.index_manager.coverageGenerationForIndex(item.name)) |generation| {
+                        item.coverage_skipped_count = self.countDerivedCoverageSkipped(item.name, generation) catch item.coverage_skipped_count;
+                    }
                     visible_doc_count = @max(visible_doc_count, item.doc_count);
                 },
                 .sparse_vector => {
@@ -9954,6 +9958,9 @@ pub const DB = struct {
                         else
                             sparse_stats.doc_count;
                         item.term_count = sparse_stats.term_count;
+                    }
+                    if (self.core.index_manager.coverageGenerationForIndex(item.name)) |generation| {
+                        item.coverage_skipped_count = self.countDerivedCoverageSkipped(item.name, generation) catch item.coverage_skipped_count;
                     }
                     visible_doc_count = @max(visible_doc_count, item.doc_count);
                 },
@@ -10242,6 +10249,7 @@ pub const DB = struct {
                         item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     }
+                    item.coverage_skipped_count = try self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGeneration(cfg.config_json));
                     if (async_indexing.dense_catch_up.active) {
                         item.catch_up_active = true;
                         item.backfill_active = true;
@@ -10264,6 +10272,7 @@ pub const DB = struct {
                         item.term_count = sparse_snapshot.term_count;
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     }
+                    item.coverage_skipped_count = try self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGeneration(cfg.config_json));
                 },
                 .graph => {
                     if (self.core.graphIndex(cfg.name)) |entry| {
@@ -10389,6 +10398,7 @@ pub const DB = struct {
                             }
                         }
                     }
+                    item.coverage_skipped_count = try self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGeneration(cfg.config_json));
                     if (!item.backfill_active and item.replay_target_sequence > 0 and item.doc_count < visible_doc_count) {
                         item.backfill_progress = @min(
                             1.0,
@@ -10418,6 +10428,7 @@ pub const DB = struct {
                             item.backfill_progress = progress;
                         }
                     }
+                    item.coverage_skipped_count = try self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGeneration(cfg.config_json));
                     if (!item.backfill_active and item.replay_target_sequence > 0) {
                         item.backfill_progress = @min(
                             1.0,
@@ -10539,6 +10550,9 @@ pub const DB = struct {
             if (try self.loadIndexStatusSnapshot(alloc, cfg.name)) |status_snapshot| {
                 applyIndexStatusSnapshot(&item, status_snapshot);
                 visible_doc_count = @max(visible_doc_count, item.doc_count);
+            }
+            if (cfg.kind == .dense_vector or cfg.kind == .sparse_vector) {
+                item.coverage_skipped_count = self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGeneration(cfg.config_json)) catch item.coverage_skipped_count;
             }
             if (cfg.kind == .full_text) {
                 item.text_merge = self.core.index_manager.textMergeStatsSnapshotForIndex(cfg.name);
@@ -10850,6 +10864,37 @@ pub const DB = struct {
         var state = CountState{ .doc_count = &doc_count };
         try self.core.store.scanWithContext(lower, if (upper) |buf| buf else "", .{}, &state, CountState.scanEntry);
         return doc_count;
+    }
+
+    fn countDerivedCoverageSkipped(self: *DB, index_name: []const u8, generation: u64) !u64 {
+        const lower = try internal_keys.derivedCoverageOutcomeKindPrefixAlloc(self.core.alloc, index_name, generation, "skipped");
+        defer self.core.alloc.free(lower);
+        const upper = try internal_keys.nextPrefixAlloc(self.core.alloc, lower);
+        defer if (upper) |key| self.core.alloc.free(key);
+        const upper_bound = if (upper) |key| key else "";
+
+        var skipped: u64 = 0;
+        const CountState = struct {
+            skipped: *u64,
+
+            fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                _ = key;
+                _ = value;
+                const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                state.skipped.* += 1;
+                return .@"continue";
+            }
+        };
+
+        var state = CountState{ .skipped = &skipped };
+        try self.core.store.scanWithContext(lower, upper_bound, .{}, &state, CountState.scanEntry);
+        return skipped;
+    }
+
+    fn deleteDerivedCoverageForIndex(self: *DB, index_name: []const u8) !void {
+        const prefix = try internal_keys.derivedCoverageOutcomePrefixAlloc(self.core.alloc, index_name);
+        defer self.core.alloc.free(prefix);
+        try deleteKeysWithPrefixFromStore(self.core.alloc, self.core.store, prefix);
     }
 
     fn scanPrimaryDocIdentityCoverage(self: *DB, byte_range: types.ByteRange) !DocIdentityCoverage {
@@ -21015,6 +21060,31 @@ fn applyDerivedBatchToIndexContext(ctx: *const AsyncContext, batch: derived_type
     try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, null);
 }
 
+fn deleteDerivedCoverageSkippedForDocKeys(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_manager: *index_manager_mod.IndexManager,
+    index_name: []const u8,
+    doc_keys: []const []const u8,
+) !void {
+    if (doc_keys.len == 0) return;
+    const generation = index_manager.coverageGenerationForIndex(index_name) orelse return;
+
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (deletes.items) |key| alloc.free(@constCast(key));
+        deletes.deinit(alloc);
+    }
+
+    for (doc_keys) |doc_key| {
+        const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, index_name, generation, doc_key, "skipped");
+        errdefer alloc.free(marker_key);
+        try deletes.append(alloc, marker_key);
+    }
+
+    if (deletes.items.len > 0) try store.putBatch(&.{}, deletes.items);
+}
+
 fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, profile: ?*BatchProfile) !void {
     var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
     defer index_apply_guard.unlock();
@@ -21058,6 +21128,8 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             const dense_delete_start_ns = monotonicTimeNs();
             try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, batch.deleted_keys, batch_options);
             try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, batch.overwritten_doc_keys, batch_options);
+            try deleteDerivedCoverageSkippedForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys);
+            try deleteDerivedCoverageSkippedForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.dense_delete_ns, dense_delete_start_ns);
 
             var dense_embeddings = try collectDenseEmbeddingWritesForBatch(
@@ -21116,6 +21188,8 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             const sparse_delete_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
             try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.deleted_keys, batch_options);
             try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.overwritten_doc_keys, batch_options);
+            try deleteDerivedCoverageSkippedForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys);
+            try deleteDerivedCoverageSkippedForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
             if (emit_sparse_write_profile) sparse_delete_ns = monotonicTimeNs() - sparse_delete_start_ns;
 
             const sparse_collect_embedding_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;

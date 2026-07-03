@@ -4898,6 +4898,21 @@ pub const IndexManager = struct {
         return try names.toOwnedSlice(alloc);
     }
 
+    pub fn coverageGenerationForIndex(self: *const IndexManager, index_name: []const u8) ?u64 {
+        for (self.dense_indexes.items) |entry| {
+            if (std.mem.eql(u8, entry.config.name, index_name)) return internal_keys.derivedCoverageGeneration(entry.config.config_json);
+        }
+        for (self.sparse_indexes.items) |entry| {
+            if (std.mem.eql(u8, entry.config.name, index_name)) return internal_keys.derivedCoverageGeneration(entry.config.config_json);
+        }
+        for (self.status_only_index_configs) |cfg| {
+            if (std.mem.eql(u8, cfg.name, index_name) and (cfg.kind == .dense_vector or cfg.kind == .sparse_vector)) {
+                return internal_keys.derivedCoverageGeneration(cfg.config_json);
+            }
+        }
+        return null;
+    }
+
     pub fn sparseIndex(self: *IndexManager, name: ?[]const u8) ?*SparseIndex {
         if (name) |index_name| {
             for (self.sparse_indexes.items) |*entry| {
