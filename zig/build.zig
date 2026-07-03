@@ -3547,6 +3547,7 @@ pub fn build(b: *std.Build) void {
         "api http server returns retryable not leader through public cluster adapter mutation",
         "api http server backs up and restores a table through public routes",
         "api http server prefers metadata-owned restore over inline write-source restore",
+        "api http server retries stale metadata table-exists restore race",
         "public API request body limit matches Go linear merge contract",
         "public api smoke e2e creates table inserts and queries documents",
         "public api e2e recreates managed embeddings index after corrupt artifact",

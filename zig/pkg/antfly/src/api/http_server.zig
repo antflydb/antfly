@@ -5379,6 +5379,29 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    fn restoreMetadataTableWithRetry(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        location_uri: []const u8,
+        backup_id: []const u8,
+    ) !bool {
+        var attempt: usize = 0;
+        while (attempt < 3) : (attempt += 1) {
+            return self.source.restoreTable(alloc, table_name, location_uri, backup_id) catch |err| switch (err) {
+                error.TableAlreadyExists => {
+                    if (self.tableExists(table_name) catch true) return err;
+                    if (attempt + 1 >= 3) return err;
+                    self.waitForTableVisibility(table_name, .absent) catch {};
+                    sleepNs(500 * std.time.ns_per_ms);
+                    continue;
+                },
+                else => return err,
+            };
+        }
+        return false;
+    }
+
     fn restoreOwnedTableWithRetry(
         self: *ApiHttpServer,
         table_name: []const u8,
@@ -6276,7 +6299,7 @@ pub const ApiHttpServer = struct {
         if (self.tableExists(table_name) catch |err| return metadataAccessFailure(err)) return error.TableAlreadyExists;
 
         if (!self.cfg.swarm_mode) {
-            if (self.source.restoreTable(self.alloc, table_name, location_uri, backup_id) catch |err| switch (err) {
+            if (self.restoreMetadataTableWithRetry(self.alloc, table_name, location_uri, backup_id) catch |err| switch (err) {
                 error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
                 error.UnsupportedOperation => false,
                 error.InvalidBackupRequest => {
@@ -6824,7 +6847,7 @@ pub const ApiHttpServer = struct {
             // For overwrite, skip the metadata restore path and use the owned-table
             // restore which creates the table and copies data synchronously.
             if (!is_overwrite and !self.cfg.swarm_mode) {
-                const restored_via_metadata = self.source.restoreTable(alloc, table_name, req.location, table_backup_id) catch |err| switch (err) {
+                const restored_via_metadata = self.restoreMetadataTableWithRetry(alloc, table_name, req.location, table_backup_id) catch |err| switch (err) {
                     error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
                     error.UnsupportedOperation => false,
                     else => {
@@ -22019,6 +22042,53 @@ test "api http server prefers metadata-owned restore over inline write-source re
     defer parsed_restore.deinit();
     const restore_status = parsed_restore.value.object.get("restore") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("triggered", restore_status.string);
+    try std.testing.expect(restore_source.restored);
+}
+
+test "api http server retries stale metadata table-exists restore race" {
+    const alloc = std.testing.allocator;
+
+    const RestoreSource = struct {
+        attempts: usize = 0,
+        restored: bool = false,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .restore_table = restoreTable,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn restoreTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("snap1", backup_id);
+            try std.testing.expectEqualStrings("file:///tmp/out", location_uri);
+            self.attempts += 1;
+            if (self.attempts == 1) return error.TableAlreadyExists;
+            self.restored = true;
+        }
+    };
+
+    var restore_source = RestoreSource{};
+    var server = ApiHttpServer.init(alloc, .{}, restore_source.iface(), null, null);
+    var restore_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/restore",
+        .content_type = "application/json",
+        .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/out\"}",
+    });
+    defer restore_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
+    try std.testing.expectEqual(@as(usize, 2), restore_source.attempts);
     try std.testing.expect(restore_source.restored);
 }
 
