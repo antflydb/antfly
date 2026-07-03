@@ -4726,6 +4726,116 @@ pub const IndexManager = struct {
         return try entry.index.searchProfiledRequest(req);
     }
 
+    pub fn exactScoreDenseEntryWithRequest(
+        self: *IndexManager,
+        entry: *DenseIndex,
+        req: hbc_mod.SearchRequest,
+    ) !hbc_mod.SearchResults {
+        const previous_load_session = active_dense_vector_load_session;
+        var vector_load_session: ?DenseVectorLoadSession = null;
+        defer {
+            if (vector_load_session != null) active_dense_vector_load_session = previous_load_session;
+            if (vector_load_session) |*session| session.deinit();
+        }
+
+        if (active_dense_vector_load_session == null and self.primary_store != null and entry.vector_loader_context != null) {
+            vector_load_session = .{
+                .context = entry.vector_loader_context.?,
+                .working_slice = .dense_search_working_set,
+                .recycle_raw_reads = false,
+                .cache_raw_values = false,
+            };
+            active_dense_vector_load_session = &vector_load_session.?;
+        }
+
+        var candidate_ids = std.ArrayListUnmanaged(u64).empty;
+        defer candidate_ids.deinit(self.alloc);
+        try candidate_ids.ensureTotalCapacity(self.alloc, req.filter_ids.len);
+        for (req.filter_ids) |vector_id| {
+            if (std.mem.indexOfScalar(u64, req.exclude_ids, vector_id) != null) continue;
+            candidate_ids.appendAssumeCapacity(vector_id);
+        }
+        std.mem.sort(u64, candidate_ids.items, {}, std.sort.asc(u64));
+        const unique_candidate_ids = candidate_ids.items[0..uniqueSortedU64(candidate_ids.items)];
+
+        var results = try hbc_mod.SearchResults.initCapacity(
+            self.alloc,
+            req.k,
+            req.k,
+            @min(req.k, unique_candidate_ids.len),
+        );
+        errdefer results.deinit();
+
+        var txn = try entry.index.beginReadTxn();
+        defer txn.abort();
+
+        const query_measure = vector_mod.norm(req.query);
+        const vector_scratch = try self.alloc.alloc(f32, entry.dims);
+        defer self.alloc.free(vector_scratch);
+        for (unique_candidate_ids) |vector_id| {
+            var owned_metadata = try self.resolveExactDenseDocKeyAlloc(entry, &txn, vector_id);
+            defer if (owned_metadata) |metadata| self.alloc.free(metadata);
+
+            const vector = entry.index.getVectorViewOrScratch(&txn, vector_id, vector_scratch) catch |err| switch (err) {
+                error.NotFound => blk: {
+                    const loader_ctx = entry.vector_loader_context orelse continue;
+                    const doc_key = owned_metadata orelse continue;
+                    break :blk try loadDenseVectorForHbcIntoScratch(loader_ctx, vector_id, doc_key, vector_scratch);
+                },
+                else => return err,
+            };
+            if (vector.len != req.query.len) return error.DimensionMismatch;
+
+            const distance = vector_mod.distanceToQuery(req.query, query_measure, vector, entry.metric);
+            if (!std.math.isFinite(distance)) continue;
+            if (req.distance_over) |threshold| {
+                if (distance <= threshold) continue;
+            }
+            if (req.distance_under) |threshold| {
+                if (distance >= threshold) continue;
+            }
+            if (req.filter_prefix.len > 0) {
+                const doc_key = owned_metadata orelse continue;
+                if (!std.mem.startsWith(u8, doc_key, req.filter_prefix)) continue;
+            }
+            results.addResultWithOwnedMetadata(vector_id, distance, 0, owned_metadata);
+            owned_metadata = null;
+        }
+        results.sort();
+        if (getenv("ANTFLY_BENCH_QUERY_PROFILE") != null) {
+            std.log.info("antfly_bench_dense_exact_filter index={s} candidates={d} hits={d}", .{
+                entry.config.name,
+                unique_candidate_ids.len,
+                results.getHits().len,
+            });
+        }
+        return results;
+    }
+
+    fn resolveExactDenseDocKeyAlloc(
+        self: *IndexManager,
+        entry: *DenseIndex,
+        hbc_txn: anytype,
+        vector_id: u64,
+    ) !?[]u8 {
+        if (try entry.index.getMetadataInTxn(hbc_txn, vector_id)) |metadata| {
+            return try self.alloc.dupe(u8, metadata);
+        }
+        const store = self.primary_store orelse return null;
+        const ordinal = entry.vector_ordinals.get(vector_id) orelse ordinal: {
+            var it = entry.ordinal_vector_ids.iterator();
+            while (it.next()) |item| {
+                if (item.value_ptr.* == vector_id) break :ordinal item.key_ptr.*;
+            }
+            return null;
+        };
+        var runtime_store = try initRuntimeStore(self.alloc, store);
+        defer runtime_store.deinit();
+        var txn = try runtime_store.store.beginRead();
+        defer txn.abort();
+        return try doc_identity.lookupDocIdTxn(self.alloc, &txn, ordinal);
+    }
+
     pub fn textIndexesForChunk(
         self: *const IndexManager,
         alloc: Allocator,
@@ -13314,6 +13424,19 @@ fn docOrdinalLessThan(_: void, lhs: doc_identity.DocOrdinal, rhs: doc_identity.D
 }
 
 fn uniqueSortedDocOrdinals(items: []doc_identity.DocOrdinal) usize {
+    if (items.len == 0) return 0;
+    var write: usize = 1;
+    var previous = items[0];
+    for (items[1..]) |item| {
+        if (item == previous) continue;
+        items[write] = item;
+        write += 1;
+        previous = item;
+    }
+    return write;
+}
+
+fn uniqueSortedU64(items: []u64) usize {
     if (items.len == 0) return 0;
     var write: usize = 1;
     var previous = items[0];

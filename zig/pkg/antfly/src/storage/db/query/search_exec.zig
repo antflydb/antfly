@@ -34,6 +34,7 @@ const mapper_mod = @import("../document_mapper.zig");
 const platform_time = @import("../../../platform/time.zig");
 const platform = @import("antfly_platform");
 const vectorindex_mod = @import("antfly_vectorindex");
+const vector_mod = @import("antfly_vector").vector;
 const builtin = @import("builtin");
 const sparse_mod = if (builtin.os.tag == .freestanding)
     @import("../sparse_stub.zig")
@@ -46,6 +47,7 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
 
 const default_balanced_search_effort: f32 = 0.5;
 const default_late_visibility_exact_candidate_budget: u32 = 100_000;
+const default_exact_native_filter_candidate_budget: u32 = 1024;
 var bench_query_profile_counter: std.atomic.Value(u64) = .init(0);
 const bench_query_profile_unknown = std.math.maxInt(u64);
 const bench_query_profile_disabled = std.math.maxInt(u64) - 1;
@@ -337,6 +339,11 @@ pub const DenseSearchExecutor = struct {
         entry: *index_manager_mod.IndexManager.DenseIndex,
         req: vectorindex_mod.SearchRequest,
     ) anyerror!vectorindex_mod.ProfiledSearchResults,
+    exact_dense_search: ?*const fn (
+        ctx: ?*anyopaque,
+        entry: *index_manager_mod.IndexManager.DenseIndex,
+        req: vectorindex_mod.SearchRequest,
+    ) anyerror!vectorindex_mod.SearchResults = null,
     postprocess: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -2230,8 +2237,17 @@ fn lateVisibilityExactCandidateBudget() u32 {
     return lateVisibilityExactCandidateBudgetFromRaw(getenv("ANTFLY_TEXT_LATE_VISIBILITY_EXACT_CANDIDATE_BUDGET"));
 }
 
-fn enforceLateVisibilityExactCandidateBudget(full_candidate_limit: u32, budget: u32) !void {
-    if (full_candidate_limit <= budget) return;
+fn boundedU32(count: anytype) u32 {
+    return @intCast(@min(count, @as(@TypeOf(count), std.math.maxInt(u32))));
+}
+
+fn effectiveTextCandidateLimit(snapshot_doc_count: u64, constraints: NativeDocIdConstraints) u32 {
+    if (constraints.positive_filter) return boundedU32(constraints.filter_doc_nums.len);
+    return boundedU32(snapshot_doc_count);
+}
+
+fn enforceLateVisibilityExactCandidateBudget(candidate_limit: u32, budget: u32) !void {
+    if (candidate_limit <= budget) return;
     return error.QueryCandidateBudgetExceeded;
 }
 
@@ -2252,6 +2268,14 @@ test "text late visibility requirement overrides positive native filter" {
         .postprocess = undefined,
     }, true, true, null);
     try std.testing.expect(needs_late_filter);
+}
+
+test "text late visibility candidate limit uses positive native filter bound" {
+    try std.testing.expectEqual(@as(u32, 2), effectiveTextCandidateLimit(1_000_000, .{
+        .positive_filter = true,
+        .filter_doc_nums = &.{ 10, 20 },
+    }));
+    try std.testing.expectEqual(std.math.maxInt(u32), effectiveTextCandidateLimit(@as(u64, std.math.maxInt(u32)) + 99, .{}));
 }
 
 test "text late visibility exact candidate budget parses disabled and fallback values" {
@@ -3673,7 +3697,7 @@ pub fn searchTextQuery(
         native_constraints.positive_filter,
         effective_req.identity_read_generation,
     );
-    const full_candidate_limit: u32 = @intCast(@min(snapshot.global_doc_count, @as(u64, std.math.maxInt(u32))));
+    const full_candidate_limit = effectiveTextCandidateLimit(snapshot.global_doc_count, native_constraints);
     const search_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints, effective_req.count_only);
     const load_stored_in_search_engine = effective_req.include_stored and !chunk_backed;
     const exact_late_visibility_totals = late_visibility_paginate and
@@ -4656,7 +4680,15 @@ fn searchDenseInternal(
     };
 
     const hbc_search_start = platform_time.monotonicNs();
-    var results = if (collect_hbc_profile) blk: {
+    const use_exact_native_filter = shouldExactScoreNativeDenseFilter(native_constraints, paging);
+    var results = if (use_exact_native_filter) blk: {
+        const exact = if (executor.exact_dense_search) |exact_search|
+            try exact_search(executor.ctx, entry, hbc_req)
+        else
+            try exactScoreNativeDenseFilter(alloc, entry, hbc_req);
+        profile.hbc_exact_vectors_scored = @intCast(native_constraints.filter_ids.len);
+        break :blk exact;
+    } else if (collect_hbc_profile) blk: {
         const profiled = executor.hbc_search_profiled(executor.ctx, entry, hbc_req) catch |err| switch (err) {
             error.NotFound => {
                 profile.returned_hit_count = 0;
@@ -4800,10 +4832,12 @@ fn searchDenseInternal(
     profile.doc_ordinal_lookup_ns = platform_time.monotonicNs() - ordinal_lookup_start;
 
     const postprocess_start = platform_time.monotonicNs();
+    const dense_hits_total: u32 = @intCast(hits.items.len);
+    const dense_hits = try hits.toOwnedSlice(alloc);
     var result = try executor.postprocess(executor.ctx, alloc, postprocess_req, .{
         .alloc = alloc,
-        .hits = try hits.toOwnedSlice(alloc),
-        .total_hits = @intCast(hits.items.len),
+        .hits = dense_hits,
+        .total_hits = dense_hits_total,
         .graph_results = &.{},
     }, chunk_backed);
     errdefer result.deinit();
@@ -4827,6 +4861,63 @@ fn shouldLogBenchQueryProfile() bool {
     if (every == 0) return false;
     const current = bench_query_profile_counter.fetchAdd(1, .monotonic) + 1;
     return current % every == 0;
+}
+
+fn shouldExactScoreNativeDenseFilter(
+    native_constraints: NativeDenseConstraints,
+    paging: ComponentPaging,
+) bool {
+    if (!native_constraints.positive_filter) return false;
+    if (native_constraints.filter_ids.len == 0) return false;
+    const paging_budget = paging.limit *| 32;
+    const budget = @max(paging_budget, default_exact_native_filter_candidate_budget);
+    return native_constraints.filter_ids.len <= budget;
+}
+
+fn exactScoreNativeDenseFilter(
+    alloc: Allocator,
+    entry: *index_manager_mod.IndexManager.DenseIndex,
+    req: vectorindex_mod.SearchRequest,
+) !vectorindex_mod.SearchResults {
+    var results = try vectorindex_mod.SearchResults.initCapacity(
+        alloc,
+        req.k,
+        req.k,
+        @min(req.k, req.filter_ids.len),
+    );
+    errdefer results.deinit();
+
+    var txn = try entry.index.beginReadTxn();
+    defer txn.abort();
+
+    const vector_scratch = try alloc.alloc(f32, entry.dims);
+    defer alloc.free(vector_scratch);
+    const query_measure = vector_mod.norm(req.query);
+
+    for (req.filter_ids) |vector_id| {
+        if (containsVectorId(req.exclude_ids, vector_id)) continue;
+        const vector = entry.index.getVectorViewOrScratch(&txn, vector_id, vector_scratch) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        if (vector.len != req.query.len) return error.DimensionMismatch;
+
+        const distance = vector_mod.distanceToQuery(req.query, query_measure, vector, entry.metric);
+        if (!std.math.isFinite(distance)) continue;
+        if (req.distance_over) |threshold| {
+            if (distance <= threshold) continue;
+        }
+        if (req.distance_under) |threshold| {
+            if (distance >= threshold) continue;
+        }
+        if (req.filter_prefix.len > 0) {
+            const metadata = (try entry.index.getMetadataInTxn(&txn, vector_id)) orelse continue;
+            if (!std.mem.startsWith(u8, metadata, req.filter_prefix)) continue;
+        }
+        results.addResult(vector_id, distance, 0);
+    }
+    results.sort();
+    return results;
 }
 
 fn benchQueryProfileEvery() ?u64 {

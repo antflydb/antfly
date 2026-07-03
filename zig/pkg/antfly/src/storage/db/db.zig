@@ -3550,6 +3550,14 @@ pub const DB = struct {
         if (self.promotion_runtime) |runtime| runtime.stop();
     }
 
+    fn clearLiveDocSetCache(self: *DB) void {
+        lockAtomic(&self.live_doc_set_cache_mutex);
+        defer self.live_doc_set_cache_mutex.unlock();
+        if (self.live_doc_set_cache_set) |*cached| cached.deinit(self.alloc);
+        self.live_doc_set_cache_set = null;
+        self.live_doc_set_cache_generation = null;
+    }
+
     fn deinitWrapperState(self: *DB, executor_ready: bool) void {
         // Stop the quarantine retry worker first: it takes the catalog lock
         // and opens indexes, which must not race the teardown below.
@@ -3558,11 +3566,7 @@ pub const DB = struct {
         // stopping. That must not call back into the write/status cache after
         // optional runtimes or index state have started tearing down.
         self.setQueryVisibilityHook(null);
-        if (self.live_doc_set_cache_set) |*cached| {
-            cached.deinit(self.alloc);
-            self.live_doc_set_cache_set = null;
-            self.live_doc_set_cache_generation = null;
-        }
+        self.clearLiveDocSetCache();
         self.bulk_ingest_coalescer.deinit(self.alloc);
         self.clearBulkIngestSeenDocKeysLocked();
         self.bulk_ingest_seen_doc_keys.deinit(self.alloc);
@@ -5134,6 +5138,7 @@ pub const DB = struct {
         }
         if (pending_identity_visibility_summary) |summary| {
             self.identity_visibility_summary_cache = summary;
+            self.clearLiveDocSetCache();
         }
         if (profile) |active_profile| {
             recordProfileNs(profile, &active_profile.store_write_ns, store_write_start_ns);
@@ -5260,6 +5265,7 @@ pub const DB = struct {
         if (try doc_identity.loadAllNewTrustedStateForNamespace(self.core.store, self.core.identity_namespace)) |state| {
             self.bulk_ingest_identity_state = state;
             self.identity_visibility_summary_cache = state.visibility_summary;
+            self.clearLiveDocSetCache();
             self.bulk_ingest_identity_all_new = true;
         }
     }
@@ -6771,6 +6777,7 @@ pub const DB = struct {
         });
         if (pending_identity_visibility_summary) |summary| {
             self.identity_visibility_summary_cache = summary;
+            self.clearLiveDocSetCache();
         }
     }
 
@@ -10111,7 +10118,7 @@ pub const DB = struct {
     }
 
     pub fn currentIdentityReadGenerationForRequest(self: *DB, requested: ?u64) !u64 {
-        const current_generation = self.core.nextDerivedSequence();
+        const current_generation = try self.currentIdentityReadGeneration();
         if (requested) |generation| {
             if (generation != current_generation) {
                 self.doc_set_planning_stats.recordStaleIdentityGenerationRejection();
@@ -10119,6 +10126,20 @@ pub const DB = struct {
             }
             return generation;
         }
+        return current_generation;
+    }
+
+    fn currentIdentityReadGeneration(self: *DB) !u64 {
+        var current_generation = self.core.nextDerivedSequence();
+        if (self.identity_visibility_summary_cache) |summary| {
+            return @max(current_generation, doc_identity.latestGenerationFromSummary(summary));
+        }
+        if (try doc_identity.latestGenerationFromSummaryFast(self.core.store)) |identity_generation| {
+            return @max(current_generation, identity_generation);
+        }
+        const identity_stats = try doc_identity.fullStatsFromStore(self.core.store);
+        current_generation = @max(current_generation, identity_stats.max_created_generation);
+        current_generation = @max(current_generation, identity_stats.max_deleted_generation);
         return current_generation;
     }
 
@@ -11546,6 +11567,15 @@ pub const DB = struct {
         return try self.core.index_manager.searchDenseEntryProfiledWithRequest(entry, req);
     }
 
+    fn exactDenseSearchCallback(
+        ctx: ?*anyopaque,
+        entry: *index_manager_mod.IndexManager.DenseIndex,
+        req: vectorindex_mod.SearchRequest,
+    ) anyerror!vectorindex_mod.SearchResults {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.core.index_manager.exactScoreDenseEntryWithRequest(entry, req);
+    }
+
     fn resolveDocSetDocIdsCallback(
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -11799,6 +11829,7 @@ pub const DB = struct {
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .hbc_search = hbcSearchCallback,
             .hbc_search_profiled = hbcSearchProfiledCallback,
+            .exact_dense_search = exactDenseSearchCallback,
             .postprocess = postprocessVectorSearchResultCallback,
         });
         if (bench_profile) {
@@ -11844,6 +11875,7 @@ pub const DB = struct {
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .hbc_search = hbcSearchCallback,
             .hbc_search_profiled = hbcSearchProfiledCallback,
+            .exact_dense_search = exactDenseSearchCallback,
             .postprocess = postprocessVectorSearchResultCallback,
         });
         return profiled catch |err| {
@@ -20871,6 +20903,50 @@ const OwnedDenseEmbeddingWrites = struct {
     }
 };
 
+const OwnedEmbeddingArtifactWriteIdentity = struct {
+    doc_key: []u8,
+    parent_doc_key: ?[]u8 = null,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.doc_key);
+        if (self.parent_doc_key) |parent_doc_key| alloc.free(parent_doc_key);
+        self.* = undefined;
+    }
+};
+
+fn decodeEmbeddingArtifactWriteIdentityAlloc(
+    alloc: Allocator,
+    artifact_key: []const u8,
+    expected_embedding_name: []const u8,
+) !?OwnedEmbeddingArtifactWriteIdentity {
+    if (artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key)) |maybe_identity| {
+        var identity = maybe_identity orelse return null;
+        defer identity.deinit(alloc);
+        if (!std.mem.eql(u8, identity.embedding_name, expected_embedding_name)) return null;
+
+        const doc_key = try alloc.dupe(u8, identity.doc_key);
+        errdefer alloc.free(doc_key);
+        const parent_doc_key = if (identity.parent_doc_key) |parent_key| try alloc.dupe(u8, parent_key) else null;
+        errdefer if (parent_doc_key) |owned_parent| alloc.free(owned_parent);
+        return .{
+            .doc_key = doc_key,
+            .parent_doc_key = parent_doc_key,
+        };
+    } else |err| switch (err) {
+        error.InvalidInternalUserKey => {},
+        else => return err,
+    }
+
+    if (try internal_keys.parseEmbeddingArtifactKeyView(artifact_key)) |identity| {
+        if (!std.mem.eql(u8, identity.artifact_name, expected_embedding_name)) return null;
+        return .{
+            .doc_key = try alloc.dupe(u8, identity.doc_key),
+        };
+    }
+
+    return null;
+}
+
 const OwnedSparseEmbeddingWrites = struct {
     alloc: Allocator,
     owned_doc_keys: []const []const u8 = &.{},
@@ -21412,24 +21488,17 @@ fn collectDenseEmbeddingWritesForArtifacts(
 
     const expected_embedding_name = index_manager.denseEmbeddingName(index_name) orelse index_name;
     for (artifact_keys) |artifact_key| {
-        var identity = artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key) catch |err| switch (err) {
-            error.InvalidInternalUserKey => continue,
-            else => return err,
-        } orelse continue;
-        defer identity.deinit(alloc);
-        if (!std.mem.eql(u8, identity.embedding_name, expected_embedding_name)) continue;
-        const doc_key = try alloc.dupe(u8, identity.doc_key);
-        errdefer alloc.free(doc_key);
-        var parent_doc_key = if (identity.parent_doc_key) |parent_key| try alloc.dupe(u8, parent_key) else null;
-        errdefer if (parent_doc_key) |owned_parent| alloc.free(owned_parent);
+        var identity = (try decodeEmbeddingArtifactWriteIdentityAlloc(alloc, artifact_key, expected_embedding_name)) orelse continue;
+        var identity_transferred = false;
+        errdefer if (!identity_transferred) identity.deinit(alloc);
         try filtered.append(alloc, .{
             .index_name = @constCast(index_name),
-            .doc_key = doc_key,
-            .parent_doc_key = parent_doc_key,
+            .doc_key = identity.doc_key,
+            .parent_doc_key = identity.parent_doc_key,
             .artifact_key = @constCast(artifact_key),
             .vector = &.{},
         });
-        parent_doc_key = null;
+        identity_transferred = true;
     }
 
     return .{
@@ -21448,24 +21517,17 @@ fn appendDenseEmbeddingWritesForArtifacts(
 ) !void {
     const expected_embedding_name = index_manager.denseEmbeddingName(index_name) orelse index_name;
     for (artifact_keys) |artifact_key| {
-        var identity = artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key) catch |err| switch (err) {
-            error.InvalidInternalUserKey => continue,
-            else => return err,
-        } orelse continue;
-        defer identity.deinit(alloc);
-        if (!std.mem.eql(u8, identity.embedding_name, expected_embedding_name)) continue;
-        const doc_key = try alloc.dupe(u8, identity.doc_key);
-        errdefer alloc.free(doc_key);
-        var parent_doc_key = if (identity.parent_doc_key) |parent_key| try alloc.dupe(u8, parent_key) else null;
-        errdefer if (parent_doc_key) |owned_parent| alloc.free(owned_parent);
+        var identity = (try decodeEmbeddingArtifactWriteIdentityAlloc(alloc, artifact_key, expected_embedding_name)) orelse continue;
+        var identity_transferred = false;
+        errdefer if (!identity_transferred) identity.deinit(alloc);
         try out.append(alloc, .{
             .index_name = @constCast(index_name),
-            .doc_key = doc_key,
-            .parent_doc_key = parent_doc_key,
+            .doc_key = identity.doc_key,
+            .parent_doc_key = identity.parent_doc_key,
             .artifact_key = @constCast(artifact_key),
             .vector = &.{},
         });
-        parent_doc_key = null;
+        identity_transferred = true;
     }
 }
 
@@ -24365,25 +24427,28 @@ fn rebuildDenseIndexFromStoredEmbeddingArtifactsContext(
             const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
             if (!internal_keys.isInternalUserKey(key)) return .@"continue";
 
-            var identity = (artifact_ids.decodeEmbeddingArtifactIdentityAlloc(state.ctx.alloc, key) catch |err| switch (err) {
-                error.InvalidInternalUserKey => return .@"continue",
-                else => return err,
-            }) orelse return .@"continue";
-            defer identity.deinit(state.ctx.alloc);
-            if (!std.mem.eql(u8, identity.embedding_name, state.expected_name)) return .@"continue";
-
             const dims = enrichment_artifact_codec.decodeDenseEmbeddingDims(value) catch |err| {
                 if (DB.isRecoverableEmbeddingArtifactError(err)) return .@"continue";
                 return err;
             };
             if (dims != state.expected_dims) return .@"continue";
 
+            var identity = (try decodeEmbeddingArtifactWriteIdentityAlloc(state.ctx.alloc, key, state.expected_name)) orelse return .@"continue";
+            var write_transferred = false;
+            errdefer if (!write_transferred) identity.deinit(state.ctx.alloc);
+
+            const owned_index_name = try state.ctx.alloc.dupe(u8, state.index_name);
+            errdefer if (!write_transferred) state.ctx.alloc.free(owned_index_name);
+            const artifact_key = try state.ctx.alloc.dupe(u8, key);
+            errdefer if (!write_transferred) state.ctx.alloc.free(artifact_key);
             try state.writes.append(state.ctx.alloc, .{
-                .index_name = try state.ctx.alloc.dupe(u8, state.index_name),
-                .doc_key = try state.ctx.alloc.dupe(u8, identity.doc_key),
-                .artifact_key = try state.ctx.alloc.dupe(u8, key),
+                .index_name = owned_index_name,
+                .doc_key = identity.doc_key,
+                .parent_doc_key = identity.parent_doc_key,
+                .artifact_key = artifact_key,
                 .vector = &.{},
             });
+            write_transferred = true;
             state.rebuilt += 1;
 
             if (state.writes.items.len >= state.rebuild_chunk_size) try state.flush();
@@ -28171,6 +28236,7 @@ test "db non chunked search paths apply broad live doc filter" {
         try txn.commit();
     }
     db.identity_visibility_summary_cache = null;
+    db.clearLiveDocSetCache();
 
     var dense_live = try db.searchDenseProfiled(alloc, .{
         .index_name = "dv_v1",
@@ -35484,6 +35550,7 @@ test "db chunked generated dense and sparse embeddings search as parent results"
         try txn.commit();
     }
     db.identity_visibility_summary_cache = null;
+    db.clearLiveDocSetCache();
 
     var stale_sparse_result = try db.search(alloc, .{
         .index_name = "sp_v1",
@@ -38211,6 +38278,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
         try txn.commit();
     }
     db.identity_visibility_summary_cache = null;
+    db.clearLiveDocSetCache();
 
     var stale_chunk_result = try db.searchDenseProfiled(alloc, .{
         .index_name = "dv_v1",
