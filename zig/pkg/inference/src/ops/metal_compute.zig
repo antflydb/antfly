@@ -19744,6 +19744,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     pub const PlannedGraphScopeKind = enum {
         attention_project,
+        embedding,
         ffn,
         ple,
     };
@@ -19763,6 +19764,35 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     pub fn copyTensorInto(_: *const ops.ComputeBackend, _: CT, _: CT) !bool {
         return false;
+    }
+
+    pub fn debugHasDeviceTensor(_: *const ops.ComputeBackend, _: CT) bool {
+        return false;
+    }
+
+    pub fn debugGatherPagedKvLayer(
+        _: *const ops.ComputeBackend,
+        _: std.mem.Allocator,
+        _: ops.KvCacheView,
+        _: usize,
+        _: usize,
+    ) !?ops.PagedKvLayerCacheRows {
+        return null;
+    }
+
+    pub fn applyPleResidual(
+        _: *const ops.ComputeBackend,
+        _: CT,
+        _: CT,
+        _: usize,
+        _: usize,
+        _: usize,
+        _: usize,
+        _: usize,
+        _: f32,
+        _: ops.DecoderRuntimeActivationKind,
+    ) !?CT {
+        return null;
     }
 
     pub fn beginPlannedGraphScope(_: *const ops.ComputeBackend, _: PlannedGraphScopeKind) !PlannedGraphScope {

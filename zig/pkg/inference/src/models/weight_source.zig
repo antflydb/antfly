@@ -412,7 +412,8 @@ pub fn loadWeightsFromMapping(
     return weights;
 }
 
-/// Convert a f16 or bf16 tensor to f32.
+/// Convert a dense scalar tensor to f32 for backends that keep resident weights
+/// in float buffers.
 pub fn convertToF32(allocator: std.mem.Allocator, tensor: *const Tensor) !Tensor {
     const count = tensor.elementCount();
     const byte_count = count * @sizeOf(f32);
@@ -439,6 +440,54 @@ pub fn convertToF32(allocator: std.mem.Allocator, tensor: *const Tensor) !Tensor
                 const f32_bits: u32 = @as(u32, bits) << 16;
                 f32_data[i] = @bitCast(f32_bits);
             }
+        },
+        .f64 => {
+            const src_bytes: [*]const u8 = tensor.data.ptr;
+            for (0..count) |i| {
+                const offset = i * 8;
+                const bits = std.mem.readInt(u64, src_bytes[offset..][0..8], .little);
+                const value: f64 = @bitCast(bits);
+                f32_data[i] = @floatCast(value);
+            }
+        },
+        .i8 => {
+            const src_bytes: [*]const u8 = tensor.data.ptr;
+            for (0..count) |i| {
+                const value: i8 = @bitCast(src_bytes[i]);
+                f32_data[i] = @floatFromInt(value);
+            }
+        },
+        .i16 => {
+            const src_bytes: [*]const u8 = tensor.data.ptr;
+            for (0..count) |i| {
+                const offset = i * 2;
+                const value = std.mem.readInt(i16, src_bytes[offset..][0..2], .little);
+                f32_data[i] = @floatFromInt(value);
+            }
+        },
+        .i32 => {
+            const src_bytes: [*]const u8 = tensor.data.ptr;
+            for (0..count) |i| {
+                const offset = i * 4;
+                const value = std.mem.readInt(i32, src_bytes[offset..][0..4], .little);
+                f32_data[i] = @floatFromInt(value);
+            }
+        },
+        .i64 => {
+            const src_bytes: [*]const u8 = tensor.data.ptr;
+            for (0..count) |i| {
+                const offset = i * 8;
+                const value = std.mem.readInt(i64, src_bytes[offset..][0..8], .little);
+                f32_data[i] = @floatFromInt(value);
+            }
+        },
+        .u8 => {
+            const src_bytes: [*]const u8 = tensor.data.ptr;
+            for (0..count) |i| f32_data[i] = @floatFromInt(src_bytes[i]);
+        },
+        .bool_ => {
+            const src_bytes: [*]const u8 = tensor.data.ptr;
+            for (0..count) |i| f32_data[i] = if (src_bytes[i] == 0) 0.0 else 1.0;
         },
         else => return error.UnsupportedConversion,
     }
@@ -479,4 +528,26 @@ test "convert bf16 to f32" {
     const values = converted.asFloat32();
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), values[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), values[1], 1e-6);
+}
+
+test "convert i64 token ordering to f32" {
+    const allocator = std.testing.allocator;
+
+    const i64_data = [_]i64{ 0, 2048, 262143 };
+    const shape = [_]i64{3};
+    const tensor = Tensor{
+        .data = @constCast(std.mem.sliceAsBytes(&i64_data)),
+        .dtype = .i64,
+        .shape = &shape,
+        .name = "masked_embedding.token_ordering",
+        .allocator = allocator,
+        .owns_data = false,
+        .owns_shape = false,
+    };
+
+    var converted = try convertToF32(allocator, &tensor);
+    defer converted.deinit();
+
+    try std.testing.expectEqual(DType.f32, converted.dtype);
+    try std.testing.expectEqualSlices(f32, &.{ 0.0, 2048.0, 262143.0 }, converted.asFloat32());
 }

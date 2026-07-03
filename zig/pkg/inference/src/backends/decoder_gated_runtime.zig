@@ -1109,6 +1109,8 @@ fn applyPleDirect(
     output_scale: ?ops.CT,
     allow_host_fallback: bool,
 ) !?ops.CT {
+    if (cb.kind() != .metal) return null;
+
     const ple_dim: usize = gpt_config.ple_hidden_size;
     const hidden_size: usize = gpt_config.hidden_size;
     const ple_offset = layer * ple_dim;
@@ -1335,6 +1337,85 @@ fn computePleVectorsDirect(
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.prefill_ple_combine_nanos += finished_at - started_at;
     return combined_scaled;
+}
+
+fn computePleVectorsDirectFromTokenTensor(
+    cb: *const ops.ComputeBackend,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    input_token: ops.CT,
+    hidden: ops.CT,
+    total: usize,
+) !?ops.CT {
+    if (gpt_config.family != .gemma or !gpt_config.hasPle()) return null;
+    if (total == 0) return null;
+
+    const ple_dim: usize = gpt_config.ple_hidden_size;
+    const num_layers: usize = gpt_config.num_hidden_layers;
+    const ple_total_dim = ple_dim * num_layers;
+
+    const planned_scope = try metal_compute_mod.MetalCompute.beginPlannedGraphScope(cb, .ple);
+    defer metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope) catch {};
+
+    var started_at = monotonicNowNs();
+    const token_w = gpt_arch.getModelWeight(cb, gpt_config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
+        error.MissingWeight => try gpt_arch.getModelWeight(cb, gpt_config, "model.embed_tokens_per_layer.weight"),
+        else => return err,
+    };
+    var finished_at = monotonicNowNs();
+    if (finished_at > started_at) timing_stats.prefill_ple_lookup_nanos += finished_at - started_at;
+    defer cb.free(token_w);
+
+    started_at = monotonicNowNs();
+    const token_embd_raw = (try cb.embeddingLookupTensor(token_w, input_token, total, ple_total_dim)) orelse return null;
+    finished_at = monotonicNowNs();
+    if (finished_at > started_at) timing_stats.prefill_ple_embedding_nanos += finished_at - started_at;
+    defer cb.free(token_embd_raw);
+
+    started_at = monotonicNowNs();
+    const model_proj_raw = (try cb.decoderRuntimeApplyLinear(&.{
+        .slot = pleModelProjSlot(configured_layer_count),
+        .input = hidden,
+        .in_dim = gpt_config.hidden_size,
+        .out_dim = ple_total_dim,
+    })) orelse return null;
+    finished_at = monotonicNowNs();
+    if (finished_at > started_at) timing_stats.prefill_ple_model_proj_nanos += finished_at - started_at;
+    defer cb.free(model_proj_raw);
+
+    started_at = monotonicNowNs();
+    const reshaped = (try cb.reshape2d(model_proj_raw, total * num_layers, ple_dim)) orelse return null;
+    defer cb.free(reshaped);
+
+    const normed_flat = (try cb.decoderRuntimeApplyRmsNorm(&.{
+        .slot = pleProjNormSlot(configured_layer_count),
+        .input = reshaped,
+        .hidden_size = ple_dim,
+        .eps = gpt_config.norm_eps,
+    })) orelse return null;
+    defer cb.free(normed_flat);
+
+    const normed_proj = (try cb.reshape2d(normed_flat, total, ple_total_dim)) orelse return null;
+    finished_at = monotonicNowNs();
+    if (finished_at > started_at) timing_stats.prefill_ple_norm_nanos += finished_at - started_at;
+    defer cb.free(normed_proj);
+
+    started_at = monotonicNowNs();
+    const embed_scale_val = @sqrt(@as(f32, @floatFromInt(ple_dim)));
+    const combine_scale_val: f32 = 1.0 / @sqrt(2.0);
+    if (try cb.decoderRuntimeApplyScaledAddScale(&.{
+        .lhs = token_embd_raw,
+        .rhs = normed_proj,
+        .dim = total * ple_total_dim,
+        .lhs_scale = embed_scale_val,
+        .output_scale = combine_scale_val,
+    })) |combined_scaled| {
+        finished_at = monotonicNowNs();
+        if (finished_at > started_at) timing_stats.prefill_ple_combine_nanos += finished_at - started_at;
+        return combined_scaled;
+    }
+
+    return null;
 }
 
 pub fn preparedLayers(configured_layers: usize) usize {
@@ -2086,11 +2167,11 @@ fn forwardFinalHiddenTensorGemmaDirect(
         {
             var block_ple_input: ?ops.CT = null;
             defer if (block_ple_input) |ple_ct| cb.free(ple_ct);
-            if (ple_vectors) |ple| {
+            if (cb.kind() == .metal) if (ple_vectors) |ple| {
                 const ple_dim: usize = gpt_config.ple_hidden_size;
                 const ple_offset = layer * ple_dim;
                 block_ple_input = try cb.sliceLastDim(ple, ple_offset, ple_offset + ple_dim);
-            }
+            };
 
             var block_output_scale: ?ops.CT = null;
             defer if (block_output_scale) |scale| cb.free(scale);
@@ -2754,13 +2835,13 @@ fn forwardFinalHiddenTensorGemmaDirect(
 
             var block_ple_input: ?ops.CT = null;
             defer if (block_ple_input) |ple_ct| cb.free(ple_ct);
-            if (ple_vectors) |ple| {
+            if (cb.kind() == .metal) if (ple_vectors) |ple| {
                 if (!disableDirectPleRequested()) {
                     const ple_dim: usize = gpt_config.ple_hidden_size;
                     const ple_offset = layer * ple_dim;
                     block_ple_input = try cb.sliceLastDim(ple, ple_offset, ple_offset + ple_dim);
                 }
-            }
+            };
             var block_output_scale: ?ops.CT = null;
             defer if (block_output_scale) |scale| cb.free(scale);
             if (block_ple_input != null or ple_vectors == null) {
@@ -5521,6 +5602,216 @@ pub fn forwardGreedyTokenAndFinalHidden(
         .token_id = result.token_id,
         .final_hidden = hidden,
     };
+}
+
+pub fn forwardGreedyTokenFromTokenTensor(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    token_id: i64,
+    token_tensor: ops.CT,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+) !?gpt_arch.GreedyDeviceTokenResult {
+    _ = token_id;
+    if (!supportsConfig(gpt_config)) return null;
+    if (decode_context.query_sequence_len != 1) return null;
+    if (decode_context.attention_mode != .paged_decode) return null;
+    timing_stats.greedy_calls += 1;
+
+    var started_at = monotonicNowNs();
+    const hidden = (try decoder_rms_runtime.embedTokenTensor(cb, allocator, gpt_config, token_tensor)) orelse return null;
+    var finished_at = monotonicNowNs();
+    if (finished_at > started_at) timing_stats.greedy_embed_nanos += finished_at - started_at;
+
+    started_at = monotonicNowNs();
+    const ple_vectors = if (try computePleVectorsDirectFromTokenTensor(
+        cb,
+        gpt_config,
+        configured_layer_count,
+        token_tensor,
+        hidden,
+        1,
+    )) |direct_ple|
+        direct_ple
+    else
+        try gpt_arch.computePleVectorsFromTokenTensor(cb, allocator, gpt_config, token_tensor, hidden, 1);
+    defer if (ple_vectors) |pv| cb.free(pv);
+
+    var compare_hidden_input: ?ops.CT = null;
+    defer if (compare_hidden_input) |ct| cb.free(ct);
+    if (gatedFamilyCompareRequested()) {
+        compare_hidden_input = try cloneTensorForCompare(cb, allocator, hidden);
+    }
+
+    started_at = monotonicNowNs();
+    const direct_hidden = try forwardFinalHiddenLastRowDirect(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        hidden,
+        seq_len,
+        decode_context,
+        .greedy,
+        ple_vectors,
+    );
+    const final_hidden = if (direct_hidden) |direct_hidden_row|
+        direct_hidden_row
+    else blk: {
+        const overrides = buildOverrides(gpt_config, configured_layer_count);
+        break :blk try gpt_arch.forwardFinalHiddenLastRowFromEmbeddingsWithLayer0Overrides(
+            cb,
+            allocator,
+            gpt_config,
+            hidden,
+            overrides,
+            1,
+            seq_len,
+            decode_context,
+            ple_vectors,
+        );
+    };
+    finished_at = monotonicNowNs();
+    if (finished_at > started_at) timing_stats.greedy_block_nanos += finished_at - started_at;
+    errdefer cb.free(final_hidden);
+
+    var compare_fallback_hidden: ?ops.CT = null;
+    defer if (compare_fallback_hidden) |ct| cb.free(ct);
+    if (direct_hidden != null and compare_hidden_input != null) {
+        const overrides = buildOverrides(gpt_config, configured_layer_count);
+        compare_fallback_hidden = try gpt_arch.forwardFinalHiddenLastRowFromEmbeddingsWithLayer0Overrides(
+            cb,
+            allocator,
+            gpt_config,
+            compare_hidden_input.?,
+            overrides,
+            1,
+            seq_len,
+            decode_context,
+            ple_vectors,
+        );
+        compare_hidden_input = null;
+        _ = try compareLastHiddenRow(
+            cb,
+            allocator,
+            "decode-final-hidden-token-tensor",
+            final_hidden,
+            1,
+            compare_fallback_hidden.?,
+            1,
+            gpt_config.hidden_size,
+        );
+    }
+
+    started_at = monotonicNowNs();
+    const result = (try decoder_tail_runtime.forwardGreedyTokenTensorFromFinalHidden(
+        cb,
+        allocator,
+        gpt_config,
+        final_hidden,
+        .rms,
+        finalNormSlot(configured_layer_count),
+    )) orelse return null;
+    finished_at = monotonicNowNs();
+    if (finished_at > started_at) timing_stats.greedy_tail_nanos += finished_at - started_at;
+    if (compare_fallback_hidden) |fallback_hidden| {
+        const fallback_token = try decoder_tail_runtime.forwardGreedyFromFinalHidden(
+            cb,
+            allocator,
+            gpt_config,
+            fallback_hidden,
+            .rms,
+            finalNormSlot(configured_layer_count),
+        );
+        std.debug.print(
+            "gated-family-compare decode-token-tensor: direct={any} fallback={any}\n",
+            .{ result.token_id, fallback_token },
+        );
+    }
+    return result;
+}
+
+pub fn forwardGreedyTokenTensorOnlyFromTokenTensor(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    token_id: i64,
+    token_tensor: ops.CT,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+) !?ops.CT {
+    _ = token_id;
+    if (!supportsConfig(gpt_config)) return null;
+    if (decode_context.query_sequence_len != 1) return null;
+    if (decode_context.attention_mode != .paged_decode) return null;
+    if (gatedFamilyCompareRequested()) return null;
+    timing_stats.greedy_calls += 1;
+
+    var started_at = monotonicNowNs();
+    const hidden = (try decoder_rms_runtime.embedTokenTensor(cb, allocator, gpt_config, token_tensor)) orelse return null;
+    var finished_at = monotonicNowNs();
+    if (finished_at > started_at) timing_stats.greedy_embed_nanos += finished_at - started_at;
+
+    started_at = monotonicNowNs();
+    const ple_vectors = if (try computePleVectorsDirectFromTokenTensor(
+        cb,
+        gpt_config,
+        configured_layer_count,
+        token_tensor,
+        hidden,
+        1,
+    )) |direct_ple|
+        direct_ple
+    else
+        try gpt_arch.computePleVectorsFromTokenTensor(cb, allocator, gpt_config, token_tensor, hidden, 1);
+    defer if (ple_vectors) |pv| cb.free(pv);
+
+    started_at = monotonicNowNs();
+    const direct_hidden = try forwardFinalHiddenLastRowDirect(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        hidden,
+        seq_len,
+        decode_context,
+        .greedy,
+        ple_vectors,
+    );
+    const final_hidden = if (direct_hidden) |direct_hidden_row|
+        direct_hidden_row
+    else blk: {
+        const overrides = buildOverrides(gpt_config, configured_layer_count);
+        break :blk try gpt_arch.forwardFinalHiddenLastRowFromEmbeddingsWithLayer0Overrides(
+            cb,
+            allocator,
+            gpt_config,
+            hidden,
+            overrides,
+            1,
+            seq_len,
+            decode_context,
+            ple_vectors,
+        );
+    };
+    finished_at = monotonicNowNs();
+    if (finished_at > started_at) timing_stats.greedy_block_nanos += finished_at - started_at;
+    errdefer cb.free(final_hidden);
+
+    started_at = monotonicNowNs();
+    const result = (try decoder_tail_runtime.forwardGreedyTokenTensorOnlyFromFinalHidden(
+        cb,
+        gpt_config,
+        final_hidden,
+        .rms,
+        finalNormSlot(configured_layer_count),
+    )) orelse return null;
+    finished_at = monotonicNowNs();
+    if (finished_at > started_at) timing_stats.greedy_tail_nanos += finished_at - started_at;
+    return result;
 }
 
 pub fn forwardLastLogits(
