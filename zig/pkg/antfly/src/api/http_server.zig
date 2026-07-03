@@ -6958,6 +6958,7 @@ pub const ApiHttpServer = struct {
             authenticated_identity,
         ) catch |err| switch (err) {
             error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
+            error.UnsupportedQueryRequest => return try textResponse(self.alloc, 422, "unsupported query request"),
             error.QueryCandidateBudgetExceeded => return try textResponse(self.alloc, 422, "query candidate budget exceeded"),
             error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
@@ -7019,6 +7020,7 @@ pub const ApiHttpServer = struct {
                 authenticated_identity,
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
+                error.UnsupportedQueryRequest => return try textResponse(self.alloc, 422, "unsupported query request"),
                 error.QueryCandidateBudgetExceeded => return try textResponse(self.alloc, 422, "query candidate budget exceeded"),
                 error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
                 error.ModelNotFound => return try modelNotFoundResponse(self.alloc),

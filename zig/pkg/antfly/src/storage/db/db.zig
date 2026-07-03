@@ -28411,6 +28411,61 @@ test "db dense and sparse vector searches apply stored symbolic filters before f
     try std.testing.expectEqualStrings("doc:b", sparse_result.hits[0].id);
 }
 
+test "db dense stored symbolic filter candidate window covers offset pagination" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+
+    var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+    defer {
+        for (writes.items) |write| {
+            alloc.free(write.key);
+            alloc.free(write.value);
+        }
+        writes.deinit(alloc);
+    }
+    try writes.ensureTotalCapacity(alloc, 2200);
+    for (0..2200) |i| {
+        try writes.append(alloc, .{
+            .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
+            .value = try std.fmt.allocPrint(alloc, "{{\"body\":\"keep\",\"embedding\":[{d},0]}}", .{i}),
+        });
+    }
+
+    try db.batch(.{
+        .writes = writes.items,
+        .sync_level = .full_index,
+    });
+
+    const active_dense_count: u32 = @intCast(db.core.denseIndex("dv_v1").?.index.stats().active_count);
+    try std.testing.expect(active_dense_count > 1024);
+
+    var dense_result = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .offset = 1024,
+        .include_stored = false,
+        .filter_query_json = "{\"match\":{\"field\":\"body\",\"text\":\"keep\"}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_result.result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), dense_result.result.hits.len);
+    try std.testing.expectEqual(@as(u32, 1025), dense_result.result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, dense_result.result.total_hits_relation);
+    try std.testing.expectEqual(@as(u32, 1025), dense_result.profile.raw_hit_count);
+}
+
 test "db dense algebraic doc facts feed native dense and sparse symbolic filters" {
     const alloc = std.testing.allocator;
 

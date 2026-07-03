@@ -4660,37 +4660,97 @@ fn searchDenseInternal(
         @intCast(@min(native_constraints.filter_ids.len, std.math.maxInt(u32)))
     else
         @intCast(index_stats.active_count);
-    const stored_filter_candidate_window: u32 = @min(
-        bounded_full_candidate_count,
-        @max(paging.limit *| 32, @as(u32, 1024)),
-    );
-    const hbc_effective_k: u32 = if (full_candidate_window) stored_filter_candidate_window else effective_k;
+    var candidate_window: u32 = if (full_candidate_window)
+        initialDenseFullCandidateWindow(bounded_full_candidate_count, paging)
+    else
+        effective_k;
 
-    const hbc_req: vectorindex_mod.SearchRequest = .{
-        .query = dense.vector,
-        .k = hbc_effective_k,
-        .rerank_k = if (full_candidate_window) @as(usize, @intCast(@min(paging.offset +| paging.limit, hbc_effective_k))) else null,
-        .search_width = resolved_search_width,
-        .epsilon = resolved_epsilon,
-        .rerank_factor = resolveRerankFactor(effort),
-        .filter_prefix = req.filter_prefix,
-        .distance_over = req.distance_over,
-        .distance_under = req.distance_under,
-        .filter_ids = effective_filter_ids,
-        .exclude_ids = effective_exclude_ids,
-    };
+    while (true) {
+        const hbc_effective_k: u32 = if (full_candidate_window) candidate_window else effective_k;
+        const hbc_req: vectorindex_mod.SearchRequest = .{
+            .query = dense.vector,
+            .k = hbc_effective_k,
+            .rerank_k = if (full_candidate_window) @as(usize, @intCast(@min(paging.offset +| paging.limit, hbc_effective_k))) else null,
+            .search_width = resolved_search_width,
+            .epsilon = resolved_epsilon,
+            .rerank_factor = resolveRerankFactor(effort),
+            .filter_prefix = req.filter_prefix,
+            .distance_over = req.distance_over,
+            .distance_under = req.distance_under,
+            .filter_ids = effective_filter_ids,
+            .exclude_ids = effective_exclude_ids,
+        };
 
-    const hbc_search_start = platform_time.monotonicNs();
-    const use_exact_native_filter = shouldExactScoreNativeDenseFilter(native_constraints, paging);
-    var results = if (use_exact_native_filter) blk: {
-        const exact = if (executor.exact_dense_search) |exact_search|
-            try exact_search(executor.ctx, entry, hbc_req)
-        else
-            try exactScoreNativeDenseFilter(alloc, entry, hbc_req);
-        profile.hbc_exact_vectors_scored = @intCast(native_constraints.filter_ids.len);
-        break :blk exact;
-    } else if (collect_hbc_profile) blk: {
-        const profiled = executor.hbc_search_profiled(executor.ctx, entry, hbc_req) catch |err| switch (err) {
+        const hbc_search_start = platform_time.monotonicNs();
+        const use_exact_native_filter = shouldExactScoreNativeDenseFilter(native_constraints, paging);
+        var results = if (use_exact_native_filter) blk: {
+            const exact = if (executor.exact_dense_search) |exact_search|
+                try exact_search(executor.ctx, entry, hbc_req)
+            else
+                try exactScoreNativeDenseFilter(alloc, entry, hbc_req);
+            profile.hbc_exact_vectors_scored = @intCast(native_constraints.filter_ids.len);
+            break :blk exact;
+        } else if (collect_hbc_profile) blk: {
+            const profiled = executor.hbc_search_profiled(executor.ctx, entry, hbc_req) catch |err| switch (err) {
+                error.NotFound => {
+                    profile.returned_hit_count = 0;
+                    profile.total_ns = platform_time.monotonicNs() - total_start;
+                    return .{
+                        .alloc = alloc,
+                        .hits = &.{},
+                        .total_hits = 0,
+                        .graph_results = &.{},
+                    };
+                },
+                else => return err,
+            };
+            profile.hbc_runtime_txn_ns = profiled.profile.runtime_txn_ns;
+            profile.hbc_scratch_acquire_ns = profiled.profile.scratch_acquire_ns;
+            profile.hbc_node_cache_lookup_ns = profiled.profile.node_cache_lookup_ns;
+            profile.hbc_quantized_cache_lookup_ns = profiled.profile.quantized_cache_lookup_ns;
+            profile.hbc_nodes_visited = profiled.profile.nodes_visited;
+            profile.hbc_leaves_explored = profiled.profile.leaves_explored;
+            profile.hbc_approx_vectors_scored = profiled.profile.approx_vectors_scored;
+            profile.hbc_exact_vectors_scored = profiled.profile.exact_vectors_scored;
+            profile.hbc_leaf_payload_stale = profiled.profile.leaf_payload_stale;
+            profile.hbc_leaf_payload_missing = profiled.profile.leaf_payload_missing;
+            profile.hbc_reranked_vectors = profiled.profile.reranked_vectors;
+            profile.hbc_approx_candidate_count = profiled.profile.approx_candidate_count;
+            profile.hbc_rerank_candidate_count = profiled.profile.rerank_candidate_count;
+            profile.hbc_ambiguous_top_k_pairs = profiled.profile.ambiguous_top_k_pairs;
+            profile.hbc_ambiguous_boundary_pairs = profiled.profile.ambiguous_boundary_pairs;
+            profile.hbc_ambiguous_distance_over_hits = profiled.profile.ambiguous_distance_over_hits;
+            profile.hbc_ambiguous_distance_under_hits = profiled.profile.ambiguous_distance_under_hits;
+            profile.hbc_full_rerank_due_to_threshold = profiled.profile.full_rerank_due_to_threshold;
+            profile.hbc_top_k_count = profiled.profile.top_k_count;
+            profile.hbc_min_distance_gap_top_k = profiled.profile.min_distance_gap_top_k;
+            profile.hbc_min_interval_gap_top_k = profiled.profile.min_interval_gap_top_k;
+            profile.hbc_closest_pair_top_k = if (profiled.profile.closest_pair_top_k) |pair| mapDebugPair(pair) else null;
+            profile.hbc_boundary_pair = if (profiled.profile.boundary_pair) |pair| mapDebugPair(pair) else null;
+            profile.hbc_boundary_tail_error_avg = profiled.profile.boundary_tail_error_avg;
+            profile.hbc_boundary_tail_error_max = profiled.profile.boundary_tail_error_max;
+            profile.hbc_boundary_tail_distance_gap_avg = profiled.profile.boundary_tail_distance_gap_avg;
+            profile.hbc_boundary_tail_distance_gap_min = profiled.profile.boundary_tail_distance_gap_min;
+            profile.hbc_boundary_tail_distance_gap_max = profiled.profile.boundary_tail_distance_gap_max;
+            profile.hbc_boundary_tail_interval_gap_avg = profiled.profile.boundary_tail_interval_gap_avg;
+            profile.hbc_boundary_tail_interval_gap_min = profiled.profile.boundary_tail_interval_gap_min;
+            profile.hbc_boundary_tail_interval_gap_max = profiled.profile.boundary_tail_interval_gap_max;
+            profile.hbc_approx_top_count = profiled.profile.approx_top_count;
+            for (profiled.profile.approx_top, 0..) |hit, i| {
+                profile.hbc_approx_top[i] = mapDebugHit(hit);
+            }
+            profile.hbc_rerank_external_score_ns = profiled.profile.rerank_vector_load_ns;
+            profile.hbc_rerank_vector_load_ns = profiled.profile.rerank_vector_load_ns;
+            profile.hbc_rerank_metadata_lookup_ns = profiled.profile.rerank_metadata_lookup_ns;
+            profile.hbc_rerank_artifact_key_ns = profiled.profile.rerank_artifact_key_ns;
+            profile.hbc_rerank_artifact_read_ns = profiled.profile.rerank_artifact_read_ns;
+            profile.hbc_rerank_artifact_decode_ns = profiled.profile.rerank_artifact_decode_ns;
+            profile.hbc_rerank_artifact_distance_ns = profiled.profile.rerank_artifact_distance_ns;
+            profile.hbc_rerank_lsm_cache_hits = profiled.profile.rerank_lsm_cache_hits;
+            profile.hbc_rerank_lsm_cache_misses = profiled.profile.rerank_lsm_cache_misses;
+            profile.hbc_rerank_distance_ns = profiled.profile.rerank_distance_ns;
+            break :blk profiled.results;
+        } else executor.hbc_search(executor.ctx, entry, hbc_req) catch |err| switch (err) {
             error.NotFound => {
                 profile.returned_hit_count = 0;
                 profile.total_ns = platform_time.monotonicNs() - total_start;
@@ -4703,158 +4763,112 @@ fn searchDenseInternal(
             },
             else => return err,
         };
-        profile.hbc_runtime_txn_ns = profiled.profile.runtime_txn_ns;
-        profile.hbc_scratch_acquire_ns = profiled.profile.scratch_acquire_ns;
-        profile.hbc_node_cache_lookup_ns = profiled.profile.node_cache_lookup_ns;
-        profile.hbc_quantized_cache_lookup_ns = profiled.profile.quantized_cache_lookup_ns;
-        profile.hbc_nodes_visited = profiled.profile.nodes_visited;
-        profile.hbc_leaves_explored = profiled.profile.leaves_explored;
-        profile.hbc_approx_vectors_scored = profiled.profile.approx_vectors_scored;
-        profile.hbc_exact_vectors_scored = profiled.profile.exact_vectors_scored;
-        profile.hbc_leaf_payload_stale = profiled.profile.leaf_payload_stale;
-        profile.hbc_leaf_payload_missing = profiled.profile.leaf_payload_missing;
-        profile.hbc_reranked_vectors = profiled.profile.reranked_vectors;
-        profile.hbc_approx_candidate_count = profiled.profile.approx_candidate_count;
-        profile.hbc_rerank_candidate_count = profiled.profile.rerank_candidate_count;
-        profile.hbc_ambiguous_top_k_pairs = profiled.profile.ambiguous_top_k_pairs;
-        profile.hbc_ambiguous_boundary_pairs = profiled.profile.ambiguous_boundary_pairs;
-        profile.hbc_ambiguous_distance_over_hits = profiled.profile.ambiguous_distance_over_hits;
-        profile.hbc_ambiguous_distance_under_hits = profiled.profile.ambiguous_distance_under_hits;
-        profile.hbc_full_rerank_due_to_threshold = profiled.profile.full_rerank_due_to_threshold;
-        profile.hbc_top_k_count = profiled.profile.top_k_count;
-        profile.hbc_min_distance_gap_top_k = profiled.profile.min_distance_gap_top_k;
-        profile.hbc_min_interval_gap_top_k = profiled.profile.min_interval_gap_top_k;
-        profile.hbc_closest_pair_top_k = if (profiled.profile.closest_pair_top_k) |pair| mapDebugPair(pair) else null;
-        profile.hbc_boundary_pair = if (profiled.profile.boundary_pair) |pair| mapDebugPair(pair) else null;
-        profile.hbc_boundary_tail_error_avg = profiled.profile.boundary_tail_error_avg;
-        profile.hbc_boundary_tail_error_max = profiled.profile.boundary_tail_error_max;
-        profile.hbc_boundary_tail_distance_gap_avg = profiled.profile.boundary_tail_distance_gap_avg;
-        profile.hbc_boundary_tail_distance_gap_min = profiled.profile.boundary_tail_distance_gap_min;
-        profile.hbc_boundary_tail_distance_gap_max = profiled.profile.boundary_tail_distance_gap_max;
-        profile.hbc_boundary_tail_interval_gap_avg = profiled.profile.boundary_tail_interval_gap_avg;
-        profile.hbc_boundary_tail_interval_gap_min = profiled.profile.boundary_tail_interval_gap_min;
-        profile.hbc_boundary_tail_interval_gap_max = profiled.profile.boundary_tail_interval_gap_max;
-        profile.hbc_approx_top_count = profiled.profile.approx_top_count;
-        for (profiled.profile.approx_top, 0..) |hit, i| {
-            profile.hbc_approx_top[i] = mapDebugHit(hit);
+        profile.hbc_search_ns += platform_time.monotonicNs() - hbc_search_start;
+        defer results.deinit();
+
+        const raw_hits = results.getHits();
+        profile.raw_hit_count = @intCast(raw_hits.len);
+        const candidate_window_incomplete = denseCandidateWindowIncomplete(hbc_effective_k, bounded_full_candidate_count, raw_hits.len);
+        const start: u32 = if (full_candidate_window) 0 else @min(paging.offset, @as(u32, @intCast(raw_hits.len)));
+        const end: u32 = if (full_candidate_window) @intCast(raw_hits.len) else @min(start + paging.limit, @as(u32, @intCast(raw_hits.len)));
+
+        var hits = std.ArrayListUnmanaged(types.SearchHit).empty;
+        var hit_vector_ids = std.ArrayListUnmanaged(u64).empty;
+        defer hit_vector_ids.deinit(alloc);
+        errdefer {
+            for (hits.items) |*hit| hit.deinit(alloc);
+            hits.deinit(alloc);
         }
-        profile.hbc_rerank_external_score_ns = profiled.profile.rerank_vector_load_ns;
-        profile.hbc_rerank_vector_load_ns = profiled.profile.rerank_vector_load_ns;
-        profile.hbc_rerank_metadata_lookup_ns = profiled.profile.rerank_metadata_lookup_ns;
-        profile.hbc_rerank_artifact_key_ns = profiled.profile.rerank_artifact_key_ns;
-        profile.hbc_rerank_artifact_read_ns = profiled.profile.rerank_artifact_read_ns;
-        profile.hbc_rerank_artifact_decode_ns = profiled.profile.rerank_artifact_decode_ns;
-        profile.hbc_rerank_artifact_distance_ns = profiled.profile.rerank_artifact_distance_ns;
-        profile.hbc_rerank_lsm_cache_hits = profiled.profile.rerank_lsm_cache_hits;
-        profile.hbc_rerank_lsm_cache_misses = profiled.profile.rerank_lsm_cache_misses;
-        profile.hbc_rerank_distance_ns = profiled.profile.rerank_distance_ns;
-        break :blk profiled.results;
-    } else executor.hbc_search(executor.ctx, entry, hbc_req) catch |err| switch (err) {
-        error.NotFound => {
-            profile.returned_hit_count = 0;
-            profile.total_ns = platform_time.monotonicNs() - total_start;
-            return .{
-                .alloc = alloc,
-                .hits = &.{},
-                .total_hits = 0,
-                .graph_results = &.{},
-            };
-        },
-        else => return err,
-    };
-    profile.hbc_search_ns = platform_time.monotonicNs() - hbc_search_start;
-    defer results.deinit();
 
-    const raw_hits = results.getHits();
-    profile.raw_hit_count = @intCast(raw_hits.len);
-    const start: u32 = if (full_candidate_window) 0 else @min(paging.offset, @as(u32, @intCast(raw_hits.len)));
-    const end: u32 = if (full_candidate_window) @intCast(raw_hits.len) else @min(start + paging.limit, @as(u32, @intCast(raw_hits.len)));
-
-    var hits = std.ArrayListUnmanaged(types.SearchHit).empty;
-    var hit_vector_ids = std.ArrayListUnmanaged(u64).empty;
-    defer hit_vector_ids.deinit(alloc);
-    errdefer {
-        for (hits.items) |*hit| hit.deinit(alloc);
-        hits.deinit(alloc);
-    }
-
-    for (raw_hits[@intCast(start)..@intCast(end)], 0..) |hit, i| {
-        const result_index: usize = @as(usize, @intCast(start)) + i;
-        const resolve_start = platform_time.monotonicNs();
-        const doc_key = if (results.takeMetadata(result_index)) |metadata| blk: {
-            profile.inline_metadata_hits += 1;
-            break :blk metadata;
-        } else blk: {
-            if (try entry.index.getMetadata(hit.vector_id)) |metadata| {
-                profile.fetched_metadata_hits += 1;
+        for (raw_hits[@intCast(start)..@intCast(end)], 0..) |hit, i| {
+            const result_index: usize = @as(usize, @intCast(start)) + i;
+            const resolve_start = platform_time.monotonicNs();
+            const doc_key = if (results.takeMetadata(result_index)) |metadata| blk: {
+                profile.inline_metadata_hits += 1;
                 break :blk metadata;
-            }
-            const looked_up = (try executor.lookup_doc_key(
-                executor.ctx,
-                req.index_name orelse entry.config.name,
-                hit.vector_id,
-            )) orelse {
-                profile.doc_key_resolve_ns += platform_time.monotonicNs() - resolve_start;
-                continue;
+            } else blk: {
+                if (try entry.index.getMetadata(hit.vector_id)) |metadata| {
+                    profile.fetched_metadata_hits += 1;
+                    break :blk metadata;
+                }
+                const looked_up = (try executor.lookup_doc_key(
+                    executor.ctx,
+                    req.index_name orelse entry.config.name,
+                    hit.vector_id,
+                )) orelse {
+                    profile.doc_key_resolve_ns += platform_time.monotonicNs() - resolve_start;
+                    continue;
+                };
+                profile.lookup_doc_key_hits += 1;
+                break :blk looked_up;
             };
-            profile.lookup_doc_key_hits += 1;
-            break :blk looked_up;
-        };
-        profile.doc_key_resolve_ns += platform_time.monotonicNs() - resolve_start;
-        var doc_key_owned = true;
-        errdefer if (doc_key_owned) alloc.free(doc_key);
+            profile.doc_key_resolve_ns += platform_time.monotonicNs() - resolve_start;
+            var doc_key_owned = true;
+            errdefer if (doc_key_owned) alloc.free(doc_key);
 
-        var stored_data: ?[]u8 = null;
-        var stored_data_owned = false;
-        errdefer if (stored_data_owned) {
-            if (stored_data) |data| alloc.free(data);
-        };
-        const load_stored_before_postprocess = postprocess_req.include_stored and
-            !(chunk_backed and group_chunk_parents) and
-            !unresolved_stored_filters;
-        if (load_stored_before_postprocess) {
+            var stored_data: ?[]u8 = null;
+            var stored_data_owned = false;
+            errdefer if (stored_data_owned) {
+                if (stored_data) |data| alloc.free(data);
+            };
+            const load_stored_before_postprocess = postprocess_req.include_stored and
+                !(chunk_backed and group_chunk_parents) and
+                !unresolved_stored_filters;
+            if (load_stored_before_postprocess) {
+                const load_start = platform_time.monotonicNs();
+                stored_data = try executor.load_projected_document(executor.ctx, alloc, postprocess_req, doc_key);
+                stored_data_owned = true;
+                profile.load_projected_document_ns += platform_time.monotonicNs() - load_start;
+            }
+            try hit_vector_ids.append(alloc, hit.vector_id);
+            try hits.append(alloc, .{
+                .id = doc_key,
+                .doc_ordinal = null,
+                .score = hit.distance,
+                .stored_data = stored_data,
+            });
+            doc_key_owned = false;
+            stored_data_owned = false;
+        }
+        const ordinal_lookup_start = platform_time.monotonicNs();
+        try lookupDenseHitDocOrdinals(alloc, postprocess_req, executor, hit_vector_ids.items, hits.items);
+        profile.doc_ordinal_lookup_ns += platform_time.monotonicNs() - ordinal_lookup_start;
+
+        const postprocess_start = platform_time.monotonicNs();
+        const dense_hits_total: u32 = @intCast(hits.items.len);
+        const dense_hits = try hits.toOwnedSlice(alloc);
+        var result = try executor.postprocess(executor.ctx, alloc, postprocess_req, .{
+            .alloc = alloc,
+            .hits = dense_hits,
+            .total_hits = dense_hits_total,
+            .total_hits_relation = if (candidate_window_incomplete) .gte else .exact,
+            .graph_results = &.{},
+        }, chunk_backed);
+        errdefer result.deinit();
+
+        const visible_candidate_count = result.total_hits;
+        if (full_candidate_window and candidate_window_incomplete and visible_candidate_count < page_candidate_window) {
+            result.deinit();
+            const grown_window = growDenseFullCandidateWindow(candidate_window, bounded_full_candidate_count, page_candidate_window);
+            if (grown_window == candidate_window) return error.InvalidQueryRequest;
+            candidate_window = grown_window;
+            continue;
+        }
+        if (candidate_window_incomplete) result.total_hits_relation = .gte;
+        if (unresolved_stored_filters) {
+            result = try pageSearchResultInPlace(alloc, result, paging);
+        }
+        profile.postprocess_ns += platform_time.monotonicNs() - postprocess_start;
+        if (postprocess_req.include_stored and !(chunk_backed and group_chunk_parents)) {
             const load_start = platform_time.monotonicNs();
-            stored_data = try executor.load_projected_document(executor.ctx, alloc, postprocess_req, doc_key);
-            stored_data_owned = true;
+            try loadMissingProjectedDenseHitDocuments(alloc, postprocess_req, executor, result.hits);
             profile.load_projected_document_ns += platform_time.monotonicNs() - load_start;
         }
-        try hit_vector_ids.append(alloc, hit.vector_id);
-        try hits.append(alloc, .{
-            .id = doc_key,
-            .doc_ordinal = null,
-            .score = hit.distance,
-            .stored_data = stored_data,
-        });
-        doc_key_owned = false;
-        stored_data_owned = false;
+        profile.returned_hit_count = result.total_hits;
+        profile.total_ns = platform_time.monotonicNs() - total_start;
+        if (bench_query_profile) logBenchDenseQueryProfile(req, dense, index_stats, profile);
+        return result;
     }
-    const ordinal_lookup_start = platform_time.monotonicNs();
-    try lookupDenseHitDocOrdinals(alloc, postprocess_req, executor, hit_vector_ids.items, hits.items);
-    profile.doc_ordinal_lookup_ns = platform_time.monotonicNs() - ordinal_lookup_start;
-
-    const postprocess_start = platform_time.monotonicNs();
-    const dense_hits_total: u32 = @intCast(hits.items.len);
-    const dense_hits = try hits.toOwnedSlice(alloc);
-    var result = try executor.postprocess(executor.ctx, alloc, postprocess_req, .{
-        .alloc = alloc,
-        .hits = dense_hits,
-        .total_hits = dense_hits_total,
-        .graph_results = &.{},
-    }, chunk_backed);
-    errdefer result.deinit();
-    if (unresolved_stored_filters) {
-        result = try pageSearchResultInPlace(alloc, result, paging);
-    }
-    profile.postprocess_ns = platform_time.monotonicNs() - postprocess_start;
-    if (postprocess_req.include_stored and !(chunk_backed and group_chunk_parents)) {
-        const load_start = platform_time.monotonicNs();
-        try loadMissingProjectedDenseHitDocuments(alloc, postprocess_req, executor, result.hits);
-        profile.load_projected_document_ns += platform_time.monotonicNs() - load_start;
-    }
-    profile.returned_hit_count = result.total_hits;
-    profile.total_ns = platform_time.monotonicNs() - total_start;
-    if (bench_query_profile) logBenchDenseQueryProfile(req, dense, index_stats, profile);
-    return result;
 }
 
 fn shouldLogBenchQueryProfile() bool {
@@ -4870,13 +4884,39 @@ fn shouldExactScoreNativeDenseFilter(
 ) bool {
     if (!native_constraints.positive_filter) return false;
     if (native_constraints.filter_ids.len == 0) return false;
-    const paging_budget = paging.limit *| 32;
+    const paging_budget = pagingCandidateWindow(paging) *| 32;
     const budget = @max(paging_budget, default_exact_native_filter_candidate_budget);
     return native_constraints.filter_ids.len <= budget;
 }
 
 fn pagingCandidateWindow(paging: ComponentPaging) u32 {
     return paging.offset +| paging.limit;
+}
+
+fn initialDenseFullCandidateWindow(bounded_full_candidate_count: u32, paging: ComponentPaging) u32 {
+    if (bounded_full_candidate_count == 0) return 0;
+    const overfetch_window = @max(paging.limit *| 32, @as(u32, 1024));
+    return @min(bounded_full_candidate_count, @max(overfetch_window, pagingCandidateWindow(paging)));
+}
+
+fn growDenseFullCandidateWindow(current: u32, bounded_full_candidate_count: u32, requested_visible_end: u32) u32 {
+    if (current >= bounded_full_candidate_count) return current;
+    const grown = @max(current +| 1, @max(current *| 2, requested_visible_end));
+    return @min(bounded_full_candidate_count, grown);
+}
+
+fn denseCandidateWindowIncomplete(candidate_window: u32, bounded_full_candidate_count: u32, raw_hits_len: usize) bool {
+    _ = raw_hits_len;
+    return candidate_window < bounded_full_candidate_count;
+}
+
+test "dense full candidate window covers requested offset page and grows bounded" {
+    const paging = ComponentPaging{ .offset = 1024, .limit = 1 };
+    try std.testing.expectEqual(@as(u32, 1025), initialDenseFullCandidateWindow(2000, paging));
+    try std.testing.expectEqual(@as(u32, 2000), growDenseFullCandidateWindow(1025, 2000, 1025));
+    try std.testing.expect(denseCandidateWindowIncomplete(1025, 2000, 1025));
+    try std.testing.expect(!denseCandidateWindowIncomplete(2000, 2000, 1025));
+    try std.testing.expectEqual(@as(u32, 7), initialDenseFullCandidateWindow(7, paging));
 }
 
 fn exactScoreNativeDenseFilter(
