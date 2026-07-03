@@ -27224,7 +27224,13 @@ fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_
     if (!shouldRunTargetAdvanceRepair(ctx, index_ref.name, now_ns)) return false;
     try noteTargetAdvanceRepairRun(ctx, index_ref.name, now_ns);
 
-    const expected_doc_count = try denseTargetCountForIndexContext(ctx, index_ref.name);
+    const expected_doc_count = (try denseTargetCountForIndexContext(ctx, index_ref.name)) orelse {
+        std.log.warn(
+            "dense replay target advance deferred by missing durable artifact counter index={s}",
+            .{index_ref.name},
+        );
+        return false;
+    };
     if (expected_doc_count == 0) return true;
     if (entry.index.stats().active_count >= expected_doc_count) return true;
 
@@ -27248,10 +27254,12 @@ fn denseIndexIsArtifactBacked(entry: anytype) bool {
     return entry.external or entry.chunk_name != null or entry.embedding_name != null;
 }
 
-fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !u64 {
-    const artifact_count = try denseArtifactTargetCountForIndexContext(ctx, index_name);
-    const inline_count = try densePrimaryVectorTargetCountForIndexContext(ctx, index_name);
-    return @max(artifact_count, inline_count);
+fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !?u64 {
+    const entry = ctx.index_manager.denseIndex(index_name) orelse return 0;
+    if (denseIndexIsArtifactBacked(entry)) {
+        return try DB.loadDenseArtifactTargetCounter(ctx.alloc, ctx.store, index_name);
+    }
+    return try densePrimaryVectorTargetCountForIndexContext(ctx, index_name);
 }
 
 fn denseArtifactTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !u64 {
@@ -28076,6 +28084,38 @@ fn putDenseEmbeddingArtifactForTest(db: *DB, alloc: Allocator, artifact_key: []c
     const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, source_hash, vector);
     defer alloc.free(payload);
     try db.core.store.put(artifact_key, payload);
+    try markArtifactPresenceForTest(db);
+}
+
+fn putDenseEmbeddingArtifactWithCounterForTest(db: *DB, alloc: Allocator, artifact_key: []const u8, source_hash: ?u64, vector: []const f32) !void {
+    const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, source_hash, vector);
+    defer alloc.free(payload);
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    try writes.append(alloc, .{ .key = artifact_key, .value = payload });
+
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+
+    try DB.appendDenseArtifactCounterMutations(
+        alloc,
+        db.core.store,
+        db.core.index_manager,
+        &writes,
+        &.{},
+        &owned_keys,
+        &owned_values,
+    );
+    try db.core.store.putBatch(writes.items, &.{});
     try markArtifactPresenceForTest(db);
 }
 
@@ -44677,7 +44717,7 @@ test "db catch-up rebuilds dense coverage before vacuous target advance" {
 
     const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
     defer alloc.free(artifact_key);
-    try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+    try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
 
     try db.core.store.ensureReplayNextSequenceAtLeast(target_sequence + 1);
     var latest_raw: [8]u8 = undefined;
@@ -44725,6 +44765,61 @@ test "db catch-up rebuilds dense coverage before vacuous target advance" {
     defer result.deinit();
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db catch-up defers artifact dense target advance without durable counter" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const target_sequence: u64 = 7;
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
+    });
+
+    const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+    defer alloc.free(stored_key);
+    try db.core.store.putBatch(&.{
+        .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
+    }, &.{});
+
+    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+    defer alloc.free(artifact_key);
+    try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+
+    try db.core.store.ensureReplayNextSequenceAtLeast(target_sequence + 1);
+    var latest_raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &latest_raw, target_sequence, .little);
+    const latest_key = internal_keys.replayLatestSequenceKey(@intCast(@intFromEnum(change_journal_mod.TargetHint.dense_vector)));
+    var batch = try db.core.store.beginWriteBatch();
+    errdefer batch.abort();
+    try batch.put(latest_key[0..], latest_raw[0..]);
+    try batch.commit();
+
+    try std.testing.expectEqual(@as(?u64, null), try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "dv_v1"));
+
+    try db.catchUpPendingDerivedReplay();
+
+    const after = try db.listDerivedReplayDebt(alloc);
+    defer {
+        for (after) |*status| status.deinit(alloc);
+        alloc.free(after);
+    }
+    try std.testing.expectEqual(@as(usize, 1), after.len);
+    try std.testing.expectEqual(@as(u64, 0), after[0].applied_sequence);
+    try std.testing.expectEqual(target_sequence, after[0].target_sequence);
+    try std.testing.expect(after[0].catch_up_required);
 }
 
 test "dense replay progress target matches replay debt target" {
