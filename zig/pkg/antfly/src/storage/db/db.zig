@@ -6167,7 +6167,28 @@ pub const DB = struct {
         index_name: ?[]const u8,
         limit: usize,
     ) ![]types.EmbeddingArtifactRepairIssue {
-        return try self.listArtifactRepairIssues(alloc, .embedding, index_name, limit);
+        const generic = try self.listArtifactRepairIssues(alloc, .embedding, index_name, limit);
+        defer types.freeArtifactRepairIssues(alloc, generic);
+
+        var issues = try alloc.alloc(types.EmbeddingArtifactRepairIssue, generic.len);
+        var count: usize = 0;
+        errdefer {
+            for (issues[0..count]) |*issue| issue.deinit(alloc);
+            alloc.free(issues);
+        }
+        for (generic) |issue| {
+            issues[count] = try types.embeddingArtifactRepairIssueFromArtifactAlloc(alloc, issue);
+            count += 1;
+        }
+        return issues;
+    }
+
+    fn countArtifactRepairIssues(self: *DB, alloc: Allocator) !u64 {
+        const prefix = try internal_keys.artifactRepairIssueRootPrefixAlloc(alloc);
+        defer alloc.free(prefix);
+        const rows = try self.core.store.scanPrefix(alloc, prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, rows);
+        return @intCast(rows.len);
     }
 
     fn countArtifactRepairIssuesForIndex(self: *DB, alloc: Allocator, index_name: []const u8) !u64 {
@@ -6187,23 +6208,27 @@ pub const DB = struct {
     fn artifactNowReadable(self: *DB, alloc: Allocator, issue: types.ArtifactRepairIssue) !bool {
         return switch (issue.artifact_kind) {
             .embedding => try self.embeddingArtifactNowReadable(alloc, issue),
-            .asset, .chunk, .graph, .full_text => try self.storedArtifactNowReadable(alloc, issue),
+            .asset => try self.documentAssetArtifactNowReadable(alloc, issue),
+            .chunk, .graph, .full_text => false,
         };
     }
 
-    fn storedArtifactNowReadable(self: *DB, alloc: Allocator, issue: types.ArtifactRepairIssue) !bool {
-        const artifact_key = if (issue.artifact_key.len > 0)
-            try hexToBytesAlloc(alloc, issue.artifact_key)
-        else
-            return false;
-        defer alloc.free(artifact_key);
-
-        const raw = self.core.store.get(alloc, artifact_key) catch |err| switch (err) {
-            error.NotFound => return false,
-            else => return err,
-        };
-        defer alloc.free(raw);
-        return raw.len > 0;
+    fn documentAssetArtifactNowReadable(self: *DB, alloc: Allocator, issue: types.ArtifactRepairIssue) !bool {
+        const doc_key = if (issue.parent_doc_key.len > 0) issue.parent_doc_key else issue.doc_key;
+        if (doc_key.len == 0 or issue.artifact_name.len == 0) return false;
+        if (issue.artifact_key.len > 0) {
+            const actual_key = try hexToBytesAlloc(alloc, issue.artifact_key);
+            defer alloc.free(actual_key);
+            const expected_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", issue.artifact_name);
+            defer alloc.free(expected_key);
+            if (!std.mem.eql(u8, actual_key, expected_key)) return false;
+        }
+        var manifest = (self.getDocumentArtifactManifest(alloc, doc_key, issue.artifact_name) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return false,
+        }) orelse return false;
+        defer manifest.deinit(alloc);
+        return true;
     }
 
     fn embeddingArtifactNowReadable(self: *DB, alloc: Allocator, issue: types.ArtifactRepairIssue) !bool {
@@ -10506,6 +10531,7 @@ pub const DB = struct {
         const async_indexing = self.snapshotAsyncIndexingStats();
         const identity_stats = dbDocIdentityStats(try doc_identity.fastStatsFromStore(self.core.store), self.core.identity_namespace);
         const primary_doc_count = self.scanPrimaryDocCount(self.core.byteRange()) catch 0;
+        const repair_issue_count = try self.countArtifactRepairIssues(alloc);
 
         var index_stats = try alloc.alloc(types.DBIndexStats, configs.len);
         var index_count: usize = 0;
@@ -10613,6 +10639,8 @@ pub const DB = struct {
             .doc_count = visible_doc_count,
             .index_count = @intCast(self.core.indexCount()),
             .indexes = index_stats[0..index_count],
+            .repair_degraded = repair_issue_count != 0,
+            .repair_issue_count = repair_issue_count,
             .doc_identity = identity_stats,
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
             .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
@@ -10654,6 +10682,7 @@ pub const DB = struct {
         const visible_doc_count = indexed_doc_count orelse try self.scanPrimaryDocCount(byte_range);
         const async_indexing = self.async_context.stats.snapshot();
         const identity_stats = try self.diagnosticDocIdentityStats(byte_range);
+        const repair_issue_count = try self.countArtifactRepairIssues(alloc);
 
         var index_stats = try alloc.alloc(types.DBIndexStats, configs.len);
         var index_count: usize = 0;
@@ -10784,6 +10813,8 @@ pub const DB = struct {
             .doc_count = visible_doc_count,
             .index_count = @intCast(self.core.indexCount()),
             .indexes = index_stats[0..index_count],
+            .repair_degraded = repair_issue_count != 0,
+            .repair_issue_count = repair_issue_count,
             .doc_identity = identity_stats,
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
             .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else try self.persistedEnrichmentStats(),
@@ -10830,6 +10861,7 @@ pub const DB = struct {
         const target_sequence = self.core.nextDerivedSequence();
         var visible_doc_count: u64 = 0;
         const identity_stats = dbDocIdentityStats(try doc_identity.fastStatsFromStore(self.core.store), self.core.identity_namespace);
+        const repair_issue_count = try self.countArtifactRepairIssues(alloc);
 
         var index_stats = try alloc.alloc(types.DBIndexStats, configs.len);
         var index_count: usize = 0;
@@ -10881,6 +10913,8 @@ pub const DB = struct {
             .doc_count = visible_doc_count,
             .index_count = @intCast(self.core.indexCount()),
             .indexes = index_stats[0..index_count],
+            .repair_degraded = repair_issue_count != 0,
+            .repair_issue_count = repair_issue_count,
             .doc_identity = identity_stats,
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
             .resolution = self.resolutionStageStats(),
@@ -14844,10 +14878,16 @@ fn computeDocumentExtractionAssetRequestDerived(
     var previous_child_ranges: []types.DocumentArtifactChildRange = &.{};
     defer freeDocumentArtifactChildRanges(alloc, previous_child_ranges);
     if (existing_manifest) |value| {
-        previous_child_ranges = try documentArtifactChildRangesFromManifestJsonAlloc(alloc, value);
+        previous_child_ranges = documentArtifactChildRangesFromManifestJsonAlloc(alloc, value) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => &.{},
+        };
     }
 
-    const from_generation = if (existing_manifest) |value| try documentExtractionManifestGeneration(alloc, value) else 0;
+    const from_generation = if (existing_manifest) |value|
+        documentExtractionManifestGeneration(alloc, value) catch 0
+    else
+        0;
     const to_generation = from_generation + 1;
 
     const metadata_fingerprint = try document_extraction_mod.metadataFingerprintAlloc(alloc, source_url, config_json, config);
@@ -14857,7 +14897,11 @@ fn computeDocumentExtractionAssetRequestDerived(
             if (existing_state) |state| {
                 if (documentExtractionStateFingerprintMatches(alloc, state, fingerprint)) {
                     if (existing_manifest) |value| {
-                        if (!(try documentExtractionManifestHasLastError(alloc, value))) {
+                        const manifest_has_last_error = documentExtractionManifestHasLastError(alloc, value) catch |err| switch (err) {
+                            error.OutOfMemory => return err,
+                            else => true,
+                        };
+                        if (!manifest_has_last_error) {
                             try artifact_writes.append(alloc, .{
                                 .key = try alloc.dupe(u8, manifest_key),
                                 .value = try alloc.dupe(u8, value),
@@ -34416,6 +34460,14 @@ test "db generic artifact repair queue reprocesses document asset artifacts" {
         try std.testing.expectEqualStrings(artifact_key_hex, issues[0].artifact_key);
     }
 
+    const degraded_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, degraded_stats);
+    try std.testing.expect(degraded_stats.repair_degraded);
+    try std.testing.expectEqual(@as(u64, 1), degraded_stats.repair_issue_count);
+    try std.testing.expectEqual(@as(u32, 0), degraded_stats.index_count);
+
+    try db.core.store.put(manifest_key, "bad-artifact");
+
     const repair = try db.repairArtifactIssues(alloc, .asset, 10);
     try std.testing.expectEqual(@as(u64, 1), repair.scanned);
     try std.testing.expectEqual(@as(u64, 1), repair.reprocessed);
@@ -34426,9 +34478,15 @@ test "db generic artifact repair queue reprocesses document asset artifacts" {
     defer types.freeArtifactRepairIssues(alloc, issues_after);
     try std.testing.expectEqual(@as(usize, 0), issues_after.len);
 
+    const repaired_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, repaired_stats);
+    try std.testing.expect(!repaired_stats.repair_degraded);
+    try std.testing.expectEqual(@as(u64, 0), repaired_stats.repair_issue_count);
+
     var after = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
     defer after.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 2), after.generation);
+    try std.testing.expectEqual(@as(u64, 1), after.generation);
+    try std.testing.expect(after.manifest_json.len > 0);
 }
 
 test "db document extraction unit ranges split by text bytes" {
@@ -41557,13 +41615,15 @@ test "db replay blocks dense embedding writes when artifact payload is missing" 
     const issues = try reopened.listEmbeddingArtifactRepairIssues(alloc, "dv_v1", 0);
     defer types.freeEmbeddingArtifactRepairIssues(alloc, issues);
     try std.testing.expectEqual(@as(usize, 1), issues.len);
-    try std.testing.expectEqual(.missing_artifact, issues[0].reason);
+    try std.testing.expectEqual(.missing_embedding_artifact, issues[0].reason);
     try std.testing.expectEqual(.embedding, issues[0].artifact_kind);
     try std.testing.expectEqualStrings("doc:a", issues[0].doc_key);
     try std.testing.expectEqualStrings("dv_v1", issues[0].artifact_name);
 
     const degraded_stats = try reopened.stats(alloc);
     defer types.freeDBStats(alloc, degraded_stats);
+    try std.testing.expect(degraded_stats.repair_degraded);
+    try std.testing.expectEqual(@as(u64, 1), degraded_stats.repair_issue_count);
     try std.testing.expect(degraded_stats.indexes[0].repair_degraded);
     try std.testing.expectEqual(@as(u64, 1), degraded_stats.indexes[0].repair_issue_count);
 
@@ -41633,7 +41693,7 @@ test "db replay blocks and preserves corrupt dense embedding artifacts" {
     const issues = try reopened.listEmbeddingArtifactRepairIssues(alloc, "dv_v1", 0);
     defer types.freeEmbeddingArtifactRepairIssues(alloc, issues);
     try std.testing.expectEqual(@as(usize, 1), issues.len);
-    try std.testing.expectEqual(.corrupt_artifact, issues[0].reason);
+    try std.testing.expectEqual(.corrupt_embedding_artifact, issues[0].reason);
     try std.testing.expectEqual(.embedding, issues[0].artifact_kind);
     try std.testing.expectEqualStrings("doc:a", issues[0].doc_key);
     try std.testing.expectEqualStrings("dv_v1", issues[0].artifact_name);
@@ -41738,7 +41798,7 @@ test "db repair queue reprocesses corrupt generated dense embedding artifacts" {
         const issues = try reopened.listEmbeddingArtifactRepairIssues(alloc, "dv_v1", 0);
         defer types.freeEmbeddingArtifactRepairIssues(alloc, issues);
         try std.testing.expectEqual(@as(usize, 1), issues.len);
-        try std.testing.expectEqual(.corrupt_artifact, issues[0].reason);
+        try std.testing.expectEqual(.corrupt_embedding_artifact, issues[0].reason);
         try std.testing.expectEqual(.embedding, issues[0].artifact_kind);
         try std.testing.expectEqualStrings("doc:a", issues[0].doc_key);
     }
@@ -41821,7 +41881,7 @@ test "db repair queue reprocesses corrupt chunk generated dense embedding artifa
         const issues = try reopened.listEmbeddingArtifactRepairIssues(alloc, "dv_v1", 0);
         defer types.freeEmbeddingArtifactRepairIssues(alloc, issues);
         try std.testing.expectEqual(@as(usize, 1), issues.len);
-        try std.testing.expectEqual(.corrupt_artifact, issues[0].reason);
+        try std.testing.expectEqual(.corrupt_embedding_artifact, issues[0].reason);
         try std.testing.expectEqual(.embedding, issues[0].artifact_kind);
         try std.testing.expectEqualStrings("doc:a", issues[0].parent_doc_key);
         try std.testing.expectEqualStrings("body_chunks_v1", issues[0].source_artifact_name);
@@ -41947,7 +42007,7 @@ test "db replay blocks and preserves corrupt sparse embedding artifacts" {
     const issues = try reopened.listEmbeddingArtifactRepairIssues(alloc, "sp_v1", 0);
     defer types.freeEmbeddingArtifactRepairIssues(alloc, issues);
     try std.testing.expectEqual(@as(usize, 1), issues.len);
-    try std.testing.expectEqual(.corrupt_artifact, issues[0].reason);
+    try std.testing.expectEqual(.corrupt_embedding_artifact, issues[0].reason);
     try std.testing.expectEqual(.embedding, issues[0].artifact_kind);
     try std.testing.expectEqualStrings("doc:a", issues[0].doc_key);
     try std.testing.expectEqualStrings("sp_v1", issues[0].artifact_name);

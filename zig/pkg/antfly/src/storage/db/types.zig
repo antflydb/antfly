@@ -1559,6 +1559,8 @@ pub const DBStats = struct {
     doc_count: u64 = 0,
     index_count: u32 = 0,
     indexes: []DBIndexStats = &.{},
+    repair_degraded: bool = false,
+    repair_issue_count: u64 = 0,
     doc_identity: DocIdentityStats = .{},
     doc_set_planning: DocSetPlanningStats = .{},
     enrichment: EnrichmentStats = .{},
@@ -1628,12 +1630,71 @@ pub const ArtifactRepairResult = struct {
     failed: u64 = 0,
 };
 
-pub const EmbeddingArtifactRepairReason = ArtifactRepairReason;
-pub const EmbeddingArtifactRepairIssue = ArtifactRepairIssue;
+pub const EmbeddingArtifactRepairReason = enum {
+    missing_embedding_artifact,
+    corrupt_embedding_artifact,
+};
+
+pub const EmbeddingArtifactRepairIssue = struct {
+    artifact_kind: ArtifactRepairKind = .embedding,
+    index_name: []const u8 = "",
+    doc_key: []const u8 = "",
+    parent_doc_key: []const u8 = "",
+    source_artifact_name: []const u8 = "",
+    artifact_name: []const u8 = "",
+    artifact_key: []const u8 = "",
+    chunk_id: ?u32 = null,
+    sequence: u64 = 0,
+    reason: EmbeddingArtifactRepairReason = .missing_embedding_artifact,
+    attempts: u64 = 0,
+    first_seen_ns: u64 = 0,
+    last_seen_ns: u64 = 0,
+    last_error: []const u8 = "",
+
+    pub fn deinit(self: *EmbeddingArtifactRepairIssue, alloc: Allocator) void {
+        if (self.index_name.len > 0) alloc.free(@constCast(self.index_name));
+        if (self.doc_key.len > 0) alloc.free(@constCast(self.doc_key));
+        if (self.parent_doc_key.len > 0) alloc.free(@constCast(self.parent_doc_key));
+        if (self.source_artifact_name.len > 0) alloc.free(@constCast(self.source_artifact_name));
+        if (self.artifact_name.len > 0) alloc.free(@constCast(self.artifact_name));
+        if (self.artifact_key.len > 0) alloc.free(@constCast(self.artifact_key));
+        if (self.last_error.len > 0) alloc.free(@constCast(self.last_error));
+        self.* = undefined;
+    }
+};
 pub const EmbeddingArtifactRepairResult = ArtifactRepairResult;
 
+pub fn embeddingArtifactRepairReasonFromArtifact(reason: ArtifactRepairReason) EmbeddingArtifactRepairReason {
+    return switch (reason) {
+        .missing_artifact => .missing_embedding_artifact,
+        .corrupt_artifact, .unreadable_artifact => .corrupt_embedding_artifact,
+    };
+}
+
+pub fn embeddingArtifactRepairIssueFromArtifactAlloc(alloc: Allocator, issue: ArtifactRepairIssue) !EmbeddingArtifactRepairIssue {
+    var out = EmbeddingArtifactRepairIssue{
+        .artifact_kind = issue.artifact_kind,
+        .chunk_id = issue.chunk_id,
+        .sequence = issue.sequence,
+        .reason = embeddingArtifactRepairReasonFromArtifact(issue.reason),
+        .attempts = issue.attempts,
+        .first_seen_ns = issue.first_seen_ns,
+        .last_seen_ns = issue.last_seen_ns,
+    };
+    errdefer out.deinit(alloc);
+    out.index_name = try alloc.dupe(u8, issue.index_name);
+    out.doc_key = try alloc.dupe(u8, issue.doc_key);
+    out.parent_doc_key = try alloc.dupe(u8, issue.parent_doc_key);
+    out.source_artifact_name = try alloc.dupe(u8, issue.source_artifact_name);
+    out.artifact_name = try alloc.dupe(u8, issue.artifact_name);
+    out.artifact_key = try alloc.dupe(u8, issue.artifact_key);
+    out.last_error = try alloc.dupe(u8, issue.last_error);
+    return out;
+}
+
 pub fn freeEmbeddingArtifactRepairIssues(alloc: Allocator, issues: []EmbeddingArtifactRepairIssue) void {
-    freeArtifactRepairIssues(alloc, issues);
+    for (issues) |*issue| issue.deinit(alloc);
+    if (issues.len > 0) alloc.free(issues);
 }
 
 pub const AlgebraicCandidateStatus = struct {

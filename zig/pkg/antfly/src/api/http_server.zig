@@ -1375,6 +1375,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn runtimeStatusNeedsDenseVisibilityRefresh(status: runtime_status.LocalTableRuntimeStatus) bool {
+        if (status.stats.repair_degraded or status.stats.repair_issue_count != 0) return false;
         const has_primary_facts = status.stats.doc_identity.live_ordinals != 0 or status.stats.doc_count != 0;
         for (status.stats.indexes) |item| {
             if (item.kind != .dense_vector) continue;

@@ -469,6 +469,7 @@ fn runtimeStatusWorthPreserving(status: LocalTableRuntimeStatus) bool {
 
 fn statusStatsHaveRuntimeFacts(stats: db_mod.types.DBStats) bool {
     if (stats.doc_count > 0) return true;
+    if (stats.repair_degraded or stats.repair_issue_count != 0) return true;
     if (docIdentityStatsHaveRuntimeFacts(stats.doc_identity)) return true;
     if (docSetPlanningStatsHaveRuntimeFacts(stats.doc_set_planning)) return true;
     if (stats.async_indexing.startup.active or stats.async_indexing.dense_catch_up.active) return true;
@@ -1037,6 +1038,8 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         .doc_count = stats.doc_count,
         .index_count = stats.index_count,
         .indexes = indexes,
+        .repair_degraded = stats.repair_degraded,
+        .repair_issue_count = stats.repair_issue_count,
         .doc_identity = stats.doc_identity,
         .doc_set_planning = stats.doc_set_planning,
         .enrichment = stats.enrichment,
@@ -1785,6 +1788,22 @@ test "cached identity and doc set telemetry are runtime facts" {
 
     try std.testing.expect(statusHasRuntimeFacts(identity_status));
     try std.testing.expect(statusHasRuntimeFacts(planning_status));
+}
+
+test "cached repair telemetry is runtime facts" {
+    const status = LocalTableRuntimeStatus{
+        .group_id = 9,
+        .metadata = .{
+            .source = .cached_snapshot,
+            .freshness = .stale,
+        },
+        .stats = .{
+            .repair_degraded = true,
+            .repair_issue_count = 1,
+        },
+    };
+
+    try std.testing.expect(statusHasRuntimeFacts(status));
 }
 
 test "table runtime snapshot cache preserves generic artifact visibility on sequence-only refresh" {
