@@ -454,6 +454,54 @@ fn releaseEntryRequestPacer(alloc: std.mem.Allocator, maybe_scope_key: ?[]u8) vo
     alloc.free(scope_key);
 }
 
+fn managedEmbeddingApiKeyIdentityHash(entry: *const ManagedEmbeddingEntry) u64 {
+    if (entry.api_key) |api_key| return api_key.identityHash();
+    return 0;
+}
+
+fn managedEmbeddingEntriesEquivalentForLookup(
+    lhs: *const ManagedEmbeddingEntry,
+    rhs: *const ManagedEmbeddingEntry,
+) bool {
+    return lhs.provider == rhs.provider and
+        lhs.dimensions == rhs.dimensions and
+        lhs.sparse == rhs.sparse and
+        lhs.multimodal == rhs.multimodal and
+        lhs.requests_per_minute == rhs.requests_per_minute and
+        lhs.burst == rhs.burst and
+        (lhs.antfly_provider != null) == (rhs.antfly_provider != null) and
+        managedEmbeddingApiKeyIdentityHash(lhs) == managedEmbeddingApiKeyIdentityHash(rhs) and
+        std.mem.eql(u8, lhs.model, rhs.model) and
+        std.mem.eql(u8, lhs.base_url, rhs.base_url) and
+        std.mem.eql(u8, lhs.region, rhs.region) and
+        std.mem.eql(u8, lhs.input_type, rhs.input_type) and
+        std.mem.eql(u8, lhs.truncate, rhs.truncate);
+}
+
+fn validateManagedEmbeddingLookupName(
+    alloc: std.mem.Allocator,
+    names: *std.StringHashMapUnmanaged(*const ManagedEmbeddingEntry),
+    name: []const u8,
+    entry: *const ManagedEmbeddingEntry,
+) !void {
+    const gop = try names.getOrPut(alloc, name);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = entry;
+        return;
+    }
+    if (!managedEmbeddingEntriesEquivalentForLookup(gop.value_ptr.*, entry)) return error.InvalidManagedEmbeddingIndex;
+}
+
+fn validateManagedEmbeddingLookupNames(alloc: std.mem.Allocator, entries: []const ManagedEmbeddingEntry) !void {
+    var names = std.StringHashMapUnmanaged(*const ManagedEmbeddingEntry).empty;
+    defer names.deinit(alloc);
+
+    for (entries) |*entry| {
+        try validateManagedEmbeddingLookupName(alloc, &names, entry.index_name, entry);
+        if (entry.embedding_name.len > 0) try validateManagedEmbeddingLookupName(alloc, &names, entry.embedding_name, entry);
+    }
+}
+
 fn requestPacerScopeKeyAlloc(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry) ![]u8 {
     const api_key_hash = if (entry.api_key) |*api_key| api_key.identityHash() else 0;
     return try std.fmt.allocPrint(alloc, "{s}\x1f{s}\x1f{s}\x1f{x}\x1f{d}\x1f{d}\x1f{d}", .{
@@ -513,6 +561,7 @@ pub const ManagedEmbedder = struct {
             const managed = try parseManagedEmbeddingEntry(alloc, entry.key_ptr.*, entry.value_ptr.*, options) orelse continue;
             try entries.append(alloc, managed);
         }
+        try validateManagedEmbeddingLookupNames(alloc, entries.items);
 
         var pacer_scope_keys = std.ArrayListUnmanaged([]u8).empty;
         errdefer {
@@ -659,6 +708,8 @@ pub const ManagedEmbedder = struct {
     fn findEntry(self: *const ManagedEmbedder, index_name: []const u8) ?*const ManagedEmbeddingEntry {
         for (self.entries) |*entry| {
             if (std.mem.eql(u8, entry.index_name, index_name)) return entry;
+        }
+        for (self.entries) |*entry| {
             if (entry.embedding_name.len > 0 and std.mem.eql(u8, entry.embedding_name, index_name)) return entry;
         }
         return null;
@@ -2321,6 +2372,41 @@ pub fn testArtifactBackedEmbeddingTranslation() !void {
 
 test "managed embedder translates artifact backed embeddings config without generator" {
     try testArtifactBackedEmbeddingTranslation();
+}
+
+test "managed embedder allows equivalent embedding name aliases" {
+    var local = TestLocalDenseProvider{ .dimensions = 384 };
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
+        \\{
+        \\  "document_vectors_primary":{"type":"embeddings","field":"embedding","embedding_name":"document_chunk_dense_v1","source_artifact_name":"document_chunks_v1","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}},
+        \\  "document_vectors_secondary":{"type":"embeddings","field":"embedding","embedding_name":"document_chunk_dense_v1","source_artifact_name":"document_chunks_v1","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
+        \\}
+    , local.provider());
+    defer managed.deinit();
+
+    try std.testing.expect(managed.findEntry("document_vectors_primary") != null);
+    try std.testing.expect(managed.findEntry("document_vectors_secondary") != null);
+    try std.testing.expect(managed.findEntry("document_chunk_dense_v1") != null);
+}
+
+test "managed embedder rejects conflicting embedding name aliases" {
+    var local = TestLocalDenseProvider{ .dimensions = 384 };
+    try std.testing.expectError(error.InvalidManagedEmbeddingIndex, ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
+        \\{
+        \\  "document_vectors_primary":{"type":"embeddings","field":"embedding","embedding_name":"document_chunk_dense_v1","source_artifact_name":"document_chunks_v1","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}},
+        \\  "document_vectors_secondary":{"type":"embeddings","field":"embedding","embedding_name":"document_chunk_dense_v1","source_artifact_name":"document_chunks_v1","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/other"}}
+        \\}
+    , local.provider()));
+}
+
+test "managed embedder rejects index name and embedding name collisions with different configs" {
+    var local = TestLocalDenseProvider{ .dimensions = 384 };
+    try std.testing.expectError(error.InvalidManagedEmbeddingIndex, ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
+        \\{
+        \\  "aliased_vectors":{"type":"embeddings","field":"embedding","embedding_name":"document_vectors","source_artifact_name":"document_chunks_v1","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}},
+        \\  "document_vectors":{"type":"embeddings","field":"embedding","embedding_name":"document_vectors_v2","source_artifact_name":"document_chunks_v1","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/other"}}
+        \\}
+    , local.provider()));
 }
 
 test "managed embedder translates managed embeddings config with probed dimension" {
