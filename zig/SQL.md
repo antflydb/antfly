@@ -430,14 +430,19 @@ projection inserts without an `_id` target allocate target ids through the same
 native generated document id helper used by direct generated-id document
 inserts; runtime sorts materialized source ids before allocating generated
 target ids so allocation order is deterministic for exact, indexed, and bounded
-source producers. Ordered sources, nondeterministic sources, nested target
-paths, `_doc`/`_version` source projection writes, and conflict actions remain
-fail-closed until their native semantics are separately proven. Document
-`MERGE` `RETURNING`, compound or expression conflict targets, partial unique
-targets, and named non-primary constraints also remain fail-closed. Unsupported
-document `RETURNING` shapes report specific stable diagnostics for `*`,
-duplicate output names, expressions, generated fields, and unsupported
-virtual/projection fields.
+source producers. Source-query `ON CONFLICT` for `_id` or an admitted declared
+unique scalar projection composes source materialization with the same native
+document conflict-write path used by direct projection inserts, so
+`DO NOTHING`, `DO UPDATE`, guarded update skips, duplicate proposed target
+rejection, no-op row reporting, row counts, and native `RETURNING` responses
+follow the direct conflict semantics. Ordered sources, nondeterministic
+sources, nested target paths, and `_doc`/`_version` source projection writes
+remain fail-closed until their native semantics are separately proven.
+Compound or expression conflict targets, partial unique targets, and named
+non-primary constraints also remain fail-closed. Unsupported document
+`RETURNING` shapes report specific stable diagnostics for `*`, duplicate output
+names, expressions, generated fields, and unsupported virtual/projection
+fields.
 
 Projection writes must preserve native document semantics for missing fields,
 JSON null, generated/defaulted fields, nested object construction, array paths,
@@ -461,15 +466,22 @@ branches lower to native document writes. The admitted subset evaluates
 `WHEN MATCHED` and `WHEN NOT MATCHED` branches in SQL order, rejects duplicate
 source join values, materializes matched `UPDATE`, matched `DELETE`, matched
 `DO NOTHING`, not-matched `_id`/`_doc` copy inserts, and not-matched
-`DO NOTHING`, and emits native document batch writes, transforms, and deletes.
-Matched update/delete branches attach lookup-backed target version predicates
-to the native batch, and target/source `_version` branch predicates compare
-against lookup metadata rather than document JSON. Public SQL records
-MERGE-specific audit outcomes for applied rows-batch writes, denied row-filter
-attempts, and failed write conflicts.
-Expression assignments, expression predicates, unsupported projection inserts,
-`RETURNING`, relational/data-modifying source plans, and unbounded producers
-remain fail-closed.
+explicit `_id` plus flat projection inserts, and not-matched `DO NOTHING`, and
+emits native document batch writes, transforms, and deletes. Projection
+not-matched inserts require `_id = source._id`, reject generated, nested,
+reserved, literal, and expression assignments, and write through native
+create-only document batch semantics. Matched update/delete branches attach
+lookup-backed target version predicates to the native batch, and target/source
+`_version` branch predicates compare against lookup metadata rather than
+document JSON. Public SQL records MERGE-specific audit outcomes for applied
+rows-batch writes, denied row-filter attempts, and failed write conflicts.
+MERGE `RETURNING` may return `_id`, `_doc`, `_version`, and declared projection
+fields for inserted, updated, and deleted rows; updated rows reflect the
+post-transform document, deleted rows reflect the pre-delete document, inserted
+rows reflect the proposed document, and `_version` follows the same committed
+or pre-delete timestamp rules as other native document writes. Expression
+assignments, expression predicates, relational/data-modifying source plans, and
+unbounded producers remain fail-closed.
 
 All other document-table `INSERT`, `UPDATE`, `DELETE`, view-target writes, and
 data-modifying CTE shapes remain fail-closed until they have a typed native

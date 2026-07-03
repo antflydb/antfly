@@ -41,6 +41,7 @@ const source_binding = @import("source_binding.zig");
 const table_catalog = @import("../metadata/catalog/source.zig");
 const token_mod = @import("token.zig");
 const tokenized = @import("tokenized.zig");
+const generated_parser = @import("generated_parser.zig");
 const value_mod = @import("value.zig");
 
 pub const SqlValue = value_mod.SqlValue;
@@ -319,6 +320,53 @@ pub const AppParityPlanSummary = struct {
     explain_wal: ?bool = null,
 };
 
+pub const AppParityNativeEquivalenceClass = enum {
+    native_equivalent,
+    explicit_noop,
+    unsupported,
+};
+
+pub const AppParityNativeEquivalenceSurface = enum {
+    catalog_mutation,
+    row_write,
+    document_write,
+    read_query,
+    derived_index_lifecycle,
+    roles,
+    extensions,
+    backups,
+    lakes,
+    maintenance,
+};
+
+pub const AppParityNativeEquivalenceSummary = struct {
+    classification: ?AppParityNativeEquivalenceClass = null,
+    surface: ?AppParityNativeEquivalenceSurface = null,
+    native_model: ?[]const u8 = null,
+    native_route: ?[]const u8 = null,
+    target_resource: ?[]const u8 = null,
+    auth_resource: ?[]const u8 = null,
+    permission: ?[]const u8 = null,
+    audit_action: ?[]const u8 = null,
+    row_filter: ?[]const u8 = null,
+    request_fingerprint: ?[]const u8 = null,
+    diagnostic: ?[]const u8 = null,
+};
+
+pub fn nativeEquivalenceSummaryHasFields(summary: AppParityNativeEquivalenceSummary) bool {
+    return summary.classification != null or
+        summary.surface != null or
+        summary.native_model != null or
+        summary.native_route != null or
+        summary.target_resource != null or
+        summary.auth_resource != null or
+        summary.permission != null or
+        summary.audit_action != null or
+        summary.row_filter != null or
+        summary.request_fingerprint != null or
+        summary.diagnostic != null;
+}
+
 pub fn summaryHasFields(summary: AppParityPlanSummary) bool {
     return summary.ddl_tag != null or
         summary.table_name != null or
@@ -406,6 +454,11 @@ pub const AppParityCorpusEntry = struct {
     family: AppParityCorpusPlanFamily,
     params: []const SqlValue = &.{},
     summary: AppParityPlanSummary = .{},
+    native_request_kind: []const u8 = "",
+    native_request_json: []const u8 = "",
+    sql_fingerprint: []const u8 = "",
+    native_fingerprint: []const u8 = "",
+    native_equivalence: AppParityNativeEquivalenceSummary = .{},
     plan: []const u8 = "",
     classification_reason: []const u8 = "",
     apply_setup_sql: []const []const u8 = &.{},
@@ -493,6 +546,7 @@ pub const AppParityParserFixtureSummary = struct {
     title_identifier: bool = false,
     title_lc_identifier: bool = false,
     extra_identifier: bool = false,
+    like_keyword: bool = false,
     ilike_keyword: bool = false,
     between_keyword: bool = false,
     is_null_predicate: bool = false,
@@ -926,6 +980,7 @@ pub fn appParityStructuredFixtureSummary(
             .title_identifier = appParityTokensHaveIdentifier(sql_tokens, "title"),
             .title_lc_identifier = appParityTokensHaveIdentifier(sql_tokens, "title_lc"),
             .extra_identifier = appParityTokensHaveIdentifier(sql_tokens, "extra"),
+            .like_keyword = appParityTokensHaveKeyword(sql_tokens, .like),
             .ilike_keyword = appParityTokensHaveKeyword(sql_tokens, .ilike),
             .between_keyword = appParityTokensHaveKeyword(sql_tokens, .between),
             .is_null_predicate = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .null }),
@@ -1428,6 +1483,17 @@ pub fn appParityEntryHasDocumentViewMappingCatalog(entry: AppParityCorpusEntry) 
     return false;
 }
 
+pub fn appParityEntryHasDocumentCatalog(entry: AppParityCorpusEntry) bool {
+    for (entry.catalog_tables) |table| {
+        if (corpusFixtureDocumentDirectCatalogTableIsTarget(entry, table.name, table.indexes_json) or
+            corpusFixtureDocumentViewMappingCatalogTableIsTarget(entry, table.name, table.indexes_json))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn appParityDocumentViewMappingCatalogContains(entry: AppParityCorpusEntry, pattern: []const u8) bool {
     for (entry.catalog_tables) |table| {
         if (corpusFixtureDocumentViewMappingCatalogTableIsTarget(entry, table.name, table.indexes_json) and
@@ -1745,6 +1811,7 @@ pub const relational_semantic_implication_matrix_format: u64 = 1;
 pub const relational_sql_api_coverage_inventory_format: u64 = 1;
 pub const relational_sql_adapter_removal_inventory_format: u64 = 1;
 pub const sql_compatibility_wrapper_inventory_format: u64 = 1;
+pub const sql_generated_ast_migration_fixture_format: u64 = 1;
 pub const sql_parser_migration_table_format: u64 = 1;
 pub const sql_production_ingress_cutover_format: u64 = 1;
 pub const sql_production_terminal_bridge_fixture_format: u64 = 1;
@@ -1905,6 +1972,18 @@ pub const SqlParserMigrationTableEntry = struct {
     retained_ast_corruption_test: []const u8,
     coverage_file: []const u8,
     removal_gate: []const u8,
+    removal_evidence: SqlParserMigrationRemovalEvidence,
+};
+
+pub const SqlParserMigrationRemovalEvidence = struct {
+    raw_ast_fixtures: []const []const u8,
+    binder_fixtures: []const []const u8,
+    lowering_fixtures: []const []const u8,
+    runtime_fixtures: []const []const u8,
+    api_native_parity_fixtures: []const []const u8,
+    unsupported_shape_fixtures: []const []const u8,
+    stale_metadata_tests: []const []const u8,
+    deleted_compatibility_paths: []const []const u8,
 };
 
 pub const SqlParserMigrationTableRoot = struct {
@@ -1918,6 +1997,30 @@ pub const SqlParserMigrationTable = struct {
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         freeSqlParserMigrationTableRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const SqlGeneratedAstMigrationFixtureCase = struct {
+    name: []const u8,
+    family: []const u8,
+    sql: []const u8,
+    expected_statement_kind: []const u8,
+    expected_statement_tag: []const u8,
+    expected_error: []const u8,
+};
+
+pub const SqlGeneratedAstMigrationFixtureRoot = struct {
+    fixture_format: u64,
+    cases: []const SqlGeneratedAstMigrationFixtureCase,
+};
+
+pub const SqlGeneratedAstMigrationFixtures = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: SqlGeneratedAstMigrationFixtureRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeSqlGeneratedAstMigrationFixtureRoot(alloc, self.root);
         self.parsed.deinit();
     }
 };
@@ -3078,6 +3181,253 @@ pub fn parseSqlCompatibilityWrapperInventoryAlloc(alloc: std.mem.Allocator) !Sql
     };
 }
 
+pub fn parseSqlGeneratedAstMigrationFixtureRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !SqlGeneratedAstMigrationFixtureRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "fixture_format", "cases" });
+    const fixture_format = try fixtureJsonOptionalU64(root, "fixture_format", 0);
+    if (fixture_format != sql_generated_ast_migration_fixture_format) return error.TestUnexpectedResult;
+    const case_values = switch (root.get("cases") orelse return error.TestUnexpectedResult) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (case_values.items.len == 0) return error.TestUnexpectedResult;
+
+    var cases = std.ArrayListUnmanaged(SqlGeneratedAstMigrationFixtureCase).empty;
+    errdefer cases.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+    var seen_family = std.StringHashMapUnmanaged(void){};
+    defer seen_family.deinit(alloc);
+
+    for (case_values.items, 0..) |case_value, i| {
+        const item = try fixtureJsonObject(case_value);
+        try fixtureRequireOnlyKeys(item, &.{
+            "name",
+            "family",
+            "sql",
+            "expected_statement_kind",
+            "expected_statement_tag",
+            "expected_error",
+        });
+        const name = try fixtureJsonOptionalString(item, "name", "");
+        const family = try fixtureJsonOptionalString(item, "family", "");
+        const sql = try fixtureJsonOptionalString(item, "sql", "");
+        const expected_statement_kind = try fixtureJsonOptionalString(item, "expected_statement_kind", "");
+        const expected_statement_tag = try fixtureJsonOptionalString(item, "expected_statement_tag", "");
+        const expected_error = try fixtureJsonOptionalString(item, "expected_error", "");
+        if (name.len == 0 or
+            family.len == 0 or
+            sql.len == 0 or
+            seen.contains(name) or
+            !sqlParserMigrationFamilyKnown(family))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (expected_error.len == 0 and (expected_statement_kind.len == 0 or expected_statement_tag.len == 0)) {
+            return error.TestUnexpectedResult;
+        }
+        if (expected_error.len != 0 and (expected_statement_kind.len != 0 or expected_statement_tag.len != 0)) {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, cases.items[i - 1].name, name)) return error.TestUnexpectedResult;
+        try seen.put(alloc, name, {});
+        try seen_family.put(alloc, family, {});
+        try cases.append(alloc, .{
+            .name = name,
+            .family = family,
+            .sql = sql,
+            .expected_statement_kind = expected_statement_kind,
+            .expected_statement_tag = expected_statement_tag,
+            .expected_error = expected_error,
+        });
+    }
+    for (sql_parser_migration_table_families) |known| {
+        if (!seen_family.contains(known)) return error.TestUnexpectedResult;
+    }
+
+    return .{
+        .fixture_format = fixture_format,
+        .cases = try cases.toOwnedSlice(alloc),
+    };
+}
+
+pub fn freeSqlGeneratedAstMigrationFixtureRoot(
+    alloc: std.mem.Allocator,
+    root: SqlGeneratedAstMigrationFixtureRoot,
+) void {
+    if (root.cases.len > 0) alloc.free(root.cases);
+}
+
+pub fn parseSqlGeneratedAstMigrationFixturesAlloc(alloc: std.mem.Allocator) !SqlGeneratedAstMigrationFixtures {
+    const fixture_json = @embedFile("fixtures/sql_generated_ast_migration_fixtures.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, fixture_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseSqlGeneratedAstMigrationFixtureRootAlloc(alloc, parsed.value);
+    errdefer freeSqlGeneratedAstMigrationFixtureRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+fn generatedSqlStatementPayloadTag(statement: generated_parser.GeneratedSqlStatement) []const u8 {
+    return switch (statement) {
+        .session => |value| @tagName(value),
+        .transaction => |value| @tagName(value),
+        .prepared => |value| @tagName(value),
+        .prepared_transaction => |value| @tagName(value),
+        .ddl => |value| @tagName(value),
+        .dml => |value| @tagName(value),
+        .read => |value| @tagName(value),
+        .extension_index => |value| @tagName(value),
+        .graph => |value| @tagName(value),
+        .cursor => |value| @tagName(value),
+        .unsupported => |value| @tagName(value),
+        .other => "other",
+    };
+}
+
+fn sqlGeneratedAstMigrationExpectedErrorMatches(err: anyerror, expected: []const u8) bool {
+    return std.mem.eql(u8, expected, @errorName(err));
+}
+
+pub fn validateSqlGeneratedAstMigrationFixtureCaseAlloc(
+    alloc: std.mem.Allocator,
+    case: SqlGeneratedAstMigrationFixtureCase,
+) !void {
+    var parsed = generated_parser.parseSqlAlloc(alloc, case.sql) catch |err| {
+        if (case.expected_error.len != 0 and sqlGeneratedAstMigrationExpectedErrorMatches(err, case.expected_error)) return;
+        std.debug.print("generated AST migration fixture parse failed: {s}: {s}: {}\n", .{ case.name, case.sql, err });
+        return error.TestUnexpectedResult;
+    };
+    defer parsed.deinit(alloc);
+
+    if (case.expected_error.len != 0) return error.TestUnexpectedResult;
+    if (!std.mem.eql(u8, @tagName(parsed.kind), case.expected_statement_kind)) return error.TestUnexpectedResult;
+    if (!std.mem.eql(u8, generatedSqlStatementPayloadTag(parsed.statement), case.expected_statement_tag)) return error.TestUnexpectedResult;
+    if (parsed.ast == null) return error.TestUnexpectedResult;
+}
+
+pub fn sqlGeneratedAstMigrationFixtureContains(
+    root: SqlGeneratedAstMigrationFixtureRoot,
+    family: []const u8,
+    name: []const u8,
+) bool {
+    for (root.cases) |case| {
+        if (std.mem.eql(u8, case.family, family) and std.mem.eql(u8, case.name, name)) return true;
+    }
+    return false;
+}
+
+pub fn appParitySourceCorpusContainsName(root: AppParitySourceCorpusRoot, name: []const u8) bool {
+    for (root.entries) |entry| {
+        if (std.mem.eql(u8, entry.name, name)) return true;
+    }
+    return false;
+}
+
+fn sqlParserMigrationEvidenceStringListContains(list: []const []const u8, name: []const u8) bool {
+    for (list) |item| {
+        if (std.mem.eql(u8, item, name)) return true;
+    }
+    return false;
+}
+
+fn validateSqlParserMigrationEvidenceNames(
+    evidence: SqlParserMigrationRemovalEvidence,
+    family: []const u8,
+    raw_ast: SqlGeneratedAstMigrationFixtureRoot,
+    source: AppParitySourceCorpusRoot,
+) !void {
+    if (evidence.raw_ast_fixtures.len == 0 or
+        evidence.stale_metadata_tests.len == 0)
+    {
+        return error.TestUnexpectedResult;
+    }
+    if (evidence.deleted_compatibility_paths.len != 0 and
+        (evidence.binder_fixtures.len == 0 or
+            evidence.lowering_fixtures.len == 0 or
+            evidence.runtime_fixtures.len == 0 or
+            evidence.api_native_parity_fixtures.len == 0))
+    {
+        return error.TestUnexpectedResult;
+    }
+    for (evidence.raw_ast_fixtures) |name| {
+        if (!sqlGeneratedAstMigrationFixtureContains(raw_ast, family, name)) return error.TestUnexpectedResult;
+    }
+    const source_lists = [_][]const []const u8{
+        evidence.binder_fixtures,
+        evidence.lowering_fixtures,
+        evidence.runtime_fixtures,
+        evidence.api_native_parity_fixtures,
+        evidence.unsupported_shape_fixtures,
+    };
+    for (source_lists) |list| {
+        for (list) |name| {
+            if (!appParitySourceCorpusContainsName(source, name)) return error.TestUnexpectedResult;
+        }
+    }
+}
+
+pub fn validateSqlParserMigrationEvidence(
+    table: SqlParserMigrationTableRoot,
+    raw_ast: SqlGeneratedAstMigrationFixtureRoot,
+    source: AppParitySourceCorpusRoot,
+) !void {
+    for (table.families) |family| {
+        try validateSqlParserMigrationEvidenceNames(family.removal_evidence, family.family, raw_ast, source);
+        if (!sqlParserMigrationEvidenceStringListContains(
+            family.removal_evidence.stale_metadata_tests,
+            family.retained_ast_corruption_test,
+        )) {
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+fn parseSqlParserMigrationRemovalEvidenceAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !SqlParserMigrationRemovalEvidence {
+    const object = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(object, &.{
+        "raw_ast_fixtures",
+        "binder_fixtures",
+        "lowering_fixtures",
+        "runtime_fixtures",
+        "api_native_parity_fixtures",
+        "unsupported_shape_fixtures",
+        "stale_metadata_tests",
+        "deleted_compatibility_paths",
+    });
+    return .{
+        .raw_ast_fixtures = try parseFixtureStringListAlloc(alloc, object, "raw_ast_fixtures"),
+        .binder_fixtures = try parseFixtureStringListAlloc(alloc, object, "binder_fixtures"),
+        .lowering_fixtures = try parseFixtureStringListAlloc(alloc, object, "lowering_fixtures"),
+        .runtime_fixtures = try parseFixtureStringListAlloc(alloc, object, "runtime_fixtures"),
+        .api_native_parity_fixtures = try parseFixtureStringListAlloc(alloc, object, "api_native_parity_fixtures"),
+        .unsupported_shape_fixtures = try parseFixtureStringListAlloc(alloc, object, "unsupported_shape_fixtures"),
+        .stale_metadata_tests = try parseFixtureStringListAlloc(alloc, object, "stale_metadata_tests"),
+        .deleted_compatibility_paths = try parseFixtureStringListAlloc(alloc, object, "deleted_compatibility_paths"),
+    };
+}
+
+fn freeSqlParserMigrationRemovalEvidence(alloc: std.mem.Allocator, evidence: SqlParserMigrationRemovalEvidence) void {
+    if (evidence.raw_ast_fixtures.len > 0) alloc.free(evidence.raw_ast_fixtures);
+    if (evidence.binder_fixtures.len > 0) alloc.free(evidence.binder_fixtures);
+    if (evidence.lowering_fixtures.len > 0) alloc.free(evidence.lowering_fixtures);
+    if (evidence.runtime_fixtures.len > 0) alloc.free(evidence.runtime_fixtures);
+    if (evidence.api_native_parity_fixtures.len > 0) alloc.free(evidence.api_native_parity_fixtures);
+    if (evidence.unsupported_shape_fixtures.len > 0) alloc.free(evidence.unsupported_shape_fixtures);
+    if (evidence.stale_metadata_tests.len > 0) alloc.free(evidence.stale_metadata_tests);
+    if (evidence.deleted_compatibility_paths.len > 0) alloc.free(evidence.deleted_compatibility_paths);
+}
+
 pub fn parseSqlParserMigrationTableRootAlloc(
     alloc: std.mem.Allocator,
     value: std.json.Value,
@@ -3096,6 +3446,7 @@ pub fn parseSqlParserMigrationTableRootAlloc(
     errdefer {
         for (families.items) |family| {
             if (family.entrypoints.len > 0) alloc.free(family.entrypoints);
+            freeSqlParserMigrationRemovalEvidence(alloc, family.removal_evidence);
         }
         families.deinit(alloc);
     }
@@ -3113,6 +3464,7 @@ pub fn parseSqlParserMigrationTableRootAlloc(
             "retained_ast_corruption_test",
             "coverage_file",
             "removal_gate",
+            "removal_evidence",
         });
         const family = try fixtureJsonOptionalString(item, "family", "");
         const compatibility_entry_point = try fixtureJsonOptionalString(item, "compatibility_entry_point", "");
@@ -3123,6 +3475,8 @@ pub fn parseSqlParserMigrationTableRootAlloc(
         const retained_ast_corruption_test = try fixtureJsonOptionalString(item, "retained_ast_corruption_test", "");
         const coverage_file = try fixtureJsonOptionalString(item, "coverage_file", "");
         const removal_gate = try fixtureJsonOptionalString(item, "removal_gate", "");
+        const removal_evidence = try parseSqlParserMigrationRemovalEvidenceAlloc(alloc, item.get("removal_evidence") orelse return error.TestUnexpectedResult);
+        errdefer freeSqlParserMigrationRemovalEvidence(alloc, removal_evidence);
         if (family.len == 0 or
             compatibility_entry_point.len == 0 or
             generated_ast_entry_point.len == 0 or
@@ -3146,6 +3500,7 @@ pub fn parseSqlParserMigrationTableRootAlloc(
             .retained_ast_corruption_test = retained_ast_corruption_test,
             .coverage_file = coverage_file,
             .removal_gate = removal_gate,
+            .removal_evidence = removal_evidence,
         });
     }
     for (sql_parser_migration_table_families) |known| {
@@ -3196,6 +3551,7 @@ pub fn freeSqlParserMigrationTableRoot(
 ) void {
     for (root.families) |family| {
         if (family.entrypoints.len > 0) alloc.free(family.entrypoints);
+        freeSqlParserMigrationRemovalEvidence(alloc, family.removal_evidence);
     }
     if (root.families.len > 0) alloc.free(root.families);
 }
@@ -3821,9 +4177,7 @@ pub fn parseDocumentSqlDependencyGuardAlloc(alloc: std.mem.Allocator) !DocumentS
     };
 }
 
-const document_sql_bounded_scan_inventory_ids = [_][]const u8{
-    "mapped-view-residual-bounded-scan",
-};
+const document_sql_bounded_scan_inventory_ids = [_][]const u8{};
 
 fn documentSqlBoundedScanInventoryIdKnown(name: []const u8) bool {
     for (document_sql_bounded_scan_inventory_ids) |known| {
@@ -3841,15 +4195,12 @@ fn documentSqlBoundedScanStatusKnown(name: []const u8) bool {
 }
 
 fn documentSqlBoundedScanSourceFixtureKnown(name: []const u8) bool {
-    return std.mem.eql(u8, name, "document sql view mapping bounded residual read");
+    _ = name;
+    return false;
 }
 
 fn documentSqlBoundedScanEntryShapeMatches(entry: DocumentSqlBoundedScanInventoryEntry) bool {
-    if (std.mem.eql(u8, entry.id, "mapped-view-residual-bounded-scan")) {
-        return std.mem.eql(u8, entry.contract_kind, "view_mapping_residual") and
-            std.mem.eql(u8, entry.status, "intentional_contract") and
-            std.mem.eql(u8, entry.source_fixture, "document sql view mapping bounded residual read");
-    }
+    _ = entry;
     return false;
 }
 
@@ -3865,8 +4216,6 @@ pub fn parseDocumentSqlBoundedScanInventoryRootAlloc(
         .array => |items| items,
         else => return error.TestUnexpectedResult,
     };
-    if (entry_values.items.len == 0) return error.TestUnexpectedResult;
-
     var entries = std.ArrayListUnmanaged(DocumentSqlBoundedScanInventoryEntry).empty;
     errdefer entries.deinit(alloc);
     var seen = std.StringHashMapUnmanaged(void){};
@@ -3963,7 +4312,6 @@ pub fn parseDocumentSqlBoundedScanInventoryAlloc(alloc: std.mem.Allocator) !Docu
 
 const document_sql_read_expansion_gate_ids = [_][]const u8{
     "additional-array-unnest-patterns",
-    "additional-mapped-fields",
     "derived-index-producer-types",
     "document-aggregates",
     "lateral-view-mapping-joins",
@@ -3978,7 +4326,6 @@ fn documentSqlReadExpansionGateIdKnown(name: []const u8) bool {
 
 fn documentSqlReadExpansionSurfaceKnown(name: []const u8) bool {
     return std.mem.eql(u8, name, "array_unnest_patterns") or
-        std.mem.eql(u8, name, "mapped_fields") or
         std.mem.eql(u8, name, "derived_index_producer_types") or
         std.mem.eql(u8, name, "document_aggregates") or
         std.mem.eql(u8, name, "lateral_view_mapping_joins");
@@ -3987,9 +4334,6 @@ fn documentSqlReadExpansionSurfaceKnown(name: []const u8) bool {
 fn documentSqlReadExpansionEntryShapeMatches(entry: DocumentSqlReadExpansionGateEntry) bool {
     if (std.mem.eql(u8, entry.id, "additional-array-unnest-patterns")) {
         return std.mem.eql(u8, entry.expansion_surface, "array_unnest_patterns");
-    }
-    if (std.mem.eql(u8, entry.id, "additional-mapped-fields")) {
-        return std.mem.eql(u8, entry.expansion_surface, "mapped_fields");
     }
     if (std.mem.eql(u8, entry.id, "derived-index-producer-types")) {
         return std.mem.eql(u8, entry.expansion_surface, "derived_index_producer_types");
@@ -4753,6 +5097,7 @@ fn relationalRoutedVisibilityOutcomeKnown(name: []const u8) bool {
     return std.mem.eql(u8, name, "changed_row_fail_closed") or
         std.mem.eql(u8, name, "changed_version_fail_closed") or
         std.mem.eql(u8, name, "gap_tracked") or
+        std.mem.eql(u8, name, "live_write_fail_closed") or
         std.mem.eql(u8, name, "stale_owner_fail_closed") or
         std.mem.eql(u8, name, "topology_retry_required") or
         std.mem.eql(u8, name, "unsupported_fixture");
@@ -6216,6 +6561,37 @@ pub fn parseFixtureSummary(value: ?std.json.Value) !AppParityPlanSummary {
     };
 }
 
+pub fn parseNativeEquivalenceSummary(value: ?std.json.Value) !AppParityNativeEquivalenceSummary {
+    if (value == null) return .{};
+    const object = try fixtureJsonObject(value.?);
+    try fixtureRequireOnlyKeys(object, &.{
+        "classification",
+        "surface",
+        "native_model",
+        "native_route",
+        "target_resource",
+        "auth_resource",
+        "permission",
+        "audit_action",
+        "row_filter",
+        "request_fingerprint",
+        "diagnostic",
+    });
+    return .{
+        .classification = if (object.get("classification")) |class_value| std.meta.stringToEnum(AppParityNativeEquivalenceClass, try fixtureJsonString(class_value)) orelse return error.TestUnexpectedResult else null,
+        .surface = if (object.get("surface")) |surface_value| std.meta.stringToEnum(AppParityNativeEquivalenceSurface, try fixtureJsonString(surface_value)) orelse return error.TestUnexpectedResult else null,
+        .native_model = try fixtureJsonOptionalStringField(object, "native_model"),
+        .native_route = try fixtureJsonOptionalStringField(object, "native_route"),
+        .target_resource = try fixtureJsonOptionalStringField(object, "target_resource"),
+        .auth_resource = try fixtureJsonOptionalStringField(object, "auth_resource"),
+        .permission = try fixtureJsonOptionalStringField(object, "permission"),
+        .audit_action = try fixtureJsonOptionalStringField(object, "audit_action"),
+        .row_filter = try fixtureJsonOptionalStringField(object, "row_filter"),
+        .request_fingerprint = try fixtureJsonOptionalStringField(object, "request_fingerprint"),
+        .diagnostic = try fixtureJsonOptionalStringField(object, "diagnostic"),
+    };
+}
+
 pub fn parseFixtureStringListAlloc(
     alloc: std.mem.Allocator,
     object: std.json.ObjectMap,
@@ -6318,6 +6694,11 @@ pub fn parseFixtureEntryAlloc(alloc: std.mem.Allocator, value: std.json.Value) !
         "family",
         "params",
         "summary",
+        "native_request_kind",
+        "native_request_json",
+        "sql_fingerprint",
+        "native_fingerprint",
+        "native_equivalence",
         "plan",
         "classification_reason",
         "apply_setup_sql",
@@ -6344,6 +6725,11 @@ pub fn parseFixtureEntryAlloc(alloc: std.mem.Allocator, value: std.json.Value) !
         .family = family,
         .params = try parseFixtureSqlValuesAlloc(alloc, object),
         .summary = summary,
+        .native_request_kind = try fixtureJsonOptionalString(object, "native_request_kind", ""),
+        .native_request_json = try fixtureJsonOptionalString(object, "native_request_json", ""),
+        .sql_fingerprint = try fixtureJsonOptionalString(object, "sql_fingerprint", ""),
+        .native_fingerprint = try fixtureJsonOptionalString(object, "native_fingerprint", ""),
+        .native_equivalence = try parseNativeEquivalenceSummary(object.get("native_equivalence")),
         .plan = plan,
         .classification_reason = try fixtureJsonOptionalString(object, "classification_reason", ""),
         .apply_setup_sql = try parseFixtureStringListAlloc(alloc, object, "apply_setup_sql"),
@@ -6394,6 +6780,7 @@ pub fn parseSourceCorpusRootAlloc(alloc: std.mem.Allocator, value: std.json.Valu
         defer parsed_sql.deinit(alloc);
         try validateSourceCorpusEntryMetadataParsedSql(entry, &parsed_sql);
         try validateSourceCorpusEntryJsonPayloadsParsedSql(alloc, entry, &parsed_sql);
+        try validateNativeEquivalenceSummaryForEntryAlloc(alloc, entry);
         try seen_names.put(alloc, entry.name, {});
         try entries.append(alloc, entry);
     }
@@ -6467,6 +6854,406 @@ fn normalizeFixtureSummary(
     return normalized;
 }
 
+fn appParityPlanContains(entry: AppParityCorpusEntry, needle: []const u8) bool {
+    return std.mem.indexOf(u8, entry.plan, needle) != null or
+        std.mem.indexOf(u8, entry.execution_plan, needle) != null or
+        std.mem.indexOf(u8, entry.classification_reason, needle) != null;
+}
+
+fn nativeEquivalenceClassForEntry(entry: AppParityCorpusEntry) AppParityNativeEquivalenceClass {
+    if (entry.family == .adapter_noop_ddl) return .explicit_noop;
+    if (corpusPlanFamilyIsUnsupported(entry.family) or corpusPlanFamilyIsInvalid(entry.family)) return .unsupported;
+    return .native_equivalent;
+}
+
+fn nativeEquivalenceDdlSurface(entry: AppParityCorpusEntry) AppParityNativeEquivalenceSurface {
+    if (entry.summary.ddl_tag) |tag| {
+        return switch (tag) {
+            .create_index,
+            .drop_index,
+            .create_materialized_view,
+            .refresh_materialized_view,
+            .drop_materialized_view,
+            .reindex_maintenance,
+            => .derived_index_lifecycle,
+            .create_role,
+            .alter_role,
+            .drop_role,
+            .grant_privilege,
+            .revoke_privilege,
+            .grant_role,
+            .revoke_role,
+            .alter_default_privileges,
+            => .roles,
+            .create_extension,
+            .alter_extension_update,
+            .drop_extension,
+            => .extensions,
+            .vacuum_maintenance,
+            .analyze_maintenance,
+            .cluster_maintenance,
+            => .maintenance,
+            else => .catalog_mutation,
+        };
+    }
+    if (appParityPlanContains(entry, "backup") or appParityPlanContains(entry, "restore")) return .backups;
+    if (appParityPlanContains(entry, "lake")) return .lakes;
+    if (appParityPlanContains(entry, "maintenance") or appParityPlanContains(entry, "vacuum") or appParityPlanContains(entry, "analyze") or appParityPlanContains(entry, "cluster")) return .maintenance;
+    if (appParityPlanContains(entry, "extension")) return .extensions;
+    if (appParityPlanContains(entry, "role") or appParityPlanContains(entry, "grant") or appParityPlanContains(entry, "revoke")) return .roles;
+    if (appParityPlanContains(entry, "index")) return .derived_index_lifecycle;
+    return .catalog_mutation;
+}
+
+fn nativeEquivalenceSurfaceForEntry(entry: AppParityCorpusEntry) AppParityNativeEquivalenceSurface {
+    return switch (entry.family) {
+        .read,
+        .query,
+        .query_function,
+        .aggregate,
+        .join,
+        .lateral,
+        .window,
+        .explain,
+        .relation_population,
+        .unsupported,
+        .unsupported_read,
+        .invalid_read,
+        => .read_query,
+        .insert,
+        .insert_source,
+        .recursive_insert_source,
+        .update,
+        .delete,
+        .update_source,
+        .delete_source,
+        .truncate_source,
+        .update_joined_source,
+        .delete_joined_source,
+        .merge_mutation,
+        .invalid_insert,
+        .invalid_update,
+        .invalid_delete,
+        .invalid_update_source,
+        .invalid_update_joined_source,
+        .unsupported_write,
+        .unsupported_insert,
+        .unsupported_update,
+        .unsupported_update_source,
+        .unsupported_delete,
+        .unsupported_update_joined_source,
+        .unsupported_delete_joined_source,
+        .unsupported_merge_mutation,
+        => if (entry.family == .document_write or std.mem.startsWith(u8, entry.classification_reason, "document_sql_") or appParityPlanContains(entry, "document"))
+            .document_write
+        else
+            .row_write,
+        .document_write => .document_write,
+        .ddl,
+        .adapter_noop_ddl,
+        .unsupported_ddl,
+        => nativeEquivalenceDdlSurface(entry),
+    };
+}
+
+fn nativeEquivalenceNativeModel(surface: AppParityNativeEquivalenceSurface) []const u8 {
+    return switch (surface) {
+        .catalog_mutation => "catalog_mutation",
+        .row_write => "relational_rows_mutation",
+        .document_write => "document_write_request",
+        .read_query => "query_request",
+        .derived_index_lifecycle => "derived_index_lifecycle",
+        .roles => "role_catalog_mutation",
+        .extensions => "extension_lifecycle",
+        .backups => "backup_lifecycle",
+        .lakes => "lake_lifecycle",
+        .maintenance => "maintenance_operation",
+    };
+}
+
+fn nativeEquivalenceNativeRoute(entry: AppParityCorpusEntry, surface: AppParityNativeEquivalenceSurface, class: AppParityNativeEquivalenceClass) []const u8 {
+    if (class == .explicit_noop) return "explicit_noop";
+    if (class == .unsupported) return "unsupported";
+    if (entry.execution_plan.len > 0) {
+        if (std.mem.indexOf(u8, entry.execution_plan, ":native=rows_batch") != null) return "rows_batch";
+        if (std.mem.indexOf(u8, entry.execution_plan, ":native=rows_query") != null) return "rows_query";
+    }
+    return switch (surface) {
+        .catalog_mutation => "catalog",
+        .row_write => switch (entry.family) {
+            .insert_source,
+            .recursive_insert_source,
+            .update_source,
+            .delete_source,
+            .truncate_source,
+            .update_joined_source,
+            .delete_joined_source,
+            .merge_mutation,
+            => "mutation_source",
+            else => "rows_batch",
+        },
+        .document_write => "document_write",
+        .read_query => "rows_query",
+        .derived_index_lifecycle => "index_management",
+        .roles => "role_management",
+        .extensions => "extension_management",
+        .backups => "backup_management",
+        .lakes => "lake_management",
+        .maintenance => "maintenance",
+    };
+}
+
+fn nativeEquivalencePermission(surface: AppParityNativeEquivalenceSurface, class: AppParityNativeEquivalenceClass) []const u8 {
+    if (class == .unsupported) return "none";
+    return switch (surface) {
+        .read_query => "read",
+        .row_write, .document_write => "write",
+        else => "admin",
+    };
+}
+
+fn nativeEquivalenceAuditAction(entry: AppParityCorpusEntry, surface: AppParityNativeEquivalenceSurface, class: AppParityNativeEquivalenceClass) []const u8 {
+    if (class == .unsupported) return "reject";
+    if (class == .explicit_noop) return "noop";
+    if (entry.summary.ddl_tag) |tag| return @tagName(tag);
+    return switch (surface) {
+        .read_query => "query",
+        .row_write => "mutate_rows",
+        .document_write => "mutate_documents",
+        .derived_index_lifecycle => "manage_index",
+        .roles => "manage_role",
+        .extensions => "manage_extension",
+        .backups => "manage_backup",
+        .lakes => "manage_lake",
+        .maintenance => "maintenance",
+        .catalog_mutation => "catalog_mutation",
+    };
+}
+
+fn nativeEquivalenceTargetResource(entry: AppParityCorpusEntry) []const u8 {
+    if (entry.summary.table_name) |table_name| return table_name;
+    if (entry.summary.document_source_table) |table_name| return table_name;
+    return "";
+}
+
+fn nativeEquivalenceRequestFingerprintFromFieldsAlloc(
+    alloc: std.mem.Allocator,
+    class: []const u8,
+    surface: []const u8,
+    model: []const u8,
+    route: []const u8,
+    target: []const u8,
+    permission: []const u8,
+    diagnostic: []const u8,
+    plan: []const u8,
+    execution_plan: []const u8,
+) ![]u8 {
+    return try std.fmt.allocPrint(
+        alloc,
+        "native_equivalence:class={s}:surface={s}:model={s}:route={s}:target={s}:permission={s}:diagnostic={s}:plan={s}:execution={s}",
+        .{
+            class,
+            surface,
+            model,
+            route,
+            target,
+            permission,
+            diagnostic,
+            plan,
+            execution_plan,
+        },
+    );
+}
+
+pub fn nativeEquivalenceRequestFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    entry: AppParityCorpusEntry,
+) ![]u8 {
+    const class = nativeEquivalenceClassForEntry(entry);
+    const surface = nativeEquivalenceSurfaceForEntry(entry);
+    return try nativeEquivalenceRequestFingerprintFromFieldsAlloc(
+        alloc,
+        @tagName(class),
+        @tagName(surface),
+        nativeEquivalenceNativeModel(surface),
+        nativeEquivalenceNativeRoute(entry, surface, class),
+        nativeEquivalenceTargetResource(entry),
+        nativeEquivalencePermission(surface, class),
+        if (class == .unsupported) entry.classification_reason else "",
+        entry.plan,
+        entry.execution_plan,
+    );
+}
+
+pub fn nativeRequestJsonAlloc(
+    alloc: std.mem.Allocator,
+    entry: AppParityCorpusEntry,
+) ![]u8 {
+    const class = nativeEquivalenceClassForEntry(entry);
+    const surface = nativeEquivalenceSurfaceForEntry(entry);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.print(
+        "{{\"classification\":{f},\"surface\":{f},\"native_model\":{f},\"native_route\":{f},\"target_resource\":{f},\"permission\":{f},\"diagnostic\":{f},\"sql_plan\":{f},\"execution_plan\":{f}}}",
+        .{
+            std.json.fmt(@tagName(class), .{}),
+            std.json.fmt(@tagName(surface), .{}),
+            std.json.fmt(nativeEquivalenceNativeModel(surface), .{}),
+            std.json.fmt(nativeEquivalenceNativeRoute(entry, surface, class), .{}),
+            std.json.fmt(nativeEquivalenceTargetResource(entry), .{}),
+            std.json.fmt(nativeEquivalencePermission(surface, class), .{}),
+            std.json.fmt(if (class == .unsupported) entry.classification_reason else "", .{}),
+            std.json.fmt(entry.plan, .{}),
+            std.json.fmt(entry.execution_plan, .{}),
+        },
+    );
+    return try out.toOwnedSlice();
+}
+
+fn nativeRequestJsonFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    native_request_json: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, native_request_json, .{});
+    defer parsed.deinit();
+    const object = try fixtureJsonObject(parsed.value);
+    try fixtureRequireOnlyKeys(object, &.{
+        "classification",
+        "surface",
+        "native_model",
+        "native_route",
+        "target_resource",
+        "permission",
+        "diagnostic",
+        "sql_plan",
+        "execution_plan",
+    });
+    return try nativeEquivalenceRequestFingerprintFromFieldsAlloc(
+        alloc,
+        try fixtureJsonString(object.get("classification") orelse return error.TestUnexpectedResult),
+        try fixtureJsonString(object.get("surface") orelse return error.TestUnexpectedResult),
+        try fixtureJsonString(object.get("native_model") orelse return error.TestUnexpectedResult),
+        try fixtureJsonString(object.get("native_route") orelse return error.TestUnexpectedResult),
+        try fixtureJsonString(object.get("target_resource") orelse return error.TestUnexpectedResult),
+        try fixtureJsonString(object.get("permission") orelse return error.TestUnexpectedResult),
+        try fixtureJsonString(object.get("diagnostic") orelse return error.TestUnexpectedResult),
+        try fixtureJsonString(object.get("sql_plan") orelse return error.TestUnexpectedResult),
+        try fixtureJsonString(object.get("execution_plan") orelse return error.TestUnexpectedResult),
+    );
+}
+
+pub fn derivedNativeEquivalenceSummaryAlloc(
+    alloc: std.mem.Allocator,
+    entry: AppParityCorpusEntry,
+) !AppParityNativeEquivalenceSummary {
+    const class = nativeEquivalenceClassForEntry(entry);
+    const surface = nativeEquivalenceSurfaceForEntry(entry);
+    return .{
+        .classification = class,
+        .surface = surface,
+        .native_model = nativeEquivalenceNativeModel(surface),
+        .native_route = nativeEquivalenceNativeRoute(entry, surface, class),
+        .target_resource = nativeEquivalenceTargetResource(entry),
+        .auth_resource = if (class == .unsupported) "none" else "table",
+        .permission = nativeEquivalencePermission(surface, class),
+        .audit_action = nativeEquivalenceAuditAction(entry, surface, class),
+        .row_filter = if (surface == .read_query or surface == .row_write or surface == .document_write) "preserved" else "not_applicable",
+        .request_fingerprint = try nativeEquivalenceRequestFingerprintAlloc(alloc, entry),
+        .diagnostic = if (class == .unsupported) entry.classification_reason else null,
+    };
+}
+
+pub fn freeDerivedNativeEquivalenceSummary(alloc: std.mem.Allocator, summary: AppParityNativeEquivalenceSummary) void {
+    if (summary.request_fingerprint) |fingerprint| alloc.free(@constCast(fingerprint));
+}
+
+fn optionalNativeEquivalenceStringMatches(pinned: ?[]const u8, expected: ?[]const u8) bool {
+    if (pinned == null) return true;
+    if (expected == null) return false;
+    return std.mem.eql(u8, pinned.?, expected.?);
+}
+
+pub fn appParityEntryHasExplicitNativeEvidence(entry: AppParityCorpusEntry) bool {
+    return entry.native_request_kind.len > 0 or
+        entry.native_request_json.len > 0 or
+        entry.sql_fingerprint.len > 0 or
+        entry.native_fingerprint.len > 0 or
+        nativeEquivalenceSummaryHasFields(entry.native_equivalence);
+}
+
+fn validateNativeEquivalenceSummaryComplete(summary: AppParityNativeEquivalenceSummary) !void {
+    if (summary.classification == null or
+        summary.surface == null or
+        summary.native_model == null or
+        summary.native_route == null or
+        summary.target_resource == null or
+        summary.auth_resource == null or
+        summary.permission == null or
+        summary.audit_action == null or
+        summary.row_filter == null or
+        summary.request_fingerprint == null)
+    {
+        return error.TestUnexpectedResult;
+    }
+    if (summary.classification != null and summary.classification.? == .unsupported and summary.diagnostic == null) return error.TestUnexpectedResult;
+}
+
+fn validateExplicitNativeEvidenceForEntryAlloc(
+    alloc: std.mem.Allocator,
+    entry: AppParityCorpusEntry,
+    derived: AppParityNativeEquivalenceSummary,
+) !void {
+    const has_evidence = appParityEntryHasExplicitNativeEvidence(entry);
+    if (!has_evidence) return;
+    if (entry.native_request_kind.len == 0 or
+        entry.native_request_json.len == 0 or
+        entry.sql_fingerprint.len == 0 or
+        entry.native_fingerprint.len == 0 or
+        !nativeEquivalenceSummaryHasFields(entry.native_equivalence))
+    {
+        return error.TestUnexpectedResult;
+    }
+    try validateNativeEquivalenceSummaryComplete(entry.native_equivalence);
+    if (derived.native_model == null or derived.request_fingerprint == null) return error.TestUnexpectedResult;
+    if (!std.mem.eql(u8, entry.native_request_kind, derived.native_model.?)) return error.TestUnexpectedResult;
+    if (!std.mem.eql(u8, entry.sql_fingerprint, derived.request_fingerprint.?)) return error.TestUnexpectedResult;
+
+    const parsed_native_fingerprint = try nativeRequestJsonFingerprintAlloc(alloc, entry.native_request_json);
+    defer alloc.free(parsed_native_fingerprint);
+    if (!std.mem.eql(u8, entry.native_fingerprint, parsed_native_fingerprint)) return error.TestUnexpectedResult;
+    if (!std.mem.eql(u8, entry.sql_fingerprint, entry.native_fingerprint)) return error.TestUnexpectedResult;
+}
+
+pub fn validateNativeEquivalenceSummaryForEntryAlloc(
+    alloc: std.mem.Allocator,
+    entry: AppParityCorpusEntry,
+) !void {
+    const derived = try derivedNativeEquivalenceSummaryAlloc(alloc, entry);
+    defer freeDerivedNativeEquivalenceSummary(alloc, derived);
+
+    if (derived.classification == .unsupported) {
+        if (entry.classification_reason.len == 0 or !corpusStableReasonToken(entry.classification_reason)) return error.TestUnexpectedResult;
+    }
+    if (derived.classification == .native_equivalent and entry.classification_reason.len != 0 and corpusPlanFamilyIsUnsupported(entry.family)) {
+        return error.TestUnexpectedResult;
+    }
+
+    const pinned = entry.native_equivalence;
+    try validateExplicitNativeEvidenceForEntryAlloc(alloc, entry, derived);
+    if (!nativeEquivalenceSummaryHasFields(pinned)) return;
+    if (pinned.classification == null or pinned.surface == null) return error.TestUnexpectedResult;
+    if (pinned.classification.? != derived.classification.? or pinned.surface.? != derived.surface.?) return error.TestUnexpectedResult;
+    if (!optionalNativeEquivalenceStringMatches(pinned.native_model, derived.native_model)) return error.TestUnexpectedResult;
+    if (!optionalNativeEquivalenceStringMatches(pinned.native_route, derived.native_route)) return error.TestUnexpectedResult;
+    if (!optionalNativeEquivalenceStringMatches(pinned.target_resource, derived.target_resource)) return error.TestUnexpectedResult;
+    if (!optionalNativeEquivalenceStringMatches(pinned.auth_resource, derived.auth_resource)) return error.TestUnexpectedResult;
+    if (!optionalNativeEquivalenceStringMatches(pinned.permission, derived.permission)) return error.TestUnexpectedResult;
+    if (!optionalNativeEquivalenceStringMatches(pinned.audit_action, derived.audit_action)) return error.TestUnexpectedResult;
+    if (!optionalNativeEquivalenceStringMatches(pinned.row_filter, derived.row_filter)) return error.TestUnexpectedResult;
+    if (!optionalNativeEquivalenceStringMatches(pinned.request_fingerprint, derived.request_fingerprint)) return error.TestUnexpectedResult;
+    if (!optionalNativeEquivalenceStringMatches(pinned.diagnostic, derived.diagnostic)) return error.TestUnexpectedResult;
+}
+
 pub fn freeFixtureEntry(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) void {
     if (entry.params.len > 0) alloc.free(entry.params);
     if (entry.apply_setup_sql.len > 0) alloc.free(entry.apply_setup_sql);
@@ -6475,6 +7262,7 @@ pub fn freeFixtureEntry(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) v
 }
 
 fn appParityCoverageFlag(coverage: AppParityCorpusCoverage, name: []const u8) !bool {
+    @setEvalBranchQuota(10_000);
     inline for (std.meta.fields(AppParityCorpusCoverage)) |field| {
         if (std.mem.eql(u8, name, field.name)) {
             if (field.type != bool) return error.TestUnexpectedResult;
@@ -6485,6 +7273,7 @@ fn appParityCoverageFlag(coverage: AppParityCorpusCoverage, name: []const u8) !b
 }
 
 fn appParityCoverageRequirementKnown(name: []const u8) bool {
+    @setEvalBranchQuota(10_000);
     inline for (std.meta.fields(AppParityCorpusCoverage)) |field| {
         if (std.mem.eql(u8, name, field.name)) {
             return field.type == bool or field.type == usize;
@@ -6494,6 +7283,7 @@ fn appParityCoverageRequirementKnown(name: []const u8) bool {
 }
 
 pub fn appParityCoverageRequirementSatisfied(coverage: AppParityCorpusCoverage, name: []const u8) !bool {
+    @setEvalBranchQuota(10_000);
     inline for (std.meta.fields(AppParityCorpusCoverage)) |field| {
         if (std.mem.eql(u8, name, field.name)) {
             if (field.type == bool) return @field(coverage, field.name);
@@ -6508,6 +7298,7 @@ pub fn parseCoverageRequirementsRootAlloc(
     alloc: std.mem.Allocator,
     value: std.json.Value,
 ) !AppParityCoverageRequirementsRoot {
+    @setEvalBranchQuota(10_000);
     const root = try fixtureJsonObject(value);
     try fixtureRequireOnlyKeys(root, &.{ "coverage_format", "required" });
     const coverage_format = try fixtureJsonOptionalU64(root, "coverage_format", 0);
@@ -7094,6 +7885,20 @@ pub fn expectAppParityCoverageRequirementsWithReportAlloc(
     return error.TestUnexpectedResult;
 }
 
+pub fn expectAppParityRequiredCoverageHasExplicitNativeEvidenceAlloc(
+    alloc: std.mem.Allocator,
+    entries: []const AppParityCorpusEntry,
+    required: []const []const u8,
+    resolved: []const AppParityResolvedRequirement,
+) !void {
+    var coverage = AppParityCorpusCoverage{};
+    for (entries) |entry| {
+        if (!appParityEntryHasExplicitNativeEvidence(entry)) continue;
+        try coverage.observe(alloc, entry);
+    }
+    try expectAppParityCoverageRequirementsWithReportAlloc(alloc, coverage, required, resolved);
+}
+
 pub fn expectAppParityCoverageRequirements(
     coverage: AppParityCorpusCoverage,
     required: []const []const u8,
@@ -7459,6 +8264,25 @@ fn fixtureWriteSummaryField(writer: anytype, first: *bool, summary: AppParityPla
     try writer.writeAll("\n      }");
 }
 
+fn fixtureWriteNativeEquivalenceField(writer: anytype, first: *bool, summary: AppParityNativeEquivalenceSummary) !void {
+    if (!nativeEquivalenceSummaryHasFields(summary)) return;
+    try fixtureWriteObjectComma(writer, first);
+    try writer.writeAll("      \"native_equivalence\": {\n");
+    var native_first = true;
+    if (summary.classification) |classification| try fixtureWriteStringField(writer, &native_first, "        ", "classification", @tagName(classification));
+    if (summary.surface) |surface| try fixtureWriteStringField(writer, &native_first, "        ", "surface", @tagName(surface));
+    if (summary.native_model) |native_model| try fixtureWriteStringField(writer, &native_first, "        ", "native_model", native_model);
+    if (summary.native_route) |native_route| try fixtureWriteStringField(writer, &native_first, "        ", "native_route", native_route);
+    if (summary.target_resource) |target_resource| try fixtureWriteStringField(writer, &native_first, "        ", "target_resource", target_resource);
+    if (summary.auth_resource) |auth_resource| try fixtureWriteStringField(writer, &native_first, "        ", "auth_resource", auth_resource);
+    if (summary.permission) |permission| try fixtureWriteStringField(writer, &native_first, "        ", "permission", permission);
+    if (summary.audit_action) |audit_action| try fixtureWriteStringField(writer, &native_first, "        ", "audit_action", audit_action);
+    if (summary.row_filter) |row_filter| try fixtureWriteStringField(writer, &native_first, "        ", "row_filter", row_filter);
+    if (summary.request_fingerprint) |request_fingerprint| try fixtureWriteStringField(writer, &native_first, "        ", "request_fingerprint", request_fingerprint);
+    if (summary.diagnostic) |diagnostic| try fixtureWriteStringField(writer, &native_first, "        ", "diagnostic", diagnostic);
+    try writer.writeAll("\n      }");
+}
+
 pub fn fixtureJsonAlloc(
     alloc: std.mem.Allocator,
     schema_json: []const u8,
@@ -7473,12 +8297,52 @@ pub fn fixtureJsonAlloc(
     const entries_writer = &entries_out.writer;
     for (entries, 0..) |encoded, i| {
         const entry = encoded.entry;
+        const derive_native_evidence = !appParityEntryHasExplicitNativeEvidence(entry);
+        var derived_native_request_json: ?[]u8 = null;
+        defer if (derived_native_request_json) |json| alloc.free(json);
+        var derived_native_equivalence: AppParityNativeEquivalenceSummary = .{};
+        var derived_native_equivalence_active = false;
+        defer if (derived_native_equivalence_active) freeDerivedNativeEquivalenceSummary(alloc, derived_native_equivalence);
+        if (derive_native_evidence) {
+            derived_native_request_json = try nativeRequestJsonAlloc(alloc, entry);
+            derived_native_equivalence = try derivedNativeEquivalenceSummaryAlloc(alloc, entry);
+            derived_native_equivalence_active = true;
+        }
+        const native_request_kind = if (entry.native_request_kind.len > 0)
+            entry.native_request_kind
+        else if (derived_native_equivalence.native_model) |native_model|
+            native_model
+        else
+            "";
+        const native_request_json = if (entry.native_request_json.len > 0)
+            entry.native_request_json
+        else
+            derived_native_request_json orelse "";
+        const native_fingerprint = if (entry.native_fingerprint.len > 0)
+            entry.native_fingerprint
+        else if (derived_native_equivalence.request_fingerprint) |fingerprint|
+            fingerprint
+        else
+            "";
+        const sql_fingerprint = if (entry.sql_fingerprint.len > 0)
+            entry.sql_fingerprint
+        else
+            native_fingerprint;
+        const native_equivalence = if (nativeEquivalenceSummaryHasFields(entry.native_equivalence))
+            entry.native_equivalence
+        else
+            derived_native_equivalence;
         if (i > 0) try entries_writer.writeByte(',');
         try entries_writer.writeAll("\n    {\n");
         var first = true;
         try fixtureWriteStringField(entries_writer, &first, "      ", "name", entry.name);
         try fixtureWriteStringField(entries_writer, &first, "      ", "family", @tagName(entry.family));
         try fixtureWriteSummaryField(entries_writer, &first, entry.summary);
+        if (native_request_kind.len > 0) try fixtureWriteStringField(entries_writer, &first, "      ", "native_request_kind", native_request_kind);
+        if (native_request_json.len > 0) try fixtureWriteStringField(entries_writer, &first, "      ", "native_request_json", native_request_json);
+        if (sql_fingerprint.len > 0) try fixtureWriteStringField(entries_writer, &first, "      ", "sql_fingerprint", sql_fingerprint);
+        if (native_fingerprint.len > 0) try fixtureWriteStringField(entries_writer, &first, "      ", "native_fingerprint", native_fingerprint);
+        try fixtureWriteNativeEquivalenceField(entries_writer, &first, native_equivalence);
         try fixtureWriteStringField(entries_writer, &first, "      ", "plan", entry.plan);
         if (entry.classification_reason.len > 0) try fixtureWriteStringField(entries_writer, &first, "      ", "classification_reason", entry.classification_reason);
         try fixtureWriteStringListField(entries_writer, &first, "      ", "apply_setup_sql", entry.apply_setup_sql);
@@ -7987,7 +8851,11 @@ fn corpusFixtureDocumentReadSummaryMatchesPlan(entry: AppParityCorpusEntry) bool
     }
     if (entry.family != .read or !documentQueryPlanMatchesReadFamily(entry.plan)) return false;
     if (entry.summary.document_source_table) |source_table| {
-        if (!planHasExactStringToken(entry.plan, ":source_table=", source_table)) return false;
+        if (!planHasExactStringToken(entry.plan, ":source_table=", source_table) and
+            !planHasExactStringToken(entry.plan, "document_query:table=", source_table))
+        {
+            return false;
+        }
     }
     if (entry.summary.document_view_mapping) |view_mapping| {
         if (!planHasExactStringToken(entry.plan, ":view_mapping=", view_mapping)) return false;
@@ -8440,6 +9308,8 @@ fn corpusFixtureCatalogTablesAreValid(entry: AppParityCorpusEntry) bool {
             !(entry.family == .ddl and table.indexes_json.len > 0) and
             !corpusFixtureReadSetOperationCatalogTableIsTarget(entry, table.name) and
             !corpusFixtureReadSetOperationCatalogTableIsSqlSource(entry, table.name) and
+            !corpusFixtureDocumentDirectCatalogTableIsTarget(entry, table.name, table.indexes_json) and
+            !corpusFixtureUnsupportedDocumentCatalogTableIsTarget(entry, table.name) and
             !corpusFixtureDocumentViewMappingCatalogTableIsTarget(entry, table.name, table.indexes_json) and
             !corpusFixtureDdlCatalogTablesAreSchemaWide(entry))
         {
@@ -8451,6 +9321,26 @@ fn corpusFixtureCatalogTablesAreValid(entry: AppParityCorpusEntry) bool {
         }
     }
     return true;
+}
+
+fn corpusFixtureUnsupportedDocumentCatalogTableIsTarget(
+    entry: AppParityCorpusEntry,
+    table_name: []const u8,
+) bool {
+    return entry.family == .unsupported_read and
+        std.mem.startsWith(u8, entry.classification_reason, "document_sql_") and
+        std.mem.indexOf(u8, entry.sql, table_name) != null;
+}
+
+fn corpusFixtureDocumentDirectCatalogTableIsTarget(
+    entry: AppParityCorpusEntry,
+    table_name: []const u8,
+    indexes_json: []const u8,
+) bool {
+    return entry.family == .read and
+        indexes_json.len > 0 and
+        documentQueryPlanMatchesReadFamily(entry.plan) and
+        planHasExactStringToken(entry.plan, "document_query:table=", table_name);
 }
 
 fn corpusFixtureDocumentViewMappingCatalogTableIsTarget(
@@ -8465,7 +9355,7 @@ fn corpusFixtureDocumentViewMappingCatalogTableIsTarget(
 }
 
 fn corpusFixtureEntryAllowsCatalogSchemas(entry: AppParityCorpusEntry) bool {
-    return corpusFixtureFamilyAllowsSourceSchema(entry.family) or appParityEntryHasDocumentViewMappingCatalog(entry);
+    return corpusFixtureFamilyAllowsSourceSchema(entry.family) or appParityEntryHasDocumentCatalog(entry);
 }
 
 fn corpusFixtureCanUseDocumentViewMappingCatalog(entry: AppParityCorpusEntry) bool {
@@ -10370,7 +11260,7 @@ fn documentQueryFingerprintAlloc(
     if (plan.unnest) |unnest| {
         fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "unnest", unnest.field);
         fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "unnest_alias", unnest.alias);
-        fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "unnest_filter", unnest.filter_value_json != null or unnest.filter_values_json != null);
+        fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "unnest_filter", unnest.filter_value_json != null or unnest.filter_values_json != null or unnest.filter_range_json != null or unnest.filter_not_query_json != null or unnest.filter_pattern_query_json != null or unnest.filter_is_not_null or unnest.filter_match_none);
     }
     return fingerprint;
 }
@@ -11079,6 +11969,14 @@ test "sql adapter corpus parses fixture entries and owns allocated slices" {
         \\    "table_name": "usage_records",
         \\    "patch_expressions": 2
         \\  },
+        \\  "native_equivalence": {
+        \\    "classification": "native_equivalent",
+        \\    "surface": "row_write",
+        \\    "native_model": "relational_rows_mutation",
+        \\    "native_route": "mutation_source",
+        \\    "target_resource": "usage_records",
+        \\    "permission": "write"
+        \\  },
         \\  "plan": "update_joined_source:table=usage_records:source_assignments=2",
         \\  "classification_reason": "",
         \\  "apply_setup_sql": ["CREATE TABLE usage_records (id text PRIMARY KEY)"],
@@ -11107,6 +12005,9 @@ test "sql adapter corpus parses fixture entries and owns allocated slices" {
     try std.testing.expectEqual(AppParityCorpusPlanFamily.update_joined_source, entry.family);
     try std.testing.expectEqual(@as(?usize, 2), entry.summary.source_assignments);
     try std.testing.expectEqual(@as(?usize, null), entry.summary.patch_expressions);
+    try std.testing.expectEqual(AppParityNativeEquivalenceClass.native_equivalent, entry.native_equivalence.classification.?);
+    try std.testing.expectEqual(AppParityNativeEquivalenceSurface.row_write, entry.native_equivalence.surface.?);
+    try std.testing.expectEqualStrings("relational_rows_mutation", entry.native_equivalence.native_model.?);
     try std.testing.expectEqual(@as(usize, 5), entry.params.len);
     try std.testing.expectEqual(@as(i64, 42), entry.params[0].integer);
     try std.testing.expectEqualStrings("queued", entry.params[1].string);
@@ -11180,6 +12081,98 @@ test "sql adapter corpus parses source corpus root entries" {
     try std.testing.expectEqualStrings("prepare statement protocol plan", root.entries[0].name);
     try std.testing.expectEqual(AppParityCorpusPlanFamily.ddl, root.entries[0].family);
     try std.testing.expectEqual(AppParityDdlTag.prepare_statement, root.entries[0].summary.ddl_tag.?);
+}
+
+test "sql adapter source corpus derives native equivalence for every entry" {
+    const alloc = std.testing.allocator;
+    var source = try parseAppParityExternalSourceCorpusAlloc(alloc);
+    defer source.deinit(alloc);
+    var required_coverage = try parseAppParityCoverageRequirementsAlloc(alloc);
+    defer required_coverage.deinit(alloc);
+    var resolved_requirements = try parseAppParityResolvedRequirementsAlloc(alloc);
+    defer resolved_requirements.deinit(alloc);
+
+    var native_equivalent: usize = 0;
+    var explicit_noop: usize = 0;
+    var unsupported: usize = 0;
+    var catalog_mutation = false;
+    var row_write = false;
+    var document_write = false;
+    var read_query = false;
+    var derived_index_lifecycle = false;
+    var roles = false;
+    var extensions = false;
+    var maintenance = false;
+
+    for (source.root.entries) |entry| {
+        const summary = try derivedNativeEquivalenceSummaryAlloc(alloc, entry);
+        defer freeDerivedNativeEquivalenceSummary(alloc, summary);
+        try validateNativeEquivalenceSummaryForEntryAlloc(alloc, entry);
+        try std.testing.expect(summary.classification != null);
+        try std.testing.expect(summary.surface != null);
+        try std.testing.expect(summary.native_model != null);
+        try std.testing.expect(summary.native_route != null);
+        try std.testing.expect(summary.permission != null);
+        try std.testing.expect(summary.request_fingerprint != null);
+        switch (summary.classification.?) {
+            .native_equivalent => native_equivalent += 1,
+            .explicit_noop => explicit_noop += 1,
+            .unsupported => unsupported += 1,
+        }
+        switch (summary.surface.?) {
+            .catalog_mutation => catalog_mutation = true,
+            .row_write => row_write = true,
+            .document_write => document_write = true,
+            .read_query => read_query = true,
+            .derived_index_lifecycle => derived_index_lifecycle = true,
+            .roles => roles = true,
+            .extensions => extensions = true,
+            .maintenance => maintenance = true,
+            .backups, .lakes => {},
+        }
+    }
+
+    try std.testing.expect(native_equivalent > 0);
+    try std.testing.expect(explicit_noop > 0);
+    try std.testing.expect(unsupported > 0);
+    try std.testing.expect(catalog_mutation);
+    try std.testing.expect(row_write);
+    try std.testing.expect(document_write);
+    try std.testing.expect(read_query);
+    try std.testing.expect(derived_index_lifecycle);
+    try std.testing.expect(roles);
+    try std.testing.expect(extensions);
+    try std.testing.expect(maintenance);
+    try expectAppParityRequiredCoverageHasExplicitNativeEvidenceAlloc(
+        alloc,
+        source.root.entries,
+        required_coverage.root.required,
+        resolved_requirements.root.resolved,
+    );
+}
+
+test "sql adapter native equivalence rejects contradictory pinned summaries" {
+    const alloc = std.testing.allocator;
+    const entry = AppParityCorpusEntry{
+        .name = "bad pinned read",
+        .family = .read,
+        .summary = .{ .table_name = "usage_records" },
+        .native_equivalence = .{
+            .classification = .native_equivalent,
+            .surface = .row_write,
+        },
+        .plan = "read:query:query:table=usage_records",
+        .sql = "SELECT id FROM usage_records",
+    };
+    try std.testing.expectError(error.TestUnexpectedResult, validateNativeEquivalenceSummaryForEntryAlloc(alloc, entry));
+
+    const unsupported = AppParityCorpusEntry{
+        .name = "unsupported without diagnostic",
+        .family = .unsupported_read,
+        .plan = "unsupported:read:requires=read_native_gap",
+        .sql = "SELECT unsupported FROM usage_records",
+    };
+    try std.testing.expectError(error.TestUnexpectedResult, validateNativeEquivalenceSummaryForEntryAlloc(alloc, unsupported));
 }
 
 fn expectSourceCorpusNativeRequirements(
@@ -11688,6 +12681,8 @@ test "sql adapter corpus validates parser migration table manifest" {
     try std.testing.expectEqualStrings("durable_executor", table.root.families[7].entrypoints[2]);
     try std.testing.expectEqualStrings("generated_gated_unsupported", table.root.families[0].parser_status);
     try std.testing.expectEqualStrings("tokenized parsed sql retained AST corruption rejects generated unsupported DDL", table.root.families[0].retained_ast_corruption_test);
+    try std.testing.expect(table.root.families[0].removal_evidence.raw_ast_fixtures.len > 0);
+    try std.testing.expect(table.root.families[0].removal_evidence.stale_metadata_tests.len > 0);
 
     const unknown_json =
         \\{
@@ -11775,6 +12770,30 @@ test "sql adapter corpus validates parser migration table manifest" {
     var parsed_unknown_parser_status = try std.json.parseFromSlice(std.json.Value, alloc, unknown_parser_status_json, .{});
     defer parsed_unknown_parser_status.deinit();
     try std.testing.expectError(error.TestUnexpectedResult, parseSqlParserMigrationParserStatus(parsed_unknown_parser_status.value));
+}
+
+test "sql adapter corpus validates generated AST migration fixtures" {
+    const alloc = std.testing.allocator;
+    var fixtures = try parseSqlGeneratedAstMigrationFixturesAlloc(alloc);
+    defer fixtures.deinit(alloc);
+    try std.testing.expectEqual(sql_generated_ast_migration_fixture_format, fixtures.root.fixture_format);
+
+    for (fixtures.root.cases) |case| {
+        errdefer std.debug.print("generated AST migration fixture failed: {s}\n", .{case.name});
+        try validateSqlGeneratedAstMigrationFixtureCaseAlloc(alloc, case);
+    }
+}
+
+test "sql adapter corpus validates parser migration removal evidence names" {
+    const alloc = std.testing.allocator;
+    var table = try parseSqlParserMigrationTableAlloc(alloc);
+    defer table.deinit(alloc);
+    var raw_ast = try parseSqlGeneratedAstMigrationFixturesAlloc(alloc);
+    defer raw_ast.deinit(alloc);
+    var source = try parseAppParityExternalSourceCorpusAlloc(alloc);
+    defer source.deinit(alloc);
+
+    try validateSqlParserMigrationEvidence(table.root, raw_ast.root, source.root);
 }
 
 test "sql adapter corpus validates production ingress cutover manifest" {
@@ -12040,20 +13059,18 @@ test "sql adapter corpus validates document sql bounded scan inventory manifest"
     defer inventory.deinit(alloc);
     try std.testing.expectEqual(document_sql_bounded_scan_inventory_format, inventory.root.inventory_format);
     try std.testing.expectEqual(document_sql_bounded_scan_inventory_ids.len, inventory.root.entries.len);
-    try std.testing.expectEqualStrings("mapped-view-residual-bounded-scan", inventory.root.entries[0].id);
-    try std.testing.expectEqualStrings("document sql view mapping bounded residual read", inventory.root.entries[0].source_fixture);
-    try std.testing.expectEqualStrings("intentional_contract", inventory.root.entries[0].status);
+    try std.testing.expectEqual(@as(usize, 0), inventory.root.entries.len);
 
     const unknown_status_json =
         \\{
         \\  "inventory_format": 1,
         \\  "entries": [
         \\    {
-        \\      "id": "mapped-view-residual-bounded-scan",
+        \\      "id": "unexpected-bounded-scan-contract",
         \\      "sql_slices_section": "Finish document query and view-mapping hardening",
         \\      "contract_kind": "view_mapping_residual",
         \\      "status": "covered",
-        \\      "source_fixture": "document sql view mapping bounded residual read",
+        \\      "source_fixture": "unexpected bounded scan fixture",
         \\      "runtime_evidence_file": "zig/pkg/antfly/src/api/table_reads/sources.zig",
         \\      "runtime_evidence_symbol": "api.table_reads.docid document SQL bounded scan runtime diagnostics pin row and byte caps",
         \\      "scan_cap_evidence": "scan",
@@ -12076,11 +13093,11 @@ test "sql adapter corpus validates document sql bounded scan inventory manifest"
         \\  "inventory_format": 1,
         \\  "entries": [
         \\    {
-        \\      "id": "mapped-view-residual-bounded-scan",
+        \\      "id": "unexpected-bounded-scan-contract",
         \\      "sql_slices_section": "Finish document query and view-mapping hardening",
         \\      "contract_kind": "view_mapping_residual",
         \\      "status": "intentional_contract",
-        \\      "source_fixture": "document sql view mapping bounded residual read",
+        \\      "source_fixture": "unexpected bounded scan fixture",
         \\      "runtime_evidence_file": "zig/pkg/antfly/src/api/table_reads/sources.zig",
         \\      "runtime_evidence_symbol": "api.table_reads.docid document SQL bounded scan runtime diagnostics pin row and byte caps",
         \\      "scan_cap_evidence": "scan",
@@ -12106,19 +13123,18 @@ test "sql adapter corpus validates document sql read expansion gate manifest" {
     try std.testing.expectEqual(document_sql_read_expansion_gate_ids.len, gate.root.entries.len);
     try std.testing.expectEqualStrings("additional-array-unnest-patterns", gate.root.entries[0].id);
     try std.testing.expectEqualStrings("array_unnest_patterns", gate.root.entries[0].expansion_surface);
-    try std.testing.expectEqualStrings("additional-mapped-fields", gate.root.entries[1].id);
-    try std.testing.expectEqualStrings("derived-index-producer-types", gate.root.entries[2].id);
-    try std.testing.expectEqualStrings("document-aggregates", gate.root.entries[3].id);
-    try std.testing.expectEqualStrings("lateral-view-mapping-joins", gate.root.entries[4].id);
+    try std.testing.expectEqualStrings("derived-index-producer-types", gate.root.entries[1].id);
+    try std.testing.expectEqualStrings("document-aggregates", gate.root.entries[2].id);
+    try std.testing.expectEqualStrings("lateral-view-mapping-joins", gate.root.entries[3].id);
 
     const unknown_status_json =
         \\{
         \\  "gate_format": 1,
         \\  "entries": [
         \\    {
-        \\      "id": "additional-mapped-fields",
+        \\      "id": "derived-index-producer-types",
         \\      "sql_slices_section": "Finish document query and view-mapping hardening",
-        \\      "expansion_surface": "mapped_fields",
+        \\      "expansion_surface": "derived_index_producer_types",
         \\      "admission_status": "admitted",
         \\      "source_corpus_requirement": "Add named sql_api_parity_source_corpus.json fixtures.",
         \\      "coverage_bucket_requirement": "Add required sql_api_required_coverage.json buckets.",
@@ -12140,9 +13156,9 @@ test "sql adapter corpus validates document sql read expansion gate manifest" {
         \\  "gate_format": 1,
         \\  "entries": [
         \\    {
-        \\      "id": "additional-mapped-fields",
+        \\      "id": "derived-index-producer-types",
         \\      "sql_slices_section": "Finish document query and view-mapping hardening",
-        \\      "expansion_surface": "mapped_fields",
+        \\      "expansion_surface": "derived_index_producer_types",
         \\      "admission_status": "blocked_until_corpus_and_runtime",
         \\      "source_corpus_requirement": "Add named sql_api_parity_source_corpus.json fixtures.",
         \\      "coverage_bucket_requirement": "Add required sql_api_required_coverage.json buckets.",
@@ -13130,7 +14146,8 @@ test "sql adapter corpus validates relational routed visibility matrix manifest"
     try std.testing.expectEqualStrings("cte-backed-join-fail-closed", inventory.root.entries[0].id);
     try std.testing.expectEqualStrings("cte_backed_join", inventory.root.entries[0].routed_shape);
     try std.testing.expectEqualStrings("live-write-pagination-gap", inventory.root.entries[1].id);
-    try std.testing.expectEqualStrings("gap_inventory", inventory.root.entries[1].evidence_kind);
+    try std.testing.expectEqualStrings("live_write_fail_closed", inventory.root.entries[1].visibility_outcome);
+    try std.testing.expectEqualStrings("execution_test", inventory.root.entries[1].evidence_kind);
     try std.testing.expectEqualStrings("system-time-cte-provisioned", inventory.root.entries[6].id);
 
     const unknown_shape_json =
@@ -13212,7 +14229,7 @@ test "sql adapter corpus validates relational production chaos inventory manifes
     try std.testing.expectEqualStrings("fk-action-page-chaos", inventory.root.entries[0].id);
     try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[0].status);
     try std.testing.expectEqualStrings("insert-source-upsert-owner-chaos", inventory.root.entries[1].id);
-    try std.testing.expectEqualStrings("missing_native_harness", inventory.root.entries[1].status);
+    try std.testing.expectEqualStrings("partial_release_gated", inventory.root.entries[1].status);
     try std.testing.expectEqualStrings("table-emptying-secondary-index-chaos", inventory.root.entries[2].id);
     try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[2].status);
 
@@ -13357,7 +14374,7 @@ test "sql adapter corpus validates relational SQL adapter removal inventory mani
     try std.testing.expectEqualStrings("application_migration_equivalence_corpus", inventory.root.entries[0].surface);
     try std.testing.expectEqualStrings("catalog-snapshot-binding", inventory.root.entries[1].id);
     try std.testing.expectEqualStrings("legacy-wrapper-deletion", inventory.root.entries[2].id);
-    try std.testing.expectEqualStrings("gap_tracked", inventory.root.entries[2].status);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[2].status);
     try std.testing.expectEqualStrings("structural-sql-normalization", inventory.root.entries[3].id);
 
     const unknown_surface_json =
@@ -15522,6 +16539,16 @@ pub const AppParityCorpusCoverage = struct {
     read_set_operation_cross_table_intersect_classifier: bool = false,
     read_set_operation_cross_table_source_schema_classifier: bool = false,
     read_window_duplicate_output_label: bool = false,
+    read_quantified_subquery_not_equal_any: bool = false,
+    read_quantified_subquery_greater_than_all: bool = false,
+    read_quantified_subquery_greater_equal_all: bool = false,
+    read_quantified_subquery_less_than_any: bool = false,
+    read_quantified_subquery_less_equal_any: bool = false,
+    read_quantified_subquery_like_some: bool = false,
+    read_quantified_subquery_ilike_some: bool = false,
+    read_quantified_subquery_ilike_all: bool = false,
+    read_quantified_subquery_not_like_any: bool = false,
+    read_quantified_subquery_not_ilike_any: bool = false,
     query: bool = false,
     query_select_all_disambiguated_outputs: bool = false,
     aggregate: bool = false,
@@ -15566,7 +16593,6 @@ pub const AppParityCorpusCoverage = struct {
     delete_joined_source_cte_mutation: bool = false,
     document_query_view_mapping: bool = false,
     document_query_view_mapping_between_predicate: bool = false,
-    document_query_view_mapping_bounded_scan: bool = false,
     document_query_view_mapping_in_predicate: bool = false,
     document_query_view_mapping_in_predicate_native_equivalence: bool = false,
     document_query_native_semantic_rejected_missing_exact_producer: bool = false,
@@ -15576,8 +16602,21 @@ pub const AppParityCorpusCoverage = struct {
     document_query_native_graph_shortest_path_rejected_missing_exact_producer: bool = false,
     document_query_native_graph_metric_rejected_missing_exact_producer: bool = false,
     document_query_native_graph_metric_rerank_rejected_missing_exact_producer: bool = false,
+    document_query_native_vector_native_equivalence: bool = false,
+    document_query_native_semantic_native_equivalence: bool = false,
+    document_query_native_hybrid_native_equivalence: bool = false,
+    document_query_native_graph_traverse_native_equivalence: bool = false,
+    document_query_native_graph_shortest_path_native_equivalence: bool = false,
+    document_query_native_graph_metric_native_equivalence: bool = false,
+    document_query_native_graph_metric_rerank_native_equivalence: bool = false,
     document_query_view_mapping_full_text_backed_native_equivalence: bool = false,
     document_query_view_mapping_native_equivalence: bool = false,
+    document_query_view_mapping_text_field_native_equivalence: bool = false,
+    document_query_view_mapping_boolean_field_native_equivalence: bool = false,
+    document_query_view_mapping_optional_missing_field_native_equivalence: bool = false,
+    document_query_view_mapping_nested_field_native_equivalence: bool = false,
+    document_query_view_mapping_multi_field_projection_native_equivalence: bool = false,
+    document_query_view_mapping_rejected_mistyped_field: bool = false,
     document_query_view_mapping_null_predicate: bool = false,
     document_query_view_mapping_null_predicate_native_equivalence: bool = false,
     document_query_view_mapping_range_predicate: bool = false,
@@ -15590,8 +16629,26 @@ pub const AppParityCorpusCoverage = struct {
     document_query_view_mapping_residual_predicate_native_equivalence: bool = false,
     document_query_view_mapping_bounded_order: bool = false,
     document_query_view_mapping_ordered_topk_native_equivalence: bool = false,
+    document_query_array_unnest: bool = false,
+    document_query_array_unnest_compound_not_equal_native_equivalence: bool = false,
+    document_query_array_unnest_native_equivalence: bool = false,
+    document_query_array_unnest_not_equal_native_equivalence: bool = false,
+    document_query_array_unnest_null_native_equivalence: bool = false,
+    document_query_array_unnest_not_null_native_equivalence: bool = false,
+    document_query_array_unnest_case_insensitive_pattern_native_equivalence: bool = false,
+    document_query_array_unnest_pattern_native_equivalence: bool = false,
+    document_query_array_unnest_range_native_equivalence: bool = false,
+    document_query_array_unnest_rejected_cartesian: bool = false,
+    document_query_array_unnest_rejected_non_equality: bool = false,
     document_query_view_mapping_unnest: bool = false,
+    document_query_view_mapping_unnest_compound_not_equal_native_equivalence: bool = false,
     document_query_view_mapping_unnest_native_equivalence: bool = false,
+    document_query_view_mapping_unnest_not_equal_native_equivalence: bool = false,
+    document_query_view_mapping_unnest_null_native_equivalence: bool = false,
+    document_query_view_mapping_unnest_not_null_native_equivalence: bool = false,
+    document_query_view_mapping_unnest_case_insensitive_pattern_native_equivalence: bool = false,
+    document_query_view_mapping_unnest_pattern_native_equivalence: bool = false,
+    document_query_view_mapping_unnest_range_native_equivalence: bool = false,
     document_query_view_mapping_between_predicate_native_equivalence: bool = false,
     adapter_noop_ddl: bool = false,
     unsupported_read: bool = false,
@@ -15691,6 +16748,8 @@ pub const AppParityCorpusCoverage = struct {
     document_write_document_sql_joined_projection_update: bool = false,
     document_write_document_sql_joined_source_assignment_update: bool = false,
     document_write_document_sql_merge_delete: bool = false,
+    document_write_document_sql_merge_projection_not_matched_insert: bool = false,
+    document_write_document_sql_merge_returning: bool = false,
     document_write_document_sql_merge_version_predicate: bool = false,
     document_write_document_sql_projection_array_update: bool = false,
     document_write_document_sql_projection_nested_alias_insert: bool = false,
@@ -15780,9 +16839,7 @@ pub const AppParityCorpusCoverage = struct {
     read_set_operation_right_cross_table_multi_join: bool = false,
     read_set_operation_right_lateral_join: bool = false,
     read_set_operation_right_multi_join: bool = false,
-    unsupported_read_correlated_subquery_predicate: bool = false,
     unsupported_read_set_operation_output_shape: bool = false,
-    unsupported_read_subquery_predicate: bool = false,
     read_row_lock_nowait: bool = false,
     read_row_lock_share: bool = false,
     read_row_lock_key_share: bool = false,
@@ -16222,12 +17279,8 @@ pub const AppParityCorpusCoverage = struct {
         entry: AppParityCorpusEntry,
         err: anyerror,
     ) !bool {
+        _ = self;
         if (!(try validateSourceCorpusGeneratedParseFailureEntryAlloc(alloc, entry, err))) return false;
-        self.unsupported_read_subquery_predicate = self.unsupported_read_subquery_predicate or
-            sourceCorpusEntryHasSubqueryPredicateReason(entry);
-        self.unsupported_read_correlated_subquery_predicate = self.unsupported_read_correlated_subquery_predicate or
-            (sourceCorpusEntryHasClassificationReason(entry, "subquery_semijoin_plan") and
-                std.mem.eql(u8, entry.name, "read correlated subquery predicate"));
         return true;
     }
 
@@ -16768,16 +17821,6 @@ pub const AppParityCorpusCoverage = struct {
                 entry.catalog_tables.len > 0 and
                 structured_summary.parser.support_view_identifier and
                 structured_summary.parser.plan_identifier);
-        self.document_query_view_mapping_bounded_scan = self.document_query_view_mapping_bounded_scan or
-            (entry.family == .read and
-                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
-                entry.catalog_tables.len > 0 and
-                structured_summary.parser.support_view_identifier and
-                structured_summary.parser.plan_identifier and
-                structured_summary.parser.where_keyword and
-                !structured_summary.parser.order_by and
-                !structured_summary.parser.unnest_function and
-                !appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\""));
         self.document_query_view_mapping_in_predicate = self.document_query_view_mapping_in_predicate or
             (entry.family == .read and
                 sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
@@ -16881,6 +17924,55 @@ pub const AppParityCorpusCoverage = struct {
                 structured_summary.parser.where_keyword and
                 structured_summary.parser.gt_or_gte_operator and
                 !structured_summary.parser.unnest_function);
+        self.document_query_native_vector_native_equivalence = self.document_query_native_vector_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                structured_summary.parser.vector_search_function and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                sql_adapter.planHasExactUsizeToken(entry.plan, ":native=", 1));
+        self.document_query_native_semantic_native_equivalence = self.document_query_native_semantic_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                structured_summary.parser.semantic_search_function and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                sql_adapter.planHasExactUsizeToken(entry.plan, ":native=", 1));
+        self.document_query_native_hybrid_native_equivalence = self.document_query_native_hybrid_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                structured_summary.parser.hybrid_search_function and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                sql_adapter.planHasExactUsizeToken(entry.plan, ":native=", 1));
+        self.document_query_native_graph_traverse_native_equivalence = self.document_query_native_graph_traverse_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                structured_summary.parser.graph_traverse_function and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                sql_adapter.planHasExactUsizeToken(entry.plan, ":native=", 1));
+        self.document_query_native_graph_shortest_path_native_equivalence = self.document_query_native_graph_shortest_path_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                structured_summary.parser.graph_shortest_path_function and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                sql_adapter.planHasExactUsizeToken(entry.plan, ":native=", 1));
+        self.document_query_native_graph_metric_native_equivalence = self.document_query_native_graph_metric_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                structured_summary.parser.graph_metric_function and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                sql_adapter.planHasExactUsizeToken(entry.plan, ":native=", 1));
+        self.document_query_native_graph_metric_rerank_native_equivalence = self.document_query_native_graph_metric_rerank_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                structured_summary.parser.graph_metric_rerank_function and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                sql_adapter.planHasExactUsizeToken(entry.plan, ":native=", 1));
         self.document_query_native_semantic_rejected_missing_exact_producer = self.document_query_native_semantic_rejected_missing_exact_producer or
             (entry.family == .unsupported_read and
                 structured_summary.hasReason("document_sql_bounded_scan_missing_exact_producer") and
@@ -16938,6 +18030,80 @@ pub const AppParityCorpusCoverage = struct {
                 entry.summary.document_view_mapping != null and
                 appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
                 appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"full_text\""));
+        self.document_query_view_mapping_text_field_native_equivalence = self.document_query_view_mapping_text_field_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_view_mapping != null and
+                structured_summary.parser.support_view_identifier and
+                std.mem.indexOf(u8, entry.sql, "title_text") != null and
+                std.mem.indexOf(u8, entry.plan, "field:/title->title_text") != null and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"text\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\""));
+        self.document_query_view_mapping_boolean_field_native_equivalence = self.document_query_view_mapping_boolean_field_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_view_mapping != null and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.where_keyword and
+                std.mem.indexOf(u8, entry.sql, "published IS TRUE") != null and
+                std.mem.indexOf(u8, entry.plan, "field:/published->published") != null and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"boolean\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\""));
+        self.document_query_view_mapping_optional_missing_field_native_equivalence = self.document_query_view_mapping_optional_missing_field_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_view_mapping != null and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.is_null_predicate and
+                std.mem.indexOf(u8, entry.sql, "region") != null and
+                std.mem.indexOf(u8, entry.plan, "field:/metadata/region->region") != null and
+                appParityDocumentViewMappingCatalogContains(entry, "\"nullable\":true") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"metadata.region\""));
+        self.document_query_view_mapping_nested_field_native_equivalence = self.document_query_view_mapping_nested_field_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_view_mapping != null and
+                structured_summary.parser.support_view_identifier and
+                std.mem.indexOf(u8, entry.plan, "field:/metadata/region->region") != null and
+                appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"metadata.region\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\""));
+        self.document_query_view_mapping_multi_field_projection_native_equivalence = self.document_query_view_mapping_multi_field_projection_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_view_mapping != null and
+                entry.summary.document_projections != null and
+                entry.summary.document_projections.? >= 6 and
+                structured_summary.parser.support_view_identifier and
+                std.mem.indexOf(u8, entry.sql, "title_text") != null and
+                structured_summary.parser.plan_identifier and
+                structured_summary.parser.score_identifier and
+                std.mem.indexOf(u8, entry.sql, "published") != null and
+                std.mem.indexOf(u8, entry.sql, "region") != null and
+                std.mem.indexOf(u8, entry.plan, "field:/title->title_text") != null and
+                std.mem.indexOf(u8, entry.plan, "field:/metadata/plan->plan") != null and
+                std.mem.indexOf(u8, entry.plan, "field:/metrics/score->score") != null and
+                std.mem.indexOf(u8, entry.plan, "field:/published->published") != null and
+                std.mem.indexOf(u8, entry.plan, "field:/metadata/region->region") != null);
+        self.document_query_view_mapping_rejected_mistyped_field = self.document_query_view_mapping_rejected_mistyped_field or
+            (entry.family == .invalid_read and
+                structured_summary.hasReason("document_sql_view_mapping_catalog") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"title_as_number\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"numeric\""));
         self.document_query_view_mapping_residual_predicate = self.document_query_view_mapping_residual_predicate or
             (entry.family == .read and
                 sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
@@ -17011,6 +18177,283 @@ pub const AppParityCorpusCoverage = struct {
                 appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array\"") and
                 appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array_element\"") and
                 appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\""));
+        self.document_query_view_mapping_unnest_range_native_equivalence = self.document_query_view_mapping_unnest_range_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_unnest != null and
+                entry.summary.document_unnest.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.unnest_function and
+                appParityDocumentViewMappingCatalogContains(entry, "\"tag_list\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array_element\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_alias=tag") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null and
+                (structured_summary.parser.lt_or_lte_operator or structured_summary.parser.gt_or_gte_operator) and
+                appParityEntryHasExplicitNativeEvidence(entry));
+        self.document_query_view_mapping_unnest_null_native_equivalence = self.document_query_view_mapping_unnest_null_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_unnest != null and
+                entry.summary.document_unnest.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.unnest_function and
+                appParityDocumentViewMappingCatalogContains(entry, "\"tag_list\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array_element\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_alias=tag") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null and
+                structured_summary.parser.is_null_predicate and
+                appParityEntryHasExplicitNativeEvidence(entry));
+        self.document_query_view_mapping_unnest_pattern_native_equivalence = self.document_query_view_mapping_unnest_pattern_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_unnest != null and
+                entry.summary.document_unnest.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.unnest_function and
+                appParityDocumentViewMappingCatalogContains(entry, "\"tag_list\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array_element\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_alias=tag") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null and
+                structured_summary.parser.like_keyword and
+                !structured_summary.parser.ilike_keyword);
+        self.document_query_view_mapping_unnest_case_insensitive_pattern_native_equivalence = self.document_query_view_mapping_unnest_case_insensitive_pattern_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_unnest != null and
+                entry.summary.document_unnest.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.unnest_function and
+                appParityDocumentViewMappingCatalogContains(entry, "\"tag_list\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array_element\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_alias=tag") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null and
+                structured_summary.parser.ilike_keyword and
+                appParityEntryHasExplicitNativeEvidence(entry));
+        self.document_query_view_mapping_unnest_not_null_native_equivalence = self.document_query_view_mapping_unnest_not_null_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_unnest != null and
+                entry.summary.document_unnest.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.unnest_function and
+                appParityDocumentViewMappingCatalogContains(entry, "\"tag_list\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array_element\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_alias=tag") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null and
+                structured_summary.parser.is_not_null_predicate);
+        self.document_query_view_mapping_unnest_not_equal_native_equivalence = self.document_query_view_mapping_unnest_not_equal_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_unnest != null and
+                entry.summary.document_unnest.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.unnest_function and
+                appParityDocumentViewMappingCatalogContains(entry, "\"tag_list\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array_element\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                std.mem.indexOf(u8, entry.sql, "<>") != null and
+                std.mem.indexOf(u8, entry.sql, " AND ") == null and
+                std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_alias=tag") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null);
+        self.document_query_view_mapping_unnest_compound_not_equal_native_equivalence = self.document_query_view_mapping_unnest_compound_not_equal_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_unnest != null and
+                entry.summary.document_unnest.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.unnest_function and
+                appParityDocumentViewMappingCatalogContains(entry, "\"tag_list\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array_element\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                std.mem.indexOf(u8, entry.sql, "<>") != null and
+                std.mem.indexOf(u8, entry.sql, " AND ") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_alias=tag") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null);
+        self.document_query_array_unnest = self.document_query_array_unnest or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                !structured_summary.parser.support_view_identifier and
+                structured_summary.parser.unnest_function and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "bounded_scan") and
+                entry.summary.document_unnest != null and
+                entry.summary.document_unnest.? and
+                std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null);
+        self.document_query_array_unnest_native_equivalence = self.document_query_array_unnest_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "bounded_scan") and
+                entry.summary.document_unnest != null and
+                entry.summary.document_unnest.? and
+                !structured_summary.parser.support_view_identifier and
+                structured_summary.parser.unnest_function and
+                std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null and
+                appParityEntryHasExplicitNativeEvidence(entry));
+        self.document_query_array_unnest_range_native_equivalence = self.document_query_array_unnest_range_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                (std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") or
+                    std.mem.eql(u8, entry.summary.document_native_request.?, "bounded_scan")) and
+                entry.summary.document_unnest != null and
+                entry.summary.document_unnest.? and
+                !structured_summary.parser.support_view_identifier and
+                structured_summary.parser.unnest_function and
+                (structured_summary.parser.lt_or_lte_operator or structured_summary.parser.gt_or_gte_operator) and
+                std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null and
+                appParityEntryHasExplicitNativeEvidence(entry));
+        self.document_query_array_unnest_null_native_equivalence = self.document_query_array_unnest_null_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                (std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") or
+                    std.mem.eql(u8, entry.summary.document_native_request.?, "bounded_scan")) and
+                entry.summary.document_unnest != null and
+                entry.summary.document_unnest.? and
+                !structured_summary.parser.support_view_identifier and
+                structured_summary.parser.unnest_function and
+                structured_summary.parser.is_null_predicate and
+                std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null and
+                appParityEntryHasExplicitNativeEvidence(entry));
+        self.document_query_array_unnest_pattern_native_equivalence = self.document_query_array_unnest_pattern_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                (std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") or
+                    std.mem.eql(u8, entry.summary.document_native_request.?, "bounded_scan")) and
+                entry.summary.document_unnest != null and
+                entry.summary.document_unnest.? and
+                !structured_summary.parser.support_view_identifier and
+                structured_summary.parser.unnest_function and
+                structured_summary.parser.like_keyword and
+                !structured_summary.parser.ilike_keyword and
+                std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null);
+        self.document_query_array_unnest_case_insensitive_pattern_native_equivalence = self.document_query_array_unnest_case_insensitive_pattern_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                (std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") or
+                    std.mem.eql(u8, entry.summary.document_native_request.?, "bounded_scan")) and
+                entry.summary.document_unnest != null and
+                entry.summary.document_unnest.? and
+                !structured_summary.parser.support_view_identifier and
+                structured_summary.parser.unnest_function and
+                structured_summary.parser.ilike_keyword and
+                std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null and
+                appParityEntryHasExplicitNativeEvidence(entry));
+        self.document_query_array_unnest_not_null_native_equivalence = self.document_query_array_unnest_not_null_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                (std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") or
+                    std.mem.eql(u8, entry.summary.document_native_request.?, "bounded_scan")) and
+                entry.summary.document_unnest != null and
+                entry.summary.document_unnest.? and
+                !structured_summary.parser.support_view_identifier and
+                structured_summary.parser.unnest_function and
+                structured_summary.parser.is_not_null_predicate and
+                std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null);
+        self.document_query_array_unnest_not_equal_native_equivalence = self.document_query_array_unnest_not_equal_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                (std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") or
+                    std.mem.eql(u8, entry.summary.document_native_request.?, "bounded_scan")) and
+                entry.summary.document_unnest != null and
+                entry.summary.document_unnest.? and
+                !structured_summary.parser.support_view_identifier and
+                structured_summary.parser.unnest_function and
+                std.mem.indexOf(u8, entry.sql, "<>") != null and
+                std.mem.indexOf(u8, entry.sql, " AND ") == null and
+                std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null);
+        self.document_query_array_unnest_compound_not_equal_native_equivalence = self.document_query_array_unnest_compound_not_equal_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                (std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") or
+                    std.mem.eql(u8, entry.summary.document_native_request.?, "bounded_scan")) and
+                entry.summary.document_unnest != null and
+                entry.summary.document_unnest.? and
+                !structured_summary.parser.support_view_identifier and
+                structured_summary.parser.unnest_function and
+                std.mem.indexOf(u8, entry.sql, "<>") != null and
+                std.mem.indexOf(u8, entry.sql, " AND ") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest=/tags") != null and
+                std.mem.indexOf(u8, entry.plan, ":unnest_filter=1") != null);
+        self.document_query_array_unnest_rejected_cartesian = self.document_query_array_unnest_rejected_cartesian or
+            (entry.family == .unsupported_read and
+                std.mem.eql(u8, entry.classification_reason, "document_sql_unnest_unsupported") and
+                structured_summary.parser.unnest_function and
+                structured_summary.parser.tag_identifier);
+        self.document_query_array_unnest_rejected_non_equality = self.document_query_array_unnest_rejected_non_equality or
+            (entry.family == .unsupported_read and
+                std.mem.eql(u8, entry.classification_reason, "document_sql_unnest_unsupported") and
+                structured_summary.parser.unnest_function and
+                structured_summary.parser.tag_identifier and
+                (std.mem.indexOf(u8, entry.sql, "<>") != null or
+                    structured_summary.parser.lt_or_lte_operator or
+                    structured_summary.parser.gt_or_gte_operator or
+                    structured_summary.parser.ilike_keyword or
+                    structured_summary.parser.is_null_predicate or
+                    structured_summary.parser.is_not_null_predicate));
         if (entry.applied_plan.len > 0) {
             self.applied_catalog_plan = true;
             self.applied_catalog_rebuild = self.applied_catalog_rebuild or applied_rebuild;
@@ -17859,6 +19302,14 @@ pub const AppParityCorpusCoverage = struct {
                     (std.mem.startsWith(u8, entry.plan, "document_merge_write:") and
                         structured_summary.parser.starts_with_merge and
                         structured_summary.parser.merge_when_matched_delete);
+                self.document_write_document_sql_merge_projection_not_matched_insert = self.document_write_document_sql_merge_projection_not_matched_insert or
+                    (std.mem.startsWith(u8, entry.plan, "document_merge_write:") and
+                        planHasExactUsizeToken(entry.plan, ":merge_insert_assignments=", 3) and
+                        std.mem.eql(u8, entry.name, "document sql merge projection not matched insert"));
+                self.document_write_document_sql_merge_returning = self.document_write_document_sql_merge_returning or
+                    (std.mem.startsWith(u8, entry.plan, "document_merge_write:") and
+                        planHasExactUsizeToken(entry.plan, ":returning=", 3) and
+                        std.mem.eql(u8, entry.name, "document sql merge returning"));
                 self.document_write_document_sql_merge_version_predicate = self.document_write_document_sql_merge_version_predicate or
                     (std.mem.startsWith(u8, entry.plan, "document_merge_write:") and
                         ((structured_summary.parser.starts_with_merge and structured_summary.parser.underscore_version_identifier) or
@@ -18069,8 +19520,32 @@ pub const AppParityCorpusCoverage = struct {
                 const is_read_window = structured_summary.plan.read_window;
                 const has_read_query_expression = structured_summary.plan.read_query_expression;
                 const has_read_source_expression = structured_summary.plan.read_source_expression;
+                const is_public_quantified_subquery = is_read_query and
+                    sql_adapter.planHasNonZeroToken(entry.plan, ":subquery_pred=");
                 self.read = true;
                 self.read_query = self.read_query or is_read_query;
+                self.read_quantified_subquery_not_equal_any = self.read_quantified_subquery_not_equal_any or
+                    (is_public_quantified_subquery and std.mem.indexOf(u8, entry.sql, "<> ANY (SELECT") != null);
+                self.read_quantified_subquery_greater_than_all = self.read_quantified_subquery_greater_than_all or
+                    (is_public_quantified_subquery and std.mem.indexOf(u8, entry.sql, " > ALL (SELECT") != null);
+                self.read_quantified_subquery_greater_equal_all = self.read_quantified_subquery_greater_equal_all or
+                    (is_public_quantified_subquery and std.mem.indexOf(u8, entry.sql, " >= ALL (SELECT") != null);
+                self.read_quantified_subquery_less_than_any = self.read_quantified_subquery_less_than_any or
+                    (is_public_quantified_subquery and std.mem.indexOf(u8, entry.sql, " < ANY (SELECT") != null);
+                self.read_quantified_subquery_less_equal_any = self.read_quantified_subquery_less_equal_any or
+                    (is_public_quantified_subquery and std.mem.indexOf(u8, entry.sql, " <= ANY (SELECT") != null);
+                self.read_quantified_subquery_like_some = self.read_quantified_subquery_like_some or
+                    (is_public_quantified_subquery and std.mem.indexOf(u8, entry.sql, " LIKE SOME (SELECT") != null);
+                self.read_quantified_subquery_ilike_some = self.read_quantified_subquery_ilike_some or
+                    (is_public_quantified_subquery and std.mem.indexOf(u8, entry.sql, " ILIKE SOME (SELECT") != null);
+                self.read_quantified_subquery_ilike_all = self.read_quantified_subquery_ilike_all or
+                    (is_public_quantified_subquery and
+                        std.mem.indexOf(u8, entry.sql, " ILIKE ALL (SELECT") != null and
+                        std.mem.indexOf(u8, entry.sql, " NOT ILIKE ALL (SELECT") == null);
+                self.read_quantified_subquery_not_like_any = self.read_quantified_subquery_not_like_any or
+                    (is_public_quantified_subquery and std.mem.indexOf(u8, entry.sql, " NOT LIKE ANY (SELECT") != null);
+                self.read_quantified_subquery_not_ilike_any = self.read_quantified_subquery_not_ilike_any or
+                    (is_public_quantified_subquery and std.mem.indexOf(u8, entry.sql, " NOT ILIKE ANY (SELECT") != null);
                 self.read_recursive_cte_stream_plan = self.read_recursive_cte_stream_plan or is_read_recursive_cte;
                 self.read_aggregate = self.read_aggregate or is_read_aggregate;
                 self.read_join = self.read_join or is_read_join;
@@ -18191,13 +19666,6 @@ pub const AppParityCorpusCoverage = struct {
             self.unsupported_read_set_operation_output_shape = self.unsupported_read_set_operation_output_shape or
                 (structured_summary.hasReason("set_operation_output_shape") and
                     structured_summary.parser.intersect);
-            self.unsupported_read_subquery_predicate = self.unsupported_read_subquery_predicate or
-                structured_summary.hasReason("subquery_scalar_plan") or
-                structured_summary.hasReason("subquery_semijoin_plan") or
-                structured_summary.hasReason("subquery_quantified_plan");
-            self.unsupported_read_correlated_subquery_predicate = self.unsupported_read_correlated_subquery_predicate or
-                (structured_summary.hasReason("subquery_semijoin_plan") and
-                    std.mem.eql(u8, entry.name, "read correlated subquery predicate"));
             self.unsupported_read_document_view_mapping_projection_expression = self.unsupported_read_document_view_mapping_projection_expression or
                 (structured_summary.hasReason("document_sql_view_mapping_unsupported") and
                     structured_summary.parser.support_view_identifier and
@@ -19839,6 +21307,34 @@ test "sql adapter corpus emits structured fixture summaries" {
     try std.testing.expect(document_view_unnest.parser.unnest_function);
     try std.testing.expect(document_view_unnest.parser.tag_identifier);
     try std.testing.expect(document_view_unnest.parser.tag_list_identifier);
+
+    var document_view_unnest_range_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag > 'm' LIMIT 10");
+    defer document_view_unnest_range_sql.deinit(alloc);
+    const document_view_unnest_range = appParityStructuredFixtureSummary(.{
+        .name = "document sql view mapping unnest range indexed read",
+        .sql = "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag > 'm' LIMIT 10",
+        .family = .read,
+        .plan = "document_query",
+    }, &document_view_unnest_range_sql);
+    try std.testing.expect(document_view_unnest_range.parser.support_view_identifier);
+    try std.testing.expect(document_view_unnest_range.parser.unnest_function);
+    try std.testing.expect(document_view_unnest_range.parser.tag_identifier);
+    try std.testing.expect(document_view_unnest_range.parser.tag_list_identifier);
+    try std.testing.expect(document_view_unnest_range.parser.gt_or_gte_operator);
+
+    var document_view_unnest_null_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag IS NULL LIMIT 10");
+    defer document_view_unnest_null_sql.deinit(alloc);
+    const document_view_unnest_null = appParityStructuredFixtureSummary(.{
+        .name = "document sql view mapping unnest null indexed read",
+        .sql = "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag IS NULL LIMIT 10",
+        .family = .read,
+        .plan = "document_query",
+    }, &document_view_unnest_null_sql);
+    try std.testing.expect(document_view_unnest_null.parser.support_view_identifier);
+    try std.testing.expect(document_view_unnest_null.parser.unnest_function);
+    try std.testing.expect(document_view_unnest_null.parser.tag_identifier);
+    try std.testing.expect(document_view_unnest_null.parser.tag_list_identifier);
+    try std.testing.expect(document_view_unnest_null.parser.is_null_predicate);
 
     var document_projection_insert_sql = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch')");
     defer document_projection_insert_sql.deinit(alloc);

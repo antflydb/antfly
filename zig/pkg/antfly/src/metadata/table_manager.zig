@@ -325,8 +325,10 @@ pub const SecondaryIndexRebuildRangeRecord = struct {
 
 pub const schema_rewrite_declared = "declared";
 pub const schema_rewrite_running = "running";
+pub const schema_rewrite_paused = "paused";
 pub const schema_rewrite_ready = "ready";
 pub const schema_rewrite_invalid = "invalid";
+pub const schema_rewrite_canceled = "canceled";
 
 pub const SchemaRewriteExpression = struct {
     target_column: []const u8,
@@ -382,6 +384,11 @@ pub const SchemaRewriteJobInvalidateRequest = struct {
     last_error: []const u8,
 };
 
+pub const SchemaRewriteJobControlRequest = struct {
+    job_id: u64,
+    reason: []const u8 = "",
+};
+
 pub const TableCatalogUpdateWithSchemaRewriteJobsRequest = struct {
     table: TableRecord,
     schema_rewrite_jobs: []const SchemaRewriteJobRecord = &.{},
@@ -402,8 +409,10 @@ pub const TableCatalogDropWithSchemaRewriteJobsRequest = struct {
 
 pub const table_emptying_declared = "declared";
 pub const table_emptying_running = "running";
+pub const table_emptying_paused = "paused";
 pub const table_emptying_ready = "ready";
 pub const table_emptying_invalid = "invalid";
+pub const table_emptying_canceled = "canceled";
 
 pub const TableEmptyingJobRecord = struct {
     job_id: u64,
@@ -445,6 +454,11 @@ pub const TableEmptyingJobInvalidateRequest = struct {
     job_id: u64,
     lease_owner: []const u8,
     last_error: []const u8,
+};
+
+pub const TableEmptyingJobControlRequest = struct {
+    job_id: u64,
+    reason: []const u8 = "",
 };
 
 pub const TableEmptyingBarrierPromotion = struct {
@@ -580,8 +594,10 @@ pub fn secondaryIndexRebuildRangeComplete(record: SecondaryIndexRebuildRangeReco
 pub fn schemaRewriteJobStateValid(state: []const u8) bool {
     return std.mem.eql(u8, state, schema_rewrite_declared) or
         std.mem.eql(u8, state, schema_rewrite_running) or
+        std.mem.eql(u8, state, schema_rewrite_paused) or
         std.mem.eql(u8, state, schema_rewrite_ready) or
-        std.mem.eql(u8, state, schema_rewrite_invalid);
+        std.mem.eql(u8, state, schema_rewrite_invalid) or
+        std.mem.eql(u8, state, schema_rewrite_canceled);
 }
 
 pub fn schemaRewriteJobComplete(record: SchemaRewriteJobRecord) bool {
@@ -591,8 +607,10 @@ pub fn schemaRewriteJobComplete(record: SchemaRewriteJobRecord) bool {
 pub fn tableEmptyingJobStateValid(state: []const u8) bool {
     return std.mem.eql(u8, state, table_emptying_declared) or
         std.mem.eql(u8, state, table_emptying_running) or
+        std.mem.eql(u8, state, table_emptying_paused) or
         std.mem.eql(u8, state, table_emptying_ready) or
-        std.mem.eql(u8, state, table_emptying_invalid);
+        std.mem.eql(u8, state, table_emptying_invalid) or
+        std.mem.eql(u8, state, table_emptying_canceled);
 }
 
 pub fn tableEmptyingJobComplete(record: TableEmptyingJobRecord) bool {
@@ -1878,6 +1896,55 @@ pub const TableManager = struct {
         try self.upsertSchemaRewriteJob(updated);
     }
 
+    pub fn pauseSchemaRewriteJob(self: *TableManager, request: SchemaRewriteJobControlRequest) !void {
+        const record = self.findSchemaRewriteJob(request.job_id) orelse return error.UnknownSchemaRewriteJob;
+        if (!std.mem.eql(u8, record.state, schema_rewrite_declared) and
+            !std.mem.eql(u8, record.state, schema_rewrite_running))
+        {
+            return error.SchemaRewriteJobNotDeclared;
+        }
+        var updated = record.*;
+        updated.state = schema_rewrite_paused;
+        updated.lease_owner = "";
+        updated.lease_expires_at_ms = 0;
+        updated.last_error = request.reason;
+        try self.upsertSchemaRewriteJob(updated);
+    }
+
+    pub fn resumeSchemaRewriteJob(self: *TableManager, request: SchemaRewriteJobControlRequest) !void {
+        const record = self.findSchemaRewriteJob(request.job_id) orelse return error.UnknownSchemaRewriteJob;
+        if (!std.mem.eql(u8, record.state, schema_rewrite_paused)) return error.SchemaRewriteJobNotPaused;
+        var updated = record.*;
+        updated.state = schema_rewrite_declared;
+        updated.lease_owner = "";
+        updated.lease_expires_at_ms = 0;
+        updated.last_error = request.reason;
+        try self.upsertSchemaRewriteJob(updated);
+    }
+
+    pub fn retrySchemaRewriteJob(self: *TableManager, request: SchemaRewriteJobControlRequest) !void {
+        const record = self.findSchemaRewriteJob(request.job_id) orelse return error.UnknownSchemaRewriteJob;
+        if (!std.mem.eql(u8, record.state, schema_rewrite_invalid)) return error.SchemaRewriteJobNotInvalid;
+        var updated = record.*;
+        updated.state = schema_rewrite_declared;
+        updated.lease_owner = "";
+        updated.lease_expires_at_ms = 0;
+        updated.last_error = request.reason;
+        try self.upsertSchemaRewriteJob(updated);
+    }
+
+    pub fn cancelSchemaRewriteJob(self: *TableManager, request: SchemaRewriteJobControlRequest) !void {
+        const record = self.findSchemaRewriteJob(request.job_id) orelse return error.UnknownSchemaRewriteJob;
+        if (std.mem.eql(u8, record.state, schema_rewrite_ready)) return error.SchemaRewriteJobComplete;
+        if (std.mem.eql(u8, record.state, schema_rewrite_canceled)) return error.SchemaRewriteJobCanceled;
+        var updated = record.*;
+        updated.state = schema_rewrite_canceled;
+        updated.lease_owner = "";
+        updated.lease_expires_at_ms = 0;
+        updated.last_error = request.reason;
+        try self.upsertSchemaRewriteJob(updated);
+    }
+
     pub fn beginTableEmptyingJob(self: *TableManager, request: TableEmptyingJobBeginRequest) !void {
         if (request.lease_owner.len == 0 or request.lease_expires_at_ms <= request.now_ms) return error.InvalidTableEmptyingJobLease;
         const record = self.findTableEmptyingJob(request.job_id) orelse return error.UnknownTableEmptyingJob;
@@ -1918,6 +1985,55 @@ pub const TableManager = struct {
         updated.lease_owner = "";
         updated.lease_expires_at_ms = 0;
         updated.last_error = request.last_error;
+        try self.upsertTableEmptyingJob(updated);
+    }
+
+    pub fn pauseTableEmptyingJob(self: *TableManager, request: TableEmptyingJobControlRequest) !void {
+        const record = self.findTableEmptyingJob(request.job_id) orelse return error.UnknownTableEmptyingJob;
+        if (!std.mem.eql(u8, record.state, table_emptying_declared) and
+            !std.mem.eql(u8, record.state, table_emptying_running))
+        {
+            return error.TableEmptyingJobNotDeclared;
+        }
+        var updated = record.*;
+        updated.state = table_emptying_paused;
+        updated.lease_owner = "";
+        updated.lease_expires_at_ms = 0;
+        updated.last_error = request.reason;
+        try self.upsertTableEmptyingJob(updated);
+    }
+
+    pub fn resumeTableEmptyingJob(self: *TableManager, request: TableEmptyingJobControlRequest) !void {
+        const record = self.findTableEmptyingJob(request.job_id) orelse return error.UnknownTableEmptyingJob;
+        if (!std.mem.eql(u8, record.state, table_emptying_paused)) return error.TableEmptyingJobNotPaused;
+        var updated = record.*;
+        updated.state = table_emptying_declared;
+        updated.lease_owner = "";
+        updated.lease_expires_at_ms = 0;
+        updated.last_error = request.reason;
+        try self.upsertTableEmptyingJob(updated);
+    }
+
+    pub fn retryTableEmptyingJob(self: *TableManager, request: TableEmptyingJobControlRequest) !void {
+        const record = self.findTableEmptyingJob(request.job_id) orelse return error.UnknownTableEmptyingJob;
+        if (!std.mem.eql(u8, record.state, table_emptying_invalid)) return error.TableEmptyingJobNotInvalid;
+        var updated = record.*;
+        updated.state = table_emptying_declared;
+        updated.lease_owner = "";
+        updated.lease_expires_at_ms = 0;
+        updated.last_error = request.reason;
+        try self.upsertTableEmptyingJob(updated);
+    }
+
+    pub fn cancelTableEmptyingJob(self: *TableManager, request: TableEmptyingJobControlRequest) !void {
+        const record = self.findTableEmptyingJob(request.job_id) orelse return error.UnknownTableEmptyingJob;
+        if (std.mem.eql(u8, record.state, table_emptying_ready)) return error.TableEmptyingJobComplete;
+        if (std.mem.eql(u8, record.state, table_emptying_canceled)) return error.TableEmptyingJobCanceled;
+        var updated = record.*;
+        updated.state = table_emptying_canceled;
+        updated.lease_owner = "";
+        updated.lease_expires_at_ms = 0;
+        updated.last_error = request.reason;
         try self.upsertTableEmptyingJob(updated);
     }
 
@@ -5012,6 +5128,111 @@ test "table manager applies schema rewrite job lifecycle operations" {
     }));
 }
 
+test "table manager applies schema rewrite operator controls" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders" });
+    try manager.upsertSchemaRewriteJob(.{
+        .job_id = 9101,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "",
+        .full_row_rewrite = true,
+    });
+
+    try manager.pauseSchemaRewriteJob(.{
+        .job_id = 9101,
+        .reason = "operator pause",
+    });
+    {
+        const jobs = try manager.listSchemaRewriteJobs(std.testing.allocator);
+        defer manager.freeSchemaRewriteJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqualStrings(schema_rewrite_paused, jobs[0].state);
+        try std.testing.expectEqualStrings("", jobs[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 0), jobs[0].lease_expires_at_ms);
+        try std.testing.expectEqualStrings("operator pause", jobs[0].last_error);
+    }
+    try std.testing.expectError(error.SchemaRewriteJobNotDeclared, manager.beginSchemaRewriteJob(.{
+        .job_id = 9101,
+        .lease_owner = "worker-a",
+        .now_ms = 1000,
+        .lease_expires_at_ms = 2000,
+    }));
+
+    try manager.resumeSchemaRewriteJob(.{
+        .job_id = 9101,
+        .reason = "operator resume",
+    });
+    try manager.beginSchemaRewriteJob(.{
+        .job_id = 9101,
+        .lease_owner = "worker-a",
+        .now_ms = 1000,
+        .lease_expires_at_ms = 2000,
+    });
+    {
+        const jobs = try manager.listSchemaRewriteJobs(std.testing.allocator);
+        defer manager.freeSchemaRewriteJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqualStrings(schema_rewrite_running, jobs[0].state);
+        try std.testing.expectEqualStrings("worker-a", jobs[0].lease_owner);
+        try std.testing.expectEqual(@as(u32, 1), jobs[0].attempts);
+    }
+
+    try manager.pauseSchemaRewriteJob(.{
+        .job_id = 9101,
+        .reason = "operator takeover pause",
+    });
+    try manager.resumeSchemaRewriteJob(.{ .job_id = 9101 });
+    try manager.beginSchemaRewriteJob(.{
+        .job_id = 9101,
+        .lease_owner = "worker-b",
+        .now_ms = 2100,
+        .lease_expires_at_ms = 3000,
+    });
+    try manager.invalidateSchemaRewriteJob(.{
+        .job_id = 9101,
+        .lease_owner = "worker-b",
+        .last_error = "worker failure",
+    });
+    try manager.retrySchemaRewriteJob(.{
+        .job_id = 9101,
+        .reason = "operator retry",
+    });
+    {
+        const jobs = try manager.listSchemaRewriteJobs(std.testing.allocator);
+        defer manager.freeSchemaRewriteJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqualStrings(schema_rewrite_declared, jobs[0].state);
+        try std.testing.expectEqualStrings("", jobs[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 0), jobs[0].lease_expires_at_ms);
+        try std.testing.expectEqualStrings("operator retry", jobs[0].last_error);
+        try std.testing.expectEqual(@as(u32, 2), jobs[0].attempts);
+    }
+
+    try manager.cancelSchemaRewriteJob(.{
+        .job_id = 9101,
+        .reason = "operator cancel",
+    });
+    {
+        const jobs = try manager.listSchemaRewriteJobs(std.testing.allocator);
+        defer manager.freeSchemaRewriteJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqualStrings(schema_rewrite_canceled, jobs[0].state);
+        try std.testing.expectEqualStrings("operator cancel", jobs[0].last_error);
+    }
+    try std.testing.expectError(error.SchemaRewriteJobNotDeclared, manager.beginSchemaRewriteJob(.{
+        .job_id = 9101,
+        .lease_owner = "worker-c",
+        .now_ms = 4000,
+        .lease_expires_at_ms = 5000,
+    }));
+
+    try std.testing.expectError(error.SchemaRewriteJobCanceled, manager.cancelSchemaRewriteJob(.{ .job_id = 9101 }));
+    try std.testing.expectError(error.SchemaRewriteJobNotPaused, manager.resumeSchemaRewriteJob(.{ .job_id = 9101 }));
+    try std.testing.expectError(error.SchemaRewriteJobNotInvalid, manager.retrySchemaRewriteJob(.{ .job_id = 9101 }));
+}
+
 test "table emptying affected table ids require primary nonzero unique membership" {
     try std.testing.expect(tableEmptyingAffectedTableIdsValid(7, &.{7}));
     try std.testing.expect(tableEmptyingAffectedTableIdsValid(7, &.{ 8, 7, 9 }));
@@ -5358,6 +5579,109 @@ test "table manager applies table emptying job lifecycle operations" {
         .completed_row_count = 1,
         .progress_row_key = "order:a",
     }));
+}
+
+test "table manager applies table emptying operator controls" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders" });
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 9201,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{7},
+        .restart_identity = true,
+    });
+
+    try manager.pauseTableEmptyingJob(.{
+        .job_id = 9201,
+        .reason = "operator pause",
+    });
+    {
+        const jobs = try manager.listTableEmptyingJobs(std.testing.allocator);
+        defer manager.freeTableEmptyingJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqualStrings(table_emptying_paused, jobs[0].state);
+        try std.testing.expectEqualStrings("", jobs[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 0), jobs[0].lease_expires_at_ms);
+        try std.testing.expectEqualStrings("operator pause", jobs[0].last_error);
+    }
+    try std.testing.expectError(error.TableEmptyingJobNotDeclared, manager.beginTableEmptyingJob(.{
+        .job_id = 9201,
+        .lease_owner = "worker-a",
+        .now_ms = 1000,
+        .lease_expires_at_ms = 2000,
+    }));
+
+    try manager.resumeTableEmptyingJob(.{
+        .job_id = 9201,
+        .reason = "operator resume",
+    });
+    try manager.beginTableEmptyingJob(.{
+        .job_id = 9201,
+        .lease_owner = "worker-a",
+        .now_ms = 1000,
+        .lease_expires_at_ms = 2000,
+    });
+    {
+        const jobs = try manager.listTableEmptyingJobs(std.testing.allocator);
+        defer manager.freeTableEmptyingJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqualStrings(table_emptying_running, jobs[0].state);
+        try std.testing.expectEqualStrings("worker-a", jobs[0].lease_owner);
+        try std.testing.expectEqual(@as(u32, 1), jobs[0].attempts);
+    }
+
+    try manager.pauseTableEmptyingJob(.{
+        .job_id = 9201,
+        .reason = "operator takeover pause",
+    });
+    try manager.resumeTableEmptyingJob(.{ .job_id = 9201 });
+    try manager.beginTableEmptyingJob(.{
+        .job_id = 9201,
+        .lease_owner = "worker-b",
+        .now_ms = 2100,
+        .lease_expires_at_ms = 3000,
+    });
+    try manager.invalidateTableEmptyingJob(.{
+        .job_id = 9201,
+        .lease_owner = "worker-b",
+        .last_error = "worker failure",
+    });
+    try manager.retryTableEmptyingJob(.{
+        .job_id = 9201,
+        .reason = "operator retry",
+    });
+    {
+        const jobs = try manager.listTableEmptyingJobs(std.testing.allocator);
+        defer manager.freeTableEmptyingJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqualStrings(table_emptying_declared, jobs[0].state);
+        try std.testing.expectEqualStrings("", jobs[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 0), jobs[0].lease_expires_at_ms);
+        try std.testing.expectEqualStrings("operator retry", jobs[0].last_error);
+        try std.testing.expectEqual(@as(u32, 2), jobs[0].attempts);
+    }
+
+    try manager.cancelTableEmptyingJob(.{
+        .job_id = 9201,
+        .reason = "operator cancel",
+    });
+    {
+        const jobs = try manager.listTableEmptyingJobs(std.testing.allocator);
+        defer manager.freeTableEmptyingJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqualStrings(table_emptying_canceled, jobs[0].state);
+        try std.testing.expectEqualStrings("operator cancel", jobs[0].last_error);
+    }
+    try std.testing.expectError(error.TableEmptyingJobNotDeclared, manager.beginTableEmptyingJob(.{
+        .job_id = 9201,
+        .lease_owner = "worker-c",
+        .now_ms = 4000,
+        .lease_expires_at_ms = 5000,
+    }));
+
+    try std.testing.expectError(error.TableEmptyingJobCanceled, manager.cancelTableEmptyingJob(.{ .job_id = 9201 }));
+    try std.testing.expectError(error.TableEmptyingJobNotPaused, manager.resumeTableEmptyingJob(.{ .job_id = 9201 }));
+    try std.testing.expectError(error.TableEmptyingJobNotInvalid, manager.retryTableEmptyingJob(.{ .job_id = 9201 }));
 }
 
 test "table manager applies secondary index rebuild lifecycle operations" {

@@ -47,6 +47,22 @@ pub const CatalogSource = struct {
             ptr: *anyopaque,
             request: metadata_table_manager.SchemaRewriteJobInvalidateRequest,
         ) anyerror!void = null,
+        pause_schema_rewrite_job: ?*const fn (
+            ptr: *anyopaque,
+            request: metadata_table_manager.SchemaRewriteJobControlRequest,
+        ) anyerror!void = null,
+        resume_schema_rewrite_job: ?*const fn (
+            ptr: *anyopaque,
+            request: metadata_table_manager.SchemaRewriteJobControlRequest,
+        ) anyerror!void = null,
+        retry_schema_rewrite_job: ?*const fn (
+            ptr: *anyopaque,
+            request: metadata_table_manager.SchemaRewriteJobControlRequest,
+        ) anyerror!void = null,
+        cancel_schema_rewrite_job: ?*const fn (
+            ptr: *anyopaque,
+            request: metadata_table_manager.SchemaRewriteJobControlRequest,
+        ) anyerror!void = null,
         upsert_table_emptying_job: ?*const fn (
             ptr: *anyopaque,
             record: metadata_table_manager.TableEmptyingJobRecord,
@@ -82,6 +98,22 @@ pub const CatalogSource = struct {
         invalidate_table_emptying_job: ?*const fn (
             ptr: *anyopaque,
             request: metadata_table_manager.TableEmptyingJobInvalidateRequest,
+        ) anyerror!void = null,
+        pause_table_emptying_job: ?*const fn (
+            ptr: *anyopaque,
+            request: metadata_table_manager.TableEmptyingJobControlRequest,
+        ) anyerror!void = null,
+        resume_table_emptying_job: ?*const fn (
+            ptr: *anyopaque,
+            request: metadata_table_manager.TableEmptyingJobControlRequest,
+        ) anyerror!void = null,
+        retry_table_emptying_job: ?*const fn (
+            ptr: *anyopaque,
+            request: metadata_table_manager.TableEmptyingJobControlRequest,
+        ) anyerror!void = null,
+        cancel_table_emptying_job: ?*const fn (
+            ptr: *anyopaque,
+            request: metadata_table_manager.TableEmptyingJobControlRequest,
         ) anyerror!void = null,
         promote_table_emptying_barrier: ?*const fn (
             ptr: *anyopaque,
@@ -161,6 +193,38 @@ pub const CatalogSource = struct {
         return try fn_ptr(self.ptr, request);
     }
 
+    pub fn pauseSchemaRewriteJob(
+        self: CatalogSource,
+        request: metadata_table_manager.SchemaRewriteJobControlRequest,
+    ) !void {
+        const fn_ptr = self.vtable.pause_schema_rewrite_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn resumeSchemaRewriteJob(
+        self: CatalogSource,
+        request: metadata_table_manager.SchemaRewriteJobControlRequest,
+    ) !void {
+        const fn_ptr = self.vtable.resume_schema_rewrite_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn retrySchemaRewriteJob(
+        self: CatalogSource,
+        request: metadata_table_manager.SchemaRewriteJobControlRequest,
+    ) !void {
+        const fn_ptr = self.vtable.retry_schema_rewrite_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn cancelSchemaRewriteJob(
+        self: CatalogSource,
+        request: metadata_table_manager.SchemaRewriteJobControlRequest,
+    ) !void {
+        const fn_ptr = self.vtable.cancel_schema_rewrite_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
     pub fn upsertTableEmptyingJob(
         self: CatalogSource,
         record: metadata_table_manager.TableEmptyingJobRecord,
@@ -230,6 +294,38 @@ pub const CatalogSource = struct {
         request: metadata_table_manager.TableEmptyingJobInvalidateRequest,
     ) !void {
         const fn_ptr = self.vtable.invalidate_table_emptying_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn pauseTableEmptyingJob(
+        self: CatalogSource,
+        request: metadata_table_manager.TableEmptyingJobControlRequest,
+    ) !void {
+        const fn_ptr = self.vtable.pause_table_emptying_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn resumeTableEmptyingJob(
+        self: CatalogSource,
+        request: metadata_table_manager.TableEmptyingJobControlRequest,
+    ) !void {
+        const fn_ptr = self.vtable.resume_table_emptying_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn retryTableEmptyingJob(
+        self: CatalogSource,
+        request: metadata_table_manager.TableEmptyingJobControlRequest,
+    ) !void {
+        const fn_ptr = self.vtable.retry_table_emptying_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn cancelTableEmptyingJob(
+        self: CatalogSource,
+        request: metadata_table_manager.TableEmptyingJobControlRequest,
+    ) !void {
+        const fn_ptr = self.vtable.cancel_table_emptying_job orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, request);
     }
 

@@ -1188,6 +1188,7 @@ fn documentSqlFieldTypeFromViewMappingFieldValue(value: std.json.Value) !?runtim
 
 fn documentSqlFieldTypeFromTypedPathTypeName(type_name: []const u8) ?runtime_schema.AntflyType {
     if (std.mem.eql(u8, type_name, "keyword") or std.mem.eql(u8, type_name, "term")) return .keyword;
+    if (std.mem.eql(u8, type_name, "text")) return .text;
     if (std.mem.eql(u8, type_name, "numeric")) return .numeric;
     if (std.mem.eql(u8, type_name, "boolean")) return .boolean;
     if (std.mem.eql(u8, type_name, "datetime")) return .datetime;
@@ -1438,8 +1439,41 @@ fn appendDocumentSqlViewMappingVirtualFieldAlloc(
     array_item_type: ?runtime_schema.AntflyType,
     nullable: ?bool,
 ) !void {
+    if (documentSqlDeclaredVirtualFieldCanBecomeViewMapping(fields, name, path, field_type, array_item_type, nullable)) |index| {
+        fields.items[index].source = .view_mapping;
+        if (field_type) |field_type_value| fields.items[index].field_type = field_type_value;
+        if (array_item_type) |array_item_type_value| fields.items[index].array_item_type = array_item_type_value;
+        if (nullable) |nullable_value| fields.items[index].nullable = nullable_value;
+        return;
+    }
     if (documentSqlVirtualFieldNameExists(fields.*, name)) return error.InvalidSqlCatalog;
     try appendDocumentSqlVirtualFieldWithNullabilityAlloc(alloc, fields, name, path, .view_mapping, field_type, array_item_type, nullable);
+}
+
+fn documentSqlDeclaredVirtualFieldCanBecomeViewMapping(
+    fields: *std.ArrayListUnmanaged(DocumentSqlVirtualField),
+    name: []const u8,
+    path: []const u8,
+    field_type: ?runtime_schema.AntflyType,
+    array_item_type: ?runtime_schema.AntflyType,
+    nullable: ?bool,
+) ?usize {
+    for (fields.items, 0..) |field, index| {
+        if (!std.ascii.eqlIgnoreCase(field.name, name)) continue;
+        if (field.source != .declared_schema) return null;
+        if (!documentScalarFilterPathEqual(field.path, path)) return null;
+        if (field_type) |expected| {
+            if (field.field_type == null or field.field_type.? != expected) return null;
+        }
+        if (array_item_type) |expected| {
+            if (field.array_item_type == null or field.array_item_type.? != expected) return null;
+        }
+        if (nullable) |expected| {
+            if (field.nullable == null or field.nullable.? != expected) return null;
+        }
+        return index;
+    }
+    return null;
 }
 
 fn appendDocumentSqlVirtualFieldWithNullabilityAlloc(
@@ -2228,23 +2262,35 @@ test "source binding classifies relational document and lake schemas" {
     var view_mapping_virtual_schema = try documentSqlSchemaForRuntimeSchemaAndIndexesJsonAlloc(
         alloc,
         unavailable_schema,
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\",\"nullable\":false},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\",\"nullable\":true},{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}}}",
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"title_text\",\"path\":\"title\",\"type\":\"text\"},{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\",\"nullable\":false},{\"name\":\"region\",\"path\":\"metadata.region\",\"type\":\"keyword\",\"nullable\":true},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\",\"nullable\":true},{\"name\":\"published\",\"path\":\"published\",\"type\":\"boolean\",\"nullable\":true},{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}}}",
     );
     defer deinitDocumentSqlSchema(alloc, &view_mapping_virtual_schema);
-    try std.testing.expectEqual(@as(usize, 5), view_mapping_virtual_schema.fields.len);
-    try std.testing.expectEqual(@as(usize, 3), view_mapping_virtual_schema.typed_paths.len);
+    try std.testing.expectEqual(@as(usize, 8), view_mapping_virtual_schema.fields.len);
+    try std.testing.expectEqual(@as(usize, 6), view_mapping_virtual_schema.typed_paths.len);
+    try std.testing.expectEqual(runtime_schema.AntflyType.text, documentSqlTypedPathType(view_mapping_virtual_schema, "/title").?);
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, documentSqlTypedPathType(view_mapping_virtual_schema, "/metadata/plan").?);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, documentSqlTypedPathType(view_mapping_virtual_schema, "/metadata/region").?);
     try std.testing.expectEqual(runtime_schema.AntflyType.numeric, documentSqlTypedPathType(view_mapping_virtual_schema, "/metrics/score").?);
+    try std.testing.expectEqual(runtime_schema.AntflyType.boolean, documentSqlTypedPathType(view_mapping_virtual_schema, "/published").?);
     try std.testing.expectEqual(runtime_schema.AntflyType.array, documentSqlTypedPathType(view_mapping_virtual_schema, "/tags").?);
     try std.testing.expectEqual(@as(usize, 1), view_mapping_virtual_schema.view_mappings.len);
     try std.testing.expectEqualStrings("support_view", view_mapping_virtual_schema.view_mappings[0].name);
     try std.testing.expectEqual(@as(usize, 0), view_mapping_virtual_schema.view_mappings[0].required_indexes);
     try std.testing.expect(!view_mapping_virtual_schema.view_mappings[0].required_indexes_ready);
     try std.testing.expect(documentSqlViewMappingSummaryForView(view_mapping_virtual_schema, "support_view") != null);
+    var saw_title_text_view_field = false;
     var saw_plan_view_field = false;
+    var saw_region_view_field = false;
     var saw_score_view_field = false;
+    var saw_published_view_field = false;
     var saw_tags_view_field = false;
     for (view_mapping_virtual_schema.fields) |field| {
+        if (std.mem.eql(u8, field.name, "title_text")) {
+            saw_title_text_view_field = true;
+            try std.testing.expectEqual(DocumentSqlVirtualFieldSource.view_mapping, field.source);
+            try std.testing.expectEqualStrings("/title", field.path);
+            try std.testing.expectEqual(runtime_schema.AntflyType.text, field.field_type.?);
+        }
         if (std.mem.eql(u8, field.name, "plan")) {
             saw_plan_view_field = true;
             try std.testing.expectEqual(DocumentSqlVirtualFieldSource.view_mapping, field.source);
@@ -2252,11 +2298,25 @@ test "source binding classifies relational document and lake schemas" {
             try std.testing.expectEqual(runtime_schema.AntflyType.keyword, field.field_type.?);
             try std.testing.expectEqual(false, field.nullable.?);
         }
+        if (std.mem.eql(u8, field.name, "region")) {
+            saw_region_view_field = true;
+            try std.testing.expectEqual(DocumentSqlVirtualFieldSource.view_mapping, field.source);
+            try std.testing.expectEqualStrings("/metadata/region", field.path);
+            try std.testing.expectEqual(runtime_schema.AntflyType.keyword, field.field_type.?);
+            try std.testing.expectEqual(true, field.nullable.?);
+        }
         if (std.mem.eql(u8, field.name, "score")) {
             saw_score_view_field = true;
             try std.testing.expectEqual(DocumentSqlVirtualFieldSource.view_mapping, field.source);
             try std.testing.expectEqualStrings("/metrics/score", field.path);
             try std.testing.expectEqual(runtime_schema.AntflyType.numeric, field.field_type.?);
+            try std.testing.expectEqual(true, field.nullable.?);
+        }
+        if (std.mem.eql(u8, field.name, "published")) {
+            saw_published_view_field = true;
+            try std.testing.expectEqual(DocumentSqlVirtualFieldSource.view_mapping, field.source);
+            try std.testing.expectEqualStrings("/published", field.path);
+            try std.testing.expectEqual(runtime_schema.AntflyType.boolean, field.field_type.?);
             try std.testing.expectEqual(true, field.nullable.?);
         }
         if (std.mem.eql(u8, field.name, "tag_list")) {
@@ -2267,8 +2327,11 @@ test "source binding classifies relational document and lake schemas" {
             try std.testing.expectEqual(runtime_schema.AntflyType.keyword, field.array_item_type.?);
         }
     }
+    try std.testing.expect(saw_title_text_view_field);
     try std.testing.expect(saw_plan_view_field);
+    try std.testing.expect(saw_region_view_field);
     try std.testing.expect(saw_score_view_field);
+    try std.testing.expect(saw_published_view_field);
     try std.testing.expect(saw_tags_view_field);
     try std.testing.expectError(error.InvalidSqlCatalog, documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithSourceTableAlloc(
         alloc,
@@ -2412,6 +2475,30 @@ test "source binding classifies relational document and lake schemas" {
         }
     }
     try std.testing.expect(saw_mapped_status);
+    var same_name_declared_path_view_schema = try documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithSourceTableAlloc(
+        alloc,
+        unavailable_schema,
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"status\",\"path\":\"status\",\"type\":\"keyword\",\"nullable\":true}]}}}",
+        "docs",
+    );
+    defer deinitDocumentSqlSchema(alloc, &same_name_declared_path_view_schema);
+    var saw_status_view_overlay = false;
+    for (same_name_declared_path_view_schema.fields) |field| {
+        if (std.mem.eql(u8, field.name, "status")) {
+            saw_status_view_overlay = true;
+            try std.testing.expectEqual(DocumentSqlVirtualFieldSource.view_mapping, field.source);
+            try std.testing.expectEqualStrings("status", field.path);
+            try std.testing.expectEqual(runtime_schema.AntflyType.keyword, field.field_type.?);
+            try std.testing.expectEqual(true, field.nullable.?);
+        }
+    }
+    try std.testing.expect(saw_status_view_overlay);
+    try std.testing.expectError(error.InvalidSqlCatalog, documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithSourceTableAlloc(
+        alloc,
+        unavailable_schema,
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"status\",\"path\":\"body\",\"type\":\"text\",\"nullable\":true}]}}}",
+        "docs",
+    ));
     try std.testing.expectError(error.InvalidSqlCatalog, documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithSourceTableAlloc(
         alloc,
         unavailable_schema,

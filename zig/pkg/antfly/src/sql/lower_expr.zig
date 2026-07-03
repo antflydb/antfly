@@ -611,6 +611,21 @@ fn generatedSubqueryCorrelationWhereAlloc(
     expression: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !?db_mod.types.RelationalRowsLateralCorrelation {
     const where_expression = expression orelse return null;
+    if (where_expression.kind == .grouped) {
+        const inner = where_expression.inner_expression orelse return error.UnsupportedSqlShape;
+        if (where_expression.inner_expression_kind != null and where_expression.inner_expression_kind.? != inner.kind) return error.UnsupportedSqlShape;
+        const inner_tokens = where_expression.inner_tokens orelse return error.UnsupportedSqlShape;
+        const inner_expression_tokens = inner.tokens orelse return error.UnsupportedSqlShape;
+        if (!generatedTokenRangeEqual(inner_expression_tokens, inner_tokens)) return error.UnsupportedSqlShape;
+        return try generatedSubqueryCorrelationWhereAlloc(
+            alloc,
+            tokens,
+            outer_schema,
+            inner_schema,
+            source_table,
+            inner,
+        );
+    }
     if (where_expression.kind != .comparison) return null;
     const operator_tokens = where_expression.operator_tokens orelse return error.UnsupportedSqlShape;
     if (operator_tokens.end != operator_tokens.start + 1 or tokens[operator_tokens.start].kind != .eq) return null;
@@ -638,6 +653,20 @@ fn generatedSubqueryCorrelationWhereAlloc(
         left,
         right,
     );
+}
+
+fn appendGeneratedSubqueryCorrelationAlloc(
+    alloc: std.mem.Allocator,
+    correlations: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsLateralCorrelation),
+    correlation: db_mod.types.RelationalRowsLateralCorrelation,
+) !void {
+    var correlation_transferred = false;
+    errdefer if (!correlation_transferred) {
+        alloc.free(correlation.left_field);
+        alloc.free(correlation.right_field);
+    };
+    try correlations.append(alloc, correlation);
+    correlation_transferred = true;
 }
 
 fn parseGeneratedSubqueryProjectionAlloc(
@@ -713,6 +742,80 @@ fn parseGeneratedSubqueryProjectionAlloc(
     return output;
 }
 
+fn parseGeneratedSubqueryWhereItemAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    item_tokens: generated_parser.GeneratedSqlTokenRange,
+    params: []const value_mod.SqlValue,
+    schema: runtime_schema.TableSchema,
+    type_context: expr_type.RowExpressionTypeContext,
+    predicates: *std.ArrayListUnmanaged(runtime_schema.RelationalCheck),
+    json_contains: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsJsonContainsPredicate),
+    json_path_eq: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsJsonPathEqPredicate),
+    json_path_exists: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsJsonPathExistsPredicate),
+    array_any: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayAnyPredicate),
+    array_contains: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayContainsPredicate),
+    array_eq: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayEqPredicate),
+    in_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsInPredicate),
+    text_patterns: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsTextPatternPredicate),
+    or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup),
+    not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup),
+    access_or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsAccessPredicateGroup),
+    access_not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsAccessPredicateGroup),
+    expression_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
+    expression_or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+    expression_not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+    expression_array_contains: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionArrayContainsPredicate),
+    subquery_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsSubqueryPredicate),
+    realtime_ns: u64,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
+    available_ctes: []const db_mod.types.RelationalRowsCte,
+    generated_expression_ast: *const generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    if (item_tokens.start >= item_tokens.end or item_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    var item_pos = item_tokens.start;
+    try parseWhereAlloc(
+        alloc,
+        tokens[0..item_tokens.end],
+        &item_pos,
+        params,
+        schema,
+        type_context,
+        &.{},
+        &.{},
+        false,
+        predicates,
+        json_contains,
+        json_path_eq,
+        json_path_exists,
+        array_any,
+        array_contains,
+        array_eq,
+        in_predicates,
+        text_patterns,
+        or_predicates,
+        not_predicates,
+        access_or_predicates,
+        access_not_predicates,
+        expression_predicates,
+        expression_or_predicates,
+        expression_not_predicates,
+        expression_array_contains,
+        subquery_predicates,
+        realtime_ns,
+        fixed_binary_hooks,
+        bare_boolean_hooks,
+        expression_alternatives_hooks,
+        expression_condition_hooks,
+        available_ctes,
+        generated_expression_ast,
+    );
+    if (item_pos != item_tokens.end) return error.UnsupportedSqlShape;
+}
+
 fn parseGeneratedSubqueryRequestAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -761,27 +864,10 @@ fn parseGeneratedSubqueryRequestAlloc(
     errdefer if (output_field.len > 0) alloc.free(output_field);
 
     if (expression.subquery_where_tokens) |where_tokens| {
-        const skip_where_parse = blk: {
-            const correlation = (try generatedSubqueryCorrelationWhereAlloc(
-                alloc,
-                tokens,
-                type_context.schema,
-                subquery_type_context.schema,
-                source_table,
-                expression.subquery_where_expression,
-            )) orelse break :blk false;
-            var correlation_transferred = false;
-            errdefer if (!correlation_transferred) {
-                alloc.free(correlation.left_field);
-                alloc.free(correlation.right_field);
-            };
-            const where_expression = expression.subquery_where_expression orelse return error.UnsupportedSqlShape;
-            const where_expression_tokens = where_expression.tokens orelse return error.UnsupportedSqlShape;
-            if (where_expression_tokens.start != where_tokens.start + 1 or where_expression_tokens.end != where_tokens.end) return error.UnsupportedSqlShape;
-            try correlations.append(alloc, correlation);
-            correlation_transferred = true;
-            break :blk true;
-        };
+        const where_expression = expression.subquery_where_expression orelse return error.UnsupportedSqlShape;
+        const where_expression_tokens = where_expression.tokens orelse return error.UnsupportedSqlShape;
+        if (!generatedTokenRangeEqual(where_expression_tokens, where_tokens)) return error.UnsupportedSqlShape;
+
         var predicates = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
         errdefer {
             freeRelationalChecks(alloc, predicates.items);
@@ -873,7 +959,69 @@ fn parseGeneratedSubqueryRequestAlloc(
             subquery_predicates.deinit(alloc);
         }
 
-        if (!skip_where_parse) {
+        if (where_expression.kind == .logical_and) {
+            const condition_items = where_expression.boolean_condition_items;
+            if (condition_items.items.len != condition_items.count or condition_items.expressions.len != condition_items.count) return error.UnsupportedSqlShape;
+            for (condition_items.expressions, 0..) |*condition_expression, condition_index| {
+                const condition_tokens = condition_items.items[condition_index];
+                const condition_expression_tokens = condition_expression.tokens orelse return error.UnsupportedSqlShape;
+                if (!generatedTokenRangeEqual(condition_expression_tokens, condition_tokens)) return error.UnsupportedSqlShape;
+                const correlation = try generatedSubqueryCorrelationWhereAlloc(
+                    alloc,
+                    tokens,
+                    type_context.schema,
+                    subquery_type_context.schema,
+                    source_table,
+                    condition_expression,
+                );
+                if (correlation) |value| {
+                    try appendGeneratedSubqueryCorrelationAlloc(alloc, &correlations, value);
+                    continue;
+                }
+                try parseGeneratedSubqueryWhereItemAlloc(
+                    alloc,
+                    tokens,
+                    condition_tokens,
+                    params,
+                    schema,
+                    subquery_type_context,
+                    &predicates,
+                    &json_contains,
+                    &json_path_eq,
+                    &json_path_exists,
+                    &array_any,
+                    &array_contains,
+                    &array_eq,
+                    &in_predicates,
+                    &text_patterns,
+                    &or_predicates,
+                    &not_predicates,
+                    &access_or_predicates,
+                    &access_not_predicates,
+                    &expression_predicates,
+                    &expression_or_predicates,
+                    &expression_not_predicates,
+                    &expression_array_contains,
+                    &subquery_predicates,
+                    realtime_ns,
+                    fixed_binary_hooks,
+                    bare_boolean_hooks,
+                    expression_alternatives_hooks,
+                    expression_condition_hooks,
+                    available_ctes,
+                    condition_expression,
+                );
+            }
+        } else if (try generatedSubqueryCorrelationWhereAlloc(
+            alloc,
+            tokens,
+            type_context.schema,
+            subquery_type_context.schema,
+            source_table,
+            where_expression,
+        )) |correlation| {
+            try appendGeneratedSubqueryCorrelationAlloc(alloc, &correlations, correlation);
+        } else {
             var where_pos = where_tokens.start;
             try parseWhereAlloc(
                 alloc,
@@ -1005,6 +1153,28 @@ fn parseGeneratedSubqueryWherePredicateAlloc(
     return true;
 }
 
+fn generatedProjectionAliasOutputAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    list: generated_parser.GeneratedSqlListAst,
+    index: usize,
+    item_range: generated_parser.GeneratedSqlTokenRange,
+    expression_range: generated_parser.GeneratedSqlTokenRange,
+) !?[]const u8 {
+    if (list.alias_items.len != list.count or list.alias_name_items.len != list.count) return error.UnsupportedSqlShape;
+    const alias_range = list.alias_items[index] orelse return null;
+    const alias_name_range = list.alias_name_items[index] orelse return error.UnsupportedSqlShape;
+    if (alias_range.start < expression_range.end or alias_range.end != item_range.end or alias_range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (alias_name_range.start < alias_range.start or alias_name_range.end != alias_range.end or alias_name_range.start >= alias_name_range.end) return error.UnsupportedSqlShape;
+    if (tokens[alias_range.start].matchesKeywordTag(.as)) {
+        if (alias_name_range.start != alias_range.start + 1) return error.UnsupportedSqlShape;
+    } else if (alias_name_range.start != alias_range.start) {
+        return error.UnsupportedSqlShape;
+    }
+    if (alias_name_range.end != alias_name_range.start + 1) return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, tokens[alias_name_range.start].text);
+}
+
 fn parseGeneratedScalarSubquerySelectListAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -1030,10 +1200,20 @@ fn parseGeneratedScalarSubquerySelectListAlloc(
         if (expression.kind == .subquery) has_scalar_subquery = true;
     }
     if (!has_scalar_subquery) return null;
-    for (read.projection_items.expressions) |expression| {
-        if (expression.kind != .subquery) return error.UnsupportedSqlShape;
-    }
+    if (read.projection_items.count != read.projection_items.items.len or
+        read.projection_items.count != read.projection_items.expression_items.len or
+        read.projection_items.count != read.projection_items.expressions.len) return error.UnsupportedSqlShape;
 
+    var fields = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        strings.freeStringSlice(alloc, fields.items);
+        fields.deinit(alloc);
+    }
+    var field_aliases = std.ArrayListUnmanaged(db_mod.types.RelationalRowsFieldAliasProjection).empty;
+    errdefer {
+        plan_mod.freeFieldAliasProjections(alloc, field_aliases.items);
+        field_aliases.deinit(alloc);
+    }
     var scalar_subqueries = std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection).empty;
     errdefer {
         for (scalar_subqueries.items) |projection| plan_mod.freeScalarSubqueryProjection(alloc, projection);
@@ -1044,7 +1224,6 @@ fn parseGeneratedScalarSubquerySelectListAlloc(
 
     for (read.projection_items.items, 0..) |item_range, index| {
         const expression = &read.projection_items.expressions[index];
-        if (expression.kind != .subquery) return error.UnsupportedSqlShape;
         try expr_generated_validate.validateGeneratedExpressionPayloads(tokens, expression.*);
 
         const expression_range = read.projection_items.expression_items[index];
@@ -1052,16 +1231,58 @@ fn parseGeneratedScalarSubquerySelectListAlloc(
         if (!generatedTokenRangeEqual(expression_tokens, expression_range)) return error.UnsupportedSqlShape;
         if (expression_range.start < item_range.start or expression_range.end > item_range.end) return error.UnsupportedSqlShape;
 
-        const alias_range = read.projection_items.alias_items[index] orelse return error.UnsupportedSqlShape;
-        const alias_name_range = read.projection_items.alias_name_items[index] orelse return error.UnsupportedSqlShape;
-        if (alias_range.start < expression_range.end or alias_range.end != item_range.end or alias_range.end > tokens.len) return error.UnsupportedSqlShape;
-        if (alias_name_range.start < alias_range.start or alias_name_range.end != alias_range.end or alias_name_range.start >= alias_name_range.end) return error.UnsupportedSqlShape;
-        if (tokens[alias_range.start].matchesKeywordTag(.as)) {
-            if (alias_name_range.start != alias_range.start + 1) return error.UnsupportedSqlShape;
-        } else if (alias_name_range.start != alias_range.start) {
-            return error.UnsupportedSqlShape;
+        if (expression.kind == .token_range) {
+            var field_pos = expression_range.start;
+            const parsed_field = try expr_generated.parseRowExpressionFieldOwnedAlloc(
+                alloc,
+                tokens,
+                &field_pos,
+                type_context.schema,
+                &.{},
+                &.{},
+                type_context.defer_row_expression_field_validation,
+            );
+            defer alloc.free(parsed_field);
+            if (field_pos != expression_range.end) return error.UnsupportedSqlShape;
+            const field = try binder.normalizeRowExpressionFieldAlloc(
+                alloc,
+                type_context.schema,
+                parsed_field,
+                &.{},
+                &.{},
+                type_context.defer_row_expression_field_validation,
+            );
+            var field_transferred = false;
+            errdefer if (!field_transferred) alloc.free(field);
+            const alias = try generatedProjectionAliasOutputAlloc(alloc, tokens, read.projection_items, index, item_range, expression_range);
+            var alias_transferred = false;
+            errdefer if (!alias_transferred) if (alias) |output| alloc.free(output);
+            if (alias) |output| {
+                if (std.mem.eql(u8, output, field)) {
+                    alloc.free(output);
+                    alias_transferred = true;
+                    try outputs.append(alloc, .{ .kind = .field, .index = fields.items.len });
+                    try fields.append(alloc, field);
+                    field_transferred = true;
+                } else {
+                    try outputs.append(alloc, .{ .kind = .field_alias, .index = field_aliases.items.len });
+                    try field_aliases.append(alloc, .{ .field = field, .output = output });
+                    field_transferred = true;
+                    alias_transferred = true;
+                }
+            } else {
+                if (item_range.end != expression_range.end) return error.UnsupportedSqlShape;
+                try outputs.append(alloc, .{ .kind = .field, .index = fields.items.len });
+                try fields.append(alloc, field);
+                field_transferred = true;
+            }
+            continue;
         }
-        if (alias_name_range.end != alias_name_range.start + 1) return error.UnsupportedSqlShape;
+        if (expression.kind != .subquery) return error.UnsupportedSqlShape;
+
+        const output = (try generatedProjectionAliasOutputAlloc(alloc, tokens, read.projection_items, index, item_range, expression_range)) orelse return error.UnsupportedSqlShape;
+        var output_transferred = false;
+        errdefer if (!output_transferred) alloc.free(output);
 
         var subquery = try parseGeneratedSubqueryRequestAlloc(
             alloc,
@@ -1080,10 +1301,6 @@ fn parseGeneratedScalarSubquerySelectListAlloc(
         );
         errdefer subquery.deinit(alloc);
 
-        const output = try alloc.dupe(u8, tokens[alias_name_range.start].text);
-        var output_transferred = false;
-        errdefer if (!output_transferred) alloc.free(output);
-
         const projection = db_mod.types.RelationalRowsScalarSubqueryProjection{
             .output = output,
             .query = subquery.query,
@@ -1096,16 +1313,26 @@ fn parseGeneratedScalarSubquerySelectListAlloc(
         try scalar_subqueries.append(alloc, projection);
     }
 
-    try expr_projection.validateSelectListOutputs(schema, false, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, scalar_subqueries.items);
+    try expr_projection.validateSelectListOutputs(schema, false, fields.items, &.{}, &.{}, &.{}, field_aliases.items, &.{}, scalar_subqueries.items);
 
+    const owned_fields = try fields.toOwnedSlice(alloc);
+    var fields_transferred = false;
+    errdefer if (!fields_transferred) strings.freeStringSlice(alloc, owned_fields);
+    const owned_field_aliases = try field_aliases.toOwnedSlice(alloc);
+    var field_aliases_transferred = false;
+    errdefer if (!field_aliases_transferred) plan_mod.freeFieldAliasProjections(alloc, owned_field_aliases);
     const owned_scalar_subqueries = try scalar_subqueries.toOwnedSlice(alloc);
     var scalar_transferred = false;
     errdefer if (!scalar_transferred) plan_mod.freeScalarSubqueryProjections(alloc, owned_scalar_subqueries);
     const owned_outputs = try outputs.toOwnedSlice(alloc);
 
+    fields_transferred = true;
+    field_aliases_transferred = true;
     pos.* = projection_tokens.end;
     scalar_transferred = true;
     return .{
+        .fields = owned_fields,
+        .field_aliases = owned_field_aliases,
         .scalar_subqueries = owned_scalar_subqueries,
         .outputs = owned_outputs,
     };
@@ -12338,6 +12565,44 @@ fn corruptGeneratedReadWhereFirstBooleanConditionOperatorTokens(parsed_sql: *tok
     return error.TestUnexpectedResult;
 }
 
+fn corruptGeneratedReadWhereSubqueryFirstBooleanConditionRange(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    const subquery_where = read.where_expression.subquery_where_expression orelse return error.TestUnexpectedResult;
+                    if (subquery_where.boolean_condition_items.expressions.len == 0 or read.projection_items.items.len == 0) return error.TestUnexpectedResult;
+                    var condition = &subquery_where.boolean_condition_items.expressions[0];
+                    if (condition.tokens == null) return error.TestUnexpectedResult;
+                    condition.tokens = read.projection_items.items[0];
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadWhereSubqueryFirstBooleanConditionInnerKind(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    const subquery_where = read.where_expression.subquery_where_expression orelse return error.TestUnexpectedResult;
+                    if (subquery_where.boolean_condition_items.expressions.len == 0) return error.TestUnexpectedResult;
+                    var condition = &subquery_where.boolean_condition_items.expressions[0];
+                    if (condition.kind != .grouped or condition.inner_expression_kind == null) return error.TestUnexpectedResult;
+                    condition.inner_expression_kind = .token_range;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn corruptGeneratedReadJoinSummaryOperatorRange(parsed_sql: *tokenized.ParsedSql) !void {
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
@@ -15725,18 +15990,28 @@ test "sql adapter lower expr lowers generated subquery predicates" {
         .{ .sql = "SELECT id FROM usage_records WHERE NOT EXISTS (SELECT 1 FROM usage_records WHERE active IS TRUE)", .kind = .exists, .negated = true, .output_field = "" },
         .{ .sql = "SELECT id FROM usage_records WHERE status = ANY (SELECT status FROM usage_records)", .kind = .quantified, .quantifier = .any },
         .{ .sql = "SELECT id FROM usage_records WHERE status = SOME (SELECT status FROM usage_records)", .kind = .quantified, .quantifier = .any },
+        .{ .sql = "SELECT id FROM usage_records WHERE status <> ANY (SELECT status FROM usage_records)", .kind = .quantified, .op = .ne, .quantifier = .any },
         .{ .sql = "SELECT id FROM usage_records WHERE status <> ALL (SELECT status FROM usage_records)", .kind = .quantified, .op = .ne, .quantifier = .all },
         .{ .sql = "SELECT id FROM usage_records WHERE amount > ANY (SELECT amount FROM usage_records)", .kind = .quantified, .op = .gt, .quantifier = .any, .output_field = "amount" },
+        .{ .sql = "SELECT id FROM usage_records WHERE amount > ALL (SELECT amount FROM usage_records)", .kind = .quantified, .op = .gt, .quantifier = .all, .output_field = "amount" },
         .{ .sql = "SELECT id FROM usage_records WHERE amount >= SOME (SELECT amount FROM usage_records)", .kind = .quantified, .op = .gte, .quantifier = .any, .output_field = "amount" },
+        .{ .sql = "SELECT id FROM usage_records WHERE amount >= ALL (SELECT amount FROM usage_records)", .kind = .quantified, .op = .gte, .quantifier = .all, .output_field = "amount" },
+        .{ .sql = "SELECT id FROM usage_records WHERE amount < ANY (SELECT amount FROM usage_records)", .kind = .quantified, .op = .lt, .quantifier = .any, .output_field = "amount" },
         .{ .sql = "SELECT id FROM usage_records WHERE amount < ALL (SELECT amount FROM usage_records)", .kind = .quantified, .op = .lt, .quantifier = .all, .output_field = "amount" },
+        .{ .sql = "SELECT id FROM usage_records WHERE amount <= ANY (SELECT amount FROM usage_records)", .kind = .quantified, .op = .lte, .quantifier = .any, .output_field = "amount" },
         .{ .sql = "SELECT id FROM usage_records WHERE amount <= ALL (SELECT amount FROM usage_records)", .kind = .quantified, .op = .lte, .quantifier = .all, .output_field = "amount" },
         .{ .sql = "SELECT id FROM usage_records WHERE status = (SELECT status FROM usage_records)", .kind = .scalar },
         .{ .sql = "SELECT id FROM usage_records WHERE status IN (SELECT status FROM usage_records)", .kind = .in },
         .{ .sql = "SELECT id FROM usage_records WHERE status NOT IN (SELECT status FROM usage_records)", .kind = .in, .negated = true },
         .{ .sql = "SELECT id FROM usage_records WHERE status LIKE ANY (SELECT status FROM usage_records)", .kind = .quantified, .op = .like, .quantifier = .any },
+        .{ .sql = "SELECT id FROM usage_records WHERE status LIKE SOME (SELECT status FROM usage_records)", .kind = .quantified, .op = .like, .quantifier = .any },
         .{ .sql = "SELECT id FROM usage_records WHERE status ILIKE ANY (SELECT status FROM usage_records)", .kind = .quantified, .op = .ilike, .quantifier = .any },
+        .{ .sql = "SELECT id FROM usage_records WHERE status ILIKE SOME (SELECT status FROM usage_records)", .kind = .quantified, .op = .ilike, .quantifier = .any },
         .{ .sql = "SELECT id FROM usage_records WHERE status LIKE ALL (SELECT status FROM usage_records)", .kind = .quantified, .op = .like, .quantifier = .all },
+        .{ .sql = "SELECT id FROM usage_records WHERE status ILIKE ALL (SELECT status FROM usage_records)", .kind = .quantified, .op = .ilike, .quantifier = .all },
+        .{ .sql = "SELECT id FROM usage_records WHERE status NOT LIKE ANY (SELECT status FROM usage_records)", .kind = .quantified, .op = .like, .negated = true, .quantifier = .any },
         .{ .sql = "SELECT id FROM usage_records WHERE status NOT LIKE ALL (SELECT status FROM usage_records)", .kind = .quantified, .op = .like, .negated = true, .quantifier = .all },
+        .{ .sql = "SELECT id FROM usage_records WHERE status NOT ILIKE ANY (SELECT status FROM usage_records)", .kind = .quantified, .op = .ilike, .negated = true, .quantifier = .any },
         .{ .sql = "SELECT id FROM usage_records WHERE status NOT ILIKE ALL (SELECT status FROM usage_records)", .kind = .quantified, .op = .ilike, .negated = true, .quantifier = .all },
     };
     for (subquery_predicates) |case| {
@@ -15761,19 +16036,47 @@ test "sql adapter lower expr lowers generated subquery predicates" {
         }
     }
 
-    var correlated_exists = try lowerQueryPlanForLowerExprTestAlloc(
-        alloc,
-        "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id)",
-        schema,
-        &.{},
-    );
-    defer correlated_exists.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), correlated_exists.plan.query.subquery_predicates.len);
-    const correlated_predicate = correlated_exists.plan.query.subquery_predicates[0];
-    try std.testing.expectEqual(db_mod.types.RelationalRowsSubqueryPredicateKind.exists, correlated_predicate.kind);
-    try std.testing.expectEqual(@as(usize, 1), correlated_predicate.correlations.len);
-    try std.testing.expectEqualStrings("customer_id", correlated_predicate.correlations[0].left_field);
-    try std.testing.expectEqualStrings("customer_id", correlated_predicate.correlations[0].right_field);
+    const correlated_predicates = [_]struct {
+        sql: []const u8,
+        kind: db_mod.types.RelationalRowsSubqueryPredicateKind,
+        negated: bool = false,
+        quantifier: ?db_mod.types.RelationalRowsSubqueryQuantifier = null,
+        output_field: []const u8 = "",
+        child_predicates: usize = 0,
+    }{
+        .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id)", .kind = .exists },
+        .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE NOT EXISTS (SELECT 1 FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id)", .kind = .exists, .negated = true },
+        .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE outer_usage.status = (SELECT status FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id)", .kind = .scalar, .output_field = "status" },
+        .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE outer_usage.status IN (SELECT status FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id)", .kind = .in, .output_field = "status" },
+        .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE outer_usage.status NOT IN (SELECT status FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id)", .kind = .in, .negated = true, .output_field = "status" },
+        .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE outer_usage.amount = ANY (SELECT amount FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id)", .kind = .quantified, .quantifier = .any, .output_field = "amount" },
+        .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id AND status = 'open')", .kind = .exists, .child_predicates = 1 },
+        .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE (usage_records.customer_id = outer_usage.customer_id) AND active IS TRUE)", .kind = .exists, .child_predicates = 1 },
+        .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE NOT EXISTS (SELECT 1 FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id AND status = 'archived')", .kind = .exists, .negated = true, .child_predicates = 1 },
+        .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE outer_usage.status = (SELECT status FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id AND active IS TRUE)", .kind = .scalar, .output_field = "status", .child_predicates = 1 },
+        .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE outer_usage.status IN (SELECT status FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id AND active IS TRUE)", .kind = .in, .output_field = "status", .child_predicates = 1 },
+        .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE outer_usage.status NOT IN (SELECT status FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id AND active IS TRUE)", .kind = .in, .negated = true, .output_field = "status", .child_predicates = 1 },
+        .{ .sql = "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE outer_usage.amount = ANY (SELECT amount FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id AND active IS TRUE)", .kind = .quantified, .quantifier = .any, .output_field = "amount", .child_predicates = 1 },
+    };
+    for (correlated_predicates) |case| {
+        var lowered = try lowerQueryPlanForLowerExprTestAlloc(
+            alloc,
+            case.sql,
+            schema,
+            &.{},
+        );
+        defer lowered.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.subquery_predicates.len);
+        const correlated_predicate = lowered.plan.query.subquery_predicates[0];
+        try std.testing.expectEqual(case.kind, correlated_predicate.kind);
+        try std.testing.expectEqual(case.negated, correlated_predicate.negated);
+        try std.testing.expectEqual(case.quantifier, correlated_predicate.quantifier);
+        try std.testing.expectEqualStrings(case.output_field, correlated_predicate.output_field);
+        try std.testing.expectEqual(@as(usize, 1), correlated_predicate.correlations.len);
+        try std.testing.expectEqualStrings("customer_id", correlated_predicate.correlations[0].left_field);
+        try std.testing.expectEqualStrings("customer_id", correlated_predicate.correlations[0].right_field);
+        try std.testing.expectEqual(case.child_predicates, correlated_predicate.query.predicates.len);
+    }
 
     var malformed_exists_operator = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -15784,6 +16087,34 @@ test "sql adapter lower expr lowers generated subquery predicates" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
         alloc,
         &malformed_exists_operator,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_compound_correlated_subquery = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id AND status = 'open')",
+    );
+    defer malformed_compound_correlated_subquery.deinit(alloc);
+    try corruptGeneratedReadWhereSubqueryFirstBooleanConditionRange(&malformed_compound_correlated_subquery);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_compound_correlated_subquery,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_grouped_compound_correlated_subquery = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE (usage_records.customer_id = outer_usage.customer_id) AND active IS TRUE)",
+    );
+    defer malformed_grouped_compound_correlated_subquery.deinit(alloc);
+    try corruptGeneratedReadWhereSubqueryFirstBooleanConditionInnerKind(&malformed_grouped_compound_correlated_subquery);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_grouped_compound_correlated_subquery,
         schema,
         &.{},
         .{},
@@ -15831,6 +16162,21 @@ test "sql adapter lower expr lowers generated scalar subquery projections" {
     try std.testing.expectEqual(@as(usize, 1), projection.query.predicates.len);
     try std.testing.expectEqualStrings("id", projection.query.predicates[0].field);
 
+    var mixed_lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, (SELECT status FROM usage_records WHERE id = 'u1') AS first_status FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer mixed_lowered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), mixed_lowered.plan.query.select.len);
+    try std.testing.expectEqualStrings("id", mixed_lowered.plan.query.select[0]);
+    try std.testing.expectEqual(@as(usize, 1), mixed_lowered.plan.query.scalar_subqueries.len);
+    try std.testing.expectEqual(@as(usize, 2), mixed_lowered.plan.select_outputs.len);
+    try std.testing.expectEqual(ast.SelectOutputKind.field, mixed_lowered.plan.select_outputs[0].kind);
+    try std.testing.expectEqual(ast.SelectOutputKind.scalar_subquery, mixed_lowered.plan.select_outputs[1].kind);
+    try std.testing.expectEqualStrings("first_status", mixed_lowered.plan.query.scalar_subqueries[0].output);
+
     var malformed_scalar_projection = try tokenized.ParsedSql.initAlloc(
         alloc,
         "SELECT (SELECT status FROM usage_records WHERE id = 'u1') AS first_status FROM usage_records",
@@ -15866,6 +16212,7 @@ test "sql adapter lower expr lowers scalar any predicates" {
     );
     defer lowered.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.in_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), lowered.plan.query.subquery_predicates.len);
     try std.testing.expectEqualStrings("status", lowered.plan.query.in_predicates[0].field);
     try std.testing.expectEqualStrings("[\"active\",\"pending\"]", lowered.plan.query.in_predicates[0].values_json);
     try std.testing.expect(!lowered.plan.query.in_predicates[0].negated);
@@ -15878,6 +16225,7 @@ test "sql adapter lower expr lowers scalar any predicates" {
     );
     defer constructor_lowered.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), constructor_lowered.plan.query.in_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), constructor_lowered.plan.query.subquery_predicates.len);
     try std.testing.expectEqualStrings("status", constructor_lowered.plan.query.in_predicates[0].field);
     try std.testing.expectEqualStrings("[\"active\",\"pending\"]", constructor_lowered.plan.query.in_predicates[0].values_json);
     try std.testing.expect(!constructor_lowered.plan.query.in_predicates[0].negated);
@@ -15941,6 +16289,20 @@ test "sql adapter lower expr lowers scalar any predicates" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
+
+    var malformed_array_as_subquery = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = ANY(ARRAY['active','pending']::text[])",
+    );
+    defer malformed_array_as_subquery.deinit(alloc);
+    try setGeneratedReadWhereRightExpressionKind(&malformed_array_as_subquery, .subquery);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_array_as_subquery,
+        schema,
+        &.{},
+        .{},
+    ));
 
     var malformed_subquery_tail_limit = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -16185,6 +16547,7 @@ test "sql adapter lower expr lowers scalar any predicates" {
     );
     defer constructor_all_equal.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), constructor_all_equal.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), constructor_all_equal.plan.query.subquery_predicates.len);
     try std.testing.expectEqualStrings("status", constructor_all_equal.plan.query.predicates[0].field);
     try std.testing.expectEqualStrings("\"active\"", constructor_all_equal.plan.query.predicates[0].value_json.?);
 

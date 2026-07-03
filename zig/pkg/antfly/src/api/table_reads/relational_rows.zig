@@ -4484,6 +4484,148 @@ test "routed rows materialization tracker uses shared spill and hard cap policy"
     try std.testing.expectEqual(@as(u64, 4), reloaded_collected[1].version);
 }
 
+test "routed paginated rows fail closed when live writes change scanned range membership" {
+    const alloc = std.testing.allocator;
+
+    var columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    const schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+    };
+
+    const FakeSource = struct {
+        live_insert_after_collect: bool = false,
+        scan_calls: usize = 0,
+        lookup_calls: usize = 0,
+
+        fn source(self: *@This()) TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(
+            ptr: *anyopaque,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            opts: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.lookup_calls += 1;
+            try std.testing.expectEqualStrings("orders", table_name);
+            try std.testing.expect(opts.include_all_fields);
+            const json = if (std.mem.eql(u8, key, "a"))
+                "{\"id\":\"a\",\"amount\":1}"
+            else if (std.mem.eql(u8, key, "b"))
+                "{\"id\":\"b\",\"amount\":4}"
+            else if (std.mem.eql(u8, key, "q"))
+                "{\"id\":\"q\",\"amount\":2}"
+            else if (std.mem.eql(u8, key, "z"))
+                "{\"id\":\"z\",\"amount\":7}"
+            else
+                return null;
+            return .{ .json = try lookup_alloc.dupe(u8, json), .version = 1 };
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.scan_calls += 1;
+            try std.testing.expectEqualStrings("orders", table_name);
+            try std.testing.expect(opts.include_documents);
+            try std.testing.expect(opts.include_all_fields);
+
+            var out = std.ArrayListUnmanaged(u8).empty;
+            errdefer out.deinit(scan_alloc);
+            if (std.mem.eql(u8, from_key, "") and std.mem.eql(u8, to_key, "n")) {
+                try appendScanLine(scan_alloc, &out, "a", "{\"id\":\"a\",\"amount\":1}", 1);
+                try appendScanLine(scan_alloc, &out, "b", "{\"id\":\"b\",\"amount\":4}", 1);
+                if (self.live_insert_after_collect and self.scan_calls > 2) {
+                    try appendScanLine(scan_alloc, &out, "c", "{\"id\":\"c\",\"amount\":6}", 1);
+                }
+            } else if (std.mem.eql(u8, from_key, "n") and std.mem.eql(u8, to_key, "")) {
+                try appendScanLine(scan_alloc, &out, "q", "{\"id\":\"q\",\"amount\":2}", 1);
+                try appendScanLine(scan_alloc, &out, "z", "{\"id\":\"z\",\"amount\":7}", 1);
+            } else {
+                return error.UnexpectedRange;
+            }
+            return .{ .ndjson = try out.toOwnedSlice(scan_alloc) };
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            return null;
+        }
+    };
+
+    const ranges = [_]db_mod.types.RelationalRowsDocKeyRange{
+        .{ .start = "", .end = "n" },
+        .{ .start = "n", .end = "" },
+    };
+    const order_by = [_]db_mod.types.RelationalRowsQueryOrder{.{
+        .field = "amount",
+        .direction = .desc,
+    }};
+
+    var stable_fake = FakeSource{};
+    const stable_source = stable_fake.source();
+    var result = (try rowsQueryPlanFromRoutedScansAlloc(alloc, stable_source, "orders", schema, .{
+        .ranges = ranges[0..],
+        .query = .{
+            .select = &.{"id"},
+            .select_all = false,
+            .order_by = order_by[0..],
+            .limit = 2,
+            .offset = 1,
+        },
+    }, .read_index)).?;
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 4), result.total);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"q\"}", result.rows[1]);
+    try std.testing.expectEqual(@as(usize, 4), stable_fake.scan_calls);
+    try std.testing.expectEqual(@as(usize, 4), stable_fake.lookup_calls);
+
+    var live_insert_fake = FakeSource{ .live_insert_after_collect = true };
+    const live_insert_source = live_insert_fake.source();
+    try std.testing.expectError(error.TopologyChanged, rowsQueryPlanFromRoutedScansAlloc(alloc, live_insert_source, "orders", schema, .{
+        .ranges = ranges[0..],
+        .query = .{
+            .select = &.{"id"},
+            .select_all = false,
+            .order_by = order_by[0..],
+            .limit = 2,
+            .offset = 1,
+        },
+    }, .read_index));
+    try std.testing.expectEqual(@as(usize, 3), live_insert_fake.scan_calls);
+    try std.testing.expectEqual(@as(usize, 4), live_insert_fake.lookup_calls);
+}
+
 test "routed rows query plan executes over scanned owner rows with ctes" {
     const alloc = std.testing.allocator;
 

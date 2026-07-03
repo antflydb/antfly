@@ -719,7 +719,8 @@ pub fn materializeDocumentSourceInsertBatchAlloc(
     var returning_rows = std.ArrayListUnmanaged([]const u8).empty;
     var returning_version_keys = std.ArrayListUnmanaged([]const u8).empty;
     var returning_version_prewrite = std.ArrayListUnmanaged(u64).empty;
-    var returning_version_outputs: ?[][]const u8 = try documentReturningVersionOutputsAlloc(alloc, lowered.returning_fields);
+    const source_returning_fields: []const sql_plan.DocumentWriteReturningField = if (lowered.conflict_write == null) lowered.returning_fields else &.{};
+    var returning_version_outputs: ?[][]const u8 = try documentReturningVersionOutputsAlloc(alloc, source_returning_fields);
     errdefer {
         for (writes[0..initialized]) |write| {
             alloc.free(@constCast(write.key));
@@ -753,8 +754,8 @@ pub fn materializeDocumentSourceInsertBatchAlloc(
         var value_transferred = false;
         errdefer if (!value_transferred) alloc.free(value);
         if (documentSourceInsertContainsKey(writes[0..initialized], key)) return error.DocumentSqlWriteDuplicateSource;
-        try appendDocumentMutationReturningRowFromJsonAlloc(alloc, &returning_rows, key, value, lowered.returning_fields, null);
-        try appendDocumentReturningVersionKeyAlloc(alloc, &returning_version_keys, &returning_version_prewrite, key, 0, lowered.returning_fields);
+        try appendDocumentMutationReturningRowFromJsonAlloc(alloc, &returning_rows, key, value, source_returning_fields, null);
+        try appendDocumentReturningVersionKeyAlloc(alloc, &returning_version_keys, &returning_version_prewrite, key, 0, source_returning_fields);
         writes[initialized] = .{
             .key = key,
             .value = value,
@@ -797,7 +798,7 @@ pub fn materializeDocumentSourceInsertBatchAlloc(
         for (returning_version_outputs_slice) |output| alloc.free(@constCast(output));
         if (returning_version_outputs_slice.len > 0) alloc.free(returning_version_outputs_slice);
     }
-    return .{
+    var source_batch = sql_plan.OwnedDocumentBatchRequest{
         .writes = writes_slice,
         .returning_rows = returning_rows_slice,
         .returning_version_keys = returning_version_keys_slice,
@@ -810,6 +811,17 @@ pub fn materializeDocumentSourceInsertBatchAlloc(
         },
         .inserted = @intCast(writes_slice.len),
     };
+    if (lowered.conflict_write) |conflict| {
+        errdefer source_batch.deinit(alloc);
+        var conflict_lowered = conflict;
+        conflict_lowered.proposed_writes = source_batch.writes;
+        conflict_lowered.returning_fields = lowered.returning_fields;
+        conflict_lowered.sync_level = lowered.sync_level;
+        const conflict_batch = try materializeDocumentConflictWriteBatchAlloc(alloc, source, conflict_lowered, consistency);
+        source_batch.deinit(alloc);
+        return conflict_batch;
+    }
+    return source_batch;
 }
 
 pub fn executeDocumentSourceInsertPlanAlloc(
@@ -1688,6 +1700,10 @@ pub fn materializeDocumentMergeMutationBatchAlloc(
     var deletes = std.ArrayListUnmanaged([]const u8).empty;
     var transforms = std.ArrayListUnmanaged(db_mod.types.DocumentTransform).empty;
     var predicates = std.ArrayListUnmanaged(db_mod.types.TransactionVersionPredicate).empty;
+    var returning_rows = std.ArrayListUnmanaged([]const u8).empty;
+    var returning_version_keys = std.ArrayListUnmanaged([]const u8).empty;
+    var returning_version_prewrite = std.ArrayListUnmanaged(u64).empty;
+    var returning_version_outputs: ?[][]const u8 = try documentReturningVersionOutputsAlloc(alloc, lowered.returning_fields);
     errdefer {
         for (writes.items) |write| {
             alloc.free(@constCast(write.key));
@@ -1703,6 +1719,10 @@ pub fn materializeDocumentMergeMutationBatchAlloc(
         transforms.deinit(alloc);
         for (predicates.items) |predicate| alloc.free(@constCast(predicate.key));
         predicates.deinit(alloc);
+        for (returning_rows.items) |row| alloc.free(@constCast(row));
+        returning_rows.deinit(alloc);
+        freeDocumentReturningVersionKeyState(alloc, &returning_version_keys, returning_version_outputs);
+        returning_version_prewrite.deinit(alloc);
     }
 
     for (source_candidates) |source_candidate| {
@@ -1720,6 +1740,10 @@ pub fn materializeDocumentMergeMutationBatchAlloc(
             if (arm.do_nothing) continue;
             switch (arm.template) {
                 .delete => {
+                    if (lowered.returning_fields.len != 0) {
+                        try appendDocumentMutationReturningRowFromJsonAlloc(alloc, &returning_rows, target_candidate.id, target_lookup.json, lowered.returning_fields, target_lookup.version);
+                        try appendDocumentReturningVersionKeyAlloc(alloc, &returning_version_keys, &returning_version_prewrite, target_candidate.id, target_lookup.version, lowered.returning_fields);
+                    }
                     try appendDocumentMergeVersionPredicateAlloc(alloc, &predicates, target_candidate.id, target_lookup.version);
                     try deletes.append(alloc, try alloc.dupe(u8, target_candidate.id));
                 },
@@ -1728,6 +1752,10 @@ pub fn materializeDocumentMergeMutationBatchAlloc(
                     errdefer alloc.free(key);
                     const operations = try documentJoinedSourceAssignmentOpsAlloc(alloc, template, source_lookup.json, arm.source_assignments);
                     errdefer freeDocumentMutationTemplateOps(alloc, operations);
+                    if (lowered.returning_fields.len != 0) {
+                        try appendDocumentMutationReturningRowAfterOperationsAlloc(alloc, &returning_rows, target_candidate.id, target_lookup.json, operations, lowered.returning_fields, null);
+                        try appendDocumentReturningVersionKeyAlloc(alloc, &returning_version_keys, &returning_version_prewrite, target_candidate.id, 0, lowered.returning_fields);
+                    }
                     try appendDocumentMergeVersionPredicateAlloc(alloc, &predicates, target_candidate.id, target_lookup.version);
                     try transforms.append(alloc, .{
                         .key = key,
@@ -1737,11 +1765,34 @@ pub fn materializeDocumentMergeMutationBatchAlloc(
             }
         } else {
             const arm = (try selectDocumentMergeNotMatchedArm(alloc, source_candidate.id, parsed_source.value, source_lookup.version, lowered.not_matched_arms)) orelse continue;
-            if (arm.do_nothing or !arm.insert_source_document) continue;
-            try writes.append(alloc, .{
-                .key = try alloc.dupe(u8, source_candidate.id),
-                .value = try alloc.dupe(u8, source_lookup.json),
-            });
+            if (arm.do_nothing) continue;
+            if (arm.insert_source_document) {
+                const key = try alloc.dupe(u8, source_candidate.id);
+                errdefer alloc.free(key);
+                const value = try alloc.dupe(u8, source_lookup.json);
+                errdefer alloc.free(value);
+                if (lowered.returning_fields.len != 0) {
+                    try appendDocumentMutationReturningRowFromJsonAlloc(alloc, &returning_rows, key, value, lowered.returning_fields, null);
+                    try appendDocumentReturningVersionKeyAlloc(alloc, &returning_version_keys, &returning_version_prewrite, key, 0, lowered.returning_fields);
+                }
+                try writes.append(alloc, .{
+                    .key = key,
+                    .value = value,
+                });
+            } else if (arm.insert_assignments.len != 0) {
+                const key = try alloc.dupe(u8, source_candidate.id);
+                errdefer alloc.free(key);
+                const value = try documentSourceInsertProjectedJsonAlloc(alloc, parsed_source.value, arm.insert_assignments);
+                errdefer alloc.free(value);
+                if (lowered.returning_fields.len != 0) {
+                    try appendDocumentMutationReturningRowFromJsonAlloc(alloc, &returning_rows, key, value, lowered.returning_fields, null);
+                    try appendDocumentReturningVersionKeyAlloc(alloc, &returning_version_keys, &returning_version_prewrite, key, 0, lowered.returning_fields);
+                }
+                try writes.append(alloc, .{
+                    .key = key,
+                    .value = value,
+                });
+            }
         }
     }
 
@@ -1772,12 +1823,38 @@ pub fn materializeDocumentMergeMutationBatchAlloc(
         for (predicate_slice) |predicate| alloc.free(@constCast(predicate.key));
         if (predicate_slice.len > 0) alloc.free(predicate_slice);
     }
+    const returning_rows_slice = try returning_rows.toOwnedSlice(alloc);
+    returning_rows = .empty;
+    errdefer {
+        for (returning_rows_slice) |row| alloc.free(@constCast(row));
+        if (returning_rows_slice.len > 0) alloc.free(returning_rows_slice);
+    }
+    const returning_version_keys_slice = try returning_version_keys.toOwnedSlice(alloc);
+    returning_version_keys = .empty;
+    errdefer {
+        for (returning_version_keys_slice) |key| alloc.free(@constCast(key));
+        if (returning_version_keys_slice.len > 0) alloc.free(returning_version_keys_slice);
+    }
+    const returning_version_prewrite_slice = try returning_version_prewrite.toOwnedSlice(alloc);
+    returning_version_prewrite = .empty;
+    errdefer if (returning_version_prewrite_slice.len > 0) alloc.free(returning_version_prewrite_slice);
+    var returning_version_outputs_slice: [][]const u8 = &.{};
+    if (returning_version_outputs) |outputs| returning_version_outputs_slice = outputs;
+    returning_version_outputs = null;
+    errdefer {
+        for (returning_version_outputs_slice) |output| alloc.free(@constCast(output));
+        if (returning_version_outputs_slice.len > 0) alloc.free(returning_version_outputs_slice);
+    }
 
     return .{
         .writes = write_slice,
         .deletes = delete_slice,
         .transforms = transform_slice,
         .predicates = predicate_slice,
+        .returning_rows = returning_rows_slice,
+        .returning_version_keys = returning_version_keys_slice,
+        .returning_version_prewrite = returning_version_prewrite_slice,
+        .returning_version_outputs = returning_version_outputs_slice,
         .req = .{
             .writes = write_slice,
             .deletes = delete_slice,
@@ -4482,6 +4559,23 @@ fn appendOrderedDocumentSqlUnnestCandidatesAlloc(
     else
         null;
     defer if (filter_values) |*value| value.deinit();
+    var filter_range = if (unnest.filter_range_json) |filter_json|
+        try std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{})
+    else
+        null;
+    defer if (filter_range) |*value| value.deinit();
+    var filter_not_value = if (unnest.filter_not_value_json) |filter_json|
+        try std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{})
+    else
+        null;
+    defer if (filter_not_value) |*value| value.deinit();
+    var filter_pattern = if (unnest.filter_pattern_json) |filter_json|
+        try std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{})
+    else
+        null;
+    defer if (filter_pattern) |*value| value.deinit();
+
+    if (unnest.filter_match_none) return;
 
     for (array_value.array.items) |item| {
         if (filter_value) |value| {
@@ -4490,6 +4584,16 @@ fn appendOrderedDocumentSqlUnnestCandidatesAlloc(
         if (filter_values) |values| {
             if (!documentSqlJsonValueInArray(item, values.value)) continue;
         }
+        if (filter_range) |range| {
+            if (!try documentSqlUnnestItemRangeMatches(item, range.value)) continue;
+        }
+        if (filter_not_value) |value| {
+            if (item == .null or documentSqlJsonValuesEqual(item, value.value)) continue;
+        }
+        if (filter_pattern) |pattern| {
+            if (!documentSqlUnnestItemPatternMatches(item, pattern.value, unnest.filter_pattern_case_insensitive)) continue;
+        }
+        if (unnest.filter_is_not_null and item == .null) continue;
         const owned_id = try alloc.dupe(u8, key);
         errdefer alloc.free(owned_id);
         const row_json = try documentSqlProjectedParsedRowJsonWithUnnestAlloc(alloc, key, parsed.value, doc_json, projection, item);
@@ -4651,6 +4755,23 @@ fn appendDocumentSqlUnnestRowsAlloc(
     else
         null;
     defer if (filter_values) |*value| value.deinit();
+    var filter_range = if (unnest.filter_range_json) |filter_json|
+        try std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{})
+    else
+        null;
+    defer if (filter_range) |*value| value.deinit();
+    var filter_not_value = if (unnest.filter_not_value_json) |filter_json|
+        try std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{})
+    else
+        null;
+    defer if (filter_not_value) |*value| value.deinit();
+    var filter_pattern = if (unnest.filter_pattern_json) |filter_json|
+        try std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{})
+    else
+        null;
+    defer if (filter_pattern) |*value| value.deinit();
+
+    if (unnest.filter_match_none) return;
 
     for (array_value.array.items) |item| {
         if (filter_value) |value| {
@@ -4659,6 +4780,16 @@ fn appendDocumentSqlUnnestRowsAlloc(
         if (filter_values) |values| {
             if (!documentSqlJsonValueInArray(item, values.value)) continue;
         }
+        if (filter_range) |range| {
+            if (!try documentSqlUnnestItemRangeMatches(item, range.value)) continue;
+        }
+        if (filter_not_value) |value| {
+            if (item == .null or documentSqlJsonValuesEqual(item, value.value)) continue;
+        }
+        if (filter_pattern) |pattern| {
+            if (!documentSqlUnnestItemPatternMatches(item, pattern.value, unnest.filter_pattern_case_insensitive)) continue;
+        }
+        if (unnest.filter_is_not_null and item == .null) continue;
         try rows.append(alloc, try documentSqlProjectedParsedRowJsonWithUnnestAlloc(alloc, key, parsed.value, doc_json, projection, item));
         if (row_limit) |limit| {
             if (rows.items.len >= limit) return;
@@ -4926,6 +5057,29 @@ fn documentSqlJsonValueInArray(actual: std.json.Value, expected_values: std.json
         if (documentSqlJsonValuesEqual(actual, expected)) return true;
     }
     return false;
+}
+
+fn documentSqlUnnestItemRangeMatches(item: std.json.Value, filter: std.json.Value) !bool {
+    if (filter != .object) return error.InvalidRowsRequest;
+    if (filter.object.get("numeric_range")) |range| {
+        return try documentSqlNumericRangeMatches(item, range);
+    }
+    if (filter.object.get("date_range")) |range| {
+        return try documentSqlStringRangeMatches(item, range, "start", "end", "inclusive_start", "inclusive_end");
+    }
+    if (filter.object.get("term_range")) |range| {
+        return try documentSqlStringRangeMatches(item, range, "min", "max", "inclusive_min", "inclusive_max");
+    }
+    return error.InvalidRowsRequest;
+}
+
+fn documentSqlUnnestItemPatternMatches(item: std.json.Value, pattern: std.json.Value, case_insensitive: bool) bool {
+    if (pattern != .string) return false;
+    const text = documentSqlFilterStringValue(item) catch return false;
+    return if (case_insensitive)
+        documentSqlWildcardMatchesIgnoreCase(pattern.string, text)
+    else
+        documentSqlWildcardMatches(pattern.string, text);
 }
 
 fn documentSqlJsonNumber(value: std.json.Value) !f64 {
@@ -6910,6 +7064,11 @@ fn documentSqlWildcardMatches(pattern: []const u8, text: []const u8) bool {
     return documentSqlWildcardMatchesAt(pattern, 0, text, 0);
 }
 
+fn documentSqlWildcardMatchesIgnoreCase(pattern: []const u8, text: []const u8) bool {
+    if (!documentSqlAsciiOnly(pattern) or !documentSqlAsciiOnly(text)) return false;
+    return documentSqlWildcardMatchesIgnoreCaseAt(pattern, 0, text, 0);
+}
+
 fn documentSqlWildcardMatchesAt(pattern: []const u8, pattern_index: usize, text: []const u8, text_index: usize) bool {
     if (pattern_index == pattern.len) return text_index == text.len;
     if (pattern[pattern_index] == '*') {
@@ -6922,6 +7081,22 @@ fn documentSqlWildcardMatchesAt(pattern: []const u8, pattern_index: usize, text:
     if (text_index == text.len) return false;
     if (pattern[pattern_index] == '?' or pattern[pattern_index] == text[text_index]) {
         return documentSqlWildcardMatchesAt(pattern, pattern_index + 1, text, text_index + 1);
+    }
+    return false;
+}
+
+fn documentSqlWildcardMatchesIgnoreCaseAt(pattern: []const u8, pattern_index: usize, text: []const u8, text_index: usize) bool {
+    if (pattern_index == pattern.len) return text_index == text.len;
+    if (pattern[pattern_index] == '*') {
+        var next = text_index;
+        while (next <= text.len) : (next += 1) {
+            if (documentSqlWildcardMatchesIgnoreCaseAt(pattern, pattern_index + 1, text, next)) return true;
+        }
+        return false;
+    }
+    if (text_index == text.len) return false;
+    if (pattern[pattern_index] == '?' or std.ascii.toLower(pattern[pattern_index]) == std.ascii.toLower(text[text_index])) {
+        return documentSqlWildcardMatchesIgnoreCaseAt(pattern, pattern_index + 1, text, text_index + 1);
     }
     return false;
 }

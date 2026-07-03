@@ -640,6 +640,16 @@ pub fn writePlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredWrite
             }
             fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "generated_target_id", document_source_insert.target_id_mode == .generated_document_id);
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_assignments", document_source_insert.assignments.len);
+            if (document_source_insert.conflict_write) |conflict| {
+                fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "conflict_action", @tagName(conflict.action));
+                fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "conflict_ops", conflict.operations.len);
+                fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "conflict_source_assignments", conflict.source_assignments.len);
+                fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "conflict_expression_assignments", conflict.expression_assignments.len);
+                fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "conflict_where_expression", if (conflict.where_expression == null) 0 else 1);
+                fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "conflict_where_expressions", conflict.where_expressions.len);
+                fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "conflict_where_any", conflict.where_any.len);
+                fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "conflict_where_not", conflict.where_not.len);
+            }
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "returning", document_source_insert.returning_fields.len);
             break :blk fingerprint;
         },
@@ -722,6 +732,10 @@ pub fn writePlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredWrite
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "join_keys", document_mutation.join_keys.len);
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "matched_arms", document_mutation.matched_arms.len);
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "not_matched_arms", document_mutation.not_matched_arms.len);
+            var merge_insert_assignments: usize = 0;
+            for (document_mutation.not_matched_arms) |arm| merge_insert_assignments += arm.insert_assignments.len;
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "merge_insert_assignments", merge_insert_assignments);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "returning", document_mutation.returning_fields.len);
             if (document_mutation.max_target_rows) |max_target_rows| {
                 fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "max_target_rows", max_target_rows);
             }

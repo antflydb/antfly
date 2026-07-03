@@ -71,6 +71,8 @@ pub const DocumentSqlWritePlanExpectationJson = struct {
     returning: ?usize = null,
     join_keys: ?usize = null,
     source_assignments: ?usize = null,
+    conflict_source_assignments: ?usize = null,
+    merge_insert_assignments: ?usize = null,
     generated_target_id: bool = false,
     expression_assignments: ?usize = null,
     where_expression: ?usize = null,
@@ -118,6 +120,7 @@ pub const ExpectedError = enum {
     DocumentSqlBoundedScanPolicyRequired,
     DocumentSqlIndexUnavailable,
     DocumentSqlNativeSearchRequiresTableFunction,
+    DocumentSqlUnnestUnsupported,
     DocumentSqlUnnestRequiresArray,
     UnsupportedSqlShape,
     InvalidRowsRequest,
@@ -143,6 +146,7 @@ pub fn errorFromName(name: []const u8) !ExpectedError {
     if (std.mem.eql(u8, name, "DocumentSqlBoundedScanPolicyRequired")) return .DocumentSqlBoundedScanPolicyRequired;
     if (std.mem.eql(u8, name, "DocumentSqlIndexUnavailable")) return .DocumentSqlIndexUnavailable;
     if (std.mem.eql(u8, name, "DocumentSqlNativeSearchRequiresTableFunction")) return .DocumentSqlNativeSearchRequiresTableFunction;
+    if (std.mem.eql(u8, name, "DocumentSqlUnnestUnsupported")) return .DocumentSqlUnnestUnsupported;
     if (std.mem.eql(u8, name, "DocumentSqlUnnestRequiresArray")) return .DocumentSqlUnnestRequiresArray;
     if (std.mem.eql(u8, name, "UnsupportedSqlShape")) return .UnsupportedSqlShape;
     if (std.mem.eql(u8, name, "InvalidRowsRequest")) return .InvalidRowsRequest;
@@ -170,6 +174,7 @@ pub fn errorValue(expected: ExpectedError) anyerror {
         .DocumentSqlBoundedScanPolicyRequired => error.DocumentSqlBoundedScanPolicyRequired,
         .DocumentSqlIndexUnavailable => error.DocumentSqlIndexUnavailable,
         .DocumentSqlNativeSearchRequiresTableFunction => error.DocumentSqlNativeSearchRequiresTableFunction,
+        .DocumentSqlUnnestUnsupported => error.DocumentSqlUnnestUnsupported,
         .DocumentSqlUnnestRequiresArray => error.DocumentSqlUnnestRequiresArray,
         .UnsupportedSqlShape => error.UnsupportedSqlShape,
         .InvalidRowsRequest => error.InvalidRowsRequest,

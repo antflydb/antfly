@@ -2489,6 +2489,22 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .invalidate_schema_rewrite_job = request });
     }
 
+    pub fn pauseSchemaRewriteJob(self: *MetadataService, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+        try self.proposeTransitionCommand(.{ .pause_schema_rewrite_job = request });
+    }
+
+    pub fn resumeSchemaRewriteJob(self: *MetadataService, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+        try self.proposeTransitionCommand(.{ .resume_schema_rewrite_job = request });
+    }
+
+    pub fn retrySchemaRewriteJob(self: *MetadataService, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+        try self.proposeTransitionCommand(.{ .retry_schema_rewrite_job = request });
+    }
+
+    pub fn cancelSchemaRewriteJob(self: *MetadataService, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+        try self.proposeTransitionCommand(.{ .cancel_schema_rewrite_job = request });
+    }
+
     pub fn upsertTableEmptyingJob(self: *MetadataService, record: metadata_table_manager.TableEmptyingJobRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_table_emptying_job = record });
     }
@@ -2507,6 +2523,22 @@ pub const MetadataService = struct {
 
     pub fn invalidateTableEmptyingJob(self: *MetadataService, request: metadata_table_manager.TableEmptyingJobInvalidateRequest) !void {
         try self.proposeTransitionCommand(.{ .invalidate_table_emptying_job = request });
+    }
+
+    pub fn pauseTableEmptyingJob(self: *MetadataService, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+        try self.proposeTransitionCommand(.{ .pause_table_emptying_job = request });
+    }
+
+    pub fn resumeTableEmptyingJob(self: *MetadataService, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+        try self.proposeTransitionCommand(.{ .resume_table_emptying_job = request });
+    }
+
+    pub fn retryTableEmptyingJob(self: *MetadataService, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+        try self.proposeTransitionCommand(.{ .retry_table_emptying_job = request });
+    }
+
+    pub fn cancelTableEmptyingJob(self: *MetadataService, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+        try self.proposeTransitionCommand(.{ .cancel_table_emptying_job = request });
     }
 
     pub fn promoteTableEmptyingBarrier(self: *MetadataService, request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) !void {
@@ -4204,6 +4236,22 @@ pub const MetadataHttpService = struct {
         try self.proposeTransitionCommand(.{ .invalidate_schema_rewrite_job = request });
     }
 
+    pub fn pauseSchemaRewriteJob(self: *MetadataHttpService, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+        try self.proposeTransitionCommand(.{ .pause_schema_rewrite_job = request });
+    }
+
+    pub fn resumeSchemaRewriteJob(self: *MetadataHttpService, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+        try self.proposeTransitionCommand(.{ .resume_schema_rewrite_job = request });
+    }
+
+    pub fn retrySchemaRewriteJob(self: *MetadataHttpService, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+        try self.proposeTransitionCommand(.{ .retry_schema_rewrite_job = request });
+    }
+
+    pub fn cancelSchemaRewriteJob(self: *MetadataHttpService, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+        try self.proposeTransitionCommand(.{ .cancel_schema_rewrite_job = request });
+    }
+
     pub fn upsertTableEmptyingJob(self: *MetadataHttpService, record: metadata_table_manager.TableEmptyingJobRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_table_emptying_job = record });
     }
@@ -4222,6 +4270,22 @@ pub const MetadataHttpService = struct {
 
     pub fn invalidateTableEmptyingJob(self: *MetadataHttpService, request: metadata_table_manager.TableEmptyingJobInvalidateRequest) !void {
         try self.proposeTransitionCommand(.{ .invalidate_table_emptying_job = request });
+    }
+
+    pub fn pauseTableEmptyingJob(self: *MetadataHttpService, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+        try self.proposeTransitionCommand(.{ .pause_table_emptying_job = request });
+    }
+
+    pub fn resumeTableEmptyingJob(self: *MetadataHttpService, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+        try self.proposeTransitionCommand(.{ .resume_table_emptying_job = request });
+    }
+
+    pub fn retryTableEmptyingJob(self: *MetadataHttpService, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+        try self.proposeTransitionCommand(.{ .retry_table_emptying_job = request });
+    }
+
+    pub fn cancelTableEmptyingJob(self: *MetadataHttpService, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+        try self.proposeTransitionCommand(.{ .cancel_table_emptying_job = request });
     }
 
     pub fn promoteTableEmptyingBarrier(self: *MetadataHttpService, request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) !void {
@@ -6001,6 +6065,22 @@ fn catalogSourceVTable(comptime Service: type) catalog_source.CatalogSource.VTab
             return try service(ptr).invalidateSchemaRewriteJob(request);
         }
 
+        fn pauseSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+            return try service(ptr).pauseSchemaRewriteJob(request);
+        }
+
+        fn resumeSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+            return try service(ptr).resumeSchemaRewriteJob(request);
+        }
+
+        fn retrySchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+            return try service(ptr).retrySchemaRewriteJob(request);
+        }
+
+        fn cancelSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+            return try service(ptr).cancelSchemaRewriteJob(request);
+        }
+
         fn upsertTableEmptyingJob(ptr: *anyopaque, record: metadata_table_manager.TableEmptyingJobRecord) !void {
             return try service(ptr).upsertTableEmptyingJob(record);
         }
@@ -6043,6 +6123,22 @@ fn catalogSourceVTable(comptime Service: type) catalog_source.CatalogSource.VTab
             return try service(ptr).invalidateTableEmptyingJob(request);
         }
 
+        fn pauseTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+            return try service(ptr).pauseTableEmptyingJob(request);
+        }
+
+        fn resumeTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+            return try service(ptr).resumeTableEmptyingJob(request);
+        }
+
+        fn retryTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+            return try service(ptr).retryTableEmptyingJob(request);
+        }
+
+        fn cancelTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+            return try service(ptr).cancelTableEmptyingJob(request);
+        }
+
         fn promoteTableEmptyingBarrier(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) !void {
             return try service(ptr).promoteTableEmptyingBarrier(request);
         }
@@ -6082,6 +6178,10 @@ fn catalogSourceVTable(comptime Service: type) catalog_source.CatalogSource.VTab
         .begin_schema_rewrite_job = Gen.beginSchemaRewriteJob,
         .finish_schema_rewrite_job = Gen.finishSchemaRewriteJob,
         .invalidate_schema_rewrite_job = Gen.invalidateSchemaRewriteJob,
+        .pause_schema_rewrite_job = Gen.pauseSchemaRewriteJob,
+        .resume_schema_rewrite_job = Gen.resumeSchemaRewriteJob,
+        .retry_schema_rewrite_job = Gen.retrySchemaRewriteJob,
+        .cancel_schema_rewrite_job = Gen.cancelSchemaRewriteJob,
         .upsert_table_emptying_job = Gen.upsertTableEmptyingJob,
         .upsert_table = Gen.upsertTable,
         .apply_table_catalog_update_with_schema_rewrite_jobs = Gen.applyTableCatalogUpdateWithSchemaRewriteJobs,
@@ -6091,6 +6191,10 @@ fn catalogSourceVTable(comptime Service: type) catalog_source.CatalogSource.VTab
         .begin_table_emptying_job = Gen.beginTableEmptyingJob,
         .finish_table_emptying_job = Gen.finishTableEmptyingJob,
         .invalidate_table_emptying_job = Gen.invalidateTableEmptyingJob,
+        .pause_table_emptying_job = Gen.pauseTableEmptyingJob,
+        .resume_table_emptying_job = Gen.resumeTableEmptyingJob,
+        .retry_table_emptying_job = Gen.retryTableEmptyingJob,
+        .cancel_table_emptying_job = Gen.cancelTableEmptyingJob,
         .promote_table_emptying_barrier = Gen.promoteTableEmptyingBarrier,
         .reset_identity_allocators_for_table_emptying_barrier = if (comptime @hasDecl(Service, "resetIdentityAllocatorsForTableEmptyingBarrier")) Gen.resetIdentityAllocatorsForTableEmptyingBarrier else null,
         .supports_identity_allocator_reset_for_table_emptying_barrier = Gen.supportsIdentityAllocatorResetForTableEmptyingBarrier,

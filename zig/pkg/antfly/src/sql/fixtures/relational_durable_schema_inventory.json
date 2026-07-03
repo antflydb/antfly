@@ -6,8 +6,8 @@
       "relational_slices_section": "Durable schema and migration execution",
       "surface": "concurrent_writer_generation_isolation",
       "status": "partial_release_gated",
-      "current_evidence": "Metadata table updates with schema rewrite jobs apply atomically, schema progress waits for hosting nodes, and schema rewrite workers invalidate stale range jobs before rewriting rows.",
-      "missing_evidence": "Concurrent-reader/writer tests still need to prove no operation observes or writes mixed schema generations during rewrite/backfill, table-emptying, CAS promotion, or restart-identity sequence reset.",
+      "current_evidence": "Metadata table updates with schema rewrite jobs apply atomically, schema progress waits for hosting nodes, schema rewrite workers invalidate stale range jobs before rewriting rows, and table-emptying barriers validate complete ready range jobs before data-generation or restart-identity promotion.",
+      "missing_evidence": "Concurrent-reader/writer tests still need to drive live rewrite, table-emptying, CAS promotion, restart-identity reset, and reopen paths together and prove no operation observes or writes mixed schema generations.",
       "evidence_file": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
       "evidence_symbol": "metadata raft apply store applies table updates with schema rewrite jobs atomically",
       "release_gate": "relational-release-gate"
@@ -16,9 +16,9 @@
       "id": "create-or-replace-table-schema-job",
       "relational_slices_section": "Durable schema and migration execution",
       "surface": "create_or_replace_table",
-      "status": "gap_tracked",
-      "current_evidence": "Applied SQL DDL can schedule typed, row-plan, and full-row schema rewrite jobs and promote completed rewrite work through table schema CAS.",
-      "missing_evidence": "CREATE OR REPLACE TABLE still needs one durable schema job owning rebuild, validation, rewrite, backfill, CAS promotion, retry, abort, reopen, and idempotent replay state.",
+      "status": "partial_release_gated",
+      "current_evidence": "Applied SQL DDL supports CREATE OR REPLACE TABLE catalog application, marks rebuild/validation/rewrite work, deterministically schedules typed, row-plan, and full-row schema rewrite jobs from applied DDL work, persists table updates with rewrite jobs atomically across metadata reopen, and promotes completed rewrite work through table schema CAS.",
+      "missing_evidence": "CREATE OR REPLACE TABLE still needs one durable schema-job workflow that owns validation, rewrite/backfill admission, CAS promotion, retry/abort decisions, reopen replay, and idempotent convergence. Existing catalog-apply and rewrite-job pieces are release evidence only after a single recoverable workflow ties them together.",
       "evidence_file": "zig/pkg/antfly/src/metadata/catalog/jobs.zig",
       "evidence_symbol": "catalog jobs schedules full row schema rewrite jobs from applied SQL DDL work",
       "release_gate": "relational-release-gate"
@@ -28,8 +28,8 @@
       "relational_slices_section": "Durable schema and migration execution",
       "surface": "drop_table_cascade",
       "status": "partial_release_gated",
-      "current_evidence": "SQL DROP TABLE CASCADE updates child schemas, records catalog work items, and drop-table API paths wait for metadata lifecycle absence.",
-      "missing_evidence": "DROP TABLE CASCADE still needs a recoverable multi-table schema job with table-generation promotion, child updates, range cleanup, sequence cleanup, partial-progress recovery, and idempotent restart convergence.",
+      "current_evidence": "SQL DROP TABLE CASCADE updates child schemas and records catalog work items, while the table-emptying barrier machinery independently schedules cascade-aware multi-table jobs, repairs jobs after range topology changes, waits for every affected table range, resets identity allocators, promotes data generations, and removes completed durable jobs.",
+      "missing_evidence": "DROP TABLE CASCADE still needs one recoverable multi-table schema job that combines child schema updates with table-emptying/range cleanup, sequence cleanup, partial-progress recovery, reopen replay, and idempotent restart convergence. Existing child-schema cleanup and table-emptying barriers are separate release-gated pieces until that job owns the full cascade.",
       "evidence_file": "zig/pkg/antfly/src/metadata/http_server.zig",
       "evidence_symbol": "metadata catalog validation applies sql drop table cascade through child schema updates",
       "release_gate": "relational-release-gate"
@@ -38,11 +38,11 @@
       "id": "schema-job-operator-controls",
       "relational_slices_section": "Durable schema and migration execution",
       "surface": "operator_controls",
-      "status": "partial_release_gated",
-      "current_evidence": "Schema rewrite and table-emptying jobs expose durable lifecycle operations, progress records, stale lease rejection, wake loops, and busy-only worker passes.",
-      "missing_evidence": "Large table-emptying and schema rewrite jobs still need operator-facing progress API, pause, resume, abort, retry, stale lease takeover controls, worker admission bounds, and surfaced failure classes.",
-      "evidence_file": "zig/pkg/antfly/src/metadata/table_manager.zig",
-      "evidence_symbol": "table manager applies schema rewrite job lifecycle operations",
+      "status": "release_evidence",
+      "current_evidence": "Schema rewrite and table-emptying jobs expose durable lifecycle operations, progress records, stale lease rejection/takeover through lease expiry, wake loops, busy-only worker passes, invalidation with last_error, HTTP worker routes, admin-snapshot job visibility, and typed metadata manager/service/catalog-source controls for pause, resume, retry/requeue, and cancel. Raft transition commands persist those operator controls across reopen for both job families, and internal metadata HTTP routes expose all eight controls with deterministic 404/405/409 response classes. Worker passes now share an explicit admission policy for lease TTL, per-pass work bounds, and stale-running-job admission; focused coverage proves both job families honor the bounds and can disable or allow stale lease takeover admission.",
+      "missing_evidence": "",
+      "evidence_file": "zig/pkg/antfly/src/api/table_writes/schema_jobs.zig",
+      "evidence_symbol": "schema job worker admission policy bounds work and stale takeover; metadata raft apply store persists schema and table emptying operator controls across reopen",
       "release_gate": "relational-release-gate"
     }
   ]

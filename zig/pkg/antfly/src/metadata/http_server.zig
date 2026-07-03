@@ -99,6 +99,13 @@ pub const NodeShutdownRequest = struct {
     reason: []const u8 = "",
 };
 
+pub const JobControlRequestBody = struct {
+    reason: []const u8 = "",
+};
+
+const SchemaRewriteJobControlAction = enum { pause, @"resume", retry, cancel };
+const TableEmptyingJobControlAction = enum { pause, @"resume", retry, cancel };
+
 pub const NodeShutdownStoreStatus = struct {
     store_id: u64,
     placement_intent_count: usize = 0,
@@ -171,6 +178,14 @@ pub const AdminSource = struct {
         finish_foreign_key_ref_range_split: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeSplitRequest) anyerror!void = null,
         begin_foreign_key_ref_range_merge: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeMergeRequest) anyerror!void = null,
         finish_foreign_key_ref_range_merge: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeMergeRequest) anyerror!void = null,
+        pause_schema_rewrite_job: ?*const fn (ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobControlRequest) anyerror!void = null,
+        resume_schema_rewrite_job: ?*const fn (ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobControlRequest) anyerror!void = null,
+        retry_schema_rewrite_job: ?*const fn (ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobControlRequest) anyerror!void = null,
+        cancel_schema_rewrite_job: ?*const fn (ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobControlRequest) anyerror!void = null,
+        pause_table_emptying_job: ?*const fn (ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobControlRequest) anyerror!void = null,
+        resume_table_emptying_job: ?*const fn (ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobControlRequest) anyerror!void = null,
+        retry_table_emptying_job: ?*const fn (ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobControlRequest) anyerror!void = null,
+        cancel_table_emptying_job: ?*const fn (ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobControlRequest) anyerror!void = null,
         reseed_replication_source_exact_cutover: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, source_ordinal: u32) anyerror!ReseedExactCutoverResult = null,
         install_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.InstallExtensionRequest) anyerror!extension_domain.InstalledExtension = null,
         update_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.UpdateExtensionRequest) anyerror!extension_domain.InstalledExtension = null,
@@ -379,6 +394,46 @@ pub const AdminSource = struct {
         return try fn_ptr(self.ptr, alloc, table_name, req);
     }
 
+    pub fn pauseSchemaRewriteJob(self: AdminSource, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+        const fn_ptr = self.vtable.pause_schema_rewrite_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn resumeSchemaRewriteJob(self: AdminSource, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+        const fn_ptr = self.vtable.resume_schema_rewrite_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn retrySchemaRewriteJob(self: AdminSource, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+        const fn_ptr = self.vtable.retry_schema_rewrite_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn cancelSchemaRewriteJob(self: AdminSource, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+        const fn_ptr = self.vtable.cancel_schema_rewrite_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn pauseTableEmptyingJob(self: AdminSource, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+        const fn_ptr = self.vtable.pause_table_emptying_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn resumeTableEmptyingJob(self: AdminSource, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+        const fn_ptr = self.vtable.resume_table_emptying_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn retryTableEmptyingJob(self: AdminSource, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+        const fn_ptr = self.vtable.retry_table_emptying_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn cancelTableEmptyingJob(self: AdminSource, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+        const fn_ptr = self.vtable.cancel_table_emptying_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
     pub fn reseedReplicationSourceExactCutover(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, source_ordinal: u32) !ReseedExactCutoverResult {
         const fn_ptr = self.vtable.reseed_replication_source_exact_cutover orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name, source_ordinal);
@@ -468,6 +523,14 @@ pub const AdminSource = struct {
                 .finish_foreign_key_ref_range_split = metadataServiceFinishForeignKeyReferenceRangeSplit,
                 .begin_foreign_key_ref_range_merge = metadataServiceBeginForeignKeyReferenceRangeMerge,
                 .finish_foreign_key_ref_range_merge = metadataServiceFinishForeignKeyReferenceRangeMerge,
+                .pause_schema_rewrite_job = metadataServicePauseSchemaRewriteJob,
+                .resume_schema_rewrite_job = metadataServiceResumeSchemaRewriteJob,
+                .retry_schema_rewrite_job = metadataServiceRetrySchemaRewriteJob,
+                .cancel_schema_rewrite_job = metadataServiceCancelSchemaRewriteJob,
+                .pause_table_emptying_job = metadataServicePauseTableEmptyingJob,
+                .resume_table_emptying_job = metadataServiceResumeTableEmptyingJob,
+                .retry_table_emptying_job = metadataServiceRetryTableEmptyingJob,
+                .cancel_table_emptying_job = metadataServiceCancelTableEmptyingJob,
                 .reseed_replication_source_exact_cutover = metadataServiceReseedReplicationSourceExactCutover,
                 .install_extension = metadataServiceInstallExtension,
                 .update_extension = metadataServiceUpdateExtension,
@@ -514,6 +577,14 @@ pub const AdminSource = struct {
                 .finish_foreign_key_ref_range_split = metadataHttpServiceFinishForeignKeyReferenceRangeSplit,
                 .begin_foreign_key_ref_range_merge = metadataHttpServiceBeginForeignKeyReferenceRangeMerge,
                 .finish_foreign_key_ref_range_merge = metadataHttpServiceFinishForeignKeyReferenceRangeMerge,
+                .pause_schema_rewrite_job = metadataHttpServicePauseSchemaRewriteJob,
+                .resume_schema_rewrite_job = metadataHttpServiceResumeSchemaRewriteJob,
+                .retry_schema_rewrite_job = metadataHttpServiceRetrySchemaRewriteJob,
+                .cancel_schema_rewrite_job = metadataHttpServiceCancelSchemaRewriteJob,
+                .pause_table_emptying_job = metadataHttpServicePauseTableEmptyingJob,
+                .resume_table_emptying_job = metadataHttpServiceResumeTableEmptyingJob,
+                .retry_table_emptying_job = metadataHttpServiceRetryTableEmptyingJob,
+                .cancel_table_emptying_job = metadataHttpServiceCancelTableEmptyingJob,
                 .reseed_replication_source_exact_cutover = metadataHttpServiceReseedReplicationSourceExactCutover,
                 .install_extension = metadataHttpServiceInstallExtension,
                 .update_extension = metadataHttpServiceUpdateExtension,
@@ -810,6 +881,54 @@ pub const AdminSource = struct {
     fn metadataServiceFinishForeignKeyReferenceRangeMerge(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeMergeRequest) !void {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         try finishForeignKeyReferenceRangeMergeForService(service.MetadataService, svc, alloc, table_name, req, flushMetadataServiceMutation);
+    }
+
+    fn metadataServicePauseSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.pauseSchemaRewriteJob(request);
+        try flushMetadataServiceMutation(svc);
+    }
+
+    fn metadataServiceResumeSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.resumeSchemaRewriteJob(request);
+        try flushMetadataServiceMutation(svc);
+    }
+
+    fn metadataServiceRetrySchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.retrySchemaRewriteJob(request);
+        try flushMetadataServiceMutation(svc);
+    }
+
+    fn metadataServiceCancelSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.cancelSchemaRewriteJob(request);
+        try flushMetadataServiceMutation(svc);
+    }
+
+    fn metadataServicePauseTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.pauseTableEmptyingJob(request);
+        try flushMetadataServiceMutation(svc);
+    }
+
+    fn metadataServiceResumeTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.resumeTableEmptyingJob(request);
+        try flushMetadataServiceMutation(svc);
+    }
+
+    fn metadataServiceRetryTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.retryTableEmptyingJob(request);
+        try flushMetadataServiceMutation(svc);
+    }
+
+    fn metadataServiceCancelTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.cancelTableEmptyingJob(request);
+        try flushMetadataServiceMutation(svc);
     }
 
     fn metadataServiceReseedReplicationSourceExactCutover(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, source_ordinal: u32) !ReseedExactCutoverResult {
@@ -1170,6 +1289,54 @@ pub const AdminSource = struct {
         try finishForeignKeyReferenceRangeMergeForService(service.MetadataHttpService, svc, alloc, table_name, req, flushMetadataHttpServiceMutation);
     }
 
+    fn metadataHttpServicePauseSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.pauseSchemaRewriteJob(request);
+        try flushMetadataHttpServiceMutation(svc);
+    }
+
+    fn metadataHttpServiceResumeSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.resumeSchemaRewriteJob(request);
+        try flushMetadataHttpServiceMutation(svc);
+    }
+
+    fn metadataHttpServiceRetrySchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.retrySchemaRewriteJob(request);
+        try flushMetadataHttpServiceMutation(svc);
+    }
+
+    fn metadataHttpServiceCancelSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.cancelSchemaRewriteJob(request);
+        try flushMetadataHttpServiceMutation(svc);
+    }
+
+    fn metadataHttpServicePauseTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.pauseTableEmptyingJob(request);
+        try flushMetadataHttpServiceMutation(svc);
+    }
+
+    fn metadataHttpServiceResumeTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.resumeTableEmptyingJob(request);
+        try flushMetadataHttpServiceMutation(svc);
+    }
+
+    fn metadataHttpServiceRetryTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.retryTableEmptyingJob(request);
+        try flushMetadataHttpServiceMutation(svc);
+    }
+
+    fn metadataHttpServiceCancelTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.cancelTableEmptyingJob(request);
+        try flushMetadataHttpServiceMutation(svc);
+    }
+
     fn metadataHttpServiceReseedReplicationSourceExactCutover(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, source_ordinal: u32) !ReseedExactCutoverResult {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         svc.cdc_runtime_mutex.lockUncancelable(std.Options.debug_io);
@@ -1480,6 +1647,30 @@ pub const MetadataHttpServer = struct {
                     };
                     return try textResponse(self.alloc, 202, "accepted");
                 }
+                if (routes.Routes.matchInternalSchemaRewriteJobPause(req.uri)) |job_id| {
+                    return try self.handleSchemaRewriteJobControl(req, job_id, .pause);
+                }
+                if (routes.Routes.matchInternalSchemaRewriteJobResume(req.uri)) |job_id| {
+                    return try self.handleSchemaRewriteJobControl(req, job_id, .@"resume");
+                }
+                if (routes.Routes.matchInternalSchemaRewriteJobRetry(req.uri)) |job_id| {
+                    return try self.handleSchemaRewriteJobControl(req, job_id, .retry);
+                }
+                if (routes.Routes.matchInternalSchemaRewriteJobCancel(req.uri)) |job_id| {
+                    return try self.handleSchemaRewriteJobControl(req, job_id, .cancel);
+                }
+                if (routes.Routes.matchInternalTableEmptyingJobPause(req.uri)) |job_id| {
+                    return try self.handleTableEmptyingJobControl(req, job_id, .pause);
+                }
+                if (routes.Routes.matchInternalTableEmptyingJobResume(req.uri)) |job_id| {
+                    return try self.handleTableEmptyingJobControl(req, job_id, .@"resume");
+                }
+                if (routes.Routes.matchInternalTableEmptyingJobRetry(req.uri)) |job_id| {
+                    return try self.handleTableEmptyingJobControl(req, job_id, .retry);
+                }
+                if (routes.Routes.matchInternalTableEmptyingJobCancel(req.uri)) |job_id| {
+                    return try self.handleTableEmptyingJobControl(req, job_id, .cancel);
+                }
                 if (routes.Routes.matchInternalTable(req.uri)) |table| {
                     var create_req = parseCreateTableRequest(self.alloc, req.body) catch return try textResponse(self.alloc, 400, "invalid create table request");
                     defer create_req.deinit(self.alloc);
@@ -1733,6 +1924,44 @@ pub const MetadataHttpServer = struct {
             },
         }
         return try textResponse(self.alloc, 404, "not found");
+    }
+
+    fn handleSchemaRewriteJobControl(
+        self: *MetadataHttpServer,
+        req: http_common.HttpRequest,
+        job_id: u64,
+        action: SchemaRewriteJobControlAction,
+    ) !http_common.HttpResponse {
+        const control = parseSchemaRewriteJobControlRequest(self.alloc, job_id, req.body) catch {
+            return try textResponse(self.alloc, 400, "invalid schema rewrite job control request");
+        };
+        defer freeSchemaRewriteJobControlRequest(self.alloc, control);
+        (switch (action) {
+            .pause => self.source.pauseSchemaRewriteJob(control),
+            .@"resume" => self.source.resumeSchemaRewriteJob(control),
+            .retry => self.source.retrySchemaRewriteJob(control),
+            .cancel => self.source.cancelSchemaRewriteJob(control),
+        }) catch |err| return try schemaRewriteJobControlErrorResponse(self.alloc, err);
+        return try textResponse(self.alloc, 202, "accepted");
+    }
+
+    fn handleTableEmptyingJobControl(
+        self: *MetadataHttpServer,
+        req: http_common.HttpRequest,
+        job_id: u64,
+        action: TableEmptyingJobControlAction,
+    ) !http_common.HttpResponse {
+        const control = parseTableEmptyingJobControlRequest(self.alloc, job_id, req.body) catch {
+            return try textResponse(self.alloc, 400, "invalid table emptying job control request");
+        };
+        defer freeTableEmptyingJobControlRequest(self.alloc, control);
+        (switch (action) {
+            .pause => self.source.pauseTableEmptyingJob(control),
+            .@"resume" => self.source.resumeTableEmptyingJob(control),
+            .retry => self.source.retryTableEmptyingJob(control),
+            .cancel => self.source.cancelTableEmptyingJob(control),
+        }) catch |err| return try tableEmptyingJobControlErrorResponse(self.alloc, err);
+        return try textResponse(self.alloc, 202, "accepted");
     }
 
     fn forwardMutationToLeader(self: *MetadataHttpServer, req: http_common.HttpRequest) !?http_common.HttpResponse {
@@ -2123,6 +2352,42 @@ fn parseMergeRequest(alloc: std.mem.Allocator, body: []const u8) !MergeRequest {
             else => return error.InvalidMergeRequest,
         } else false,
     };
+}
+
+fn parseSchemaRewriteJobControlRequest(alloc: std.mem.Allocator, job_id: u64, body: []const u8) !metadata_table_manager.SchemaRewriteJobControlRequest {
+    var parsed = try std.json.parseFromSlice(JobControlRequestBody, alloc, jsonBodyOrEmptyObject(body), .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    const reason = try alloc.dupe(u8, parsed.value.reason);
+    errdefer alloc.free(reason);
+    return .{
+        .job_id = job_id,
+        .reason = reason,
+    };
+}
+
+fn parseTableEmptyingJobControlRequest(alloc: std.mem.Allocator, job_id: u64, body: []const u8) !metadata_table_manager.TableEmptyingJobControlRequest {
+    var parsed = try std.json.parseFromSlice(JobControlRequestBody, alloc, jsonBodyOrEmptyObject(body), .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    const reason = try alloc.dupe(u8, parsed.value.reason);
+    errdefer alloc.free(reason);
+    return .{
+        .job_id = job_id,
+        .reason = reason,
+    };
+}
+
+fn freeSchemaRewriteJobControlRequest(alloc: std.mem.Allocator, request: metadata_table_manager.SchemaRewriteJobControlRequest) void {
+    alloc.free(request.reason);
+}
+
+fn freeTableEmptyingJobControlRequest(alloc: std.mem.Allocator, request: metadata_table_manager.TableEmptyingJobControlRequest) void {
+    alloc.free(request.reason);
 }
 
 fn parseForeignKeyReferenceRangeSelectorRequest(alloc: std.mem.Allocator, body: []const u8) !ForeignKeyReferenceRangeSelectorRequest {
@@ -4055,6 +4320,34 @@ fn extensionLifecycleErrorResponse(alloc: std.mem.Allocator, err: anyerror) !htt
     };
 }
 
+fn schemaRewriteJobControlErrorResponse(alloc: std.mem.Allocator, err: anyerror) !http_common.HttpResponse {
+    return switch (err) {
+        error.UnsupportedOperation => try textResponse(alloc, 405, "unsupported operation"),
+        error.UnknownSchemaRewriteJob => try textResponse(alloc, 404, "schema rewrite job not found"),
+        error.SchemaRewriteJobNotDeclared,
+        error.SchemaRewriteJobNotPaused,
+        error.SchemaRewriteJobNotInvalid,
+        error.SchemaRewriteJobComplete,
+        error.SchemaRewriteJobCanceled,
+        => try textResponse(alloc, 409, "invalid schema rewrite job state"),
+        else => err,
+    };
+}
+
+fn tableEmptyingJobControlErrorResponse(alloc: std.mem.Allocator, err: anyerror) !http_common.HttpResponse {
+    return switch (err) {
+        error.UnsupportedOperation => try textResponse(alloc, 405, "unsupported operation"),
+        error.UnknownTableEmptyingJob => try textResponse(alloc, 404, "table emptying job not found"),
+        error.TableEmptyingJobNotDeclared,
+        error.TableEmptyingJobNotPaused,
+        error.TableEmptyingJobNotInvalid,
+        error.TableEmptyingJobComplete,
+        error.TableEmptyingJobCanceled,
+        => try textResponse(alloc, 409, "invalid table emptying job state"),
+        else => err,
+    };
+}
+
 fn textResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !http_common.HttpResponse {
     return .{
         .status = status,
@@ -5447,6 +5740,151 @@ test "metadata http server accepts internal foreign key reference range lifecycl
     try std.testing.expectEqual(@as(usize, 1), source.finish_splits);
     try std.testing.expectEqual(@as(usize, 1), source.begin_merges);
     try std.testing.expectEqual(@as(usize, 1), source.finish_merges);
+}
+
+test "metadata http server accepts internal schema job operator control routes" {
+    const FakeSource = struct {
+        schema_pause_count: usize = 0,
+        schema_resume_count: usize = 0,
+        schema_retry_count: usize = 0,
+        schema_cancel_count: usize = 0,
+        table_pause_count: usize = 0,
+        table_resume_count: usize = 0,
+        table_retry_count: usize = 0,
+        table_cancel_count: usize = 0,
+
+        fn iface(self: *@This()) AdminSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .pause_schema_rewrite_job = pauseSchemaRewriteJob,
+                    .resume_schema_rewrite_job = resumeSchemaRewriteJob,
+                    .retry_schema_rewrite_job = retrySchemaRewriteJob,
+                    .cancel_schema_rewrite_job = cancelSchemaRewriteJob,
+                    .pause_table_emptying_job = pauseTableEmptyingJob,
+                    .resume_table_emptying_job = resumeTableEmptyingJob,
+                    .retry_table_emptying_job = retryTableEmptyingJob,
+                    .cancel_table_emptying_job = cancelTableEmptyingJob,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metadata_epoch = 2, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metadata_epoch = 2, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            snapshot.* = undefined;
+        }
+
+        fn pauseSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 9101), request.job_id);
+            try std.testing.expectEqualStrings("schema pause", request.reason);
+            self.schema_pause_count += 1;
+        }
+
+        fn resumeSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 9101), request.job_id);
+            try std.testing.expectEqualStrings("schema resume", request.reason);
+            self.schema_resume_count += 1;
+        }
+
+        fn retrySchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 9101), request.job_id);
+            try std.testing.expectEqualStrings("schema retry", request.reason);
+            self.schema_retry_count += 1;
+        }
+
+        fn cancelSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobControlRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 9101), request.job_id);
+            try std.testing.expectEqualStrings("schema cancel", request.reason);
+            self.schema_cancel_count += 1;
+        }
+
+        fn pauseTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 9201), request.job_id);
+            try std.testing.expectEqualStrings("table pause", request.reason);
+            self.table_pause_count += 1;
+        }
+
+        fn resumeTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 9201), request.job_id);
+            try std.testing.expectEqualStrings("table resume", request.reason);
+            self.table_resume_count += 1;
+        }
+
+        fn retryTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 9201), request.job_id);
+            try std.testing.expectEqualStrings("table retry", request.reason);
+            self.table_retry_count += 1;
+        }
+
+        fn cancelTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobControlRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 9201), request.job_id);
+            try std.testing.expectEqualStrings("table cancel", request.reason);
+            self.table_cancel_count += 1;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+
+    const controls = [_]struct {
+        uri: []const u8,
+        body: []const u8,
+    }{
+        .{ .uri = "/internal/v1/schema-rewrite-jobs/9101/pause", .body = "{\"reason\":\"schema pause\"}" },
+        .{ .uri = "/internal/v1/schema-rewrite-jobs/9101/resume", .body = "{\"reason\":\"schema resume\"}" },
+        .{ .uri = "/internal/v1/schema-rewrite-jobs/9101/retry", .body = "{\"reason\":\"schema retry\"}" },
+        .{ .uri = "/internal/v1/schema-rewrite-jobs/9101/cancel", .body = "{\"reason\":\"schema cancel\"}" },
+        .{ .uri = "/internal/v1/table-emptying-jobs/9201/pause", .body = "{\"reason\":\"table pause\"}" },
+        .{ .uri = "/internal/v1/table-emptying-jobs/9201/resume", .body = "{\"reason\":\"table resume\"}" },
+        .{ .uri = "/internal/v1/table-emptying-jobs/9201/retry", .body = "{\"reason\":\"table retry\"}" },
+        .{ .uri = "/internal/v1/table-emptying-jobs/9201/cancel", .body = "{\"reason\":\"table cancel\"}" },
+    };
+
+    for (controls) |control| {
+        var resp = try server.handle(.{
+            .method = .POST,
+            .uri = control.uri,
+            .body = control.body,
+            .content_type = "application/json",
+        });
+        defer resp.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u16, 202), resp.status);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), source.schema_pause_count);
+    try std.testing.expectEqual(@as(usize, 1), source.schema_resume_count);
+    try std.testing.expectEqual(@as(usize, 1), source.schema_retry_count);
+    try std.testing.expectEqual(@as(usize, 1), source.schema_cancel_count);
+    try std.testing.expectEqual(@as(usize, 1), source.table_pause_count);
+    try std.testing.expectEqual(@as(usize, 1), source.table_resume_count);
+    try std.testing.expectEqual(@as(usize, 1), source.table_retry_count);
+    try std.testing.expectEqual(@as(usize, 1), source.table_cancel_count);
 }
 
 test "metadata http server rejects split and merge during active doc identity reassignment before source mutation" {

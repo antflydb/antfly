@@ -17,12 +17,12 @@
       "id": "insert-source-upsert-owner-chaos",
       "relational_slices_section": "Release parity and production chaos gate",
       "scope": "insert_source_upsert_owner_movement",
-      "status": "missing_native_harness",
+      "status": "partial_release_gated",
       "required_behavior": "Hosted/provisioned insert-source upsert must handle unique owner movement between source read, conflict lookup, grouped conflict guard evaluation, staging, and commit without duplicate unique entries, stale owner writes, or SQL versus typed-plan divergence.",
-      "current_evidence": "Release-gated local insert-source conflict/upsert parity, hosted mutation-source topology retry, and typed insert-source planner fail-closed coverage for ordinary unique and temporal-overlap owner topology errors exist, but insert-source upsert has no hosted/provisioned native stage protocol equivalent to mutation-source staging.",
-      "missing_evidence": "Add a production chaos harness or explicit native insert-source staging protocol that revalidates unique owners after topology movement before grouped conflict updates commit.",
-      "evidence_file": "zig/pkg/antfly/src/sql/relational_rows.zig",
-      "evidence_symbol": "relational rows insert source conflict owner topology changes fail closed",
+      "current_evidence": "Release-gated local insert-source conflict/upsert parity, hosted mutation-source collect/stage topology retry, and typed insert-source planner fail-closed coverage for ordinary unique and temporal-overlap owner topology errors exist. A public API insert-source mutation harness now drives the current API-layer planning path through source read, unique-owner topology unavailability, deterministic 503 response, and zero commitTransaction/batch calls, proving that owner movement before grouped conflict updates fails closed before writes are staged.",
+      "missing_evidence": "Insert-source upsert still plans in the API/server layer and then batches writes; it has no hosted/provisioned native stage protocol equivalent to mutation-source staging. Full release evidence still needs hosted/provisioned owner-movement chaos or a native stage protocol covering successful conflict-owner lookup followed by guard evaluation, grouped staging, commit retry/fail-closed behavior, and SQL versus typed-plan convergence.",
+      "evidence_file": "zig/pkg/antfly/src/api_rows_test_root.zig",
+      "evidence_symbol": "api rows insert-source upsert aborts before commit when unique owner topology moves",
       "release_gate": "relational-release-gate"
     },
     {

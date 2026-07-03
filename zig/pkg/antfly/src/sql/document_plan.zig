@@ -273,12 +273,25 @@ pub const DocumentUnnest = struct {
     item_type: runtime_schema.AntflyType,
     filter_value_json: ?[]const u8 = null,
     filter_values_json: ?[]const u8 = null,
+    filter_range_json: ?[]const u8 = null,
+    filter_not_value_json: ?[]const u8 = null,
+    filter_not_query_json: ?[]const u8 = null,
+    filter_pattern_json: ?[]const u8 = null,
+    filter_pattern_query_json: ?[]const u8 = null,
+    filter_pattern_case_insensitive: bool = false,
+    filter_is_not_null: bool = false,
+    filter_match_none: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.field.len > 0) alloc.free(@constCast(self.field));
         if (self.alias.len > 0) alloc.free(@constCast(self.alias));
         if (self.filter_value_json) |value| alloc.free(@constCast(value));
         if (self.filter_values_json) |values| alloc.free(@constCast(values));
+        if (self.filter_range_json) |range| alloc.free(@constCast(range));
+        if (self.filter_not_value_json) |value| alloc.free(@constCast(value));
+        if (self.filter_not_query_json) |query| alloc.free(@constCast(query));
+        if (self.filter_pattern_json) |pattern| alloc.free(@constCast(pattern));
+        if (self.filter_pattern_query_json) |query| alloc.free(@constCast(query));
         self.* = undefined;
     }
 
@@ -304,6 +317,54 @@ pub const DocumentUnnest = struct {
         const values = self.filter_values_json;
         self.filter_values_json = null;
         return values;
+    }
+
+    fn takeFilterRangeJson(self: *@This()) ?[]const u8 {
+        const range = self.filter_range_json;
+        self.filter_range_json = null;
+        return range;
+    }
+
+    fn takeFilterNotValueJson(self: *@This()) ?[]const u8 {
+        const value = self.filter_not_value_json;
+        self.filter_not_value_json = null;
+        return value;
+    }
+
+    fn takeFilterNotQueryJson(self: *@This()) ?[]const u8 {
+        const query = self.filter_not_query_json;
+        self.filter_not_query_json = null;
+        return query;
+    }
+
+    fn takeFilterPatternJson(self: *@This()) ?[]const u8 {
+        const pattern = self.filter_pattern_json;
+        self.filter_pattern_json = null;
+        return pattern;
+    }
+
+    fn takeFilterPatternQueryJson(self: *@This()) ?[]const u8 {
+        const query = self.filter_pattern_query_json;
+        self.filter_pattern_query_json = null;
+        return query;
+    }
+
+    fn takeFilterPatternCaseInsensitive(self: *@This()) bool {
+        const value = self.filter_pattern_case_insensitive;
+        self.filter_pattern_case_insensitive = false;
+        return value;
+    }
+
+    fn takeFilterIsNotNull(self: *@This()) bool {
+        const value = self.filter_is_not_null;
+        self.filter_is_not_null = false;
+        return value;
+    }
+
+    fn takeFilterMatchNone(self: *@This()) bool {
+        const value = self.filter_match_none;
+        self.filter_match_none = false;
+        return value;
     }
 };
 
@@ -766,9 +827,10 @@ fn lowerDocumentReadPlanInternalParsedSqlAlloc(
         var mutable = producer;
         mutable.deinit(alloc);
     }
-    if (view_mapping != null and !documentViewMappingBoundedScanProducerAdmitted(producer, order_by, limit, from_binding.unnest)) {
-        return error.DocumentSqlBoundedScanMissingExactProducer;
-    }
+    if (view_mapping != null) switch (producer) {
+        .bounded_scan => return error.DocumentSqlBoundedScanMissingExactProducer,
+        else => {},
+    };
     if (limit == null and bounded_scan_policy != null) switch (producer) {
         .indexed_query, .bounded_scan => return error.DocumentSqlBoundedScanIncompleteTopK,
         .id_lookup => {},
@@ -793,29 +855,17 @@ fn lowerDocumentReadPlanInternalParsedSqlAlloc(
             .item_type = unnest.item_type,
             .filter_value_json = unnest.takeFilterValueJson(),
             .filter_values_json = unnest.takeFilterValuesJson(),
+            .filter_range_json = unnest.takeFilterRangeJson(),
+            .filter_not_value_json = unnest.takeFilterNotValueJson(),
+            .filter_not_query_json = unnest.takeFilterNotQueryJson(),
+            .filter_pattern_json = unnest.takeFilterPatternJson(),
+            .filter_pattern_query_json = unnest.takeFilterPatternQueryJson(),
+            .filter_pattern_case_insensitive = unnest.takeFilterPatternCaseInsensitive(),
+            .filter_is_not_null = unnest.takeFilterIsNotNull(),
+            .filter_match_none = unnest.takeFilterMatchNone(),
         } else null,
         .limit = limit,
     };
-}
-
-fn documentViewMappingBoundedScanProducerAdmitted(
-    producer: DocumentProducer,
-    order_by: ?DocumentOrderBy,
-    limit: ?u32,
-    unnest: ?DocumentUnnest,
-) bool {
-    const bounded_scan = switch (producer) {
-        .bounded_scan => |scan| scan,
-        else => return true,
-    };
-    if (order_by != null or limit == null or unnest != null) return false;
-    const residual_filter_json = bounded_scan.residual_filter_json orelse return false;
-    return documentViewMappingResidualBoundedScanFilterAdmitted(residual_filter_json);
-}
-
-fn documentViewMappingResidualBoundedScanFilterAdmitted(filter_json: []const u8) bool {
-    return std.mem.startsWith(u8, filter_json, "{\"term\":{\"path\":\"/metadata/plan\",\"value\":") and
-        std.mem.endsWith(u8, filter_json, "}}");
 }
 
 fn parseWhereBoundedScanProducerAlloc(
@@ -1785,7 +1835,7 @@ fn parseWhereProducerAlloc(
 
     if (unnest) |binding| {
         if (!parsed.id_lookup_seen and parsed.full_text_query == null and native_query == null and
-            (binding.filter_value_json != null or binding.filter_values_json != null) and
+            (binding.filter_value_json != null or binding.filter_values_json != null or binding.filter_range_json != null or binding.filter_not_query_json != null or binding.filter_pattern_query_json != null or binding.filter_is_not_null or binding.filter_match_none) and
             documentProducerArrayElementPathReady(producer_capabilities, binding.field))
         {
             const clause = try buildDocumentUnnestIndexedFilterClauseAlloc(alloc, binding.*);
@@ -2090,7 +2140,10 @@ fn partitionScalarFilterClausesByIndexReadinessAlloc(
         for (clauses) |clause| indexed.appendAssumeCapacity(clause);
         return;
     }
-    if (capabilities.indexed_scalar_filter_paths.len == 0 and capabilities.runtime_schema_scalar_filters == null) {
+    if (capabilities.indexed_scalar_filter_paths.len == 0 and
+        capabilities.indexed_array_element_paths.len == 0 and
+        capabilities.runtime_schema_scalar_filters == null)
+    {
         try residual.ensureUnusedCapacity(alloc, clauses.len);
         for (clauses) |clause| residual.appendAssumeCapacity(clause);
         return;
@@ -2141,6 +2194,8 @@ fn documentScalarFilterObjectIndexReady(capabilities: DocumentProducerCapabiliti
     if (object.get("match_none") != null) return true;
     if (object.get("match_all") != null) return false;
     if (object.get("bool")) |bool_value| return documentScalarFilterBoolIndexReady(capabilities, bool_value);
+    if (object.get("conjuncts")) |items| return documentScalarFilterValueIndexReady(capabilities, items);
+    if (object.get("disjuncts")) |items| return documentScalarFilterValueIndexReady(capabilities, items);
 
     if (documentScalarFilterOperatorPath(object, "term")) |path| return documentProducerScalarPathReady(capabilities, path);
     if (documentScalarFilterOperatorPath(object, "terms")) |path| return documentProducerScalarPathReady(capabilities, path);
@@ -2722,6 +2777,7 @@ fn parseDocumentUnnestFilterIntoAlloc(
     if (tokens.len == 0 or tokens[0].kind != .identifier) return false;
     if (!std.ascii.eqlIgnoreCase(tokens[0].text, unnest.alias)) return false;
     if (tokens.len >= 5 and tokens[1].matchesKeywordTag(.in)) {
+        if (unnest.filter_pattern_json != null) return error.DocumentSqlUnnestUnsupported;
         const values_json = (try tokenLiteralListSqlInJsonAlloc(alloc, tokens[2..])) orelse try alloc.dupe(u8, "[]");
         errdefer alloc.free(values_json);
         if (unnest.filter_values_json) |existing| {
@@ -2732,7 +2788,82 @@ fn parseDocumentUnnestFilterIntoAlloc(
         unnest.filter_values_json = values_json;
         return true;
     }
-    if (tokens.len != 3 or tokens[1].kind != .eq) return error.UnsupportedSqlShape;
+    if (tokens.len == 3 and tokens[1].matchesKeywordTag(.is) and tokens[2].matchesKeywordTag(.null)) {
+        if (unnest.filter_pattern_json != null) return error.DocumentSqlUnnestUnsupported;
+        if (unnest.filter_value_json) |existing| {
+            if (!std.mem.eql(u8, existing, "null")) return error.DocumentSqlUnnestUnsupported;
+            return true;
+        }
+        unnest.filter_value_json = try alloc.dupe(u8, "null");
+        return true;
+    }
+    if (tokens.len == 4 and tokens[1].matchesKeywordTag(.is) and tokens[2].matchesKeywordTag(.not) and tokens[3].matchesKeywordTag(.null)) {
+        if (unnest.filter_pattern_json != null) return error.DocumentSqlUnnestUnsupported;
+        unnest.filter_is_not_null = true;
+        return true;
+    }
+    if (tokens.len == 3 and tokens[1].kind == .neq) {
+        if (unnest.filter_pattern_json != null) return error.DocumentSqlUnnestUnsupported;
+        if (tokenIsNullLiteral(tokens[2])) {
+            unnest.filter_match_none = true;
+            return true;
+        }
+        const value_json = try tokenLiteralJsonAlloc(alloc, tokens[2]);
+        errdefer alloc.free(value_json);
+        if (unnest.filter_not_value_json) |existing| {
+            if (!std.mem.eql(u8, existing, value_json)) return error.DocumentSqlUnnestUnsupported;
+            alloc.free(value_json);
+            return true;
+        }
+        const query_json = try buildDocumentUnnestNotEqualFilterClauseAlloc(alloc, unnest.*, tokens[2]);
+        errdefer alloc.free(query_json);
+        unnest.filter_not_value_json = value_json;
+        unnest.filter_not_query_json = query_json;
+        return true;
+    }
+    if (tokens.len == 3 and (tokens[1].matchesKeywordTag(.like) or tokens[1].matchesKeywordTag(.ilike))) {
+        const case_insensitive = tokens[1].matchesKeywordTag(.ilike);
+        if (documentUnnestHasValueFilter(unnest.*)) return error.DocumentSqlUnnestUnsupported;
+        if (tokenIsNullLiteral(tokens[2])) {
+            unnest.filter_match_none = true;
+            return true;
+        }
+        if (tokens[2].kind != .string) return error.DocumentSqlUnnestUnsupported;
+        if (case_insensitive and !documentSqlAsciiOnly(tokens[2].text)) return error.DocumentSqlUnnestUnsupported;
+        var pattern = try documentLikePatternToNativeAlloc(alloc, tokens[2].text);
+        defer pattern.deinit(alloc);
+        if (case_insensitive) try validateDocumentSqlCaseVariantPattern(pattern.pattern);
+        const pattern_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(pattern.pattern, .{})});
+        errdefer alloc.free(pattern_json);
+        if (unnest.filter_pattern_json) |existing| {
+            if (!std.mem.eql(u8, existing, pattern_json)) return error.DocumentSqlUnnestUnsupported;
+            if (unnest.filter_pattern_case_insensitive != case_insensitive) return error.DocumentSqlUnnestUnsupported;
+            alloc.free(pattern_json);
+            return true;
+        }
+        const query_json = try buildDocumentUnnestLikeFilterClauseAlloc(alloc, unnest.*, tokens[2], case_insensitive);
+        errdefer alloc.free(query_json);
+        unnest.filter_pattern_json = pattern_json;
+        unnest.filter_pattern_query_json = query_json;
+        unnest.filter_pattern_case_insensitive = case_insensitive;
+        return true;
+    }
+    if (tokens.len == 3) {
+        if (documentRangeBound(tokens[1].kind, tokens[2].text) != null) {
+            if (unnest.filter_pattern_json != null) return error.DocumentSqlUnnestUnsupported;
+            const range_json = try buildDocumentUnnestRangeFilterClauseAlloc(alloc, unnest.*, tokens[1], tokens[2]);
+            errdefer alloc.free(range_json);
+            if (unnest.filter_range_json) |existing| {
+                if (!std.mem.eql(u8, existing, range_json)) return error.DocumentSqlUnnestUnsupported;
+                alloc.free(range_json);
+                return true;
+            }
+            unnest.filter_range_json = range_json;
+            return true;
+        }
+    }
+    if (tokens.len != 3 or tokens[1].kind != .eq) return error.DocumentSqlUnnestUnsupported;
+    if (unnest.filter_pattern_json != null) return error.DocumentSqlUnnestUnsupported;
     const value_json = try tokenLiteralJsonAlloc(alloc, tokens[2]);
     errdefer alloc.free(value_json);
     if (unnest.filter_value_json) |existing| {
@@ -2742,6 +2873,16 @@ fn parseDocumentUnnestFilterIntoAlloc(
     }
     unnest.filter_value_json = value_json;
     return true;
+}
+
+fn documentUnnestHasValueFilter(unnest: DocumentUnnest) bool {
+    return unnest.filter_value_json != null or
+        unnest.filter_values_json != null or
+        unnest.filter_range_json != null or
+        unnest.filter_not_value_json != null or
+        unnest.filter_not_query_json != null or
+        unnest.filter_is_not_null or
+        unnest.filter_match_none;
 }
 
 fn parseFullTextQueryAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?[]const u8 {
@@ -3132,7 +3273,11 @@ fn buildDocumentUnnestIndexedFilterClauseAlloc(
     alloc: std.mem.Allocator,
     unnest: DocumentUnnest,
 ) ![]const u8 {
+    if (unnest.filter_match_none) return try buildMatchNoneFilterClauseAlloc(alloc);
     if (unnest.filter_value_json) |value_json| {
+        if (unnest.filter_not_value_json) |not_value_json| {
+            if (std.mem.eql(u8, value_json, not_value_json)) return try buildMatchNoneFilterClauseAlloc(alloc);
+        }
         return try std.fmt.allocPrint(
             alloc,
             "{{\"array_any\":{{\"path\":{f},\"value\":{s}}}}}",
@@ -3148,10 +3293,15 @@ fn buildDocumentUnnestIndexedFilterClauseAlloc(
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(alloc);
         try out.appendSlice(alloc, "{\"disjuncts\":[");
+        var written: usize = 0;
         for (parsed.value.array.items, 0..) |value, i| {
-            if (i > 0) try out.append(alloc, ',');
+            _ = i;
             const value_json = try std.json.Stringify.valueAlloc(alloc, value, .{});
             defer alloc.free(value_json);
+            if (unnest.filter_not_value_json) |not_value_json| {
+                if (std.mem.eql(u8, value_json, not_value_json)) continue;
+            }
+            if (written > 0) try out.append(alloc, ',');
             const clause = try std.fmt.allocPrint(
                 alloc,
                 "{{\"array_any\":{{\"path\":{f},\"value\":{s}}}}}",
@@ -3159,11 +3309,216 @@ fn buildDocumentUnnestIndexedFilterClauseAlloc(
             );
             defer alloc.free(clause);
             try out.appendSlice(alloc, clause);
+            written += 1;
+        }
+        if (written == 0) {
+            out.deinit(alloc);
+            return try buildMatchNoneFilterClauseAlloc(alloc);
         }
         try out.appendSlice(alloc, "]}");
         return try out.toOwnedSlice(alloc);
     }
+    if (unnest.filter_range_json) |range_json| {
+        if (unnest.filter_not_query_json != null) return error.DocumentSqlUnnestUnsupported;
+        if (unnest.filter_pattern_query_json != null) return error.DocumentSqlUnnestUnsupported;
+        return try alloc.dupe(u8, range_json);
+    }
+    if (unnest.filter_not_query_json) |query_json| return try alloc.dupe(u8, query_json);
+    if (unnest.filter_pattern_query_json) |query_json| return try alloc.dupe(u8, query_json);
+    if (unnest.filter_is_not_null) return try buildDocumentUnnestIsNotNullFilterClauseAlloc(alloc, unnest);
     return error.UnsupportedSqlShape;
+}
+
+fn buildDocumentUnnestLikeFilterClauseAlloc(
+    alloc: std.mem.Allocator,
+    unnest: DocumentUnnest,
+    value: Token,
+    case_insensitive: bool,
+) ![]const u8 {
+    if (value.kind != .string) return error.DocumentSqlUnnestUnsupported;
+    switch (unnest.item_type) {
+        .keyword, .text, .search_as_you_type => {},
+        else => return error.DocumentSqlUnnestUnsupported,
+    }
+    var pattern = try documentLikePatternToNativeAlloc(alloc, value.text);
+    defer pattern.deinit(alloc);
+    if (case_insensitive) {
+        if (!documentSqlAsciiOnly(value.text)) return error.DocumentSqlUnnestUnsupported;
+        try validateDocumentSqlCaseVariantPattern(pattern.pattern);
+    }
+    if (!pattern.has_wildcard) {
+        if (case_insensitive) {
+            return try buildDocumentUnnestCaseVariantFilterClauseAlloc(alloc, unnest.field, "array_any", "value", pattern.pattern);
+        }
+        return try std.fmt.allocPrint(
+            alloc,
+            "{{\"array_any\":{{\"path\":{f},\"value\":{f}}}}}",
+            .{ std.json.fmt(unnest.field, .{}), std.json.fmt(pattern.pattern, .{}) },
+        );
+    }
+    if (pattern.prefix) {
+        if (case_insensitive) {
+            return try buildDocumentUnnestCaseVariantFilterClauseAlloc(alloc, unnest.field, "prefix", "value", pattern.pattern[0 .. pattern.pattern.len - 1]);
+        }
+        return try std.fmt.allocPrint(
+            alloc,
+            "{{\"prefix\":{{\"path\":{f},\"value\":{f}}}}}",
+            .{ std.json.fmt(unnest.field, .{}), std.json.fmt(pattern.pattern[0 .. pattern.pattern.len - 1], .{}) },
+        );
+    }
+    if (case_insensitive) {
+        return try buildDocumentUnnestCaseVariantFilterClauseAlloc(alloc, unnest.field, "wildcard", "pattern", pattern.pattern);
+    }
+    return try std.fmt.allocPrint(
+        alloc,
+        "{{\"wildcard\":{{\"path\":{f},\"pattern\":{f}}}}}",
+        .{ std.json.fmt(unnest.field, .{}), std.json.fmt(pattern.pattern, .{}) },
+    );
+}
+
+const document_sql_max_case_variant_bits = 6;
+
+fn validateDocumentSqlCaseVariantPattern(pattern: []const u8) !void {
+    var bits: usize = 0;
+    for (pattern) |ch| {
+        if (documentSqlAsciiAlphabetic(ch)) {
+            bits += 1;
+            if (bits > document_sql_max_case_variant_bits) return error.DocumentSqlUnnestUnsupported;
+        } else if (ch >= 0x80) {
+            return error.DocumentSqlUnnestUnsupported;
+        }
+    }
+}
+
+fn buildDocumentUnnestCaseVariantFilterClauseAlloc(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    operator: []const u8,
+    value_name: []const u8,
+    pattern: []const u8,
+) ![]const u8 {
+    const mutable = try alloc.dupe(u8, pattern);
+    defer alloc.free(mutable);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var written: usize = 0;
+    try appendDocumentSqlCaseVariantFilterClausesAlloc(alloc, &out, &written, path, operator, value_name, mutable, 0);
+    if (written == 0) return error.DocumentSqlUnnestUnsupported;
+    if (written == 1) return try out.toOwnedSlice(alloc);
+
+    const clauses = try out.toOwnedSlice(alloc);
+    defer alloc.free(clauses);
+    return try std.fmt.allocPrint(alloc, "{{\"disjuncts\":[{s}]}}", .{clauses});
+}
+
+fn appendDocumentSqlCaseVariantFilterClausesAlloc(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    written: *usize,
+    path: []const u8,
+    operator: []const u8,
+    value_name: []const u8,
+    pattern: []u8,
+    index: usize,
+) !void {
+    if (index == pattern.len) {
+        if (written.* > 0) try out.append(alloc, ',');
+        const clause = if (std.mem.eql(u8, operator, "array_any"))
+            try std.fmt.allocPrint(
+                alloc,
+                "{{\"array_any\":{{\"path\":{f},\"value\":{f}}}}}",
+                .{ std.json.fmt(path, .{}), std.json.fmt(pattern, .{}) },
+            )
+        else
+            try std.fmt.allocPrint(
+                alloc,
+                "{{\"{s}\":{{\"path\":{f},\"{s}\":{f}}}}}",
+                .{ operator, std.json.fmt(path, .{}), value_name, std.json.fmt(pattern, .{}) },
+            );
+        defer alloc.free(clause);
+        try out.appendSlice(alloc, clause);
+        written.* += 1;
+        return;
+    }
+    const ch = pattern[index];
+    if (!documentSqlAsciiAlphabetic(ch)) {
+        try appendDocumentSqlCaseVariantFilterClausesAlloc(alloc, out, written, path, operator, value_name, pattern, index + 1);
+        return;
+    }
+    pattern[index] = documentSqlAsciiLower(ch);
+    try appendDocumentSqlCaseVariantFilterClausesAlloc(alloc, out, written, path, operator, value_name, pattern, index + 1);
+    pattern[index] = documentSqlAsciiUpper(ch);
+    try appendDocumentSqlCaseVariantFilterClausesAlloc(alloc, out, written, path, operator, value_name, pattern, index + 1);
+    pattern[index] = ch;
+}
+
+fn documentSqlAsciiAlphabetic(ch: u8) bool {
+    return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z');
+}
+
+fn documentSqlAsciiLower(ch: u8) u8 {
+    return if (ch >= 'A' and ch <= 'Z') ch + ('a' - 'A') else ch;
+}
+
+fn documentSqlAsciiUpper(ch: u8) u8 {
+    return if (ch >= 'a' and ch <= 'z') ch - ('a' - 'A') else ch;
+}
+
+fn buildDocumentUnnestNotEqualFilterClauseAlloc(
+    alloc: std.mem.Allocator,
+    unnest: DocumentUnnest,
+    value: Token,
+) ![]const u8 {
+    const lower = DocumentRangeBound{ .max = value.text, .inclusive_max = false };
+    const upper = DocumentRangeBound{ .min = value.text, .inclusive_min = false };
+    const lower_json = switch (unnest.item_type) {
+        .numeric => try buildNumericRangeFilterClauseAlloc(alloc, unnest.field, lower, value),
+        .datetime => try buildDateRangeFilterClauseAlloc(alloc, unnest.field, lower, value),
+        .keyword, .text, .search_as_you_type => try buildTermRangeFilterClauseAlloc(alloc, unnest.field, lower, value),
+        else => return error.DocumentSqlUnnestUnsupported,
+    };
+    defer alloc.free(lower_json);
+    const upper_json = switch (unnest.item_type) {
+        .numeric => try buildNumericRangeFilterClauseAlloc(alloc, unnest.field, upper, value),
+        .datetime => try buildDateRangeFilterClauseAlloc(alloc, unnest.field, upper, value),
+        .keyword, .text, .search_as_you_type => try buildTermRangeFilterClauseAlloc(alloc, unnest.field, upper, value),
+        else => unreachable,
+    };
+    defer alloc.free(upper_json);
+    return try std.fmt.allocPrint(
+        alloc,
+        "{{\"disjuncts\":[{s},{s}]}}",
+        .{ lower_json, upper_json },
+    );
+}
+
+fn buildDocumentUnnestIsNotNullFilterClauseAlloc(
+    alloc: std.mem.Allocator,
+    unnest: DocumentUnnest,
+) ![]const u8 {
+    return switch (unnest.item_type) {
+        .keyword, .text, .search_as_you_type => try std.fmt.allocPrint(
+            alloc,
+            "{{\"term_range\":{{\"path\":{f},\"min\":\"\",\"inclusive_min\":true}}}}",
+            .{std.json.fmt(unnest.field, .{})},
+        ),
+        else => error.DocumentSqlUnnestUnsupported,
+    };
+}
+
+fn buildDocumentUnnestRangeFilterClauseAlloc(
+    alloc: std.mem.Allocator,
+    unnest: DocumentUnnest,
+    operator: Token,
+    value: Token,
+) ![]const u8 {
+    const bound = documentRangeBound(operator.kind, value.text) orelse return error.DocumentSqlUnnestUnsupported;
+    return switch (unnest.item_type) {
+        .numeric => try buildNumericRangeFilterClauseAlloc(alloc, unnest.field, bound, value),
+        .datetime => try buildDateRangeFilterClauseAlloc(alloc, unnest.field, bound, value),
+        .keyword, .text, .search_as_you_type => try buildTermRangeFilterClauseAlloc(alloc, unnest.field, bound, value),
+        else => error.DocumentSqlUnnestUnsupported,
+    };
 }
 
 fn buildIsNullFilterClauseAlloc(alloc: std.mem.Allocator, path: []const u8) ![]const u8 {
@@ -5588,6 +5943,14 @@ test "document SQL lowers json path equality to indexed filter producer" {
         .bounded_scan = .{ .max_rows = 25 },
     }));
 
+    var mapped_view_residual = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, plan FROM support_view WHERE plan = 'pro' LIMIT 5");
+    defer mapped_view_residual.deinit(alloc);
+    try std.testing.expectError(error.DocumentSqlBoundedScanMissingExactProducer, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped_view_residual, .{
+        .storage_mode = .document,
+    }, mapped_view_schema, .{
+        .bounded_scan = .{ .max_rows = 25 },
+    }));
+
     var mapped_view_lowered = try lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped_view, .{
         .storage_mode = .document,
     }, mapped_view_schema, .{
@@ -6961,6 +7324,148 @@ test "document SQL lowers explicit array unnest over bounded scan" {
     try std.testing.expect(in_filter_lowered.unnest.?.filter_value_json == null);
     try std.testing.expectEqualStrings("[\"urgent\",\"vip\"]", in_filter_lowered.unnest.?.filter_values_json.?);
 
+    var range_filter = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag > 'u' LIMIT 10");
+    defer range_filter.deinit(alloc);
+    var range_filter_lowered = try lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &range_filter, schema, .{
+        .indexed_array_element_paths = &.{"/tags"},
+    });
+    defer range_filter_lowered.deinit(alloc);
+
+    try std.testing.expect(range_filter_lowered.unnest != null);
+    try std.testing.expectEqualStrings(
+        "{\"term_range\":{\"path\":\"/tags\",\"min\":\"u\",\"inclusive_min\":false}}",
+        range_filter_lowered.unnest.?.filter_range_json.?,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"term_range\":{\"path\":\"/tags\",\"min\":\"u\",\"inclusive_min\":false}}",
+        range_filter_lowered.producer.indexed_query.filter_query_json.?,
+    );
+
+    var pattern_prefix_filter = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag LIKE 'u%' LIMIT 10");
+    defer pattern_prefix_filter.deinit(alloc);
+    var pattern_prefix_filter_lowered = try lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &pattern_prefix_filter, schema, .{
+        .indexed_array_element_paths = &.{"/tags"},
+    });
+    defer pattern_prefix_filter_lowered.deinit(alloc);
+
+    try std.testing.expect(pattern_prefix_filter_lowered.unnest != null);
+    try std.testing.expectEqualStrings("\"u*\"", pattern_prefix_filter_lowered.unnest.?.filter_pattern_json.?);
+    try std.testing.expectEqualStrings(
+        "{\"prefix\":{\"path\":\"/tags\",\"value\":\"u\"}}",
+        pattern_prefix_filter_lowered.producer.indexed_query.filter_query_json.?,
+    );
+
+    var pattern_wildcard_filter = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag LIKE 'v_p' LIMIT 10");
+    defer pattern_wildcard_filter.deinit(alloc);
+    var pattern_wildcard_filter_lowered = try lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &pattern_wildcard_filter, schema, .{
+        .indexed_array_element_paths = &.{"/tags"},
+    });
+    defer pattern_wildcard_filter_lowered.deinit(alloc);
+
+    try std.testing.expect(pattern_wildcard_filter_lowered.unnest != null);
+    try std.testing.expectEqualStrings("\"v?p\"", pattern_wildcard_filter_lowered.unnest.?.filter_pattern_json.?);
+    try std.testing.expectEqualStrings(
+        "{\"wildcard\":{\"path\":\"/tags\",\"pattern\":\"v?p\"}}",
+        pattern_wildcard_filter_lowered.producer.indexed_query.filter_query_json.?,
+    );
+
+    var pattern_ilike_filter = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag ILIKE 'u%' LIMIT 10");
+    defer pattern_ilike_filter.deinit(alloc);
+    var pattern_ilike_filter_lowered = try lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &pattern_ilike_filter, schema, .{
+        .indexed_array_element_paths = &.{"/tags"},
+    });
+    defer pattern_ilike_filter_lowered.deinit(alloc);
+
+    try std.testing.expect(pattern_ilike_filter_lowered.unnest != null);
+    try std.testing.expect(pattern_ilike_filter_lowered.unnest.?.filter_pattern_case_insensitive);
+    try std.testing.expectEqualStrings("\"u*\"", pattern_ilike_filter_lowered.unnest.?.filter_pattern_json.?);
+    try std.testing.expectEqualStrings(
+        "{\"disjuncts\":[{\"prefix\":{\"path\":\"/tags\",\"value\":\"u\"}},{\"prefix\":{\"path\":\"/tags\",\"value\":\"U\"}}]}",
+        pattern_ilike_filter_lowered.producer.indexed_query.filter_query_json.?,
+    );
+
+    var pattern_ilike_wildcard_filter = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag ILIKE 'v_p' LIMIT 10");
+    defer pattern_ilike_wildcard_filter.deinit(alloc);
+    var pattern_ilike_wildcard_filter_lowered = try lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &pattern_ilike_wildcard_filter, schema, .{
+        .indexed_array_element_paths = &.{"/tags"},
+    });
+    defer pattern_ilike_wildcard_filter_lowered.deinit(alloc);
+
+    try std.testing.expect(pattern_ilike_wildcard_filter_lowered.unnest != null);
+    try std.testing.expect(pattern_ilike_wildcard_filter_lowered.unnest.?.filter_pattern_case_insensitive);
+    try std.testing.expectEqualStrings(
+        "{\"disjuncts\":[{\"wildcard\":{\"path\":\"/tags\",\"pattern\":\"v?p\"}},{\"wildcard\":{\"path\":\"/tags\",\"pattern\":\"v?P\"}},{\"wildcard\":{\"path\":\"/tags\",\"pattern\":\"V?p\"}},{\"wildcard\":{\"path\":\"/tags\",\"pattern\":\"V?P\"}}]}",
+        pattern_ilike_wildcard_filter_lowered.producer.indexed_query.filter_query_json.?,
+    );
+
+    var null_filter = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag IS NULL LIMIT 10");
+    defer null_filter.deinit(alloc);
+    var null_filter_lowered = try lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &null_filter, schema, .{
+        .indexed_array_element_paths = &.{"/tags"},
+    });
+    defer null_filter_lowered.deinit(alloc);
+
+    try std.testing.expect(null_filter_lowered.unnest != null);
+    try std.testing.expectEqualStrings("null", null_filter_lowered.unnest.?.filter_value_json.?);
+    try std.testing.expectEqualStrings(
+        "{\"array_any\":{\"path\":\"/tags\",\"value\":null}}",
+        null_filter_lowered.producer.indexed_query.filter_query_json.?,
+    );
+
+    var not_equal_filter = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag <> 'urgent' LIMIT 10");
+    defer not_equal_filter.deinit(alloc);
+    var not_equal_filter_lowered = try lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &not_equal_filter, schema, .{
+        .indexed_array_element_paths = &.{"/tags"},
+    });
+    defer not_equal_filter_lowered.deinit(alloc);
+
+    try std.testing.expect(not_equal_filter_lowered.unnest != null);
+    try std.testing.expectEqualStrings("\"urgent\"", not_equal_filter_lowered.unnest.?.filter_not_value_json.?);
+    try std.testing.expectEqualStrings(
+        "{\"disjuncts\":[{\"term_range\":{\"path\":\"/tags\",\"max\":\"urgent\",\"inclusive_max\":false}},{\"term_range\":{\"path\":\"/tags\",\"min\":\"urgent\",\"inclusive_min\":false}}]}",
+        not_equal_filter_lowered.producer.indexed_query.filter_query_json.?,
+    );
+
+    var compound_filter = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag = 'urgent' AND tag <> 'stale' LIMIT 10");
+    defer compound_filter.deinit(alloc);
+    var compound_filter_lowered = try lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &compound_filter, schema, .{
+        .indexed_array_element_paths = &.{"/tags"},
+    });
+    defer compound_filter_lowered.deinit(alloc);
+
+    try std.testing.expectEqualStrings("\"urgent\"", compound_filter_lowered.unnest.?.filter_value_json.?);
+    try std.testing.expectEqualStrings("\"stale\"", compound_filter_lowered.unnest.?.filter_not_value_json.?);
+    try std.testing.expectEqualStrings(
+        "{\"array_any\":{\"path\":\"/tags\",\"value\":\"urgent\"}}",
+        compound_filter_lowered.producer.indexed_query.filter_query_json.?,
+    );
+
+    var contradictory_filter = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag = 'urgent' AND tag <> 'urgent' LIMIT 10");
+    defer contradictory_filter.deinit(alloc);
+    var contradictory_filter_lowered = try lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &contradictory_filter, schema, .{
+        .indexed_array_element_paths = &.{"/tags"},
+    });
+    defer contradictory_filter_lowered.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "{\"match_none\":{}}",
+        contradictory_filter_lowered.producer.indexed_query.filter_query_json.?,
+    );
+
+    var not_null_filter = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag IS NOT NULL LIMIT 10");
+    defer not_null_filter.deinit(alloc);
+    var not_null_filter_lowered = try lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &not_null_filter, schema, .{
+        .indexed_array_element_paths = &.{"/tags"},
+    });
+    defer not_null_filter_lowered.deinit(alloc);
+
+    try std.testing.expect(not_null_filter_lowered.unnest != null);
+    try std.testing.expect(not_null_filter_lowered.unnest.?.filter_is_not_null);
+    try std.testing.expectEqualStrings(
+        "{\"term_range\":{\"path\":\"/tags\",\"min\":\"\",\"inclusive_min\":true}}",
+        not_null_filter_lowered.producer.indexed_query.filter_query_json.?,
+    );
+
     const view_mapping_virtual_schema = source_binding.DocumentSqlSchema{
         .fields = &.{
             .{
@@ -7008,6 +7513,111 @@ test "document SQL lowers explicit array unnest over bounded scan" {
     try std.testing.expectEqualStrings(
         "{\"disjuncts\":[{\"array_any\":{\"path\":\"/tags\",\"value\":\"urgent\"}},{\"array_any\":{\"path\":\"/tags\",\"value\":\"vip\"}}]}",
         view_mapping_indexed_unnest_in_lowered.producer.indexed_query.filter_query_json.?,
+    );
+
+    var view_mapping_indexed_unnest_range = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag > 'm' LIMIT 10");
+    defer view_mapping_indexed_unnest_range.deinit(alloc);
+    var view_mapping_indexed_unnest_range_lowered = try lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_indexed_unnest_range, schema, view_mapping_virtual_schema, .{
+        .indexed_array_element_paths = &.{"/tags"},
+    });
+    defer view_mapping_indexed_unnest_range_lowered.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "{\"term_range\":{\"path\":\"/tags\",\"min\":\"m\",\"inclusive_min\":false}}",
+        view_mapping_indexed_unnest_range_lowered.producer.indexed_query.filter_query_json.?,
+    );
+
+    var view_mapping_indexed_unnest_pattern = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag LIKE 'u%' LIMIT 10");
+    defer view_mapping_indexed_unnest_pattern.deinit(alloc);
+    var view_mapping_indexed_unnest_pattern_lowered = try lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_indexed_unnest_pattern, schema, view_mapping_virtual_schema, .{
+        .indexed_array_element_paths = &.{"/tags"},
+    });
+    defer view_mapping_indexed_unnest_pattern_lowered.deinit(alloc);
+
+    try std.testing.expectEqualStrings("\"u*\"", view_mapping_indexed_unnest_pattern_lowered.unnest.?.filter_pattern_json.?);
+    try std.testing.expectEqualStrings(
+        "{\"prefix\":{\"path\":\"/tags\",\"value\":\"u\"}}",
+        view_mapping_indexed_unnest_pattern_lowered.producer.indexed_query.filter_query_json.?,
+    );
+
+    var view_mapping_indexed_unnest_ilike = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag ILIKE 'u%' LIMIT 10");
+    defer view_mapping_indexed_unnest_ilike.deinit(alloc);
+    var view_mapping_indexed_unnest_ilike_lowered = try lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_indexed_unnest_ilike, schema, view_mapping_virtual_schema, .{
+        .indexed_array_element_paths = &.{"/tags"},
+    });
+    defer view_mapping_indexed_unnest_ilike_lowered.deinit(alloc);
+
+    try std.testing.expect(view_mapping_indexed_unnest_ilike_lowered.unnest.?.filter_pattern_case_insensitive);
+    try std.testing.expectEqualStrings(
+        "{\"disjuncts\":[{\"prefix\":{\"path\":\"/tags\",\"value\":\"u\"}},{\"prefix\":{\"path\":\"/tags\",\"value\":\"U\"}}]}",
+        view_mapping_indexed_unnest_ilike_lowered.producer.indexed_query.filter_query_json.?,
+    );
+
+    var view_mapping_indexed_unnest_null = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag IS NULL LIMIT 10");
+    defer view_mapping_indexed_unnest_null.deinit(alloc);
+    var view_mapping_indexed_unnest_null_lowered = try lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_indexed_unnest_null, schema, view_mapping_virtual_schema, .{
+        .indexed_array_element_paths = &.{"/tags"},
+    });
+    defer view_mapping_indexed_unnest_null_lowered.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "{\"array_any\":{\"path\":\"/tags\",\"value\":null}}",
+        view_mapping_indexed_unnest_null_lowered.producer.indexed_query.filter_query_json.?,
+    );
+
+    var view_mapping_indexed_unnest_not_equal = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag <> 'urgent' LIMIT 10");
+    defer view_mapping_indexed_unnest_not_equal.deinit(alloc);
+    var view_mapping_indexed_unnest_not_equal_lowered = try lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_indexed_unnest_not_equal, schema, view_mapping_virtual_schema, .{
+        .indexed_array_element_paths = &.{"/tags"},
+    });
+    defer view_mapping_indexed_unnest_not_equal_lowered.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "{\"disjuncts\":[{\"term_range\":{\"path\":\"/tags\",\"max\":\"urgent\",\"inclusive_max\":false}},{\"term_range\":{\"path\":\"/tags\",\"min\":\"urgent\",\"inclusive_min\":false}}]}",
+        view_mapping_indexed_unnest_not_equal_lowered.producer.indexed_query.filter_query_json.?,
+    );
+
+    const view_mapping_indexes_json =
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"tags_array\",\"lifecycle\":\"ready\",\"generation\":4}],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"tags_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\",\"generation\":4}}";
+    var catalog_view_mapping_virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithSourceTableAlloc(alloc, schema, view_mapping_indexes_json, "docs");
+    defer source_binding.deinitDocumentSqlSchema(alloc, &catalog_view_mapping_virtual_schema);
+    var catalog_view_mapping_capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonAlloc(alloc, schema, view_mapping_indexes_json);
+    defer source_binding.deinitDocumentSqlCapabilities(alloc, &catalog_view_mapping_capabilities);
+
+    var catalog_view_mapping_indexed_unnest_not_equal = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag <> 'urgent' LIMIT 10");
+    defer catalog_view_mapping_indexed_unnest_not_equal.deinit(alloc);
+    var catalog_view_mapping_indexed_unnest_not_equal_lowered = try lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &catalog_view_mapping_indexed_unnest_not_equal, schema, catalog_view_mapping_virtual_schema, catalog_view_mapping_capabilities);
+    defer catalog_view_mapping_indexed_unnest_not_equal_lowered.deinit(alloc);
+
+    try std.testing.expectEqualStrings("support_view", catalog_view_mapping_indexed_unnest_not_equal_lowered.view_mapping.?.name);
+    try std.testing.expectEqualStrings(
+        "{\"disjuncts\":[{\"term_range\":{\"path\":\"/tags\",\"max\":\"urgent\",\"inclusive_max\":false}},{\"term_range\":{\"path\":\"/tags\",\"min\":\"urgent\",\"inclusive_min\":false}}]}",
+        catalog_view_mapping_indexed_unnest_not_equal_lowered.producer.indexed_query.filter_query_json.?,
+    );
+
+    var view_mapping_indexed_unnest_compound = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' AND tag <> 'stale' LIMIT 10");
+    defer view_mapping_indexed_unnest_compound.deinit(alloc);
+    var view_mapping_indexed_unnest_compound_lowered = try lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_indexed_unnest_compound, schema, view_mapping_virtual_schema, .{
+        .indexed_array_element_paths = &.{"/tags"},
+    });
+    defer view_mapping_indexed_unnest_compound_lowered.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "{\"array_any\":{\"path\":\"/tags\",\"value\":\"urgent\"}}",
+        view_mapping_indexed_unnest_compound_lowered.producer.indexed_query.filter_query_json.?,
+    );
+
+    var view_mapping_indexed_unnest_not_null = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag IS NOT NULL LIMIT 10");
+    defer view_mapping_indexed_unnest_not_null.deinit(alloc);
+    var view_mapping_indexed_unnest_not_null_lowered = try lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_indexed_unnest_not_null, schema, view_mapping_virtual_schema, .{
+        .indexed_array_element_paths = &.{"/tags"},
+    });
+    defer view_mapping_indexed_unnest_not_null_lowered.deinit(alloc);
+
+    try std.testing.expect(view_mapping_indexed_unnest_not_null_lowered.unnest.?.filter_is_not_null);
+    try std.testing.expectEqualStrings(
+        "{\"term_range\":{\"path\":\"/tags\",\"min\":\"\",\"inclusive_min\":true}}",
+        view_mapping_indexed_unnest_not_null_lowered.producer.indexed_query.filter_query_json.?,
     );
 
     var residual = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag = 'urgent' AND status = 'active' LIMIT 10");

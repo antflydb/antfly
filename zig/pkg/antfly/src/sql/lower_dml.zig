@@ -194,6 +194,7 @@ pub const ConflictUpdateAssignmentValueParserOptions = struct {
     insert_columns: []const []const u8,
     insert_values: []const []const u8,
     realtime_ns: u64,
+    default_context: relational_rows.DefaultValueContext = .{},
     json_set: JsonSetSqlValueParserOptions,
     expression_options: ConflictUpdateAssignmentExpressionParserOptions,
 };
@@ -928,14 +929,16 @@ pub fn parseInsertSourceWithCtesAlloc(
     if (source.query.select_all or source.select_outputs.len != columns.items.len) return error.UnsupportedSqlShape;
 
     const effective_source_schema = relational_rows.rowsPlannedQuerySourceSchema(base_source_schema, planned_ctes, source.query) orelse return error.UnsupportedSqlShape;
+    var projected_source_schema = try insertSourceProjectedSourceSchemaAlloc(alloc, effective_source_schema, source.query, source.select_outputs);
+    defer projected_source_schema.deinit(alloc);
 
     const type_context: expr_type.RowExpressionTypeContext = .{
         .alloc = alloc,
         .schema = hooks.schema,
-        .joined_source_schema = effective_source_schema,
+        .joined_source_schema = projected_source_schema.schema,
         .defer_row_expression_field_validation = hooks.defer_row_expression_field_validation,
     };
-    const assignments = try insertSourceAssignmentsFromSelectAlloc(alloc, hooks.schema, effective_source_schema, type_context, columns.items, source.query, source.select_outputs);
+    const assignments = try insertSourceAssignmentsFromSelectAlloc(alloc, hooks.schema, projected_source_schema.schema, type_context, columns.items, source.query, source.select_outputs);
     var assignments_transferred = false;
     errdefer if (!assignments_transferred) freeExpressionAssignments(alloc, assignments);
 
@@ -949,7 +952,7 @@ pub fn parseInsertSourceWithCtesAlloc(
         const parsed_conflict = try parseConflictClauseWithContextAlloc(alloc, tokens, pos, .{
             .params = hooks.params,
             .schema = hooks.schema,
-            .joined_source_schema = effective_source_schema,
+            .joined_source_schema = projected_source_schema.schema,
             .table_name = target_table.name,
             .existing_qualifiers = &conflict_qualifiers,
             .insert_columns = columns.items,
@@ -2903,11 +2906,95 @@ pub fn insertSourceExpressionFromSelectOutputAlloc(
             if (output.index >= source_query.expressions.len) return error.UnsupportedSqlShape;
             break :blk try cloneExpressionAlloc(alloc, source_query.expressions[output.index].expression);
         },
-        .scalar_subquery => return error.UnsupportedSqlShape,
+        .scalar_subquery => blk: {
+            if (output.index >= source_query.scalar_subqueries.len) return error.UnsupportedSqlShape;
+            const projection = source_query.scalar_subqueries[output.index];
+            if (projection.output.len == 0) return error.UnsupportedSqlShape;
+            break :blk db_mod.types.RelationalRowsExpression{
+                .kind = .field,
+                .field = try alloc.dupe(u8, projection.output),
+                .field_source = .source,
+            };
+        },
     };
     errdefer freeExpression(alloc, expression);
     plan_mod.rewriteExpressionFieldsToSource(&expression);
     return expression;
+}
+
+const InsertSourceProjectedSourceSchema = struct {
+    schema: runtime_schema.TableSchema,
+    owned_columns: []const runtime_schema.RelationalColumn = &.{},
+    base_column_count: usize = 0,
+
+    fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        if (self.owned_columns.len == 0) return;
+        ddl_plan.clearDdlRelationalColumns(alloc, self.owned_columns[self.base_column_count..]);
+        alloc.free(self.owned_columns);
+    }
+};
+
+fn insertSourceProjectedSourceSchemaAlloc(
+    alloc: std.mem.Allocator,
+    source_schema: runtime_schema.TableSchema,
+    source_query: db_mod.types.RelationalRowsQueryRequest,
+    source_outputs: []const SelectOutputRef,
+) !InsertSourceProjectedSourceSchema {
+    if (source_outputs.len == 0) return .{ .schema = source_schema };
+
+    const output_columns = try expr_projection.selectOutputColumnsAlloc(alloc, .{
+        .alloc = alloc,
+        .schema = source_schema,
+    }, .{
+        .fields = source_query.select,
+        .json_extract = source_query.json_extract,
+        .array_length = source_query.array_length,
+        .coalesce = source_query.coalesce,
+        .field_aliases = source_query.field_aliases,
+        .expressions = source_query.expressions,
+        .scalar_subqueries = source_query.scalar_subqueries,
+        .outputs = source_outputs,
+        .select_all = false,
+    });
+    defer {
+        ddl_plan.clearDdlRelationalColumns(alloc, output_columns);
+        if (output_columns.len > 0) alloc.free(output_columns);
+    }
+
+    var columns = std.ArrayListUnmanaged(runtime_schema.RelationalColumn).empty;
+    errdefer {
+        if (columns.items.len > source_schema.relational_columns.len) {
+            ddl_plan.clearDdlRelationalColumns(alloc, columns.items[source_schema.relational_columns.len..]);
+        }
+        columns.deinit(alloc);
+    }
+    try columns.appendSlice(alloc, source_schema.relational_columns);
+
+    var appended_projected_column = false;
+    for (output_columns) |column| {
+        if (binder.relationalColumnForField(source_schema, column.name, null) != null or expr_projection.outputColumnExists(columns.items, column.name)) {
+            continue;
+        }
+        const projected_column = try ddl_plan.cloneDdlRelationalColumn(alloc, column);
+        var projected_column_transferred = false;
+        errdefer if (!projected_column_transferred) ddl_plan.freeDdlRelationalColumn(alloc, projected_column);
+        try columns.append(alloc, projected_column);
+        projected_column_transferred = true;
+        appended_projected_column = true;
+    }
+
+    if (!appended_projected_column) {
+        columns.deinit(alloc);
+        return .{ .schema = source_schema };
+    }
+
+    var schema = source_schema;
+    schema.relational_columns = try columns.toOwnedSlice(alloc);
+    return .{
+        .schema = schema,
+        .owned_columns = schema.relational_columns,
+        .base_column_count = source_schema.relational_columns.len,
+    };
 }
 
 pub fn clearInsertSourceQueryProjection(alloc: std.mem.Allocator, query: *db_mod.types.RelationalRowsQueryRequest) void {
@@ -2917,14 +3004,12 @@ pub fn clearInsertSourceQueryProjection(alloc: std.mem.Allocator, query: *db_mod
     freeCoalesceProjections(alloc, query.coalesce);
     freeFieldAliasProjections(alloc, query.field_aliases);
     freeExpressionProjections(alloc, query.expressions);
-    plan_mod.freeScalarSubqueryProjections(alloc, query.scalar_subqueries);
     query.select = &.{};
     query.json_extract = &.{};
     query.array_length = &.{};
     query.coalesce = &.{};
     query.field_aliases = &.{};
     query.expressions = &.{};
-    query.scalar_subqueries = &.{};
     query.select_all = true;
 }
 
@@ -4727,6 +4812,7 @@ fn parseConflictUpdateRowAssignmentAlloc(
                 .insert_columns = insert_columns,
                 .insert_values = insert_values,
                 .realtime_ns = hooks.value.realtime_ns,
+                .default_context = hooks.value.default_context,
                 .json_set = jsonSetSqlValueOptionsWithInsertColumns(hooks.value.json_set, insert_columns),
                 .expression_options = hooks.value.expression_options,
             },
@@ -4789,6 +4875,7 @@ fn parseConflictUpdateAssignmentAlloc(
             .insert_columns = insert_columns,
             .insert_values = insert_values,
             .realtime_ns = hooks.value.realtime_ns,
+            .default_context = hooks.value.default_context,
             .json_set = jsonSetSqlValueOptionsWithInsertColumns(hooks.value.json_set, insert_columns),
             .expression_options = hooks.value.expression_options,
         },
@@ -4945,17 +5032,27 @@ pub fn parseConflictUpdateAssignmentValueAlloc(
     }
 
     const rhs_start = pos.*;
-    const value_json = try parseConflictValueJsonAlloc(
-        alloc,
-        tokens,
-        pos,
-        hooks.schema,
-        hooks.params,
-        column,
-        hooks.insert_columns,
-        hooks.insert_values,
-        hooks.realtime_ns,
-    );
+    const value_json = value_json: {
+        if (parser.matchKeywordTag(tokens, pos, .default)) {
+            const default_value = column.default_value orelse return error.UnsupportedSqlShape;
+            break :value_json try relational_rows.relationalDefaultValueJsonWithContextAlloc(
+                alloc,
+                default_value,
+                hooks.default_context,
+            );
+        }
+        break :value_json try parseConflictValueJsonAlloc(
+            alloc,
+            tokens,
+            pos,
+            hooks.schema,
+            hooks.params,
+            column,
+            hooks.insert_columns,
+            hooks.insert_values,
+            hooks.realtime_ns,
+        );
+    };
     var value_transferred = false;
     errdefer if (!value_transferred) alloc.free(value_json);
     try validateGeneratedDmlAssignmentRhsMetadata(tokens, rhs_start, pos.*, hooks.expression_options.assignment_options.generated_expression_ast);
@@ -15598,6 +15695,17 @@ fn expectDocumentSqlWriteCorpusCase(
         try expectOptionalU32EqualForDmlTest(expected.source_limit, document_insert.source_limit);
         try expectOptionalUsizeEqualForDmlTest(expected.returning, document_insert.returning_fields.len);
         try std.testing.expectEqual(expected.generated_target_id, document_insert.target_id_mode == .generated_document_id);
+        if (expected.action != null) {
+            const conflict_write = document_insert.conflict_write orelse return error.TestUnexpectedResult;
+            try expectOptionalStringEqualForDmlTest(expected.action, @tagName(conflict_write.action));
+            try expectOptionalUsizeEqualForDmlTest(expected.ops, conflict_write.operations.len);
+            try expectOptionalUsizeEqualForDmlTest(expected.conflict_source_assignments, conflict_write.source_assignments.len);
+            try expectOptionalUsizeEqualForDmlTest(expected.expression_assignments, conflict_write.expression_assignments.len);
+            try expectOptionalUsizeEqualForDmlTest(expected.where_expression, if (conflict_write.where_expression == null) 0 else 1);
+            try expectOptionalUsizeEqualForDmlTest(expected.where_expressions, conflict_write.where_expressions.len);
+            try expectOptionalUsizeEqualForDmlTest(expected.where_any, conflict_write.where_any.len);
+            try expectOptionalUsizeEqualForDmlTest(expected.where_not, conflict_write.where_not.len);
+        }
         switch (document_insert.source_producer) {
             .id_lookup => {},
             .indexed_query => |query| {
@@ -15702,6 +15810,10 @@ fn expectDocumentSqlWriteCorpusCase(
         var source_assignments: usize = 0;
         for (document_mutation.matched_arms) |arm| source_assignments += arm.source_assignments.len;
         try expectOptionalUsizeEqualForDmlTest(expected.source_assignments, source_assignments);
+        var insert_assignments: usize = 0;
+        for (document_mutation.not_matched_arms) |arm| insert_assignments += arm.insert_assignments.len;
+        try expectOptionalUsizeEqualForDmlTest(expected.merge_insert_assignments, insert_assignments);
+        try expectOptionalUsizeEqualForDmlTest(expected.returning, document_mutation.returning_fields.len);
         try expectOptionalU32EqualForDmlTest(expected.max_target_rows, document_mutation.max_target_rows);
         try expectOptionalU32EqualForDmlTest(expected.max_source_rows, document_mutation.max_source_rows);
     } else {
@@ -20676,7 +20788,12 @@ fn parseDocumentSourceProjectionInsertAlloc(
     const statement_end = if (tokens.len > 0 and tokens[tokens.len - 1].kind == .semicolon) tokens.len - 1 else tokens.len;
     if (!parser.peekKeywordTag(tokens, where_start, .where)) return error.DocumentSqlWriteUnsupported;
     const returning_index = parser.findTopLevelKeywordTagFromIndex(tokens[0..statement_end], where_start, .returning);
-    const source_end = returning_index orelse statement_end;
+    const conflict_tail_end = returning_index orelse statement_end;
+    const conflict_index = parser.findTopLevelKeywordTagFromIndex(tokens[0..conflict_tail_end], where_start, .on);
+    if (conflict_index) |index| {
+        if (!parser.peekKeywordTag(tokens, index + 1, .conflict)) return error.DocumentSqlWriteUnsupported;
+    }
+    const source_end = conflict_index orelse conflict_tail_end;
     const order_index = parser.findTopLevelKeywordTagFromIndex(tokens[0..source_end], where_start, .order);
     if (order_index != null) return error.DocumentSqlWriteUnsupported;
     const limit_index = parser.findTopLevelKeywordTagFromIndex(tokens[0..source_end], where_start, .limit);
@@ -20690,6 +20807,17 @@ fn parseDocumentSourceProjectionInsertAlloc(
     var producer = try lowerDocumentWriteProducerFromWhereAlloc(alloc, tokens, where_start, producer_end, schema, source_table);
     var producer_transferred = false;
     errdefer if (!producer_transferred) producer.deinit(alloc);
+
+    var conflict_write: ?plan_mod.LoweredDocumentConflictWrite = null;
+    var conflict_transferred = false;
+    errdefer if (!conflict_transferred) {
+        if (conflict_write) |*value| value.deinit(alloc);
+    };
+    if (conflict_index) |index| {
+        var conflict_pos = index;
+        conflict_write = try parseDocumentInsertConflictWriteAlloc(alloc, tokens, &conflict_pos, schema, target_table, columns, &.{}, params, sync_level);
+        if (conflict_pos != conflict_tail_end) return error.DocumentSqlWriteUnsupported;
+    }
 
     var returning_fields: []DocumentReturningField = &.{};
     var returning_transferred = false;
@@ -20715,6 +20843,7 @@ fn parseDocumentSourceProjectionInsertAlloc(
     alloc.free(source_table.alias);
     producer_transferred = true;
     assignments_transferred = true;
+    conflict_transferred = true;
     returning_transferred = true;
     return .{ .document_source_insert = .{
         .table_name = table_name,
@@ -20723,6 +20852,7 @@ fn parseDocumentSourceProjectionInsertAlloc(
         .source_limit = source_limit,
         .target_id_mode = target_id_mode,
         .assignments = assignments_slice,
+        .conflict_write = conflict_write,
         .returning_fields = returning_fields,
         .sync_level = sync_level,
     } };
@@ -23762,6 +23892,10 @@ fn documentMergeMatchedArmAlloc(
 
 fn documentMergeNotMatchedArmAlloc(
     alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    source_table: plan_mod.TableAlias,
     arm: plan_mod.MergeNotMatchedArm,
 ) !plan_mod.DocumentMergeNotMatchedArm {
     try validateDocumentMergeSimplePredicates(arm.predicates);
@@ -23775,20 +23909,95 @@ fn documentMergeNotMatchedArmAlloc(
         if (predicates.len > 0) alloc.free(predicates);
     }
     if (arm.do_nothing) return .{ .predicates = predicates, .do_nothing = true };
-    if (arm.insert.len != 2) return error.DocumentSqlWriteUnsupported;
-    var saw_id = false;
-    var saw_doc = false;
-    for (arm.insert) |mapping| {
-        if (std.ascii.eqlIgnoreCase(mapping.target_field, "_id") and std.ascii.eqlIgnoreCase(mapping.source_field, "_id")) {
-            saw_id = true;
-        } else if (std.ascii.eqlIgnoreCase(mapping.target_field, "_doc") and std.ascii.eqlIgnoreCase(mapping.source_field, "_doc")) {
-            saw_doc = true;
+
+    if (arm.insert.len == 2) {
+        var saw_id = false;
+        var saw_doc = false;
+        for (arm.insert) |mapping| {
+            if (documentIdentityFieldMatches(mapping.target_field, target_table) and documentIdentityFieldMatches(mapping.source_field, source_table)) {
+                saw_id = true;
+            } else if (documentDocFieldMatches(mapping.target_field, target_table) and documentDocFieldMatches(mapping.source_field, source_table)) {
+                saw_doc = true;
+            } else {
+                break;
+            }
         } else {
-            return error.DocumentSqlWriteUnsupported;
+            if (saw_id and saw_doc) return .{ .predicates = predicates, .insert_source_document = true };
         }
     }
-    if (!saw_id or !saw_doc) return error.DocumentSqlWriteUnsupported;
-    return .{ .predicates = predicates, .insert_source_document = true };
+
+    const insert_assignments = try documentMergeProjectionInsertAssignmentsAlloc(alloc, schema, source_schema, target_table, source_table, arm.insert);
+    errdefer {
+        for (insert_assignments) |*assignment| assignment.deinit(alloc);
+        if (insert_assignments.len > 0) alloc.free(insert_assignments);
+    }
+    return .{
+        .predicates = predicates,
+        .insert_assignments = insert_assignments,
+    };
+}
+
+fn documentMergeProjectionInsertAssignmentForMappingAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    source_table: plan_mod.TableAlias,
+    mapping: plan_mod.MergeFieldMapping,
+) !plan_mod.DocumentSourceInsertAssignment {
+    if (documentIdentityFieldMatches(mapping.target_field, target_table)) {
+        if (!documentIdentityFieldMatches(mapping.source_field, source_table)) return error.DocumentSqlWriteUnsupported;
+        return .{
+            .kind = .identity,
+            .field_type = .keyword,
+        };
+    }
+    if (documentDocFieldMatches(mapping.target_field, target_table) or documentVersionFieldMatches(mapping.target_field, target_table)) return error.DocumentSqlWriteUnsupported;
+    if (documentDocFieldMatches(mapping.source_field, source_table) or documentVersionFieldMatches(mapping.source_field, source_table) or documentIdentityFieldMatches(mapping.source_field, source_table)) return error.DocumentSqlWriteUnsupported;
+
+    const target_projection = try documentProjectionColumnForField(schema, target_table, mapping.target_field);
+    if (target_projection.path.len == 0 or std.mem.indexOfAny(u8, target_projection.path, "./") != null) return error.DocumentSqlWriteUnsupported;
+    if (target_projection.generated != null) return error.DocumentSqlWriteUnsupported;
+    const source_projection = try documentProjectionColumnForField(source_schema, source_table, mapping.source_field);
+    if (source_projection.path.len == 0 or std.mem.indexOfAny(u8, source_projection.path, "./") != null) return error.DocumentSqlWriteUnsupported;
+    if (source_projection.generated != null) return error.DocumentSqlWriteUnsupported;
+    if (source_projection.field_type != target_projection.field_type) return error.DocumentSqlWriteUnsupported;
+
+    const target_path = try alloc.dupe(u8, target_projection.path);
+    errdefer alloc.free(target_path);
+    const source_path = try alloc.dupe(u8, source_projection.path);
+    errdefer alloc.free(source_path);
+    return .{
+        .kind = .projection,
+        .target_path = target_path,
+        .source_path = source_path,
+        .field_type = target_projection.field_type,
+    };
+}
+
+fn documentMergeProjectionInsertAssignmentsAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    source_table: plan_mod.TableAlias,
+    mappings: []const plan_mod.MergeFieldMapping,
+) ![]plan_mod.DocumentSourceInsertAssignment {
+    if (mappings.len == 0) return error.DocumentSqlWriteUnsupported;
+    var assignments = try alloc.alloc(plan_mod.DocumentSourceInsertAssignment, mappings.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (assignments[0..initialized]) |*assignment| assignment.deinit(alloc);
+        if (assignments.len > 0) alloc.free(assignments);
+    }
+    var has_identity = false;
+    for (mappings) |mapping| {
+        assignments[initialized] = try documentMergeProjectionInsertAssignmentForMappingAlloc(alloc, schema, source_schema, target_table, source_table, mapping);
+        if (assignments[initialized].kind == .identity) has_identity = true;
+        initialized += 1;
+    }
+    if (!has_identity) return error.DocumentSqlWriteUnsupported;
+    return assignments;
 }
 
 fn documentMergeJoinKeysAlloc(
@@ -23896,9 +24105,21 @@ fn parseDocumentMergeMutationAlloc(
     );
     defer merge.deinit(alloc);
     if (merge.ctes.len != 0 or merge.data_modifying_ctes.len != 0 or merge.source.source_cte.len != 0) return error.DocumentSqlWriteUnsupported;
-    if (merge.returning.hasProjection()) return error.DocumentSqlWriteUnsupported;
+
+    var returning_fields: []DocumentReturningField = &.{};
+    var returning_transferred = false;
+    defer if (!returning_transferred) freeDocumentReturningFields(alloc, returning_fields);
+    if (merge.returning.hasProjection()) {
+        const statement_end = if (parsed_sql.items().len > 0 and parsed_sql.items()[parsed_sql.items().len - 1].kind == .semicolon) parsed_sql.items().len - 1 else parsed_sql.items().len;
+        const returning_index = parser.findTopLevelKeywordTagFromIndex(parsed_sql.items()[0..statement_end], 0, .returning) orelse return error.DocumentSqlWriteUnsupported;
+        var returning_pos = returning_index + 1;
+        const target_table_for_returning = plan_mod.TableAlias{ .name = merge.target_table_name, .alias = merge.target_table_name };
+        returning_fields = try parseDocumentReturningFieldsAlloc(alloc, parsed_sql.items(), &returning_pos, schema, target_table_for_returning);
+        if (returning_pos != statement_end) return error.DocumentSqlWriteUnsupported;
+    }
 
     const target_table = plan_mod.TableAlias{ .name = merge.target_table_name, .alias = merge.target_table_name };
+    const source_table = plan_mod.TableAlias{ .name = merge.source_table_name, .alias = merge.source_table_name };
     var matched_arms = try alloc.alloc(plan_mod.DocumentMergeMatchedArm, merge.matched_arms.len);
     var matched_initialized: usize = 0;
     errdefer {
@@ -23917,7 +24138,7 @@ fn parseDocumentMergeMutationAlloc(
         if (not_matched_arms.len > 0) alloc.free(not_matched_arms);
     }
     for (merge.not_matched_arms) |arm| {
-        not_matched_arms[not_matched_initialized] = try documentMergeNotMatchedArmAlloc(alloc, arm);
+        not_matched_arms[not_matched_initialized] = try documentMergeNotMatchedArmAlloc(alloc, schema, source_schema, target_table, source_table, arm);
         not_matched_initialized += 1;
     }
 
@@ -23931,6 +24152,7 @@ fn parseDocumentMergeMutationAlloc(
     errdefer alloc.free(table_name);
     const source_table_name = try alloc.dupe(u8, merge.source_table_name);
     errdefer alloc.free(source_table_name);
+    returning_transferred = true;
 
     return .{
         .table_name = table_name,
@@ -23942,6 +24164,7 @@ fn parseDocumentMergeMutationAlloc(
         .not_matched_arms = not_matched_arms,
         .max_target_rows = source_binding.default_document_sql_bounded_scan_rows,
         .max_source_rows = source_binding.default_document_sql_bounded_scan_rows,
+        .returning_fields = returning_fields,
         .sync_level = sync_level,
     };
 }
@@ -29618,9 +29841,11 @@ test "sql adapter lower dml rejects stale generated point update assignment hook
         .mutation_claim = .{
             .mode = .for_update,
             .wait_policy = .wait,
+            .owner_id = "__antfly_sql_test_claim__",
             .txn_id = [_]u8{0} ** 16,
         },
         .generated_assignment_items = &ast.assignment_items,
+        .generated_returning_items = generatedDmlTopLevelReturningItems(&ast),
         .generated_dml_ast = &ast,
     };
     var lowered = try parser_context.ParserState.ContextAccessors.parseUpdateMutationSource(&parser_state);
@@ -29636,9 +29861,11 @@ test "sql adapter lower dml rejects stale generated point update assignment hook
         .mutation_claim = .{
             .mode = .for_update,
             .wait_policy = .wait,
+            .owner_id = "__antfly_sql_test_claim__",
             .txn_id = [_]u8{0} ** 16,
         },
         .generated_assignment_items = &stale_ast.assignment_items,
+        .generated_returning_items = generatedDmlTopLevelReturningItems(&stale_ast),
         .generated_dml_ast = &stale_ast,
     };
     try std.testing.expectError(error.UnsupportedSqlShape, parser_context.ParserState.ContextAccessors.parseUpdateMutationSource(&stale_parser_state));
@@ -29673,9 +29900,11 @@ test "sql adapter lower dml rejects stale generated joined update assignment hoo
         .mutation_claim = .{
             .mode = .for_update,
             .wait_policy = .wait,
+            .owner_id = "__antfly_sql_test_claim__",
             .txn_id = [_]u8{0} ** 16,
         },
         .generated_assignment_items = &ast.assignment_items,
+        .generated_returning_items = generatedDmlTopLevelReturningItems(&ast),
         .generated_dml_ast = &ast,
     };
     var lowered = try parseJoinedMutationSourceAlloc(
@@ -29698,9 +29927,11 @@ test "sql adapter lower dml rejects stale generated joined update assignment hoo
         .mutation_claim = .{
             .mode = .for_update,
             .wait_policy = .wait,
+            .owner_id = "__antfly_sql_test_claim__",
             .txn_id = [_]u8{0} ** 16,
         },
         .generated_assignment_items = &stale_ast.assignment_items,
+        .generated_returning_items = generatedDmlTopLevelReturningItems(&stale_ast),
         .generated_dml_ast = &stale_ast,
     };
     try std.testing.expectError(error.UnsupportedSqlShape, parseJoinedMutationSourceAlloc(
@@ -29893,6 +30124,7 @@ test "sql adapter lower dml rejects stale generated mutation source returning ho
         .mutation_claim = .{
             .mode = .for_update,
             .wait_policy = .wait,
+            .owner_id = "__antfly_sql_test_claim__",
             .txn_id = [_]u8{0} ** 16,
         },
         .generated_assignment_items = &ast.assignment_items,
@@ -29912,6 +30144,7 @@ test "sql adapter lower dml rejects stale generated mutation source returning ho
         .mutation_claim = .{
             .mode = .for_update,
             .wait_policy = .wait,
+            .owner_id = "__antfly_sql_test_claim__",
             .txn_id = [_]u8{0} ** 16,
         },
         .generated_assignment_items = &stale_ast.assignment_items,
@@ -29950,6 +30183,7 @@ test "sql adapter lower dml rejects stale generated joined mutation source retur
         .mutation_claim = .{
             .mode = .for_update,
             .wait_policy = .wait,
+            .owner_id = "__antfly_sql_test_claim__",
             .txn_id = [_]u8{0} ** 16,
         },
         .generated_assignment_items = &ast.assignment_items,
@@ -29976,6 +30210,7 @@ test "sql adapter lower dml rejects stale generated joined mutation source retur
         .mutation_claim = .{
             .mode = .for_update,
             .wait_policy = .wait,
+            .owner_id = "__antfly_sql_test_claim__",
             .txn_id = [_]u8{0} ** 16,
         },
         .generated_assignment_items = &stale_ast.assignment_items,
@@ -30023,6 +30258,7 @@ test "sql adapter lower dml rejects stale generated semijoin returning hook rang
             .mutation_claim = .{
                 .mode = .for_update,
                 .wait_policy = .wait,
+                .owner_id = "__antfly_sql_test_claim__",
                 .txn_id = [_]u8{0} ** 16,
             },
             .generated_assignment_items = &ast.assignment_items,
@@ -30053,7 +30289,6 @@ test "sql adapter lower dml rejects stale generated semijoin returning hook rang
             },
             .generated_assignment_items = &stale_ast.assignment_items,
             .generated_returning_items = &stale_ast.returning_items,
-            .generated_dml_ast = &stale_ast,
         };
         try std.testing.expectError(error.UnsupportedSqlShape, parseJoinedMutationSourceAlloc(
             alloc,
@@ -37117,7 +37352,7 @@ test "sql adapter lower dml lowers insert default values into defaulted row batc
 test "sql adapter lower dml materializes sequence defaults through write options" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"numeric","x-antfly-default":{"op":"sequence_next","sequence":"usage_id_seq","database":"tenant","schema":"billing"}},"status":{"type":"keyword","default":"pending"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"numeric","x-antfly-default":{"op":"sequence_next","sequence":"usage_id_seq","database":"tenant","schema":"billing"}},"ticket":{"type":"numeric","x-antfly-default":{"op":"sequence_next","sequence":"usage_id_seq","database":"tenant","schema":"billing"}},"status":{"type":"keyword","default":"pending"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
     defer runtime_schema.freeSchema(alloc, schema);
@@ -37169,10 +37404,35 @@ test "sql adapter lower dml materializes sequence defaults through write options
 
     switch (lowered) {
         .insert => |insert| {
-            try std.testing.expectEqual(@as(usize, 1), resolver.calls);
+            try std.testing.expectEqual(@as(usize, 2), resolver.calls);
             try std.testing.expectEqualStrings("usage_records", insert.table_name);
             try std.testing.expectEqual(@as(u32, 1), insert.batch.inserted);
             try std.testing.expectEqualStrings("{\"id\":101,\"status\":\"pending\"}", insert.batch.returning_rows[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var update_resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":7,\"ticket\":8,\"status\":\"open\"}", .version = 19 };
+    var update_default = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET ticket = DEFAULT WHERE id = 7 RETURNING id, ticket",
+        schema,
+        &.{},
+        .{
+            .unique_resolver = update_resolver_ctx.resolver(),
+            .default_context = .{ .sequence_resolver = resolver.iface() },
+        },
+    );
+    defer update_default.deinit(alloc);
+
+    switch (update_default) {
+        .update => |update| {
+            try std.testing.expectEqual(@as(usize, 3), resolver.calls);
+            try std.testing.expectEqual(@as(u32, 1), update.batch.transformed);
+            try std.testing.expectEqualStrings("ticket", update.batch.transforms[0].operations[0].path);
+            try std.testing.expectEqualStrings("101", update.batch.transforms[0].operations[0].value_json.?);
+            try std.testing.expectEqualStrings("{\"id\":7,\"ticket\":101}", update.batch.returning_rows[0]);
+            try std.testing.expectEqual(@as(u64, 19), update.batch.predicates[0].expected_version);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -37359,9 +37619,35 @@ test "sql adapter lower dml lowers insert source write plans" {
             try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.order_by.len);
             try std.testing.expectEqual(@as(?u32, 5), insert_source.insert_source.req.source.limit);
             try std.testing.expectEqual(@as(u32, 2), insert_source.insert_source.req.source.offset);
-            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.returning.len);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.insert_source.req.returning.len);
             try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.returning_expressions.len);
             try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, insert_source.insert_source.req.returning_expressions[0].expression.kind);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var insert_source_scalar_subquery_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) SELECT id, (SELECT status FROM usage_records WHERE id = 'u1') AS first_status FROM usage_records WHERE status = 'ready' RETURNING id, status",
+        schema,
+        &.{},
+        .{ .unique_resolver = multi_conflict_resolver.resolver() },
+    );
+    defer insert_source_scalar_subquery_plan.deinit(alloc);
+    switch (insert_source_scalar_subquery_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqualStrings("usage_records", insert_source.table_name);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.insert_source.req.assignments.len);
+            try std.testing.expectEqualStrings("status", insert_source.insert_source.req.assignments[1].field);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, insert_source.insert_source.req.assignments[1].expression.kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, insert_source.insert_source.req.assignments[1].expression.field_source);
+            try std.testing.expectEqualStrings("first_status", insert_source.insert_source.req.assignments[1].expression.field);
+            try std.testing.expect(insert_source.insert_source.req.source.select_all);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.scalar_subqueries.len);
+            try std.testing.expectEqualStrings("first_status", insert_source.insert_source.req.source.scalar_subqueries[0].output);
+            try std.testing.expectEqualStrings("status", insert_source.insert_source.req.source.scalar_subqueries[0].output_field);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.scalar_subqueries[0].query.predicates.len);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.returning.len);
         },
         else => return error.TestUnexpectedResult,
     }

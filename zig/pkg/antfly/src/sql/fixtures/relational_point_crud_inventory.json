@@ -38,11 +38,11 @@
       "id": "routed-conflict-range-movement-chaos",
       "relational_slices_section": "Point CRUD and conflict upsert hardening",
       "surface": "routed_conflict_range_movement",
-      "status": "gap_tracked",
-      "current_evidence": "Hosted mutation-source routing already gates stale topology epoch rejection, collect retry before staging, and global planned candidate staging. Typed insert-source planning now fails closed when ordinary unique or temporal-overlap owner lookup reports topology movement before any write batch is staged.",
-      "missing_evidence": "Add hosted/provisioned range-movement chaos that drives routed insert-source conflict lookup, conflict guard evaluation, staged write commit, and temporal unique overlap selection through real owner movement and proves retry or fail-closed behavior without stale owner writes.",
-      "evidence_file": "zig/pkg/antfly/src/sql/relational_rows.zig",
-      "evidence_symbol": "relational rows insert source conflict owner topology changes fail closed",
+      "status": "partial_release_gated",
+      "current_evidence": "Hosted mutation-source routing already gates stale topology epoch rejection, collect retry before staging, and global planned candidate staging. Typed insert-source planning fails closed when ordinary unique or temporal-overlap owner lookup reports topology movement before any write batch is staged, and the public API insert-source mutation endpoint now proves a source read followed by unique-owner topology unavailability returns 503 without invoking commitTransaction or batch.",
+      "missing_evidence": "Add hosted/provisioned range-movement chaos for routed insert-source conflict ownership. The proof still needs owner movement after successful source read and conflict-owner routing, across conflict guard evaluation, grouped write staging, and commit, then assert retry or fail-closed behavior without stale owner writes.",
+      "evidence_file": "zig/pkg/antfly/src/api_rows_test_root.zig",
+      "evidence_symbol": "api rows insert-source upsert aborts before commit when unique owner topology moves",
       "release_gate": "relational-release-gate"
     }
   ]

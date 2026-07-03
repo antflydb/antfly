@@ -8882,11 +8882,12 @@ test "api.table_reads.docid document sql view mapping runtime results match nati
     try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
     try db.batch(.{
         .writes = &.{
-            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"status\":\"active\",\"metadata\":{\"plan\":\"pro\"},\"metrics\":{\"score\":9},\"tags\":[\"urgent\",\"vip\"]}" },
-            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"status\":\"active\",\"metadata\":{\"plan\":\"free\"},\"metrics\":{\"score\":2},\"tags\":[\"normal\"]}" },
-            .{ .key = "doc:c", .value = "{\"title\":\"alpha\",\"status\":\"archived\",\"metadata\":{\"plan\":\"pro\"},\"metrics\":{\"score\":7},\"tags\":[\"urgent\"]}" },
-            .{ .key = "doc:d", .value = "{\"title\":\"alpha\",\"status\":\"active\",\"metadata\":{\"plan\":\"team\"},\"metrics\":{\"score\":5},\"tags\":[\"vip\"]}" },
-            .{ .key = "doc:e", .value = "{\"title\":\"gamma\",\"status\":\"active\",\"metrics\":{\"score\":4},\"tags\":[]}" },
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"status\":\"active\",\"published\":true,\"metadata\":{\"plan\":\"pro\",\"region\":\"west\"},\"metrics\":{\"score\":9},\"tags\":[\"urgent\",\"vip\"]}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"status\":\"active\",\"published\":false,\"metadata\":{\"plan\":\"free\",\"region\":\"east\"},\"metrics\":{\"score\":2},\"tags\":[\"normal\"]}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"alpha\",\"status\":\"archived\",\"published\":true,\"metadata\":{\"plan\":\"pro\"},\"metrics\":{\"score\":7},\"tags\":[\"urgent\"]}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"alpha\",\"status\":\"active\",\"published\":true,\"metadata\":{\"plan\":\"team\",\"region\":\"west\"},\"metrics\":{\"score\":5},\"tags\":[\"vip\"]}" },
+            .{ .key = "doc:e", .value = "{\"title\":\"gamma\",\"status\":\"active\",\"published\":false,\"metrics\":{\"score\":4},\"tags\":[]}" },
+            .{ .key = "doc:f", .value = "{\"title\":\"delta\",\"status\":\"active\",\"published\":false,\"metadata\":{\"plan\":\"trial\",\"region\":\"west\"},\"metrics\":{\"score\":6},\"tags\":[null,\"visible\"]}" },
         },
         .sync_level = .full_index,
     });
@@ -8900,7 +8901,7 @@ test "api.table_reads.docid document sql view mapping runtime results match nati
 
     const indexes_json =
         \\{
-        \\  "full_text_index_v0":{"type":"full_text","lifecycle":"ready","scalar_paths":["metadata.plan","metrics.score"]},
+        \\  "full_text_index_v0":{"type":"full_text","lifecycle":"ready","scalar_paths":["title","metadata.plan","metadata.region","metrics.score","published"]},
         \\  "tags_array":{"type":"array_element","path":"tags","lifecycle":"ready"},
         \\  "view_mappings":{
         \\    "support_view":{
@@ -8910,10 +8911,12 @@ test "api.table_reads.docid document sql view mapping runtime results match nati
         \\        {"name":"tags_array","lifecycle":"ready"}
         \\      ],
         \\      "fields":[
-        \\        {"name":"title","path":"title"},
+        \\        {"name":"title_text","path":"title","type":"text"},
         \\        {"name":"status","path":"status","type":"keyword"},
         \\        {"name":"plan","path":"metadata.plan","type":"keyword","nullable":true},
+        \\        {"name":"region","path":"metadata.region","type":"keyword","nullable":true},
         \\        {"name":"score","path":"metrics.score","type":"numeric","nullable":true},
+        \\        {"name":"published","path":"published","type":"boolean","nullable":true},
         \\        {"name":"tag_list","path":"tags","type":"array","item_type":"keyword"}
         \\      ]
         \\    }
@@ -8923,7 +8926,7 @@ test "api.table_reads.docid document sql view mapping runtime results match nati
 
     var virtual_schema = try sql_adapter.documentSqlSchemaForRuntimeSchemaAndIndexesJsonAlloc(alloc, schema, indexes_json);
     defer sql_adapter.deinitDocumentSqlSchema(alloc, &virtual_schema);
-    const indexed_scalar_paths = [_][]const u8{ "/metadata/plan", "/metrics/score" };
+    const indexed_scalar_paths = [_][]const u8{ "/title", "/metadata/plan", "/metadata/region", "/metrics/score", "/published" };
     const indexed_array_paths = [_][]const u8{ "tags", "/tags" };
     const capabilities = sql_adapter.DocumentSqlCapabilities{
         .full_text_filters = true,
@@ -9091,6 +9094,110 @@ test "api.table_reads.docid document sql view mapping runtime results match nati
     defer between.deinit(alloc);
     try Harness.expectIndexedFilter(between);
 
+    var text_field = try Harness.expectRows(
+        alloc,
+        adapter.runtimeSource(),
+        schema,
+        virtual_schema,
+        capabilities,
+        "SELECT _id, title_text FROM support_view WHERE title_text = 'alpha' LIMIT 10",
+        3,
+        &.{
+            "{\"_id\":\"doc:a\",\"title_text\":\"alpha\"}",
+            "{\"_id\":\"doc:c\",\"title_text\":\"alpha\"}",
+            "{\"_id\":\"doc:d\",\"title_text\":\"alpha\"}",
+        },
+    );
+    defer text_field.deinit(alloc);
+    try Harness.expectIndexedFilter(text_field);
+
+    var boolean_field = try Harness.expectRows(
+        alloc,
+        adapter.runtimeSource(),
+        schema,
+        virtual_schema,
+        capabilities,
+        "SELECT _id, published FROM support_view WHERE published IS TRUE LIMIT 10",
+        3,
+        &.{
+            "{\"_id\":\"doc:a\",\"published\":true}",
+            "{\"_id\":\"doc:c\",\"published\":true}",
+            "{\"_id\":\"doc:d\",\"published\":true}",
+        },
+    );
+    defer boolean_field.deinit(alloc);
+    try Harness.expectIndexedFilter(boolean_field);
+
+    var missing_nested = try Harness.expectRows(
+        alloc,
+        adapter.runtimeSource(),
+        schema,
+        virtual_schema,
+        capabilities,
+        "SELECT _id, region FROM support_view WHERE region IS NULL LIMIT 10",
+        2,
+        &.{
+            "{\"_id\":\"doc:c\",\"region\":null}",
+            "{\"_id\":\"doc:e\",\"region\":null}",
+        },
+    );
+    defer missing_nested.deinit(alloc);
+    try Harness.expectIndexedFilter(missing_nested);
+
+    var multi_field = try Harness.expectRows(
+        alloc,
+        adapter.runtimeSource(),
+        schema,
+        virtual_schema,
+        capabilities,
+        "SELECT _id, title_text, plan, score, published, region FROM support_view WHERE region = 'west' LIMIT 10",
+        3,
+        &.{
+            "{\"_id\":\"doc:a\",\"title_text\":\"alpha\",\"plan\":\"pro\",\"score\":9,\"published\":true,\"region\":\"west\"}",
+            "{\"_id\":\"doc:d\",\"title_text\":\"alpha\",\"plan\":\"team\",\"score\":5,\"published\":true,\"region\":\"west\"}",
+            "{\"_id\":\"doc:f\",\"title_text\":\"delta\",\"plan\":\"trial\",\"score\":6,\"published\":false,\"region\":\"west\"}",
+        },
+    );
+    defer multi_field.deinit(alloc);
+    try Harness.expectIndexedFilter(multi_field);
+
+    var mapped_scalar_scan = (try source.source().scan(alloc, "docs", "", "", .{
+        .include_documents = true,
+        .fields = &.{ "title", "metadata", "published" },
+        .include_all_fields = false,
+        .limit = 100,
+    }, .read_index)).?;
+    defer mapped_scalar_scan.deinit(alloc);
+    var native_title_alpha: usize = 0;
+    var native_published_true: usize = 0;
+    var native_region_null: usize = 0;
+    var native_region_west: usize = 0;
+    var mapped_scalar_lines = std.mem.splitScalar(u8, mapped_scalar_scan.ndjson, '\n');
+    while (mapped_scalar_lines.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = try parseJsonTestBody(std.json.Value, alloc, line);
+        defer parsed.deinit();
+        if (parsed.value.object.get("title")) |title| {
+            if (title == .string and std.mem.eql(u8, title.string, "alpha")) native_title_alpha += 1;
+        }
+        if (parsed.value.object.get("published")) |published| {
+            if (published == .bool and published.bool) native_published_true += 1;
+        }
+        const region = if (parsed.value.object.get("metadata")) |metadata|
+            if (metadata == .object) metadata.object.get("region") else null
+        else
+            null;
+        if (region == null or region.? == .null) {
+            native_region_null += 1;
+        } else if (region.? == .string and std.mem.eql(u8, region.?.string, "west")) {
+            native_region_west += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), native_title_alpha);
+    try std.testing.expectEqual(@as(usize, 3), native_published_true);
+    try std.testing.expectEqual(@as(usize, 2), native_region_null);
+    try std.testing.expectEqual(@as(usize, 3), native_region_west);
+
     var ordered = try Harness.expectRows(
         alloc,
         adapter.runtimeSource(),
@@ -9113,11 +9220,11 @@ test "api.table_reads.docid document sql view mapping runtime results match nati
         schema,
         virtual_schema,
         capabilities,
-        "SELECT _id, title, status FROM support_view WHERE full_text_search('title:alpha') AND status = 'active' LIMIT 10",
+        "SELECT _id, title_text, status FROM support_view WHERE full_text_search('title:alpha') AND status = 'active' LIMIT 10",
         2,
         &.{
-            "{\"_id\":\"doc:a\",\"title\":\"alpha\",\"status\":\"active\"}",
-            "{\"_id\":\"doc:d\",\"title\":\"alpha\",\"status\":\"active\"}",
+            "{\"_id\":\"doc:a\",\"title_text\":\"alpha\",\"status\":\"active\"}",
+            "{\"_id\":\"doc:d\",\"title_text\":\"alpha\",\"status\":\"active\"}",
         },
     );
     defer residual.deinit(alloc);
@@ -9172,6 +9279,166 @@ test "api.table_reads.docid document sql view mapping runtime results match nati
         }
     }
     try std.testing.expectEqual(@as(usize, 2), urgent_matches);
+
+    var unnest_range = try Harness.expectRows(
+        alloc,
+        adapter.runtimeSource(),
+        schema,
+        virtual_schema,
+        capabilities,
+        "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag > 'u' LIMIT 10",
+        3,
+        &.{
+            "{\"_id\":\"doc:a\",\"tag\":\"urgent\"}",
+            "{\"_id\":\"doc:a\",\"tag\":\"vip\"}",
+            "{\"_id\":\"doc:f\",\"tag\":\"visible\"}",
+        },
+    );
+    defer unnest_range.deinit(alloc);
+    try std.testing.expect(unnest_range.unnest != null);
+    try Harness.expectIndexedFilter(unnest_range);
+
+    var unnest_pattern = try Harness.expectRows(
+        alloc,
+        adapter.runtimeSource(),
+        schema,
+        virtual_schema,
+        capabilities,
+        "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag LIKE 'v%' LIMIT 10",
+        2,
+        &.{
+            "{\"_id\":\"doc:a\",\"tag\":\"vip\"}",
+            "{\"_id\":\"doc:f\",\"tag\":\"visible\"}",
+        },
+    );
+    defer unnest_pattern.deinit(alloc);
+    try std.testing.expect(unnest_pattern.unnest != null);
+    try Harness.expectIndexedFilter(unnest_pattern);
+
+    var unnest_ilike = try Harness.expectRows(
+        alloc,
+        adapter.runtimeSource(),
+        schema,
+        virtual_schema,
+        capabilities,
+        "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag ILIKE 'V%' LIMIT 10",
+        2,
+        &.{
+            "{\"_id\":\"doc:a\",\"tag\":\"vip\"}",
+            "{\"_id\":\"doc:f\",\"tag\":\"visible\"}",
+        },
+    );
+    defer unnest_ilike.deinit(alloc);
+    try std.testing.expect(unnest_ilike.unnest != null);
+    try Harness.expectIndexedFilter(unnest_ilike);
+
+    var unnest_null = try Harness.expectRows(
+        alloc,
+        adapter.runtimeSource(),
+        schema,
+        virtual_schema,
+        capabilities,
+        "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag IS NULL LIMIT 10",
+        1,
+        &.{
+            "{\"_id\":\"doc:f\",\"tag\":null}",
+        },
+    );
+    defer unnest_null.deinit(alloc);
+    try std.testing.expect(unnest_null.unnest != null);
+    try Harness.expectIndexedFilter(unnest_null);
+
+    var unnest_not_null = try Harness.expectRows(
+        alloc,
+        adapter.runtimeSource(),
+        schema,
+        virtual_schema,
+        capabilities,
+        "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag IS NOT NULL LIMIT 10",
+        6,
+        &.{
+            "{\"_id\":\"doc:a\",\"tag\":\"urgent\"}",
+            "{\"_id\":\"doc:a\",\"tag\":\"vip\"}",
+            "{\"_id\":\"doc:b\",\"tag\":\"stale\"}",
+            "{\"_id\":\"doc:c\",\"tag\":\"urgent\"}",
+            "{\"_id\":\"doc:c\",\"tag\":\"review\"}",
+            "{\"_id\":\"doc:f\",\"tag\":\"visible\"}",
+        },
+    );
+    defer unnest_not_null.deinit(alloc);
+    try std.testing.expect(unnest_not_null.unnest != null);
+    try Harness.expectIndexedFilter(unnest_not_null);
+
+    var unnest_not_equal = try Harness.expectRows(
+        alloc,
+        adapter.runtimeSource(),
+        schema,
+        virtual_schema,
+        capabilities,
+        "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag <> 'urgent' LIMIT 10",
+        4,
+        &.{
+            "{\"_id\":\"doc:a\",\"tag\":\"vip\"}",
+            "{\"_id\":\"doc:b\",\"tag\":\"stale\"}",
+            "{\"_id\":\"doc:c\",\"tag\":\"review\"}",
+            "{\"_id\":\"doc:f\",\"tag\":\"visible\"}",
+        },
+    );
+    defer unnest_not_equal.deinit(alloc);
+    try std.testing.expect(unnest_not_equal.unnest != null);
+    try Harness.expectIndexedFilter(unnest_not_equal);
+
+    var unnest_compound = try Harness.expectRows(
+        alloc,
+        adapter.runtimeSource(),
+        schema,
+        virtual_schema,
+        capabilities,
+        "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' AND tag <> 'stale' LIMIT 10",
+        2,
+        &.{
+            "{\"_id\":\"doc:a\",\"tag\":\"urgent\"}",
+            "{\"_id\":\"doc:c\",\"tag\":\"urgent\"}",
+        },
+    );
+    defer unnest_compound.deinit(alloc);
+    try std.testing.expect(unnest_compound.unnest != null);
+    try Harness.expectIndexedFilter(unnest_compound);
+
+    var mapped_range_matches: usize = 0;
+    var mapped_pattern_matches: usize = 0;
+    var mapped_ilike_matches: usize = 0;
+    var mapped_null_matches: usize = 0;
+    var mapped_not_null_matches: usize = 0;
+    var mapped_not_equal_matches: usize = 0;
+    var mapped_compound_matches: usize = 0;
+    var mapped_lines = std.mem.splitScalar(u8, native_scan.ndjson, '\n');
+    while (mapped_lines.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = try parseJsonTestBody(std.json.Value, alloc, line);
+        defer parsed.deinit();
+        const tags = parsed.value.object.get("tags").?.array.items;
+        for (tags) |tag| {
+            if (tag == .null) {
+                mapped_null_matches += 1;
+                continue;
+            }
+            if (tag != .string) continue;
+            mapped_not_null_matches += 1;
+            if (std.mem.order(u8, tag.string, "u") == .gt) mapped_range_matches += 1;
+            if (std.mem.startsWith(u8, tag.string, "v")) mapped_pattern_matches += 1;
+            if (tag.string.len > 0 and (tag.string[0] == 'v' or tag.string[0] == 'V')) mapped_ilike_matches += 1;
+            if (!std.mem.eql(u8, tag.string, "urgent")) mapped_not_equal_matches += 1;
+            if (std.mem.eql(u8, tag.string, "urgent") and !std.mem.eql(u8, tag.string, "stale")) mapped_compound_matches += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), mapped_range_matches);
+    try std.testing.expectEqual(@as(usize, 2), mapped_pattern_matches);
+    try std.testing.expectEqual(@as(usize, 2), mapped_ilike_matches);
+    try std.testing.expectEqual(@as(usize, 1), mapped_null_matches);
+    try std.testing.expectEqual(@as(usize, 6), mapped_not_null_matches);
+    try std.testing.expectEqual(@as(usize, 4), mapped_not_equal_matches);
+    try std.testing.expectEqual(@as(usize, 2), mapped_compound_matches);
 }
 
 test "api.table_reads.docid document sql catalog read producers treat catalog misses as terminal" {

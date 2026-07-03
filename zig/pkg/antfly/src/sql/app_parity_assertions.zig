@@ -63,6 +63,7 @@ pub fn expectFailClosedUnsupported(result: anytype) !void {
         error.DocumentSqlBoundedScanMissingExactProducer,
         error.DocumentSqlBoundedScanUnboundedSource,
         error.DocumentSqlBoundedScanUnsupportedResidual,
+        error.DocumentSqlUnnestUnsupported,
         error.DocumentSqlIndexUnavailable,
         error.DocumentSqlWriteJoinMissingExactProducer,
         error.DocumentSqlWriteJoinMissingCardinalityProof,
@@ -299,10 +300,13 @@ fn documentProducerHasResidual(producer: document_plan.DocumentProducer) bool {
 }
 
 fn expectDocumentReadSummary(summary: corpus.AppParityPlanSummary, document: document_plan.DocumentReadPlan) !void {
-    if (summary.table_name != null) return error.TestUnexpectedResult;
+    if (summary.table_name) |table_name| try std.testing.expectEqualStrings(table_name, document.table_name);
     if (summary.document_source_table) |source_table| {
-        const view_mapping = document.view_mapping orelse return error.TestUnexpectedResult;
-        try std.testing.expectEqualStrings(source_table, view_mapping.source_table);
+        if (document.view_mapping) |view_mapping| {
+            try std.testing.expectEqualStrings(source_table, view_mapping.source_table);
+        } else {
+            try std.testing.expectEqualStrings(source_table, document.table_name);
+        }
     }
     if (summary.document_view_mapping) |mapping_name| {
         const view_mapping = document.view_mapping orelse return error.TestUnexpectedResult;

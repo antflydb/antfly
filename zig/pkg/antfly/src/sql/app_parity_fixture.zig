@@ -149,6 +149,7 @@ pub fn validateAppParityFixtureMetadataWithBaseSchema(
     };
     defer parsed_sql.deinit(alloc);
     try corpus.validateFixtureMetadataCoreParsedSql(entry, &parsed_sql);
+    try corpus.validateNativeEquivalenceSummaryForEntryAlloc(alloc, entry);
     if (!corpus.corpusFixtureSqlParameterCoverageMatchesParsedSql(entry, &parsed_sql)) return error.TestUnexpectedResult;
     var owned_applied_base_schema_json: ?[]u8 = null;
     defer if (owned_applied_base_schema_json) |schema_json| alloc.free(schema_json);
@@ -175,7 +176,7 @@ pub fn validateAppParityFixtureMetadataWithBaseSchema(
     }
     for (entry.catalog_tables) |catalog_table| {
         var catalog_schema_valid = try corpus.fixtureSchemaJsonIsRelationalTableAlloc(alloc, catalog_table.schema_json);
-        if (!catalog_schema_valid and corpus.appParityEntryHasDocumentViewMappingCatalog(entry)) {
+        if (!catalog_schema_valid and corpus.appParityEntryHasDocumentCatalog(entry)) {
             catalog_schema_valid = try corpus.fixtureSchemaJsonIsDocumentTableAlloc(alloc, catalog_table.schema_json);
         }
         if (!catalog_schema_valid) {

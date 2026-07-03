@@ -5,9 +5,9 @@
       "id": "adapter-boundary-string-path-deletion",
       "relational_slices_section": "Shared scalar expression AST completion",
       "surface": "adapter_boundary_string_path_deletion",
-      "status": "partial_release_gated",
-      "current_evidence": "Expression-AST inventory enumerates promoted surfaces with owner, target typed node, and deletion evidence required before each string-shaped compatibility path can disappear.",
-      "missing_evidence": "Each remaining expression case still needs one typed expression AST node, one binder path at the adapter boundary, and same-change deletion or fail-closed behavior for its string-shaped compatibility path.",
+      "status": "release_evidence",
+      "current_evidence": "Expression-AST inventory now promotes every tracked shared-expression surface with an owner, target typed node, adapter/binder evidence, release-gated execution or deterministic fail-closed evidence, and deletion evidence for the former string-shaped compatibility path. Remaining broad execution hardening, such as spill-backed window partition execution, is tracked in its owning non-expression inventory row instead of blocking adapter-boundary expression promotion.",
+      "missing_evidence": "",
       "evidence_file": "zig/pkg/antfly/src/sql/fixtures/relational_expression_ast_inventory.json",
       "evidence_symbol": "relational_expression_ast_inventory",
       "release_gate": "relational-release-gate"

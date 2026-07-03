@@ -774,6 +774,7 @@ pub const LoweredDocumentSourceInsert = struct {
     source_limit: ?u32 = null,
     target_id_mode: DocumentSourceInsertTargetIdMode = .source_identity,
     assignments: []DocumentSourceInsertAssignment = &.{},
+    conflict_write: ?LoweredDocumentConflictWrite = null,
     returning_fields: []DocumentWriteReturningField = &.{},
     sync_level: db_mod.types.SyncLevel = .write,
 
@@ -783,6 +784,7 @@ pub const LoweredDocumentSourceInsert = struct {
         self.source_producer.deinit(alloc);
         for (self.assignments) |*assignment| assignment.deinit(alloc);
         if (self.assignments.len > 0) alloc.free(self.assignments);
+        if (self.conflict_write) |*conflict| conflict.deinit(alloc);
         for (self.returning_fields) |*field| field.deinit(alloc);
         if (self.returning_fields.len > 0) alloc.free(self.returning_fields);
         self.* = undefined;
@@ -881,11 +883,14 @@ pub const DocumentMergeMatchedArm = struct {
 pub const DocumentMergeNotMatchedArm = struct {
     predicates: []const MergeArmPredicate = &.{},
     insert_source_document: bool = false,
+    insert_assignments: []DocumentSourceInsertAssignment = &.{},
     do_nothing: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         freeMergeArmPredicateValues(alloc, self.predicates);
         if (self.predicates.len > 0) alloc.free(self.predicates);
+        for (self.insert_assignments) |*assignment| assignment.deinit(alloc);
+        if (self.insert_assignments.len > 0) alloc.free(self.insert_assignments);
         self.* = undefined;
     }
 };
@@ -900,6 +905,7 @@ pub const LoweredDocumentMergeMutation = struct {
     not_matched_arms: []DocumentMergeNotMatchedArm = &.{},
     max_target_rows: ?u32 = null,
     max_source_rows: ?u32 = null,
+    returning_fields: []DocumentWriteReturningField = &.{},
     sync_level: db_mod.types.SyncLevel = .write,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -913,6 +919,8 @@ pub const LoweredDocumentMergeMutation = struct {
         if (self.matched_arms.len > 0) alloc.free(self.matched_arms);
         for (self.not_matched_arms) |*arm| arm.deinit(alloc);
         if (self.not_matched_arms.len > 0) alloc.free(self.not_matched_arms);
+        for (self.returning_fields) |*field| field.deinit(alloc);
+        if (self.returning_fields.len > 0) alloc.free(self.returning_fields);
         self.* = undefined;
     }
 };

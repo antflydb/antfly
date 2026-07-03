@@ -841,11 +841,74 @@
       }
     },
     {
-      "name": "document projection source insert on conflict stays unsupported",
+      "name": "document projection source insert on conflict do nothing lowers to source conflict insert",
       "schema": "write_rich",
       "sql": "INSERT INTO docs (_id, title) SELECT _id, title FROM docs WHERE _id = 'doc:a' ON CONFLICT (_id) DO NOTHING",
       "expected": {
-        "expected_error": "DocumentSqlWriteUnsupported"
+        "plan": "document_source_insert",
+        "table_name": "docs",
+        "source_producer": "id_lookup",
+        "source_assignments": 2,
+        "action": "nothing"
+      }
+    },
+    {
+      "name": "document projection source insert on conflict do update lowers to source conflict insert",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title, status) SELECT _id, title, status FROM docs WHERE _id = 'doc:a' ON CONFLICT (_id) DO UPDATE SET title = excluded.title, status = 'source-conflict'",
+      "expected": {
+        "plan": "document_source_insert",
+        "table_name": "docs",
+        "source_producer": "id_lookup",
+        "source_assignments": 3,
+        "action": "update",
+        "ops": 1,
+        "conflict_source_assignments": 1
+      }
+    },
+    {
+      "name": "document projection source insert on conflict guarded update lowers to source conflict insert",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title, status) SELECT _id, title, status FROM docs WHERE status = 'draft' LIMIT 1 ON CONFLICT (_id) DO UPDATE SET title = excluded.title WHERE excluded.status = 'draft' RETURNING _id, title",
+      "expected": {
+        "plan": "document_source_insert",
+        "table_name": "docs",
+        "source_producer": "indexed_query",
+        "source_assignments": 3,
+        "source_limit": 1,
+        "action": "update",
+        "conflict_source_assignments": 1,
+        "where_expression": 1,
+        "returning": 2,
+        "max_candidate_rows": 10000,
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"draft\"}}"
+      }
+    },
+    {
+      "name": "document projection source insert on unique conflict target lowers to source conflict insert",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (_id, title, status) SELECT _id, title, status FROM docs WHERE _id = 'doc:a' ON CONFLICT (status) DO UPDATE SET title = excluded.title",
+      "expected": {
+        "plan": "document_source_insert",
+        "table_name": "docs",
+        "source_producer": "id_lookup",
+        "source_assignments": 3,
+        "action": "update",
+        "conflict_source_assignments": 1
+      }
+    },
+    {
+      "name": "document projection generated source insert on conflict lowers to source conflict insert",
+      "schema": "write_rich",
+      "sql": "INSERT INTO docs (title) SELECT title FROM docs WHERE _id = 'doc:a' ON CONFLICT (_id) DO NOTHING RETURNING _id, title",
+      "expected": {
+        "plan": "document_source_insert",
+        "table_name": "docs",
+        "source_producer": "id_lookup",
+        "source_assignments": 1,
+        "generated_target_id": true,
+        "action": "nothing",
+        "returning": 2
       }
     },
     {
@@ -957,6 +1020,39 @@
       }
     },
     {
+      "name": "document merge projection not matched insert lowers to bounded native producer",
+      "schema": "write_rich",
+      "sql": "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN NOT MATCHED THEN INSERT (_id, title, status) VALUES (source._id, source.title, source.status)",
+      "expected": {
+        "plan": "document_merge_mutation",
+        "table_name": "docs",
+        "target_producer": "bounded_scan",
+        "source_producer": "bounded_scan",
+        "join_keys": 1,
+        "matched_arms": 0,
+        "not_matched_arms": 1,
+        "merge_insert_assignments": 3,
+        "max_target_rows": 10000,
+        "max_source_rows": 10000
+      }
+    },
+    {
+      "name": "document merge projection not matched insert without id stays unsupported",
+      "schema": "write_rich",
+      "sql": "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN NOT MATCHED THEN INSERT (title, status) VALUES (source.title, source.status)",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "document merge projection not matched generated target stays unsupported",
+      "schema": "write_rich",
+      "sql": "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN NOT MATCHED THEN INSERT (_id, status_lower) VALUES (source._id, source.status)",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
       "name": "document merge branch predicate lowers to bounded native producer",
       "schema": "write_rich",
       "sql": "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN MATCHED AND source.status = 'ready' THEN UPDATE SET title = source.title WHEN MATCHED THEN DO NOTHING",
@@ -991,11 +1087,20 @@
       }
     },
     {
-      "name": "document merge returning waits for native producer contract",
+      "name": "document merge returning lowers to bounded native producer",
       "schema": "write_rich",
-      "sql": "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN MATCHED THEN DELETE RETURNING docs._id",
+      "sql": "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN MATCHED THEN DELETE RETURNING _id, _doc, _version",
       "expected": {
-        "expected_error": "DocumentSqlWriteUnsupported"
+        "plan": "document_merge_mutation",
+        "table_name": "docs",
+        "target_producer": "bounded_scan",
+        "source_producer": "bounded_scan",
+        "join_keys": 1,
+        "matched_arms": 1,
+        "not_matched_arms": 0,
+        "returning": 3,
+        "max_target_rows": 10000,
+        "max_source_rows": 10000
       }
     },
     {
@@ -2467,16 +2572,275 @@
       }
     },
     {
-      "name": "view-mapped scalar predicate without indexed path lowers to bounded residual scan",
+      "name": "explicit unnest bare alias over indexed array lowers to indexed array element producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"tags_array_element\":{\"type\":\"array_element\",\"path\":\"tags\"}}",
+      "sql": "SELECT d._id, tag_value FROM docs AS d, UNNEST(d.tags) tag_value WHERE tag_value = 'urgent' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"term\"",
+          "\"/tags\"",
+          "\"urgent\""
+        ]
+      }
+    },
+    {
+      "name": "explicit unnest non equality predicate over indexed array lowers to indexed array element producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"tags_array_element\":{\"type\":\"array_element\",\"path\":\"tags\"}}",
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag <> 'urgent' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"disjuncts\"",
+          "\"term_range\"",
+          "\"/tags\"",
+          "\"max\":\"urgent\"",
+          "\"min\":\"urgent\""
+        ]
+      }
+    },
+    {
+      "name": "explicit unnest range predicate over indexed array lowers to indexed array element producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"tags_array_element\":{\"type\":\"array_element\",\"path\":\"tags\"}}",
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag > 'm' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"term_range\"",
+          "\"/tags\"",
+          "\"m\"",
+          "\"inclusive_min\":false"
+        ]
+      }
+    },
+    {
+      "name": "explicit unnest pattern predicate over indexed array lowers to indexed array element producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"tags_array_element\":{\"type\":\"array_element\",\"path\":\"tags\"}}",
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag LIKE 'v%' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"prefix\"",
+          "\"/tags\"",
+          "\"v\""
+        ]
+      }
+    },
+    {
+      "name": "explicit unnest case-insensitive pattern predicate over indexed array lowers to indexed array element producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"tags_array_element\":{\"type\":\"array_element\",\"path\":\"tags\"}}",
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag ILIKE 'u%' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"disjuncts\"",
+          "\"prefix\"",
+          "\"/tags\"",
+          "\"u\"",
+          "\"U\""
+        ]
+      }
+    },
+    {
+      "name": "explicit unnest case-insensitive pattern predicate with too many variants remains unsupported",
+      "schema": "array_ready",
+      "indexes_json": "{\"tags_array_element\":{\"type\":\"array_element\",\"path\":\"tags\"}}",
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag ILIKE 'abcdefg%' LIMIT 10",
+      "expected": {
+        "expected_error": "DocumentSqlUnnestUnsupported"
+      }
+    },
+    {
+      "name": "explicit unnest null predicate over indexed array lowers to indexed array element producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"tags_array_element\":{\"type\":\"array_element\",\"path\":\"tags\"}}",
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag IS NULL LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"array_any\"",
+          "\"/tags\"",
+          "null"
+        ]
+      }
+    },
+    {
+      "name": "explicit unnest not null predicate over indexed array lowers to indexed array element producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"tags_array_element\":{\"type\":\"array_element\",\"path\":\"tags\"}}",
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag IS NOT NULL LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"term_range\"",
+          "\"/tags\"",
+          "\"min\":\"\"",
+          "\"inclusive_min\":true"
+        ]
+      }
+    },
+    {
+      "name": "explicit unnest compound non equality predicate over indexed array lowers to indexed array element producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"tags_array_element\":{\"type\":\"array_element\",\"path\":\"tags\"}}",
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag = 'urgent' AND tag <> 'stale' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"array_any\"",
+          "\"/tags\"",
+          "\"urgent\""
+        ]
+      }
+    },
+    {
+      "name": "explicit multiple unnest cartesian expansion remains unsupported",
+      "schema": "array_ready",
+      "sql": "SELECT d._id, tag, label FROM docs AS d, UNNEST(d.tags) AS tag, UNNEST(d.labels) AS label LIMIT 10",
+      "expected": {
+        "expected_error": "DocumentSqlUnnestUnsupported"
+      }
+    },
+    {
+      "name": "explicit nested unnest remains unsupported",
+      "schema": "array_ready",
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(UNNEST(d.tags)) AS tag LIMIT 10",
+      "expected": {
+        "expected_error": "DocumentSqlUnnestUnsupported"
+      }
+    },
+    {
+      "name": "explicit multi argument unnest remains unsupported",
+      "schema": "array_ready",
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags, d.labels) AS tag LIMIT 10",
+      "expected": {
+        "expected_error": "DocumentSqlUnnestUnsupported"
+      }
+    },
+    {
+      "name": "explicit unnest over non array rejects during binding",
+      "schema": "array_ready",
+      "sql": "SELECT d._id, title FROM docs AS d, UNNEST(d.title) AS title LIMIT 10",
+      "expected": {
+        "expected_error": "DocumentSqlUnnestRequiresArray"
+      }
+    },
+    {
+      "name": "view-mapped unnest range predicate over indexed array lowers to indexed array element producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"tags_array\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"tags_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag > 'm' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"term_range\"",
+          "\"/tags\"",
+          "\"m\"",
+          "\"inclusive_min\":false"
+        ]
+      }
+    },
+    {
+      "name": "view-mapped unnest pattern predicate over indexed array lowers to indexed array element producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"tags_array\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"tags_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag LIKE 'v%' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"prefix\"",
+          "\"/tags\"",
+          "\"v\""
+        ]
+      }
+    },
+    {
+      "name": "view-mapped unnest case-insensitive pattern predicate over indexed array lowers to indexed array element producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"tags_array\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"tags_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag ILIKE 'u%' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"disjuncts\"",
+          "\"prefix\"",
+          "\"/tags\"",
+          "\"u\"",
+          "\"U\""
+        ]
+      }
+    },
+    {
+      "name": "view-mapped unnest null predicate over indexed array lowers to indexed array element producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"tags_array\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"tags_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag IS NULL LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"array_any\"",
+          "\"/tags\"",
+          "null"
+        ]
+      }
+    },
+    {
+      "name": "view-mapped unnest not null predicate over indexed array lowers to indexed array element producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"tags_array\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"tags_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag IS NOT NULL LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"term_range\"",
+          "\"/tags\"",
+          "\"min\":\"\"",
+          "\"inclusive_min\":true"
+        ]
+      }
+    },
+    {
+      "name": "view-mapped unnest non equality predicate over indexed array lowers to indexed array element producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"tags_array\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"tags_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag <> 'urgent' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"disjuncts\"",
+          "\"term_range\"",
+          "\"/tags\"",
+          "\"max\":\"urgent\"",
+          "\"min\":\"urgent\""
+        ]
+      }
+    },
+    {
+      "name": "view-mapped unnest compound non equality predicate over indexed array lowers to indexed array element producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"tags_array\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"tags_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' AND tag <> 'stale' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"array_any\"",
+          "\"/tags\"",
+          "\"urgent\""
+        ]
+      }
+    },
+    {
+      "name": "view-mapped scalar predicate without indexed path requires exact producer",
       "schema": "text_only",
       "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}",
-      "sql": "SELECT _id, plan FROM docs WHERE plan = 'pro' LIMIT 10",
+      "sql": "SELECT _id, plan FROM support_view WHERE plan = 'pro' LIMIT 10",
       "expected": {
-        "producer": "bounded_scan",
-        "residual_filter_contains": [
-          "\"/metadata/plan\"",
-          "\"pro\""
-        ]
+        "expected_error": "DocumentSqlBoundedScanMissingExactProducer"
       }
     },
     {
@@ -2490,6 +2854,62 @@
           "\"term\"",
           "\"/metadata/plan\"",
           "\"pro\""
+        ]
+      }
+    },
+    {
+      "name": "view-mapped explicit text field predicate lowers to indexed filter",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"mapped_fields_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"title_text\",\"path\":\"title\",\"type\":\"text\"}]}},\"mapped_fields_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"title\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT _id, title_text FROM support_view WHERE title_text = 'alpha' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"term\"",
+          "\"/title\"",
+          "\"alpha\""
+        ]
+      }
+    },
+    {
+      "name": "view-mapped boolean field predicate lowers to indexed filter",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"mapped_fields_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"published\",\"path\":\"published\",\"type\":\"boolean\",\"nullable\":true}]}},\"mapped_fields_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"published\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT _id, published FROM support_view WHERE published IS TRUE LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"term\"",
+          "\"/published\"",
+          "true"
+        ]
+      }
+    },
+    {
+      "name": "view-mapped optional nested field null predicate lowers to indexed filter",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"mapped_fields_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"region\",\"path\":\"metadata.region\",\"type\":\"keyword\",\"nullable\":true}]}},\"mapped_fields_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.region\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT _id, region FROM support_view WHERE region IS NULL LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"/metadata/region\"",
+          "\"exists\"",
+          "null"
+        ]
+      }
+    },
+    {
+      "name": "view-mapped multi-field projection over nested fields lowers to indexed filter",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"mapped_fields_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"title_text\",\"path\":\"title\",\"type\":\"text\"},{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\",\"nullable\":true},{\"name\":\"region\",\"path\":\"metadata.region\",\"type\":\"keyword\",\"nullable\":true},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\",\"nullable\":true},{\"name\":\"published\",\"path\":\"published\",\"type\":\"boolean\",\"nullable\":true}]}},\"mapped_fields_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"title\",\"metadata.plan\",\"metadata.region\",\"metrics.score\",\"published\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT _id, title_text, plan, score, published, region FROM support_view WHERE region = 'west' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"term\"",
+          "\"/metadata/region\"",
+          "\"west\""
         ]
       }
     },

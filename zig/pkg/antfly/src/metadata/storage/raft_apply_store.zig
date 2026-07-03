@@ -161,6 +161,10 @@ pub const TransitionCommand = union(enum) {
     begin_schema_rewrite_job: metadata_table_manager.SchemaRewriteJobBeginRequest,
     finish_schema_rewrite_job: metadata_table_manager.SchemaRewriteJobFinishRequest,
     invalidate_schema_rewrite_job: metadata_table_manager.SchemaRewriteJobInvalidateRequest,
+    pause_schema_rewrite_job: metadata_table_manager.SchemaRewriteJobControlRequest,
+    resume_schema_rewrite_job: metadata_table_manager.SchemaRewriteJobControlRequest,
+    retry_schema_rewrite_job: metadata_table_manager.SchemaRewriteJobControlRequest,
+    cancel_schema_rewrite_job: metadata_table_manager.SchemaRewriteJobControlRequest,
     upsert_table_emptying_job: metadata.TableEmptyingJobRecord,
     remove_table_emptying_job: struct {
         job_id: u64,
@@ -168,6 +172,10 @@ pub const TransitionCommand = union(enum) {
     begin_table_emptying_job: metadata_table_manager.TableEmptyingJobBeginRequest,
     finish_table_emptying_job: metadata_table_manager.TableEmptyingJobFinishRequest,
     invalidate_table_emptying_job: metadata_table_manager.TableEmptyingJobInvalidateRequest,
+    pause_table_emptying_job: metadata_table_manager.TableEmptyingJobControlRequest,
+    resume_table_emptying_job: metadata_table_manager.TableEmptyingJobControlRequest,
+    retry_table_emptying_job: metadata_table_manager.TableEmptyingJobControlRequest,
+    cancel_table_emptying_job: metadata_table_manager.TableEmptyingJobControlRequest,
     promote_table_emptying_barrier: metadata_table_manager.TableEmptyingBarrierPromotionRequest,
     promote_secondary_index_ready: metadata_table_manager.SecondaryIndexReadyPromotionRequest,
     compare_and_swap_table_schema: metadata_table_manager.TableSchemaCompareAndSwapRequest,
@@ -315,6 +323,9 @@ pub const TransitionCommand = union(enum) {
             .invalidate_schema_rewrite_job => |*request| {
                 freeSchemaRewriteJobInvalidateRequest(alloc, request.*);
             },
+            .pause_schema_rewrite_job, .resume_schema_rewrite_job, .retry_schema_rewrite_job, .cancel_schema_rewrite_job => |*request| {
+                freeSchemaRewriteJobControlRequest(alloc, request.*);
+            },
             .upsert_table_emptying_job => |*record| {
                 metadata_table_manager.freeTableEmptyingJob(alloc, record.*);
             },
@@ -326,6 +337,9 @@ pub const TransitionCommand = union(enum) {
             },
             .invalidate_table_emptying_job => |*request| {
                 freeTableEmptyingJobInvalidateRequest(alloc, request.*);
+            },
+            .pause_table_emptying_job, .resume_table_emptying_job, .retry_table_emptying_job, .cancel_table_emptying_job => |*request| {
+                freeTableEmptyingJobControlRequest(alloc, request.*);
             },
             .promote_table_emptying_barrier => |*request| {
                 freeTableEmptyingBarrierPromotionRequest(alloc, request.*);
@@ -2015,6 +2029,18 @@ pub const RaftApplyStore = struct {
             .invalidate_schema_rewrite_job => |request| {
                 try self.applySchemaRewriteJobInvalidateTxn(txn, group_id, request);
             },
+            .pause_schema_rewrite_job => |request| {
+                try self.applySchemaRewriteJobPauseTxn(txn, group_id, request);
+            },
+            .resume_schema_rewrite_job => |request| {
+                try self.applySchemaRewriteJobResumeTxn(txn, group_id, request);
+            },
+            .retry_schema_rewrite_job => |request| {
+                try self.applySchemaRewriteJobRetryTxn(txn, group_id, request);
+            },
+            .cancel_schema_rewrite_job => |request| {
+                try self.applySchemaRewriteJobCancelTxn(txn, group_id, request);
+            },
             .upsert_table_emptying_job => |record| {
                 try self.putTableEmptyingJobTxn(txn, group_id, record);
             },
@@ -2029,6 +2055,18 @@ pub const RaftApplyStore = struct {
             },
             .invalidate_table_emptying_job => |request| {
                 try self.applyTableEmptyingJobInvalidateTxn(txn, group_id, request);
+            },
+            .pause_table_emptying_job => |request| {
+                try self.applyTableEmptyingJobPauseTxn(txn, group_id, request);
+            },
+            .resume_table_emptying_job => |request| {
+                try self.applyTableEmptyingJobResumeTxn(txn, group_id, request);
+            },
+            .retry_table_emptying_job => |request| {
+                try self.applyTableEmptyingJobRetryTxn(txn, group_id, request);
+            },
+            .cancel_table_emptying_job => |request| {
+                try self.applyTableEmptyingJobCancelTxn(txn, group_id, request);
             },
             .promote_table_emptying_barrier => |request| {
                 try self.applyTableEmptyingBarrierPromotionTxn(txn, group_id, request);
@@ -3405,6 +3443,75 @@ pub const RaftApplyStore = struct {
         try self.putSchemaRewriteJobTxn(txn, group_id, record);
     }
 
+    fn applySchemaRewriteJobPauseTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.SchemaRewriteJobControlRequest,
+    ) !void {
+        var record = (try self.loadSchemaRewriteJobTxn(txn, group_id, request.job_id)) orelse return error.UnknownSchemaRewriteJob;
+        defer metadata_table_manager.freeSchemaRewriteJob(self.alloc, record);
+        if (!std.mem.eql(u8, record.state, metadata_table_manager.schema_rewrite_declared) and
+            !std.mem.eql(u8, record.state, metadata_table_manager.schema_rewrite_running))
+        {
+            return error.SchemaRewriteJobNotDeclared;
+        }
+        try replaceOwnedString(self.alloc, &record.state, metadata_table_manager.schema_rewrite_paused);
+        try replaceOwnedString(self.alloc, &record.lease_owner, "");
+        record.lease_expires_at_ms = 0;
+        try replaceOwnedString(self.alloc, &record.last_error, request.reason);
+        try self.putSchemaRewriteJobTxn(txn, group_id, record);
+    }
+
+    fn applySchemaRewriteJobResumeTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.SchemaRewriteJobControlRequest,
+    ) !void {
+        var record = (try self.loadSchemaRewriteJobTxn(txn, group_id, request.job_id)) orelse return error.UnknownSchemaRewriteJob;
+        defer metadata_table_manager.freeSchemaRewriteJob(self.alloc, record);
+        if (!std.mem.eql(u8, record.state, metadata_table_manager.schema_rewrite_paused)) return error.SchemaRewriteJobNotPaused;
+        try replaceOwnedString(self.alloc, &record.state, metadata_table_manager.schema_rewrite_declared);
+        try replaceOwnedString(self.alloc, &record.lease_owner, "");
+        record.lease_expires_at_ms = 0;
+        try replaceOwnedString(self.alloc, &record.last_error, request.reason);
+        try self.putSchemaRewriteJobTxn(txn, group_id, record);
+    }
+
+    fn applySchemaRewriteJobRetryTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.SchemaRewriteJobControlRequest,
+    ) !void {
+        var record = (try self.loadSchemaRewriteJobTxn(txn, group_id, request.job_id)) orelse return error.UnknownSchemaRewriteJob;
+        defer metadata_table_manager.freeSchemaRewriteJob(self.alloc, record);
+        if (!std.mem.eql(u8, record.state, metadata_table_manager.schema_rewrite_invalid)) return error.SchemaRewriteJobNotInvalid;
+        try replaceOwnedString(self.alloc, &record.state, metadata_table_manager.schema_rewrite_declared);
+        try replaceOwnedString(self.alloc, &record.lease_owner, "");
+        record.lease_expires_at_ms = 0;
+        try replaceOwnedString(self.alloc, &record.last_error, request.reason);
+        try self.putSchemaRewriteJobTxn(txn, group_id, record);
+    }
+
+    fn applySchemaRewriteJobCancelTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.SchemaRewriteJobControlRequest,
+    ) !void {
+        var record = (try self.loadSchemaRewriteJobTxn(txn, group_id, request.job_id)) orelse return error.UnknownSchemaRewriteJob;
+        defer metadata_table_manager.freeSchemaRewriteJob(self.alloc, record);
+        if (std.mem.eql(u8, record.state, metadata_table_manager.schema_rewrite_ready)) return error.SchemaRewriteJobComplete;
+        if (std.mem.eql(u8, record.state, metadata_table_manager.schema_rewrite_canceled)) return error.SchemaRewriteJobCanceled;
+        try replaceOwnedString(self.alloc, &record.state, metadata_table_manager.schema_rewrite_canceled);
+        try replaceOwnedString(self.alloc, &record.lease_owner, "");
+        record.lease_expires_at_ms = 0;
+        try replaceOwnedString(self.alloc, &record.last_error, request.reason);
+        try self.putSchemaRewriteJobTxn(txn, group_id, record);
+    }
+
     fn loadSchemaRewriteJobTxn(
         self: *RaftApplyStore,
         txn: *docstore.DocStore.Txn,
@@ -3516,6 +3623,75 @@ pub const RaftApplyStore = struct {
         try replaceOwnedString(self.alloc, &record.lease_owner, "");
         record.lease_expires_at_ms = 0;
         try replaceOwnedString(self.alloc, &record.last_error, request.last_error);
+        try self.putTableEmptyingJobTxn(txn, group_id, record);
+    }
+
+    fn applyTableEmptyingJobPauseTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.TableEmptyingJobControlRequest,
+    ) !void {
+        var record = (try self.loadTableEmptyingJobTxn(txn, group_id, request.job_id)) orelse return error.UnknownTableEmptyingJob;
+        defer metadata_table_manager.freeTableEmptyingJob(self.alloc, record);
+        if (!std.mem.eql(u8, record.state, metadata_table_manager.table_emptying_declared) and
+            !std.mem.eql(u8, record.state, metadata_table_manager.table_emptying_running))
+        {
+            return error.TableEmptyingJobNotDeclared;
+        }
+        try replaceOwnedString(self.alloc, &record.state, metadata_table_manager.table_emptying_paused);
+        try replaceOwnedString(self.alloc, &record.lease_owner, "");
+        record.lease_expires_at_ms = 0;
+        try replaceOwnedString(self.alloc, &record.last_error, request.reason);
+        try self.putTableEmptyingJobTxn(txn, group_id, record);
+    }
+
+    fn applyTableEmptyingJobResumeTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.TableEmptyingJobControlRequest,
+    ) !void {
+        var record = (try self.loadTableEmptyingJobTxn(txn, group_id, request.job_id)) orelse return error.UnknownTableEmptyingJob;
+        defer metadata_table_manager.freeTableEmptyingJob(self.alloc, record);
+        if (!std.mem.eql(u8, record.state, metadata_table_manager.table_emptying_paused)) return error.TableEmptyingJobNotPaused;
+        try replaceOwnedString(self.alloc, &record.state, metadata_table_manager.table_emptying_declared);
+        try replaceOwnedString(self.alloc, &record.lease_owner, "");
+        record.lease_expires_at_ms = 0;
+        try replaceOwnedString(self.alloc, &record.last_error, request.reason);
+        try self.putTableEmptyingJobTxn(txn, group_id, record);
+    }
+
+    fn applyTableEmptyingJobRetryTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.TableEmptyingJobControlRequest,
+    ) !void {
+        var record = (try self.loadTableEmptyingJobTxn(txn, group_id, request.job_id)) orelse return error.UnknownTableEmptyingJob;
+        defer metadata_table_manager.freeTableEmptyingJob(self.alloc, record);
+        if (!std.mem.eql(u8, record.state, metadata_table_manager.table_emptying_invalid)) return error.TableEmptyingJobNotInvalid;
+        try replaceOwnedString(self.alloc, &record.state, metadata_table_manager.table_emptying_declared);
+        try replaceOwnedString(self.alloc, &record.lease_owner, "");
+        record.lease_expires_at_ms = 0;
+        try replaceOwnedString(self.alloc, &record.last_error, request.reason);
+        try self.putTableEmptyingJobTxn(txn, group_id, record);
+    }
+
+    fn applyTableEmptyingJobCancelTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.TableEmptyingJobControlRequest,
+    ) !void {
+        var record = (try self.loadTableEmptyingJobTxn(txn, group_id, request.job_id)) orelse return error.UnknownTableEmptyingJob;
+        defer metadata_table_manager.freeTableEmptyingJob(self.alloc, record);
+        if (std.mem.eql(u8, record.state, metadata_table_manager.table_emptying_ready)) return error.TableEmptyingJobComplete;
+        if (std.mem.eql(u8, record.state, metadata_table_manager.table_emptying_canceled)) return error.TableEmptyingJobCanceled;
+        try replaceOwnedString(self.alloc, &record.state, metadata_table_manager.table_emptying_canceled);
+        try replaceOwnedString(self.alloc, &record.lease_owner, "");
+        record.lease_expires_at_ms = 0;
+        try replaceOwnedString(self.alloc, &record.last_error, request.reason);
         try self.putTableEmptyingJobTxn(txn, group_id, record);
     }
 
@@ -4114,6 +4290,10 @@ fn freeSchemaRewriteJobInvalidateRequest(alloc: std.mem.Allocator, request: meta
     alloc.free(request.last_error);
 }
 
+fn freeSchemaRewriteJobControlRequest(alloc: std.mem.Allocator, request: metadata_table_manager.SchemaRewriteJobControlRequest) void {
+    alloc.free(request.reason);
+}
+
 fn freeTableCatalogUpdateWithSchemaRewriteJobsRequest(alloc: std.mem.Allocator, request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest) void {
     metadata_table_manager.freeTable(alloc, request.table);
     for (request.schema_rewrite_jobs) |record| metadata_table_manager.freeSchemaRewriteJob(alloc, record);
@@ -4148,6 +4328,10 @@ fn freeTableEmptyingJobFinishRequest(alloc: std.mem.Allocator, request: metadata
 fn freeTableEmptyingJobInvalidateRequest(alloc: std.mem.Allocator, request: metadata_table_manager.TableEmptyingJobInvalidateRequest) void {
     alloc.free(request.lease_owner);
     alloc.free(request.last_error);
+}
+
+fn freeTableEmptyingJobControlRequest(alloc: std.mem.Allocator, request: metadata_table_manager.TableEmptyingJobControlRequest) void {
+    alloc.free(request.reason);
 }
 
 fn freeTableEmptyingBarrierPromotionRequest(alloc: std.mem.Allocator, request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) void {
@@ -4286,6 +4470,14 @@ const TransitionTag = enum(u8) {
     compare_and_swap_sequence = 84,
     apply_table_catalog_batch_update_with_schema_rewrite_jobs = 85,
     apply_table_catalog_drop_with_schema_rewrite_jobs = 86,
+    pause_schema_rewrite_job = 87,
+    resume_schema_rewrite_job = 88,
+    retry_schema_rewrite_job = 89,
+    cancel_schema_rewrite_job = 90,
+    pause_table_emptying_job = 91,
+    resume_table_emptying_job = 92,
+    retry_table_emptying_job = 93,
+    cancel_table_emptying_job = 94,
 };
 
 pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionCommand) ![]u8 {
@@ -4547,6 +4739,22 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try out.append(alloc, @intFromEnum(TransitionTag.invalidate_schema_rewrite_job));
             try appendSchemaRewriteJobInvalidateRequest(alloc, &out, request);
         },
+        .pause_schema_rewrite_job => |request| {
+            try out.append(alloc, @intFromEnum(TransitionTag.pause_schema_rewrite_job));
+            try appendSchemaRewriteJobControlRequest(alloc, &out, request);
+        },
+        .resume_schema_rewrite_job => |request| {
+            try out.append(alloc, @intFromEnum(TransitionTag.resume_schema_rewrite_job));
+            try appendSchemaRewriteJobControlRequest(alloc, &out, request);
+        },
+        .retry_schema_rewrite_job => |request| {
+            try out.append(alloc, @intFromEnum(TransitionTag.retry_schema_rewrite_job));
+            try appendSchemaRewriteJobControlRequest(alloc, &out, request);
+        },
+        .cancel_schema_rewrite_job => |request| {
+            try out.append(alloc, @intFromEnum(TransitionTag.cancel_schema_rewrite_job));
+            try appendSchemaRewriteJobControlRequest(alloc, &out, request);
+        },
         .upsert_table_emptying_job => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.upsert_table_emptying_job));
             try appendTableEmptyingJobRecord(alloc, &out, record);
@@ -4566,6 +4774,22 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .invalidate_table_emptying_job => |request| {
             try out.append(alloc, @intFromEnum(TransitionTag.invalidate_table_emptying_job));
             try appendTableEmptyingJobInvalidateRequest(alloc, &out, request);
+        },
+        .pause_table_emptying_job => |request| {
+            try out.append(alloc, @intFromEnum(TransitionTag.pause_table_emptying_job));
+            try appendTableEmptyingJobControlRequest(alloc, &out, request);
+        },
+        .resume_table_emptying_job => |request| {
+            try out.append(alloc, @intFromEnum(TransitionTag.resume_table_emptying_job));
+            try appendTableEmptyingJobControlRequest(alloc, &out, request);
+        },
+        .retry_table_emptying_job => |request| {
+            try out.append(alloc, @intFromEnum(TransitionTag.retry_table_emptying_job));
+            try appendTableEmptyingJobControlRequest(alloc, &out, request);
+        },
+        .cancel_table_emptying_job => |request| {
+            try out.append(alloc, @intFromEnum(TransitionTag.cancel_table_emptying_job));
+            try appendTableEmptyingJobControlRequest(alloc, &out, request);
         },
         .promote_table_emptying_barrier => |request| {
             try out.append(alloc, @intFromEnum(TransitionTag.promote_table_emptying_barrier));
@@ -4875,6 +5099,18 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         .invalidate_schema_rewrite_job => .{
             .invalidate_schema_rewrite_job = try readSchemaRewriteJobInvalidateRequest(alloc, encoded, &pos),
         },
+        .pause_schema_rewrite_job => .{
+            .pause_schema_rewrite_job = try readSchemaRewriteJobControlRequest(alloc, encoded, &pos),
+        },
+        .resume_schema_rewrite_job => .{
+            .resume_schema_rewrite_job = try readSchemaRewriteJobControlRequest(alloc, encoded, &pos),
+        },
+        .retry_schema_rewrite_job => .{
+            .retry_schema_rewrite_job = try readSchemaRewriteJobControlRequest(alloc, encoded, &pos),
+        },
+        .cancel_schema_rewrite_job => .{
+            .cancel_schema_rewrite_job = try readSchemaRewriteJobControlRequest(alloc, encoded, &pos),
+        },
         .upsert_table_emptying_job => .{
             .upsert_table_emptying_job = try readTableEmptyingJobRecord(alloc, encoded, &pos),
         },
@@ -4889,6 +5125,18 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         },
         .invalidate_table_emptying_job => .{
             .invalidate_table_emptying_job = try readTableEmptyingJobInvalidateRequest(alloc, encoded, &pos),
+        },
+        .pause_table_emptying_job => .{
+            .pause_table_emptying_job = try readTableEmptyingJobControlRequest(alloc, encoded, &pos),
+        },
+        .resume_table_emptying_job => .{
+            .resume_table_emptying_job = try readTableEmptyingJobControlRequest(alloc, encoded, &pos),
+        },
+        .retry_table_emptying_job => .{
+            .retry_table_emptying_job = try readTableEmptyingJobControlRequest(alloc, encoded, &pos),
+        },
+        .cancel_table_emptying_job => .{
+            .cancel_table_emptying_job = try readTableEmptyingJobControlRequest(alloc, encoded, &pos),
         },
         .promote_table_emptying_barrier => .{
             .promote_table_emptying_barrier = try readTableEmptyingBarrierPromotionRequest(alloc, encoded, &pos),
@@ -6496,6 +6744,15 @@ fn appendSchemaRewriteJobInvalidateRequest(
     try appendRequiredString(alloc, out, request.last_error);
 }
 
+fn appendSchemaRewriteJobControlRequest(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    request: metadata_table_manager.SchemaRewriteJobControlRequest,
+) !void {
+    try appendInt(alloc, out, u64, request.job_id);
+    try appendRequiredString(alloc, out, request.reason);
+}
+
 fn appendTableEmptyingJobRecord(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -6553,6 +6810,15 @@ fn appendTableEmptyingJobInvalidateRequest(
     try appendInt(alloc, out, u64, request.job_id);
     try appendRequiredString(alloc, out, request.lease_owner);
     try appendRequiredString(alloc, out, request.last_error);
+}
+
+fn appendTableEmptyingJobControlRequest(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    request: metadata_table_manager.TableEmptyingJobControlRequest,
+) !void {
+    try appendInt(alloc, out, u64, request.job_id);
+    try appendRequiredString(alloc, out, request.reason);
 }
 
 fn appendTableEmptyingBarrierPromotionRequest(
@@ -7690,6 +7956,20 @@ fn readSchemaRewriteJobInvalidateRequest(
     };
 }
 
+fn readSchemaRewriteJobControlRequest(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+) !metadata_table_manager.SchemaRewriteJobControlRequest {
+    const job_id = try readInt(encoded, pos, u64);
+    const reason = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(reason);
+    return .{
+        .job_id = job_id,
+        .reason = reason,
+    };
+}
+
 fn readTableEmptyingJobRecord(
     alloc: std.mem.Allocator,
     encoded: []const u8,
@@ -7800,6 +8080,20 @@ fn readTableEmptyingJobInvalidateRequest(
         .job_id = job_id,
         .lease_owner = lease_owner,
         .last_error = last_error,
+    };
+}
+
+fn readTableEmptyingJobControlRequest(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+) !metadata_table_manager.TableEmptyingJobControlRequest {
+    const job_id = try readInt(encoded, pos, u64);
+    const reason = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(reason);
+    return .{
+        .job_id = job_id,
+        .reason = reason,
     };
 }
 
@@ -9931,6 +10225,221 @@ test "metadata raft apply store rejects malformed table emptying jobs before sto
             .entries_bytes = encoded_entries,
         }));
     }
+}
+
+test "metadata raft apply store persists schema and table emptying operator controls across reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-schema-table-operator-controls", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const orders_table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = .{
+            .table_id = 41,
+            .name = "orders",
+            .schema_json = "{\"type\":\"object\"}",
+        },
+    });
+    defer std.testing.allocator.free(orders_table_cmd);
+    const items_table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = .{
+            .table_id = 42,
+            .name = "order_items",
+            .schema_json = "{\"type\":\"object\"}",
+        },
+    });
+    defer std.testing.allocator.free(items_table_cmd);
+
+    const schema_job_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_schema_rewrite_job = .{
+            .job_id = 9301,
+            .table_id = 41,
+            .group_id = 93001,
+            .schema_generation = 42,
+            .action = "rewrite",
+            .reason = "row_images",
+            .start_row_key = "",
+            .end_row_key = null,
+        },
+    });
+    defer std.testing.allocator.free(schema_job_cmd);
+    const pause_schema_declared_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .pause_schema_rewrite_job = .{ .job_id = 9301, .reason = "operator pause before start" },
+    });
+    defer std.testing.allocator.free(pause_schema_declared_cmd);
+    const resume_schema_declared_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .resume_schema_rewrite_job = .{ .job_id = 9301, .reason = "operator resume before start" },
+    });
+    defer std.testing.allocator.free(resume_schema_declared_cmd);
+    const begin_schema_a_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .begin_schema_rewrite_job = .{
+            .job_id = 9301,
+            .lease_owner = "worker-a",
+            .now_ms = 1000,
+            .lease_expires_at_ms = 2000,
+        },
+    });
+    defer std.testing.allocator.free(begin_schema_a_cmd);
+    const pause_schema_running_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .pause_schema_rewrite_job = .{ .job_id = 9301, .reason = "operator pause during rewrite" },
+    });
+    defer std.testing.allocator.free(pause_schema_running_cmd);
+    const resume_schema_running_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .resume_schema_rewrite_job = .{ .job_id = 9301, .reason = "operator resume after maintenance" },
+    });
+    defer std.testing.allocator.free(resume_schema_running_cmd);
+    const begin_schema_b_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .begin_schema_rewrite_job = .{
+            .job_id = 9301,
+            .lease_owner = "worker-b",
+            .now_ms = 3000,
+            .lease_expires_at_ms = 4000,
+        },
+    });
+    defer std.testing.allocator.free(begin_schema_b_cmd);
+    const invalidate_schema_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .invalidate_schema_rewrite_job = .{
+            .job_id = 9301,
+            .lease_owner = "worker-b",
+            .last_error = "schema generation moved",
+        },
+    });
+    defer std.testing.allocator.free(invalidate_schema_cmd);
+    const retry_schema_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .retry_schema_rewrite_job = .{ .job_id = 9301, .reason = "operator retry after invalidation" },
+    });
+    defer std.testing.allocator.free(retry_schema_cmd);
+    const cancel_schema_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .cancel_schema_rewrite_job = .{ .job_id = 9301, .reason = "operator cancel" },
+    });
+    defer std.testing.allocator.free(cancel_schema_cmd);
+
+    const table_emptying_job_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table_emptying_job = .{
+            .job_id = 9401,
+            .table_id = 41,
+            .group_id = 94001,
+            .schema_generation = 42,
+            .data_generation = 7,
+            .barrier_id = 7007,
+            .affected_table_ids = &.{ 41, 42 },
+            .cascade = true,
+        },
+    });
+    defer std.testing.allocator.free(table_emptying_job_cmd);
+    const pause_emptying_declared_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .pause_table_emptying_job = .{ .job_id = 9401, .reason = "operator pause before delete" },
+    });
+    defer std.testing.allocator.free(pause_emptying_declared_cmd);
+    const resume_emptying_declared_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .resume_table_emptying_job = .{ .job_id = 9401, .reason = "operator resume before delete" },
+    });
+    defer std.testing.allocator.free(resume_emptying_declared_cmd);
+    const begin_emptying_a_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .begin_table_emptying_job = .{
+            .job_id = 9401,
+            .lease_owner = "worker-a",
+            .now_ms = 1000,
+            .lease_expires_at_ms = 2000,
+        },
+    });
+    defer std.testing.allocator.free(begin_emptying_a_cmd);
+    const pause_emptying_running_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .pause_table_emptying_job = .{ .job_id = 9401, .reason = "operator pause during delete" },
+    });
+    defer std.testing.allocator.free(pause_emptying_running_cmd);
+    const resume_emptying_running_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .resume_table_emptying_job = .{ .job_id = 9401, .reason = "operator resume after maintenance" },
+    });
+    defer std.testing.allocator.free(resume_emptying_running_cmd);
+    const begin_emptying_b_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .begin_table_emptying_job = .{
+            .job_id = 9401,
+            .lease_owner = "worker-b",
+            .now_ms = 3000,
+            .lease_expires_at_ms = 4000,
+        },
+    });
+    defer std.testing.allocator.free(begin_emptying_b_cmd);
+    const invalidate_emptying_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .invalidate_table_emptying_job = .{
+            .job_id = 9401,
+            .lease_owner = "worker-b",
+            .last_error = "schema generation moved",
+        },
+    });
+    defer std.testing.allocator.free(invalidate_emptying_cmd);
+    const retry_emptying_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .retry_table_emptying_job = .{ .job_id = 9401, .reason = "operator retry after invalidation" },
+    });
+    defer std.testing.allocator.free(retry_emptying_cmd);
+    const cancel_emptying_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .cancel_table_emptying_job = .{ .job_id = 9401, .reason = "operator cancel" },
+    });
+    defer std.testing.allocator.free(cancel_emptying_cmd);
+
+    const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = orders_table_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = items_table_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = schema_job_cmd },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = pause_schema_declared_cmd },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = resume_schema_declared_cmd },
+        .{ .term = 1, .index = 6, .entry_type = .normal, .data = begin_schema_a_cmd },
+        .{ .term = 1, .index = 7, .entry_type = .normal, .data = pause_schema_running_cmd },
+        .{ .term = 1, .index = 8, .entry_type = .normal, .data = resume_schema_running_cmd },
+        .{ .term = 1, .index = 9, .entry_type = .normal, .data = begin_schema_b_cmd },
+        .{ .term = 1, .index = 10, .entry_type = .normal, .data = invalidate_schema_cmd },
+        .{ .term = 1, .index = 11, .entry_type = .normal, .data = retry_schema_cmd },
+        .{ .term = 1, .index = 12, .entry_type = .normal, .data = cancel_schema_cmd },
+        .{ .term = 1, .index = 13, .entry_type = .normal, .data = table_emptying_job_cmd },
+        .{ .term = 1, .index = 14, .entry_type = .normal, .data = pause_emptying_declared_cmd },
+        .{ .term = 1, .index = 15, .entry_type = .normal, .data = resume_emptying_declared_cmd },
+        .{ .term = 1, .index = 16, .entry_type = .normal, .data = begin_emptying_a_cmd },
+        .{ .term = 1, .index = 17, .entry_type = .normal, .data = pause_emptying_running_cmd },
+        .{ .term = 1, .index = 18, .entry_type = .normal, .data = resume_emptying_running_cmd },
+        .{ .term = 1, .index = 19, .entry_type = .normal, .data = begin_emptying_b_cmd },
+        .{ .term = 1, .index = 20, .entry_type = .normal, .data = invalidate_emptying_cmd },
+        .{ .term = 1, .index = 21, .entry_type = .normal, .data = retry_emptying_cmd },
+        .{ .term = 1, .index = 22, .entry_type = .normal, .data = cancel_emptying_cmd },
+    });
+    defer std.testing.allocator.free(encoded_entries);
+
+    {
+        var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+        defer store.deinit();
+        try store.snapshotBuilder().applyBatch(.{
+            .group_id = 41,
+            .commit_index = 22,
+            .entries_bytes = encoded_entries,
+        });
+    }
+
+    var reopened = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer reopened.deinit();
+
+    const schema_jobs = try reopened.listSchemaRewriteJobs(std.testing.allocator, 41);
+    defer reopened.freeSchemaRewriteJobs(std.testing.allocator, schema_jobs);
+    try std.testing.expectEqual(@as(usize, 1), schema_jobs.len);
+    try std.testing.expectEqual(@as(u64, 9301), schema_jobs[0].job_id);
+    try std.testing.expectEqualStrings(metadata_table_manager.schema_rewrite_canceled, schema_jobs[0].state);
+    try std.testing.expectEqualStrings("", schema_jobs[0].lease_owner);
+    try std.testing.expectEqual(@as(u64, 0), schema_jobs[0].lease_expires_at_ms);
+    try std.testing.expectEqual(@as(u32, 2), schema_jobs[0].attempts);
+    try std.testing.expectEqualStrings("operator cancel", schema_jobs[0].last_error);
+
+    const emptying_jobs = try reopened.listTableEmptyingJobs(std.testing.allocator, 41);
+    defer reopened.freeTableEmptyingJobs(std.testing.allocator, emptying_jobs);
+    try std.testing.expectEqual(@as(usize, 1), emptying_jobs.len);
+    try std.testing.expectEqual(@as(u64, 9401), emptying_jobs[0].job_id);
+    try std.testing.expectEqualStrings(metadata_table_manager.table_emptying_canceled, emptying_jobs[0].state);
+    try std.testing.expectEqualStrings("", emptying_jobs[0].lease_owner);
+    try std.testing.expectEqual(@as(u64, 0), emptying_jobs[0].lease_expires_at_ms);
+    try std.testing.expectEqual(@as(u32, 2), emptying_jobs[0].attempts);
+    try std.testing.expectEqualStrings("operator cancel", emptying_jobs[0].last_error);
+    try std.testing.expectEqual(@as(usize, 2), emptying_jobs[0].affected_table_ids.len);
+    try std.testing.expectEqual(@as(u64, 41), emptying_jobs[0].affected_table_ids[0]);
+    try std.testing.expectEqual(@as(u64, 42), emptying_jobs[0].affected_table_ids[1]);
 }
 
 test "metadata raft apply store promotes table emptying barriers atomically" {

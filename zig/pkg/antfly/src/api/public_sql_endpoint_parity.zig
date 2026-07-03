@@ -385,6 +385,8 @@ test "api public SQL endpoint executes document merge matched branches" {
         public: table_reads.BoundTableReadSource,
         native: table_reads.BoundTableReadSource,
         stale_version_key: ?[]const u8 = null,
+        source_insert_key: []const u8 = "doc:merge-projection-insert",
+        source_insert_json: []const u8 = "{\"title\":\"projected insert title\",\"status\":\"source-only-status\",\"note\":\"source note\"}",
 
         fn source(self: *@This()) table_reads.TableReadSource {
             return .{
@@ -411,6 +413,13 @@ test "api public SQL endpoint executes document merge matched branches" {
             consistency: raft_mod.ReadConsistency,
         ) !?table_reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.eql(u8, table_name, "docs_source")) {
+                if (!std.mem.eql(u8, key, self.source_insert_key)) return null;
+                return .{
+                    .json = try inner_alloc.dupe(u8, self.source_insert_json),
+                    .version = 1,
+                };
+            }
             var response = (try self.route(table_name).lookup(inner_alloc, table_name, key, opts, consistency)) orelse return null;
             if (self.stale_version_key) |stale_key| {
                 if (std.mem.eql(u8, table_name, "docs") and std.mem.eql(u8, key, stale_key)) {
@@ -430,6 +439,9 @@ test "api public SQL endpoint executes document merge matched branches" {
             consistency: raft_mod.ReadConsistency,
         ) !?table_reads.ScanResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.eql(u8, table_name, "docs_source")) {
+                return .{ .ndjson = try inner_alloc.dupe(u8, "{\"key\":\"doc:merge-projection-insert\"}\n") };
+            }
             return try self.route(table_name).scan(inner_alloc, table_name, from_key, to_key, opts, consistency);
         }
 
@@ -452,7 +464,7 @@ test "api public SQL endpoint executes document merge matched branches" {
     var write_source = table_writes.BoundTableWriteSource.init("docs", &db);
 
     const FakeSource = struct {
-        tables: [1]metadata_table_manager.TableRecord,
+        tables: [2]metadata_table_manager.TableRecord,
 
         fn iface(self: *@This()) StatusSource {
             return .{
@@ -504,12 +516,17 @@ test "api public SQL endpoint executes document merge matched branches" {
         }
     };
 
-    var source = FakeSource{ .tables = .{.{
+    var source = FakeSource{ .tables = .{ .{
         .table_id = 1,
         .name = "docs",
         .schema_json = schema_json,
         .desired_replica_count = 1,
-    }} };
+    }, .{
+        .table_id = 2,
+        .name = "docs_source",
+        .schema_json = schema_json,
+        .desired_replica_count = 1,
+    } } };
     var audit = FakePublicSqlAudit{};
     var server = ApiHttpServer.init(alloc, .{ .public_sql_audit_sink = audit.sink() }, source.iface(), read_source.source(), write_source.source());
     defer server.deinit();
@@ -633,6 +650,85 @@ test "api public SQL endpoint executes document merge matched branches" {
     var parsed_conflict = try std.json.parseFromSlice(std.json.Value, alloc, conflict, .{});
     defer parsed_conflict.deinit();
     try std.testing.expectEqualStrings("conflict old", parsed_conflict.value.object.get("note").?.string);
+
+    var merge_projection_insert_resp = try handlePublicSqlEndpoint(
+        &server,
+        alloc,
+        "MERGE INTO docs USING docs_source AS source ON docs.title = source.status WHEN NOT MATCHED THEN INSERT (_id, title, status) VALUES (source._id, source.title, source.status) RETURNING _id, title, status, _doc, _version;",
+    );
+    defer merge_projection_insert_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), merge_projection_insert_resp.status);
+    var merge_projection_insert_parsed = try std.json.parseFromSlice(std.json.Value, alloc, merge_projection_insert_resp.body, .{ .allocate = .alloc_always });
+    defer merge_projection_insert_parsed.deinit();
+    const merge_projection_insert_result = merge_projection_insert_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), merge_projection_insert_result.get("inserted").?.integer);
+    const merge_projection_insert_row = merge_projection_insert_result.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:merge-projection-insert", merge_projection_insert_row.get("_id").?.string);
+    try std.testing.expectEqualStrings("projected insert title", merge_projection_insert_row.get("title").?.string);
+    try std.testing.expectEqualStrings("source-only-status", merge_projection_insert_row.get("status").?.string);
+    try std.testing.expectEqualStrings("projected insert title", merge_projection_insert_row.get("_doc").?.object.get("title").?.string);
+    try std.testing.expectEqual(@as(i64, @intCast(try db.getTimestamp(alloc, "doc:merge-projection-insert"))), merge_projection_insert_row.get("_version").?.integer);
+    try std.testing.expectEqual(@as(usize, 5), audit.record_count);
+    try std.testing.expectEqual(api_http_server.PublicSqlAuditOutcome.applied, audit.records[4].outcome);
+    try std.testing.expectEqual(sql_adapter.SqlWriteStatementKind.merge, audit.records[4].statement_kind);
+    try std.testing.expectEqual(api_http_server.PublicSqlNativeRoute.rows_batch, audit.records[4].native_route);
+    try std.testing.expectEqual(@as(usize, 1), audit.records[4].row_count);
+    try std.testing.expect(audit.records[4].authenticated_subject == null);
+    try std.testing.expect(audit.records[4].error_name == null);
+
+    const projected_insert = (try db.get(alloc, "doc:merge-projection-insert")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(projected_insert);
+    var parsed_projected_insert = try std.json.parseFromSlice(std.json.Value, alloc, projected_insert, .{});
+    defer parsed_projected_insert.deinit();
+    try std.testing.expectEqualStrings("projected insert title", parsed_projected_insert.value.object.get("title").?.string);
+    try std.testing.expectEqualStrings("source-only-status", parsed_projected_insert.value.object.get("status").?.string);
+    try std.testing.expect(parsed_projected_insert.value.object.get("note") == null);
+
+    try db.batch(.{ .writes = &.{
+        .{ .key = "doc:merge-return-update", .value = "{\"title\":\"return update title\",\"note\":\"return old\",\"status\":\"merge-return-update\"}" },
+        .{ .key = "doc:merge-return-delete", .value = "{\"title\":\"return delete title\",\"note\":\"delete return old\",\"status\":\"merge-return-delete\"}" },
+    } });
+    const merge_return_delete_version = try db.getTimestamp(alloc, "doc:merge-return-delete");
+    var merge_return_resp = try handlePublicSqlEndpoint(
+        &server,
+        alloc,
+        "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN MATCHED AND docs.status = 'merge-return-update' THEN UPDATE SET note = source.title WHEN MATCHED AND docs.status = 'merge-return-delete' THEN DELETE WHEN MATCHED THEN DO NOTHING RETURNING _id, note, _doc, _version;",
+    );
+    defer merge_return_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), merge_return_resp.status);
+    var merge_return_parsed = try std.json.parseFromSlice(std.json.Value, alloc, merge_return_resp.body, .{ .allocate = .alloc_always });
+    defer merge_return_parsed.deinit();
+    const merge_return_result = merge_return_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), merge_return_result.get("transformed").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), merge_return_result.get("deleted").?.integer);
+    const merge_return_rows = merge_return_result.get("returning").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), merge_return_rows.len);
+    var saw_merge_return_update = false;
+    var saw_merge_return_delete = false;
+    for (merge_return_rows) |row_value| {
+        const row = row_value.object;
+        const id = row.get("_id").?.string;
+        if (std.mem.eql(u8, id, "doc:merge-return-update")) {
+            saw_merge_return_update = true;
+            try std.testing.expectEqualStrings("return update title", row.get("note").?.string);
+            try std.testing.expectEqualStrings("return update title", row.get("_doc").?.object.get("note").?.string);
+            try std.testing.expectEqual(@as(i64, @intCast(try db.getTimestamp(alloc, "doc:merge-return-update"))), row.get("_version").?.integer);
+        } else if (std.mem.eql(u8, id, "doc:merge-return-delete")) {
+            saw_merge_return_delete = true;
+            try std.testing.expectEqualStrings("delete return old", row.get("note").?.string);
+            try std.testing.expectEqualStrings("delete return old", row.get("_doc").?.object.get("note").?.string);
+            try std.testing.expectEqual(@as(i64, @intCast(merge_return_delete_version)), row.get("_version").?.integer);
+        }
+    }
+    try std.testing.expect(saw_merge_return_update);
+    try std.testing.expect(saw_merge_return_delete);
+    try std.testing.expect((try db.get(alloc, "doc:merge-return-delete")) == null);
+    try std.testing.expectEqual(@as(usize, 6), audit.record_count);
+    try std.testing.expectEqual(api_http_server.PublicSqlAuditOutcome.applied, audit.records[5].outcome);
+    try std.testing.expectEqual(sql_adapter.SqlWriteStatementKind.merge, audit.records[5].statement_kind);
+    try std.testing.expectEqual(api_http_server.PublicSqlNativeRoute.rows_batch, audit.records[5].native_route);
+    try std.testing.expectEqual(@as(usize, 2), audit.records[5].row_count);
+    try std.testing.expect(audit.records[5].error_name == null);
 }
 
 test "api public SQL endpoint executes document joined write parity cases" {
@@ -822,6 +918,11 @@ test "api public SQL endpoint executes document joined write parity cases" {
             .{ .key = "doc:source-duplicate", .value = "{\"title\":\"duplicate source\",\"status\":\"source-duplicate\"}" },
             .{ .key = "doc:source-returning", .value = "{\"title\":\"returning source projection\",\"status\":\"source-returning\"}" },
             .{ .key = "doc:source-generate", .value = "{\"title\":\"generated source projection\",\"status\":\"source-generate\"}" },
+            .{ .key = "doc:source-conflict-noop", .value = "{\"title\":\"source conflict noop\",\"status\":\"noop-status\",\"note\":\"unchanged\"}" },
+            .{ .key = "doc:source-conflict-update", .value = "{\"title\":\"source conflict update\",\"status\":\"source-conflict-note\",\"note\":\"old note\"}" },
+            .{ .key = "doc:source-conflict-guard", .value = "{\"title\":\"source conflict guard\",\"status\":\"guard-status\",\"note\":\"guard old\"}" },
+            .{ .key = "doc:source-conflict-generate", .value = "{\"title\":\"source conflict generated\",\"status\":\"generated-note\"}" },
+            .{ .key = "doc:source-conflict-unique", .value = "{\"title\":\"source conflict unique\",\"status\":\"unique-status\",\"note\":\"unique old\"}" },
         },
         .sync_level = .full_index,
     });
@@ -1009,6 +1110,98 @@ test "api public SQL endpoint executes document joined write parity cases" {
     try std.testing.expect(std.mem.startsWith(u8, generated_bounded_b, "doc:"));
     try std.testing.expectEqual(@as(usize, 36), generated_bounded_a.len);
     try std.testing.expectEqual(@as(usize, 36), generated_bounded_b.len);
+
+    var source_conflict_noop_resp = try handlePublicSqlEndpoint(
+        &server,
+        alloc,
+        "INSERT INTO docs (_id, title, note) SELECT _id, title, status FROM docs WHERE _id = 'doc:source-conflict-noop' ON CONFLICT (_id) DO NOTHING RETURNING _id, title;",
+    );
+    defer source_conflict_noop_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), source_conflict_noop_resp.status);
+    var source_conflict_noop_parsed = try std.json.parseFromSlice(std.json.Value, alloc, source_conflict_noop_resp.body, .{ .allocate = .alloc_always });
+    defer source_conflict_noop_parsed.deinit();
+    try std.testing.expectEqualStrings("insert_source", source_conflict_noop_parsed.value.object.get("statement_kind").?.string);
+    const source_conflict_noop_result = source_conflict_noop_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 0), source_conflict_noop_result.get("inserted").?.integer);
+    try std.testing.expectEqual(@as(usize, 0), source_conflict_noop_result.get("returning").?.array.items.len);
+    const source_conflict_noop_doc = (try db.get(alloc, "doc:source-conflict-noop")) orelse return error.TestExpectedEqual;
+    defer alloc.free(source_conflict_noop_doc);
+    var source_conflict_noop_doc_parsed = try std.json.parseFromSlice(std.json.Value, alloc, source_conflict_noop_doc, .{});
+    defer source_conflict_noop_doc_parsed.deinit();
+    try std.testing.expectEqualStrings("unchanged", source_conflict_noop_doc_parsed.value.object.get("note").?.string);
+
+    var source_conflict_update_resp = try handlePublicSqlEndpoint(
+        &server,
+        alloc,
+        "INSERT INTO docs (_id, title, note) SELECT _id, title, status FROM docs WHERE _id = 'doc:source-conflict-update' ON CONFLICT (_id) DO UPDATE SET title = 'source conflict updated', note = excluded.note RETURNING _id, title, note, _doc, _version;",
+    );
+    defer source_conflict_update_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), source_conflict_update_resp.status);
+    var source_conflict_update_parsed = try std.json.parseFromSlice(std.json.Value, alloc, source_conflict_update_resp.body, .{ .allocate = .alloc_always });
+    defer source_conflict_update_parsed.deinit();
+    const source_conflict_update_result = source_conflict_update_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 0), source_conflict_update_result.get("inserted").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), source_conflict_update_result.get("transformed").?.integer);
+    const source_conflict_update_row = source_conflict_update_result.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:source-conflict-update", source_conflict_update_row.get("_id").?.string);
+    try std.testing.expectEqualStrings("source conflict updated", source_conflict_update_row.get("title").?.string);
+    try std.testing.expectEqualStrings("source-conflict-note", source_conflict_update_row.get("note").?.string);
+    try std.testing.expectEqualStrings("source-conflict-note", source_conflict_update_row.get("_doc").?.object.get("note").?.string);
+    try std.testing.expectEqual(@as(i64, @intCast(try db.getTimestamp(alloc, "doc:source-conflict-update"))), source_conflict_update_row.get("_version").?.integer);
+
+    var source_conflict_guard_resp = try handlePublicSqlEndpoint(
+        &server,
+        alloc,
+        "INSERT INTO docs (_id, title, note) SELECT _id, title, status FROM docs WHERE _id = 'doc:source-conflict-guard' ON CONFLICT (_id) DO UPDATE SET note = excluded.note WHERE excluded.status = 'not-current' RETURNING _id;",
+    );
+    defer source_conflict_guard_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), source_conflict_guard_resp.status);
+    var source_conflict_guard_parsed = try std.json.parseFromSlice(std.json.Value, alloc, source_conflict_guard_resp.body, .{ .allocate = .alloc_always });
+    defer source_conflict_guard_parsed.deinit();
+    const source_conflict_guard_result = source_conflict_guard_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 0), source_conflict_guard_result.get("inserted").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), source_conflict_guard_result.get("transformed").?.integer);
+    try std.testing.expectEqual(@as(usize, 0), source_conflict_guard_result.get("returning").?.array.items.len);
+    const source_conflict_guard_doc = (try db.get(alloc, "doc:source-conflict-guard")) orelse return error.TestExpectedEqual;
+    defer alloc.free(source_conflict_guard_doc);
+    var source_conflict_guard_doc_parsed = try std.json.parseFromSlice(std.json.Value, alloc, source_conflict_guard_doc, .{});
+    defer source_conflict_guard_doc_parsed.deinit();
+    try std.testing.expectEqualStrings("guard old", source_conflict_guard_doc_parsed.value.object.get("note").?.string);
+
+    var source_conflict_generated_resp = try handlePublicSqlEndpoint(
+        &server,
+        alloc,
+        "INSERT INTO docs (title, note) SELECT title, status FROM docs WHERE _id = 'doc:source-conflict-generate' ON CONFLICT (_id) DO NOTHING RETURNING _id, title, note;",
+    );
+    defer source_conflict_generated_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), source_conflict_generated_resp.status);
+    var source_conflict_generated_parsed = try std.json.parseFromSlice(std.json.Value, alloc, source_conflict_generated_resp.body, .{ .allocate = .alloc_always });
+    defer source_conflict_generated_parsed.deinit();
+    const source_conflict_generated_result = source_conflict_generated_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), source_conflict_generated_result.get("inserted").?.integer);
+    const source_conflict_generated_row = source_conflict_generated_result.get("returning").?.array.items[0].object;
+    const source_conflict_generated_id = source_conflict_generated_row.get("_id").?.string;
+    try std.testing.expect(!std.mem.eql(u8, source_conflict_generated_id, "doc:source-conflict-generate"));
+    try std.testing.expect(std.mem.startsWith(u8, source_conflict_generated_id, "doc:"));
+    try std.testing.expectEqual(@as(usize, 36), source_conflict_generated_id.len);
+    try std.testing.expectEqualStrings("source conflict generated", source_conflict_generated_row.get("title").?.string);
+    try std.testing.expectEqualStrings("generated-note", source_conflict_generated_row.get("note").?.string);
+
+    var source_conflict_unique_resp = try handlePublicSqlEndpoint(
+        &server,
+        alloc,
+        "INSERT INTO docs (_id, title, status, note) SELECT _id, title, status, note FROM docs WHERE _id = 'doc:source-conflict-unique' ON CONFLICT (status) DO UPDATE SET note = 'unique conflict updated' RETURNING _id, note;",
+    );
+    defer source_conflict_unique_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), source_conflict_unique_resp.status);
+    var source_conflict_unique_parsed = try std.json.parseFromSlice(std.json.Value, alloc, source_conflict_unique_resp.body, .{ .allocate = .alloc_always });
+    defer source_conflict_unique_parsed.deinit();
+    const source_conflict_unique_result = source_conflict_unique_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 0), source_conflict_unique_result.get("inserted").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), source_conflict_unique_result.get("transformed").?.integer);
+    const source_conflict_unique_row = source_conflict_unique_result.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:source-conflict-unique", source_conflict_unique_row.get("_id").?.string);
+    try std.testing.expectEqualStrings("unique conflict updated", source_conflict_unique_row.get("note").?.string);
 
     try db.batch(.{
         .writes = &.{
@@ -2072,6 +2265,97 @@ test "api public SQL endpoint executes SQL reads through typed row plan ingress"
     try expectPublicSqlDiagnosticMissingNativeModel(alloc, cte_claim_resp.body, "lockable base-row source for materialized CTE row claim");
 }
 
+test "api public SQL endpoint executes expression order keys through typed row plan ingress" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/public-sql-expression-order", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+
+    var read_source = table_reads.BoundTableReadSource.init("usage_records", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var write_source = table_writes.BoundTableWriteSource.init("usage_records", &db);
+
+    const FakeSource = struct {
+        tables: [1]metadata_table_manager.TableRecord,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = self.tables[0..],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = FakeSource{ .tables = .{.{
+        .table_id = 1,
+        .name = "usage_records",
+        .schema_json = schema_json,
+        .desired_replica_count = 1,
+    }} };
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), write_source.source());
+    defer server.deinit();
+
+    var insert_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/usage_records/rows/batch",
+        .content_type = "application/json",
+        .body = "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"u1\",\"status\":\"open\",\"amount\":10}},{\"op\":\"insert\",\"row\":{\"id\":\"u2\",\"status\":\"closed\",\"amount\":90}},{\"op\":\"insert\",\"row\":{\"id\":\"u3\",\"status\":\"open\",\"amount\":20}}]}",
+    });
+    defer insert_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), insert_resp.status);
+
+    var expression_order_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT id, status, amount FROM usage_records ORDER BY lower(status) ASC NULLS LAST, amount DESC LIMIT 3;\"}",
+    });
+    defer expression_order_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), expression_order_resp.status);
+    var parsed_expression_order = try std.json.parseFromSlice(std.json.Value, alloc, expression_order_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_expression_order.deinit();
+    try std.testing.expectEqualStrings("read", parsed_expression_order.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", parsed_expression_order.value.object.get("statement_kind").?.string);
+    const expression_order_result = parsed_expression_order.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 3), expression_order_result.get("total").?.integer);
+    const expression_order_rows = expression_order_result.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), expression_order_rows.len);
+    try std.testing.expectEqualStrings("u2", expression_order_rows[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("u3", expression_order_rows[1].object.get("id").?.string);
+    try std.testing.expectEqualStrings("u1", expression_order_rows[2].object.get("id").?.string);
+}
+
 test "api public SQL endpoint executes domain SQL fixtures through typed row plan parity" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -2266,6 +2550,9 @@ test "api public SQL endpoint executes document SQL reads through typed document
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"status\":\"active\",\"amount\":10,\"note\":null,\"metadata\":{\"plan\":\"pro\"},\"tags\":[\"urgent\",\"vip\"]}" },
             .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"status\":\"archived\",\"amount\":20,\"metadata\":{\"plan\":\"free\"},\"tags\":[\"stale\"]}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"aardvark\",\"status\":\"pending\",\"amount\":30,\"metadata\":{\"plan\":\"trial\"},\"tags\":[]}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"aaa\",\"status\":\"review\",\"amount\":40,\"metadata\":{\"plan\":\"trial\"}}" },
+            .{ .key = "doc:e", .value = "{\"title\":\"aardvark-null\",\"status\":\"archived\",\"amount\":50,\"metadata\":{\"plan\":\"trial\"},\"tags\":[null,\"visible\"]}" },
         },
         .sync_level = .full_index,
     });
@@ -2560,9 +2847,11 @@ test "api public SQL endpoint executes document SQL reads through typed document
     try std.testing.expectEqualStrings("read", null_predicate_parsed.value.object.get("kind").?.string);
     try std.testing.expectEqualStrings("query", null_predicate_parsed.value.object.get("statement_kind").?.string);
     const null_predicate_rows = null_predicate_parsed.value.object.get("result").?.object.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), null_predicate_rows.len);
+    try std.testing.expectEqual(@as(usize, 4), null_predicate_rows.len);
     try std.testing.expectEqualStrings("doc:a", null_predicate_rows[0].object.get("_id").?.string);
     try std.testing.expectEqualStrings("doc:b", null_predicate_rows[1].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("doc:c", null_predicate_rows[2].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("doc:d", null_predicate_rows[3].object.get("_id").?.string);
 
     var not_null_predicate_resp = try server.handle(.{
         .method = .POST,
@@ -2579,9 +2868,11 @@ test "api public SQL endpoint executes document SQL reads through typed document
     try std.testing.expectEqualStrings("read", not_null_predicate_parsed.value.object.get("kind").?.string);
     try std.testing.expectEqualStrings("query", not_null_predicate_parsed.value.object.get("statement_kind").?.string);
     const not_null_predicate_rows = not_null_predicate_parsed.value.object.get("result").?.object.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), not_null_predicate_rows.len);
+    try std.testing.expectEqual(@as(usize, 4), not_null_predicate_rows.len);
     try std.testing.expectEqualStrings("doc:a", not_null_predicate_rows[0].object.get("_id").?.string);
     try std.testing.expectEqualStrings("doc:b", not_null_predicate_rows[1].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("doc:c", not_null_predicate_rows[2].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("doc:d", not_null_predicate_rows[3].object.get("_id").?.string);
 
     var json_path_resp = try server.handle(.{
         .method = .POST,
@@ -2623,6 +2914,54 @@ test "api public SQL endpoint executes document SQL reads through typed document
     try std.testing.expectEqualStrings("doc:a", unnest_row.get("_id").?.string);
     try std.testing.expectEqualStrings("urgent", unnest_row.get("tag").?.string);
 
+    var bare_alias_unnest_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, tag_value FROM docs AS d, UNNEST(d.tags) tag_value WHERE tag_value = 'vip' LIMIT 10;\"}",
+    });
+    defer bare_alias_unnest_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), bare_alias_unnest_resp.status);
+    try std.testing.expectEqualStrings("application/json", bare_alias_unnest_resp.content_type.?);
+
+    var bare_alias_unnest_parsed = try std.json.parseFromSlice(std.json.Value, alloc, bare_alias_unnest_resp.body, .{ .allocate = .alloc_always });
+    defer bare_alias_unnest_parsed.deinit();
+    try std.testing.expectEqualStrings("read", bare_alias_unnest_parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", bare_alias_unnest_parsed.value.object.get("statement_kind").?.string);
+    const bare_alias_unnest_result = bare_alias_unnest_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), bare_alias_unnest_result.get("total").?.integer);
+    const bare_alias_unnest_row = bare_alias_unnest_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", bare_alias_unnest_row.get("_id").?.string);
+    try std.testing.expectEqualStrings("vip", bare_alias_unnest_row.get("tag_value").?.string);
+
+    var empty_array_unnest_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE d._id = 'doc:c' LIMIT 10;\"}",
+    });
+    defer empty_array_unnest_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), empty_array_unnest_resp.status);
+    var empty_array_unnest_parsed = try std.json.parseFromSlice(std.json.Value, alloc, empty_array_unnest_resp.body, .{ .allocate = .alloc_always });
+    defer empty_array_unnest_parsed.deinit();
+    const empty_array_unnest_result = empty_array_unnest_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 0), empty_array_unnest_result.get("total").?.integer);
+    try std.testing.expectEqual(@as(usize, 0), empty_array_unnest_result.get("rows").?.array.items.len);
+
+    var missing_array_unnest_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE d._id = 'doc:d' LIMIT 10;\"}",
+    });
+    defer missing_array_unnest_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), missing_array_unnest_resp.status);
+    var missing_array_unnest_parsed = try std.json.parseFromSlice(std.json.Value, alloc, missing_array_unnest_resp.body, .{ .allocate = .alloc_always });
+    defer missing_array_unnest_parsed.deinit();
+    const missing_array_unnest_result = missing_array_unnest_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 0), missing_array_unnest_result.get("total").?.integer);
+    try std.testing.expectEqual(@as(usize, 0), missing_array_unnest_result.get("rows").?.array.items.len);
+
     var unnest_in_resp = try server.handle(.{
         .method = .POST,
         .uri = "/db/v1/sql",
@@ -2645,6 +2984,141 @@ test "api public SQL endpoint executes document SQL reads through typed document
     try std.testing.expectEqualStrings("urgent", unnest_in_rows[0].object.get("tag").?.string);
     try std.testing.expectEqualStrings("doc:a", unnest_in_rows[1].object.get("_id").?.string);
     try std.testing.expectEqualStrings("vip", unnest_in_rows[1].object.get("tag").?.string);
+
+    var unnest_range_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag > 'u' LIMIT 10;\"}",
+    });
+    defer unnest_range_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), unnest_range_resp.status);
+    var unnest_range_parsed = try std.json.parseFromSlice(std.json.Value, alloc, unnest_range_resp.body, .{ .allocate = .alloc_always });
+    defer unnest_range_parsed.deinit();
+    const unnest_range_result = unnest_range_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 3), unnest_range_result.get("total").?.integer);
+    const unnest_range_rows = unnest_range_result.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), unnest_range_rows.len);
+    try std.testing.expectEqualStrings("doc:a", unnest_range_rows[0].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("urgent", unnest_range_rows[0].object.get("tag").?.string);
+    try std.testing.expectEqualStrings("doc:a", unnest_range_rows[1].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("vip", unnest_range_rows[1].object.get("tag").?.string);
+    try std.testing.expectEqualStrings("doc:e", unnest_range_rows[2].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("visible", unnest_range_rows[2].object.get("tag").?.string);
+
+    var unnest_pattern_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag LIKE 'v%' LIMIT 10;\"}",
+    });
+    defer unnest_pattern_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), unnest_pattern_resp.status);
+    var unnest_pattern_parsed = try std.json.parseFromSlice(std.json.Value, alloc, unnest_pattern_resp.body, .{ .allocate = .alloc_always });
+    defer unnest_pattern_parsed.deinit();
+    const unnest_pattern_result = unnest_pattern_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 2), unnest_pattern_result.get("total").?.integer);
+    const unnest_pattern_rows = unnest_pattern_result.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), unnest_pattern_rows.len);
+    try std.testing.expectEqualStrings("doc:a", unnest_pattern_rows[0].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("vip", unnest_pattern_rows[0].object.get("tag").?.string);
+    try std.testing.expectEqualStrings("doc:e", unnest_pattern_rows[1].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("visible", unnest_pattern_rows[1].object.get("tag").?.string);
+
+    var unnest_ilike_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag ILIKE 'V%' LIMIT 10;\"}",
+    });
+    defer unnest_ilike_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), unnest_ilike_resp.status);
+    var unnest_ilike_parsed = try std.json.parseFromSlice(std.json.Value, alloc, unnest_ilike_resp.body, .{ .allocate = .alloc_always });
+    defer unnest_ilike_parsed.deinit();
+    const unnest_ilike_result = unnest_ilike_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 2), unnest_ilike_result.get("total").?.integer);
+    const unnest_ilike_rows = unnest_ilike_result.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), unnest_ilike_rows.len);
+    try std.testing.expectEqualStrings("doc:a", unnest_ilike_rows[0].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("vip", unnest_ilike_rows[0].object.get("tag").?.string);
+    try std.testing.expectEqualStrings("doc:e", unnest_ilike_rows[1].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("visible", unnest_ilike_rows[1].object.get("tag").?.string);
+
+    var unnest_null_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag IS NULL LIMIT 10;\"}",
+    });
+    defer unnest_null_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), unnest_null_resp.status);
+    var unnest_null_parsed = try std.json.parseFromSlice(std.json.Value, alloc, unnest_null_resp.body, .{ .allocate = .alloc_always });
+    defer unnest_null_parsed.deinit();
+    const unnest_null_result = unnest_null_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), unnest_null_result.get("total").?.integer);
+    const unnest_null_row = unnest_null_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:e", unnest_null_row.get("_id").?.string);
+    try std.testing.expectEqual(std.json.Value.null, unnest_null_row.get("tag").?);
+
+    var unnest_not_null_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag IS NOT NULL LIMIT 10;\"}",
+    });
+    defer unnest_not_null_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), unnest_not_null_resp.status);
+    var unnest_not_null_parsed = try std.json.parseFromSlice(std.json.Value, alloc, unnest_not_null_resp.body, .{ .allocate = .alloc_always });
+    defer unnest_not_null_parsed.deinit();
+    const unnest_not_null_result = unnest_not_null_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 4), unnest_not_null_result.get("total").?.integer);
+    const unnest_not_null_rows = unnest_not_null_result.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 4), unnest_not_null_rows.len);
+    try std.testing.expectEqualStrings("doc:a", unnest_not_null_rows[0].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("urgent", unnest_not_null_rows[0].object.get("tag").?.string);
+    try std.testing.expectEqualStrings("doc:a", unnest_not_null_rows[1].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("vip", unnest_not_null_rows[1].object.get("tag").?.string);
+    try std.testing.expectEqualStrings("doc:b", unnest_not_null_rows[2].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("stale", unnest_not_null_rows[2].object.get("tag").?.string);
+    try std.testing.expectEqualStrings("doc:e", unnest_not_null_rows[3].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("visible", unnest_not_null_rows[3].object.get("tag").?.string);
+
+    var unnest_not_equal_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag <> 'urgent' LIMIT 10;\"}",
+    });
+    defer unnest_not_equal_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), unnest_not_equal_resp.status);
+    var unnest_not_equal_parsed = try std.json.parseFromSlice(std.json.Value, alloc, unnest_not_equal_resp.body, .{ .allocate = .alloc_always });
+    defer unnest_not_equal_parsed.deinit();
+    const unnest_not_equal_result = unnest_not_equal_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 3), unnest_not_equal_result.get("total").?.integer);
+    const unnest_not_equal_rows = unnest_not_equal_result.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), unnest_not_equal_rows.len);
+    try std.testing.expectEqualStrings("doc:a", unnest_not_equal_rows[0].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("vip", unnest_not_equal_rows[0].object.get("tag").?.string);
+    try std.testing.expectEqualStrings("doc:b", unnest_not_equal_rows[1].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("stale", unnest_not_equal_rows[1].object.get("tag").?.string);
+    try std.testing.expectEqualStrings("doc:e", unnest_not_equal_rows[2].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("visible", unnest_not_equal_rows[2].object.get("tag").?.string);
+
+    var unnest_compound_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag = 'urgent' AND tag <> 'stale' LIMIT 10;\"}",
+    });
+    defer unnest_compound_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), unnest_compound_resp.status);
+    var unnest_compound_parsed = try std.json.parseFromSlice(std.json.Value, alloc, unnest_compound_resp.body, .{ .allocate = .alloc_always });
+    defer unnest_compound_parsed.deinit();
+    const unnest_compound_result = unnest_compound_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), unnest_compound_result.get("total").?.integer);
+    const unnest_compound_row = unnest_compound_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", unnest_compound_row.get("_id").?.string);
+    try std.testing.expectEqualStrings("urgent", unnest_compound_row.get("tag").?.string);
 
     var indexed_unnest_resp = try server.handle(.{
         .method = .POST,
@@ -2748,7 +3222,7 @@ test "api public SQL endpoint executes document SQL reads through typed document
     const count_result = count_parsed.value.object.get("result").?.object;
     try std.testing.expectEqual(@as(i64, 1), count_result.get("total_groups").?.integer);
     const count_row = count_result.get("rows").?.array.items[0].object;
-    try std.testing.expectEqual(@as(i64, 2), count_row.get("row_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), count_row.get("row_count").?.integer);
 
     var grouped_count_resp = try server.handle(.{
         .method = .POST,
@@ -2765,13 +3239,17 @@ test "api public SQL endpoint executes document SQL reads through typed document
     try std.testing.expectEqualStrings("read", grouped_count_parsed.value.object.get("kind").?.string);
     try std.testing.expectEqualStrings("aggregate", grouped_count_parsed.value.object.get("statement_kind").?.string);
     const grouped_count_result = grouped_count_parsed.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 2), grouped_count_result.get("total_groups").?.integer);
+    try std.testing.expectEqual(@as(i64, 4), grouped_count_result.get("total_groups").?.integer);
     const grouped_count_rows = grouped_count_result.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), grouped_count_rows.len);
+    try std.testing.expectEqual(@as(usize, 4), grouped_count_rows.len);
     try std.testing.expectEqualStrings("active", grouped_count_rows[0].object.get("status").?.string);
     try std.testing.expectEqual(@as(i64, 1), grouped_count_rows[0].object.get("row_count").?.integer);
     try std.testing.expectEqualStrings("archived", grouped_count_rows[1].object.get("status").?.string);
-    try std.testing.expectEqual(@as(i64, 1), grouped_count_rows[1].object.get("row_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), grouped_count_rows[1].object.get("row_count").?.integer);
+    try std.testing.expectEqualStrings("pending", grouped_count_rows[2].object.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 1), grouped_count_rows[2].object.get("row_count").?.integer);
+    try std.testing.expectEqualStrings("review", grouped_count_rows[3].object.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 1), grouped_count_rows[3].object.get("row_count").?.integer);
 
     var row_filters = try alloc.alloc(usermgr.RowFilterEntry, 1);
     row_filters[0] = try usermgr.RowFilterEntry.initOwned(alloc, "docs", "{\"term\":{\"status\":\"active\"}}");
@@ -2860,6 +3338,23 @@ test "api public SQL endpoint executes document SQL reads through typed document
     defer unsupported_unnest_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), unsupported_unnest_resp.status);
     try expectPublicSqlDiagnosticBody(alloc, unsupported_unnest_resp.body, "plan", "invalid_sql_request", "document_sql_unnest_unsupported", 0, 0);
+
+    const unsupported_unnest_predicates = [_][]const u8{
+        "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag ILIKE 'abcdefg%' LIMIT 10;",
+    };
+    for (unsupported_unnest_predicates) |sql| {
+        const body = try std.fmt.allocPrint(alloc, "{{\"sql\":{f}}}", .{std.json.fmt(sql, .{})});
+        defer alloc.free(body);
+        var unsupported_unnest_predicate_resp = try server.handle(.{
+            .method = .POST,
+            .uri = "/db/v1/sql",
+            .content_type = "application/json",
+            .body = body,
+        });
+        defer unsupported_unnest_predicate_resp.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), unsupported_unnest_predicate_resp.status);
+        try expectPublicSqlDiagnosticBody(alloc, unsupported_unnest_predicate_resp.body, "plan", "invalid_sql_request", "document_sql_unnest_unsupported", 0, 0);
+    }
 
     var join_resp = try server.handle(.{
         .method = .POST,

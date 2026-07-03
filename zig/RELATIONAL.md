@@ -4940,17 +4940,35 @@ scalar/JSON/array expressions, lockable row streams, routed stream composition,
 and parity evidence. Keep this document focused on those contracts. Current
 per-feature status and remaining gaps live in the release-gated SQL and
 relational fixture inventories, which are checked by `relational-release-gate`
-and the SQL parity fixture gates. As of the current inventory, 11 rows still
-carry `gap_tracked`, `missing_native_harness`, or `partial_release_gated`
-status; optimizer expression pushdown, expression-derived rebuild/promotion,
-stale derived-artifact safety, and aggregate expression pushdown capability have
-moved to release evidence because the gate covers typed expression implication
-with fail-closed unsafe cases, generated expression index rebuild/promotion
-through the ordinary secondary-index lifecycle, base-row fallback for incomplete
-indexes, stale rebuild-generation rejection, unvalidated unique-owner rejection
-for upsert selection, unvalidated FK non-enforcement, explicit aggregate
+and the SQL parity fixture gates. As of the current inventory, no status rows
+carry `gap_tracked` or `missing_native_harness`, no routed visibility row is
+left as `gap_tracked`, and 7 rows still carry `partial_release_gated` status.
+Routed live-write pagination is release evidence because paginated routed reads
+prove stable page boundaries after range rescans and fail closed when a live
+write changes scanned range membership before returning a page.
+Adapter-boundary expression deletion,
+optimizer expression pushdown, expression-derived rebuild/promotion, stale
+derived-artifact safety, and aggregate expression pushdown capability have
+moved to release evidence because
+the gate covers promoted expression AST ownership for every tracked shared
+expression surface, typed expression implication with fail-closed unsafe cases,
+generated expression index rebuild/promotion through the ordinary
+secondary-index lifecycle, base-row fallback for incomplete indexes, stale
+rebuild-generation rejection, unvalidated unique-owner rejection for upsert
+selection, unvalidated FK non-enforcement, explicit aggregate
 pushdown/local-evaluation capability classification, and routed stable-scan
-fallback for aggregate expression execution. Durable ordered-composite metadata
+fallback for aggregate expression execution. Structural SQL normalization is
+also release evidence because generated DML lowering now validates token ranges,
+list boundaries, aliases, target/source tables, CTE bodies, read-source bodies,
+conflict targets/actions, returning lists, merge arms, and nested expression
+surfaces against the generated AST before using SQL text, with stale metadata
+tests proving fail-closed behavior across those hooks. Legacy wrapper deletion
+is also release evidence because production ingress now has no migration-blocker
+wrappers: the only remaining wrapper is an explicit read-only bounded document
+query compatibility contract with typed parser, binder, plan, runtime,
+diagnostic, parity, and state-safety evidence recorded in the wrapper
+inventories. Durable
+ordered-composite metadata
 is also release evidence because catalog DDL now proves ordered index element
 clauses, shared index generation, include columns, building lifecycle, stale
 promotion rejection, and ready lifecycle promotion all survive through schema
@@ -5845,8 +5863,12 @@ PostgreSQL-shaped SQL coverage should be divided into three buckets:
 
 Remaining SQL/API parity gaps are tracked in release-gated fixture inventories
 rather than repeated here as prose tables. The current unresolved inventory has
-11 rows; each row names the model surface, current evidence, missing evidence,
-and release gate that must pass before the gap can be removed.
+8 rows; each row names the model surface, current evidence, concrete missing
+evidence, and release gate that must pass before the gap can be removed. The
+remaining rows are production-proof slices: spill-backed window execution,
+concurrent generation isolation, single durable CREATE OR REPLACE and DROP
+CASCADE schema jobs, routed conflict owner movement chaos, insert-source upsert
+owner movement, and CTE spill/resume.
 
 The read-join and bounded-lateral SQL lowerers have separate source-schema
 entrypoints for cross-table planning. The remaining routed-read work is

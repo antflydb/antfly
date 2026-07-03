@@ -847,6 +847,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .insert_columns = insert_columns,
                 .insert_values = insert_values,
                 .realtime_ns = value_mod.currentRealtimeNs(),
+                .default_context = ptr.default_context,
                 .json_set = Accessors.conflictJsonSetSqlValueParserOptions(ptr, insert_columns),
                 .expression_options = .{
                     .type_context = Accessors.rowExpressionTypeContext(ptr),

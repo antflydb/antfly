@@ -127,6 +127,16 @@ pub const TableEmptyingGroupRequest = struct {
     lease_ms: u64 = 60_000,
 };
 
+pub const SchemaJobWorkerAdmissionPolicy = struct {
+    lease_ms: u64 = 60_000,
+    max_work_units: usize = 1,
+    allow_stale_lease_takeover: bool = true,
+
+    pub fn validate(self: @This(), worker_id: []const u8) !void {
+        if (worker_id.len == 0 or self.lease_ms == 0 or self.max_work_units == 0) return error.InvalidSchemaJobWorkerAdmissionPolicy;
+    }
+};
+
 pub fn mergeSecondaryIndexRebuildReport(
     aggregate: *db_mod.relational_store.SecondaryIndexRebuildReport,
     next: db_mod.relational_store.SecondaryIndexRebuildReport,
@@ -389,8 +399,15 @@ pub fn runSecondaryIndexRebuildWorkerPassForCatalog(
 }
 
 pub fn schemaRewriteRecordPending(record: metadata_table_manager.SchemaRewriteJobRecord) bool {
+    return schemaRewriteRecordAdmitted(record, .{});
+}
+
+pub fn schemaRewriteRecordAdmitted(
+    record: metadata_table_manager.SchemaRewriteJobRecord,
+    policy: SchemaJobWorkerAdmissionPolicy,
+) bool {
     return std.mem.eql(u8, record.state, metadata_table_manager.schema_rewrite_declared) or
-        std.mem.eql(u8, record.state, metadata_table_manager.schema_rewrite_running);
+        (policy.allow_stale_lease_takeover and std.mem.eql(u8, record.state, metadata_table_manager.schema_rewrite_running));
 }
 
 pub fn findSchemaRewriteJobById(
@@ -508,7 +525,21 @@ pub fn runSchemaRewriteWorkerPassForCatalog(
     lease_ms: u64,
     max_work_units: usize,
 ) !SchemaRewriteWorkerPassResult {
-    if (worker_id.len == 0 or lease_ms == 0 or max_work_units == 0) return error.InvalidSchemaRewriteJobLease;
+    return try runSchemaRewriteWorkerPassForCatalogWithAdmission(alloc, source, catalog, table_name, worker_id, .{
+        .lease_ms = lease_ms,
+        .max_work_units = max_work_units,
+    });
+}
+
+pub fn runSchemaRewriteWorkerPassForCatalogWithAdmission(
+    alloc: std.mem.Allocator,
+    source: anytype,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    worker_id: []const u8,
+    policy: SchemaJobWorkerAdmissionPolicy,
+) !SchemaRewriteWorkerPassResult {
+    policy.validate(worker_id) catch return error.InvalidSchemaRewriteJobLease;
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return .{};
@@ -519,9 +550,9 @@ pub fn runSchemaRewriteWorkerPassForCatalog(
     var result: SchemaRewriteWorkerPassResult = .{};
     for (snapshot.schema_rewrite_jobs) |record| {
         if (record.table_id != table.table_id) continue;
-        if (!schemaRewriteRecordPending(record)) continue;
+        if (!schemaRewriteRecordAdmitted(record, policy)) continue;
         result.jobs_scanned += 1;
-        if (result.jobs_claimed >= max_work_units) {
+        if (result.jobs_claimed >= policy.max_work_units) {
             result.complete = false;
             continue;
         }
@@ -532,7 +563,7 @@ pub fn runSchemaRewriteWorkerPassForCatalog(
             table_name,
             record,
             worker_id,
-            lease_ms,
+            policy.lease_ms,
         )) orelse {
             result.complete = false;
             continue;
@@ -568,8 +599,15 @@ pub fn runSchemaRewriteWorkerPassForCatalog(
 }
 
 pub fn tableEmptyingRecordPending(record: metadata_table_manager.TableEmptyingJobRecord) bool {
+    return tableEmptyingRecordAdmitted(record, .{});
+}
+
+pub fn tableEmptyingRecordAdmitted(
+    record: metadata_table_manager.TableEmptyingJobRecord,
+    policy: SchemaJobWorkerAdmissionPolicy,
+) bool {
     return std.mem.eql(u8, record.state, metadata_table_manager.table_emptying_declared) or
-        std.mem.eql(u8, record.state, metadata_table_manager.table_emptying_running);
+        (policy.allow_stale_lease_takeover and std.mem.eql(u8, record.state, metadata_table_manager.table_emptying_running));
 }
 
 pub fn findTableEmptyingJobById(
@@ -898,11 +936,25 @@ pub fn runTableEmptyingWorkerPassForCatalog(
     lease_ms: u64,
     max_work_units: usize,
 ) !TableEmptyingWorkerPassResult {
-    if (worker_id.len == 0 or lease_ms == 0 or max_work_units == 0) return error.InvalidTableEmptyingJobLease;
+    return try runTableEmptyingWorkerPassForCatalogWithAdmission(alloc, source, catalog, table_name, worker_id, .{
+        .lease_ms = lease_ms,
+        .max_work_units = max_work_units,
+    });
+}
+
+pub fn runTableEmptyingWorkerPassForCatalogWithAdmission(
+    alloc: std.mem.Allocator,
+    source: anytype,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    worker_id: []const u8,
+    policy: SchemaJobWorkerAdmissionPolicy,
+) !TableEmptyingWorkerPassResult {
+    policy.validate(worker_id) catch return error.InvalidTableEmptyingJobLease;
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return .{};
-    return try runTableEmptyingWorkerPassForSnapshotTable(alloc, source, snapshot.table_emptying_jobs, table.*, worker_id, lease_ms, max_work_units);
+    return try runTableEmptyingWorkerPassForSnapshotTable(alloc, source, snapshot.table_emptying_jobs, table.*, worker_id, policy);
 }
 
 pub fn runTableEmptyingWorkerPassForCatalogTableId(
@@ -915,12 +967,27 @@ pub fn runTableEmptyingWorkerPassForCatalogTableId(
     lease_ms: u64,
     max_work_units: usize,
 ) !TableEmptyingWorkerPassResult {
+    return try runTableEmptyingWorkerPassForCatalogTableIdWithAdmission(alloc, source, catalog, table_id, table_name, worker_id, .{
+        .lease_ms = lease_ms,
+        .max_work_units = max_work_units,
+    });
+}
+
+pub fn runTableEmptyingWorkerPassForCatalogTableIdWithAdmission(
+    alloc: std.mem.Allocator,
+    source: anytype,
+    catalog: table_catalog.CatalogSource,
+    table_id: u64,
+    table_name: []const u8,
+    worker_id: []const u8,
+    policy: SchemaJobWorkerAdmissionPolicy,
+) !TableEmptyingWorkerPassResult {
     _ = table_name;
-    if (worker_id.len == 0 or lease_ms == 0 or max_work_units == 0) return error.InvalidTableEmptyingJobLease;
+    policy.validate(worker_id) catch return error.InvalidTableEmptyingJobLease;
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
     const table = findTableRecordById(&snapshot, table_id) orelse return .{};
-    return try runTableEmptyingWorkerPassForSnapshotTable(alloc, source, snapshot.table_emptying_jobs, table, worker_id, lease_ms, max_work_units);
+    return try runTableEmptyingWorkerPassForSnapshotTable(alloc, source, snapshot.table_emptying_jobs, table, worker_id, policy);
 }
 
 fn runTableEmptyingWorkerPassForSnapshotTable(
@@ -929,8 +996,7 @@ fn runTableEmptyingWorkerPassForSnapshotTable(
     table_emptying_jobs: []const metadata_table_manager.TableEmptyingJobRecord,
     table: metadata_table_manager.TableRecord,
     worker_id: []const u8,
-    lease_ms: u64,
-    max_work_units: usize,
+    policy: SchemaJobWorkerAdmissionPolicy,
 ) !TableEmptyingWorkerPassResult {
     var groups = std.ArrayListUnmanaged(TableEmptyingWorkerResult).empty;
     errdefer {
@@ -941,9 +1007,9 @@ fn runTableEmptyingWorkerPassForSnapshotTable(
     var result: TableEmptyingWorkerPassResult = .{};
     for (table_emptying_jobs) |record| {
         if (record.table_id != table.table_id) continue;
-        if (!tableEmptyingRecordPending(record)) continue;
+        if (!tableEmptyingRecordAdmitted(record, policy)) continue;
         result.jobs_scanned += 1;
-        if (result.jobs_claimed >= max_work_units) {
+        if (result.jobs_claimed >= policy.max_work_units) {
             result.complete = false;
             continue;
         }
@@ -954,7 +1020,7 @@ fn runTableEmptyingWorkerPassForSnapshotTable(
             table.name,
             record,
             worker_id,
-            lease_ms,
+            policy.lease_ms,
         )) orelse {
             result.complete = false;
             continue;
@@ -2951,6 +3017,216 @@ test "schema rewrite worker pass treats unclaimed terminal jobs as terminal" {
     try std.testing.expectEqual(@as(usize, 2), pass.groups.len);
     try std.testing.expect(pass.groups[0].completed);
     try std.testing.expect(pass.groups[1].invalidated);
+}
+
+test "schema job worker admission policy bounds work and stale takeover" {
+    const alloc = std.testing.allocator;
+
+    const Catalog = struct {
+        table: metadata_table_manager.TableRecord = .{
+            .table_id = 77,
+            .name = "events",
+            .placement_role = "data",
+            .indexes_json = "{}",
+            .schema_json = "{}",
+            .data_generation = 4,
+        },
+        schema_jobs: [3]metadata_table_manager.SchemaRewriteJobRecord = .{
+            .{
+                .job_id = 8101,
+                .table_id = 77,
+                .group_id = 9001,
+                .schema_generation = 11,
+                .action = "rewrite",
+                .reason = "row_images",
+                .start_row_key = "",
+            },
+            .{
+                .job_id = 8102,
+                .table_id = 77,
+                .group_id = 9002,
+                .schema_generation = 11,
+                .action = "rewrite",
+                .reason = "row_images",
+                .start_row_key = "",
+                .state = metadata_table_manager.schema_rewrite_running,
+                .lease_owner = "stale-worker",
+                .lease_expires_at_ms = 1,
+            },
+            .{
+                .job_id = 8103,
+                .table_id = 77,
+                .group_id = 9003,
+                .schema_generation = 11,
+                .action = "rewrite",
+                .reason = "row_images",
+                .start_row_key = "",
+            },
+        },
+        emptying_jobs: [3]metadata_table_manager.TableEmptyingJobRecord = .{
+            .{ .job_id = 9101, .table_id = 77, .group_id = 8001, .schema_generation = 11, .data_generation = 4, .affected_table_ids = &.{77} },
+            .{
+                .job_id = 9102,
+                .table_id = 77,
+                .group_id = 8002,
+                .schema_generation = 11,
+                .data_generation = 4,
+                .affected_table_ids = &.{77},
+                .state = metadata_table_manager.table_emptying_running,
+                .lease_owner = "stale-worker",
+                .lease_expires_at_ms = 1,
+            },
+            .{ .job_id = 9103, .table_id = 77, .group_id = 8003, .schema_generation = 11, .data_generation = 4, .affected_table_ids = &.{77} },
+        },
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = &.{},
+                .schema_rewrite_jobs = self.schema_jobs[0..],
+                .table_emptying_jobs = self.emptying_jobs[0..],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const Source = struct {
+        schema_calls: usize = 0,
+        schema_seen_running: bool = false,
+        table_calls: usize = 0,
+        table_seen_running: bool = false,
+
+        fn schemaRewriteGroupLocal(
+            self: *@This(),
+            _: std.mem.Allocator,
+            group_id: u64,
+            _: []const u8,
+            record: metadata_table_manager.SchemaRewriteJobRecord,
+            _: []const u8,
+            lease_ms: u64,
+        ) !?SchemaRewriteWorkerResult {
+            try std.testing.expectEqual(@as(u64, 250), lease_ms);
+            self.schema_calls += 1;
+            if (std.mem.eql(u8, record.state, metadata_table_manager.schema_rewrite_running)) self.schema_seen_running = true;
+            return .{
+                .group_id = group_id,
+                .table_id = record.table_id,
+                .job_id = record.job_id,
+                .claimed = true,
+            };
+        }
+
+        fn tableEmptyingGroupLocal(
+            self: *@This(),
+            _: std.mem.Allocator,
+            group_id: u64,
+            _: []const u8,
+            record: metadata_table_manager.TableEmptyingJobRecord,
+            _: []const u8,
+            lease_ms: u64,
+        ) !?TableEmptyingWorkerResult {
+            try std.testing.expectEqual(@as(u64, 250), lease_ms);
+            self.table_calls += 1;
+            if (std.mem.eql(u8, record.state, metadata_table_manager.table_emptying_running)) self.table_seen_running = true;
+            return .{
+                .group_id = group_id,
+                .table_id = record.table_id,
+                .job_id = record.job_id,
+                .claimed = true,
+            };
+        }
+    };
+
+    var catalog = Catalog{};
+
+    {
+        var source = Source{};
+        var pass = try runSchemaRewriteWorkerPassForCatalogWithAdmission(
+            alloc,
+            &source,
+            catalog.iface(),
+            "events",
+            "worker-a",
+            .{ .lease_ms = 250, .max_work_units = 1, .allow_stale_lease_takeover = false },
+        );
+        defer pass.deinit(alloc);
+        try std.testing.expect(!pass.complete);
+        try std.testing.expectEqual(@as(u64, 2), pass.jobs_scanned);
+        try std.testing.expectEqual(@as(u64, 1), pass.jobs_claimed);
+        try std.testing.expectEqual(@as(usize, 1), source.schema_calls);
+        try std.testing.expect(!source.schema_seen_running);
+    }
+
+    {
+        var source = Source{};
+        var pass = try runSchemaRewriteWorkerPassForCatalogWithAdmission(
+            alloc,
+            &source,
+            catalog.iface(),
+            "events",
+            "worker-a",
+            .{ .lease_ms = 250, .max_work_units = 2, .allow_stale_lease_takeover = true },
+        );
+        defer pass.deinit(alloc);
+        try std.testing.expect(!pass.complete);
+        try std.testing.expectEqual(@as(u64, 3), pass.jobs_scanned);
+        try std.testing.expectEqual(@as(u64, 2), pass.jobs_claimed);
+        try std.testing.expectEqual(@as(usize, 2), source.schema_calls);
+        try std.testing.expect(source.schema_seen_running);
+    }
+
+    {
+        var source = Source{};
+        var pass = try runTableEmptyingWorkerPassForCatalogWithAdmission(
+            alloc,
+            &source,
+            catalog.iface(),
+            "events",
+            "worker-a",
+            .{ .lease_ms = 250, .max_work_units = 1, .allow_stale_lease_takeover = false },
+        );
+        defer pass.deinit(alloc);
+        try std.testing.expect(!pass.complete);
+        try std.testing.expectEqual(@as(u64, 2), pass.jobs_scanned);
+        try std.testing.expectEqual(@as(u64, 1), pass.jobs_claimed);
+        try std.testing.expectEqual(@as(usize, 1), source.table_calls);
+        try std.testing.expect(!source.table_seen_running);
+    }
+
+    {
+        var source = Source{};
+        var pass = try runTableEmptyingWorkerPassForCatalogWithAdmission(
+            alloc,
+            &source,
+            catalog.iface(),
+            "events",
+            "worker-a",
+            .{ .lease_ms = 250, .max_work_units = 2, .allow_stale_lease_takeover = true },
+        );
+        defer pass.deinit(alloc);
+        try std.testing.expect(!pass.complete);
+        try std.testing.expectEqual(@as(u64, 3), pass.jobs_scanned);
+        try std.testing.expectEqual(@as(u64, 2), pass.jobs_claimed);
+        try std.testing.expectEqual(@as(usize, 2), source.table_calls);
+        try std.testing.expect(source.table_seen_running);
+    }
 }
 
 test "table emptying worker pass can select same-name table by table id" {

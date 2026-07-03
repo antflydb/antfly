@@ -46,6 +46,12 @@ pub const Routes = struct {
     pub const internal_table_reseed_exact_cutover_suffix = "/reseed-exact-cutover";
     pub const internal_split_suffix = "/split";
     pub const internal_merge_suffix = "/merge";
+    pub const internal_schema_rewrite_jobs_prefix = "/internal/v1/schema-rewrite-jobs/";
+    pub const internal_table_emptying_jobs_prefix = "/internal/v1/table-emptying-jobs/";
+    pub const internal_job_pause_suffix = "/pause";
+    pub const internal_job_resume_suffix = "/resume";
+    pub const internal_job_retry_suffix = "/retry";
+    pub const internal_job_cancel_suffix = "/cancel";
     pub const internal_fk_ref_rebuild_begin_suffix = "/foreign-key-ref-ranges/rebuild/begin";
     pub const internal_fk_ref_rebuild_finish_suffix = "/foreign-key-ref-ranges/rebuild/finish";
     pub const internal_fk_ref_split_begin_suffix = "/foreign-key-ref-ranges/split/begin";
@@ -126,6 +132,38 @@ pub const Routes = struct {
 
     pub fn matchInternalTableMerge(path: []const u8) ?InternalTablePath {
         return matchInternalTablePath(path, internal_merge_suffix);
+    }
+
+    pub fn matchInternalSchemaRewriteJobPause(path: []const u8) ?u64 {
+        return matchJobIDPath(path, internal_schema_rewrite_jobs_prefix, internal_job_pause_suffix);
+    }
+
+    pub fn matchInternalSchemaRewriteJobResume(path: []const u8) ?u64 {
+        return matchJobIDPath(path, internal_schema_rewrite_jobs_prefix, internal_job_resume_suffix);
+    }
+
+    pub fn matchInternalSchemaRewriteJobRetry(path: []const u8) ?u64 {
+        return matchJobIDPath(path, internal_schema_rewrite_jobs_prefix, internal_job_retry_suffix);
+    }
+
+    pub fn matchInternalSchemaRewriteJobCancel(path: []const u8) ?u64 {
+        return matchJobIDPath(path, internal_schema_rewrite_jobs_prefix, internal_job_cancel_suffix);
+    }
+
+    pub fn matchInternalTableEmptyingJobPause(path: []const u8) ?u64 {
+        return matchJobIDPath(path, internal_table_emptying_jobs_prefix, internal_job_pause_suffix);
+    }
+
+    pub fn matchInternalTableEmptyingJobResume(path: []const u8) ?u64 {
+        return matchJobIDPath(path, internal_table_emptying_jobs_prefix, internal_job_resume_suffix);
+    }
+
+    pub fn matchInternalTableEmptyingJobRetry(path: []const u8) ?u64 {
+        return matchJobIDPath(path, internal_table_emptying_jobs_prefix, internal_job_retry_suffix);
+    }
+
+    pub fn matchInternalTableEmptyingJobCancel(path: []const u8) ?u64 {
+        return matchJobIDPath(path, internal_table_emptying_jobs_prefix, internal_job_cancel_suffix);
     }
 
     pub fn matchInternalForeignKeyReferenceRangeRebuildBegin(path: []const u8) ?InternalTablePath {
@@ -230,6 +268,12 @@ pub const Routes = struct {
         const node_id = matchNumericPath(path, prefix, suffix) orelse return null;
         if (node_id == 0) return null;
         return node_id;
+    }
+
+    fn matchJobIDPath(path: []const u8, prefix: []const u8, suffix: []const u8) ?u64 {
+        const job_id = matchNumericPath(path, prefix, suffix) orelse return null;
+        if (job_id == 0) return null;
+        return job_id;
     }
 
     fn matchInternalTablePath(path: []const u8, suffix: []const u8) ?InternalTablePath {

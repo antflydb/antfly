@@ -27,9 +27,9 @@
       "id": "legacy-wrapper-deletion",
       "relational_slices_section": "SQL adapter and compatibility wrapper removal",
       "surface": "legacy_wrapper_deletion",
-      "status": "gap_tracked",
-      "current_evidence": "Compatibility wrapper and parser migration inventories enumerate parser, binder, planner, and runtime wrapper classes with typed parser, binder, plan, runtime, parity, and state-safety evidence required before deletion.",
-      "missing_evidence": "Legacy string-only compatibility wrappers still need to be removed one at a time behind the recorded parser, binder, plan, runtime, and parity evidence.",
+      "status": "release_evidence",
+      "current_evidence": "Compatibility wrapper and production-ingress cutover inventories now leave no migration-blocker wrappers. The only remaining wrapper is document-query-bounded-scan-runtime, explicitly reclassified as a read-only compatibility contract outside generated grammar coverage; its parser, binder, typed plan, runtime diagnostics, parity evidence, and state-safety proof are recorded in sql_compatibility_wrappers.json, while document_sql_bounded_scan_inventory.json is empty.",
+      "missing_evidence": "",
       "evidence_file": "zig/pkg/antfly/src/sql/fixtures/sql_compatibility_wrappers.json",
       "evidence_symbol": "sql_compatibility_wrappers",
       "release_gate": "relational-release-gate"
@@ -38,11 +38,11 @@
       "id": "structural-sql-normalization",
       "relational_slices_section": "SQL adapter and compatibility wrapper removal",
       "surface": "structural_sql_normalization",
-      "status": "partial_release_gated",
-      "current_evidence": "Generated DML metadata rejection tests already fail closed for stale aliases, generated names, returning metadata, conflict targets, and generated CTE-prefix payloads.",
-      "missing_evidence": "Placeholders, aliases, table targets, generated names, and conflict targets still need structural normalization everywhere instead of SQL string scans.",
+      "status": "release_evidence",
+      "current_evidence": "Generated DML lowering validates structural parser metadata before using SQL text: token ranges, list boundaries, aliases, target/source tables, CTE bodies, read-source bodies, conflict targets/actions, returning lists, merge arms, and nested expression surfaces are compared against the generated AST, with stale metadata tests proving fail-closed behavior for conflict ranges, conflict target payloads, targetless conflicts, joined updates, insert-source columns, mutation-source returning hooks, merge CTE prefixes, merge arm payloads, returning aliases, and returning expression children.",
+      "missing_evidence": "",
       "evidence_file": "zig/pkg/antfly/src/sql/lower_dml.zig",
-      "evidence_symbol": "sql adapter lower dml rejects stale generated returning alias metadata",
+      "evidence_symbol": "generatedDmlAstSurfaceEqual",
       "release_gate": "relational-release-gate"
     }
   ]

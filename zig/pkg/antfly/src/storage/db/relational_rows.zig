@@ -8181,7 +8181,7 @@ pub fn validateInsertSourceRequestWithSchemas(
         for (req.assignments[0..i]) |previous| {
             if (std.mem.eql(u8, previous.field, assignment.field)) return error.InvalidQueryRequest;
         }
-        try validateInsertSourceExpression(source_schema, assignment.expression);
+        try validateInsertSourceExpression(source_schema, req.source, assignment.expression);
     }
     if (req.on_conflict) |conflict| try validateOnConflict(target_schema, conflict);
     try validateMutationReturningRequestOutputs(target_schema, req.returning, req.returning_all, req.returning_expressions);
@@ -8190,26 +8190,56 @@ pub fn validateInsertSourceRequestWithSchemas(
 
 fn validateInsertSourceExpression(
     source_schema: schema_mod.TableSchema,
+    source_query: types.RelationalRowsQueryRequest,
     expression: types.RelationalRowsExpression,
 ) anyerror!void {
     if (expression.kind == .field) {
         if (expression.field_source == .existing or expression.field_source == .proposed) return error.InvalidQueryRequest;
-        _ = findColumn(source_schema.relational_columns, expression.field) orelse return error.InvalidQueryRequest;
+        if (findColumn(source_schema.relational_columns, expression.field) == null and !insertSourceQueryOutputFieldExists(source_query, expression.field)) return error.InvalidQueryRequest;
     }
-    for (expression.operands) |operand| try validateInsertSourceExpression(source_schema, operand);
+    for (expression.operands) |operand| try validateInsertSourceExpression(source_schema, source_query, operand);
     for (expression.case_branches) |branch| {
-        try validateInsertSourceExpressionCondition(source_schema, branch.when);
-        try validateInsertSourceExpression(source_schema, branch.then);
+        try validateInsertSourceExpressionCondition(source_schema, source_query, branch.when);
+        try validateInsertSourceExpression(source_schema, source_query, branch.then);
     }
-    for (expression.case_else) |case_else| try validateInsertSourceExpression(source_schema, case_else);
+    for (expression.case_else) |case_else| try validateInsertSourceExpression(source_schema, source_query, case_else);
 }
 
 fn validateInsertSourceExpressionCondition(
     source_schema: schema_mod.TableSchema,
+    source_query: types.RelationalRowsQueryRequest,
     condition: types.RelationalRowsExpressionCondition,
 ) anyerror!void {
-    try validateInsertSourceExpression(source_schema, condition.lhs);
-    for (condition.rhs) |rhs| try validateInsertSourceExpression(source_schema, rhs);
+    try validateInsertSourceExpression(source_schema, source_query, condition.lhs);
+    for (condition.rhs) |rhs| try validateInsertSourceExpression(source_schema, source_query, rhs);
+}
+
+fn insertSourceQueryOutputFieldExists(
+    source_query: types.RelationalRowsQueryRequest,
+    field: []const u8,
+) bool {
+    for (source_query.select) |output| {
+        if (std.mem.eql(u8, output, field)) return true;
+    }
+    for (source_query.json_extract) |projection| {
+        if (std.mem.eql(u8, projection.output, field)) return true;
+    }
+    for (source_query.array_length) |projection| {
+        if (std.mem.eql(u8, projection.output, field)) return true;
+    }
+    for (source_query.coalesce) |projection| {
+        if (std.mem.eql(u8, projection.output, field)) return true;
+    }
+    for (source_query.field_aliases) |projection| {
+        if (std.mem.eql(u8, projection.output, field)) return true;
+    }
+    for (source_query.expressions) |projection| {
+        if (std.mem.eql(u8, projection.output, field)) return true;
+    }
+    for (source_query.scalar_subqueries) |projection| {
+        if (std.mem.eql(u8, projection.output, field)) return true;
+    }
+    return false;
 }
 
 fn validateOnConflict(
@@ -23210,6 +23240,124 @@ test "relational rows subquery predicates use sql null and empty-set semantics" 
     try std.testing.expectEqual(@as(u32, 2), correlated_exists_result.total);
     try std.testing.expectEqualStrings("{\"id\":\"a\"}", correlated_exists_result.rows[0]);
     try std.testing.expectEqualStrings("{\"id\":\"c\"}", correlated_exists_result.rows[1]);
+
+    const filtered_correlated_exists = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .exists,
+        .query = .{
+            .predicates = rank_is_one[0..],
+        },
+        .correlations = status_correlation[0..],
+    }};
+    var filtered_correlated_exists_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = filtered_correlated_exists[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer filtered_correlated_exists_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), filtered_correlated_exists_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", filtered_correlated_exists_result.rows[0]);
+
+    const correlated_not_exists = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .exists,
+        .negated = true,
+        .query = .{},
+        .correlations = status_correlation[0..],
+    }};
+    var correlated_not_exists_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = correlated_not_exists[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer correlated_not_exists_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), correlated_not_exists_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", correlated_not_exists_result.rows[0]);
+
+    const correlated_scalar_status = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .scalar,
+        .lhs = lhs_status,
+        .query = .{
+            .select = select_status[0..],
+            .select_all = false,
+        },
+        .output_field = "status",
+        .correlations = status_correlation[0..],
+    }};
+    var correlated_scalar_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = correlated_scalar_status[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer correlated_scalar_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), correlated_scalar_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", correlated_scalar_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", correlated_scalar_result.rows[1]);
+
+    const correlated_in_status = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .in,
+        .lhs = lhs_status,
+        .query = .{
+            .select = select_status[0..],
+            .select_all = false,
+        },
+        .output_field = "status",
+        .correlations = status_correlation[0..],
+    }};
+    var correlated_in_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = correlated_in_status[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer correlated_in_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), correlated_in_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", correlated_in_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", correlated_in_result.rows[1]);
+
+    const correlated_not_in_status = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .in,
+        .lhs = lhs_status,
+        .negated = true,
+        .query = .{
+            .select = select_status[0..],
+            .select_all = false,
+        },
+        .output_field = "status",
+        .correlations = status_correlation[0..],
+    }};
+    var correlated_not_in_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = correlated_not_in_status[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer correlated_not_in_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), correlated_not_in_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", correlated_not_in_result.rows[0]);
+
+    const correlated_any_status = [_]types.RelationalRowsSubqueryPredicate{.{
+        .kind = .quantified,
+        .lhs = lhs_status,
+        .quantifier = .any,
+        .query = .{
+            .select = select_status[0..],
+            .select_all = false,
+        },
+        .output_field = "status",
+        .correlations = status_correlation[0..],
+    }};
+    var correlated_any_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .subquery_predicates = correlated_any_status[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .order_by = order_by_id[0..],
+    });
+    defer correlated_any_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), correlated_any_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", correlated_any_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", correlated_any_result.rows[1]);
 
     const nested_in_closed_inner = [_]types.RelationalRowsSubqueryPredicate{.{
         .kind = .in,

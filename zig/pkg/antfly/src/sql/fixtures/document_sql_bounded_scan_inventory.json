@@ -1,21 +1,4 @@
 {
   "inventory_format": 1,
-  "entries": [
-    {
-      "id": "mapped-view-residual-bounded-scan",
-      "sql_slices_section": "Finish document query and view-mapping hardening",
-      "contract_kind": "view_mapping_residual",
-      "status": "intentional_contract",
-      "source_fixture": "document sql view mapping bounded residual read",
-      "runtime_evidence_file": "zig/pkg/antfly/src/api/table_reads/sources.zig",
-      "runtime_evidence_symbol": "api.table_reads.docid document SQL bounded scan runtime diagnostics pin row and byte caps",
-      "scan_cap_evidence": "Runtime diagnostics prove row-cap exhaustion for bounded scans; the source fixture pins scan_rows=10000 and limit=5.",
-      "byte_cap_evidence": "Runtime diagnostics prove byte-cap exhaustion for bounded scans.",
-      "residual_evidence": "The source fixture pins producer=bounded_scan and residual=1 for a mapped metadata.plan predicate without required_indexes.",
-      "ordering_evidence": "No ORDER BY is admitted for this contract; ordered mapped-view reads must use exact top-k indexed/native producers or fail with incomplete top-k diagnostics.",
-      "missing_producer_diagnostic": "document_sql_bounded_scan_missing_exact_producer",
-      "missing_or_next_evidence": "Replace this contract with an exact indexed/native producer when mapped scalar residual predicates no longer require bounded scan fallback.",
-      "release_gate": "document-sql-hardening-gate"
-    }
-  ]
+  "entries": []
 }

@@ -17,12 +17,12 @@
       "id": "live-write-pagination-gap",
       "relational_slices_section": "Routed reads, joins, CTEs, and streaming",
       "routed_shape": "live_write_pagination",
-      "visibility_outcome": "gap_tracked",
-      "evidence_kind": "gap_inventory",
-      "evidence_file": "zig/RELATIONAL.md",
-      "evidence_symbol": "Add live-write and range-movement pagination tests for routed reads",
-      "coverage_contract": "The matrix keeps live-write and range-movement pagination visible as a separate execution gap instead of treating local pagination fixtures as routed visibility proof.",
-      "missing_or_next_evidence": "Add release-gated routed pagination tests proving stable ordering, no duplicates, no missing rows, and deterministic retry or fail-closed behavior under range movement.",
+      "visibility_outcome": "live_write_fail_closed",
+      "evidence_kind": "execution_test",
+      "evidence_file": "zig/pkg/antfly/src/api/table_reads/relational_rows.zig",
+      "evidence_symbol": "routed paginated rows fail closed when live writes change scanned range membership",
+      "coverage_contract": "Paginated routed reads rescan every routed range after collecting owner rows, prove stable ordering and page boundaries when membership is unchanged, and fail closed with TopologyChanged when a live write changes range membership before returning a page.",
+      "missing_or_next_evidence": "Extend the same pagination fence evidence to hosted/provisioned range movement once the live topology retry harness lands.",
       "release_gate": "relational-release-gate"
     },
     {

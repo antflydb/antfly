@@ -1,0 +1,77 @@
+{
+  "fixture_format": 1,
+  "cases": [
+    {
+      "name": "backups-backup-database-generated-rejection",
+      "family": "backups",
+      "sql": "BACKUP DATABASE tenant_ops TO 's3://usage-backups/tenant_ops'",
+      "expected_statement_kind": "",
+      "expected_statement_tag": "",
+      "expected_error": "UnexpectedToken"
+    },
+    {
+      "name": "ddl-create-table-generated-ast",
+      "family": "ddl",
+      "sql": "CREATE TABLE usage_records (id text PRIMARY KEY, status text DEFAULT 'open')",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "create_table",
+      "expected_error": ""
+    },
+    {
+      "name": "dml-insert-values-generated-ast",
+      "family": "dml",
+      "sql": "INSERT INTO usage_records (id, status) VALUES ('u1', 'open')",
+      "expected_statement_kind": "dml",
+      "expected_statement_tag": "insert_values",
+      "expected_error": ""
+    },
+    {
+      "name": "extensions-create-extension-generated-ast",
+      "family": "extensions",
+      "sql": "CREATE EXTENSION IF NOT EXISTS vector WITH VERSION '0.7.0'",
+      "expected_statement_kind": "extension_index",
+      "expected_statement_tag": "create_extension",
+      "expected_error": ""
+    },
+    {
+      "name": "functions-create-function-generated-ast",
+      "family": "functions",
+      "sql": "CREATE FUNCTION audit_changes() RETURNS trigger LANGUAGE plpgsql",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "create_function",
+      "expected_error": ""
+    },
+    {
+      "name": "lakes-antfly-source-function-generated-read-ast",
+      "family": "lakes",
+      "sql": "SELECT * FROM antfly.semantic_search(index => 'docs_embeddings', query => 'refund', limit => 10)",
+      "expected_statement_kind": "read",
+      "expected_statement_tag": "query",
+      "expected_error": ""
+    },
+    {
+      "name": "maintenance-vacuum-generated-unsupported-ast",
+      "family": "maintenance",
+      "sql": "VACUUM (FULL, VERBOSE, ANALYZE) public.usage_records",
+      "expected_statement_kind": "unsupported",
+      "expected_statement_tag": "vacuum",
+      "expected_error": ""
+    },
+    {
+      "name": "query-join-generated-read-ast",
+      "family": "query",
+      "sql": "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id",
+      "expected_statement_kind": "read",
+      "expected_statement_tag": "join",
+      "expected_error": ""
+    },
+    {
+      "name": "roles-create-role-generated-ast",
+      "family": "roles",
+      "sql": "CREATE ROLE app_writer",
+      "expected_statement_kind": "ddl",
+      "expected_statement_tag": "create_role",
+      "expected_error": ""
+    }
+  ]
+}
