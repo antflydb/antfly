@@ -26,6 +26,12 @@ pub const ScanOptions = struct {
 
 pub const ScanAction = enum { @"continue", stop };
 
+pub const ScanWithContextCallback = *const fn (
+    ctx: ?*anyopaque,
+    key: []const u8,
+    value: []const u8,
+) anyerror!ScanAction;
+
 pub fn freeResults(alloc: std.mem.Allocator, results: []OwnedKVPair) void {
     for (results) |item| {
         alloc.free(item.key);
@@ -41,12 +47,16 @@ pub fn scan(
     options: ScanOptions,
     callback: *const fn (key: []const u8, value: []const u8) anyerror!ScanAction,
 ) !void {
-    var txn = try store.beginRead();
-    defer txn.abort();
+    const Adapter = struct {
+        callback: *const fn (key: []const u8, value: []const u8) anyerror!ScanAction,
 
-    var cur = try txn.openCursor();
-    defer cur.close();
-    try scanCursor(&cur, lower, upper, options, callback);
+        fn run(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!ScanAction {
+            const adapter: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try adapter.callback(key, value);
+        }
+    };
+    var adapter = Adapter{ .callback = callback };
+    return try scanWithContext(store, lower, upper, options, &adapter, Adapter.run);
 }
 
 pub fn scanCurrent(
@@ -56,12 +66,48 @@ pub fn scanCurrent(
     options: ScanOptions,
     callback: *const fn (key: []const u8, value: []const u8) anyerror!ScanAction,
 ) !void {
+    const Adapter = struct {
+        callback: *const fn (key: []const u8, value: []const u8) anyerror!ScanAction,
+
+        fn run(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!ScanAction {
+            const adapter: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try adapter.callback(key, value);
+        }
+    };
+    var adapter = Adapter{ .callback = callback };
+    return try scanCurrentWithContext(store, lower, upper, options, &adapter, Adapter.run);
+}
+
+pub fn scanWithContext(
+    store: *backend_erased.Store,
+    lower: []const u8,
+    upper: []const u8,
+    options: ScanOptions,
+    ctx: ?*anyopaque,
+    callback: ScanWithContextCallback,
+) !void {
+    var txn = try store.beginRead();
+    defer txn.abort();
+
+    var cur = try txn.openCursor();
+    defer cur.close();
+    try scanCursorWithContext(&cur, lower, upper, options, ctx, callback);
+}
+
+pub fn scanCurrentWithContext(
+    store: *backend_erased.Store,
+    lower: []const u8,
+    upper: []const u8,
+    options: ScanOptions,
+    ctx: ?*anyopaque,
+    callback: ScanWithContextCallback,
+) !void {
     var txn = try store.beginCurrentScan();
     defer txn.abort();
 
     var cur = try txn.openCursor();
     defer cur.close();
-    try scanCursor(&cur, lower, upper, options, callback);
+    try scanCursorWithContext(&cur, lower, upper, options, ctx, callback);
 }
 
 fn scanCursor(
@@ -70,6 +116,26 @@ fn scanCursor(
     upper: []const u8,
     options: ScanOptions,
     callback: *const fn (key: []const u8, value: []const u8) anyerror!ScanAction,
+) !void {
+    const Adapter = struct {
+        callback: *const fn (key: []const u8, value: []const u8) anyerror!ScanAction,
+
+        fn run(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!ScanAction {
+            const adapter: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try adapter.callback(key, value);
+        }
+    };
+    var adapter = Adapter{ .callback = callback };
+    try scanCursorWithContext(cur, lower, upper, options, &adapter, Adapter.run);
+}
+
+fn scanCursorWithContext(
+    cur: *backend_erased.Cursor,
+    lower: []const u8,
+    upper: []const u8,
+    options: ScanOptions,
+    ctx: ?*anyopaque,
+    callback: ScanWithContextCallback,
 ) !void {
     cur.setUpperBound(if (upper.len > 0) upper else null);
 
@@ -81,7 +147,7 @@ fn scanCursor(
     if (upper.len > 0 and std.mem.order(u8, first.key, upper) != .lt) return;
 
     if (options.skip_fn == null or !options.skip_fn.?(first.key)) {
-        if (try callback(first.key, first.value) == .stop) return;
+        if (try callback(ctx, first.key, first.value) == .stop) return;
     }
 
     var entry = try cur.next();
@@ -90,7 +156,7 @@ fn scanCursor(
         if (options.skip_fn) |skip| {
             if (skip(kv.key)) continue;
         }
-        if (try callback(kv.key, kv.value) == .stop) return;
+        if (try callback(ctx, kv.key, kv.value) == .stop) return;
     }
 }
 

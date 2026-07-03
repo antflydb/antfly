@@ -3831,6 +3831,7 @@ pub fn build(b: *std.Build) void {
             "provisioned create index updates cached writer in place",
             "write cache metadata refresh preserves inactive adoptable seed",
             "write cache adopts active just-created db across generation bump",
+            "hosted runtime status prefers live writer over stale hosted snapshot",
             "runtime status collection leaves active stale write lease live",
             "primary lookup adopts seeded write cache across visible generation bump",
             "provisioned write cache close detaches promotion leadership callback before stats",
