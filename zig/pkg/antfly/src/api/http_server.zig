@@ -2020,11 +2020,17 @@ pub const ApiHttpServer = struct {
             return try jsonResponse(self.alloc, topology_status);
         }
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.connections)) {
+            const connection_types = parseSimpleQueryParamDecodedAlloc(self.alloc, uri_parts.query, "types") catch return try textResponse(self.alloc, 400, "invalid types");
+            defer if (connection_types) |value| self.alloc.free(value);
+            const connection_include = parseSimpleQueryParamDecodedAlloc(self.alloc, uri_parts.query, "include") catch return try textResponse(self.alloc, 400, "invalid include");
+            defer if (connection_include) |value| self.alloc.free(value);
+            const connection_refresh = parseSimpleQueryParamDecodedAlloc(self.alloc, uri_parts.query, "refresh") catch return try textResponse(self.alloc, 400, "invalid refresh");
+            defer if (connection_refresh) |value| self.alloc.free(value);
             const body = try self.listConnectionsJsonAlloc(
                 self.alloc,
-                parseSimpleQueryParam(uri_parts.query, "types"),
-                parseSimpleQueryParam(uri_parts.query, "include"),
-                parseSimpleQueryParam(uri_parts.query, "refresh"),
+                connection_types,
+                connection_include,
+                connection_refresh,
             );
             return .{
                 .status = 200,
@@ -2114,6 +2120,9 @@ pub const ApiHttpServer = struct {
             }
             return try self.bodyResponse(200, "application/yaml", spec.body, false);
         }
+        var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        defer query_arena_impl.deinit();
+        const query_alloc = query_arena_impl.allocator();
         if (std.mem.eql(u8, uri_parts.path, routes.Routes.ai_catalog)) {
             if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
             const mode: ard_catalog.CatalogMode = if (authenticated_identity != null) .tenant else .public_bootstrap;
@@ -2125,7 +2134,7 @@ pub const ApiHttpServer = struct {
             } else null;
             const body = try ard_catalog.catalogJsonWithExtensionsAlloc(
                 self.alloc,
-                self.ardCatalogOptions(mode, uri_parts.query, authenticated_identity),
+                try self.ardCatalogOptions(query_alloc, mode, uri_parts.query, authenticated_identity),
                 extension_context,
             );
             return try self.ardCatalogResponse(200, body, mode == .public_bootstrap);
@@ -2136,7 +2145,7 @@ pub const ApiHttpServer = struct {
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
             const body = try ard_catalog.catalogJsonWithExtensionsAlloc(
                 self.alloc,
-                self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
+                try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
             );
             return try self.ardCatalogResponse(200, body, false);
@@ -2147,7 +2156,7 @@ pub const ApiHttpServer = struct {
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
             const body = ard_catalog.searchJsonWithExtensionsAlloc(
                 self.alloc,
-                self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
+                try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
                 req.body,
                 false,
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
@@ -2163,7 +2172,7 @@ pub const ApiHttpServer = struct {
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
             const body = ard_catalog.searchJsonWithExtensionsAlloc(
                 self.alloc,
-                self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
+                try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
                 req.body,
                 true,
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
@@ -2179,7 +2188,7 @@ pub const ApiHttpServer = struct {
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
             const body = ard_catalog.agentsJsonWithExtensionsQueryAlloc(
                 self.alloc,
-                self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
+                try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
                 uri_parts.query,
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
             ) catch |err| switch (err) {
@@ -2191,7 +2200,7 @@ pub const ApiHttpServer = struct {
         if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.ard_v1_skills_prefix)) {
             if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
             const slug = uri_parts.path[routes.Routes.ard_v1_skills_prefix.len..];
-            const options = self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity);
+            const options = try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity);
             const body = (try ard_catalog.skillMarkdownAlloc(self.alloc, options, slug)) orelse blk: {
                 var snapshot_opt = try self.source.adminSnapshot();
                 defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
@@ -2214,7 +2223,7 @@ pub const ApiHttpServer = struct {
                 const body = (try ard_catalog.mcpDescriptorJsonAlloc(
                     self.alloc,
                     name,
-                    self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
+                    try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
                     if (snapshot_opt) |snapshot| self.ardExtensionCatalogContext(snapshot, authenticated_identity) else null,
                 )) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
                 return try self.ardCatalogResponse(200, body, false);
@@ -2226,7 +2235,7 @@ pub const ApiHttpServer = struct {
                 const body = (try ard_catalog.agentDescriptorJsonAlloc(
                     self.alloc,
                     name,
-                    self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
+                    try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
                     if (snapshot_opt) |snapshot| self.ardExtensionCatalogContext(snapshot, authenticated_identity) else null,
                 )) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
                 return try self.ardCatalogResponse(200, body, false);
@@ -2286,10 +2295,12 @@ pub const ApiHttpServer = struct {
         defer self.alloc.free(route);
         var snapshot_opt = try self.source.adminSnapshot();
         defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+        var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        defer query_arena_impl.deinit();
         return try ard_catalog.agentDescriptorJsonAlloc(
             self.alloc,
             route,
-            self.ardCatalogOptions(.tenant, query, authenticated_identity),
+            try self.ardCatalogOptions(query_arena_impl.allocator(), .tenant, query, authenticated_identity),
             self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
         );
     }
@@ -2321,7 +2332,7 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    fn ardCatalogOptions(self: *ApiHttpServer, mode: ard_catalog.CatalogMode, query: []const u8, authenticated_identity: ?AuthenticatedIdentity) ard_catalog.CatalogOptions {
+    fn ardCatalogOptions(self: *ApiHttpServer, alloc: std.mem.Allocator, mode: ard_catalog.CatalogMode, query: []const u8, authenticated_identity: ?AuthenticatedIdentity) !ard_catalog.CatalogOptions {
         return .{
             .mode = mode,
             .base_url = self.cfg.ard_base_url,
@@ -2329,9 +2340,9 @@ pub const ApiHttpServer = struct {
             .display_name = if (self.cfg.ard_display_name.len > 0) self.cfg.ard_display_name else "Antfly",
             .is_admin = !self.cfg.auth_enabled or authenticatedIdentityIsAdmin(authenticated_identity),
             .permissions = if (authenticated_identity) |identity| identity.permissions else null,
-            .profile = parseSimpleQueryParam(query, "profile"),
-            .types = parseSimpleQueryParam(query, "types"),
-            .include = parseSimpleQueryParam(query, "include"),
+            .profile = try parseSimpleQueryParamDecodedAlloc(alloc, query, "profile"),
+            .types = try parseSimpleQueryParamDecodedAlloc(alloc, query, "types"),
+            .include = try parseSimpleQueryParamDecodedAlloc(alloc, query, "include"),
         };
     }
 
@@ -2675,10 +2686,14 @@ pub const ApiHttpServer = struct {
         if (req.method == .DELETE) {
             if (routes.Routes.matchUserPermissions(uri_parts.path)) |user_path| {
                 const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const params = parseRemovePermissionFromUserParams(uri_parts.query) catch |err| switch (err) {
+                var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+                defer query_arena_impl.deinit();
+                const params = parseRemovePermissionFromUserParams(query_arena_impl.allocator(), uri_parts.query) catch |err| switch (err) {
                     error.MissingResource => return try jsonErrorResponse(self.alloc, 400, "missing resource"),
                     error.MissingResourceType => return try jsonErrorResponse(self.alloc, 400, "missing resourceType"),
                     error.InvalidResourceType => return try jsonErrorResponse(self.alloc, 400, "invalid resourceType"),
+                    error.InvalidArgument => return try jsonErrorResponse(self.alloc, 400, "invalid query parameter"),
+                    else => return err,
                 };
                 manager.removePermissionFromUser(
                     user_path.user_name,
@@ -2696,7 +2711,9 @@ pub const ApiHttpServer = struct {
             }
             if (routes.Routes.matchUserRoles(uri_parts.path)) |user_path| {
                 const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const params = parseRemoveRoleFromUserParams(uri_parts.query) catch {
+                var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+                defer query_arena_impl.deinit();
+                const params = parseRemoveRoleFromUserParams(query_arena_impl.allocator(), uri_parts.query) catch {
                     return try jsonErrorResponse(self.alloc, 400, "missing role");
                 };
                 manager.removeRoleFromUser(user_path.user_name, params.role) catch |err| switch (err) {
@@ -3858,13 +3875,17 @@ pub const ApiHttpServer = struct {
 
     fn dispatchPublicTableRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.backups)) {
-            const params = parseListBackupsParams(uri_parts.query) catch return try textResponse(self.alloc, 400, "missing location");
+            var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+            defer query_arena_impl.deinit();
+            const params = parseListBackupsParams(query_arena_impl.allocator(), uri_parts.query) catch return try textResponse(self.alloc, 400, "missing location");
             return try self.handlePublicClusterBackupList(params.location);
         }
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.tables)) {
             var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
             defer self.source.freeAdminSnapshot(&snapshot);
-            const params = try parseListTablesParams(uri_parts.query);
+            var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+            defer query_arena_impl.deinit();
+            const params = try parseListTablesParams(query_arena_impl.allocator(), uri_parts.query);
             if (params.pattern != null) return try textResponse(self.alloc, 400, "unsupported table pattern");
             const storage_statuses = try self.collectTableStorageStatuses(&snapshot, params.prefix);
             defer if (storage_statuses) |items| self.alloc.free(items);
@@ -4929,7 +4950,7 @@ pub const ApiHttpServer = struct {
         query: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !public_table_http.DocumentArtifactManifestOptions {
-        var opts = public_table_http.parseDocumentArtifactManifestOptions(query) catch return error.InvalidDetail;
+        var opts = public_table_http.parseDocumentArtifactManifestOptions(self.alloc, query) catch return error.InvalidDetail;
         if (self.cfg.auth_enabled and parseSimpleQueryParam(query, "detail") == null) opts.detail = .summary;
         if (opts.detail == .raw and self.cfg.auth_enabled) {
             const identity = authenticated_identity orelse return error.Forbidden;
@@ -8990,9 +9011,9 @@ fn cloneRowFiltersFromOpenApi(
     return out;
 }
 
-fn parseRemovePermissionFromUserParams(query: []const u8) !usermgr_openapi.server.RemovePermissionFromUserParams {
-    const resource = parseSimpleQueryParam(query, "resource") orelse return error.MissingResource;
-    const resource_type = parseSimpleQueryParam(query, "resourceType") orelse return error.MissingResourceType;
+fn parseRemovePermissionFromUserParams(alloc: std.mem.Allocator, query: []const u8) !usermgr_openapi.server.RemovePermissionFromUserParams {
+    const resource = (try parseSimpleQueryParamDecodedAlloc(alloc, query, "resource")) orelse return error.MissingResource;
+    const resource_type = (try parseSimpleQueryParamDecodedAlloc(alloc, query, "resourceType")) orelse return error.MissingResourceType;
     _ = usermgr.ResourceType.fromSlice(resource_type) catch return error.InvalidResourceType;
     return .{
         .resource = resource,
@@ -9000,22 +9021,22 @@ fn parseRemovePermissionFromUserParams(query: []const u8) !usermgr_openapi.serve
     };
 }
 
-fn parseRemoveRoleFromUserParams(query: []const u8) !usermgr_openapi.server.RemoveRoleFromUserParams {
-    const role = parseSimpleQueryParam(query, "role") orelse return error.MissingRole;
+fn parseRemoveRoleFromUserParams(alloc: std.mem.Allocator, query: []const u8) !usermgr_openapi.server.RemoveRoleFromUserParams {
+    const role = (try parseSimpleQueryParamDecodedAlloc(alloc, query, "role")) orelse return error.MissingRole;
     if (role.len == 0) return error.MissingRole;
     return .{ .role = role };
 }
 
-fn parseListBackupsParams(query: []const u8) !metadata_openapi.server.ListBackupsParams {
+fn parseListBackupsParams(alloc: std.mem.Allocator, query: []const u8) !metadata_openapi.server.ListBackupsParams {
     return .{
-        .location = parseSimpleQueryParam(query, "location") orelse return error.MissingLocation,
+        .location = (try parseSimpleQueryParamDecodedAlloc(alloc, query, "location")) orelse return error.MissingLocation,
     };
 }
 
-fn parseListTablesParams(query: []const u8) !metadata_openapi.server.ListTablesParams {
+fn parseListTablesParams(alloc: std.mem.Allocator, query: []const u8) !metadata_openapi.server.ListTablesParams {
     return .{
-        .prefix = parseSimpleQueryParam(query, "prefix"),
-        .pattern = parseSimpleQueryParam(query, "pattern"),
+        .prefix = try parseSimpleQueryParamDecodedAlloc(alloc, query, "prefix"),
+        .pattern = try parseSimpleQueryParamDecodedAlloc(alloc, query, "pattern"),
     };
 }
 
@@ -9998,6 +10019,24 @@ test "artifact repair query params decode percent encoded values" {
     const cursor = (try parseSimpleQueryParamDecodedAlloc(alloc, "index=tenant%2Fembedding%20v1&cursor=7001%3Aabc%2Fdef", "cursor")).?;
     defer alloc.free(cursor);
     try std.testing.expectEqualStrings("7001:abc/def", cursor);
+}
+
+test "generated client query params decode for metadata parsers" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const tables = try parseListTablesParams(arena, "prefix=tenant%2Fdocs%20v1&pattern=docs%2A");
+    try std.testing.expectEqualStrings("tenant/docs v1", tables.prefix.?);
+    try std.testing.expectEqualStrings("docs*", tables.pattern.?);
+
+    const backups = try parseListBackupsParams(arena, "location=s3%3A%2F%2Fbucket%2Fpath%20one");
+    try std.testing.expectEqualStrings("s3://bucket/path one", backups.location);
+
+    const permission = try parseRemovePermissionFromUserParams(arena, "resource=docs%2Ftenant&resourceType=table");
+    try std.testing.expectEqualStrings("docs/tenant", permission.resource);
+    try std.testing.expectEqualStrings("table", permission.resource_type);
 }
 
 test "api http server serves status" {
