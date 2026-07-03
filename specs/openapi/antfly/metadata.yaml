@@ -2044,6 +2044,7 @@ components:
         - index_name
         - doc_key
         - artifact_name
+        - repairable
         - sequence
         - reason
         - attempts
@@ -2061,6 +2062,9 @@ components:
         parent_doc_key:
           type: string
           description: Parent source document key for chunk-derived artifacts.
+        unit_id:
+          type: string
+          description: Unit identifier for unit-scoped artifacts, when applicable.
         source_artifact_name:
           type: string
           description: Source artifact stream used to produce this artifact, when applicable.
@@ -2075,6 +2079,12 @@ components:
           format: uint32
           nullable: true
           description: Chunk ordinal for chunk-derived artifacts.
+        repairable:
+          type: boolean
+          description: Whether this artifact kind currently has an automated repair reprocessor.
+        unsupported_reason:
+          type: string
+          description: Stable reason code when repairable is false.
         sequence:
           type: integer
           format: uint64
@@ -2104,6 +2114,7 @@ components:
         - target
         - limit
         - scanned
+        - groups_scanned
         - has_more
         - issues
       properties:
@@ -2120,6 +2131,10 @@ components:
           type: integer
           format: uint64
           description: Number of repair records scanned while building this page.
+        groups_scanned:
+          type: integer
+          format: uint64
+          description: Number of table groups touched while building this page.
         has_more:
           type: boolean
           description: Whether another page is available.
@@ -2162,6 +2177,7 @@ components:
       description: Result of one bounded artifact repair pass.
       required:
         - scanned
+        - groups_scanned
         - reprocessed
         - repaired
         - missing_source_docs
@@ -2174,6 +2190,10 @@ components:
           type: integer
           format: uint64
           description: Number of repair records attempted by this pass.
+        groups_scanned:
+          type: integer
+          format: uint64
+          description: Number of table groups touched by this bounded repair pass.
         reprocessed:
           type: integer
           format: uint64

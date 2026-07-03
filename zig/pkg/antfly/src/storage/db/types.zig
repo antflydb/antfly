@@ -1562,6 +1562,7 @@ pub const DBStats = struct {
     repair_degraded: bool = false,
     repair_issue_count: u64 = 0,
     repair_summary_ready: bool = true,
+    repair_issue_count_estimated: bool = false,
     doc_identity: DocIdentityStats = .{},
     doc_set_planning: DocSetPlanningStats = .{},
     enrichment: EnrichmentStats = .{},
@@ -1595,10 +1596,13 @@ pub const ArtifactRepairIssue = struct {
     index_name: []const u8 = "",
     doc_key: []const u8 = "",
     parent_doc_key: []const u8 = "",
+    unit_id: []const u8 = "",
     source_artifact_name: []const u8 = "",
     artifact_name: []const u8 = "",
     artifact_key: []const u8 = "",
     chunk_id: ?u32 = null,
+    repairable: bool = true,
+    unsupported_reason: []const u8 = "",
     sequence: u64 = 0,
     reason: ArtifactRepairReason = .missing_artifact,
     attempts: u64 = 0,
@@ -1610,9 +1614,11 @@ pub const ArtifactRepairIssue = struct {
         if (self.index_name.len > 0) alloc.free(@constCast(self.index_name));
         if (self.doc_key.len > 0) alloc.free(@constCast(self.doc_key));
         if (self.parent_doc_key.len > 0) alloc.free(@constCast(self.parent_doc_key));
+        if (self.unit_id.len > 0) alloc.free(@constCast(self.unit_id));
         if (self.source_artifact_name.len > 0) alloc.free(@constCast(self.source_artifact_name));
         if (self.artifact_name.len > 0) alloc.free(@constCast(self.artifact_name));
         if (self.artifact_key.len > 0) alloc.free(@constCast(self.artifact_key));
+        if (self.unsupported_reason.len > 0) alloc.free(@constCast(self.unsupported_reason));
         if (self.last_error.len > 0) alloc.free(@constCast(self.last_error));
         self.* = undefined;
     }
@@ -1634,6 +1640,7 @@ pub const ArtifactRepairListResult = struct {
     issues: []ArtifactRepairIssue = &.{},
     limit: u32 = 0,
     scanned: u64 = 0,
+    groups_scanned: u64 = 0,
     next_cursor: ?[]u8 = null,
     has_more: bool = false,
 
@@ -1653,6 +1660,7 @@ pub const ArtifactRepairRunRequest = struct {
 
 pub const ArtifactRepairResult = struct {
     scanned: u64 = 0,
+    groups_scanned: u64 = 0,
     reprocessed: u64 = 0,
     repaired: u64 = 0,
     missing_source_docs: u64 = 0,
@@ -1678,10 +1686,13 @@ pub const EmbeddingArtifactRepairIssue = struct {
     index_name: []const u8 = "",
     doc_key: []const u8 = "",
     parent_doc_key: []const u8 = "",
+    unit_id: []const u8 = "",
     source_artifact_name: []const u8 = "",
     artifact_name: []const u8 = "",
     artifact_key: []const u8 = "",
     chunk_id: ?u32 = null,
+    repairable: bool = true,
+    unsupported_reason: []const u8 = "",
     sequence: u64 = 0,
     reason: EmbeddingArtifactRepairReason = .missing_embedding_artifact,
     attempts: u64 = 0,
@@ -1693,9 +1704,11 @@ pub const EmbeddingArtifactRepairIssue = struct {
         if (self.index_name.len > 0) alloc.free(@constCast(self.index_name));
         if (self.doc_key.len > 0) alloc.free(@constCast(self.doc_key));
         if (self.parent_doc_key.len > 0) alloc.free(@constCast(self.parent_doc_key));
+        if (self.unit_id.len > 0) alloc.free(@constCast(self.unit_id));
         if (self.source_artifact_name.len > 0) alloc.free(@constCast(self.source_artifact_name));
         if (self.artifact_name.len > 0) alloc.free(@constCast(self.artifact_name));
         if (self.artifact_key.len > 0) alloc.free(@constCast(self.artifact_key));
+        if (self.unsupported_reason.len > 0) alloc.free(@constCast(self.unsupported_reason));
         if (self.last_error.len > 0) alloc.free(@constCast(self.last_error));
         self.* = undefined;
     }
@@ -1713,6 +1726,7 @@ pub fn embeddingArtifactRepairIssueFromArtifactAlloc(alloc: Allocator, issue: Ar
     var out = EmbeddingArtifactRepairIssue{
         .artifact_kind = issue.artifact_kind,
         .chunk_id = issue.chunk_id,
+        .repairable = issue.repairable,
         .sequence = issue.sequence,
         .reason = embeddingArtifactRepairReasonFromArtifact(issue.reason),
         .attempts = issue.attempts,
@@ -1723,9 +1737,11 @@ pub fn embeddingArtifactRepairIssueFromArtifactAlloc(alloc: Allocator, issue: Ar
     out.index_name = try alloc.dupe(u8, issue.index_name);
     out.doc_key = try alloc.dupe(u8, issue.doc_key);
     out.parent_doc_key = try alloc.dupe(u8, issue.parent_doc_key);
+    out.unit_id = try alloc.dupe(u8, issue.unit_id);
     out.source_artifact_name = try alloc.dupe(u8, issue.source_artifact_name);
     out.artifact_name = try alloc.dupe(u8, issue.artifact_name);
     out.artifact_key = try alloc.dupe(u8, issue.artifact_key);
+    out.unsupported_reason = try alloc.dupe(u8, issue.unsupported_reason);
     out.last_error = try alloc.dupe(u8, issue.last_error);
     return out;
 }
@@ -1793,6 +1809,7 @@ pub const DBIndexStats = struct {
     repair_degraded: bool = false,
     repair_issue_count: u64 = 0,
     repair_summary_ready: bool = true,
+    repair_issue_count_estimated: bool = false,
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
     replay_catch_up_required: bool = false,

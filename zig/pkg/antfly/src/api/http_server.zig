@@ -7249,6 +7249,7 @@ pub const ApiHttpServer = struct {
             .target = "artifact",
             .limit = limit,
             .scanned = result.scanned,
+            .groups_scanned = result.groups_scanned,
             .has_more = result.has_more,
             .next_cursor = result.next_cursor,
             .issues = result.issues,

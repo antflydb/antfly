@@ -311,16 +311,14 @@ pub fn artifactRepairIssueKeyAlloc(
     alloc: Allocator,
     index_name: []const u8,
     repair_artifact_kind: []const u8,
-    doc_key: []const u8,
-    artifact_name: []const u8,
+    issue_id: []const u8,
 ) ![]u8 {
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);
     try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_issue_kind });
     try appendEncodedComponent(&list, alloc, index_name);
     try appendEncodedComponent(&list, alloc, repair_artifact_kind);
-    try appendEncodedComponent(&list, alloc, doc_key);
-    try appendEncodedComponent(&list, alloc, artifact_name);
+    try appendEncodedComponent(&list, alloc, issue_id);
     return try list.toOwnedSlice(alloc);
 }
 
@@ -349,16 +347,14 @@ pub fn artifactRepairIssueKindKeyAlloc(
     alloc: Allocator,
     repair_artifact_kind: []const u8,
     index_name: []const u8,
-    doc_key: []const u8,
-    artifact_name: []const u8,
+    issue_id: []const u8,
 ) ![]u8 {
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);
     try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_kind_issue_kind });
     try appendEncodedComponent(&list, alloc, repair_artifact_kind);
     try appendEncodedComponent(&list, alloc, index_name);
-    try appendEncodedComponent(&list, alloc, doc_key);
-    try appendEncodedComponent(&list, alloc, artifact_name);
+    try appendEncodedComponent(&list, alloc, issue_id);
     return try list.toOwnedSlice(alloc);
 }
 
@@ -426,15 +422,6 @@ pub fn embeddingArtifactRepairIssueRootPrefixAlloc(alloc: Allocator) ![]u8 {
 
 pub fn embeddingArtifactRepairIssueIndexPrefixAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
     return try artifactRepairIssueIndexPrefixAlloc(alloc, index_name);
-}
-
-pub fn embeddingArtifactRepairIssueKeyAlloc(
-    alloc: Allocator,
-    index_name: []const u8,
-    doc_key: []const u8,
-    artifact_name: []const u8,
-) ![]u8 {
-    return try artifactRepairIssueKeyAlloc(alloc, index_name, "embedding", doc_key, artifact_name);
 }
 
 pub fn chunkArtifactKeyAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const u8, chunk_id: u32) ![]u8 {

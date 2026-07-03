@@ -71,6 +71,7 @@ const auto_bulk_ingest_max_hbc_leaf_splits_per_publish: usize = 256;
 const provisioned_write_coalesce_max_waiters: usize = 64;
 const provisioned_write_coalesce_max_ops: usize = 10_000;
 const startup_obsolete_reclaim_max_steps: usize = 64;
+const artifact_repair_max_groups_per_request: usize = 64;
 // Explicit cache bulk sessions are reserved for rebuild/import paths. Normal
 // API uploads no longer start these windows automatically; DB/storage owns
 // online write batching and L0 maintenance for ordinary write traffic.
@@ -277,6 +278,7 @@ fn appendOwnedArtifactRepairIssues(
 
 fn mergeArtifactRepairResult(dst: *db_mod.types.ArtifactRepairResult, src: db_mod.types.ArtifactRepairResult) void {
     dst.scanned += src.scanned;
+    dst.groups_scanned += src.groups_scanned;
     dst.reprocessed += src.reprocessed;
     dst.repaired += src.repaired;
     dst.missing_source_docs += src.missing_source_docs;
@@ -331,6 +333,7 @@ fn cloneArtifactRepairIssueAlloc(alloc: std.mem.Allocator, issue: db_mod.types.A
     var out = db_mod.types.ArtifactRepairIssue{
         .artifact_kind = issue.artifact_kind,
         .chunk_id = issue.chunk_id,
+        .repairable = issue.repairable,
         .sequence = issue.sequence,
         .reason = issue.reason,
         .attempts = issue.attempts,
@@ -341,9 +344,11 @@ fn cloneArtifactRepairIssueAlloc(alloc: std.mem.Allocator, issue: db_mod.types.A
     out.index_name = try alloc.dupe(u8, issue.index_name);
     out.doc_key = try alloc.dupe(u8, issue.doc_key);
     out.parent_doc_key = try alloc.dupe(u8, issue.parent_doc_key);
+    out.unit_id = try alloc.dupe(u8, issue.unit_id);
     out.source_artifact_name = try alloc.dupe(u8, issue.source_artifact_name);
     out.artifact_name = try alloc.dupe(u8, issue.artifact_name);
     out.artifact_key = try alloc.dupe(u8, issue.artifact_key);
+    out.unsupported_reason = try alloc.dupe(u8, issue.unsupported_reason);
     out.last_error = try alloc.dupe(u8, issue.last_error);
     return out;
 }
@@ -367,6 +372,7 @@ fn parseArtifactRepairListResultAlloc(alloc: std.mem.Allocator, body: []const u8
         .issues = issues,
         .limit = parsed.value.limit,
         .scanned = parsed.value.scanned,
+        .groups_scanned = parsed.value.groups_scanned,
         .next_cursor = if (parsed.value.next_cursor) |cursor| try alloc.dupe(u8, cursor) else null,
         .has_more = parsed.value.has_more,
     };
@@ -378,6 +384,7 @@ fn parseArtifactRepairResultAlloc(alloc: std.mem.Allocator, body: []const u8) !d
 
     return .{
         .scanned = parsed.value.scanned,
+        .groups_scanned = parsed.value.groups_scanned,
         .reprocessed = parsed.value.reprocessed,
         .repaired = parsed.value.repaired,
         .missing_source_docs = parsed.value.missing_source_docs,
@@ -8208,7 +8215,13 @@ pub const ProvisionedTableWriteSource = struct {
             out.deinit(alloc);
         }
 
+        var groups_scanned: usize = 0;
         for (group_ids[start_index..], start_index..) |group_id, idx| {
+            if (groups_scanned >= artifact_repair_max_groups_per_request) {
+                result.has_more = true;
+                result.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, null);
+                break;
+            }
             if (req.limit != 0 and out.items.len >= req.limit) {
                 result.has_more = true;
                 result.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, null);
@@ -8221,6 +8234,8 @@ pub const ProvisionedTableWriteSource = struct {
                 if (idx == start_index) start_cursor else null,
             ))) orelse continue;
             defer group_result.deinit(alloc);
+            groups_scanned += 1;
+            result.groups_scanned += 1;
             result.scanned += group_result.scanned;
             try appendOwnedArtifactRepairIssues(alloc, &out, group_result.issues);
             group_result.issues = &.{};
@@ -8271,7 +8286,13 @@ pub const ProvisionedTableWriteSource = struct {
 
         var total = db_mod.types.ArtifactRepairResult{ .limit = req.limit };
         errdefer total.deinit(alloc);
+        var groups_scanned: usize = 0;
         for (group_ids[start_index..], start_index..) |group_id, idx| {
+            if (groups_scanned >= artifact_repair_max_groups_per_request) {
+                total.has_more = true;
+                total.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, null);
+                break;
+            }
             if (req.limit != 0 and total.scanned >= req.limit) {
                 total.has_more = true;
                 total.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, null);
@@ -8284,6 +8305,8 @@ pub const ProvisionedTableWriteSource = struct {
                 if (idx == start_index) start_cursor else null,
             ))) orelse continue;
             defer result.deinit(alloc);
+            groups_scanned += 1;
+            result.groups_scanned += 1;
             if (result.has_more) {
                 total.has_more = true;
                 total.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, result.next_cursor);
@@ -9520,7 +9543,13 @@ pub const HostedProvisionedTableWriteSource = struct {
             out.deinit(alloc);
         }
 
+        var groups_scanned: usize = 0;
         for (group_ids[start_index..], start_index..) |group_id, idx| {
+            if (groups_scanned >= artifact_repair_max_groups_per_request) {
+                result.has_more = true;
+                result.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, null);
+                break;
+            }
             if (req.limit != 0 and out.items.len >= req.limit) {
                 result.has_more = true;
                 result.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, null);
@@ -9547,6 +9576,8 @@ pub const HostedProvisionedTableWriteSource = struct {
                 };
             } else (try listArtifactRepairIssuesGroupLocal(ptr, alloc, group_id, table_name, group_req)) orelse continue;
             defer group_result.deinit(alloc);
+            groups_scanned += 1;
+            result.groups_scanned += 1;
             result.scanned += group_result.scanned;
             try appendOwnedArtifactRepairIssues(alloc, &out, group_result.issues);
             group_result.issues = &.{};
@@ -9592,7 +9623,13 @@ pub const HostedProvisionedTableWriteSource = struct {
 
         var total = db_mod.types.ArtifactRepairResult{ .limit = req.limit };
         errdefer total.deinit(alloc);
+        var groups_scanned: usize = 0;
         for (group_ids[start_index..], start_index..) |group_id, idx| {
+            if (groups_scanned >= artifact_repair_max_groups_per_request) {
+                total.has_more = true;
+                total.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, null);
+                break;
+            }
             if (req.limit != 0 and total.scanned >= req.limit) {
                 total.has_more = true;
                 total.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, null);
@@ -9619,6 +9656,8 @@ pub const HostedProvisionedTableWriteSource = struct {
                 };
             } else (try repairArtifactIssuesGroupLocal(ptr, alloc, group_id, table_name, group_req)) orelse continue;
             defer group_result.deinit(alloc);
+            groups_scanned += 1;
+            group_result.groups_scanned += 1;
             if (group_result.has_more) {
                 total.has_more = true;
                 total.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, group_result.next_cursor);

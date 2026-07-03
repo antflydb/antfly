@@ -448,6 +448,8 @@ pub const RepairTarget = enum {
 pub const ArtifactRepairRunResult = struct {
     /// Number of repair records attempted by this pass.
     scanned: i64,
+    /// Number of table groups touched by this bounded repair pass.
+    groups_scanned: i64,
     /// Number of artifacts whose source was reprocessed.
     reprocessed: i64,
     /// Number of repair records cleared because the artifact became readable.
@@ -4207,6 +4209,8 @@ pub const ArtifactRepairIssue = struct {
     doc_key: []const u8,
     /// Parent source document key for chunk-derived artifacts.
     parent_doc_key: ?[]const u8 = null,
+    /// Unit identifier for unit-scoped artifacts, when applicable.
+    unit_id: ?[]const u8 = null,
     /// Source artifact stream used to produce this artifact, when applicable.
     source_artifact_name: ?[]const u8 = null,
     /// Derived artifact name that must be reprocessed or made readable.
@@ -4215,6 +4219,10 @@ pub const ArtifactRepairIssue = struct {
     artifact_key: ?[]const u8 = null,
     /// Chunk ordinal for chunk-derived artifacts.
     chunk_id: ?i64 = null,
+    /// Whether this artifact kind currently has an automated repair reprocessor.
+    repairable: bool,
+    /// Stable reason code when repairable is false.
+    unsupported_reason: ?[]const u8 = null,
     /// Derived replay sequence that observed the issue.
     sequence: i64,
     reason: ArtifactRepairReason,
@@ -5515,6 +5523,8 @@ pub const ArtifactRepairIssueList = struct {
     limit: i64,
     /// Number of repair records scanned while building this page.
     scanned: i64,
+    /// Number of table groups touched while building this page.
+    groups_scanned: i64,
     /// Whether another page is available.
     has_more: bool,
     /// Opaque cursor for the next page.
