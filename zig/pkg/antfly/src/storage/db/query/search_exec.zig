@@ -48,6 +48,7 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
 const default_balanced_search_effort: f32 = 0.5;
 const default_late_visibility_exact_candidate_budget: u32 = 100_000;
 const default_exact_native_filter_candidate_budget: u32 = 1024;
+const default_match_all_primary_key_scan_batch_size: usize = 4096;
 var bench_query_profile_counter: std.atomic.Value(u64) = .init(0);
 const bench_query_profile_unknown = std.math.maxInt(u64);
 const bench_query_profile_disabled = std.math.maxInt(u64) - 1;
@@ -530,6 +531,7 @@ pub const MatchAllCandidates = struct {
 pub const MatchAllCandidateCollectOptions = struct {
     candidate_limit: ?u32 = null,
     constraints: ?*const NativeDocIdConstraints = null,
+    scan_batch_size: ?usize = null,
 };
 
 pub const MatchAllExecutor = struct {
@@ -6102,7 +6104,32 @@ pub fn collectMatchAllCandidatesWithOptions(
     errdefer state.deinitCandidates();
 
     if (collector.scan_store_range_with_context) |scan| {
-        try scan(collector.ctx, lower, "", &state, MatchAllCandidateCollectState.scanEntry);
+        var current_lower = try alloc.dupe(u8, lower);
+        defer alloc.free(current_lower);
+        const batch_size = @max(options.scan_batch_size orelse default_match_all_primary_key_scan_batch_size, 1);
+
+        while (true) {
+            var batch = MatchAllPrimaryKeyScanBatch{
+                .alloc = alloc,
+                .req = req,
+                .max_keys = batch_size,
+            };
+            errdefer batch.deinit();
+
+            try scan(collector.ctx, current_lower, "", &batch, MatchAllPrimaryKeyScanBatch.scanEntry);
+            for (batch.raw_keys.items) |*raw_key| {
+                const owned = raw_key.*;
+                raw_key.* = @constCast(&[_]u8{});
+                try state.consumeRawKey(owned);
+            }
+
+            const maybe_next_lower = batch.next_lower;
+            batch.next_lower = null;
+            batch.deinit();
+            const next_lower = maybe_next_lower orelse break;
+            alloc.free(current_lower);
+            current_lower = next_lower;
+        }
     } else {
         const docs = try collector.scan_store_range(collector.ctx, alloc, lower, "");
         defer docstore_mod.DocStore.freeResults(alloc, docs);
@@ -6112,6 +6139,50 @@ pub fn collectMatchAllCandidatesWithOptions(
     return .{ .items = try state.candidates.toOwnedSlice(alloc) };
 }
 
+const MatchAllPrimaryKeyScanBatch = struct {
+    alloc: Allocator,
+    req: types.SearchRequest,
+    max_keys: usize,
+    raw_keys: std.ArrayListUnmanaged([]u8) = .empty,
+    next_lower: ?[]u8 = null,
+    scanned: usize = 0,
+
+    fn deinit(self: *@This()) void {
+        for (self.raw_keys.items) |key| {
+            if (key.len > 0) self.alloc.free(key);
+        }
+        self.raw_keys.deinit(self.alloc);
+        if (self.next_lower) |next| self.alloc.free(next);
+        self.* = undefined;
+    }
+
+    fn scanEntry(ctx: ?*anyopaque, key: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+        const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        self.scanned += 1;
+        if (self.scanned % 1024 == 0) try checkSearchRequestDeadline(self.req);
+
+        if (!internal_keys.isPrimaryDocumentKey(key)) return .@"continue";
+        var raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, key)) orelse return .@"continue";
+        errdefer self.alloc.free(raw_key);
+
+        try self.raw_keys.append(self.alloc, raw_key);
+        raw_key = @constCast(&[_]u8{});
+
+        if (self.raw_keys.items.len >= self.max_keys) {
+            self.next_lower = try exclusiveStoreScanResumeLowerAlloc(self.alloc, key);
+            return .stop;
+        }
+        return .@"continue";
+    }
+};
+
+fn exclusiveStoreScanResumeLowerAlloc(alloc: Allocator, key: []const u8) ![]u8 {
+    const out = try alloc.alloc(u8, key.len + 1);
+    @memcpy(out[0..key.len], key);
+    out[key.len] = 0;
+    return out;
+}
+
 const MatchAllCandidateCollectState = struct {
     alloc: Allocator,
     req: types.SearchRequest,
@@ -6119,25 +6190,28 @@ const MatchAllCandidateCollectState = struct {
     options: MatchAllCandidateCollectOptions,
     candidates: std.ArrayListUnmanaged(MatchAllCandidate) = .empty,
     seen: std.StringHashMapUnmanaged(void) = .{},
-    scanned: usize = 0,
+    processed: usize = 0,
 
     fn deinitCandidates(self: *@This()) void {
         for (self.candidates.items) |*item| item.deinit(self.alloc);
         self.candidates.deinit(self.alloc);
     }
 
-    fn scanEntry(ctx: ?*anyopaque, key: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
-        const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        try self.consumeStoreKey(key);
-        return .@"continue";
-    }
-
     fn consumeStoreKey(self: *@This(), store_key: []const u8) !void {
-        self.scanned += 1;
-        if (self.scanned % 1024 == 0) try checkSearchRequestDeadline(self.req);
+        self.processed += 1;
+        if (self.processed % 1024 == 0) try checkSearchRequestDeadline(self.req);
 
         if (!internal_keys.isPrimaryDocumentKey(store_key)) return;
         var raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, store_key)) orelse return;
+        errdefer self.alloc.free(raw_key);
+
+        const owned = raw_key;
+        raw_key = @constCast(&[_]u8{});
+        try self.consumeRawKey(owned);
+    }
+
+    fn consumeRawKey(self: *@This(), raw_key_owned: []u8) !void {
+        var raw_key = raw_key_owned;
         errdefer self.alloc.free(raw_key);
 
         if (try self.collector.is_expired_key(self.collector.ctx, self.alloc, raw_key)) {
@@ -7108,6 +7182,9 @@ test "match_all streaming collection stops after exact sort budget" {
     const Harness = struct {
         keys: []const []const u8,
         visited: usize = 0,
+        in_scan_callback: bool = false,
+        expired_checks: usize = 0,
+        ordinal_lookups: usize = 0,
 
         fn scanStoreRange(
             _: ?*anyopaque,
@@ -7126,14 +7203,26 @@ test "match_all streaming collection stops after exact sort budget" {
             callback: docstore_mod.DocStore.ScanWithContextCallback,
         ) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.in_scan_callback = true;
+            defer self.in_scan_callback = false;
             for (self.keys) |key| {
                 self.visited += 1;
                 if (try callback(scan_ctx, key, "{}") == .stop) return;
             }
         }
 
-        fn isExpiredKey(_: ?*anyopaque, _: Allocator, _: []const u8) anyerror!bool {
+        fn isExpiredKey(ctx: ?*anyopaque, _: Allocator, _: []const u8) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            try std.testing.expect(!self.in_scan_callback);
+            self.expired_checks += 1;
             return false;
+        }
+
+        fn lookupDocOrdinal(ctx: ?*anyopaque, _: Allocator, _: []const u8, _: ?u64) anyerror!?doc_set.DocOrdinal {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            try std.testing.expect(!self.in_scan_callback);
+            self.ordinal_lookups += 1;
+            return @intCast(self.ordinal_lookups);
         }
     };
 
@@ -7143,8 +7232,14 @@ test "match_all streaming collection stops after exact sort budget" {
         .scan_store_range = Harness.scanStoreRange,
         .scan_store_range_with_context = Harness.scanStoreRangeWithContext,
         .is_expired_key = Harness.isExpiredKey,
-    }, .{ .candidate_limit = 1 }));
+        .lookup_doc_ordinal = Harness.lookupDocOrdinal,
+    }, .{
+        .candidate_limit = 1,
+        .scan_batch_size = 2,
+    }));
     try std.testing.expectEqual(@as(usize, 2), harness.visited);
+    try std.testing.expectEqual(@as(usize, 2), harness.expired_checks);
+    try std.testing.expectEqual(@as(usize, 2), harness.ordinal_lookups);
 }
 
 test "match_all consumes resolved ordinal filters without doc id projection" {
