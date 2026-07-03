@@ -20988,6 +20988,10 @@ fn replayDocumentStoreKeyAlloc(alloc: Allocator, key: []const u8) ![]u8 {
         try internal_keys.documentKeyAlloc(alloc, key);
 }
 
+fn replayDocumentKeyInRange(byte_range: types.ByteRange, key: []const u8) bool {
+    return internal_keys.isInternalUserKey(key) or byte_range.contains(key);
+}
+
 const OwnedSparseFieldWrites = struct {
     alloc: Allocator,
     items: []sparse_mod.SparseWrite = &.{},
@@ -21046,7 +21050,7 @@ fn collectSparseFieldWritesProfiled(
     const scan_start_ns = if (profile != null) monotonicTimeNs() else 0;
     for (documents) |doc| {
         if (doc.action != .upsert) continue;
-        if (!byte_range.contains(doc.key)) continue;
+        if (!replayDocumentKeyInRange(byte_range, doc.key)) continue;
         if (opts.skip_doc_keys) |skip_doc_keys| {
             if (skip_doc_keys.contains(doc.key)) continue;
         }
@@ -21205,7 +21209,7 @@ fn collectDocumentWritesProfiled(
     const scan_start_ns = if (profile != null) monotonicTimeNs() else 0;
     for (documents) |doc| {
         if (doc.action != .upsert) continue;
-        if (!byte_range.contains(doc.key)) continue;
+        if (!replayDocumentKeyInRange(byte_range, doc.key)) continue;
         if (opts.skip_doc_keys) |skip_doc_keys| {
             if (skip_doc_keys.contains(doc.key)) continue;
         }
@@ -21396,7 +21400,7 @@ fn applyTextDocumentsForIndex(
 
     for (documents) |doc| {
         if (doc.action != .upsert) continue;
-        if (!byte_range.contains(doc.key)) continue;
+        if (!replayDocumentKeyInRange(byte_range, doc.key)) continue;
         if (!documentTargetsTextIndex(doc, index_name, chunk_name != null)) continue;
         if (trust_inline and doc.cleaned_value != null) {
             try writes.append(alloc, .{
@@ -36178,7 +36182,7 @@ test "db default full text index searches template chunk text when chunker full 
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 }
 
-test "db full_text sync level does not run template chunk full text routing" {
+test "db full_text sync level does not precompute template chunk full text routing" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -36223,6 +36227,18 @@ test "db full_text sync level does not run template chunk full text routing" {
     defer result.deinit();
 
     try std.testing.expectEqual(@as(u32, 0), result.total_hits);
+
+    try db.enrichment_runtime.?.waitForApplied(1);
+
+    const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "semantic_template_chunked_idx_chunks");
+    defer alloc.free(chunk_prefix);
+    const artifacts = try db.core.store.scanPrefix(alloc, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+    var chunk_count: usize = 0;
+    for (artifacts) |entry| {
+        if (internal_keys.isChunkArtifactRecordKey(entry.key)) chunk_count += 1;
+    }
+    try std.testing.expect(chunk_count > 0);
 }
 
 test "cloneManagedSyncTargetsAll duplicates names independently" {

@@ -10884,6 +10884,7 @@ fn jsonValueHasGeneratedEnrichment(alloc: std.mem.Allocator, value: std.json.Val
             if (object.get("kind")) |kind| {
                 if (kind == .string and (std.mem.eql(u8, kind.string, "asset") or std.mem.eql(u8, kind.string, "chunk"))) return true;
             }
+            if (object.get("generator") != null or object.get("chunker") != null) return true;
             var it = object.iterator();
             while (it.next()) |entry| {
                 if (try jsonValueHasGeneratedEnrichment(alloc, entry.value_ptr.*)) return true;
@@ -10989,6 +10990,20 @@ test "provisioning does not require asset producer for copy graph shorthand asse
         \\  "name":"relations_graph",
         \\  "kind":"graph",
         \\  "config_json":"{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"field\":\"relations\"}}"
+        \\}]
+    ));
+}
+
+test "provisioning detects generated embedding chunkers inside index metadata" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try indexesJsonHasGeneratedEnrichment(alloc,
+        \\{"semantic_chunked_idx":{"type":"embeddings","field":"body","dimension":3,"chunker":{"provider":"antfly","model":"fixed-bert-tokenizer","store_chunks":false,"full_text_index":{},"text":{"target_tokens":4,"overlap_tokens":1,"separator":" "}}}}
+    ));
+    try std.testing.expect(try indexesJsonHasGeneratedEnrichment(alloc,
+        \\[{
+        \\  "name":"semantic_chunked_idx",
+        \\  "type":"embeddings",
+        \\  "config_json":"{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunker\":{\"provider\":\"antfly\",\"model\":\"fixed-bert-tokenizer\",\"store_chunks\":false}}}"
         \\}]
     ));
 }
