@@ -3043,6 +3043,7 @@ pub fn build(b: *std.Build) void {
         "data runtime raft status changes force immediate store status publication",
         "data runtime structural changes preserve writer-published runtime status",
         "data runtime startup catch-up prefers cached admin snapshot",
+        "data runtime startup catch-up clears dirty bit for terminal degraded index load",
         "data runtime startup catch-up clears no-debt busy writer groups",
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
@@ -3513,6 +3514,7 @@ pub fn build(b: *std.Build) void {
         "provisioned table write source cached runtime status does not fetch catalog coverage",
         "managed startup catch-up uses provided indexes json without catalog fetch",
         "managed startup catch-up marks FileNotFound index open terminal degraded",
+        "managed startup catch-up finishes restore repair before terminal index load degradation",
         "idle startup runtime status preserves live empty cached status",
         "api http server serves table batch transforms",
         "api http server updates local table schema through bound write source",
@@ -3842,6 +3844,7 @@ pub fn build(b: *std.Build) void {
             "idle startup runtime status publish is live when startup flag is still set",
             "managed startup catch-up uses provided indexes json without catalog fetch",
             "managed startup catch-up marks FileNotFound index open terminal degraded",
+            "managed startup catch-up finishes restore repair before terminal index load degradation",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

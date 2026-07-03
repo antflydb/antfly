@@ -3817,6 +3817,7 @@ pub const ProvisionedTableWriteSource = struct {
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     dropped_table_delete_owner_id: u64 = 0,
     restore_repair_work_group: Io.Group = .init,
+    restore_repair_shutdown: std.atomic.Value(bool) = .init(false),
     restore_repair_completion_mutex: Io.Mutex = .init,
     restore_repair_completion_group: Io.Group = .init,
     restore_repair_completion_scheduled: std.atomic.Value(bool) = .init(false),
@@ -4028,6 +4029,7 @@ pub const ProvisionedTableWriteSource = struct {
     pub fn deinit(self: *ProvisionedTableWriteSource) void {
         self.drainDroppedTableDeletes();
         const io = self.table_activity_threaded.io();
+        self.restore_repair_shutdown.store(true, .release);
         self.restore_repair_work_group.await(io) catch {};
         self.restore_repair_completion_group.await(io) catch {};
         self.freeRestoreRepairCompletions();
@@ -6832,6 +6834,7 @@ pub const ProvisionedTableWriteSource = struct {
             var attempts: usize = 0;
             std.log.info("restore background catch-up begin table={s} group_id={d}", .{ work.table_name, work.group_id });
             while (true) {
+                if (work.source.restore_repair_shutdown.load(.acquire)) return;
                 attempts += 1;
                 const busy = try work.repairOnce(path);
                 const still_needed = try db_mod.DB.restoreRuntimeRepairNeededForPath(work.alloc, path);
@@ -6870,13 +6873,16 @@ pub const ProvisionedTableWriteSource = struct {
             const indexes_json = (try loadTableIndexesJson(self.alloc, self.source.catalog, self.table_name)) orelse return true;
             defer self.alloc.free(indexes_json);
 
-            var db = try self.source.openRestoreRepairDbForGroup(
+            var db = self.source.openRestoreRepairDbForGroup(
                 self.alloc,
                 path,
                 self.group_id,
                 self.table_name,
                 indexes_json,
-            );
+            ) catch |err| switch (err) {
+                error.LsmRootWriterAlreadyOpen, error.WriterLocked => return true,
+                else => return err,
+            };
             defer db.close();
 
             if (try db.repairRestoreRuntimeStateStepIfNeeded(self.alloc)) {
@@ -6894,6 +6900,7 @@ pub const ProvisionedTableWriteSource = struct {
     };
 
     fn requestRestoreRepairCatchUp(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
+        if (self.restore_repair_shutdown.load(.acquire)) return;
         const alloc = std.heap.page_allocator;
         const work = alloc.create(RestoreRepairCatchUpWork) catch |err| {
             std.log.warn("restore background catch-up allocation failed table={s} group_id={d} err={}", .{ table_name, group_id, err });
