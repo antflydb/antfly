@@ -69,6 +69,19 @@ pub const ListDocumentArtifactManifestsParams = struct {
     detail: ?[]const u8 = null,
 };
 
+pub const ListArtifactRepairIssuesParams = struct {
+    /// Restrict results to one artifact kind.
+    kind: ?[]const u8 = null,
+    /// Restrict results to one index name.
+    index: ?[]const u8 = null,
+    /// Opaque cursor returned by a prior response.
+    cursor: ?[]const u8 = null,
+    /// Maximum repair records to return. Must be greater than zero.
+    limit: ?[]const u8 = null,
+    /// Repair subsystem to list. Defaults to artifact.
+    target: ?[]const u8 = null,
+};
+
 pub const GetDocumentArtifactManifestParams = struct {
     /// Response detail level. `summary` returns typed manifest fields only. `raw` also includes opaque manifest/state JSON and requires table admin permission when authentication is enabled.
     detail: ?[]const u8 = null,
@@ -693,6 +706,68 @@ pub const Client = struct {
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.TableArtifactEnrichmentList).fromResponse(self.allocator, &resp);
+    }
+
+    /// List artifact repair issues
+    /// GET /db/v1/tables/{tableName}/repair/issues
+    pub fn listArtifactRepairIssues(self: *@This(), table_name: []const u8, params: ListArtifactRepairIssuesParams) !ApiResponse(types.ArtifactRepairIssueList) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/repair/issues", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.kind) |v| {
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "kind=");
+            try query_buf.appendSlice(self.allocator, v);
+            sep = '&';
+        }
+        if (params.index) |v| {
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "index=");
+            try query_buf.appendSlice(self.allocator, v);
+            sep = '&';
+        }
+        if (params.cursor) |v| {
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, v);
+            sep = '&';
+        }
+        if (params.limit) |v| {
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, v);
+            sep = '&';
+        }
+        if (params.target) |v| {
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "target=");
+            try query_buf.appendSlice(self.allocator, v);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ArtifactRepairIssueList).fromResponse(self.allocator, &resp);
+    }
+
+    /// Run a bounded artifact repair pass
+    /// POST /db/v1/tables/{tableName}/repair/run
+    pub fn repairArtifactIssues(self: *@This(), table_name: []const u8, body: types.RepairRunRequest) !ApiResponse(types.ArtifactRepairRunResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/repair/run", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.ArtifactRepairRunResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Reprocess a derived document artifact across a table range

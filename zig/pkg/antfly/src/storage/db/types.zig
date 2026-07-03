@@ -1645,6 +1645,7 @@ pub const ArtifactRepairListResult = struct {
 
 pub const ArtifactRepairRunRequest = struct {
     artifact_kind: ?ArtifactRepairKind = null,
+    index_name: ?[]const u8 = null,
     limit: u32 = 100,
     cursor: ?[]const u8 = null,
 };

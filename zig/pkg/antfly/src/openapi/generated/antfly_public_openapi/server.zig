@@ -300,6 +300,36 @@ pub const ListArtifactEnrichmentsPathParams = struct {
     table_name: []const u8,
 };
 
+/// List artifact repair issues
+pub const ListArtifactRepairIssuesPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+};
+
+pub const ListArtifactRepairIssuesParams = struct {
+    /// Restrict results to one artifact kind.
+    kind: ?[]const u8 = null,
+    /// Restrict results to one index name.
+    index: ?[]const u8 = null,
+    /// Opaque cursor returned by a prior response.
+    cursor: ?[]const u8 = null,
+    /// Maximum repair records to return. Must be greater than zero.
+    limit: ?[]const u8 = null,
+    /// Repair subsystem to list. Defaults to artifact.
+    target: ?[]const u8 = null,
+};
+
+/// Run a bounded artifact repair pass
+pub const RepairArtifactIssuesPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for repairArtifactIssues.
+pub fn parseRepairArtifactIssuesBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RepairRunRequest) {
+    return std.json.parseFromSlice(types.RepairRunRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Reprocess a derived document artifact across a table range
 pub const ReprocessDocumentArtifactRangePathParams = struct {
     /// Name of the table
@@ -673,6 +703,8 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey" },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests" },
     .{ .method = "GET", .path = "/tables/{tableName}/artifacts", .operation_id = "listArtifactEnrichments" },
+    .{ .method = "GET", .path = "/tables/{tableName}/repair/issues", .operation_id = "listArtifactRepairIssues" },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/run", .operation_id = "repairArtifactIssues" },
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifactRange" },
     .{ .method = "PUT", .path = "/tables/{tableName}/artifacts/{artifactName}/enrichment", .operation_id = "putArtifactEnrichment" },
     .{ .method = "DELETE", .path = "/tables/{tableName}/artifacts/{artifactName}/enrichment", .operation_id = "deleteArtifactEnrichment" },
@@ -755,6 +787,8 @@ pub const routes = [_]Route{
 //   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
 //   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !httpx.Response
 //   fn listArtifactEnrichments(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn listArtifactRepairIssues(self: *Impl, ctx: *httpx.Context, table_name: []const u8, params: ListArtifactRepairIssuesParams) !httpx.Response
+//   fn repairArtifactIssues(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn reprocessDocumentArtifactRange(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn putArtifactEnrichment(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn deleteArtifactEnrichment(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response

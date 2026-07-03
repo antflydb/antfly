@@ -363,6 +363,115 @@ pub const TableArtifactEnrichmentList = struct {
     artifacts: []const antfly_indexes_openapi.EnrichmentConfig,
 };
 
+/// Kind of stored artifact tracked by the repair queue.
+pub const ArtifactRepairKind = enum {
+    embedding,
+    asset,
+    chunk,
+    graph,
+    full_text,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .embedding => "embedding",
+            .asset => "asset",
+            .chunk => "chunk",
+            .graph => "graph",
+            .full_text => "full_text",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "embedding", .embedding },
+            .{ "asset", .asset },
+            .{ "chunk", .chunk },
+            .{ "graph", .graph },
+            .{ "full_text", .full_text },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Reason an artifact was added to the repair queue.
+pub const ArtifactRepairReason = enum {
+    missing_artifact,
+    corrupt_artifact,
+    unreadable_artifact,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .missing_artifact => "missing_artifact",
+            .corrupt_artifact => "corrupt_artifact",
+            .unreadable_artifact => "unreadable_artifact",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "missing_artifact", .missing_artifact },
+            .{ "corrupt_artifact", .corrupt_artifact },
+            .{ "unreadable_artifact", .unreadable_artifact },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Repair subsystem to inspect or run. This release implements artifact repair.
+pub const RepairTarget = enum {
+    artifact,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .artifact => "artifact",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "artifact", .artifact },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Result of one bounded artifact repair pass.
+pub const ArtifactRepairRunResult = struct {
+    /// Number of repair records attempted by this pass.
+    scanned: i64,
+    /// Number of artifacts whose source was reprocessed.
+    reprocessed: i64,
+    /// Number of repair records cleared because the artifact became readable.
+    repaired: i64,
+    /// Number of repair records whose source document no longer exists.
+    missing_source_docs: i64,
+    /// Number of supported repair attempts that failed.
+    failed: i64,
+    /// Number of repair records skipped because no reprocessor exists for the artifact kind.
+    unsupported: i64,
+    /// Effective repair limit.
+    limit: i64,
+    /// Opaque cursor for the next repair pass.
+    next_cursor: ?[]const u8 = null,
+    /// Whether repair debt remains after this bounded pass.
+    has_more: bool,
+};
+
 pub const DocumentArtifactReprocessResponse = struct {
     /// Indicates that reprocessing was accepted.
     reprocess: []const u8,
@@ -1873,6 +1982,61 @@ pub const DocumentArtifactManifest = struct {
     state_json: ?[]const u8 = null,
 };
 
+/// Durable repair debt for a derived artifact. This is an operator-facing record and includes exact source and artifact identifiers.
+pub const ArtifactRepairIssue = struct {
+    artifact_kind: ArtifactRepairKind,
+    /// Index whose replay or derived state observed the artifact problem.
+    index_name: []const u8,
+    /// Source or derived document key whose artifact is missing or unreadable.
+    doc_key: []const u8,
+    /// Parent source document key for chunk-derived artifacts.
+    parent_doc_key: ?[]const u8 = null,
+    /// Source artifact stream used to produce this artifact, when applicable.
+    source_artifact_name: ?[]const u8 = null,
+    /// Derived artifact name that must be reprocessed or made readable.
+    artifact_name: []const u8,
+    /// Hex-encoded internal artifact storage key, when known.
+    artifact_key: ?[]const u8 = null,
+    /// Chunk ordinal for chunk-derived artifacts.
+    chunk_id: ?i64 = null,
+    /// Derived replay sequence that observed the issue.
+    sequence: i64,
+    reason: ArtifactRepairReason,
+    /// Number of repair attempts made for this issue.
+    attempts: i64,
+    /// Monotonic timestamp when this issue was first recorded.
+    first_seen_ns: i64,
+    /// Monotonic timestamp when this issue was last observed or attempted.
+    last_seen_ns: i64,
+    /// Last stable repair error code, when a repair attempt failed.
+    last_error: ?[]const u8 = null,
+};
+
+/// Bounded request to run a table repair pass.
+pub const RepairRunRequest = struct {
+    target: ?RepairTarget = null,
+    kind: ?ArtifactRepairKind = null,
+    artifact_kind: ?ArtifactRepairKind = null,
+    /// Restrict artifact repair attempts to one index name.
+    index: ?[]const u8 = null,
+    /// Backward-compatible alias for index.
+    index_name: ?[]const u8 = null,
+    /// Opaque cursor returned by a prior repair response.
+    cursor: ?[]const u8 = null,
+    /// Maximum repair records to attempt.
+    limit: ?i64 = null,
+};
+
+/// Response for a bounded artifact repair pass.
+pub const ArtifactRepairRunResponse = struct {
+    /// Table whose repair queue was processed.
+    table: []const u8,
+    target: RepairTarget,
+    /// Effective repair limit.
+    limit: i64,
+    result: ArtifactRepairRunResult,
+};
+
 /// Bounded request for reprocessing a derived artifact across source rows in key order.
 pub const DocumentArtifactTableReprocessRequest = struct {
     /// Exclusive lower bound source document key. Use the prior response next_key to continue.
@@ -2385,6 +2549,22 @@ pub const DocumentArtifactManifestList = struct {
     /// Stable identity of the source document.
     document_id: []const u8,
     artifacts: []const DocumentArtifactManifest,
+};
+
+/// Bounded page of artifact repair queue entries.
+pub const ArtifactRepairIssueList = struct {
+    /// Table whose repair queue was listed.
+    table: []const u8,
+    target: RepairTarget,
+    /// Effective page limit.
+    limit: i64,
+    /// Number of repair records scanned while building this page.
+    scanned: i64,
+    /// Whether another page is available.
+    has_more: bool,
+    /// Opaque cursor for the next page.
+    next_cursor: ?[]const u8 = null,
+    issues: []const ArtifactRepairIssue,
 };
 
 pub const ClusterTopology = struct {

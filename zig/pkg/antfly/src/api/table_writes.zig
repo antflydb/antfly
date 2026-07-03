@@ -321,6 +321,7 @@ fn artifactRepairRunRequestForShard(
 ) db_mod.types.ArtifactRepairRunRequest {
     return .{
         .artifact_kind = req.artifact_kind,
+        .index_name = req.index_name,
         .limit = limit,
         .cursor = cursor,
     };

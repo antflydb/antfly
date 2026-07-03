@@ -113,8 +113,8 @@ pub const Routes = struct {
     pub const indexes_suffix = "/indexes";
     pub const indexes_marker = "/indexes/";
     pub const artifacts_suffix = "/artifacts";
-    pub const artifact_repair_suffix = "/repair/artifacts";
-    pub const artifact_repair_run_suffix = "/repair/artifacts/run";
+    pub const artifact_repair_suffix = "/repair/issues";
+    pub const artifact_repair_run_suffix = "/repair/run";
     pub const documents_marker = "/documents/";
     pub const artifacts_marker = "/artifacts/";
     pub const reprocess_suffix = "/reprocess";
@@ -1305,9 +1305,9 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("docs", backup.table_name);
     const restore = Routes.matchTableRestore("/tables/docs/restore").?;
     try std.testing.expectEqualStrings("docs", restore.table_name);
-    const repair = Routes.matchTableArtifactRepair("/tables/docs/repair/artifacts").?;
+    const repair = Routes.matchTableArtifactRepair("/tables/docs/repair/issues").?;
     try std.testing.expectEqualStrings("docs", repair.table_name);
-    const repair_run = Routes.matchTableArtifactRepairRun("/tables/docs/repair/artifacts/run").?;
+    const repair_run = Routes.matchTableArtifactRepairRun("/tables/docs/repair/run").?;
     try std.testing.expectEqualStrings("docs", repair_run.table_name);
     const indexes = Routes.matchTableIndexes("/tables/docs/indexes").?;
     try std.testing.expectEqualStrings("docs", indexes.table_name);
