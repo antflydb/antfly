@@ -47826,6 +47826,72 @@ test "db dense artifact rebuild trusts clean projection checkpoint without artif
     try std.testing.expectEqual(stats.indexes[0].replay_target_sequence -| checkpoint.applied_sequence, stats.indexes[0].checkpoint_replay_tail_sequence_count);
 }
 
+test "db dense projection checkpoint prefers hbc metadata over corrupt sidecar" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const dense_cfg: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    };
+    var target_sequence: u64 = 0;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(dense_cfg);
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
+            },
+            .sync_level = .full_index,
+        });
+
+        target_sequence = db.core.nextDerivedSequence() -| 1;
+        try db.core.saveProjectionCheckpoint("dense_idx", .{
+            .applied_sequence = target_sequence,
+            .status = .clean,
+            .generation = 11,
+            .config_hash = types.indexConfigHash(dense_cfg),
+        });
+
+        const checkpoint_path = db.core.applied_sequence_checkpoint_path orelse return error.TestUnexpectedResult;
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
+            .sub_path = checkpoint_path,
+            .data = "not-a-derived-apply-checkpoint",
+        });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const checkpoint = try reopened.core.loadProjectionCheckpoint(alloc, "dense_idx");
+    try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
+    try std.testing.expectEqual(@as(u64, 11), checkpoint.generation);
+    try std.testing.expectEqual(types.indexConfigHash(dense_cfg), checkpoint.config_hash);
+    try std.testing.expectEqual(target_sequence, checkpoint.applied_sequence);
+
+    const stats = try reopened.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(usize, 1), stats.indexes.len);
+    try std.testing.expectEqual(checkpoint.applied_sequence, stats.indexes[0].projection_checkpoint_applied_sequence);
+    try std.testing.expectEqual(@as(u64, 11), stats.indexes[0].projection_checkpoint_generation);
+}
+
 test "db dense artifact rebuild rejects clean checkpoint for stale config identity" {
     const alloc = std.testing.allocator;
 

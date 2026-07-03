@@ -698,6 +698,9 @@ pub const DBCore = struct {
     }
 
     pub fn loadAppliedSequence(self: *DBCore, alloc: Allocator, index_name: []const u8) !u64 {
+        if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |dense_checkpoint| {
+            if (dense_checkpoint.config_hash != 0) return dense_checkpoint.applied_sequence;
+        }
         return try apply_state.loadAppliedSequenceWithCheckpoint(
             alloc,
             self.store,
@@ -707,16 +710,15 @@ pub const DBCore = struct {
     }
 
     pub fn loadProjectionCheckpoint(self: *DBCore, alloc: Allocator, index_name: []const u8) !apply_state.ProjectionCheckpoint {
-        const sidecar_checkpoint = try apply_state.loadProjectionCheckpointWithSidecar(
+        if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |dense_checkpoint| {
+            if (dense_checkpoint.config_hash != 0) return dense_checkpoint;
+        }
+        return try apply_state.loadProjectionCheckpointWithSidecar(
             alloc,
             self.store,
             self.applied_sequence_checkpoint_path,
             index_name,
         );
-        if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |dense_checkpoint| {
-            if (dense_checkpoint.config_hash != 0) return dense_checkpoint;
-        }
-        return sidecar_checkpoint;
     }
 
     pub fn indexRequiresEnrichmentReplay(self: *DBCore, index_name: []const u8) !bool {
