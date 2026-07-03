@@ -12761,12 +12761,8 @@ fn catchUpManagedDb(
         std.log.warn("managed startup catch-up dense rebuild probe failed table={s} err={}", .{ table_name, err });
         return err;
     };
-    const has_index_load_failure = try managedDbHasIndexLoadFailure(alloc, db);
-    if (has_index_load_failure) {
-        try publishRuntimeStatusSnapshotWithStartupPhaseMode(source, alloc, table_name, group_id, .idle, .consistent, db);
-        return .{ .had_debt = true, .terminal_degraded = true };
-    }
-    const initial_repair_debt = had_debt or restore_repair_needed or needs_dense_artifact_rebuild;
+    const initial_index_load_failure = try managedDbHasIndexLoadFailure(alloc, db);
+    const initial_repair_debt = had_debt or restore_repair_needed or needs_dense_artifact_rebuild or initial_index_load_failure;
 
     var repaired_restore_runtime = false;
     var repaired_dense_artifacts: usize = 0;
@@ -12887,6 +12883,13 @@ fn catchUpManagedDb(
         return .{
             .had_debt = initial_repair_debt,
             .cleared_debt = false,
+        };
+    }
+    if (try managedDbHasIndexLoadFailure(alloc, db)) {
+        try publishRuntimeStatusSnapshotWithStartupPhaseMode(source, alloc, table_name, group_id, .idle, .consistent, db);
+        return .{
+            .had_debt = true,
+            .terminal_degraded = true,
         };
     }
     return .{
@@ -22727,6 +22730,101 @@ test "managed startup catch-up marks FileNotFound index open terminal degraded" 
     try std.testing.expect(status.stats.indexes[0].repair_degraded);
     try std.testing.expect(status.stats.indexes[0].load_error != null);
     try std.testing.expectEqualStrings("FileNotFound", status.stats.indexes[0].load_error.?);
+}
+
+test "managed startup catch-up finishes restore repair before terminal index load degradation" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-restore-before-terminal-load", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+    const indexes_json = "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}";
+    const identity_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 7001, .range_id = 7001 };
+
+    {
+        var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+            alloc,
+            path,
+            indexes_json,
+            null,
+            null,
+            table_reads.backend_current_root_generation,
+            null,
+            .default,
+            null,
+            null,
+            null,
+            null,
+            identity_namespace,
+        );
+        defer db.close();
+    }
+    try db_mod.DB.markRestorePrimaryRestoredForPath(alloc, path, "snap1", "local", "snap1/groups/7001", 7001);
+    try std.testing.expect(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, path));
+
+    const NoCatalog = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var catalog = NoCatalog{};
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var startup_write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer startup_write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
+    source.runtime_status_cache = &snapshot_cache;
+    source.startup_write_cache = &startup_write_cache;
+
+    index_manager_mod.test_inject_index_open_error = error.FileNotFound;
+    defer index_manager_mod.test_inject_index_open_error = null;
+
+    var repair_passes: usize = 0;
+    while (try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, path)) : (repair_passes += 1) {
+        if (repair_passes > 16) return error.TestUnexpectedResult;
+        const result = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
+            .indexes_json = indexes_json,
+            .schema_json = "",
+            .identity_namespace = identity_namespace,
+        });
+        try std.testing.expect(!result.busy);
+        try std.testing.expect(result.had_debt);
+        try std.testing.expect(!result.terminal_degraded);
+        try std.testing.expect(!result.cleared_debt);
+    }
+    try std.testing.expect(repair_passes > 0);
+
+    const terminal = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
+        .indexes_json = indexes_json,
+        .schema_json = "",
+        .identity_namespace = identity_namespace,
+    });
+    try std.testing.expect(!terminal.busy);
+    try std.testing.expect(terminal.had_debt);
+    try std.testing.expect(terminal.terminal_degraded);
+    try std.testing.expect(!terminal.cleared_debt);
+    try std.testing.expectEqual(@as(usize, 0), catalog.calls);
 }
 
 test "managed startup catch-up reclaims due obsolete primary run files" {
