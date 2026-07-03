@@ -16551,6 +16551,27 @@ test "index load state tracks generic index names independently" {
     try std.testing.expect(manager.indexLoadComplete("sp_v1"));
 }
 
+test "index load state allocation failure leaves no borrowed key behind" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "generic-index-load-state-oom");
+    defer cleanupIndexManagerDir(path);
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+
+    failing.fail_index = failing.alloc_index + 1;
+    try std.testing.expectError(error.OutOfMemory, manager.beginIndexLoadNoLock("ft_v1"));
+    failing.fail_index = std.math.maxInt(usize);
+
+    try std.testing.expectEqual(@as(usize, 0), manager.index_load_states.count());
+    try std.testing.expect(manager.indexLoadComplete("ft_v1"));
+    try manager.beginIndexLoadNoLock("ft_v1");
+    try std.testing.expect(!manager.indexLoadComplete("ft_v1"));
+}
+
 test "dense artifact preload session reuses cached raw values across calls" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

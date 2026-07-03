@@ -668,6 +668,7 @@ const dense_catch_up_startup_max_chunk_bytes_default: u64 = 512 * 1024;
 const dense_catch_up_startup_cache_nodes_default: usize = 2048;
 const dense_catch_up_startup_cache_vectors_default: usize = 2048;
 const graph_repair_rebuild_batch_size: usize = 2048;
+var test_graph_repair_stream_flushes: std.atomic.Value(u64) = .init(0);
 const dense_posting_idle_default_max_postings_per_index: usize = 64;
 const dense_posting_idle_default_max_layout_changes_per_index: usize = 8;
 const dense_posting_idle_default_max_boundary_reassignments_per_index: usize = 64;
@@ -26431,6 +26432,9 @@ fn applySplitGraphArtifactsForIndexStreaming(
 
         fn flush(state: *@This()) !void {
             if (state.keys.items.len == 0) return;
+            if (comptime builtin.is_test) {
+                _ = test_graph_repair_stream_flushes.fetchAdd(1, .monotonic);
+            }
             state.mutation_count += try applySplitGraphArtifactsForIndex(
                 state.dest_store,
                 state.dest_indexes,
@@ -37562,6 +37566,7 @@ test "db index repair streams graph artifact rebuild in batches" {
     }
     try db.core.store.putBatch(writes.items, &.{});
 
+    test_graph_repair_stream_flushes.store(0, .monotonic);
     var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
         .target = .index,
         .artifact_kind = .graph,
@@ -37573,6 +37578,7 @@ test "db index repair streams graph artifact rebuild in batches" {
     try std.testing.expectEqual(@as(u64, @intCast(total_edges)), repair.reprocessed);
     try std.testing.expectEqual(@as(u64, 1), repair.repaired);
     try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
+    try std.testing.expectEqual(@as(u64, 2), test_graph_repair_stream_flushes.load(.monotonic));
 
     const last_source = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{total_edges - 1});
     defer alloc.free(last_source);
