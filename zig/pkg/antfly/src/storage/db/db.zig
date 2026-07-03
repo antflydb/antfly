@@ -10393,16 +10393,28 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         rebuild_targets: []const DenseArtifactRebuildTarget,
-    ) !?DenseArtifactTargetCounts {
+    ) !DenseArtifactTargetCounts {
         var counts: DenseArtifactTargetCounts = .{};
         errdefer counts.deinit(alloc);
 
+        var source_counts = std.HashMapUnmanaged(DenseArtifactTargetKey, u64, DenseArtifactTargetKeyContext, 80).empty;
+        defer source_counts.deinit(alloc);
+
         for (rebuild_targets) |target| {
             const entry = &self.core.index_manager.dense_indexes.items[target.dense_index_idx];
-            const count = (try loadDenseArtifactTargetCounter(alloc, self.core.store, entry.config.name)) orelse return null;
+            const count = (try loadDenseArtifactTargetCounter(alloc, self.core.store, entry.config.name)) orelse 0;
             try counts.per_target_index.put(alloc, target.dense_index_idx, count);
-            counts.total_target_artifacts +|= count;
+
+            const source_key: DenseArtifactTargetKey = .{
+                .artifact_name = denseArtifactNameForEntry(entry),
+                .dims = entry.dims,
+            };
+            const gop = try source_counts.getOrPut(alloc, source_key);
+            if (!gop.found_existing or count > gop.value_ptr.*) gop.value_ptr.* = count;
         }
+
+        var source_it = source_counts.valueIterator();
+        while (source_it.next()) |count| counts.total_target_artifacts +|= count.*;
 
         return counts;
     }
@@ -10505,8 +10517,7 @@ pub const DB = struct {
             try candidate_targets.append(alloc, .{ .dense_index_idx = candidate.dense_index_idx });
         }
 
-        var target_counts = (try self.collectDenseArtifactTargetCountsFromCounters(alloc, candidate_targets.items)) orelse
-            try self.collectDenseArtifactTargetCounts(alloc, candidate_targets.items);
+        var target_counts = try self.collectDenseArtifactTargetCountsFromCounters(alloc, candidate_targets.items);
         defer target_counts.deinit(alloc);
 
         for (candidates.items) |*candidate| {
@@ -48097,6 +48108,62 @@ test "db dense artifact rebuild checks artifact counters before clean checkpoint
     try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].doc_count);
 }
 
+test "db dense artifact rebuild does not recount counterless artifacts during startup" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const dense_cfg: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(dense_cfg);
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(stored_key);
+        try db.core.store.putBatch(&.{
+            .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
+        }, &.{});
+        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dense_idx");
+        defer alloc.free(artifact_key);
+        try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0, 0 });
+
+        const target_sequence = db.core.nextDerivedSequence() -| 1;
+        try db.core.saveProjectionCheckpoint("dense_idx", .{
+            .applied_sequence = target_sequence,
+            .status = .clean,
+            .generation = 9,
+            .config_hash = types.indexConfigHash(dense_cfg),
+        });
+    }
+
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const dense_index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
+    defer alloc.free(dense_index_path);
+    try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
+    try std.testing.expectEqual(@as(usize, 0), try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
+}
+
 test "db dense artifact rebuild uses durable artifact counters instead of recount" {
     const alloc = std.testing.allocator;
 
@@ -48315,7 +48382,7 @@ test "db dense artifact rebuild resumes from persisted state" {
 
             const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, doc_id, "dense_idx");
             defer alloc.free(artifact_key);
-            try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{
+            try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, artifact_key, null, &[_]f32{
                 @floatFromInt(i + 1),
                 0,
                 0,
@@ -48447,7 +48514,7 @@ test "db dense artifact rebuild progress counts source artifacts across multiple
 
             const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, doc_id, "shared_dense_v1");
             defer alloc.free(artifact_key);
-            try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{
+            try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, artifact_key, null, &[_]f32{
                 @floatFromInt(i + 1),
                 0,
                 0,
@@ -48659,7 +48726,7 @@ test "db dense artifact rebuild does not let resumed targets skip fresh targets"
 
             const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, doc_id, "shared_dense_v1");
             defer alloc.free(artifact_key);
-            try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{
+            try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, artifact_key, null, &[_]f32{
                 @floatFromInt(i + 1),
                 0,
                 0,
@@ -48774,11 +48841,11 @@ test "db dense artifact rebuild ignores stale wrong-dimension artifacts when cou
 
         const valid_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "shared_dense_v1");
         defer alloc.free(valid_artifact_key);
-        try putDenseEmbeddingArtifactForTest(&db, alloc, valid_artifact_key, null, &[_]f32{ 1, 0, 0 });
+        try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, valid_artifact_key, null, &[_]f32{ 1, 0, 0 });
 
         const stale_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:stale", "shared_dense_v1");
         defer alloc.free(stale_artifact_key);
-        try putDenseEmbeddingArtifactForTest(&db, alloc, stale_artifact_key, null, &[_]f32{ 1, 0 });
+        try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, stale_artifact_key, null, &[_]f32{ 1, 0 });
     }
 
     var io_impl = threadedIo();
