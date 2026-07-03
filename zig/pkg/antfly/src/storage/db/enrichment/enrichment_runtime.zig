@@ -21,6 +21,7 @@ const Allocator = std.mem.Allocator;
 const common_secrets = @import("../../../common/secrets.zig");
 const backend_erased = @import("../../backend_erased.zig");
 const backend_scan = @import("../../backend_scan.zig");
+const mem_backend = @import("../../mem_backend.zig");
 const internal_keys = @import("../../internal_keys.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
 const change_journal_mod = @import("../derived/change_journal.zig");
@@ -7116,7 +7117,7 @@ fn saveAppliedSequenceWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, 
             else => return err,
         };
         checkpoint.applied_sequence = sequence;
-        checkpoint.status = .clean;
+        checkpoint.status = runtimeProjectionStatus(runtime.retrying, runtime.worker_failed);
         checkpoint.config_hash = try enrichmentCatalogConfigHash(runtime.alloc, runtime.index_manager);
         enrichment_state.saveProjectionCheckpoint(runtime.store, scope, checkpoint) catch |err| switch (err) {
             error.WriterLocked => {
@@ -7161,6 +7162,63 @@ fn saveRuntimeStatusWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, st
         };
         return;
     }
+}
+
+test "enrichment applied checkpoint stays degraded until runtime status clears" {
+    const alloc = std.testing.allocator;
+
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/indexes", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+        .retrying = true,
+        .worker_failed = false,
+    };
+
+    try enrichment_state.saveProjectionCheckpoint(runtime.store, scope_name, .{
+        .applied_sequence = 3,
+        .status = .degraded,
+        .generation = 2,
+        .config_hash = 0,
+    });
+
+    try saveAppliedSequenceWithRetry(&runtime, scope_name, 5);
+    const degraded_checkpoint = try enrichment_state.loadProjectionCheckpoint(alloc, runtime.store, scope_name);
+    try std.testing.expectEqual(@as(u64, 5), degraded_checkpoint.applied_sequence);
+    try std.testing.expectEqual(enrichment_state.ProjectionStatus.degraded, degraded_checkpoint.status);
+
+    runtime.retrying = false;
+    runtime.worker_failed = false;
+    try saveRuntimeStatusWithRetry(&runtime, scope_name, runtimeStatusSnapshot(&runtime));
+    const clean_checkpoint = try enrichment_state.loadProjectionCheckpoint(alloc, runtime.store, scope_name);
+    try std.testing.expectEqual(@as(u64, 5), clean_checkpoint.applied_sequence);
+    try std.testing.expectEqual(enrichment_state.ProjectionStatus.clean, clean_checkpoint.status);
 }
 
 fn appendGeneratedBatchWithRetry(
