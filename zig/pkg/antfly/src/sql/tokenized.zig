@@ -1949,6 +1949,7 @@ fn generatedDdlAstHasValidClassificationPayload(
     if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.index_where_tokens)) return false;
     if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.alter_table_operation_tokens)) return false;
     if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.rename_target_tokens)) return false;
+    if (!generatedDdlCommonPayloadIsValid(tokens, end, ddl_ast)) return false;
     if (!generatedDdlShapePayloadIsValid(tokens, end, ddl_ast)) return false;
     return generatedDdlRequiredRangesArePresent(ddl_ast);
 }
@@ -1971,6 +1972,227 @@ fn generatedDdlOptionalTokenRangeIsValid(
     range: ?generated_parser.GeneratedSqlTokenRange,
 ) bool {
     if (range) |value| return end <= tokens.len and value.start < value.end and value.end <= end;
+    return true;
+}
+
+fn generatedDdlTokenRangeIsValid(
+    tokens: []const Token,
+    end: usize,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    return end <= tokens.len and range.start < range.end and range.end <= end;
+}
+
+fn generatedDdlCommonPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+) bool {
+    const optional_ranges = [_]?generated_parser.GeneratedSqlTokenRange{
+        ddl_ast.object_name_tokens,
+        ddl_ast.schema_name_tokens,
+        ddl_ast.version_tokens,
+        ddl_ast.setting_name_tokens,
+        ddl_ast.setting_value_tokens,
+        ddl_ast.role_database_name_tokens,
+        ddl_ast.operator_name_tokens,
+        ddl_ast.cast_source_type_tokens,
+        ddl_ast.cast_target_type_tokens,
+        ddl_ast.cast_function_name_tokens,
+        ddl_ast.enum_value_tokens,
+        ddl_ast.enum_neighbor_value_tokens,
+        ddl_ast.tablespace_location_tokens,
+        ddl_ast.create_table_like_source_tokens,
+        ddl_ast.create_table_storage_parameter_tokens,
+        ddl_ast.create_table_system_versioned_tokens,
+        ddl_ast.create_table_partition_tokens,
+        ddl_ast.create_table_partition_method_tokens,
+        ddl_ast.create_table_partition_key_tokens,
+        ddl_ast.create_table_partition_of_parent_tokens,
+        ddl_ast.create_table_partition_bound_tokens,
+        ddl_ast.create_table_partition_lower_bound_tokens,
+        ddl_ast.create_table_partition_upper_bound_tokens,
+        ddl_ast.domain_type_tokens,
+        ddl_ast.index_table_tokens,
+        ddl_ast.index_method_tokens,
+        ddl_ast.index_elements_tokens,
+        ddl_ast.index_include_tokens,
+        ddl_ast.index_options_tokens,
+        ddl_ast.index_where_tokens,
+        ddl_ast.alter_table_partition_name_tokens,
+        ddl_ast.alter_table_partition_bound_tokens,
+        ddl_ast.alter_table_partition_lower_bound_tokens,
+        ddl_ast.alter_table_partition_upper_bound_tokens,
+        ddl_ast.materialized_view_data_clause_tokens,
+        ddl_ast.comment_target_tokens,
+        ddl_ast.comment_parent_table_tokens,
+        ddl_ast.comment_value_tokens,
+        ddl_ast.security_label_provider_tokens,
+        ddl_ast.privilege_object_kind_tokens,
+        ddl_ast.privilege_object_name_tokens,
+        ddl_ast.privilege_principal_tokens,
+        ddl_ast.rename_target_tokens,
+        ddl_ast.subscription_connection_value_tokens,
+        ddl_ast.policy_mode_tokens,
+        ddl_ast.policy_command_tokens,
+        ddl_ast.policy_using_predicate_tokens,
+        ddl_ast.policy_check_predicate_tokens,
+        ddl_ast.relation_population_source_tokens,
+        ddl_ast.relation_population_data_clause_tokens,
+    };
+    for (optional_ranges) |range| {
+        if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, range)) return false;
+    }
+
+    const lists = [_]*const generated_parser.GeneratedSqlListAst{
+        &ddl_ast.enum_value_items,
+        &ddl_ast.create_table_like_option_items,
+        &ddl_ast.create_table_storage_parameter_items,
+        &ddl_ast.create_table_document_schema_items,
+        &ddl_ast.create_table_partition_key_items,
+        &ddl_ast.alter_table_operation_items,
+        &ddl_ast.domain_operation_items,
+        &ddl_ast.sequence_operation_items,
+        &ddl_ast.collation_option_items,
+        &ddl_ast.operator_argument_items,
+        &ddl_ast.operator_option_items,
+        &ddl_ast.cast_function_argument_items,
+        &ddl_ast.publication_table_items,
+        &ddl_ast.publication_option_items,
+        &ddl_ast.subscription_publication_items,
+        &ddl_ast.subscription_option_items,
+        &ddl_ast.policy_role_target_items,
+        &ddl_ast.aggregate_argument_items,
+        &ddl_ast.aggregate_option_items,
+        &ddl_ast.privilege_items,
+        &ddl_ast.privilege_principal_items,
+        &ddl_ast.default_privilege_target_role_items,
+        &ddl_ast.default_privilege_schema_items,
+    };
+    for (lists) |list| {
+        if (!generatedDdlListPayloadIsValid(tokens, end, list)) return false;
+    }
+
+    if (!generatedDdlParallelRangeItemsAreValid(tokens, end, ddl_ast.create_table_document_schema_items.count, ddl_ast.create_table_document_schema_name_items)) return false;
+    if (!generatedDdlParallelRangeItemsAreValid(tokens, end, ddl_ast.create_table_document_schema_items.count, ddl_ast.create_table_document_schema_format_items)) return false;
+    if (!generatedDdlParallelRangeItemsAreValid(tokens, end, ddl_ast.create_table_document_schema_items.count, ddl_ast.create_table_document_schema_json_items)) return false;
+
+    if (ddl_ast.routine_metadata) |routine| {
+        if (!generatedDdlRoutinePayloadIsValid(tokens, end, routine)) return false;
+    }
+    if (ddl_ast.view_metadata) |view| {
+        if (!generatedDdlViewPayloadIsValid(tokens, end, view)) return false;
+    }
+    if (ddl_ast.relation_population_source_read) |read| {
+        const source = ddl_ast.relation_population_source_tokens orelse return false;
+        if (!generatedDdlTokenRangeIsValid(tokens, end, source)) return false;
+        if (source.end > tokens.len or !generatedReadAstHasValidClassificationPayload(tokens[source.start..source.end], read)) return false;
+    }
+    return true;
+}
+
+fn generatedDdlParallelRangeItemsAreValid(
+    tokens: []const Token,
+    end: usize,
+    expected_count: usize,
+    items: []const generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (items.len == 0) return true;
+    if (items.len != expected_count) return false;
+    for (items) |item| {
+        if (!generatedDdlTokenRangeIsValid(tokens, end, item)) return false;
+    }
+    return true;
+}
+
+fn generatedDdlRoutinePayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    routine: *const generated_parser.GeneratedSqlRoutineAst,
+) bool {
+    const ranges = [_]?generated_parser.GeneratedSqlTokenRange{
+        routine.returns_type_tokens,
+        routine.language_tokens,
+        routine.volatility_tokens,
+        routine.security_tokens,
+        routine.null_input_tokens,
+        routine.parallel_safety_tokens,
+        routine.leakproof_tokens,
+        routine.window_tokens,
+        routine.support_function_tokens,
+        routine.cost_tokens,
+        routine.rows_tokens,
+        routine.body_tokens,
+    };
+    for (ranges) |range| {
+        if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, range)) return false;
+    }
+    return generatedDdlListPayloadIsValid(tokens, end, &routine.argument_items) and
+        generatedDdlListPayloadIsValid(tokens, end, &routine.transform_type_items) and
+        generatedDdlListPayloadIsValid(tokens, end, &routine.setting_items);
+}
+
+fn generatedDdlViewPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    view: *const generated_parser.GeneratedSqlViewAst,
+) bool {
+    return generatedDdlOptionalTokenRangeIsValid(tokens, end, view.query_tokens) and
+        generatedDdlListPayloadIsValid(tokens, end, &view.column_items);
+}
+
+fn generatedDdlListPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    list: *const generated_parser.GeneratedSqlListAst,
+) bool {
+    if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, list.first_tokens)) return false;
+    if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, list.last_tokens)) return false;
+    if (!generatedDdlRangeSliceIsValid(tokens, end, list.items)) return false;
+    if (!generatedDdlRangeSliceIsValid(tokens, end, list.expression_items)) return false;
+    if (!generatedDdlOptionalRangeSliceIsValid(tokens, end, list.alias_items)) return false;
+    if (!generatedDdlOptionalRangeSliceIsValid(tokens, end, list.alias_name_items)) return false;
+    if (!generatedDdlOptionalRangeSliceIsValid(tokens, end, list.direction_items)) return false;
+    if (!generatedDdlOptionalRangeSliceIsValid(tokens, end, list.order_using_operator_items)) return false;
+    if (!generatedDdlOptionalRangeSliceIsValid(tokens, end, list.nulls_order_items)) return false;
+    if (!generatedDdlListPayloadCountIsValid(list.count, list.items.len)) return false;
+    if (!generatedDdlListPayloadCountIsValid(list.count, list.expression_items.len)) return false;
+    if (!generatedDdlListPayloadCountIsValid(list.count, list.alias_items.len)) return false;
+    if (!generatedDdlListPayloadCountIsValid(list.count, list.alias_name_items.len)) return false;
+    if (!generatedDdlListPayloadCountIsValid(list.count, list.direction_items.len)) return false;
+    if (!generatedDdlListPayloadCountIsValid(list.count, list.directions.len)) return false;
+    if (!generatedDdlListPayloadCountIsValid(list.count, list.order_using_operator_items.len)) return false;
+    if (!generatedDdlListPayloadCountIsValid(list.count, list.nulls_order_items.len)) return false;
+    if (!generatedDdlListPayloadCountIsValid(list.count, list.nulls_orders.len)) return false;
+    if (!generatedDdlListPayloadCountIsValid(list.count, list.expressions.len)) return false;
+    if (list.count == 0) return list.first_tokens == null and list.last_tokens == null;
+    if (list.first_tokens == null or list.last_tokens == null) return false;
+    return true;
+}
+
+fn generatedDdlListPayloadCountIsValid(count: usize, len: usize) bool {
+    return len == 0 or len == count;
+}
+
+fn generatedDdlRangeSliceIsValid(
+    tokens: []const Token,
+    end: usize,
+    items: []const generated_parser.GeneratedSqlTokenRange,
+) bool {
+    for (items) |item| {
+        if (!generatedDdlTokenRangeIsValid(tokens, end, item)) return false;
+    }
+    return true;
+}
+
+fn generatedDdlOptionalRangeSliceIsValid(
+    tokens: []const Token,
+    end: usize,
+    items: []const ?generated_parser.GeneratedSqlTokenRange,
+) bool {
+    for (items) |item| {
+        if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, item)) return false;
+    }
     return true;
 }
 
@@ -10553,6 +10775,43 @@ test "sql adapter parsed sql rejects malformed generated classification payloads
         std.meta.activeTag(parseStatement(covering_index.raw_statement, malformed_index_where, &covering_index.tokenized_sql)),
     );
 
+    var publication_list = try ParsedSql.initAlloc(alloc, "CREATE PUBLICATION usage_pub FOR TABLE usage_records, usage_events");
+    defer publication_list.deinit(alloc);
+    var stale_publication_table_count = publication_list.generated_statement.?;
+    if (stale_publication_table_count.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_publication, ddl_ast.kind);
+                try std.testing.expect(ddl_ast.publication_table_items.count != 0);
+                ddl_ast.publication_table_items.count = 0;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(publication_list.raw_statement, stale_publication_table_count, &publication_list.tokenized_sql)),
+    );
+
+    var generated_routine_metadata = try ParsedSql.initAlloc(alloc, "CREATE FUNCTION audit_usage() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$");
+    defer generated_routine_metadata.deinit(alloc);
+    var malformed_routine_returns_range = generated_routine_metadata.generated_statement.?;
+    if (malformed_routine_returns_range.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_function, ddl_ast.kind);
+                const routine = ddl_ast.routine_metadata orelse return error.TestUnexpectedResult;
+                _ = routine.returns_type_tokens orelse return error.TestUnexpectedResult;
+                routine.returns_type_tokens.?.end = routine.returns_type_tokens.?.start;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(generated_routine_metadata.raw_statement, malformed_routine_returns_range, &generated_routine_metadata.tokenized_sql)),
+    );
+
     var graph_index = try ParsedSql.initAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON doc_edges");
     defer graph_index.deinit(alloc);
     var mismatched_graph_kind = graph_index.generated_statement.?;
@@ -10810,9 +11069,9 @@ test "sql adapter parsed sql rejects malformed generated classification payloads
     if (malformed_alter_procedure_argument.ast) |*generated_ast| {
         switch (generated_ast.*) {
             .unsupported => |*unsupported_ast| {
-                const routine_metadata = unsupported_ast.routine_metadata orelse return error.TestUnexpectedResult;
-                try std.testing.expectEqual(@as(usize, 1), routine_metadata.argument_items.count);
-                routine_metadata.argument_items.items[0].start += 1;
+                const unsupported_routine_metadata = unsupported_ast.routine_metadata orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(@as(usize, 1), unsupported_routine_metadata.argument_items.count);
+                unsupported_routine_metadata.argument_items.items[0].start += 1;
             },
             else => return error.TestUnexpectedResult,
         }

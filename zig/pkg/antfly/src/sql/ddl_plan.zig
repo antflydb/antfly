@@ -10531,10 +10531,11 @@ fn validateGeneratedDdlAstSpans(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlDdlAst,
 ) !void {
-    _ = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     if (tokens[0].source_start != ast.command_span.start or tokens[0].source_end != ast.command_span.end) {
         return error.UnsupportedSqlShape;
     }
+    try validateGeneratedDdlAstCommonPayload(tokens, end, ast);
     if (ast.kind == .relation_population) {
         if (!tokens[0].matchesKeywordTag(.select) and !tokens[0].matchesKeywordTag(.create)) return error.UnsupportedSqlShape;
         return;
@@ -10610,6 +10611,216 @@ fn validateGeneratedDdlAstSpans(
         .revoke => .revoke,
     };
     if (!tokens[0].matchesKeywordTag(expected)) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedDdlAstCommonPayload(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !void {
+    const optional_ranges = [_]?generated_parser.GeneratedSqlTokenRange{
+        ast.object_name_tokens,
+        ast.schema_name_tokens,
+        ast.version_tokens,
+        ast.setting_name_tokens,
+        ast.setting_value_tokens,
+        ast.role_database_name_tokens,
+        ast.operator_name_tokens,
+        ast.cast_source_type_tokens,
+        ast.cast_target_type_tokens,
+        ast.cast_function_name_tokens,
+        ast.enum_value_tokens,
+        ast.enum_neighbor_value_tokens,
+        ast.tablespace_location_tokens,
+        ast.create_table_like_source_tokens,
+        ast.create_table_storage_parameter_tokens,
+        ast.create_table_system_versioned_tokens,
+        ast.create_table_partition_tokens,
+        ast.create_table_partition_method_tokens,
+        ast.create_table_partition_key_tokens,
+        ast.create_table_partition_of_parent_tokens,
+        ast.create_table_partition_bound_tokens,
+        ast.create_table_partition_lower_bound_tokens,
+        ast.create_table_partition_upper_bound_tokens,
+        ast.domain_type_tokens,
+        ast.index_table_tokens,
+        ast.index_method_tokens,
+        ast.index_elements_tokens,
+        ast.index_include_tokens,
+        ast.index_options_tokens,
+        ast.index_where_tokens,
+        ast.alter_table_partition_name_tokens,
+        ast.alter_table_partition_bound_tokens,
+        ast.alter_table_partition_lower_bound_tokens,
+        ast.alter_table_partition_upper_bound_tokens,
+        ast.materialized_view_data_clause_tokens,
+        ast.comment_target_tokens,
+        ast.comment_parent_table_tokens,
+        ast.comment_value_tokens,
+        ast.security_label_provider_tokens,
+        ast.privilege_object_kind_tokens,
+        ast.privilege_object_name_tokens,
+        ast.privilege_principal_tokens,
+        ast.rename_target_tokens,
+        ast.subscription_connection_value_tokens,
+        ast.policy_mode_tokens,
+        ast.policy_command_tokens,
+        ast.policy_using_predicate_tokens,
+        ast.policy_check_predicate_tokens,
+        ast.relation_population_source_tokens,
+        ast.relation_population_data_clause_tokens,
+    };
+    for (optional_ranges) |range| try validateGeneratedDdlOptionalRange(tokens, end, range);
+
+    const lists = [_]*const generated_parser.GeneratedSqlListAst{
+        &ast.enum_value_items,
+        &ast.create_table_like_option_items,
+        &ast.create_table_storage_parameter_items,
+        &ast.create_table_document_schema_items,
+        &ast.create_table_partition_key_items,
+        &ast.alter_table_operation_items,
+        &ast.domain_operation_items,
+        &ast.sequence_operation_items,
+        &ast.collation_option_items,
+        &ast.operator_argument_items,
+        &ast.operator_option_items,
+        &ast.cast_function_argument_items,
+        &ast.publication_table_items,
+        &ast.publication_option_items,
+        &ast.subscription_publication_items,
+        &ast.subscription_option_items,
+        &ast.policy_role_target_items,
+        &ast.aggregate_argument_items,
+        &ast.aggregate_option_items,
+        &ast.privilege_items,
+        &ast.privilege_principal_items,
+        &ast.default_privilege_target_role_items,
+        &ast.default_privilege_schema_items,
+    };
+    for (lists) |list| try validateGeneratedDdlListPayload(tokens, end, list);
+
+    try validateGeneratedDdlRangeItems(tokens, end, ast.create_table_document_schema_items.count, ast.create_table_document_schema_name_items);
+    try validateGeneratedDdlRangeItems(tokens, end, ast.create_table_document_schema_items.count, ast.create_table_document_schema_format_items);
+    try validateGeneratedDdlRangeItems(tokens, end, ast.create_table_document_schema_items.count, ast.create_table_document_schema_json_items);
+
+    if (ast.routine_metadata) |routine| try validateGeneratedDdlRoutinePayload(tokens, end, routine);
+    if (ast.view_metadata) |view| try validateGeneratedDdlViewPayload(tokens, end, view);
+    if (ast.relation_population_source_read != null) {
+        try validateGeneratedDdlOptionalRange(tokens, end, ast.relation_population_source_tokens);
+        if (ast.relation_population_source_tokens == null) return error.UnsupportedSqlShape;
+    }
+}
+
+fn validateGeneratedDdlRoutinePayload(
+    tokens: []const grammar.Token,
+    end: usize,
+    routine: *const generated_parser.GeneratedSqlRoutineAst,
+) !void {
+    const ranges = [_]?generated_parser.GeneratedSqlTokenRange{
+        routine.returns_type_tokens,
+        routine.language_tokens,
+        routine.volatility_tokens,
+        routine.security_tokens,
+        routine.null_input_tokens,
+        routine.parallel_safety_tokens,
+        routine.leakproof_tokens,
+        routine.window_tokens,
+        routine.support_function_tokens,
+        routine.cost_tokens,
+        routine.rows_tokens,
+        routine.body_tokens,
+    };
+    for (ranges) |range| try validateGeneratedDdlOptionalRange(tokens, end, range);
+    try validateGeneratedDdlListPayload(tokens, end, &routine.argument_items);
+    try validateGeneratedDdlListPayload(tokens, end, &routine.transform_type_items);
+    try validateGeneratedDdlListPayload(tokens, end, &routine.setting_items);
+}
+
+fn validateGeneratedDdlViewPayload(
+    tokens: []const grammar.Token,
+    end: usize,
+    view: *const generated_parser.GeneratedSqlViewAst,
+) !void {
+    try validateGeneratedDdlOptionalRange(tokens, end, view.query_tokens);
+    try validateGeneratedDdlListPayload(tokens, end, &view.column_items);
+}
+
+fn validateGeneratedDdlListPayload(
+    tokens: []const grammar.Token,
+    end: usize,
+    list: *const generated_parser.GeneratedSqlListAst,
+) !void {
+    try validateGeneratedDdlOptionalRange(tokens, end, list.first_tokens);
+    try validateGeneratedDdlOptionalRange(tokens, end, list.last_tokens);
+    try validateGeneratedDdlRangeSlice(tokens, end, list.items);
+    try validateGeneratedDdlRangeSlice(tokens, end, list.expression_items);
+    try validateGeneratedDdlOptionalRangeSlice(tokens, end, list.alias_items);
+    try validateGeneratedDdlOptionalRangeSlice(tokens, end, list.alias_name_items);
+    try validateGeneratedDdlOptionalRangeSlice(tokens, end, list.direction_items);
+    try validateGeneratedDdlOptionalRangeSlice(tokens, end, list.order_using_operator_items);
+    try validateGeneratedDdlOptionalRangeSlice(tokens, end, list.nulls_order_items);
+    try validateGeneratedDdlListCount(list.count, list.items.len);
+    try validateGeneratedDdlListCount(list.count, list.expression_items.len);
+    try validateGeneratedDdlListCount(list.count, list.alias_items.len);
+    try validateGeneratedDdlListCount(list.count, list.alias_name_items.len);
+    try validateGeneratedDdlListCount(list.count, list.direction_items.len);
+    try validateGeneratedDdlListCount(list.count, list.directions.len);
+    try validateGeneratedDdlListCount(list.count, list.order_using_operator_items.len);
+    try validateGeneratedDdlListCount(list.count, list.nulls_order_items.len);
+    try validateGeneratedDdlListCount(list.count, list.nulls_orders.len);
+    try validateGeneratedDdlListCount(list.count, list.expressions.len);
+    if (list.count == 0) {
+        if (list.first_tokens != null or list.last_tokens != null) return error.UnsupportedSqlShape;
+        return;
+    }
+    if (list.first_tokens == null or list.last_tokens == null) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedDdlListCount(count: usize, len: usize) !void {
+    if (len != 0 and len != count) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedDdlRangeItems(
+    tokens: []const grammar.Token,
+    end: usize,
+    expected_count: usize,
+    items: []const generated_parser.GeneratedSqlTokenRange,
+) !void {
+    if (items.len == 0) return;
+    if (items.len != expected_count) return error.UnsupportedSqlShape;
+    try validateGeneratedDdlRangeSlice(tokens, end, items);
+}
+
+fn validateGeneratedDdlRangeSlice(
+    tokens: []const grammar.Token,
+    end: usize,
+    items: []const generated_parser.GeneratedSqlTokenRange,
+) !void {
+    for (items) |item| try validateGeneratedDdlRange(tokens, end, item);
+}
+
+fn validateGeneratedDdlOptionalRangeSlice(
+    tokens: []const grammar.Token,
+    end: usize,
+    items: []const ?generated_parser.GeneratedSqlTokenRange,
+) !void {
+    for (items) |item| try validateGeneratedDdlOptionalRange(tokens, end, item);
+}
+
+fn validateGeneratedDdlOptionalRange(
+    tokens: []const grammar.Token,
+    end: usize,
+    range: ?generated_parser.GeneratedSqlTokenRange,
+) !void {
+    if (range) |value| try validateGeneratedDdlRange(tokens, end, value);
+}
+
+fn validateGeneratedDdlRange(
+    tokens: []const grammar.Token,
+    end: usize,
+    range: generated_parser.GeneratedSqlTokenRange,
+) !void {
+    if (end > tokens.len or range.start >= range.end or range.end > end) return error.UnsupportedSqlShape;
 }
 
 fn requireGeneratedTokenRangeAt(
@@ -24773,6 +24984,41 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_generated_alter_table_item));
     try std.testing.expectError(error.UnsupportedSqlShape, parseLogicalDdlPlanAlloc(alloc, &malformed_generated_alter_table_item, .{}));
+
+    var stale_generated_publication_table_count = try tokenized.ParsedSql.initAlloc(alloc, "CREATE PUBLICATION usage_pub FOR TABLE usage_records, usage_events");
+    defer stale_generated_publication_table_count.deinit(alloc);
+    if (stale_generated_publication_table_count.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_publication, ddl.kind);
+                    try std.testing.expect(ddl.publication_table_items.count != 0);
+                    ddl.publication_table_items.count = 0;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &stale_generated_publication_table_count));
+    try std.testing.expectError(error.UnsupportedSqlShape, parseLogicalDdlPlanAlloc(alloc, &stale_generated_publication_table_count, .{}));
+
+    var malformed_generated_routine_returns = try tokenized.ParsedSql.initAlloc(alloc, "CREATE FUNCTION audit_usage() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$");
+    defer malformed_generated_routine_returns.deinit(alloc);
+    if (malformed_generated_routine_returns.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_function, ddl.kind);
+                    const routine = ddl.routine_metadata orelse return error.TestUnexpectedResult;
+                    _ = routine.returns_type_tokens orelse return error.TestUnexpectedResult;
+                    routine.returns_type_tokens.?.end = routine.returns_type_tokens.?.start;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_generated_routine_returns));
+    try std.testing.expectError(error.UnsupportedSqlShape, parseLogicalDdlPlanAlloc(alloc, &malformed_generated_routine_returns, .{}));
 
     var runtime_row_security = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ENABLE ROW LEVEL SECURITY;");
     defer runtime_row_security.deinit(alloc);

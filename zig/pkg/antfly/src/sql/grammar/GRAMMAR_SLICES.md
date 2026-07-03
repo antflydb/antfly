@@ -35,11 +35,6 @@ tokenization already recognizes do not need lexer churn.
   - [ ] Add stable unsupported diagnostics for generated expression shapes that parse but do not yet have executable semantics.
   - [ ] Add missing SQL/API parity rows or typed unsupported rows, plus any missing fail-closed corrupted child-expression/list payload fixtures, for each newly lowered expression family.
 
-- [ ] Rich DDL metadata and semantic coverage
-  - [ ] Route every valid-but-unplanned generated-owned DDL shape to a typed unsupported statement with stable reason, exact subject span, and retained-AST validation before any catalog/DDL fallback can run.
-  - [ ] For each newly admitted DDL keyword, clause delimiter, or option operator, update `TokenKind`/`TokenKeyword` in `token.zig`, lexer recognition in `lexer.zig`, generated-token mapping, and grammar-tail fixtures in the same patch as the generated AST metadata.
-  - [ ] For every new DDL metadata field, add generated parser span coverage, grammar tail fixtures, parsed-entrypoint corruption tests, logical-DDL corruption tests where applicable, SQL/API parity rows or unsupported-reason fixture coverage, and required manifest entries.
-
 - [ ] Evidence and performance hardening
   - [ ] For each generated-owned SQL shape admitted at the public SQL/API boundary, add or graduate rows in `fixtures/sql_api_parity_source_corpus.json`, promote `fixtures/sql_api_parity_corpus.json`, and update required coverage or unsupported-reason manifests in the same patch.
   - [ ] For Antfly-specific query functions, graph, Lite, table APIs, and routed execution paths, add SQL/API parity rows when the public adapter contract changes and focused Zig runtime tests when seeded execution behavior is the proof.
