@@ -7190,8 +7190,6 @@ pub const DB = struct {
             if (cursor.len == 0) break :blk null;
             break :blk cursor;
         } else null;
-        var graph_artifact_keys: ?[][]const u8 = null;
-        defer if (graph_artifact_keys) |keys| freeOwnedConstStringSlice(alloc, keys);
         var quarantined_retry_run = false;
         var cursor_found = cursor_name == null;
         for (configs) |cfg| {
@@ -7252,14 +7250,12 @@ pub const DB = struct {
                     break :blk count;
                 },
                 .graph => blk: {
-                    if (graph_artifact_keys == null) {
-                        graph_artifact_keys = try collectGraphArtifactKeysInRangeAlloc(alloc, self.core.store, "", "");
-                    }
-                    const count = try applySplitGraphArtifactsForIndex(
+                    const count = try applySplitGraphArtifactsForIndexStreaming(
+                        alloc,
                         self.core.store,
                         self.core.index_manager,
-                        graph_artifact_keys.?,
                         cfg.name,
+                        graph_repair_rebuild_batch_size,
                     );
                     try self.core.index_manager.syncIndexByName(cfg.name, true);
                     break :blk count;

@@ -1629,9 +1629,13 @@ pub const IndexManager = struct {
     }
 
     fn beginIndexLoadNoLock(self: *IndexManager, name: []const u8) !void {
-        const gop = try self.index_load_states.getOrPut(self.alloc, name);
+        const owned_name = try self.alloc.dupe(u8, name);
+        errdefer self.alloc.free(owned_name);
+        const gop = try self.index_load_states.getOrPut(self.alloc, owned_name);
         if (!gop.found_existing) {
-            gop.key_ptr.* = try self.alloc.dupe(u8, name);
+            gop.key_ptr.* = owned_name;
+        } else {
+            self.alloc.free(owned_name);
         }
         gop.value_ptr.* = .loading;
     }
@@ -1641,7 +1645,7 @@ pub const IndexManager = struct {
     }
 
     pub fn indexLoadComplete(self: *IndexManager, name: []const u8) bool {
-        if (!self.catalog_mutex.tryLockShared()) return false;
+        self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
         return (self.index_load_states.get(name) orelse .complete) == .complete;
     }
@@ -1736,9 +1740,9 @@ pub const IndexManager = struct {
                 self.dropFailedIndexLoad(name);
                 continue;
             };
-            try self.beginIndexLoadNoLock(cfg.name);
-            defer self.completeIndexLoadNoLock(cfg.name);
+            try self.beginIndexLoadNoLock(name);
             var opened = self.openConfiguredIndexDetached(store, cfg, true, false) catch |err| {
+                self.completeIndexLoadNoLock(name);
                 const record = self.failed_index_loads.getPtr(name) orelse continue;
                 record.err_name = @errorName(err);
                 record.retry_attempts +|= 1;
@@ -1757,14 +1761,17 @@ pub const IndexManager = struct {
                 &.{}
             else
                 self.alloc.alloc(types.IndexConfig, old.len - 1) catch |err| {
+                    self.completeIndexLoadNoLock(name);
                     opened.deinit(self);
                     return err;
                 };
             self.appendOpenedIndex(opened) catch |err| {
                 if (replacement.len > 0) self.alloc.free(replacement);
+                self.completeIndexLoadNoLock(name);
                 opened.deinit(self);
                 return err;
             };
+            self.completeIndexLoadNoLock(name);
             var wi: usize = 0;
             for (old) |old_cfg| {
                 if (std.mem.eql(u8, old_cfg.name, name)) {
