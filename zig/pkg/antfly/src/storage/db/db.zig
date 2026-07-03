@@ -10242,7 +10242,10 @@ pub const DB = struct {
         delta: i64,
     ) !void {
         if (delta == 0) return;
-        var identity = (try artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key)) orelse return;
+        var identity = (artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key) catch |err| switch (err) {
+            error.InvalidInternalUserKey => return,
+            else => return err,
+        }) orelse return;
         defer identity.deinit(alloc);
         const value = artifact_value orelse return;
         const dims = enrichment_artifact_codec.decodeDenseEmbeddingDims(value) catch return;
@@ -42625,6 +42628,76 @@ test "db batch persists per-index applied sequence watermark" {
     try std.testing.expectEqual(@as(u64, 0), index_lsm.immutable_memtables);
     try std.testing.expect(index_lsm.wal_checkpoint_current_segment > 0);
     try std.testing.expectEqual(@as(u64, 0), index_lsm.wal_checkpoint_lag_segments);
+}
+
+test "db managed projection checkpoints persist status and config identity" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const configs = [_]types.IndexConfig{
+        .{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{\"field\":\"title\"}",
+        },
+        .{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+        },
+        .{
+            .name = "sp_v1",
+            .kind = .sparse_vector,
+            .config_json = "{\"field\":\"sparse\"}",
+        },
+        .{
+            .name = "gr_v1",
+            .kind = .graph,
+            .config_json = "{}",
+        },
+        .{
+            .name = "alg_v1",
+            .kind = .algebraic,
+            .config_json =
+            \\{
+            \\  "version": 1,
+            \\  "table": "docs",
+            \\  "group_fields": [{"name":"category","path":"category","type":"string"}],
+            \\  "measure_fields": [{"name":"score","path":"score","type":"number"}],
+            \\  "materializations": [{"name":"count_by_category","op":"count","group_by":["category"]}]
+            \\}
+            ,
+        },
+    };
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    for (configs) |cfg| try db.addIndex(cfg);
+
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "doc:a",
+                .value = "{\"title\":\"alpha\",\"category\":\"news\",\"score\":3,\"embedding\":[1,0],\"sparse\":{\"indices\":[1,3],\"values\":[0.5,0.75]}}",
+            },
+        },
+        .graph_writes = &.{
+            .{ .index_name = "gr_v1", .source = "doc:a", .target = "doc:b", .edge_type = "links", .weight = 1.0 },
+        },
+        .sync_level = .full_index,
+    });
+
+    for (configs) |cfg| {
+        const checkpoint = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
+        try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
+        try std.testing.expectEqual(try db.core.loadAppliedSequence(alloc, cfg.name), checkpoint.applied_sequence);
+        try std.testing.expect(checkpoint.applied_sequence > 0);
+        try std.testing.expectEqual(types.indexConfigHash(cfg), checkpoint.config_hash);
+    }
 }
 
 test "db batch truncates replay logs after managed indexes catch up" {
