@@ -104,6 +104,8 @@ const Options = struct {
     scratch_budget_mb: usize = 0,
     raw_prompt: bool = false,
     no_bos: bool = false,
+    raw_decode_bench: bool = false,
+    ignore_eos: bool = false,
     cache_dtype: ?[]const u8 = null,
     cache_compaction_ratio: ?f32 = null,
     mode: ?ExecutionMode = null,
@@ -118,10 +120,14 @@ const Options = struct {
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     const opts = try parseArgs(args);
     const effective_draft_model = if (opts.speculation_policy == .off) null else opts.draft_model;
+    if (opts.raw_decode_bench and (opts.image_count > 0 or opts.audio_count > 0)) return error.RawDecodeBenchRequiresTextOnly;
+    if (opts.raw_decode_bench and effective_draft_model != null) return error.RawDecodeBenchSpeculationUnsupported;
+    if (opts.raw_decode_bench and opts.stream) return error.RawDecodeBenchStreamingUnsupported;
     try native_backend_choice.validate(opts.backend);
     const require_server = requireWarmServer(opts);
     if (effective_draft_model != null and opts.backend == .onnx) return error.SpeculativeDecodingRequiresNativeBackend;
     if (opts.server_url orelse platform.env.getenv("ANTFLY_INFERENCE_SERVER_URL")) |server_url| {
+        if (opts.raw_decode_bench) return error.RawDecodeBenchRequiresLocalBackend;
         var server_opts = opts;
         server_opts.server_url = server_url;
         if (defaultServerModelName(opts.model_dir)) |model_name| server_opts.model_dir = model_name;
@@ -209,6 +215,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .speculation_policy = opts.speculation_policy,
         .speculation_calibration = opts.speculation_calibration,
         .cache_compaction_ratio = opts.cache_compaction_ratio,
+        .ignore_eos = opts.ignore_eos,
     };
 
     const artifact_backend = switch (opts.backend) {
@@ -622,6 +629,16 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
         null
+    else if (gpt_config.sliding_window > 0 and gpt_config.hasGlobalAttentionLayers() and !kvSlidingTrimForced())
+        // Mixed attention (iSWA-style models like Gemma): global layers need
+        // the full KV history, and the pool packs every layer's KV into
+        // shared blocks, so window-trimming the pool silently truncates the
+        // global layers' context. Retain everything; sliding-window layers
+        // still apply their exact window inside the attention kernels, so
+        // their compute stays bounded — only KV memory grows with context.
+        // ANTFLY_INFERENCE_KV_SLIDING_TRIM=1 restores the old
+        // trim-to-window behavior (lower memory, truncated global context).
+        null
     else if (gpt_config.sliding_window > 0)
         gpt_config.sliding_window
     else if (gpt_config.max_position_embeddings > 0)
@@ -649,6 +666,26 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     });
     defer kv_storage.deinit();
     try cb.provisionKvDeviceWriteHook(&kv_storage);
+
+    var cuda_gemma_prefill_prewarm_ms: u64 = 0;
+    if (cudaGemmaPrefillPrewarmEnabled()) {
+        const prewarm_started_at = std.Io.Timestamp.now(io, .awake);
+        // Prewarm is a pure residency optimization; a failure must not
+        // abort the generation the real prefill could still serve.
+        const prewarmed = prewarmCudaGemmaPrefillResidency(
+            allocator,
+            &cb,
+            gpt_config,
+            prompt_tokens,
+        ) catch |err| blk: {
+            std.log.warn("cuda_gemma_prefill_prewarm_failed: err={s}", .{@errorName(err)});
+            break :blk false;
+        };
+        const prewarm_finished_at = std.Io.Timestamp.now(io, .awake);
+        if (prewarmed) {
+            cuda_gemma_prefill_prewarm_ms = durationMillis(prewarm_started_at, prewarm_finished_at);
+        }
+    }
 
     var decode_state = generation.NativeDecodeState.initPaged(allocator, &kv_manager, pool_id, model.shared_moe_cache);
     decode_state.kv_storage = &kv_storage;
@@ -743,6 +780,75 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         if (draft_model) |loaded_draft| session_factory.getCudaRuntimeStats(loaded_draft.session) else null
     else
         null;
+    if (opts.raw_decode_bench) {
+        const bench_result = runRawDecodeBench(
+            allocator,
+            io,
+            &cb,
+            gpt_config,
+            prompt_encoded.ids[0..countPromptTokens(prompt_encoded.attention_mask)],
+            @intCast(@max(opts.max_tokens, 0)),
+            config.prefill_chunk_size,
+            &decode_state,
+        ) catch |err| {
+            if (err == error.MemoryBudgetExceeded) {
+                printBudgetExceeded(model.session, &run_budget);
+            }
+            return err;
+        };
+        const finished_generate_at = std.Io.Timestamp.now(io, .awake);
+        const cuda_stats_after_generate = if (comptime build_options.enable_cuda)
+            session_factory.getCudaRuntimeStats(model.session)
+        else
+            null;
+        const cuda_generate_stats = if (comptime build_options.enable_cuda)
+            if (cuda_stats_after_generate) |after|
+                if (cuda_stats_before_generate) |before| cudaStatsDelta(after, before) else null
+            else
+                null
+        else
+            null;
+
+        if (opts.print_token_count) print("tokens={d}\n", .{bench_result.tokens});
+        if (opts.print_timing) {
+            print(
+                "timing_ms: load_model={d} prompt_prep={d} scheduler={d} backend_setup={d} decode_setup={d} prefill={d} device_warmup={d} warmup={d} decode={d} total={d}\n",
+                .{
+                    durationMillis(started_at, loaded_model_at),
+                    durationMillis(loaded_model_at, encoded_prompt_at),
+                    durationMillis(encoded_prompt_at, acquired_scheduler_at),
+                    durationMillis(acquired_scheduler_at, created_backend_at),
+                    durationMillis(created_backend_at, created_decode_state_at),
+                    bench_result.prefill_ms,
+                    bench_result.device_warmup_ms,
+                    bench_result.warmup_ms,
+                    bench_result.decode_ms,
+                    durationMillis(started_at, finished_generate_at),
+                },
+            );
+            print("raw_decode_tok_per_s={d:.3}\n", .{tokensPerSecond(bench_result.tokens, bench_result.decode_ms)});
+            print("raw_decode_scope={s}\n", .{bench_result.scope});
+        }
+        if (opts.json_timing_path) |path| {
+            try writeRawDecodeBenchJson(
+                allocator,
+                io,
+                path,
+                opts.model_dir,
+                @tagName(model.session.backend()),
+                bench_result,
+                durationMillis(started_at, loaded_model_at),
+                durationMillis(loaded_model_at, encoded_prompt_at),
+                durationMillis(encoded_prompt_at, acquired_scheduler_at),
+                durationMillis(acquired_scheduler_at, created_backend_at),
+                durationMillis(created_backend_at, created_decode_state_at),
+                durationMillis(started_at, finished_generate_at),
+                cuda_stats_after_generate,
+                cuda_generate_stats,
+            );
+        }
+        return;
+    }
     var result = generateWithOptionalStreaming(&pipeline, &messages, config, opts.stream) catch |err| {
         if (err == error.MemoryBudgetExceeded) {
             printBudgetExceeded(model.session, &run_budget);
@@ -812,6 +918,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                 durationMillis(started_at, finished_generate_at),
             },
         );
+        if (cuda_gemma_prefill_prewarm_ms != 0) {
+            print("cuda_gemma_prefill_prewarm_ms: runtime_prepare={d}\n", .{cuda_gemma_prefill_prewarm_ms});
+        }
         const decode_ms = if (result.timing_ms) |timing| timing.decode else durationMillis(created_decode_state_at, finished_generate_at);
         print("decode_tok_per_s={d:.3}\n", .{tokensPerSecond(result.tokens_used, decode_ms)});
         if (build_options.enable_metal and model.session.backend().usesGpuHostedSession() and detailedGpuTimingEnabled()) {
@@ -1156,6 +1265,18 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         },
                     );
                     print(
+                        "cuda_generate_pinned_scalar_transfers: uploads={d} upload_bytes={d} upload_fallbacks={d} upload_wrap_syncs={d} downloads={d} download_bytes={d} download_fallbacks={d}\n",
+                        .{
+                            generate_stats.pinned_scalar_uploads,
+                            generate_stats.pinned_scalar_upload_bytes,
+                            generate_stats.pinned_scalar_upload_fallbacks,
+                            generate_stats.pinned_scalar_upload_wrap_syncs,
+                            generate_stats.pinned_scalar_downloads,
+                            generate_stats.pinned_scalar_download_bytes,
+                            generate_stats.pinned_scalar_download_fallbacks,
+                        },
+                    );
+                    print(
                         "cuda_generate_norm_launch_breakdown: layer={d} add_layer={d} rms={d} rms_add={d} rms_add_mul_scalar={d} rms_add_output_scale={d} rms_bare={d} head_rope={d}\n",
                         .{
                             generate_stats.launch_norm_layer,
@@ -1169,9 +1290,15 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         },
                     );
                     print(
-                        "cuda_generate_attention_launch_breakdown: gqa_decode={d} gqa_scalar={d}\n",
+                        "cuda_generate_attention_launch_breakdown: gqa_decode={d} gqa_fast={d} gqa_fast_fallbacks={d} gqa_prefill_fast={d} gqa_prefill_tiled={d} gqa_prefill_mma={d} gqa_prefill_mma_m32={d} gqa_scalar={d}\n",
                         .{
                             generate_stats.launch_attention_gqa_decode,
+                            generate_stats.launch_attention_gqa_decode_fast,
+                            generate_stats.launch_attention_gqa_decode_fast_fallbacks,
+                            generate_stats.launch_attention_gqa_prefill_fast,
+                            generate_stats.launch_attention_gqa_prefill_tiled,
+                            generate_stats.launch_attention_gqa_prefill_mma,
+                            generate_stats.launch_attention_gqa_prefill_mma_m32,
                             generate_stats.launch_attention_gqa_scalar,
                         },
                     );
@@ -1198,22 +1325,31 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         },
                     );
                     print(
-                        "cuda_generate_lm_head_argmax_counts: fused_q8={d} fused_q4={d} fallbacks={d}\n",
+                        "cuda_generate_lm_head_argmax_counts: fused_q8={d} fused_q4_0={d} fused_q4={d} fused_q6={d} fallbacks={d}\n",
                         .{
                             generate_stats.lm_head_argmax_fused_q8,
+                            generate_stats.lm_head_argmax_fused_q4_0,
                             generate_stats.lm_head_argmax_fused_q4,
+                            generate_stats.lm_head_argmax_fused_q6,
                             generate_stats.lm_head_argmax_fallbacks,
                         },
                     );
                     print(
-                        "cuda_generate_epilogue_fusion_counts: activation_multiply={d} add_mul_scalar={d} rms_norm_add={d} rms_norm_add_output_scale={d} rms_norm_add_output_scale_fallbacks={d} gated_down_q8={d} gated_down_q4={d} gated_down_fallbacks={d}\n",
+                        "cuda_generate_epilogue_fusion_counts: activation_multiply={d} linear_activation_slice_q4_0={d} add_mul_scalar={d} rms_norm_add={d} rms_norm_add_output_scale={d} rms_norm_add_weighted_embedding_q6_k={d} rms_norm_add_output_scale_fallbacks={d} gated_down_q8={d} gated_down_q4_0={d} gated_down_q4_0_precompute={d} gated_down_q4_0_tile4={d} gated_down_q4_0_tile8={d} gated_down_q4_0_tile16={d} gated_down_q4={d} gated_down_fallbacks={d}\n",
                         .{
                             generate_stats.activation_multiply_fused,
+                            generate_stats.linear_activation_slice_fused_q4_0,
                             generate_stats.add_mul_scalar_fused,
                             generate_stats.rms_norm_add_fused,
                             generate_stats.rms_norm_add_output_scale_fused,
+                            generate_stats.rms_norm_add_weighted_embedding_fused_q6_k,
                             generate_stats.rms_norm_add_output_scale_fallbacks,
                             generate_stats.gated_down_fused_q8,
+                            generate_stats.gated_down_fused_q4_0,
+                            generate_stats.gated_down_fused_q4_0_precompute,
+                            generate_stats.gated_down_fused_q4_0_tile4,
+                            generate_stats.gated_down_fused_q4_0_tile8,
+                            generate_stats.gated_down_fused_q4_0_tile16,
                             generate_stats.gated_down_fused_q4,
                             generate_stats.gated_down_fallbacks,
                         },
@@ -1253,6 +1389,23 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                             generate_stats.decode_profile_ffn_post_norm_us,
                             generate_stats.decode_profile_lm_head_argmax_us,
                             generate_stats.decode_profile_graph_replay_us,
+                        },
+                    );
+                    print(
+                        "cuda_prefill_profile_us: events={d} q4_linear={d} q4_qkv={d} q4_pair={d} q4_gated_down={d} bf16_linear={d} bf16_qkv={d} bf16_pair={d} attention={d} ple_dense={d} staging={d} norm={d}\n",
+                        .{
+                            generate_stats.prefill_profile_events,
+                            generate_stats.prefill_profile_q4_linear_us,
+                            generate_stats.prefill_profile_q4_qkv_us,
+                            generate_stats.prefill_profile_q4_pair_us,
+                            generate_stats.prefill_profile_q4_gated_down_us,
+                            generate_stats.prefill_profile_bf16_linear_us,
+                            generate_stats.prefill_profile_bf16_qkv_us,
+                            generate_stats.prefill_profile_bf16_pair_us,
+                            generate_stats.prefill_profile_attention_us,
+                            generate_stats.prefill_profile_ple_dense_us,
+                            generate_stats.prefill_profile_staging_us,
+                            generate_stats.prefill_profile_norm_us,
                         },
                     );
                 }
@@ -1396,9 +1549,15 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
-                    "cuda_attention_launch_breakdown: gqa_decode={d} gqa_scalar={d}\n",
+                    "cuda_attention_launch_breakdown: gqa_decode={d} gqa_fast={d} gqa_fast_fallbacks={d} gqa_prefill_fast={d} gqa_prefill_tiled={d} gqa_prefill_mma={d} gqa_prefill_mma_m32={d} gqa_scalar={d}\n",
                     .{
                         cuda_stats.launch_attention_gqa_decode,
+                        cuda_stats.launch_attention_gqa_decode_fast,
+                        cuda_stats.launch_attention_gqa_decode_fast_fallbacks,
+                        cuda_stats.launch_attention_gqa_prefill_fast,
+                        cuda_stats.launch_attention_gqa_prefill_tiled,
+                        cuda_stats.launch_attention_gqa_prefill_mma,
+                        cuda_stats.launch_attention_gqa_prefill_mma_m32,
                         cuda_stats.launch_attention_gqa_scalar,
                     },
                 );
@@ -1421,6 +1580,18 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         cuda_stats.upload_owned_host_bytes,
                         cuda_stats.download_alloc_calls,
                         cuda_stats.download_alloc_bytes,
+                    },
+                );
+                print(
+                    "cuda_pinned_scalar_transfers: uploads={d} upload_bytes={d} upload_fallbacks={d} upload_wrap_syncs={d} downloads={d} download_bytes={d} download_fallbacks={d}\n",
+                    .{
+                        cuda_stats.pinned_scalar_uploads,
+                        cuda_stats.pinned_scalar_upload_bytes,
+                        cuda_stats.pinned_scalar_upload_fallbacks,
+                        cuda_stats.pinned_scalar_upload_wrap_syncs,
+                        cuda_stats.pinned_scalar_downloads,
+                        cuda_stats.pinned_scalar_download_bytes,
+                        cuda_stats.pinned_scalar_download_fallbacks,
                     },
                 );
                 print(
@@ -1468,9 +1639,12 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
-                    "cuda_qkv_counts: fused_q8={d} fused_q4={d} fused_q4_q4_f32={d} fused_f32={d} fallback_unsupported={d} kernel_unavailable={d}\n",
+                    "cuda_qkv_counts: fused_q8={d} fused_q4_0={d} fused_q4_0_tile4={d} fused_q4_0_tile8={d} fused_q4={d} fused_q4_q4_f32={d} fused_f32={d} fallback_unsupported={d} kernel_unavailable={d}\n",
                     .{
                         cuda_stats.qkv_fused_q8,
+                        cuda_stats.qkv_fused_q4_0,
+                        cuda_stats.qkv_fused_q4_0_tile4,
+                        cuda_stats.qkv_fused_q4_0_tile8,
                         cuda_stats.qkv_fused_q4,
                         cuda_stats.qkv_fused_q4_q4_f32,
                         cuda_stats.qkv_fused_f32,
@@ -1479,30 +1653,73 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
-                    "cuda_linear_pair_counts: fused_q8={d} fused_q4={d} fallbacks={d}\n",
+                    "cuda_q4_0_q8_1_prefill_counts: linear={d} linear_rows2={d} linear_rows4={d} linear_rows8_c4={d} linear_e4b_down_rows={d} linear_generic_rows={d} linear_tile8_rows={d} qkv={d} qkv_rows4={d} qkv_tile8_rows={d} qkv_tile8_w8_rows={d} pair={d} pair_rows2={d} pair_rows4={d} pair_rows8_c2={d} pair_rows16_c1={d} pair_generic_rows={d} pair_tile8_rows={d} gated_down={d} gated_down_rows2={d} gated_down_rows4={d} gated_down_rows8_c4={d} gated_down_e4b_down_rows={d} gated_down_generic_rows={d} gated_down_tile8_rows={d}\n",
+                    .{
+                        cuda_stats.q4_0_q8_1_prefill_linear_hits,
+                        cuda_stats.q4_0_q8_1_prefill_linear_rows2_hits,
+                        cuda_stats.q4_0_q8_1_prefill_linear_rows4_hits,
+                        cuda_stats.q4_0_q8_1_prefill_linear_rows8_c4_hits,
+                        cuda_stats.q4_0_q8_1_prefill_linear_e4b_down_rows_hits,
+                        cuda_stats.q4_0_q8_1_prefill_linear_generic_rows_hits,
+                        cuda_stats.q4_0_q8_1_prefill_linear_tile8_rows_hits,
+                        cuda_stats.q4_0_q8_1_prefill_qkv_hits,
+                        cuda_stats.q4_0_q8_1_prefill_qkv_rows4_hits,
+                        cuda_stats.q4_0_q8_1_prefill_qkv_tile8_rows_hits,
+                        cuda_stats.q4_0_q8_1_prefill_qkv_tile8_w8_rows_hits,
+                        cuda_stats.q4_0_q8_1_prefill_pair_hits,
+                        cuda_stats.q4_0_q8_1_prefill_pair_rows2_hits,
+                        cuda_stats.q4_0_q8_1_prefill_pair_rows4_hits,
+                        cuda_stats.q4_0_q8_1_prefill_pair_rows8_c2_hits,
+                        cuda_stats.q4_0_q8_1_prefill_pair_rows16_c1_hits,
+                        cuda_stats.q4_0_q8_1_prefill_pair_generic_rows_hits,
+                        cuda_stats.q4_0_q8_1_prefill_pair_tile8_rows_hits,
+                        cuda_stats.q4_0_q8_1_prefill_gated_down_hits,
+                        cuda_stats.q4_0_q8_1_prefill_gated_down_rows2_hits,
+                        cuda_stats.q4_0_q8_1_prefill_gated_down_rows4_hits,
+                        cuda_stats.q4_0_q8_1_prefill_gated_down_rows8_c4_hits,
+                        cuda_stats.q4_0_q8_1_prefill_gated_down_e4b_down_rows_hits,
+                        cuda_stats.q4_0_q8_1_prefill_gated_down_generic_rows_hits,
+                        cuda_stats.q4_0_q8_1_prefill_gated_down_tile8_rows_hits,
+                    },
+                );
+                print(
+                    "cuda_linear_pair_counts: fused_q8={d} fused_q4_0={d} fused_q4_0_activation={d} fused_q4_0_tile4={d} fused_q4_0_tile8={d} fused_q4={d} fallbacks={d}\n",
                     .{
                         cuda_stats.linear_pair_fused_q8,
+                        cuda_stats.linear_pair_fused_q4_0,
+                        cuda_stats.linear_pair_fused_q4_0_activation,
+                        cuda_stats.linear_pair_fused_q4_0_tile4,
+                        cuda_stats.linear_pair_fused_q4_0_tile8,
                         cuda_stats.linear_pair_fused_q4,
                         cuda_stats.linear_pair_fallbacks,
                     },
                 );
                 print(
-                    "cuda_lm_head_argmax_counts: fused_q8={d} fused_q4={d} fallbacks={d}\n",
+                    "cuda_lm_head_argmax_counts: fused_q8={d} fused_q4_0={d} fused_q4={d} fused_q6={d} fallbacks={d}\n",
                     .{
                         cuda_stats.lm_head_argmax_fused_q8,
+                        cuda_stats.lm_head_argmax_fused_q4_0,
                         cuda_stats.lm_head_argmax_fused_q4,
+                        cuda_stats.lm_head_argmax_fused_q6,
                         cuda_stats.lm_head_argmax_fallbacks,
                     },
                 );
                 print(
-                    "cuda_epilogue_fusion_counts: activation_multiply={d} add_mul_scalar={d} rms_norm_add={d} rms_norm_add_output_scale={d} rms_norm_add_output_scale_fallbacks={d} gated_down_q8={d} gated_down_q4={d} gated_down_fallbacks={d}\n",
+                    "cuda_epilogue_fusion_counts: activation_multiply={d} linear_activation_slice_q4_0={d} add_mul_scalar={d} rms_norm_add={d} rms_norm_add_output_scale={d} rms_norm_add_weighted_embedding_q6_k={d} rms_norm_add_output_scale_fallbacks={d} gated_down_q8={d} gated_down_q4_0={d} gated_down_q4_0_precompute={d} gated_down_q4_0_tile4={d} gated_down_q4_0_tile8={d} gated_down_q4_0_tile16={d} gated_down_q4={d} gated_down_fallbacks={d}\n",
                     .{
                         cuda_stats.activation_multiply_fused,
+                        cuda_stats.linear_activation_slice_fused_q4_0,
                         cuda_stats.add_mul_scalar_fused,
                         cuda_stats.rms_norm_add_fused,
                         cuda_stats.rms_norm_add_output_scale_fused,
+                        cuda_stats.rms_norm_add_weighted_embedding_fused_q6_k,
                         cuda_stats.rms_norm_add_output_scale_fallbacks,
                         cuda_stats.gated_down_fused_q8,
+                        cuda_stats.gated_down_fused_q4_0,
+                        cuda_stats.gated_down_fused_q4_0_precompute,
+                        cuda_stats.gated_down_fused_q4_0_tile4,
+                        cuda_stats.gated_down_fused_q4_0_tile8,
+                        cuda_stats.gated_down_fused_q4_0_tile16,
                         cuda_stats.gated_down_fused_q4,
                         cuda_stats.gated_down_fallbacks,
                     },
@@ -1530,14 +1747,16 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
-                    "cuda_bf16_counts: cublaslt_linear={d} cublaslt_qkv={d} cublaslt_activation_staging={d} cublaslt_fallbacks={d} scalar_linear={d} scalar_qkv={d}\n",
+                    "cuda_bf16_counts: cublaslt_linear={d} cublaslt_qkv={d} cublaslt_activation_staging={d} cublaslt_activation_mirror={d} cublaslt_fallbacks={d} scalar_linear={d} scalar_qkv={d} rms_norm_bf16_mirror={d}\n",
                     .{
                         cuda_stats.bf16_cublaslt_linear_calls,
                         cuda_stats.bf16_cublaslt_qkv_calls,
                         cuda_stats.bf16_cublaslt_activation_staging_calls,
+                        cuda_stats.bf16_cublaslt_activation_mirror_hits,
                         cuda_stats.bf16_cublaslt_fallbacks,
                         cuda_stats.bf16_scalar_linear_calls,
                         cuda_stats.bf16_scalar_qkv_calls,
+                        cuda_stats.rms_norm_bf16_mirror_hits,
                     },
                 );
                 print(
@@ -1555,8 +1774,22 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
-                    "cuda_mtp_counts: masked_argmax_hits={d} masked_argmax_fallbacks={d} verify_device_hits={d} verify_device_fallbacks={d} verify_result_downloads={d} verify_choice_downloads={d}\n",
+                    "cuda_mtp_counts: preproject_fused_hits={d} preproject_fused_f32_weight_hits={d} preproject_fused_bf16_weight_hits={d} preproject_fused_f16_weight_hits={d} preproject_fused_fallbacks={d} masked_select_fused_hits={d} masked_select_fused_f32_weight_hits={d} masked_select_fused_bf16_weight_hits={d} masked_select_fused_f16_weight_hits={d} masked_select_fused_fallbacks={d} masked_select_hidden_fused_hits={d} masked_select_hidden_fused_bf16_hits={d} masked_select_hidden_multiblock_hits={d} masked_select_hidden_fused_fallbacks={d} masked_argmax_hits={d} masked_argmax_fallbacks={d} verify_device_hits={d} verify_device_fallbacks={d} verify_result_downloads={d} verify_choice_downloads={d}\n",
                     .{
+                        cuda_stats.mtp_preproject_fused_hits,
+                        cuda_stats.mtp_preproject_fused_f32_weight_hits,
+                        cuda_stats.mtp_preproject_fused_bf16_weight_hits,
+                        cuda_stats.mtp_preproject_fused_f16_weight_hits,
+                        cuda_stats.mtp_preproject_fused_fallbacks,
+                        cuda_stats.mtp_masked_select_fused_hits,
+                        cuda_stats.mtp_masked_select_fused_f32_weight_hits,
+                        cuda_stats.mtp_masked_select_fused_bf16_weight_hits,
+                        cuda_stats.mtp_masked_select_fused_f16_weight_hits,
+                        cuda_stats.mtp_masked_select_fused_fallbacks,
+                        cuda_stats.mtp_masked_select_hidden_fused_hits,
+                        cuda_stats.mtp_masked_select_hidden_fused_bf16_hits,
+                        cuda_stats.mtp_masked_select_hidden_multiblock_hits,
+                        cuda_stats.mtp_masked_select_hidden_fused_fallbacks,
                         cuda_stats.mtp_masked_argmax_hits,
                         cuda_stats.mtp_masked_argmax_fallbacks,
                         cuda_stats.mtp_verify_commit_device_hits,
@@ -1566,7 +1799,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
-                    "cuda_device_kv_counts: attempts={d} successes={d} writes={d} reads={d} compressed_v_writes={d} compressed_v_reads={d} compressed_v_bytes={d} block_table_uploads={d} block_table_bytes={d} fail_batch={d} fail_no_cache={d} fail_no_storage={d} fail_no_hook={d} fail_write={d} fail_read={d} fail_shape={d}\n",
+                    "cuda_device_kv_counts: attempts={d} successes={d} writes={d} reads={d} compressed_v_writes={d} compressed_v_reads={d} compressed_v_bytes={d} block_table_uploads={d} block_table_bytes={d} identity_attention_reads={d} fail_batch={d} fail_no_cache={d} fail_no_storage={d} fail_no_hook={d} fail_write={d} fail_read={d} fail_shape={d}\n",
                     .{
                         cuda_stats.device_kv_attempts,
                         cuda_stats.device_kv_successes,
@@ -1577,6 +1810,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         cuda_stats.device_kv_compressed_v_bytes,
                         cuda_stats.device_kv_paged_block_table_uploads,
                         cuda_stats.device_kv_paged_block_table_bytes,
+                        cuda_stats.device_kv_paged_identity_attention_reads,
                         cuda_stats.device_kv_fail_batch,
                         cuda_stats.device_kv_fail_no_cache,
                         cuda_stats.device_kv_fail_no_storage,
@@ -1590,7 +1824,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             if (draft_model) |loaded_draft| {
                 if (session_factory.getCudaRuntimeStats(loaded_draft.session)) |draft_cuda_stats| {
                     print(
-                        "draft_cuda_counts: launches={d} syncs={d} upload_syncs={d} download_syncs={d} linear={d} argmax={d} h2d={d} d2h={d} cross_backend_copies={d} cross_backend_bytes={d} cross_backend_event_records={d} cross_backend_event_waits={d} cross_backend_sync_fallbacks={d} mtp_masked_argmax_hits={d} mtp_masked_argmax_fallbacks={d} device_kv_attempts={d} device_kv_successes={d} device_kv_reads={d} device_kv_writes={d} device_kv_fail_read={d} device_kv_fail_shape={d}\n",
+                        "draft_cuda_counts: launches={d} syncs={d} upload_syncs={d} download_syncs={d} linear={d} argmax={d} h2d={d} d2h={d} cross_backend_copies={d} cross_backend_bytes={d} cross_backend_event_records={d} cross_backend_event_waits={d} cross_backend_sync_fallbacks={d} mtp_preproject_fused_hits={d} mtp_preproject_fused_fallbacks={d} mtp_masked_select_fused_hits={d} mtp_masked_select_fused_fallbacks={d} mtp_masked_select_hidden_fused_hits={d} mtp_masked_select_hidden_multiblock_hits={d} mtp_masked_select_hidden_fused_fallbacks={d} mtp_masked_argmax_hits={d} mtp_masked_argmax_fallbacks={d} device_kv_attempts={d} device_kv_successes={d} device_kv_reads={d} device_kv_writes={d} device_kv_fail_read={d} device_kv_fail_shape={d}\n",
                         .{
                             draft_cuda_stats.kernel_launches,
                             draft_cuda_stats.stream_syncs,
@@ -1605,6 +1839,13 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                             draft_cuda_stats.cross_backend_event_records,
                             draft_cuda_stats.cross_backend_event_waits,
                             draft_cuda_stats.cross_backend_sync_fallbacks,
+                            draft_cuda_stats.mtp_preproject_fused_hits,
+                            draft_cuda_stats.mtp_preproject_fused_fallbacks,
+                            draft_cuda_stats.mtp_masked_select_fused_hits,
+                            draft_cuda_stats.mtp_masked_select_fused_fallbacks,
+                            draft_cuda_stats.mtp_masked_select_hidden_fused_hits,
+                            draft_cuda_stats.mtp_masked_select_hidden_multiblock_hits,
+                            draft_cuda_stats.mtp_masked_select_hidden_fused_fallbacks,
                             draft_cuda_stats.mtp_masked_argmax_hits,
                             draft_cuda_stats.mtp_masked_argmax_fallbacks,
                             draft_cuda_stats.device_kv_attempts,
@@ -1665,6 +1906,359 @@ fn tokensPerSecond(tokens: usize, millis: u64) f64 {
     return @as(f64, @floatFromInt(tokens)) * 1000.0 / @as(f64, @floatFromInt(millis));
 }
 
+const RawDecodeBenchResult = struct {
+    tokens: usize,
+    warmup_tokens: usize,
+    prompt_tokens: usize,
+    scope: []const u8,
+    device_warmup_ms: u64,
+    prefill_ms: u64,
+    warmup_ms: u64,
+    decode_ms: u64,
+};
+
+fn runRawDecodeBench(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cb: *const ops.ComputeBackend,
+    gpt_config: gpt_mod.Config,
+    prompt_ids_i32: []const i32,
+    tokens: usize,
+    prefill_chunk_size: usize,
+    decode_state: *generation.NativeDecodeState,
+) !RawDecodeBenchResult {
+    const prompt_ids = try allocator.alloc(i64, prompt_ids_i32.len);
+    defer allocator.free(prompt_ids);
+    for (prompt_ids_i32, 0..) |id, idx| prompt_ids[idx] = id;
+
+    var last_hidden: ?ops.CT = null;
+    defer if (last_hidden) |hidden| cb.free(hidden);
+    var last_token_tensor: ?ops.CT = null;
+    defer if (last_token_tensor) |token| cb.free(token);
+    const include_greedy_token = rawDecodeBenchGreedyTokenTensorEnabled();
+    const scope = if (include_greedy_token)
+        "greedy_token_tensor_no_host_resolution"
+    else
+        "hidden_decode_no_lm_head_sampler";
+
+    const prefill_started_at = std.Io.Timestamp.now(io, .awake);
+    var offset: usize = 0;
+    const chunk_size = if (prefill_chunk_size > 0) prefill_chunk_size else prompt_ids.len;
+    while (offset < prompt_ids.len) {
+        const remaining = prompt_ids.len - offset;
+        const query_len = @min(remaining, chunk_size);
+        try decode_state.appendPrefillChunk(query_len);
+        const seq_len = decode_state.total_tokens;
+        var decode_context = decode_state.gptDecodeContext(seq_len, query_len);
+        if (last_hidden) |hidden| {
+            cb.free(hidden);
+            last_hidden = null;
+        }
+        last_hidden = try gpt_arch.forwardHiddenTensorWithCudaReplay(
+            cb,
+            allocator,
+            gpt_config,
+            prompt_ids[offset..][0..query_len],
+            1,
+            seq_len,
+            &decode_context,
+            "gpt.raw_hidden_decode",
+        );
+        offset += query_len;
+    }
+    const finished_prefill_at = std.Io.Timestamp.now(io, .awake);
+
+    var token_buf: [1]i64 = undefined;
+    var token_buf_i32: [1]i32 = undefined;
+    const token_shape = [_]i32{1};
+    const warmup_tokens = rawDecodeBenchWarmupTokens();
+    const total_decode_steps = try std.math.add(usize, warmup_tokens, tokens);
+    var resident_token_tensors = std.ArrayListUnmanaged(ops.CT).empty;
+    defer {
+        for (resident_token_tensors.items) |token_tensor| cb.free(token_tensor);
+        resident_token_tensors.deinit(allocator);
+    }
+    if (rawDecodeBenchResidentTokenInputsEnabled()) {
+        var idx: usize = 0;
+        while (idx < total_decode_steps) : (idx += 1) {
+            const token_id = rawDecodeBenchToken(idx, gpt_config.vocab_size);
+            const token_id_i32 = std.math.cast(i32, token_id) orelse return error.InvalidTokenId;
+            token_buf_i32[0] = token_id_i32;
+            const token_tensor = (try cb.fromInt32Shape(token_buf_i32[0..], &token_shape)) orelse break;
+            try resident_token_tensors.append(allocator, token_tensor);
+        }
+        if (resident_token_tensors.items.len != total_decode_steps) {
+            for (resident_token_tensors.items) |token_tensor| cb.free(token_tensor);
+            resident_token_tensors.clearRetainingCapacity();
+        }
+    }
+    const use_resident_token_tensors = resident_token_tensors.items.len == total_decode_steps;
+    const device_warmup_ms = try runRawDecodeDeviceWarmup(allocator, io, cb);
+
+    const warmup_started_at = std.Io.Timestamp.now(io, .awake);
+    for (0..warmup_tokens) |idx| {
+        try decode_state.appendGeneratedToken();
+        const seq_len = decode_state.total_tokens;
+        var decode_context = decode_state.gptDecodeContext(seq_len, 1);
+        const need_hidden = idx + 1 == warmup_tokens;
+        token_buf[0] = rawDecodeBenchToken(idx, gpt_config.vocab_size);
+        if (last_hidden) |hidden| {
+            cb.free(hidden);
+            last_hidden = null;
+        }
+        if (last_token_tensor) |token| {
+            cb.free(token);
+            last_token_tensor = null;
+        }
+        token_buf_i32[0] = std.math.cast(i32, token_buf[0]) orelse return error.InvalidTokenId;
+        const token_tensor_opt: ?ops.CT = if (use_resident_token_tensors)
+            resident_token_tensors.items[idx]
+        else
+            try cb.fromInt32Shape(token_buf_i32[0..], &token_shape);
+        if (token_tensor_opt) |token_tensor| {
+            defer if (!use_resident_token_tensors) cb.free(token_tensor);
+            if (include_greedy_token) {
+                last_token_tensor = (try gpt_arch.forwardGreedyLastTokenTensorOnlyFromTokenTensor(
+                    cb,
+                    allocator,
+                    gpt_config,
+                    token_tensor,
+                    1,
+                    seq_len,
+                    &decode_context,
+                )) orelse return error.RawDecodeGreedyTokenTensorUnavailable;
+                continue;
+            }
+            if (!need_hidden and try gpt_arch.forwardHiddenOnlyFromTokenTensorWithCudaReplayDiscard(
+                cb,
+                allocator,
+                gpt_config,
+                token_tensor,
+                1,
+                seq_len,
+                &decode_context,
+                "gpt.raw_hidden_decode",
+            )) {
+                continue;
+            }
+            if (try gpt_arch.forwardHiddenTensorFromTokenTensorWithCudaReplay(
+                cb,
+                allocator,
+                gpt_config,
+                token_tensor,
+                1,
+                seq_len,
+                &decode_context,
+                "gpt.raw_hidden_decode",
+            )) |hidden| {
+                last_hidden = hidden;
+                continue;
+            }
+        }
+        last_hidden = try gpt_arch.forwardHiddenTensorWithCudaReplay(cb, allocator, gpt_config, token_buf[0..], 1, seq_len, &decode_context, "gpt.raw_hidden_decode");
+    }
+    if (last_hidden) |hidden| try cb.evalTensor(hidden);
+    if (last_token_tensor) |token| try cb.evalTensor(token);
+    const finished_warmup_at = std.Io.Timestamp.now(io, .awake);
+
+    const decode_started_at = std.Io.Timestamp.now(io, .awake);
+    for (0..tokens) |idx| {
+        const token_index = warmup_tokens + idx;
+        try decode_state.appendGeneratedToken();
+        const seq_len = decode_state.total_tokens;
+        var decode_context = decode_state.gptDecodeContext(seq_len, 1);
+        const need_hidden = idx + 1 == tokens;
+        token_buf[0] = rawDecodeBenchToken(token_index, gpt_config.vocab_size);
+        if (last_hidden) |hidden| {
+            cb.free(hidden);
+            last_hidden = null;
+        }
+        if (last_token_tensor) |token| {
+            cb.free(token);
+            last_token_tensor = null;
+        }
+        token_buf_i32[0] = std.math.cast(i32, token_buf[0]) orelse return error.InvalidTokenId;
+        const token_tensor_opt: ?ops.CT = if (use_resident_token_tensors)
+            resident_token_tensors.items[token_index]
+        else
+            try cb.fromInt32Shape(token_buf_i32[0..], &token_shape);
+        if (token_tensor_opt) |token_tensor| {
+            defer if (!use_resident_token_tensors) cb.free(token_tensor);
+            if (include_greedy_token) {
+                last_token_tensor = (try gpt_arch.forwardGreedyLastTokenTensorOnlyFromTokenTensor(
+                    cb,
+                    allocator,
+                    gpt_config,
+                    token_tensor,
+                    1,
+                    seq_len,
+                    &decode_context,
+                )) orelse return error.RawDecodeGreedyTokenTensorUnavailable;
+                continue;
+            }
+            if (!need_hidden and try gpt_arch.forwardHiddenOnlyFromTokenTensorWithCudaReplayDiscard(
+                cb,
+                allocator,
+                gpt_config,
+                token_tensor,
+                1,
+                seq_len,
+                &decode_context,
+                "gpt.raw_hidden_decode",
+            )) {
+                continue;
+            }
+            if (try gpt_arch.forwardHiddenTensorFromTokenTensorWithCudaReplay(
+                cb,
+                allocator,
+                gpt_config,
+                token_tensor,
+                1,
+                seq_len,
+                &decode_context,
+                "gpt.raw_hidden_decode",
+            )) |hidden| {
+                last_hidden = hidden;
+                continue;
+            }
+        }
+        last_hidden = try gpt_arch.forwardHiddenTensorWithCudaReplay(cb, allocator, gpt_config, token_buf[0..], 1, seq_len, &decode_context, "gpt.raw_hidden_decode");
+    }
+    if (last_hidden) |hidden| try cb.evalTensor(hidden);
+    if (last_token_tensor) |token| try cb.evalTensor(token);
+    const finished_decode_at = std.Io.Timestamp.now(io, .awake);
+
+    return .{
+        .tokens = tokens,
+        .warmup_tokens = warmup_tokens,
+        .prompt_tokens = prompt_ids.len,
+        .scope = scope,
+        .device_warmup_ms = device_warmup_ms,
+        .prefill_ms = durationMillis(prefill_started_at, finished_prefill_at),
+        .warmup_ms = durationMillis(warmup_started_at, finished_warmup_at),
+        .decode_ms = durationMillis(decode_started_at, finished_decode_at),
+    };
+}
+
+fn runRawDecodeDeviceWarmup(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cb: *const ops.ComputeBackend,
+) !u64 {
+    _ = allocator;
+    const target_ms = platform.env.getenvUsize("ANTFLY_INFERENCE_RAW_DECODE_DEVICE_WARMUP_MS") orelse 0;
+    const fixed_iters = platform.env.getenvUsize("ANTFLY_INFERENCE_RAW_DECODE_DEVICE_WARMUP_ITERS") orelse 0;
+    if (target_ms == 0 and fixed_iters == 0) return 0;
+
+    const warmup_mb = platform.env.getenvUsize("ANTFLY_INFERENCE_RAW_DECODE_DEVICE_WARMUP_MB") orelse 256;
+    const warmup_bytes = try std.math.mul(usize, warmup_mb, 1024 * 1024);
+    const iterations = if (fixed_iters != 0) fixed_iters else @max(target_ms, 1);
+    const started_at = std.Io.Timestamp.now(io, .awake);
+    if (!(try cb.debugCudaDeviceWarmup(warmup_bytes, iterations))) return 0;
+    return durationMillis(started_at, std.Io.Timestamp.now(io, .awake));
+}
+
+fn rawDecodeBenchWarmupTokens() usize {
+    return platform.env.getenvUsize("ANTFLY_INFERENCE_RAW_DECODE_WARMUP_TOKENS") orelse 0;
+}
+
+fn rawDecodeBenchResidentTokenInputsEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_RAW_DECODE_RESIDENT_TOKEN_INPUTS", false);
+}
+
+fn rawDecodeBenchGreedyTokenTensorEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_RAW_DECODE_GREEDY_TOKEN_TENSOR", false);
+}
+
+fn rawDecodeBenchToken(index: usize, vocab_size: u32) i64 {
+    if (vocab_size <= 1) return 0;
+    var x: u64 = @as(u64, @intCast(index)) +% 1;
+    x = x *% 6364136223846793005 +% 1442695040888963407;
+    return @intCast((x % @as(u64, vocab_size - 1)) + 1);
+}
+
+fn writeRawDecodeBenchJson(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    model_dir: []const u8,
+    backend_name: []const u8,
+    result: RawDecodeBenchResult,
+    load_model_ms: u64,
+    prompt_prep_ms: u64,
+    scheduler_ms: u64,
+    backend_setup_ms: u64,
+    decode_setup_ms: u64,
+    total_ms: u64,
+    cuda_stats_opt: ?session_factory.CudaRuntimeStats,
+    cuda_generate_stats_opt: ?session_factory.CudaRuntimeStats,
+) !void {
+    const cuda_json = if (comptime build_options.enable_cuda)
+        try cudaStatsCompactJson(allocator, cuda_stats_opt, result.tokens)
+    else
+        try allocator.dupe(u8, "null");
+    defer allocator.free(cuda_json);
+
+    const cuda_generate_json = if (comptime build_options.enable_cuda)
+        try cudaStatsCompactJson(allocator, cuda_generate_stats_opt, result.tokens)
+    else
+        try allocator.dupe(u8, "null");
+    defer allocator.free(cuda_generate_json);
+
+    const json = try std.fmt.allocPrint(
+        allocator,
+        \\{{
+        \\"model_dir":{f},
+        \\"backend":{f},
+        \\"tokens":{d},
+        \\"warmup_tokens":{d},
+        \\"prompt_tokens":{d},
+        \\"benchmark_type":"raw_decode",
+        \\"benchmark_scope":{f},
+        \\"raw_decode_tok_per_s":{d:.6},
+        \\"timing_ms":{{
+        \\"load_model":{d},
+        \\"prompt_prep":{d},
+        \\"scheduler":{d},
+        \\"backend_setup":{d},
+        \\"decode_setup":{d},
+        \\"prefill":{d},
+        \\"device_warmup":{d},
+        \\"warmup":{d},
+        \\"decode":{d},
+        \\"total":{d}
+        \\}},
+        \\"cuda":{s},
+        \\"cuda_generate":{s}
+        \\}}
+        \\
+    ,
+        .{
+            std.json.fmt(model_dir, .{}),
+            std.json.fmt(backend_name, .{}),
+            result.tokens,
+            result.warmup_tokens,
+            result.prompt_tokens,
+            std.json.fmt(result.scope, .{}),
+            tokensPerSecond(result.tokens, result.decode_ms),
+            load_model_ms,
+            prompt_prep_ms,
+            scheduler_ms,
+            backend_setup_ms,
+            decode_setup_ms,
+            result.prefill_ms,
+            result.device_warmup_ms,
+            result.warmup_ms,
+            result.decode_ms,
+            total_ms,
+            cuda_json,
+            cuda_generate_json,
+        },
+    );
+    defer allocator.free(json);
+    try compat.cwd().writeFile(io, .{ .sub_path = path, .data = json });
+}
+
 fn perToken(count: usize, tokens: usize) f64 {
     if (tokens == 0) return 0.0;
     return @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(tokens));
@@ -1693,6 +2287,20 @@ fn appendFmt(
     try out.appendSlice(allocator, chunk);
 }
 
+fn tokenIdsJson(allocator: std.mem.Allocator, ids_opt: ?[]i32) ![]u8 {
+    if (!platform.env.getenvBool("ANTFLY_INFERENCE_JSON_TOKEN_IDS")) return allocator.dupe(u8, "null");
+    const ids = ids_opt orelse return allocator.dupe(u8, "null");
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '[');
+    for (ids, 0..) |id, idx| {
+        if (idx > 0) try out.append(allocator, ',');
+        try appendFmt(allocator, &out, "{d}", .{id});
+    }
+    try out.append(allocator, ']');
+    return out.toOwnedSlice(allocator);
+}
+
 fn cudaStatsCompactJson(
     allocator: std.mem.Allocator,
     stats_opt: ?session_factory.CudaRuntimeStats,
@@ -1710,6 +2318,13 @@ fn cudaStatsCompactJson(
         \\"stream_syncs":{d},
         \\"syncs_per_token":{d:.6},
         \\"upload_syncs":{d},
+        \\"pinned_scalar_uploads":{d},
+        \\"pinned_scalar_upload_bytes":{d},
+        \\"pinned_scalar_upload_fallbacks":{d},
+        \\"pinned_scalar_upload_wrap_syncs":{d},
+        \\"pinned_scalar_downloads":{d},
+        \\"pinned_scalar_download_bytes":{d},
+        \\"pinned_scalar_download_fallbacks":{d},
         \\"download_syncs":{d},
         \\"eval_syncs":{d},
         \\"h2d_bytes":{d},
@@ -1728,6 +2343,13 @@ fn cudaStatsCompactJson(
             stats.stream_syncs,
             perToken(stats.stream_syncs, tokens),
             stats.upload_syncs,
+            stats.pinned_scalar_uploads,
+            stats.pinned_scalar_upload_bytes,
+            stats.pinned_scalar_upload_fallbacks,
+            stats.pinned_scalar_upload_wrap_syncs,
+            stats.pinned_scalar_downloads,
+            stats.pinned_scalar_download_bytes,
+            stats.pinned_scalar_download_fallbacks,
             stats.download_syncs,
             stats.eval_syncs,
             stats.h2d_bytes,
@@ -1743,6 +2365,16 @@ fn cudaStatsCompactJson(
     try appendFmt(
         allocator,
         &out,
+        \\"graph_capture_begins":{d},
+        \\"graph_capture_replays":{d},
+        \\"graph_capture_discards":{d},
+        \\"graph_capture_instantiates":{d},
+        \\"graph_capture_update_successes":{d},
+        \\"graph_capture_update_failures":{d},
+        \\"graph_capture_update_unavailable":{d},
+        \\"graph_capture_scalar_updates":{d},
+        \\"graph_capture_persistent_replays":{d},
+        \\"graph_capture_capacity_skips":{d},
         \\"launch_linear":{d},
         \\"launch_linear_qkv":{d},
         \\"launch_norm":{d},
@@ -1759,6 +2391,16 @@ fn cudaStatsCompactJson(
         \\
     ,
         .{
+            stats.cuda_graph_capture_begins,
+            stats.cuda_graph_capture_replays,
+            stats.cuda_graph_capture_discards,
+            stats.cuda_graph_capture_instantiates,
+            stats.cuda_graph_capture_update_successes,
+            stats.cuda_graph_capture_update_failures,
+            stats.cuda_graph_capture_update_unavailable,
+            stats.cuda_graph_capture_scalar_updates,
+            stats.cuda_graph_capture_persistent_replays,
+            stats.cuda_graph_capture_capacity_skips,
             stats.launch_linear,
             stats.launch_linear_qkv,
             stats.launch_norm,
@@ -1788,26 +2430,11 @@ fn cudaStatsCompactJson(
         \\"decode_profile_lm_head_argmax_us":{d},
         \\"decode_profile_graph_replay_us":{d},
         \\"lm_head_argmax_fused_q8":{d},
+        \\"lm_head_argmax_fused_q4_0":{d},
         \\"lm_head_argmax_fused_q4":{d},
+        \\"lm_head_argmax_fused_q6":{d},
         \\"lm_head_argmax_fallbacks":{d},
-        \\"mtp_masked_argmax_hits":{d},
-        \\"mtp_masked_argmax_fallbacks":{d},
-        \\"mtp_verify_commit_device_hits":{d},
-        \\"mtp_verify_commit_device_fallbacks":{d},
-        \\"mtp_verify_commit_result_downloads":{d},
-        \\"mtp_verify_commit_choice_downloads":{d},
-        \\"device_kv_attempts":{d},
-        \\"device_kv_successes":{d},
-        \\"device_kv_reads":{d},
-        \\"device_kv_writes":{d},
-        \\"device_kv_compressed_v_reads":{d},
-        \\"device_kv_compressed_v_writes":{d},
-        \\"device_kv_compressed_v_bytes":{d},
-        \\"device_kv_paged_block_table_uploads":{d},
-        \\"device_kv_paged_block_table_bytes":{d},
-        \\"device_kv_fail_read":{d},
-        \\"device_kv_fail_shape":{d}
-        \\}}
+        \\
     ,
         .{
             stats.decode_profile_events,
@@ -1821,14 +2448,110 @@ fn cudaStatsCompactJson(
             stats.decode_profile_lm_head_argmax_us,
             stats.decode_profile_graph_replay_us,
             stats.lm_head_argmax_fused_q8,
+            stats.lm_head_argmax_fused_q4_0,
             stats.lm_head_argmax_fused_q4,
+            stats.lm_head_argmax_fused_q6,
             stats.lm_head_argmax_fallbacks,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\"prefill_profile_events":{d},
+        \\"prefill_profile_q4_linear_us":{d},
+        \\"prefill_profile_q4_qkv_us":{d},
+        \\"prefill_profile_q4_pair_us":{d},
+        \\"prefill_profile_q4_gated_down_us":{d},
+        \\"prefill_profile_bf16_linear_us":{d},
+        \\"prefill_profile_bf16_qkv_us":{d},
+        \\"prefill_profile_bf16_pair_us":{d},
+        \\"prefill_profile_attention_us":{d},
+        \\"prefill_profile_ple_dense_us":{d},
+        \\"prefill_profile_staging_us":{d},
+        \\"prefill_profile_norm_us":{d},
+        \\
+    ,
+        .{
+            stats.prefill_profile_events,
+            stats.prefill_profile_q4_linear_us,
+            stats.prefill_profile_q4_qkv_us,
+            stats.prefill_profile_q4_pair_us,
+            stats.prefill_profile_q4_gated_down_us,
+            stats.prefill_profile_bf16_linear_us,
+            stats.prefill_profile_bf16_qkv_us,
+            stats.prefill_profile_bf16_pair_us,
+            stats.prefill_profile_attention_us,
+            stats.prefill_profile_ple_dense_us,
+            stats.prefill_profile_staging_us,
+            stats.prefill_profile_norm_us,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\"mtp_preproject_fused_hits":{d},
+        \\"mtp_preproject_fused_f32_weight_hits":{d},
+        \\"mtp_preproject_fused_bf16_weight_hits":{d},
+        \\"mtp_preproject_fused_f16_weight_hits":{d},
+        \\"mtp_preproject_fused_fallbacks":{d},
+        \\"mtp_masked_select_fused_hits":{d},
+        \\"mtp_masked_select_fused_f32_weight_hits":{d},
+        \\"mtp_masked_select_fused_bf16_weight_hits":{d},
+        \\"mtp_masked_select_fused_f16_weight_hits":{d},
+        \\"mtp_masked_select_fused_fallbacks":{d},
+        \\"mtp_masked_select_hidden_fused_hits":{d},
+        \\"mtp_masked_select_hidden_fused_bf16_hits":{d},
+        \\"mtp_masked_select_hidden_multiblock_hits":{d},
+        \\"mtp_masked_select_hidden_fused_fallbacks":{d},
+        \\"mtp_masked_argmax_hits":{d},
+        \\"mtp_masked_argmax_fallbacks":{d},
+        \\"mtp_verify_commit_device_hits":{d},
+        \\"mtp_verify_commit_device_fallbacks":{d},
+        \\"mtp_verify_commit_result_downloads":{d},
+        \\"mtp_verify_commit_choice_downloads":{d},
+        \\
+    ,
+        .{
+            stats.mtp_preproject_fused_hits,
+            stats.mtp_preproject_fused_f32_weight_hits,
+            stats.mtp_preproject_fused_bf16_weight_hits,
+            stats.mtp_preproject_fused_f16_weight_hits,
+            stats.mtp_preproject_fused_fallbacks,
+            stats.mtp_masked_select_fused_hits,
+            stats.mtp_masked_select_fused_f32_weight_hits,
+            stats.mtp_masked_select_fused_bf16_weight_hits,
+            stats.mtp_masked_select_fused_f16_weight_hits,
+            stats.mtp_masked_select_fused_fallbacks,
+            stats.mtp_masked_select_hidden_fused_hits,
+            stats.mtp_masked_select_hidden_fused_bf16_hits,
+            stats.mtp_masked_select_hidden_multiblock_hits,
+            stats.mtp_masked_select_hidden_fused_fallbacks,
             stats.mtp_masked_argmax_hits,
             stats.mtp_masked_argmax_fallbacks,
             stats.mtp_verify_commit_device_hits,
             stats.mtp_verify_commit_device_fallbacks,
             stats.mtp_verify_commit_result_downloads,
             stats.mtp_verify_commit_choice_downloads,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\"device_kv_attempts":{d},
+        \\"device_kv_successes":{d},
+        \\"device_kv_reads":{d},
+        \\"device_kv_writes":{d},
+        \\"device_kv_compressed_v_reads":{d},
+        \\"device_kv_compressed_v_writes":{d},
+        \\"device_kv_compressed_v_bytes":{d},
+        \\"device_kv_paged_block_table_uploads":{d},
+        \\"device_kv_paged_block_table_bytes":{d},
+        \\"device_kv_paged_identity_attention_reads":{d},
+        \\"device_kv_fail_read":{d},
+        \\"device_kv_fail_shape":{d}
+        \\}}
+    ,
+        .{
             stats.device_kv_attempts,
             stats.device_kv_successes,
             stats.device_kv_reads,
@@ -1838,6 +2561,7 @@ fn cudaStatsCompactJson(
             stats.device_kv_compressed_v_bytes,
             stats.device_kv_paged_block_table_uploads,
             stats.device_kv_paged_block_table_bytes,
+            stats.device_kv_paged_identity_attention_reads,
             stats.device_kv_fail_read,
             stats.device_kv_fail_shape,
         },
@@ -1865,6 +2589,8 @@ fn writeJsonTiming(
     draft_cuda_generate_stats_opt: ?session_factory.CudaRuntimeStats,
 ) !void {
     const inner_timing = result.timing_ms orelse generation.GenerationTimingMs{};
+    const runtime_stats = graph_mod.metal_executor.getTimingStats();
+    const decoder_debug_stats = generation.getDecoderRuntimeDebugStats();
     const decode_ms = if (inner_timing.decode != 0) inner_timing.decode else generate_ms;
     const speculative_json = if (result.speculative) |stats| blk: {
         const quality = stats.mtp_quality;
@@ -1928,7 +2654,21 @@ fn writeJsonTiming(
             \\"bonus_materializations":{d},
             \\"bonus_skips":{d},
             \\"fallback_calls":{d},
+            \\"draft_embedding_cache_hits":{d},
+            \\"draft_embedding_cache_misses":{d},
+            \\"draft_embedding_cache_inserts":{d},
+            \\"draft_embedding_cache_evictions":{d},
+            \\"draft_embedding_cache_disabled":{d},
+            \\"draft_target_embedding_cross_copies":{d},
             \\"draft_token_ns":{d},
+            \\"draft_target_embedding_ns":{d},
+            \\"draft_concat_ns":{d},
+            \\"draft_preprojection_ns":{d},
+            \\"draft_assistant_ns":{d},
+            \\"draft_postprojection_ns":{d},
+            \\"draft_argmax_ns":{d},
+            \\"draft_lm_head_ns":{d},
+            \\"draft_selection_ns":{d},
             \\"target_verify_ns":{d},
             \\"activation_copy_ns":{d},
             \\"materialization_ns":{d},
@@ -1947,7 +2687,21 @@ fn writeJsonTiming(
                 profile.bonus_materializations,
                 profile.bonus_skips,
                 profile.fallback_calls,
+                profile.draft_embedding_cache_hits,
+                profile.draft_embedding_cache_misses,
+                profile.draft_embedding_cache_inserts,
+                profile.draft_embedding_cache_evictions,
+                profile.draft_embedding_cache_disabled,
+                profile.draft_target_embedding_cross_copies,
                 profile.draft_token_ns,
+                profile.draft_target_embedding_ns,
+                profile.draft_concat_ns,
+                profile.draft_preprojection_ns,
+                profile.draft_assistant_ns,
+                profile.draft_postprojection_ns,
+                profile.draft_argmax_ns,
+                profile.draft_lm_head_ns,
+                profile.draft_selection_ns,
                 profile.target_verify_ns,
                 profile.activation_copy_ns,
                 profile.materialization_ns,
@@ -2033,6 +2787,13 @@ fn writeJsonTiming(
                 \\"stream_syncs":{d},
                 \\"syncs_per_token":{d:.6},
                 \\"upload_syncs":{d},
+                \\"pinned_scalar_uploads":{d},
+                \\"pinned_scalar_upload_bytes":{d},
+                \\"pinned_scalar_upload_fallbacks":{d},
+                \\"pinned_scalar_upload_wrap_syncs":{d},
+                \\"pinned_scalar_downloads":{d},
+                \\"pinned_scalar_download_bytes":{d},
+                \\"pinned_scalar_download_fallbacks":{d},
                 \\"download_syncs":{d},
                 \\"eval_syncs":{d},
                 \\"h2d_bytes":{d},
@@ -2051,6 +2812,13 @@ fn writeJsonTiming(
                     cuda_stats.stream_syncs,
                     perToken(cuda_stats.stream_syncs, result.tokens_used),
                     cuda_stats.upload_syncs,
+                    cuda_stats.pinned_scalar_uploads,
+                    cuda_stats.pinned_scalar_upload_bytes,
+                    cuda_stats.pinned_scalar_upload_fallbacks,
+                    cuda_stats.pinned_scalar_upload_wrap_syncs,
+                    cuda_stats.pinned_scalar_downloads,
+                    cuda_stats.pinned_scalar_download_bytes,
+                    cuda_stats.pinned_scalar_download_fallbacks,
                     cuda_stats.download_syncs,
                     cuda_stats.eval_syncs,
                     cuda_stats.h2d_bytes,
@@ -2121,6 +2889,12 @@ fn writeJsonTiming(
                 \\"launch_rope":{d},
                 \\"launch_attention":{d},
                 \\"launch_attention_gqa_decode":{d},
+                \\"launch_attention_gqa_decode_fast":{d},
+                \\"launch_attention_gqa_decode_fast_fallbacks":{d},
+                \\"launch_attention_gqa_prefill_fast":{d},
+                \\"launch_attention_gqa_prefill_tiled":{d},
+                \\"launch_attention_gqa_prefill_mma":{d},
+                \\"launch_attention_gqa_prefill_mma_m32":{d},
                 \\"launch_attention_gqa_scalar":{d},
                 \\"launch_elementwise":{d},
                 \\"launch_scalar":{d},
@@ -2135,6 +2909,12 @@ fn writeJsonTiming(
                     cuda_stats.launch_rope,
                     cuda_stats.launch_attention,
                     cuda_stats.launch_attention_gqa_decode,
+                    cuda_stats.launch_attention_gqa_decode_fast,
+                    cuda_stats.launch_attention_gqa_decode_fast_fallbacks,
+                    cuda_stats.launch_attention_gqa_prefill_fast,
+                    cuda_stats.launch_attention_gqa_prefill_tiled,
+                    cuda_stats.launch_attention_gqa_prefill_mma,
+                    cuda_stats.launch_attention_gqa_prefill_mma_m32,
                     cuda_stats.launch_attention_gqa_scalar,
                     cuda_stats.launch_elementwise,
                     cuda_stats.launch_scalar,
@@ -2145,32 +2925,146 @@ fn writeJsonTiming(
                 allocator,
                 &cuda_out,
                 \\"activation_multiply_fused":{d},
+                \\"linear_activation_slice_fused_q4_0":{d},
                 \\"add_mul_scalar_fused":{d},
                 \\"rms_norm_add_output_scale_fused":{d},
+                \\"rms_norm_add_weighted_embedding_fused_q6_k":{d},
                 \\"rms_norm_add_output_scale_fallbacks":{d},
                 \\"gated_down_fused_q8":{d},
+                \\"gated_down_fused_q4_0":{d},
+                \\"gated_down_fused_q4_0_precompute":{d},
+                \\"gated_down_fused_q4_0_tile4":{d},
+                \\"gated_down_fused_q4_0_tile8":{d},
+                \\"gated_down_fused_q4_0_tile16":{d},
                 \\"gated_down_fused_q4":{d},
                 \\"gated_down_fallbacks":{d},
                 \\"qkv_fused_q8":{d},
+                \\"qkv_fused_q4_0":{d},
+                \\"qkv_fused_q4_0_tile4":{d},
+                \\"qkv_fused_q4_0_tile8":{d},
                 \\"qkv_fused_q4":{d},
                 \\"qkv_fused_q4_q4_f32":{d},
                 \\"qkv_fused_f32":{d},
                 \\"qkv_fallback_unsupported":{d},
                 \\"qkv_kernel_unavailable":{d},
                 \\"linear_pair_fused_q8":{d},
+                \\"linear_pair_fused_q4_0":{d},
+                \\"linear_pair_fused_q4_0_activation":{d},
+                \\"linear_pair_fused_q4_0_tile4":{d},
+                \\"linear_pair_fused_q4_0_tile8":{d},
                 \\"linear_pair_fused_q4":{d},
                 \\"linear_pair_fallbacks":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.activation_multiply_fused,
+                    cuda_stats.linear_activation_slice_fused_q4_0,
+                    cuda_stats.add_mul_scalar_fused,
+                    cuda_stats.rms_norm_add_output_scale_fused,
+                    cuda_stats.rms_norm_add_weighted_embedding_fused_q6_k,
+                    cuda_stats.rms_norm_add_output_scale_fallbacks,
+                    cuda_stats.gated_down_fused_q8,
+                    cuda_stats.gated_down_fused_q4_0,
+                    cuda_stats.gated_down_fused_q4_0_precompute,
+                    cuda_stats.gated_down_fused_q4_0_tile4,
+                    cuda_stats.gated_down_fused_q4_0_tile8,
+                    cuda_stats.gated_down_fused_q4_0_tile16,
+                    cuda_stats.gated_down_fused_q4,
+                    cuda_stats.gated_down_fallbacks,
+                    cuda_stats.qkv_fused_q8,
+                    cuda_stats.qkv_fused_q4_0,
+                    cuda_stats.qkv_fused_q4_0_tile4,
+                    cuda_stats.qkv_fused_q4_0_tile8,
+                    cuda_stats.qkv_fused_q4,
+                    cuda_stats.qkv_fused_q4_q4_f32,
+                    cuda_stats.qkv_fused_f32,
+                    cuda_stats.qkv_fallback_unsupported,
+                    cuda_stats.qkv_kernel_unavailable,
+                    cuda_stats.linear_pair_fused_q8,
+                    cuda_stats.linear_pair_fused_q4_0,
+                    cuda_stats.linear_pair_fused_q4_0_activation,
+                    cuda_stats.linear_pair_fused_q4_0_tile4,
+                    cuda_stats.linear_pair_fused_q4_0_tile8,
+                    cuda_stats.linear_pair_fused_q4,
+                    cuda_stats.linear_pair_fallbacks,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\"q4_0_q8_1_prefill_linear_hits":{d},
+                \\"q4_0_q8_1_prefill_linear_rows2_hits":{d},
+                \\"q4_0_q8_1_prefill_linear_rows4_hits":{d},
+                \\"q4_0_q8_1_prefill_linear_rows8_c4_hits":{d},
+                \\"q4_0_q8_1_prefill_linear_e4b_down_rows_hits":{d},
+                \\"q4_0_q8_1_prefill_linear_generic_rows_hits":{d},
+                \\"q4_0_q8_1_prefill_linear_tile8_rows_hits":{d},
+                \\"q4_0_q8_1_prefill_qkv_hits":{d},
+                \\"q4_0_q8_1_prefill_qkv_rows4_hits":{d},
+                \\"q4_0_q8_1_prefill_qkv_tile8_rows_hits":{d},
+                \\"q4_0_q8_1_prefill_qkv_tile8_w8_rows_hits":{d},
+                \\"q4_0_q8_1_prefill_pair_hits":{d},
+                \\"q4_0_q8_1_prefill_pair_rows2_hits":{d},
+                \\"q4_0_q8_1_prefill_pair_rows4_hits":{d},
+                \\"q4_0_q8_1_prefill_pair_rows8_c2_hits":{d},
+                \\"q4_0_q8_1_prefill_pair_rows16_c1_hits":{d},
+                \\"q4_0_q8_1_prefill_pair_generic_rows_hits":{d},
+                \\"q4_0_q8_1_prefill_pair_tile8_rows_hits":{d},
+                \\"q4_0_q8_1_prefill_gated_down_hits":{d},
+                \\"q4_0_q8_1_prefill_gated_down_rows2_hits":{d},
+                \\"q4_0_q8_1_prefill_gated_down_rows4_hits":{d},
+                \\"q4_0_q8_1_prefill_gated_down_rows8_c4_hits":{d},
+                \\"q4_0_q8_1_prefill_gated_down_e4b_down_rows_hits":{d},
+                \\"q4_0_q8_1_prefill_gated_down_generic_rows_hits":{d},
+                \\"q4_0_q8_1_prefill_gated_down_tile8_rows_hits":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.q4_0_q8_1_prefill_linear_hits,
+                    cuda_stats.q4_0_q8_1_prefill_linear_rows2_hits,
+                    cuda_stats.q4_0_q8_1_prefill_linear_rows4_hits,
+                    cuda_stats.q4_0_q8_1_prefill_linear_rows8_c4_hits,
+                    cuda_stats.q4_0_q8_1_prefill_linear_e4b_down_rows_hits,
+                    cuda_stats.q4_0_q8_1_prefill_linear_generic_rows_hits,
+                    cuda_stats.q4_0_q8_1_prefill_linear_tile8_rows_hits,
+                    cuda_stats.q4_0_q8_1_prefill_qkv_hits,
+                    cuda_stats.q4_0_q8_1_prefill_qkv_rows4_hits,
+                    cuda_stats.q4_0_q8_1_prefill_qkv_tile8_rows_hits,
+                    cuda_stats.q4_0_q8_1_prefill_qkv_tile8_w8_rows_hits,
+                    cuda_stats.q4_0_q8_1_prefill_pair_hits,
+                    cuda_stats.q4_0_q8_1_prefill_pair_rows2_hits,
+                    cuda_stats.q4_0_q8_1_prefill_pair_rows4_hits,
+                    cuda_stats.q4_0_q8_1_prefill_pair_rows8_c2_hits,
+                    cuda_stats.q4_0_q8_1_prefill_pair_rows16_c1_hits,
+                    cuda_stats.q4_0_q8_1_prefill_pair_generic_rows_hits,
+                    cuda_stats.q4_0_q8_1_prefill_pair_tile8_rows_hits,
+                    cuda_stats.q4_0_q8_1_prefill_gated_down_hits,
+                    cuda_stats.q4_0_q8_1_prefill_gated_down_rows2_hits,
+                    cuda_stats.q4_0_q8_1_prefill_gated_down_rows4_hits,
+                    cuda_stats.q4_0_q8_1_prefill_gated_down_rows8_c4_hits,
+                    cuda_stats.q4_0_q8_1_prefill_gated_down_e4b_down_rows_hits,
+                    cuda_stats.q4_0_q8_1_prefill_gated_down_generic_rows_hits,
+                    cuda_stats.q4_0_q8_1_prefill_gated_down_tile8_rows_hits,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
                 \\"lm_head_argmax_fused_q8":{d},
+                \\"lm_head_argmax_fused_q4_0":{d},
                 \\"lm_head_argmax_fused_q4":{d},
+                \\"lm_head_argmax_fused_q6":{d},
                 \\"lm_head_argmax_fallbacks":{d},
                 \\"q4k_decode_fast_hits":{d},
                 \\"q4k_decode_fast_fallbacks":{d},
                 \\"bf16_cublaslt_linear_calls":{d},
                 \\"bf16_cublaslt_qkv_calls":{d},
                 \\"bf16_cublaslt_activation_staging_calls":{d},
+                \\"bf16_cublaslt_activation_mirror_hits":{d},
                 \\"bf16_cublaslt_fallbacks":{d},
                 \\"bf16_scalar_linear_calls":{d},
                 \\"bf16_scalar_qkv_calls":{d},
+                \\"rms_norm_bf16_mirror_hits":{d},
                 \\"mtp_verify_commit_device_hits":{d},
                 \\"mtp_verify_commit_device_fallbacks":{d},
                 \\"mtp_verify_commit_result_downloads":{d},
@@ -2178,33 +3072,21 @@ fn writeJsonTiming(
                 \\
             ,
                 .{
-                    cuda_stats.activation_multiply_fused,
-                    cuda_stats.add_mul_scalar_fused,
-                    cuda_stats.rms_norm_add_output_scale_fused,
-                    cuda_stats.rms_norm_add_output_scale_fallbacks,
-                    cuda_stats.gated_down_fused_q8,
-                    cuda_stats.gated_down_fused_q4,
-                    cuda_stats.gated_down_fallbacks,
-                    cuda_stats.qkv_fused_q8,
-                    cuda_stats.qkv_fused_q4,
-                    cuda_stats.qkv_fused_q4_q4_f32,
-                    cuda_stats.qkv_fused_f32,
-                    cuda_stats.qkv_fallback_unsupported,
-                    cuda_stats.qkv_kernel_unavailable,
-                    cuda_stats.linear_pair_fused_q8,
-                    cuda_stats.linear_pair_fused_q4,
-                    cuda_stats.linear_pair_fallbacks,
                     cuda_stats.lm_head_argmax_fused_q8,
+                    cuda_stats.lm_head_argmax_fused_q4_0,
                     cuda_stats.lm_head_argmax_fused_q4,
+                    cuda_stats.lm_head_argmax_fused_q6,
                     cuda_stats.lm_head_argmax_fallbacks,
                     cuda_stats.q4k_decode_fast_hits,
                     cuda_stats.q4k_decode_fast_fallbacks,
                     cuda_stats.bf16_cublaslt_linear_calls,
                     cuda_stats.bf16_cublaslt_qkv_calls,
                     cuda_stats.bf16_cublaslt_activation_staging_calls,
+                    cuda_stats.bf16_cublaslt_activation_mirror_hits,
                     cuda_stats.bf16_cublaslt_fallbacks,
                     cuda_stats.bf16_scalar_linear_calls,
                     cuda_stats.bf16_scalar_qkv_calls,
+                    cuda_stats.rms_norm_bf16_mirror_hits,
                     cuda_stats.mtp_verify_commit_device_hits,
                     cuda_stats.mtp_verify_commit_device_fallbacks,
                     cuda_stats.mtp_verify_commit_result_downloads,
@@ -2271,6 +3153,38 @@ fn writeJsonTiming(
                     cuda_stats.decode_profile_ffn_post_norm_us,
                     cuda_stats.decode_profile_lm_head_argmax_us,
                     cuda_stats.decode_profile_graph_replay_us,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\"prefill_profile_events":{d},
+                \\"prefill_profile_q4_linear_us":{d},
+                \\"prefill_profile_q4_qkv_us":{d},
+                \\"prefill_profile_q4_pair_us":{d},
+                \\"prefill_profile_q4_gated_down_us":{d},
+                \\"prefill_profile_bf16_linear_us":{d},
+                \\"prefill_profile_bf16_qkv_us":{d},
+                \\"prefill_profile_bf16_pair_us":{d},
+                \\"prefill_profile_attention_us":{d},
+                \\"prefill_profile_ple_dense_us":{d},
+                \\"prefill_profile_staging_us":{d},
+                \\"prefill_profile_norm_us":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.prefill_profile_events,
+                    cuda_stats.prefill_profile_q4_linear_us,
+                    cuda_stats.prefill_profile_q4_qkv_us,
+                    cuda_stats.prefill_profile_q4_pair_us,
+                    cuda_stats.prefill_profile_q4_gated_down_us,
+                    cuda_stats.prefill_profile_bf16_linear_us,
+                    cuda_stats.prefill_profile_bf16_qkv_us,
+                    cuda_stats.prefill_profile_bf16_pair_us,
+                    cuda_stats.prefill_profile_attention_us,
+                    cuda_stats.prefill_profile_ple_dense_us,
+                    cuda_stats.prefill_profile_staging_us,
+                    cuda_stats.prefill_profile_norm_us,
                 },
             );
             try appendFmt(
@@ -2355,6 +3269,7 @@ fn writeJsonTiming(
                 \\"device_kv_compressed_v_bytes":{d},
                 \\"device_kv_paged_block_table_uploads":{d},
                 \\"device_kv_paged_block_table_bytes":{d},
+                \\"device_kv_paged_identity_attention_reads":{d},
                 \\"device_kv_fail_batch":{d},
                 \\"device_kv_fail_no_cache":{d},
                 \\"device_kv_fail_no_storage":{d},
@@ -2375,6 +3290,7 @@ fn writeJsonTiming(
                     cuda_stats.device_kv_compressed_v_bytes,
                     cuda_stats.device_kv_paged_block_table_uploads,
                     cuda_stats.device_kv_paged_block_table_bytes,
+                    cuda_stats.device_kv_paged_identity_attention_reads,
                     cuda_stats.device_kv_fail_batch,
                     cuda_stats.device_kv_fail_no_cache,
                     cuda_stats.device_kv_fail_no_storage,
@@ -2403,6 +3319,13 @@ fn writeJsonTiming(
                 \\"stream_syncs":{d},
                 \\"syncs_per_token":{d:.6},
                 \\"upload_syncs":{d},
+                \\"pinned_scalar_uploads":{d},
+                \\"pinned_scalar_upload_bytes":{d},
+                \\"pinned_scalar_upload_fallbacks":{d},
+                \\"pinned_scalar_upload_wrap_syncs":{d},
+                \\"pinned_scalar_downloads":{d},
+                \\"pinned_scalar_download_bytes":{d},
+                \\"pinned_scalar_download_fallbacks":{d},
                 \\"download_syncs":{d},
                 \\"eval_syncs":{d},
                 \\"device_alloc_calls":{d},
@@ -2429,6 +3352,13 @@ fn writeJsonTiming(
                     cuda_stats.stream_syncs,
                     perToken(cuda_stats.stream_syncs, result.tokens_used),
                     cuda_stats.upload_syncs,
+                    cuda_stats.pinned_scalar_uploads,
+                    cuda_stats.pinned_scalar_upload_bytes,
+                    cuda_stats.pinned_scalar_upload_fallbacks,
+                    cuda_stats.pinned_scalar_upload_wrap_syncs,
+                    cuda_stats.pinned_scalar_downloads,
+                    cuda_stats.pinned_scalar_download_bytes,
+                    cuda_stats.pinned_scalar_download_fallbacks,
                     cuda_stats.download_syncs,
                     cuda_stats.eval_syncs,
                     cuda_stats.device_alloc_calls,
@@ -2546,6 +3476,38 @@ fn writeJsonTiming(
             try appendFmt(
                 allocator,
                 &cuda_generate_out,
+                \\"prefill_profile_events":{d},
+                \\"prefill_profile_q4_linear_us":{d},
+                \\"prefill_profile_q4_qkv_us":{d},
+                \\"prefill_profile_q4_pair_us":{d},
+                \\"prefill_profile_q4_gated_down_us":{d},
+                \\"prefill_profile_bf16_linear_us":{d},
+                \\"prefill_profile_bf16_qkv_us":{d},
+                \\"prefill_profile_bf16_pair_us":{d},
+                \\"prefill_profile_attention_us":{d},
+                \\"prefill_profile_ple_dense_us":{d},
+                \\"prefill_profile_staging_us":{d},
+                \\"prefill_profile_norm_us":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.prefill_profile_events,
+                    cuda_stats.prefill_profile_q4_linear_us,
+                    cuda_stats.prefill_profile_q4_qkv_us,
+                    cuda_stats.prefill_profile_q4_pair_us,
+                    cuda_stats.prefill_profile_q4_gated_down_us,
+                    cuda_stats.prefill_profile_bf16_linear_us,
+                    cuda_stats.prefill_profile_bf16_qkv_us,
+                    cuda_stats.prefill_profile_bf16_pair_us,
+                    cuda_stats.prefill_profile_attention_us,
+                    cuda_stats.prefill_profile_ple_dense_us,
+                    cuda_stats.prefill_profile_staging_us,
+                    cuda_stats.prefill_profile_norm_us,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_generate_out,
                 \\"launch_norm":{d},
                 \\"launch_norm_layer":{d},
                 \\"launch_norm_add_layer":{d},
@@ -2557,12 +3519,20 @@ fn writeJsonTiming(
                 \\"launch_norm_head_rope":{d},
                 \\"launch_attention":{d},
                 \\"launch_attention_gqa_decode":{d},
+                \\"launch_attention_gqa_decode_fast":{d},
+                \\"launch_attention_gqa_decode_fast_fallbacks":{d},
+                \\"launch_attention_gqa_prefill_fast":{d},
+                \\"launch_attention_gqa_prefill_tiled":{d},
+                \\"launch_attention_gqa_prefill_mma":{d},
+                \\"launch_attention_gqa_prefill_mma_m32":{d},
                 \\"launch_attention_gqa_scalar":{d},
                 \\"launch_elementwise":{d},
                 \\"launch_scalar":{d},
                 \\"launch_argmax":{d},
                 \\"lm_head_argmax_fused_q8":{d},
+                \\"lm_head_argmax_fused_q4_0":{d},
                 \\"lm_head_argmax_fused_q4":{d},
+                \\"lm_head_argmax_fused_q6":{d},
                 \\"lm_head_argmax_fallbacks":{d},
                 \\"mtp_verify_commit_device_hits":{d},
                 \\"mtp_verify_commit_device_fallbacks":{d},
@@ -2582,12 +3552,20 @@ fn writeJsonTiming(
                     cuda_stats.launch_norm_head_rope,
                     cuda_stats.launch_attention,
                     cuda_stats.launch_attention_gqa_decode,
+                    cuda_stats.launch_attention_gqa_decode_fast,
+                    cuda_stats.launch_attention_gqa_decode_fast_fallbacks,
+                    cuda_stats.launch_attention_gqa_prefill_fast,
+                    cuda_stats.launch_attention_gqa_prefill_tiled,
+                    cuda_stats.launch_attention_gqa_prefill_mma,
+                    cuda_stats.launch_attention_gqa_prefill_mma_m32,
                     cuda_stats.launch_attention_gqa_scalar,
                     cuda_stats.launch_elementwise,
                     cuda_stats.launch_scalar,
                     cuda_stats.launch_argmax,
                     cuda_stats.lm_head_argmax_fused_q8,
+                    cuda_stats.lm_head_argmax_fused_q4_0,
                     cuda_stats.lm_head_argmax_fused_q4,
+                    cuda_stats.lm_head_argmax_fused_q6,
                     cuda_stats.lm_head_argmax_fallbacks,
                     cuda_stats.mtp_verify_commit_device_hits,
                     cuda_stats.mtp_verify_commit_device_fallbacks,
@@ -2599,11 +3577,18 @@ fn writeJsonTiming(
                 allocator,
                 &cuda_generate_out,
                 \\"activation_multiply_fused":{d},
+                \\"linear_activation_slice_fused_q4_0":{d},
                 \\"add_mul_scalar_fused":{d},
                 \\"rms_norm_add_fused":{d},
                 \\"rms_norm_add_output_scale_fused":{d},
+                \\"rms_norm_add_weighted_embedding_fused_q6_k":{d},
                 \\"rms_norm_add_output_scale_fallbacks":{d},
                 \\"gated_down_fused_q8":{d},
+                \\"gated_down_fused_q4_0":{d},
+                \\"gated_down_fused_q4_0_precompute":{d},
+                \\"gated_down_fused_q4_0_tile4":{d},
+                \\"gated_down_fused_q4_0_tile8":{d},
+                \\"gated_down_fused_q4_0_tile16":{d},
                 \\"gated_down_fused_q4":{d},
                 \\"gated_down_fallbacks":{d},
                 \\"deferred_free_queued":{d},
@@ -2614,11 +3599,18 @@ fn writeJsonTiming(
             ,
                 .{
                     cuda_stats.activation_multiply_fused,
+                    cuda_stats.linear_activation_slice_fused_q4_0,
                     cuda_stats.add_mul_scalar_fused,
                     cuda_stats.rms_norm_add_fused,
                     cuda_stats.rms_norm_add_output_scale_fused,
+                    cuda_stats.rms_norm_add_weighted_embedding_fused_q6_k,
                     cuda_stats.rms_norm_add_output_scale_fallbacks,
                     cuda_stats.gated_down_fused_q8,
+                    cuda_stats.gated_down_fused_q4_0,
+                    cuda_stats.gated_down_fused_q4_0_precompute,
+                    cuda_stats.gated_down_fused_q4_0_tile4,
+                    cuda_stats.gated_down_fused_q4_0_tile8,
+                    cuda_stats.gated_down_fused_q4_0_tile16,
                     cuda_stats.gated_down_fused_q4,
                     cuda_stats.gated_down_fallbacks,
                     cuda_stats.deferred_free_queued,
@@ -2645,12 +3637,66 @@ fn writeJsonTiming(
         try allocator.dupe(u8, "null");
     defer allocator.free(draft_cuda_generate_json);
 
+    const runtime_json = try std.fmt.allocPrint(
+        allocator,
+        \\{{
+        \\"decode_greedy_calls":{d},
+        \\"decode_greedy_device_token_handoff_attempts":{d},
+        \\"decode_greedy_device_token_handoff_hits":{d},
+        \\"decode_greedy_device_token_handoff_fallbacks":{d},
+        \\"decode_greedy_device_token_seeds":{d}
+        \\}}
+    ,
+        .{
+            runtime_stats.decode_greedy_calls,
+            runtime_stats.decode_greedy_device_token_handoff_attempts,
+            runtime_stats.decode_greedy_device_token_handoff_hits,
+            runtime_stats.decode_greedy_device_token_handoff_fallbacks,
+            runtime_stats.decode_greedy_device_token_seeds,
+        },
+    );
+    defer allocator.free(runtime_json);
+
+    const generation_decoder_runtime_json = try std.fmt.allocPrint(
+        allocator,
+        \\{{
+        \\"forward_attempts":{d},
+        \\"backend_not_device_decode":{d},
+        \\"graph_blocked":{d},
+        \\"kv_missing":{d},
+        \\"non_greedy":{d},
+        \\"grammar_blocked":{d},
+        \\"device_token_handoff_attempts":{d},
+        \\"device_token_handoff_hits":{d},
+        \\"device_token_handoff_fallbacks":{d},
+        \\"device_token_handoff_seeds":{d}
+        \\}}
+    ,
+        .{
+            decoder_debug_stats.forward_attempts,
+            decoder_debug_stats.backend_not_device_decode,
+            decoder_debug_stats.graph_blocked,
+            decoder_debug_stats.kv_missing,
+            decoder_debug_stats.non_greedy,
+            decoder_debug_stats.grammar_blocked,
+            decoder_debug_stats.device_token_handoff_attempts,
+            decoder_debug_stats.device_token_handoff_hits,
+            decoder_debug_stats.device_token_handoff_fallbacks,
+            decoder_debug_stats.device_token_handoff_seeds,
+        },
+    );
+    defer allocator.free(generation_decoder_runtime_json);
+
+    const token_ids_json = try tokenIdsJson(allocator, result.token_ids);
+    defer allocator.free(token_ids_json);
+
     const json = try std.fmt.allocPrint(
         allocator,
         \\{{
         \\"model_dir":{f},
         \\"backend":{f},
         \\"tokens":{d},
+        \\"token_ids":{s},
         \\"finish_reason":{f},
         \\"decode_tok_per_s":{d:.6},
         \\"timing_ms":{{
@@ -2666,8 +3712,11 @@ fn writeJsonTiming(
         \\"runtime_prepare_inner":{d},
         \\"prefill_inner":{d},
         \\"decode_inner":{d},
+        \\"text_decode_inner":{d},
         \\"total_inner":{d}
         \\}},
+        \\"runtime":{s},
+        \\"generation_decoder_runtime":{s},
         \\"speculative":{s},
         \\"cuda":{s},
         \\"cuda_generate":{s},
@@ -2680,6 +3729,7 @@ fn writeJsonTiming(
             std.json.fmt(model_dir, .{}),
             std.json.fmt(backend_name, .{}),
             result.tokens_used,
+            token_ids_json,
             std.json.fmt(result.finish_reason, .{}),
             tokensPerSecond(result.tokens_used, decode_ms),
             load_model_ms,
@@ -2694,7 +3744,10 @@ fn writeJsonTiming(
             inner_timing.runtime_prepare,
             inner_timing.prefill,
             inner_timing.decode,
+            inner_timing.text_decode,
             inner_timing.total,
+            runtime_json,
+            generation_decoder_runtime_json,
             speculative_json,
             cuda_json,
             cuda_generate_json,
@@ -2737,6 +3790,47 @@ fn metalExecutorReuseProbeEnabled() bool {
 fn gemmaPrefillPrewarmEnabled() bool {
     if (envFlagEnabled("TERMITE_METAL_DISABLE_GEMMA_PREFILL_PREWARM")) return false;
     return envFlagEnabled("TERMITE_METAL_ENABLE_GEMMA_PREFILL_PREWARM");
+}
+
+fn kvSlidingTrimForced() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_KV_SLIDING_TRIM", false);
+}
+
+fn cudaGemmaPrefillPrewarmEnabled() bool {
+    if (envFlagEnabled("ANTFLY_INFERENCE_DISABLE_GEMMA_PREFILL_PREWARM")) return false;
+    if (envFlagEnabled("ANTFLY_INFERENCE_CUDA_DISABLE_GEMMA_PREFILL_PREWARM")) return false;
+    return envFlagEnabled("ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM") or
+        envFlagEnabled("ANTFLY_INFERENCE_CUDA_GEMMA_PREFILL_PREWARM");
+}
+
+fn prewarmCudaGemmaPrefillResidency(
+    allocator: std.mem.Allocator,
+    cb: *const ops.ComputeBackend,
+    gpt_config: gpt_mod.Config,
+    prompt_tokens: usize,
+) !bool {
+    if (cb.kind() != .cuda or gpt_config.family != .gemma or gpt_config.usesMoe()) return false;
+    const configured_layer_count: usize = @intCast(gpt_config.num_hidden_layers);
+    const prepare = try cb.decoderRuntimePrepareOrReuseFamily(
+        allocator,
+        gpt_config,
+        prompt_tokens,
+        configured_layer_count,
+    );
+    if (!prepare.prepared) return false;
+
+    const embedding = try gpt_arch.getEmbeddingWeight(cb, gpt_config);
+    defer cb.free(embedding);
+
+    const final_norm = gpt_arch.getModelWeight(cb, gpt_config, "model.norm.weight") catch |err| switch (err) {
+        error.MissingWeight, error.WeightNotFound => null,
+        else => return err,
+    };
+    defer if (final_norm) |weight| cb.free(weight);
+
+    const lm_head = try gpt_arch.getLmHeadWeight(cb, gpt_config);
+    defer cb.free(lm_head);
+    return true;
 }
 
 fn printLiveWholeModelExecutorDetails(runtime_opt: ?*const graph_mod.model_runtime.ModelRuntime) void {
@@ -3408,6 +4502,16 @@ fn runOnnxWholeModelGraphGenerate(
 
     const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
         null
+    else if (gpt_config.sliding_window > 0 and gpt_config.hasGlobalAttentionLayers() and !kvSlidingTrimForced())
+        // Mixed attention (iSWA-style models like Gemma): global layers need
+        // the full KV history, and the pool packs every layer's KV into
+        // shared blocks, so window-trimming the pool silently truncates the
+        // global layers' context. Retain everything; sliding-window layers
+        // still apply their exact window inside the attention kernels, so
+        // their compute stays bounded — only KV memory grows with context.
+        // ANTFLY_INFERENCE_KV_SLIDING_TRIM=1 restores the old
+        // trim-to-window behavior (lower memory, truncated global context).
+        null
     else if (gpt_config.sliding_window > 0)
         gpt_config.sliding_window
     else if (gpt_config.max_position_embeddings > 0)
@@ -3869,6 +4973,8 @@ fn serverGenerateSupportsOptions(opts: Options) bool {
         opts.audio_count == 0 and
         !opts.raw_prompt and
         !opts.no_bos and
+        !opts.raw_decode_bench and
+        !opts.ignore_eos and
         !opts.no_chat_template and
         opts.draft_model == null and
         opts.speculation_policy == .auto and
@@ -4069,6 +5175,10 @@ fn parseArgs(args: []const []const u8) !Options {
             opts.raw_prompt = true;
         } else if (std.mem.eql(u8, arg, "--no-bos")) {
             opts.no_bos = true;
+        } else if (std.mem.eql(u8, arg, "--raw-decode-bench")) {
+            opts.raw_decode_bench = true;
+        } else if (std.mem.eql(u8, arg, "--ignore-eos")) {
+            opts.ignore_eos = true;
         } else if (std.mem.eql(u8, arg, "--cache-dtype")) {
             i += 1;
             if (i >= args.len) return error.MissingCacheDtype;
@@ -4170,7 +5280,7 @@ fn printSpeculativeStats(result: *const generation.GenerationResult) void {
     const profile = stats.mtp_profile;
     if (profile.enabled) {
         print(
-            "mtp_profile: sync={} draft_steps={d} resident_draft_steps={d} host_draft_steps={d} target_verify_calls={d} target_verify_rows={d} target_verify_argmax_calls={d} target_verify_argmax_rows={d} target_verify_argmax_batched_calls={d} target_verify_argmax_syncs={d} dedicated_runtime_hits={d} dedicated_runtime_fallbacks={d} device_verify_commit_hits={d} device_verify_commit_fallbacks={d} device_verify_commit_result_downloads={d} target_choice_downloads={d} commit_forwards_required={d} commit_forwards_avoided={d} accepted_hidden_reuse_rows={d} activation_copies={d} materializations={d} hidden_only_materializations={d} hidden_only_fallbacks={d} correction_materializations={d} bonus_materializations={d} bonus_skips={d} fallback_calls={d} draft_ms={d} verify_ms={d} activation_copy_ms={d} materialization_ms={d} fallback_ms={d}\n",
+            "mtp_profile: sync={} draft_steps={d} resident_draft_steps={d} host_draft_steps={d} target_verify_calls={d} target_verify_rows={d} target_verify_argmax_calls={d} target_verify_argmax_rows={d} target_verify_argmax_batched_calls={d} target_verify_argmax_syncs={d} dedicated_runtime_hits={d} dedicated_runtime_fallbacks={d} device_verify_commit_hits={d} device_verify_commit_fallbacks={d} device_verify_commit_result_downloads={d} target_choice_downloads={d} commit_forwards_required={d} commit_forwards_avoided={d} accepted_hidden_reuse_rows={d} activation_copies={d} materializations={d} hidden_only_materializations={d} hidden_only_fallbacks={d} correction_materializations={d} bonus_materializations={d} bonus_skips={d} fallback_calls={d}",
             .{
                 profile.sync_enabled,
                 profile.draft_steps,
@@ -4199,7 +5309,26 @@ fn printSpeculativeStats(result: *const generation.GenerationResult) void {
                 profile.bonus_materializations,
                 profile.bonus_skips,
                 profile.fallback_calls,
+            },
+        );
+        print(
+            " draft_embed_cache_hits={d} draft_embed_cache_misses={d} draft_embed_cache_inserts={d} draft_embed_cache_evictions={d} draft_embed_cache_disabled={d} draft_embedding_cross_copies={d} draft_ms={d} draft_embedding_ms={d} draft_concat_ms={d} draft_preprojection_ms={d} draft_assistant_ms={d} draft_postprojection_ms={d} draft_argmax_ms={d} draft_lm_head_ms={d} draft_selection_ms={d} verify_ms={d} activation_copy_ms={d} materialization_ms={d} fallback_ms={d}\n",
+            .{
+                profile.draft_embedding_cache_hits,
+                profile.draft_embedding_cache_misses,
+                profile.draft_embedding_cache_inserts,
+                profile.draft_embedding_cache_evictions,
+                profile.draft_embedding_cache_disabled,
+                profile.draft_target_embedding_cross_copies,
                 profile.draft_token_ns / std.time.ns_per_ms,
+                profile.draft_target_embedding_ns / std.time.ns_per_ms,
+                profile.draft_concat_ns / std.time.ns_per_ms,
+                profile.draft_preprojection_ns / std.time.ns_per_ms,
+                profile.draft_assistant_ns / std.time.ns_per_ms,
+                profile.draft_postprojection_ns / std.time.ns_per_ms,
+                profile.draft_argmax_ns / std.time.ns_per_ms,
+                profile.draft_lm_head_ns / std.time.ns_per_ms,
+                profile.draft_selection_ns / std.time.ns_per_ms,
                 profile.target_verify_ns / std.time.ns_per_ms,
                 profile.activation_copy_ns / std.time.ns_per_ms,
                 profile.materialization_ns / std.time.ns_per_ms,
@@ -4461,7 +5590,7 @@ fn metalEagerDenseMaxBytes() u64 {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path]
+        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
         \\  --stream prints generated text incrementally as token deltas arrive.
@@ -4472,6 +5601,8 @@ fn printUsage() void {
         \\  artifact-dir overrides that lookup root.
         \\  whole-model compiled generate prefers package manifests before raw sidecar scanning.
         \\  compiled-target=whole-model requests a compiled backend only when it can own the full traced graph shape.
+        \\  raw-decode-bench runs transformer-body decode without logits/sampling for llama-bench-style baselines.
+        \\  ignore-eos keeps generating after EOS for benchmark compatibility with engines that do not stop on the same EOG token set.
         \\
     , .{});
 }
@@ -4629,6 +5760,18 @@ test "server generate rejects unsupported server options" {
         .prompt = "hello",
         .backend = .metal,
         .json_timing_path = "/tmp/timing.json",
+    }));
+    try std.testing.expect(!serverGenerateSupportsOptions(.{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .cuda,
+        .raw_decode_bench = true,
+    }));
+    try std.testing.expect(!serverGenerateSupportsOptions(.{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .cuda,
+        .ignore_eos = true,
     }));
 }
 

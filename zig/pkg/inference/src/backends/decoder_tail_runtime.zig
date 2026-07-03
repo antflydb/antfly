@@ -152,10 +152,7 @@ pub fn forwardPreparedGreedyFromFinalHidden(
 }
 
 pub fn getLmHeadWeight(cb: *const ops.ComputeBackend, gpt_config: gpt_mod.Config) !ops.CT {
-    return if (gpt_config.weight_tying)
-        try gpt_arch.getEmbeddingWeight(cb, gpt_config)
-    else
-        cb.getWeight("lm_head.weight") catch try gpt_arch.getEmbeddingWeight(cb, gpt_config);
+    return try gpt_arch.getLmHeadWeight(cb, gpt_config);
 }
 
 pub fn forwardGreedyFromFinalHidden(
@@ -194,14 +191,18 @@ pub fn forwardGreedyFromFinalHidden(
     if (finished_at > started_at) timing_stats.greedy_fast_argmax_nanos += finished_at - started_at;
 
     started_at = monotonicNowNs();
-    const final_norm = (try applyFinalNorm(
+    const prepared_final_norm = try applyFinalNorm(
         cb,
         norm_kind,
         norm_slot,
         final_hidden,
         gpt_config.hidden_size,
         gpt_config.norm_eps,
-    )) orelse return null;
+    );
+    const final_norm = if (prepared_final_norm) |normed|
+        normed
+    else
+        try gpt_arch.applyFinalNorm(cb, allocator, gpt_config, final_hidden);
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.greedy_fallback_norm_nanos += finished_at - started_at;
     defer cb.free(final_norm);
@@ -231,6 +232,114 @@ pub fn forwardGreedyFromFinalHidden(
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.greedy_fallback_host_nanos += finished_at - started_at;
     return @intCast(best_idx);
+}
+
+fn greedyResultFromTokenTensor(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    token: ops.CT,
+) !gpt_arch.GreedyDeviceTokenResult {
+    errdefer cb.free(token);
+    const ids = try cb.toFloat32(token, allocator);
+    defer allocator.free(ids);
+    if (ids.len != 1 or ids[0] < 0) return error.InvalidTensorShape;
+    return .{
+        .token_id = @intFromFloat(ids[0]),
+        .token_tensor = token,
+    };
+}
+
+fn greedyTokenTensorFromFinalHidden(
+    cb: *const ops.ComputeBackend,
+    gpt_config: gpt_mod.Config,
+    final_hidden: ops.CT,
+    norm_kind: FinalNormKind,
+    norm_slot: usize,
+) !?ops.CT {
+    if (!gpt_arch.canUseFastGreedyArgmaxForConfig(gpt_config)) return null;
+
+    var started_at = monotonicNowNs();
+    const lm_head_weight = try getLmHeadWeight(cb, gpt_config);
+    var finished_at = monotonicNowNs();
+    if (finished_at > started_at) timing_stats.greedy_lm_head_lookup_nanos += finished_at - started_at;
+    defer cb.free(lm_head_weight);
+
+    started_at = monotonicNowNs();
+    const final_norm = (try applyFinalNorm(
+        cb,
+        norm_kind,
+        norm_slot,
+        final_hidden,
+        gpt_config.hidden_size,
+        gpt_config.norm_eps,
+    )) orelse return null;
+    finished_at = monotonicNowNs();
+    if (finished_at > started_at) timing_stats.greedy_fallback_norm_nanos += finished_at - started_at;
+    defer cb.free(final_norm);
+
+    started_at = monotonicNowNs();
+    const token_tensor = blk: {
+        const suppress_token_ids = gpt_config.suppressTokenIds();
+        if (suppress_token_ids.len > 0) {
+            break :blk (try cb.linearNoBiasArgmaxLastRowSuppressTensor(
+                final_norm,
+                lm_head_weight,
+                1,
+                gpt_config.hidden_size,
+                gpt_config.vocab_size,
+                suppress_token_ids,
+            )) orelse return null;
+        }
+        break :blk (try cb.linearNoBiasArgmaxLastRowTensor(
+            final_norm,
+            lm_head_weight,
+            1,
+            gpt_config.hidden_size,
+            gpt_config.vocab_size,
+        )) orelse return null;
+    };
+    finished_at = monotonicNowNs();
+    if (finished_at > started_at) timing_stats.greedy_fast_argmax_nanos += finished_at - started_at;
+    return token_tensor;
+}
+
+pub fn forwardGreedyTokenTensorFromFinalHidden(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    final_hidden: ops.CT,
+    norm_kind: FinalNormKind,
+    norm_slot: usize,
+) !?gpt_arch.GreedyDeviceTokenResult {
+    const token_tensor = (try greedyTokenTensorFromFinalHidden(
+        cb,
+        gpt_config,
+        final_hidden,
+        norm_kind,
+        norm_slot,
+    )) orelse return null;
+
+    const started_at = monotonicNowNs();
+    const result = try greedyResultFromTokenTensor(cb, allocator, token_tensor);
+    const finished_at = monotonicNowNs();
+    if (finished_at > started_at) timing_stats.greedy_fallback_host_nanos += finished_at - started_at;
+    return result;
+}
+
+pub fn forwardGreedyTokenTensorOnlyFromFinalHidden(
+    cb: *const ops.ComputeBackend,
+    gpt_config: gpt_mod.Config,
+    final_hidden: ops.CT,
+    norm_kind: FinalNormKind,
+    norm_slot: usize,
+) !?ops.CT {
+    return try greedyTokenTensorFromFinalHidden(
+        cb,
+        gpt_config,
+        final_hidden,
+        norm_kind,
+        norm_slot,
+    );
 }
 
 pub fn forwardLogitsTensorFromFinalHidden(
