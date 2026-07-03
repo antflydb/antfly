@@ -460,12 +460,16 @@ pub const ArtifactRepairRunResult = struct {
     failed: i64,
     /// Number of repair records skipped because no reprocessor exists for the artifact kind.
     unsupported: i64,
+    /// Number of attempted repair records that remained queued after this pass.
+    unresolved: i64,
     /// Effective repair limit.
     limit: i64,
-    /// Opaque cursor for the next repair pass.
+    /// Opaque cursor for the next repair pass when has_more is true.
     next_cursor: ?[]const u8 = null,
-    /// Whether repair debt remains after this bounded pass.
+    /// Whether another scan page is available via next_cursor.
     has_more: bool,
+    /// Whether repair debt remains after this bounded pass. If true and next_cursor is absent, rerun repair from the beginning after addressing failed or unsupported records.
+    debt_remaining: bool,
 };
 
 pub const DocumentArtifactReprocessResponse = struct {
@@ -4240,11 +4244,8 @@ pub const ArtifactRepairIssue = struct {
 pub const RepairRunRequest = struct {
     target: ?RepairTarget = null,
     kind: ?ArtifactRepairKind = null,
-    artifact_kind: ?ArtifactRepairKind = null,
     /// Restrict artifact repair attempts to one index name.
     index: ?[]const u8 = null,
-    /// Backward-compatible alias for index.
-    index_name: ?[]const u8 = null,
     /// Opaque cursor returned by a prior repair response.
     cursor: ?[]const u8 = null,
     /// Maximum repair records to attempt.

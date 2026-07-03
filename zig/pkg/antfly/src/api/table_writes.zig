@@ -284,6 +284,8 @@ fn mergeArtifactRepairResult(dst: *db_mod.types.ArtifactRepairResult, src: db_mo
     dst.missing_source_docs += src.missing_source_docs;
     dst.failed += src.failed;
     dst.unsupported += src.unsupported;
+    dst.unresolved += src.unresolved;
+    dst.debt_remaining = dst.debt_remaining or src.debt_remaining;
 }
 
 const ArtifactRepairTableCursor = struct {
@@ -390,9 +392,11 @@ fn parseArtifactRepairResultAlloc(alloc: std.mem.Allocator, body: []const u8) !d
         .missing_source_docs = parsed.value.missing_source_docs,
         .failed = parsed.value.failed,
         .unsupported = parsed.value.unsupported,
+        .unresolved = parsed.value.unresolved,
         .limit = parsed.value.limit,
         .next_cursor = if (parsed.value.next_cursor) |cursor| try alloc.dupe(u8, cursor) else null,
         .has_more = parsed.value.has_more,
+        .debt_remaining = parsed.value.debt_remaining,
     };
 }
 
@@ -8290,11 +8294,13 @@ pub const ProvisionedTableWriteSource = struct {
         for (group_ids[start_index..], start_index..) |group_id, idx| {
             if (groups_scanned >= artifact_repair_max_groups_per_request) {
                 total.has_more = true;
+                total.debt_remaining = true;
                 total.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, null);
                 break;
             }
             if (req.limit != 0 and total.scanned >= req.limit) {
                 total.has_more = true;
+                total.debt_remaining = true;
                 total.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, null);
                 break;
             }
@@ -8309,6 +8315,7 @@ pub const ProvisionedTableWriteSource = struct {
             result.groups_scanned += 1;
             if (result.has_more) {
                 total.has_more = true;
+                total.debt_remaining = true;
                 total.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, result.next_cursor);
             }
             mergeArtifactRepairResult(&total, result);
@@ -9627,11 +9634,13 @@ pub const HostedProvisionedTableWriteSource = struct {
         for (group_ids[start_index..], start_index..) |group_id, idx| {
             if (groups_scanned >= artifact_repair_max_groups_per_request) {
                 total.has_more = true;
+                total.debt_remaining = true;
                 total.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, null);
                 break;
             }
             if (req.limit != 0 and total.scanned >= req.limit) {
                 total.has_more = true;
+                total.debt_remaining = true;
                 total.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, null);
                 break;
             }
@@ -9660,6 +9669,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             group_result.groups_scanned += 1;
             if (group_result.has_more) {
                 total.has_more = true;
+                total.debt_remaining = true;
                 total.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, group_result.next_cursor);
             }
             mergeArtifactRepairResult(&total, group_result);

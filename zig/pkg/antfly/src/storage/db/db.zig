@@ -6152,6 +6152,73 @@ pub const DB = struct {
         };
     }
 
+    const ArtifactRepairIndexFallbackCounts = struct {
+        alloc: Allocator,
+        counts: std.StringHashMapUnmanaged(u64) = .empty,
+        loaded: bool = false,
+
+        fn deinit(self: *@This()) void {
+            var it = self.counts.iterator();
+            while (it.next()) |entry| self.alloc.free(entry.key_ptr.*);
+            self.counts.deinit(self.alloc);
+        }
+    };
+
+    fn ensureArtifactRepairIndexFallbackCounts(self: *DB, alloc: Allocator, fallback: *ArtifactRepairIndexFallbackCounts) !void {
+        if (fallback.loaded) return;
+        fallback.loaded = true;
+
+        const prefix = try internal_keys.artifactRepairIssueRootPrefixAlloc(alloc);
+        defer alloc.free(prefix);
+        const upper = try internal_keys.nextPrefixAlloc(alloc, prefix);
+        defer if (upper) |buf| alloc.free(buf);
+
+        const ScanState = struct {
+            const scan_limit: usize = 1024;
+
+            alloc: Allocator,
+            counts: *std.StringHashMapUnmanaged(u64),
+            scanned: usize = 0,
+
+            fn scanEntry(ctx: ?*anyopaque, _: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                var issue = try decodeArtifactRepairIssueValueAlloc(state.alloc, value);
+                defer issue.deinit(state.alloc);
+                state.scanned += 1;
+                const result = try state.counts.getOrPut(state.alloc, issue.index_name);
+                if (!result.found_existing) {
+                    result.key_ptr.* = try state.alloc.dupe(u8, issue.index_name);
+                    result.value_ptr.* = 0;
+                }
+                result.value_ptr.* += 1;
+                if (state.scanned >= scan_limit) return .stop;
+                return .@"continue";
+            }
+        };
+
+        var state = ScanState{ .alloc = alloc, .counts = &fallback.counts };
+        try self.core.store.scanWithContext(prefix, if (upper) |buf| buf else "", .{}, &state, ScanState.scanEntry);
+    }
+
+    fn artifactRepairSummaryIndexSnapshotForStats(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        ready: bool,
+        fallback: *ArtifactRepairIndexFallbackCounts,
+    ) !ArtifactRepairSummarySnapshot {
+        if (ready) return try self.artifactRepairSummaryIndexSnapshot(alloc, index_name, true);
+
+        const key = try internal_keys.artifactRepairSummaryRebuildIndexKeyAlloc(alloc, index_name);
+        defer alloc.free(key);
+        if (try self.loadArtifactRepairSummaryCountByKey(alloc, key)) |count| {
+            return .{ .ready = false, .count = count };
+        }
+
+        try self.ensureArtifactRepairIndexFallbackCounts(alloc, fallback);
+        return .{ .ready = false, .count = fallback.counts.get(index_name) orelse 0 };
+    }
+
     fn artifactRepairSummaryIndexCount(self: *DB, alloc: Allocator, index_name: []const u8) !u64 {
         return (try self.artifactRepairSummaryIndexSnapshot(alloc, index_name, try self.artifactRepairSummaryReady(alloc))).count;
     }
@@ -6998,6 +7065,7 @@ pub const DB = struct {
         var result: types.ArtifactRepairResult = .{
             .limit = req.limit,
             .has_more = page.has_more,
+            .debt_remaining = page.has_more,
         };
         if (page.next_cursor) |cursor| {
             result.next_cursor = try alloc.dupe(u8, cursor);
@@ -7016,6 +7084,8 @@ pub const DB = struct {
                 try replaceRepairIssueLastError(alloc, issue, unsupported_reason);
                 try saveArtifactRepairIssueToStore(alloc, self.core.store, issue.*);
                 result.unsupported += 1;
+                result.unresolved += 1;
+                result.debt_remaining = true;
                 continue;
             }
 
@@ -7024,12 +7094,16 @@ pub const DB = struct {
                     try replaceRepairIssueLastError(alloc, issue, "source_document_missing");
                     try saveArtifactRepairIssueToStore(alloc, self.core.store, issue.*);
                     result.missing_source_docs += 1;
+                    result.unresolved += 1;
+                    result.debt_remaining = true;
                     continue;
                 },
                 else => {
                     try replaceRepairIssueLastError(alloc, issue, @errorName(err));
                     try saveArtifactRepairIssueToStore(alloc, self.core.store, issue.*);
                     result.failed += 1;
+                    result.unresolved += 1;
+                    result.debt_remaining = true;
                     continue;
                 },
             };
@@ -7041,6 +7115,8 @@ pub const DB = struct {
                 try replaceRepairIssueLastError(alloc, issue, unavailable_error);
                 try saveArtifactRepairIssueToStore(alloc, self.core.store, issue.*);
                 result.failed += 1;
+                result.unresolved += 1;
+                result.debt_remaining = true;
                 continue;
             }
             result.reprocessed += 1;
@@ -7051,6 +7127,8 @@ pub const DB = struct {
                 try replaceRepairIssueLastError(alloc, issue, "artifact_still_unreadable");
                 try saveArtifactRepairIssueToStore(alloc, self.core.store, issue.*);
                 result.failed += 1;
+                result.unresolved += 1;
+                result.debt_remaining = true;
             }
         }
         if (result.repaired != 0) {
@@ -11336,6 +11414,8 @@ pub const DB = struct {
         const primary_doc_count = self.scanPrimaryDocCount(self.core.byteRange()) catch 0;
         const repair_summary = try self.artifactRepairSummaryRootSnapshot(alloc);
         const repair_issue_count = repair_summary.count;
+        var repair_index_fallback = ArtifactRepairIndexFallbackCounts{ .alloc = alloc };
+        defer repair_index_fallback.deinit();
 
         var index_stats = try alloc.alloc(types.DBIndexStats, configs.len);
         var index_count: usize = 0;
@@ -11373,7 +11453,7 @@ pub const DB = struct {
                 item.backfill_active = false;
                 item.catch_up_active = false;
             }
-            const index_repair_summary = try self.artifactRepairSummaryIndexSnapshot(alloc, cfg.name, repair_summary.ready);
+            const index_repair_summary = try self.artifactRepairSummaryIndexSnapshotForStats(alloc, cfg.name, repair_summary.ready, &repair_index_fallback);
             item.repair_issue_count = index_repair_summary.count;
             item.repair_summary_ready = index_repair_summary.ready;
             item.repair_issue_count_estimated = !index_repair_summary.ready;
@@ -11493,6 +11573,8 @@ pub const DB = struct {
         const identity_stats = try self.diagnosticDocIdentityStats(byte_range);
         const repair_summary = try self.artifactRepairSummaryRootSnapshot(alloc);
         const repair_issue_count = repair_summary.count;
+        var repair_index_fallback = ArtifactRepairIndexFallbackCounts{ .alloc = alloc };
+        defer repair_index_fallback.deinit();
 
         var index_stats = try alloc.alloc(types.DBIndexStats, configs.len);
         var index_count: usize = 0;
@@ -11517,7 +11599,7 @@ pub const DB = struct {
                 item.catch_up_active = false;
                 break;
             }
-            const index_repair_summary = try self.artifactRepairSummaryIndexSnapshot(alloc, cfg.name, repair_summary.ready);
+            const index_repair_summary = try self.artifactRepairSummaryIndexSnapshotForStats(alloc, cfg.name, repair_summary.ready, &repair_index_fallback);
             item.repair_issue_count = index_repair_summary.count;
             item.repair_summary_ready = index_repair_summary.ready;
             item.repair_issue_count_estimated = !index_repair_summary.ready;
@@ -11678,6 +11760,8 @@ pub const DB = struct {
         const identity_stats = dbDocIdentityStats(try doc_identity.fastStatsFromStore(self.core.store), self.core.identity_namespace);
         const repair_summary = try self.artifactRepairSummaryRootSnapshot(alloc);
         const repair_issue_count = repair_summary.count;
+        var repair_index_fallback = ArtifactRepairIndexFallbackCounts{ .alloc = alloc };
+        defer repair_index_fallback.deinit();
 
         var index_stats = try alloc.alloc(types.DBIndexStats, configs.len);
         var index_count: usize = 0;
@@ -11716,7 +11800,7 @@ pub const DB = struct {
                 applyIndexStatusSnapshot(&item, status_snapshot);
                 visible_doc_count = @max(visible_doc_count, item.doc_count);
             }
-            const index_repair_summary = try self.artifactRepairSummaryIndexSnapshot(alloc, cfg.name, repair_summary.ready);
+            const index_repair_summary = try self.artifactRepairSummaryIndexSnapshotForStats(alloc, cfg.name, repair_summary.ready, &repair_index_fallback);
             item.repair_issue_count = index_repair_summary.count;
             item.repair_summary_ready = index_repair_summary.ready;
             item.repair_issue_count_estimated = !index_repair_summary.ready;
@@ -36236,6 +36320,10 @@ test "db artifact repair reports unsupported artifact kinds without clearing deb
     try std.testing.expectEqual(@as(u64, 0), repair.repaired);
     try std.testing.expectEqual(@as(u64, 0), repair.failed);
     try std.testing.expectEqual(@as(u64, 1), repair.unsupported);
+    try std.testing.expectEqual(@as(u64, 1), repair.unresolved);
+    try std.testing.expect(!repair.has_more);
+    try std.testing.expect(repair.next_cursor == null);
+    try std.testing.expect(repair.debt_remaining);
 
     const issues = try db.listArtifactRepairIssues(alloc, .graph, "entity_graph_v1", 0);
     defer types.freeArtifactRepairIssues(alloc, issues);

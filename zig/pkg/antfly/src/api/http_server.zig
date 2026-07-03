@@ -7261,9 +7261,7 @@ pub const ApiHttpServer = struct {
     const PublicRepairRunRequest = struct {
         target: []const u8 = "artifact",
         kind: ?db_mod.types.ArtifactRepairKind = null,
-        artifact_kind: ?db_mod.types.ArtifactRepairKind = null,
         index: ?[]const u8 = null,
-        index_name: ?[]const u8 = null,
         cursor: ?[]const u8 = null,
         limit: ?u32 = null,
     };
@@ -7277,10 +7275,10 @@ pub const ApiHttpServer = struct {
         parseRepairTargetQuery(query) catch return try textResponse(self.alloc, 400, "invalid repair target");
         if (!std.mem.eql(u8, parsed.value.target, "artifact")) return try textResponse(self.alloc, 400, "invalid repair target");
         const query_kind = parseArtifactRepairKindQuery(query) catch return try textResponse(self.alloc, 400, "invalid artifact repair kind");
-        const artifact_kind = query_kind orelse parsed.value.kind orelse parsed.value.artifact_kind;
+        const artifact_kind = query_kind orelse parsed.value.kind;
         const query_index_name = parseSimpleQueryParamDecodedAlloc(self.alloc, query, "index") catch return try textResponse(self.alloc, 400, "invalid index");
         defer if (query_index_name) |value| self.alloc.free(value);
-        const index_name = query_index_name orelse parsed.value.index orelse parsed.value.index_name;
+        const index_name = query_index_name orelse parsed.value.index;
         const query_cursor = parseSimpleQueryParamDecodedAlloc(self.alloc, query, "cursor") catch return try textResponse(self.alloc, 400, "invalid cursor");
         defer if (query_cursor) |value| self.alloc.free(value);
         const cursor = query_cursor orelse parsed.value.cursor;
@@ -10001,9 +9999,7 @@ fn parseUnsignedQueryParam(query: []const u8, key: []const u8) !?u64 {
 }
 
 fn parseArtifactRepairKindQuery(query: []const u8) !?db_mod.types.ArtifactRepairKind {
-    const value = parseSimpleQueryParam(query, "kind") orelse
-        parseSimpleQueryParam(query, "artifact_kind") orelse
-        return null;
+    const value = parseSimpleQueryParam(query, "kind") orelse return null;
     return std.meta.stringToEnum(db_mod.types.ArtifactRepairKind, value) orelse error.InvalidArtifactRepairKind;
 }
 

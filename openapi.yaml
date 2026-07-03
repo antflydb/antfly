@@ -7489,14 +7489,9 @@ components:
           $ref: '#/components/schemas/RepairTarget'
         kind:
           $ref: '#/components/schemas/ArtifactRepairKind'
-        artifact_kind:
-          $ref: '#/components/schemas/ArtifactRepairKind'
         index:
           type: string
           description: Restrict artifact repair attempts to one index name.
-        index_name:
-          type: string
-          description: Backward-compatible alias for index.
         cursor:
           type: string
           description: Opaque cursor returned by a prior repair response.
@@ -7518,8 +7513,10 @@ components:
         - missing_source_docs
         - failed
         - unsupported
+        - unresolved
         - limit
         - has_more
+        - debt_remaining
       properties:
         scanned:
           type: integer
@@ -7550,6 +7547,10 @@ components:
           format: uint64
           description: Number of repair records skipped because no reprocessor exists for the artifact
             kind.
+        unresolved:
+          type: integer
+          format: uint64
+          description: Number of attempted repair records that remained queued after this pass.
         limit:
           type: integer
           format: uint32
@@ -7557,10 +7558,14 @@ components:
         next_cursor:
           type: string
           nullable: true
-          description: Opaque cursor for the next repair pass.
+          description: Opaque cursor for the next repair pass when has_more is true.
         has_more:
           type: boolean
-          description: Whether repair debt remains after this bounded pass.
+          description: Whether another scan page is available via next_cursor.
+        debt_remaining:
+          type: boolean
+          description: Whether repair debt remains after this bounded pass. If true and next_cursor is
+            absent, rerun repair from the beginning after addressing failed or unsupported records.
     ArtifactRepairRunResponse:
       type: object
       description: Response for a bounded artifact repair pass.

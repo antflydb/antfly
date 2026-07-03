@@ -524,6 +524,7 @@ const JsonDBStats = struct {
     repair_degraded: bool,
     repair_issue_count: u64,
     repair_summary_ready: bool,
+    repair_issue_count_estimated: bool,
     enrichment: JsonEnrichmentStats,
     ttl_cleanup: JsonTTLCleanupStats,
     transaction_recovery: JsonTransactionRecoveryStats,
@@ -542,6 +543,7 @@ const JsonDBIndexStats = struct {
     repair_degraded: bool,
     repair_issue_count: u64,
     repair_summary_ready: bool,
+    repair_issue_count_estimated: bool,
 };
 
 const JsonEnrichmentStats = struct {
@@ -3812,6 +3814,7 @@ fn dbIndexStatsProjectionAlloc(alloc: Allocator, stats: db_mod.types.DBStats) ![
             .repair_degraded = item.repair_degraded,
             .repair_issue_count = item.repair_issue_count,
             .repair_summary_ready = item.repair_summary_ready,
+            .repair_issue_count_estimated = item.repair_issue_count_estimated,
         };
     }
     return indexes;
@@ -3825,6 +3828,7 @@ fn jsonDBStatsProjection(stats: db_mod.types.DBStats, indexes: []JsonDBIndexStat
         .repair_degraded = stats.repair_degraded,
         .repair_issue_count = stats.repair_issue_count,
         .repair_summary_ready = stats.repair_summary_ready,
+        .repair_issue_count_estimated = stats.repair_issue_count_estimated,
         .enrichment = .{
             .enabled = stats.enrichment.enabled,
             .lease_owned = stats.enrichment.lease_owned,

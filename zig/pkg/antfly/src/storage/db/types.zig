@@ -1666,9 +1666,11 @@ pub const ArtifactRepairResult = struct {
     missing_source_docs: u64 = 0,
     failed: u64 = 0,
     unsupported: u64 = 0,
+    unresolved: u64 = 0,
     limit: u32 = 0,
     next_cursor: ?[]u8 = null,
     has_more: bool = false,
+    debt_remaining: bool = false,
 
     pub fn deinit(self: *ArtifactRepairResult, alloc: Allocator) void {
         if (self.next_cursor) |value| alloc.free(value);
