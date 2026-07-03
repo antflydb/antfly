@@ -4080,9 +4080,11 @@ paths:
 
         replays derived state. The operation is bounded by `limit`, returns an
 
-        opaque continuation cursor when more debt remains, and requires table
+        opaque continuation cursor when more scanned issues remain in the page
 
-        admin permission when authentication is enabled.
+        stream, reports unresolved debt separately, and requires table admin
+
+        permission when authentication is enabled.
       tags:
         - data_operations
       operationId: repairArtifactIssues

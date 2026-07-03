@@ -6841,17 +6841,24 @@ pub const DB = struct {
         return try internal_keys.artifactRepairIssueKindRootPrefixAlloc(alloc, @tagName(kind));
     }
 
+    fn artifactRepairFallbackScanBudget(limit: u32) u64 {
+        const requested: u64 = if (limit == 0) 4096 else @as(u64, limit) * 32;
+        return @min(@max(requested, 256), 4096);
+    }
+
     pub fn listArtifactRepairIssuesPage(
         self: *DB,
         alloc: Allocator,
         req: types.ArtifactRepairListRequest,
     ) !types.ArtifactRepairListResult {
+        var filtering_without_kind_index = false;
         const prefix = if (req.artifact_kind) |kind| prefix_blk: {
             if (try self.artifactRepairKindIndexReady(alloc)) {
                 const kind_prefix = try self.artifactRepairKindScanPrefixAlloc(alloc, req, kind);
                 if (try self.artifactRepairCursorMatchesPrefix(alloc, req.cursor, kind_prefix)) break :prefix_blk kind_prefix;
                 alloc.free(kind_prefix);
             }
+            filtering_without_kind_index = true;
             break :prefix_blk try self.artifactRepairPrimaryScanPrefixAlloc(alloc, req);
         } else try self.artifactRepairPrimaryScanPrefixAlloc(alloc, req);
         defer alloc.free(prefix);
@@ -6865,6 +6872,7 @@ pub const DB = struct {
             db: *DB,
             artifact_kind: ?types.ArtifactRepairKind,
             limit: u32,
+            scan_budget: u64,
             scanned: u64 = 0,
             has_more: bool = false,
             last_cursor: ?[]u8 = null,
@@ -6878,28 +6886,41 @@ pub const DB = struct {
 
             fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
                 const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                if (state.limit != 0 and state.issues.items.len >= state.limit) {
+                    state.has_more = true;
+                    return .stop;
+                }
                 state.scanned += 1;
+                if (state.last_cursor) |cursor| state.alloc.free(cursor);
+                state.last_cursor = try bytesToHexAlloc(state.alloc, key);
                 var issue = try state.db.decodeArtifactRepairIssueAlloc(state.alloc, value);
                 errdefer issue.deinit(state.alloc);
                 if (state.artifact_kind) |kind| {
                     if (issue.artifact_kind != kind) {
                         issue.deinit(state.alloc);
+                        if (state.scan_budget != 0 and state.scanned >= state.scan_budget) {
+                            state.has_more = true;
+                            return .stop;
+                        }
                         return .@"continue";
                     }
                 }
-                if (state.limit != 0 and state.issues.items.len >= state.limit) {
-                    issue.deinit(state.alloc);
+                try state.issues.append(state.alloc, issue);
+                if (state.scan_budget != 0 and state.scanned >= state.scan_budget) {
                     state.has_more = true;
                     return .stop;
                 }
-                try state.issues.append(state.alloc, issue);
-                if (state.last_cursor) |cursor| state.alloc.free(cursor);
-                state.last_cursor = try bytesToHexAlloc(state.alloc, key);
                 return .@"continue";
             }
         };
 
-        var state = ScanState{ .alloc = alloc, .db = self, .artifact_kind = req.artifact_kind, .limit = req.limit };
+        var state = ScanState{
+            .alloc = alloc,
+            .db = self,
+            .artifact_kind = req.artifact_kind,
+            .limit = req.limit,
+            .scan_budget = if (filtering_without_kind_index) artifactRepairFallbackScanBudget(req.limit) else 0,
+        };
         errdefer state.deinitPartial();
         try self.core.store.scanWithContext(lower, if (upper) |buf| buf else "", .{}, &state, ScanState.scanEntry);
         const issues = try state.issues.toOwnedSlice(alloc);
@@ -21712,7 +21733,35 @@ fn artifactRepairIssueKindKeyForIssueAlloc(alloc: Allocator, issue: types.Artifa
 
 fn artifactRepairIssueIdAlloc(alloc: Allocator, issue: types.ArtifactRepairIssue) ![]u8 {
     if (issue.artifact_key.len > 0) return try alloc.dupe(u8, issue.artifact_key);
-    return try std.fmt.allocPrint(alloc, "{s}\x1f{s}\x1f{s}\x1f{?d}", .{ issue.doc_key, issue.artifact_name, issue.unit_id, issue.chunk_id });
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    artifactRepairIssueIdHashString(&hasher, issue.doc_key);
+    artifactRepairIssueIdHashString(&hasher, issue.parent_doc_key);
+    artifactRepairIssueIdHashString(&hasher, issue.source_artifact_name);
+    artifactRepairIssueIdHashString(&hasher, issue.artifact_name);
+    artifactRepairIssueIdHashString(&hasher, issue.unit_id);
+    artifactRepairIssueIdHashOptionalU64(&hasher, if (issue.chunk_id) |chunk_id| @as(u64, chunk_id) else null);
+    artifactRepairIssueIdHashString(&hasher, @tagName(issue.artifact_kind));
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const hex = try bytesToHexAlloc(alloc, &digest);
+    defer alloc.free(hex);
+    return try std.fmt.allocPrint(alloc, "tuple-sha256:{s}", .{hex});
+}
+
+fn artifactRepairIssueIdHashString(hasher: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
+    var len_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len_buf, value.len, .little);
+    hasher.update(&len_buf);
+    hasher.update(value);
+}
+
+fn artifactRepairIssueIdHashOptionalU64(hasher: *std.crypto.hash.sha2.Sha256, value: ?u64) void {
+    hasher.update(if (value == null) "\x00" else "\x01");
+    if (value) |raw| {
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, raw, .little);
+        hasher.update(&buf);
+    }
 }
 
 fn artifactRepairKindHasAutomatedReprocessor(kind: types.ArtifactRepairKind) bool {
@@ -36151,6 +36200,7 @@ test "db artifact repair list cursor pages durable repair debt" {
         .index_name = try alloc.dupe(u8, "document_units_v1"),
         .doc_key = try alloc.dupe(u8, "doc:a"),
         .artifact_name = try alloc.dupe(u8, "document_units_v1"),
+        .artifact_key = try alloc.dupe(u8, "asset:0001"),
         .reason = .corrupt_artifact,
         .sequence = 1,
     };
@@ -36162,6 +36212,7 @@ test "db artifact repair list cursor pages durable repair debt" {
         .index_name = try alloc.dupe(u8, "document_units_v1"),
         .doc_key = try alloc.dupe(u8, "doc:b"),
         .artifact_name = try alloc.dupe(u8, "document_units_v1"),
+        .artifact_key = try alloc.dupe(u8, "asset:0002"),
         .reason = .corrupt_artifact,
         .sequence = 2,
     };
@@ -36234,6 +36285,45 @@ test "db artifact repair queue keeps distinct unit artifacts for same document a
     try std.testing.expectEqualStrings("page:000002", issues[1].unit_id);
 }
 
+test "db artifact repair fallback issue ids do not collide on delimiter-bearing fields" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    var first_issue = types.ArtifactRepairIssue{
+        .artifact_kind = .chunk,
+        .index_name = try alloc.dupe(u8, "body_chunks_v1"),
+        .doc_key = try alloc.dupe(u8, "doc:a\x1fbody"),
+        .artifact_name = try alloc.dupe(u8, "chunks"),
+        .unit_id = try alloc.dupe(u8, "page:1"),
+        .reason = .corrupt_artifact,
+        .sequence = 1,
+    };
+    defer first_issue.deinit(alloc);
+    try db.recordArtifactRepairIssue(alloc, first_issue);
+
+    var second_issue = types.ArtifactRepairIssue{
+        .artifact_kind = .chunk,
+        .index_name = try alloc.dupe(u8, "body_chunks_v1"),
+        .doc_key = try alloc.dupe(u8, "doc:a"),
+        .artifact_name = try alloc.dupe(u8, "body\x1fchunks"),
+        .unit_id = try alloc.dupe(u8, "page:1"),
+        .reason = .corrupt_artifact,
+        .sequence = 2,
+    };
+    defer second_issue.deinit(alloc);
+    try db.recordArtifactRepairIssue(alloc, second_issue);
+
+    const issues = try db.listArtifactRepairIssues(alloc, .chunk, "body_chunks_v1", 10);
+    defer types.freeArtifactRepairIssues(alloc, issues);
+    try std.testing.expectEqual(@as(usize, 2), issues.len);
+}
+
 test "db artifact repair kind filter uses selective index after reopen" {
     const alloc = std.testing.allocator;
 
@@ -36290,6 +36380,79 @@ test "db artifact repair kind filter uses selective index after reopen" {
     try std.testing.expectEqual(@as(usize, 1), page.issues.len);
     try std.testing.expectEqual(.graph, page.issues[0].artifact_kind);
     try std.testing.expectEqualStrings("doc:g", page.issues[0].doc_key);
+}
+
+test "db artifact repair kind fallback scan is bounded when kind index is rebuilding" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const fallback_scan_budget: u64 = 256;
+    var i: usize = 0;
+    while (i < fallback_scan_budget + 8) : (i += 1) {
+        const doc_key = try std.fmt.allocPrint(alloc, "doc:embedding:{d:0>4}", .{i});
+        defer alloc.free(doc_key);
+        const artifact_key = try std.fmt.allocPrint(alloc, "embedding:{d:0>4}", .{i});
+        defer alloc.free(artifact_key);
+        var issue = types.ArtifactRepairIssue{
+            .artifact_kind = .embedding,
+            .index_name = try alloc.dupe(u8, "idx"),
+            .doc_key = try alloc.dupe(u8, doc_key),
+            .artifact_name = try alloc.dupe(u8, "idx"),
+            .artifact_key = try alloc.dupe(u8, artifact_key),
+            .reason = .missing_artifact,
+            .sequence = @intCast(i + 1),
+        };
+        defer issue.deinit(alloc);
+        const key = try artifactRepairIssueKeyForIssueAlloc(alloc, issue);
+        defer alloc.free(key);
+        const value = try encodeArtifactRepairIssueValueAlloc(alloc, issue);
+        defer alloc.free(value);
+        try db.core.store.put(key, value);
+    }
+
+    var graph_issue = types.ArtifactRepairIssue{
+        .artifact_kind = .graph,
+        .index_name = try alloc.dupe(u8, "idx"),
+        .doc_key = try alloc.dupe(u8, "doc:graph"),
+        .artifact_name = try alloc.dupe(u8, "idx"),
+        .artifact_key = try alloc.dupe(u8, "graph:0001"),
+        .reason = .corrupt_artifact,
+        .sequence = 1000,
+    };
+    defer graph_issue.deinit(alloc);
+    const graph_key = try artifactRepairIssueKeyForIssueAlloc(alloc, graph_issue);
+    defer alloc.free(graph_key);
+    const graph_value = try encodeArtifactRepairIssueValueAlloc(alloc, graph_issue);
+    defer alloc.free(graph_value);
+    try db.core.store.put(graph_key, graph_value);
+
+    const ready_key = try internal_keys.artifactRepairKindIndexReadyKeyAlloc(alloc);
+    defer alloc.free(ready_key);
+    try db.core.store.putBatch(&.{}, &.{ready_key});
+
+    var first_page = try db.listArtifactRepairIssuesPage(alloc, .{ .artifact_kind = .graph, .index_name = "idx", .limit = 1 });
+    defer first_page.deinit(alloc);
+    try std.testing.expect(first_page.has_more);
+    try std.testing.expect(first_page.next_cursor != null);
+    try std.testing.expectEqual(fallback_scan_budget, first_page.scanned);
+    try std.testing.expectEqual(@as(usize, 0), first_page.issues.len);
+
+    var second_page = try db.listArtifactRepairIssuesPage(alloc, .{
+        .artifact_kind = .graph,
+        .index_name = "idx",
+        .limit = 1,
+        .cursor = first_page.next_cursor,
+    });
+    defer second_page.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), second_page.issues.len);
+    try std.testing.expectEqual(.graph, second_page.issues[0].artifact_kind);
+    try std.testing.expectEqualStrings("doc:graph", second_page.issues[0].doc_key);
 }
 
 test "db artifact repair reports unsupported artifact kinds without clearing debt" {

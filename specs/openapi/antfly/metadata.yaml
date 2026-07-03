@@ -8435,8 +8435,9 @@ paths:
         Attempts to repair queued table issues. This release supports
         `target=artifact`, which reprocesses supported artifact kinds and
         replays derived state. The operation is bounded by `limit`, returns an
-        opaque continuation cursor when more debt remains, and requires table
-        admin permission when authentication is enabled.
+        opaque continuation cursor when more scanned issues remain in the page
+        stream, reports unresolved debt separately, and requires table admin
+        permission when authentication is enabled.
       tags:
         - data_operations
       operationId: repairArtifactIssues
