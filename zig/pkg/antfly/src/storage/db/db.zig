@@ -14026,6 +14026,12 @@ fn requestHasChunking(request: enrichment_types.GeneratedEnrichmentRequest) bool
     return request.chunk_size > 0 or request.chunker_json.len > 0;
 }
 
+fn requestUsesMaterializedChunkArtifact(db: *const DB, artifact_name: []const u8) bool {
+    if (artifact_name.len == 0) return false;
+    const chunk_cfg = db.core.index_manager.getEnrichment(.chunk, artifact_name) orelse return false;
+    return chunk_cfg.source_artifact_name.len > 0;
+}
+
 fn remoteRenderConfig(
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
@@ -16952,6 +16958,12 @@ fn chunkEmbeddingSourcesForRequest(
             alloc.free(source.text);
         }
         sources.deinit(alloc);
+    }
+
+    if (requestUsesMaterializedChunkArtifact(db, artifact_name)) {
+        try collectChunkEmbeddingSourcesFromWrites(alloc, &sources, artifact_writes, artifact_name, request.source_field);
+        try collectChunkEmbeddingSourcesFromStore(alloc, db, &sources, request.doc_key, artifact_name, request.source_field);
+        return try sources.toOwnedSlice(alloc);
     }
 
     const chunks = try getOrCreateChunks(alloc, db, doc_value, request, cache);
@@ -34195,7 +34207,7 @@ test "db document extraction chunks units through source artifact enrichment" {
     const planned = try db.core.planGeneratedEnrichments(
         alloc,
         "doc:planned",
-        "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
+        "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\",\"text\":\"source document decoy\"}",
         &.{},
         &.{},
     );
@@ -34227,7 +34239,7 @@ test "db document extraction chunks units through source artifact enrichment" {
     try db.batch(.{
         .writes = &.{.{
             .key = "doc:a",
-            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\",\"text\":\"source document decoy\"}",
         }},
         .sync_level = .full_index,
     });
@@ -34380,7 +34392,7 @@ test "db document extraction chunks units through source artifact enrichment" {
     try db.batch(.{
         .writes = &.{.{
             .key = "doc:a",
-            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBkZWx0YQ==\"}",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBkZWx0YQ==\",\"text\":\"updated source document decoy\"}",
         }},
         .sync_level = .full_index,
     });
