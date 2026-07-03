@@ -6431,6 +6431,17 @@ fn documentSqlCorpusReadPlanSchema(name: []const u8) !runtime_schema.TableSchema
             },
         };
     }
+    if (std.mem.eql(u8, name, "aggregate_ready")) {
+        return .{
+            .storage_mode = .document,
+            .relational_columns = &.{
+                .{ .name = "body", .path = "body", .field_type = .text, .indexed = true, .index_lifecycle = .ready },
+                .{ .name = "status", .path = "status", .field_type = .keyword, .indexed = true, .index_lifecycle = .ready },
+                .{ .name = "category", .path = "category", .field_type = .keyword, .indexed = false },
+                .{ .name = "amount", .path = "amount", .field_type = .numeric, .indexed = false },
+            },
+        };
+    }
     if (std.mem.eql(u8, name, "array_ready")) {
         return .{
             .storage_mode = .document,
@@ -6473,6 +6484,108 @@ fn lowerDocumentReadPlanForCorpusCaseAlloc(
     return try lowerDocumentReadPlanParsedSqlAlloc(alloc, parsed, schema);
 }
 
+fn lowerDocumentAggregatePlanForCorpusCaseAlloc(
+    alloc: std.mem.Allocator,
+    parsed: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    case: document_sql_corpus.DocumentSqlReadPlanCaseJson,
+) !DocumentAlgebraicAggregatePlan {
+    if (case.indexes_json) |indexes_json| {
+        var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, document_sql_corpus_fixture_source_generation, document_sql_corpus_fixture_source_schema_fingerprint);
+        defer source_binding.deinitDocumentSqlCapabilities(alloc, &capabilities);
+        var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", document_sql_corpus_fixture_source_generation, document_sql_corpus_fixture_source_schema_fingerprint);
+        defer source_binding.deinitDocumentSqlSchema(alloc, &virtual_schema);
+        if (case.bounded_scan_rows) |max_rows| capabilities.bounded_scan = .{ .max_rows = max_rows };
+        return try lowerDocumentAggregatePlanWithOptionalIndexesAndVirtualSchemaCapabilitiesParsedSqlAlloc(alloc, parsed, schema, virtual_schema, indexes_json, capabilities);
+    }
+    if (case.bounded_scan_rows) |max_rows| {
+        return try lowerDocumentAggregatePlanWithOptionalIndexesAndBoundedScanPolicyParsedSqlAlloc(alloc, parsed, schema, null, .{ .max_rows = max_rows });
+    }
+    return try lowerDocumentAggregatePlanWithOptionalIndexesJsonParsedSqlAlloc(alloc, parsed, schema, null);
+}
+
+fn expectDocumentSqlCorpusAggregateProducer(
+    case: document_sql_corpus.DocumentSqlReadPlanCaseJson,
+    producer: DocumentProducer,
+) !void {
+    const expected = case.expected.producer orelse return error.InvalidSqlCorpusFixture;
+    if (std.mem.eql(u8, expected, "indexed_filter")) {
+        const indexed_query = switch (producer) {
+            .indexed_query => |query| query,
+            else => return error.TestUnexpectedResult,
+        };
+        if (case.expected.filter_query_contains.len > 0) {
+            const filter_query_json = indexed_query.filter_query_json orelse return error.TestUnexpectedResult;
+            for (case.expected.filter_query_contains) |needle| {
+                try std.testing.expect(std.mem.indexOf(u8, filter_query_json, needle) != null);
+            }
+        }
+        if (case.expected.residual_filter_json) |expected_json| {
+            try std.testing.expectEqualStrings(expected_json, indexed_query.residual_filter_json orelse return error.TestUnexpectedResult);
+        }
+        if (case.expected.residual_filter_contains.len > 0) {
+            const residual_filter_json = indexed_query.residual_filter_json orelse return error.TestUnexpectedResult;
+            for (case.expected.residual_filter_contains) |needle| {
+                try std.testing.expect(std.mem.indexOf(u8, residual_filter_json, needle) != null);
+            }
+        }
+        if (case.expected.max_candidate_rows) |max_candidate_rows| {
+            try std.testing.expectEqual(max_candidate_rows, indexed_query.max_candidate_rows orelse return error.TestUnexpectedResult);
+        }
+    } else if (std.mem.eql(u8, expected, "bounded_scan")) {
+        const bounded_scan = switch (producer) {
+            .bounded_scan => |scan| scan,
+            else => return error.TestUnexpectedResult,
+        };
+        if (case.expected.residual_filter_json) |expected_json| {
+            try std.testing.expectEqualStrings(expected_json, bounded_scan.residual_filter_json orelse return error.TestUnexpectedResult);
+        }
+        for (case.expected.residual_filter_contains) |needle| {
+            const residual_filter_json = bounded_scan.residual_filter_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, residual_filter_json, needle) != null);
+        }
+        if (case.expected.max_candidate_rows) |max_rows| {
+            try std.testing.expectEqual(max_rows, bounded_scan.max_rows);
+        }
+    } else {
+        return error.InvalidSqlCorpusFixture;
+    }
+}
+
+fn expectDocumentSqlCorpusAggregatePlan(
+    case: document_sql_corpus.DocumentSqlReadPlanCaseJson,
+    lowered: DocumentAlgebraicAggregatePlan,
+) !void {
+    const expected_op = case.expected.aggregate_op orelse return error.InvalidSqlCorpusFixture;
+    try std.testing.expectEqualStrings(expected_op, @tagName(lowered.aggregate.op));
+    if (case.expected.aggregate_input) |expected_input| {
+        const input = lowered.aggregate.input orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(expected_input, input.field);
+    }
+    if (case.expected.group_by) |expected_group| {
+        const group_by = lowered.group_by orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(expected_group, group_by.field);
+    }
+    if (case.expected.having) |expected_having| {
+        try std.testing.expectEqual(expected_having, lowered.having.len);
+    }
+    if (case.expected.order_by) |expected_order| {
+        const order_by = lowered.order_by orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(expected_order, @tagName(order_by.key));
+    }
+    if (case.expected.limit) |expected_limit| {
+        try std.testing.expectEqual(expected_limit, lowered.limit orelse return error.TestUnexpectedResult);
+    }
+    const expected_producer = case.expected.producer orelse return error.InvalidSqlCorpusFixture;
+    if (std.mem.eql(u8, expected_producer, "algebraic_materialization")) {
+        try std.testing.expect(lowered.index_name != null);
+        try std.testing.expect(lowered.materialization_name != null);
+        try std.testing.expect(lowered.candidate_producer == null);
+    } else {
+        try expectDocumentSqlCorpusAggregateProducer(case, lowered.candidate_producer orelse return error.TestUnexpectedResult);
+    }
+}
+
 test "document SQL read plan corpus cases" {
     const alloc = std.testing.allocator;
     var corpus = try document_sql_corpus.parseDocumentSqlCorpusAlloc(alloc);
@@ -6482,6 +6595,7 @@ test "document SQL read plan corpus cases" {
         const schema = try documentSqlCorpusReadPlanSchema(case.schema);
         var parsed = try tokenized.ParsedSql.initAlloc(alloc, case.sql);
         defer parsed.deinit(alloc);
+        const statement_kind = try validatedDocumentReadStatementKind(&parsed);
         if (case.expected.expected_error) |expected_error_name| {
             try std.testing.expect(case.expected.producer == null);
             try std.testing.expect(case.expected.native_query_json == null);
@@ -6489,10 +6603,24 @@ test "document SQL read plan corpus cases" {
             try std.testing.expect(case.expected.filter_query_contains.len == 0);
             try std.testing.expect(case.expected.native_query_contains.len == 0);
             try std.testing.expect(case.expected.residual_filter_contains.len == 0);
-            try std.testing.expectError(
-                document_sql_corpus.errorValue(try document_sql_corpus.errorFromName(expected_error_name)),
-                lowerDocumentReadPlanForCorpusCaseAlloc(alloc, &parsed, schema, case),
-            );
+            if (statement_kind == .aggregate) {
+                try std.testing.expectError(
+                    document_sql_corpus.errorValue(try document_sql_corpus.errorFromName(expected_error_name)),
+                    lowerDocumentAggregatePlanForCorpusCaseAlloc(alloc, &parsed, schema, case),
+                );
+            } else {
+                try std.testing.expectError(
+                    document_sql_corpus.errorValue(try document_sql_corpus.errorFromName(expected_error_name)),
+                    lowerDocumentReadPlanForCorpusCaseAlloc(alloc, &parsed, schema, case),
+                );
+            }
+            continue;
+        }
+
+        if (statement_kind == .aggregate) {
+            var lowered_aggregate = try lowerDocumentAggregatePlanForCorpusCaseAlloc(alloc, &parsed, schema, case);
+            defer lowered_aggregate.deinit(alloc);
+            try expectDocumentSqlCorpusAggregatePlan(case, lowered_aggregate);
             continue;
         }
 

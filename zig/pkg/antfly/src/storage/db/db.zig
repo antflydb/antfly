@@ -3022,6 +3022,34 @@ pub const DB = struct {
         try relational_rows_impl.admitRelationalRowsCteMaterializationAllowSpill(cte, observed_rows, observed_bytes);
     }
 
+    pub fn testSpillRelationalRowsCteResultAlloc(
+        self: *DB,
+        alloc: Allocator,
+        result: types.RelationalRowsQueryResult,
+        materialized_bytes: u64,
+    ) !relational_rows.RelationalRowsSpilledCte {
+        if (!builtin.is_test) @compileError("testSpillRelationalRowsCteResultAlloc is only available in tests");
+        return try relational_rows_impl.spillRelationalRowsCteResultAlloc(self, alloc, result, materialized_bytes);
+    }
+
+    pub fn testLoadRelationalRowsSpilledCteAlloc(
+        self: *DB,
+        alloc: Allocator,
+        spill: relational_rows.RelationalRowsSpilledCte,
+    ) !types.RelationalRowsQueryResult {
+        if (!builtin.is_test) @compileError("testLoadRelationalRowsSpilledCteAlloc is only available in tests");
+        return try relational_rows_impl.loadRelationalRowsSpilledCteAlloc(self, alloc, spill);
+    }
+
+    pub fn testDeleteRelationalRowsSpilledCte(
+        self: *DB,
+        alloc: Allocator,
+        spill: relational_rows.RelationalRowsSpilledCte,
+    ) void {
+        if (!builtin.is_test) @compileError("testDeleteRelationalRowsSpilledCte is only available in tests");
+        relational_rows_impl.deleteRelationalRowsSpilledCte(self, alloc, spill);
+    }
+
     pub fn relationalRowsSetOperationRowsAlloc(
         alloc: Allocator,
         operation: types.RelationalRowsSetOperation,

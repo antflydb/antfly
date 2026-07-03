@@ -38,11 +38,11 @@
       "id": "spill-backed-window-execution",
       "relational_slices_section": "Advanced aggregates, windows, and rollups",
       "surface": "spill_backed_window",
-      "status": "partial_release_gated",
-      "current_evidence": "Typed row-number windows and global ordered windows across ranges are release-gated.",
-      "missing_evidence": "Window execution still needs partition spill for partitions above bounded caps, per-partition memory limits, spill bytes, reload accounting, and failure classes.",
+      "status": "release_evidence",
+      "current_evidence": "Typed row-number windows and global ordered windows across ranges are release-gated. Window source execution now applies explicit max_rows, max_bytes, and spill_after_bytes admission, spills oversized admitted source rows through the shared SQL row-spill format, reloads before evaluation, returns typed window_diagnostics with input/output rows, source materialized bytes, window count, partition evaluation count, max partition rows/bytes, spill write bytes, reload count, and resource-budget failure counters, and fails closed when row or byte hard caps are exceeded.",
+      "missing_evidence": "",
       "evidence_file": "zig/pkg/antfly/src/storage/db/relational_rows.zig",
-      "evidence_symbol": "relational rows query across ranges merges ordered windows globally",
+      "evidence_symbol": "relational rows window source spill reloads rows and records diagnostics",
       "release_gate": "relational-release-gate"
     }
   ]

@@ -12881,7 +12881,9 @@ fn findTopLevelExpressionOperator(tokens: []const token_mod.Token, range: Genera
                 if (depth == 0) return null;
                 depth -= 1;
             },
-            .eq, .neq, .lt, .lte, .gt, .gte => if (depth == 0) {
+            .eq, .neq, .lt, .lte, .gt, .gte => if (depth == 0 and index > range.start and index + 1 < range.end) {
+                if (tokens[index].kind == .eq and tokens[index + 1].kind == .gt) continue;
+                if (tokens[index].kind == .gt and tokens[index - 1].kind == .eq) continue;
                 if (index + 1 < range.end and isGeneratedQuantifiedOperator(tokens[index + 1])) {
                     return .{ .kind = .quantified_comparison, .index = index, .quantifier_index = index + 1 };
                 }
@@ -17660,6 +17662,20 @@ test "generated SQL parser facade builds null logical and join AST spans" {
     try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, function_expression.argument_items.expressions[0].tokens.?);
     try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, function_expression.argument_items.expressions[1].kind);
     try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, function_expression.argument_items.expressions[1].tokens.?);
+
+    var named_argument_function_tokens = try lexer.tokenizeAlloc(alloc, "antfly.vector_search(table_name => 'docs', limit => 5)");
+    defer lexer.freeTokens(alloc, &named_argument_function_tokens);
+    var named_argument_function_expression = try buildGeneratedExpressionAst(alloc, named_argument_function_tokens.items, .{ .start = 0, .end = named_argument_function_tokens.items.len });
+    defer named_argument_function_expression.deinit(alloc);
+    try std.testing.expectEqual(GeneratedSqlExpressionKind.function_call, named_argument_function_expression.kind);
+    try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 11 }, named_argument_function_expression.argument_tokens.?);
+    try std.testing.expectEqual(@as(usize, 2), named_argument_function_expression.argument_items.count);
+    try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 6 }, named_argument_function_expression.argument_items.items[0]);
+    try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 11 }, named_argument_function_expression.argument_items.items[1]);
+    try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, named_argument_function_expression.argument_items.expressions[0].kind);
+    try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 6 }, named_argument_function_expression.argument_items.expressions[0].tokens.?);
+    try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, named_argument_function_expression.argument_items.expressions[1].kind);
+    try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 11 }, named_argument_function_expression.argument_items.expressions[1].tokens.?);
 
     var distinct_function_tokens = try lexer.tokenizeAlloc(alloc, "count(DISTINCT status)");
     defer lexer.freeTokens(alloc, &distinct_function_tokens);

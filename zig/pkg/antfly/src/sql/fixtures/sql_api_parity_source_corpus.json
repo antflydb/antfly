@@ -42003,6 +42003,140 @@
         }
       ],
       "sql": "SELECT id FROM usage_records WHERE name ILIKE $1"
+    },
+    {
+      "name": "document sql aggregate count residual native read",
+      "family": "read",
+      "native_request_kind": "query_request",
+      "native_request_json": "{\"classification\":\"native_equivalent\",\"surface\":\"read_query\",\"native_model\":\"query_request\",\"native_route\":\"rows_query\",\"target_resource\":\"\",\"permission\":\"read\",\"diagnostic\":\"\",\"sql_plan\":\"document_aggregate:table=docs:op=count:producer=indexed_query:group=0:having=0:order=0:limit=-1:index=0:native=0:full_text=1:filter=0:residual=1:candidate_rows=25\",\"execution_plan\":\"\"}",
+      "sql_fingerprint": "native_equivalence:class=native_equivalent:surface=read_query:model=query_request:route=rows_query:target=:permission=read:diagnostic=:plan=document_aggregate:table=docs:op=count:producer=indexed_query:group=0:having=0:order=0:limit=-1:index=0:native=0:full_text=1:filter=0:residual=1:candidate_rows=25:execution=",
+      "native_fingerprint": "native_equivalence:class=native_equivalent:surface=read_query:model=query_request:route=rows_query:target=:permission=read:diagnostic=:plan=document_aggregate:table=docs:op=count:producer=indexed_query:group=0:having=0:order=0:limit=-1:index=0:native=0:full_text=1:filter=0:residual=1:candidate_rows=25:execution=",
+      "native_equivalence": {
+        "classification": "native_equivalent",
+        "surface": "read_query",
+        "native_model": "query_request",
+        "native_route": "rows_query",
+        "target_resource": "",
+        "auth_resource": "table",
+        "permission": "read",
+        "audit_action": "query",
+        "row_filter": "preserved",
+        "request_fingerprint": "native_equivalence:class=native_equivalent:surface=read_query:model=query_request:route=rows_query:target=:permission=read:diagnostic=:plan=document_aggregate:table=docs:op=count:producer=indexed_query:group=0:having=0:order=0:limit=-1:index=0:native=0:full_text=1:filter=0:residual=1:candidate_rows=25:execution="
+      },
+      "plan": "document_aggregate:table=docs:op=count:producer=indexed_query:group=0:having=0:order=0:limit=-1:index=0:native=0:full_text=1:filter=0:residual=1:candidate_rows=25",
+      "sql": "SELECT count(*) AS row_count FROM docs WHERE full_text_search('body:alpha') AND status = 'active'"
+    },
+    {
+      "name": "document sql aggregate min native read",
+      "family": "read",
+      "native_request_kind": "query_request",
+      "native_request_json": "{\"classification\":\"native_equivalent\",\"surface\":\"read_query\",\"native_model\":\"query_request\",\"native_route\":\"rows_query\",\"target_resource\":\"\",\"permission\":\"read\",\"diagnostic\":\"\",\"sql_plan\":\"document_aggregate:table=docs:op=min:producer=bounded_scan:group=0:having=0:order=0:limit=-1:input=/amount:scan_rows=25\",\"execution_plan\":\"\"}",
+      "sql_fingerprint": "native_equivalence:class=native_equivalent:surface=read_query:model=query_request:route=rows_query:target=:permission=read:diagnostic=:plan=document_aggregate:table=docs:op=min:producer=bounded_scan:group=0:having=0:order=0:limit=-1:input=/amount:scan_rows=25:execution=",
+      "native_fingerprint": "native_equivalence:class=native_equivalent:surface=read_query:model=query_request:route=rows_query:target=:permission=read:diagnostic=:plan=document_aggregate:table=docs:op=min:producer=bounded_scan:group=0:having=0:order=0:limit=-1:input=/amount:scan_rows=25:execution=",
+      "native_equivalence": {
+        "classification": "native_equivalent",
+        "surface": "read_query",
+        "native_model": "query_request",
+        "native_route": "rows_query",
+        "target_resource": "",
+        "auth_resource": "table",
+        "permission": "read",
+        "audit_action": "query",
+        "row_filter": "preserved",
+        "request_fingerprint": "native_equivalence:class=native_equivalent:surface=read_query:model=query_request:route=rows_query:target=:permission=read:diagnostic=:plan=document_aggregate:table=docs:op=min:producer=bounded_scan:group=0:having=0:order=0:limit=-1:input=/amount:scan_rows=25:execution="
+      },
+      "plan": "document_aggregate:table=docs:op=min:producer=bounded_scan:group=0:having=0:order=0:limit=-1:input=/amount:scan_rows=25",
+      "sql": "SELECT min(amount) AS min_amount FROM docs"
+    },
+    {
+      "name": "document sql aggregate sum native read",
+      "family": "read",
+      "native_request_kind": "query_request",
+      "native_request_json": "{\"classification\":\"native_equivalent\",\"surface\":\"read_query\",\"native_model\":\"query_request\",\"native_route\":\"rows_query\",\"target_resource\":\"\",\"permission\":\"read\",\"diagnostic\":\"\",\"sql_plan\":\"document_aggregate:table=docs:op=sum:producer=bounded_scan:group=0:having=0:order=0:limit=-1:input=/amount:scan_rows=25\",\"execution_plan\":\"\"}",
+      "sql_fingerprint": "native_equivalence:class=native_equivalent:surface=read_query:model=query_request:route=rows_query:target=:permission=read:diagnostic=:plan=document_aggregate:table=docs:op=sum:producer=bounded_scan:group=0:having=0:order=0:limit=-1:input=/amount:scan_rows=25:execution=",
+      "native_fingerprint": "native_equivalence:class=native_equivalent:surface=read_query:model=query_request:route=rows_query:target=:permission=read:diagnostic=:plan=document_aggregate:table=docs:op=sum:producer=bounded_scan:group=0:having=0:order=0:limit=-1:input=/amount:scan_rows=25:execution=",
+      "native_equivalence": {
+        "classification": "native_equivalent",
+        "surface": "read_query",
+        "native_model": "query_request",
+        "native_route": "rows_query",
+        "target_resource": "",
+        "auth_resource": "table",
+        "permission": "read",
+        "audit_action": "query",
+        "row_filter": "preserved",
+        "request_fingerprint": "native_equivalence:class=native_equivalent:surface=read_query:model=query_request:route=rows_query:target=:permission=read:diagnostic=:plan=document_aggregate:table=docs:op=sum:producer=bounded_scan:group=0:having=0:order=0:limit=-1:input=/amount:scan_rows=25:execution="
+      },
+      "plan": "document_aggregate:table=docs:op=sum:producer=bounded_scan:group=0:having=0:order=0:limit=-1:input=/amount:scan_rows=25",
+      "sql": "SELECT sum(amount) AS total_amount FROM docs"
+    },
+    {
+      "name": "document sql aggregate grouped having order limit native read",
+      "family": "read",
+      "native_request_kind": "query_request",
+      "native_request_json": "{\"classification\":\"native_equivalent\",\"surface\":\"read_query\",\"native_model\":\"query_request\",\"native_route\":\"rows_query\",\"target_resource\":\"\",\"permission\":\"read\",\"diagnostic\":\"\",\"sql_plan\":\"document_aggregate:table=docs:op=count:producer=indexed_query:group=1:having=1:order=1:limit=10:group_field=/status:order_key=group:order_dir=asc:index=0:native=0:full_text=0:filter=1:residual=0:candidate_rows=25\",\"execution_plan\":\"\"}",
+      "sql_fingerprint": "native_equivalence:class=native_equivalent:surface=read_query:model=query_request:route=rows_query:target=:permission=read:diagnostic=:plan=document_aggregate:table=docs:op=count:producer=indexed_query:group=1:having=1:order=1:limit=10:group_field=/status:order_key=group:order_dir=asc:index=0:native=0:full_text=0:filter=1:residual=0:candidate_rows=25:execution=",
+      "native_fingerprint": "native_equivalence:class=native_equivalent:surface=read_query:model=query_request:route=rows_query:target=:permission=read:diagnostic=:plan=document_aggregate:table=docs:op=count:producer=indexed_query:group=1:having=1:order=1:limit=10:group_field=/status:order_key=group:order_dir=asc:index=0:native=0:full_text=0:filter=1:residual=0:candidate_rows=25:execution=",
+      "native_equivalence": {
+        "classification": "native_equivalent",
+        "surface": "read_query",
+        "native_model": "query_request",
+        "native_route": "rows_query",
+        "target_resource": "",
+        "auth_resource": "table",
+        "permission": "read",
+        "audit_action": "query",
+        "row_filter": "preserved",
+        "request_fingerprint": "native_equivalence:class=native_equivalent:surface=read_query:model=query_request:route=rows_query:target=:permission=read:diagnostic=:plan=document_aggregate:table=docs:op=count:producer=indexed_query:group=1:having=1:order=1:limit=10:group_field=/status:order_key=group:order_dir=asc:index=0:native=0:full_text=0:filter=1:residual=0:candidate_rows=25:execution="
+      },
+      "plan": "document_aggregate:table=docs:op=count:producer=indexed_query:group=1:having=1:order=1:limit=10:group_field=/status:order_key=group:order_dir=asc:index=0:native=0:full_text=0:filter=1:residual=0:candidate_rows=25",
+      "sql": "SELECT count(*) AS row_count FROM docs WHERE status = 'active' GROUP BY status HAVING row_count > 1 ORDER BY status ASC LIMIT 10"
+    },
+    {
+      "name": "document sql aggregate null empty bounded native read",
+      "family": "read",
+      "native_request_kind": "query_request",
+      "native_request_json": "{\"classification\":\"native_equivalent\",\"surface\":\"read_query\",\"native_model\":\"query_request\",\"native_route\":\"rows_query\",\"target_resource\":\"\",\"permission\":\"read\",\"diagnostic\":\"\",\"sql_plan\":\"document_aggregate:table=docs:op=avg:producer=bounded_scan:group=0:having=0:order=0:limit=10:input=/amount:scan_rows=25\",\"execution_plan\":\"\"}",
+      "sql_fingerprint": "native_equivalence:class=native_equivalent:surface=read_query:model=query_request:route=rows_query:target=:permission=read:diagnostic=:plan=document_aggregate:table=docs:op=avg:producer=bounded_scan:group=0:having=0:order=0:limit=10:input=/amount:scan_rows=25:execution=",
+      "native_fingerprint": "native_equivalence:class=native_equivalent:surface=read_query:model=query_request:route=rows_query:target=:permission=read:diagnostic=:plan=document_aggregate:table=docs:op=avg:producer=bounded_scan:group=0:having=0:order=0:limit=10:input=/amount:scan_rows=25:execution=",
+      "native_equivalence": {
+        "classification": "native_equivalent",
+        "surface": "read_query",
+        "native_model": "query_request",
+        "native_route": "rows_query",
+        "target_resource": "",
+        "auth_resource": "table",
+        "permission": "read",
+        "audit_action": "query",
+        "row_filter": "preserved",
+        "request_fingerprint": "native_equivalence:class=native_equivalent:surface=read_query:model=query_request:route=rows_query:target=:permission=read:diagnostic=:plan=document_aggregate:table=docs:op=avg:producer=bounded_scan:group=0:having=0:order=0:limit=10:input=/amount:scan_rows=25:execution="
+      },
+      "plan": "document_aggregate:table=docs:op=avg:producer=bounded_scan:group=0:having=0:order=0:limit=10:input=/amount:scan_rows=25",
+      "sql": "SELECT avg(amount) AS avg_amount FROM docs LIMIT 10"
+    },
+    {
+      "name": "unsupported document sql aggregate unbounded scan",
+      "family": "unsupported_read",
+      "native_request_kind": "query_request",
+      "native_request_json": "{\"classification\":\"unsupported\",\"surface\":\"read_query\",\"native_model\":\"query_request\",\"native_route\":\"unsupported\",\"target_resource\":\"\",\"permission\":\"none\",\"diagnostic\":\"document_sql_bounded_scan_missing_exact_producer\",\"sql_plan\":\"unsupported:read:requires=document_sql_bounded_scan_missing_exact_producer\",\"execution_plan\":\"\"}",
+      "sql_fingerprint": "native_equivalence:class=unsupported:surface=read_query:model=query_request:route=unsupported:target=:permission=none:diagnostic=document_sql_bounded_scan_missing_exact_producer:plan=unsupported:read:requires=document_sql_bounded_scan_missing_exact_producer:execution=",
+      "native_fingerprint": "native_equivalence:class=unsupported:surface=read_query:model=query_request:route=unsupported:target=:permission=none:diagnostic=document_sql_bounded_scan_missing_exact_producer:plan=unsupported:read:requires=document_sql_bounded_scan_missing_exact_producer:execution=",
+      "native_equivalence": {
+        "classification": "unsupported",
+        "surface": "read_query",
+        "native_model": "query_request",
+        "native_route": "unsupported",
+        "target_resource": "",
+        "auth_resource": "none",
+        "permission": "none",
+        "audit_action": "reject",
+        "row_filter": "preserved",
+        "request_fingerprint": "native_equivalence:class=unsupported:surface=read_query:model=query_request:route=unsupported:target=:permission=none:diagnostic=document_sql_bounded_scan_missing_exact_producer:plan=unsupported:read:requires=document_sql_bounded_scan_missing_exact_producer:execution=",
+        "diagnostic": "document_sql_bounded_scan_missing_exact_producer"
+      },
+      "plan": "unsupported:read:requires=document_sql_bounded_scan_missing_exact_producer",
+      "classification_reason": "document_sql_bounded_scan_missing_exact_producer",
+      "sql": "SELECT count(*) AS row_count FROM docs"
     }
   ]
 }

@@ -15,19 +15,6 @@
       "release_gate": "document-sql-hardening-gate"
     },
     {
-      "id": "derived-index-producer-types",
-      "sql_slices_section": "Finish document query and view-mapping hardening",
-      "expansion_surface": "derived_index_producer_types",
-      "admission_status": "blocked_until_corpus_and_runtime",
-      "source_corpus_requirement": "Keep named sql_api_parity_source_corpus.json fixtures for each admitted native/derived-index producer and add lifecycle edge fixtures for any newly admitted partial, ordered, or rebuild-in-progress producer behavior.",
-      "coverage_bucket_requirement": "Keep required sql_api_required_coverage.json buckets for each admitted derived-index producer type and add buckets for lifecycle/result-parity contracts as they become executable.",
-      "runtime_parity_requirement": "Add executable runtime result-parity tests comparing SQL producer requests with native document API requests, including stale lifecycle and missing-producer failures.",
-      "current_guard": "Vector, semantic, hybrid, graph traverse, graph shortest path, graph metric, and graph metric rerank reads have exact read-plan corpus coverage plus fixture-backed native/API equivalence for ready indexes. Runtime result parity and explicit partial, ordered, and rebuild-in-progress lifecycle behavior remain blocked until executable SQL/native tests prove same rows or same rejection.",
-      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
-      "evidence_symbol": "document sql native graph metric rerank read",
-      "release_gate": "document-sql-hardening-gate"
-    },
-    {
       "id": "document-aggregates",
       "sql_slices_section": "Finish document query and view-mapping hardening",
       "expansion_surface": "document_aggregates",

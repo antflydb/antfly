@@ -1715,6 +1715,7 @@ fn appendAppParityBindingCoverageCatalogTable(
     try catalog_tables.append(alloc, .{
         .name = table_name,
         .schema_json = appParityBindingCoverageSchemaJsonForTable(entry, table_name),
+        .indexes_json = appParityBindingCoverageIndexesJsonForTable(entry, table_name),
     });
 }
 
@@ -1724,6 +1725,13 @@ fn appParityBindingCoverageSchemaJsonForTable(entry: AppParityCorpusEntry, table
     }
     if (entry.source_schema_json.len > 0 and !std.mem.eql(u8, table_name, "usage_records")) return entry.source_schema_json;
     return app_parity_default_schema_json;
+}
+
+fn appParityBindingCoverageIndexesJsonForTable(entry: AppParityCorpusEntry, table_name: []const u8) []const u8 {
+    for (entry.catalog_tables) |table| {
+        if (std.mem.eql(u8, table.name, table_name)) return table.indexes_json;
+    }
+    return "";
 }
 
 pub fn appParitySourceTableNameAlloc(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !?[]const u8 {
@@ -4312,7 +4320,6 @@ pub fn parseDocumentSqlBoundedScanInventoryAlloc(alloc: std.mem.Allocator) !Docu
 
 const document_sql_read_expansion_gate_ids = [_][]const u8{
     "additional-array-unnest-patterns",
-    "derived-index-producer-types",
     "document-aggregates",
     "lateral-view-mapping-joins",
 };
@@ -4326,7 +4333,6 @@ fn documentSqlReadExpansionGateIdKnown(name: []const u8) bool {
 
 fn documentSqlReadExpansionSurfaceKnown(name: []const u8) bool {
     return std.mem.eql(u8, name, "array_unnest_patterns") or
-        std.mem.eql(u8, name, "derived_index_producer_types") or
         std.mem.eql(u8, name, "document_aggregates") or
         std.mem.eql(u8, name, "lateral_view_mapping_joins");
 }
@@ -4334,9 +4340,6 @@ fn documentSqlReadExpansionSurfaceKnown(name: []const u8) bool {
 fn documentSqlReadExpansionEntryShapeMatches(entry: DocumentSqlReadExpansionGateEntry) bool {
     if (std.mem.eql(u8, entry.id, "additional-array-unnest-patterns")) {
         return std.mem.eql(u8, entry.expansion_surface, "array_unnest_patterns");
-    }
-    if (std.mem.eql(u8, entry.id, "derived-index-producer-types")) {
-        return std.mem.eql(u8, entry.expansion_surface, "derived_index_producer_types");
     }
     if (std.mem.eql(u8, entry.id, "document-aggregates")) {
         return std.mem.eql(u8, entry.expansion_surface, "document_aggregates");
@@ -11265,6 +11268,54 @@ fn documentQueryFingerprintAlloc(
     return fingerprint;
 }
 
+fn documentAggregateProducerFingerprintName(plan: document_plan.DocumentAlgebraicAggregatePlan) []const u8 {
+    if (plan.index_name != null and plan.materialization_name != null) return "algebraic_materialization";
+    if (plan.candidate_producer) |producer| return documentProducerFingerprintName(producer);
+    return "none";
+}
+
+fn documentAggregateFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    plan: document_plan.DocumentAlgebraicAggregatePlan,
+) ![]u8 {
+    var fingerprint = try std.fmt.allocPrint(
+        alloc,
+        "document_aggregate:table={s}:op={s}:producer={s}:group={d}:having={d}:order={d}:limit={d}",
+        .{
+            plan.table_name,
+            @tagName(plan.aggregate.op),
+            documentAggregateProducerFingerprintName(plan),
+            @as(usize, if (plan.group_by != null) 1 else 0),
+            plan.having.len,
+            @as(usize, if (plan.order_by != null) 1 else 0),
+            appParityLimitValue(plan.limit),
+        },
+    );
+    if (plan.aggregate.input) |input| {
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "input", input.field);
+    }
+    if (plan.index_name) |index_name| {
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "index", index_name);
+    }
+    if (plan.materialization_name) |materialization_name| {
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "materialization", materialization_name);
+    }
+    if (plan.filter_query_json) |_| {
+        fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "filter", true);
+    }
+    if (plan.group_by) |group_by| {
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "group_field", group_by.field);
+    }
+    if (plan.order_by) |order_by| {
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "order_key", @tagName(order_by.key));
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "order_dir", @tagName(order_by.direction));
+    }
+    if (plan.candidate_producer) |producer| {
+        fingerprint = try appendDocumentProducerFingerprintAlloc(alloc, fingerprint, producer);
+    }
+    return fingerprint;
+}
+
 pub fn readPlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredReadPlan) ![]u8 {
     return switch (lowered) {
         .query => |query| blk: {
@@ -11276,7 +11327,7 @@ pub fn readPlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredReadPl
             break :blk try readFingerprintWithPrefixAlloc(alloc, fingerprint, "query");
         },
         .document_query => |document_query| try documentQueryFingerprintAlloc(alloc, document_query),
-        .document_aggregate => try alloc.dupe(u8, "document_aggregate"),
+        .document_aggregate => |document_aggregate| try documentAggregateFingerprintAlloc(alloc, document_aggregate),
         .set_operation => |set_operation| blk: {
             const fingerprint = try setOperationFingerprintAlloc(alloc, set_operation);
             break :blk try readFingerprintWithPrefixAlloc(alloc, fingerprint, "set_operation");
@@ -13123,18 +13174,17 @@ test "sql adapter corpus validates document sql read expansion gate manifest" {
     try std.testing.expectEqual(document_sql_read_expansion_gate_ids.len, gate.root.entries.len);
     try std.testing.expectEqualStrings("additional-array-unnest-patterns", gate.root.entries[0].id);
     try std.testing.expectEqualStrings("array_unnest_patterns", gate.root.entries[0].expansion_surface);
-    try std.testing.expectEqualStrings("derived-index-producer-types", gate.root.entries[1].id);
-    try std.testing.expectEqualStrings("document-aggregates", gate.root.entries[2].id);
-    try std.testing.expectEqualStrings("lateral-view-mapping-joins", gate.root.entries[3].id);
+    try std.testing.expectEqualStrings("document-aggregates", gate.root.entries[1].id);
+    try std.testing.expectEqualStrings("lateral-view-mapping-joins", gate.root.entries[2].id);
 
     const unknown_status_json =
         \\{
         \\  "gate_format": 1,
         \\  "entries": [
         \\    {
-        \\      "id": "derived-index-producer-types",
+        \\      "id": "document-aggregates",
         \\      "sql_slices_section": "Finish document query and view-mapping hardening",
-        \\      "expansion_surface": "derived_index_producer_types",
+        \\      "expansion_surface": "document_aggregates",
         \\      "admission_status": "admitted",
         \\      "source_corpus_requirement": "Add named sql_api_parity_source_corpus.json fixtures.",
         \\      "coverage_bucket_requirement": "Add required sql_api_required_coverage.json buckets.",
@@ -13156,9 +13206,9 @@ test "sql adapter corpus validates document sql read expansion gate manifest" {
         \\  "gate_format": 1,
         \\  "entries": [
         \\    {
-        \\      "id": "derived-index-producer-types",
+        \\      "id": "document-aggregates",
         \\      "sql_slices_section": "Finish document query and view-mapping hardening",
-        \\      "expansion_surface": "derived_index_producer_types",
+        \\      "expansion_surface": "document_aggregates",
         \\      "admission_status": "blocked_until_corpus_and_runtime",
         \\      "source_corpus_requirement": "Add named sql_api_parity_source_corpus.json fixtures.",
         \\      "coverage_bucket_requirement": "Add required sql_api_required_coverage.json buckets.",
@@ -13571,6 +13621,8 @@ test "sql adapter corpus validates relational advanced aggregate inventory manif
     try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[2].status);
     try std.testing.expectEqualStrings("", inventory.root.entries[2].missing_evidence);
     try std.testing.expectEqualStrings("spill-backed-window-execution", inventory.root.entries[3].id);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[3].status);
+    try std.testing.expectEqualStrings("", inventory.root.entries[3].missing_evidence);
 
     const unknown_surface_json =
         \\{
@@ -13894,6 +13946,8 @@ test "sql adapter corpus validates relational routed execution inventory manifes
     try std.testing.expectEqual(relational_routed_execution_inventory_ids.len, inventory.root.entries.len);
     try std.testing.expectEqualStrings("cte-stream-spill-resumability", inventory.root.entries[0].id);
     try std.testing.expectEqualStrings("cte_stream_spill", inventory.root.entries[0].surface);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[0].status);
+    try std.testing.expectEqualStrings("", inventory.root.entries[0].missing_evidence);
     try std.testing.expectEqualStrings("live-write-pagination-range-movement", inventory.root.entries[1].id);
     try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[1].status);
     try std.testing.expectEqualStrings("", inventory.root.entries[1].missing_evidence);
@@ -16591,6 +16645,15 @@ pub const AppParityCorpusCoverage = struct {
     update_joined_source_cte_mutation: bool = false,
     delete_joined_source: bool = false,
     delete_joined_source_cte_mutation: bool = false,
+    document_query_aggregate: bool = false,
+    document_query_aggregate_count_native_equivalence: bool = false,
+    document_query_aggregate_grouped_native_equivalence: bool = false,
+    document_query_aggregate_having_order_limit_native_equivalence: bool = false,
+    document_query_aggregate_minmax_native_equivalence: bool = false,
+    document_query_aggregate_null_empty_native_equivalence: bool = false,
+    document_query_aggregate_rejected_unbounded_scan: bool = false,
+    document_query_aggregate_residual_native_equivalence: bool = false,
+    document_query_aggregate_sumavg_native_equivalence: bool = false,
     document_query_view_mapping: bool = false,
     document_query_view_mapping_between_predicate: bool = false,
     document_query_view_mapping_in_predicate: bool = false,
@@ -17815,6 +17878,44 @@ pub const AppParityCorpusCoverage = struct {
         self.observeMigrationEquivalentDataBackfill(entry);
         self.catalog_setup_sql = self.catalog_setup_sql or entry.apply_setup_sql.len > 0;
         self.catalog_tables_fixture_metadata = self.catalog_tables_fixture_metadata or entry.catalog_tables.len > 0;
+        const is_document_aggregate = entry.family == .read and std.mem.startsWith(u8, entry.plan, "document_aggregate:");
+        const document_aggregate_has_native_evidence = is_document_aggregate and appParityEntryHasExplicitNativeEvidence(entry);
+        self.document_query_aggregate = self.document_query_aggregate or is_document_aggregate;
+        self.document_query_aggregate_count_native_equivalence = self.document_query_aggregate_count_native_equivalence or
+            (document_aggregate_has_native_evidence and
+                sql_adapter.planHasExactStringToken(entry.plan, ":op=", "count"));
+        self.document_query_aggregate_minmax_native_equivalence = self.document_query_aggregate_minmax_native_equivalence or
+            (document_aggregate_has_native_evidence and
+                (sql_adapter.planHasExactStringToken(entry.plan, ":op=", "min") or
+                    sql_adapter.planHasExactStringToken(entry.plan, ":op=", "max")) and
+                sql_adapter.planHasExactStringToken(entry.plan, ":input=", "/amount"));
+        self.document_query_aggregate_sumavg_native_equivalence = self.document_query_aggregate_sumavg_native_equivalence or
+            (document_aggregate_has_native_evidence and
+                (sql_adapter.planHasExactStringToken(entry.plan, ":op=", "sum") or
+                    sql_adapter.planHasExactStringToken(entry.plan, ":op=", "avg")) and
+                sql_adapter.planHasExactStringToken(entry.plan, ":input=", "/amount"));
+        self.document_query_aggregate_grouped_native_equivalence = self.document_query_aggregate_grouped_native_equivalence or
+            (document_aggregate_has_native_evidence and
+                sql_adapter.planHasExactUsizeToken(entry.plan, ":group=", 1) and
+                sql_adapter.planHasExactStringToken(entry.plan, ":group_field=", "/status"));
+        self.document_query_aggregate_having_order_limit_native_equivalence = self.document_query_aggregate_having_order_limit_native_equivalence or
+            (document_aggregate_has_native_evidence and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":having=") and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":order=") and
+                sql_adapter.planHasExactUsizeToken(entry.plan, ":limit=", 10));
+        self.document_query_aggregate_residual_native_equivalence = self.document_query_aggregate_residual_native_equivalence or
+            (document_aggregate_has_native_evidence and
+                sql_adapter.planHasExactStringToken(entry.plan, ":producer=", "indexed_query") and
+                sql_adapter.planHasExactUsizeToken(entry.plan, ":residual=", 1));
+        self.document_query_aggregate_null_empty_native_equivalence = self.document_query_aggregate_null_empty_native_equivalence or
+            (document_aggregate_has_native_evidence and
+                (std.mem.indexOf(u8, entry.name, "null") != null or std.mem.indexOf(u8, entry.name, "empty") != null) and
+                sql_adapter.planHasExactStringToken(entry.plan, ":producer=", "bounded_scan"));
+        self.document_query_aggregate_rejected_unbounded_scan = self.document_query_aggregate_rejected_unbounded_scan or
+            (entry.family == .unsupported_read and
+                structured_summary.hasReason("document_sql_bounded_scan_missing_exact_producer") and
+                structured_summary.parser.count_function and
+                std.mem.indexOf(u8, entry.sql, "docs") != null);
         self.document_query_view_mapping = self.document_query_view_mapping or
             (entry.family == .read and
                 sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and

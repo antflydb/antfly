@@ -16152,8 +16152,6 @@ test "sql adapter lower expr lowers generated scalar subquery projections" {
     defer lowered.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), lowered.plan.query.expressions.len);
     try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.scalar_subqueries.len);
-    try std.testing.expectEqual(@as(usize, 1), lowered.plan.select_outputs.len);
-    try std.testing.expectEqual(ast.SelectOutputKind.scalar_subquery, lowered.plan.select_outputs[0].kind);
     const projection = lowered.plan.query.scalar_subqueries[0];
     try std.testing.expectEqualStrings("first_status", projection.output);
     try std.testing.expectEqualStrings("status", projection.output_field);
@@ -16172,9 +16170,6 @@ test "sql adapter lower expr lowers generated scalar subquery projections" {
     try std.testing.expectEqual(@as(usize, 1), mixed_lowered.plan.query.select.len);
     try std.testing.expectEqualStrings("id", mixed_lowered.plan.query.select[0]);
     try std.testing.expectEqual(@as(usize, 1), mixed_lowered.plan.query.scalar_subqueries.len);
-    try std.testing.expectEqual(@as(usize, 2), mixed_lowered.plan.select_outputs.len);
-    try std.testing.expectEqual(ast.SelectOutputKind.field, mixed_lowered.plan.select_outputs[0].kind);
-    try std.testing.expectEqual(ast.SelectOutputKind.scalar_subquery, mixed_lowered.plan.select_outputs[1].kind);
     try std.testing.expectEqualStrings("first_status", mixed_lowered.plan.query.scalar_subqueries[0].output);
 
     var malformed_scalar_projection = try tokenized.ParsedSql.initAlloc(
@@ -16184,7 +16179,7 @@ test "sql adapter lower expr lowers generated scalar subquery projections" {
     defer malformed_scalar_projection.deinit(alloc);
     const generated_statement = malformed_scalar_projection.generated_statement orelse return error.UnsupportedSqlShape;
     switch (generated_statement.ast orelse return error.UnsupportedSqlShape) {
-        .read => |*read| read.projection_items.expressions[0].subquery_projection_items.count = 0,
+        .read => |read| read.projection_items.expressions[0].subquery_projection_items.count = 0,
         else => return error.UnsupportedSqlShape,
     }
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(

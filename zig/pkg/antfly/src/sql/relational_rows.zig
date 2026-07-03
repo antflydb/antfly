@@ -3246,7 +3246,7 @@ pub fn parseRowsWindowRequest(
     }) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidRowsRequest;
-    try requireJsonObjectOnlyKeys(parsed.value.object, &.{ "source", "windows", "select", "order_by", "limit", "offset" });
+    try requireJsonObjectOnlyKeys(parsed.value.object, &.{ "source", "windows", "select", "order_by", "limit", "offset", "max_rows", "max_bytes", "spill_after_bytes" });
 
     var source: OwnedRowsQueryRequest = if (parsed.value.object.get("source")) |source_value| blk: {
         if (source_value != .object) return error.InvalidRowsRequest;
@@ -3281,6 +3281,9 @@ pub fn parseRowsWindowRequest(
         .order_by = order_by,
         .limit = try parseOptionalU32(parsed.value.object.get("limit")),
         .offset = (try parseOptionalU32(parsed.value.object.get("offset"))) orelse 0,
+        .max_rows = try parseOptionalU32(parsed.value.object.get("max_rows")),
+        .max_bytes = try parseOptionalU64(parsed.value.object.get("max_bytes")),
+        .spill_after_bytes = try parseOptionalU64(parsed.value.object.get("spill_after_bytes")),
     };
 }
 
@@ -7584,15 +7587,49 @@ pub fn encodeRowsWindowResponseWithSchemaAlloc(
     result: db_mod.types.RelationalRowsWindowResult,
     result_schema: []const runtime_schema.RelationalColumn,
 ) ![]u8 {
-    return try encodeRowsResultWithTotalFieldAlloc(alloc, "total_rows", result.total_rows, result.rows, result_schema);
+    return try encodeRowsWindowResponseWithResultSchemaAlloc(alloc, result, result_schema);
 }
 
 pub fn encodeRowsWindowResponseWithResultSchemaAlloc(
     alloc: std.mem.Allocator,
     result: db_mod.types.RelationalRowsWindowResult,
-    result_schema: []const RowsResultColumn,
+    result_schema: anytype,
 ) ![]u8 {
-    return try encodeRowsResultWithTotalFieldAndResultSchemaAlloc(alloc, "total_rows", result.total_rows, result.rows, result_schema);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.print("{{\"total_rows\":{d}", .{result.total_rows});
+    try appendRowsWindowDiagnosticsJson(writer, result.diagnostics);
+    try appendRowsResultColumnsJson(writer, result_schema);
+    try writer.writeAll(",\"rows\":[");
+    for (result.rows, 0..) |row, i| {
+        if (i != 0) try writer.writeByte(',');
+        try writer.writeAll(row);
+    }
+    try writer.writeAll("]}");
+    return try out.toOwnedSlice();
+}
+
+fn appendRowsWindowDiagnosticsJson(
+    writer: *std.Io.Writer,
+    diagnostics: db_mod.types.RelationalRowsWindowDiagnostics,
+) !void {
+    try writer.print(
+        ",\"window_diagnostics\":{{\"input_rows\":{d},\"output_rows\":{d},\"source_materialized_bytes\":{d},\"window_count\":{d},\"partition_evaluations\":{d},\"max_partition_rows\":{d},\"max_partition_materialized_bytes\":{d},\"source_spill_writes\":{d},\"source_spill_bytes\":{d},\"source_spill_reload_count\":{d},\"resource_budget_failures\":{d}}}",
+        .{
+            diagnostics.input_rows,
+            diagnostics.output_rows,
+            diagnostics.source_materialized_bytes,
+            diagnostics.window_count,
+            diagnostics.partition_evaluations,
+            diagnostics.max_partition_rows,
+            diagnostics.max_partition_materialized_bytes,
+            diagnostics.source_spill_writes,
+            diagnostics.source_spill_bytes,
+            diagnostics.source_spill_reload_count,
+            diagnostics.resource_budget_failures,
+        },
+    );
 }
 
 pub fn encodeRowsJoinResponseAlloc(

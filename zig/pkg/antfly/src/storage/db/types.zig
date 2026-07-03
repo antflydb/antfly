@@ -2049,6 +2049,9 @@ pub const RelationalRowsWindowRequest = struct {
     order_by: []const RelationalRowsQueryOrder = &.{},
     limit: ?u32 = null,
     offset: u32 = 0,
+    max_rows: ?u32 = null,
+    max_bytes: ?u64 = null,
+    spill_after_bytes: ?u64 = null,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         self.source.deinit(alloc);
@@ -2152,12 +2155,27 @@ pub const RelationalRowsWindowPlan = struct {
 pub const RelationalRowsWindowResult = struct {
     rows: [][]const u8 = &.{},
     total_rows: u32 = 0,
+    diagnostics: RelationalRowsWindowDiagnostics = .{},
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.rows) |row| alloc.free(@constCast(row));
         if (self.rows.len > 0) alloc.free(self.rows);
         self.* = undefined;
     }
+};
+
+pub const RelationalRowsWindowDiagnostics = struct {
+    input_rows: u64 = 0,
+    output_rows: u32 = 0,
+    source_materialized_bytes: u64 = 0,
+    window_count: u32 = 0,
+    partition_evaluations: u64 = 0,
+    max_partition_rows: u64 = 0,
+    max_partition_materialized_bytes: u64 = 0,
+    source_spill_writes: u64 = 0,
+    source_spill_bytes: u64 = 0,
+    source_spill_reload_count: u64 = 0,
+    resource_budget_failures: u64 = 0,
 };
 
 pub const RelationalRowsAggregateOp = enum {

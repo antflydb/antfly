@@ -31,6 +31,7 @@ const transactions_mod = @import("../transactions.zig");
 const transform_mod = @import("transform.zig");
 const ttl_mod = @import("../ttl.zig");
 const types = @import("types.zig");
+const row_spill = @import("../../sql/row_spill.zig");
 const regex_mod = @import("antfly_regex");
 
 const Allocator = std.mem.Allocator;
@@ -10410,12 +10411,16 @@ pub fn windowFromSourceRowsWithColumnsAlloc(
     source_columns: []const schema_mod.RelationalColumn,
     now_ns: u64,
 ) !types.RelationalRowsWindowResult {
-    try admitRelationalRowsWindowSourceRows(source_rows);
+    var materialized = try materializeRelationalRowsWindowSourceRowsAlloc(alloc, req, source_rows);
+    defer materialized.deinit(alloc);
+    var diagnostics = materialized.diagnostics;
+    const window_source_rows = materialized.rows;
 
     var effective_req = req;
     const resolved_windows = try resolvedWindowSpecsOrderCollationsAlloc(alloc, req.windows, source_columns);
     defer freeResolvedWindowSpecsOrderCollations(alloc, resolved_windows);
     effective_req.windows = resolved_windows;
+    diagnostics.window_count = @intCast(effective_req.windows.len);
 
     const contexts = try alloc.alloc(RelationalRowsWindowEvaluationContext, effective_req.windows.len);
     var contexts_initialized: usize = 0;
@@ -10424,7 +10429,8 @@ pub fn windowFromSourceRowsWithColumnsAlloc(
         alloc.free(contexts);
     }
     for (effective_req.windows) |window| {
-        contexts[contexts_initialized] = try buildRelationalRowsWindowEvaluationContextAlloc(alloc, source_rows, source_columns, window, now_ns);
+        contexts[contexts_initialized] = try buildRelationalRowsWindowEvaluationContextAlloc(alloc, window_source_rows, source_columns, window, now_ns);
+        accountRelationalRowsWindowPartitionDiagnostics(&diagnostics, contexts[contexts_initialized]);
         contexts_initialized += 1;
     }
 
@@ -10434,7 +10440,7 @@ pub fn windowFromSourceRowsWithColumnsAlloc(
         rows.deinit(alloc);
     }
 
-    for (source_rows, 0..) |row_json, i| {
+    for (window_source_rows, 0..) |row_json, i| {
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -10449,6 +10455,7 @@ pub fn windowFromSourceRowsWithColumnsAlloc(
     if (req.order_by.len > 0) try sortOutputRowsAlloc(alloc, rows.items, req.order_by, now_ns);
 
     const total_rows: u32 = @intCast(rows.items.len);
+    diagnostics.output_rows = total_rows;
     const start = @min(@as(usize, req.offset), rows.items.len);
     const limited_len: usize = if (req.limit) |limit|
         @min(@as(usize, limit), rows.items.len - start)
@@ -10459,10 +10466,10 @@ pub fn windowFromSourceRowsWithColumnsAlloc(
         for (rows.items[start + limited_len ..]) |row| alloc.free(@constCast(row));
         const kept = try alloc.dupe([]const u8, rows.items[start .. start + limited_len]);
         rows.deinit(alloc);
-        return .{ .rows = kept, .total_rows = total_rows };
+        return .{ .rows = kept, .total_rows = total_rows, .diagnostics = diagnostics };
     }
 
-    return .{ .rows = try rows.toOwnedSlice(alloc), .total_rows = total_rows };
+    return .{ .rows = try rows.toOwnedSlice(alloc), .total_rows = total_rows, .diagnostics = diagnostics };
 }
 
 pub fn admitRelationalRowsWindowSourceRows(
@@ -10483,6 +10490,81 @@ fn admitRelationalRowsWindowSourceRowsWithLimits(
     const observed_bytes = types.relationalRowsCteMaterializedJsonBytes(source_rows) orelse return error.RelationalRowsCteMaterializationRejected;
     if (source_rows.len > max_rows) return error.RelationalRowsCteMaterializationRejected;
     if (observed_bytes > max_bytes) return error.RelationalRowsCteMaterializationRejected;
+}
+
+const MaterializedRelationalRowsWindowSource = struct {
+    rows: []const []const u8,
+    owned_rows: ?[][]const u8 = null,
+    diagnostics: types.RelationalRowsWindowDiagnostics,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.owned_rows) |rows| row_spill.freeJsonRows(alloc, rows);
+        self.* = undefined;
+    }
+};
+
+fn materializeRelationalRowsWindowSourceRowsAlloc(
+    alloc: Allocator,
+    req: types.RelationalRowsWindowRequest,
+    source_rows: []const []const u8,
+) !MaterializedRelationalRowsWindowSource {
+    var diagnostics = types.RelationalRowsWindowDiagnostics{
+        .input_rows = @intCast(source_rows.len),
+    };
+    const observed_bytes = types.relationalRowsCteMaterializedJsonBytes(source_rows) orelse {
+        diagnostics.resource_budget_failures += 1;
+        return error.RelationalRowsCteMaterializationRejected;
+    };
+    diagnostics.source_materialized_bytes = observed_bytes;
+    const decision = types.relationalRowsCteMaterializationDecision(.{
+        .name = "window_source_rows",
+        .max_rows = req.max_rows,
+        .max_bytes = req.max_bytes,
+        .spill_after_bytes = req.spill_after_bytes,
+    }, source_rows.len, observed_bytes);
+    switch (decision) {
+        .memory => return .{
+            .rows = source_rows,
+            .diagnostics = diagnostics,
+        },
+        .spill => {
+            var spill = try row_spill.spillJsonRowsAlloc(alloc, source_rows, observed_bytes, "window-source");
+            defer spill.deinit(alloc);
+            const reloaded = try row_spill.loadJsonRowsAlloc(alloc, spill);
+            diagnostics.source_spill_writes = 1;
+            diagnostics.source_spill_bytes = observed_bytes;
+            diagnostics.source_spill_reload_count = 1;
+            return .{
+                .rows = reloaded,
+                .owned_rows = reloaded,
+                .diagnostics = diagnostics,
+            };
+        },
+        .reject => {
+            diagnostics.resource_budget_failures += 1;
+            return error.RelationalRowsCteMaterializationRejected;
+        },
+    }
+}
+
+fn accountRelationalRowsWindowPartitionDiagnostics(
+    diagnostics: *types.RelationalRowsWindowDiagnostics,
+    context: RelationalRowsWindowEvaluationContext,
+) void {
+    var start: usize = 0;
+    while (start < context.source_rows.len) {
+        var end = start;
+        var partition_bytes: u64 = 2;
+        while (end < context.source_rows.len and std.mem.eql(u8, context.partition_keys[start], context.partition_keys[end])) : (end += 1) {
+            if (end > start) partition_bytes += 1;
+            partition_bytes += @intCast(context.source_rows[end].len);
+        }
+        const partition_rows = end - start;
+        diagnostics.partition_evaluations += 1;
+        diagnostics.max_partition_rows = @max(diagnostics.max_partition_rows, @as(u64, @intCast(partition_rows)));
+        diagnostics.max_partition_materialized_bytes = @max(diagnostics.max_partition_materialized_bytes, partition_bytes);
+        start = end;
+    }
 }
 
 fn relationalRowsWindowPartitionKeyJsonAlloc(
@@ -11784,7 +11866,7 @@ pub fn Impl(comptime DB: type) type {
             return try aggregateFromSourceRowsWithColumnsAndSpillAlloc(alloc, req, source_rows, source_columns, currentTimeNs(), &spill_context);
         }
 
-        fn spillRelationalRowsCteResultAlloc(
+        pub fn spillRelationalRowsCteResultAlloc(
             self: *DB,
             alloc: Allocator,
             result: types.RelationalRowsQueryResult,
@@ -11816,7 +11898,7 @@ pub fn Impl(comptime DB: type) type {
             };
         }
 
-        fn loadRelationalRowsSpilledCteAlloc(
+        pub fn loadRelationalRowsSpilledCteAlloc(
             self: *DB,
             alloc: Allocator,
             spill: RelationalRowsSpilledCte,
@@ -11845,7 +11927,7 @@ pub fn Impl(comptime DB: type) type {
             };
         }
 
-        fn deleteRelationalRowsSpilledCte(
+        pub fn deleteRelationalRowsSpilledCte(
             self: *DB,
             alloc: Allocator,
             spill: RelationalRowsSpilledCte,
@@ -16388,6 +16470,68 @@ test "relational rows window plan computes row_number over ordered partitions" {
             .expressions = source_scoped_cte_expressions[0..],
         },
     }));
+}
+
+test "relational rows window source spill reloads rows and records diagnostics" {
+    const alloc = std.testing.allocator;
+    var columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "tenant", .path = "tenant", .field_type = .keyword, .nullable = false },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    const rows = [_][]const u8{
+        "{\"id\":\"a\",\"tenant\":\"t1\",\"amount\":2}",
+        "{\"id\":\"b\",\"tenant\":\"t1\",\"amount\":5}",
+        "{\"id\":\"c\",\"tenant\":\"t2\",\"amount\":1}",
+    };
+    const partition_t1_rows = [_][]const u8{ rows[0], rows[1] };
+    const observed_bytes = types.relationalRowsCteMaterializedJsonBytes(rows[0..]) orelse return error.TestUnexpectedResult;
+    const t1_partition_bytes = types.relationalRowsCteMaterializedJsonBytes(partition_t1_rows[0..]) orelse return error.TestUnexpectedResult;
+
+    const window_order = [_]types.RelationalRowsQueryOrder{.{
+        .field = "amount",
+        .direction = .desc,
+    }};
+    const windows = [_]types.RelationalRowsWindowSpec{.{
+        .output = "row_num",
+        .function = .row_number,
+        .partition_by = &.{"tenant"},
+        .order_by = window_order[0..],
+    }};
+    var result = try windowFromSourceRowsWithColumnsAlloc(alloc, .{
+        .windows = windows[0..],
+        .select = &.{ "id", "tenant" },
+        .spill_after_bytes = 8,
+        .max_bytes = observed_bytes,
+    }, rows[0..], columns[0..], 0);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 3), result.total_rows);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"tenant\":\"t1\",\"row_num\":2}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"tenant\":\"t1\",\"row_num\":1}", result.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\",\"tenant\":\"t2\",\"row_num\":1}", result.rows[2]);
+    try std.testing.expectEqual(@as(u64, 3), result.diagnostics.input_rows);
+    try std.testing.expectEqual(@as(u32, 3), result.diagnostics.output_rows);
+    try std.testing.expectEqual(observed_bytes, result.diagnostics.source_materialized_bytes);
+    try std.testing.expectEqual(@as(u32, 1), result.diagnostics.window_count);
+    try std.testing.expectEqual(@as(u64, 2), result.diagnostics.partition_evaluations);
+    try std.testing.expectEqual(@as(u64, 2), result.diagnostics.max_partition_rows);
+    try std.testing.expectEqual(t1_partition_bytes, result.diagnostics.max_partition_materialized_bytes);
+    try std.testing.expectEqual(@as(u64, 1), result.diagnostics.source_spill_writes);
+    try std.testing.expectEqual(observed_bytes, result.diagnostics.source_spill_bytes);
+    try std.testing.expectEqual(@as(u64, 1), result.diagnostics.source_spill_reload_count);
+    try std.testing.expectEqual(@as(u64, 0), result.diagnostics.resource_budget_failures);
+
+    try std.testing.expectError(error.RelationalRowsCteMaterializationRejected, windowFromSourceRowsWithColumnsAlloc(alloc, .{
+        .windows = windows[0..],
+        .select = &.{"id"},
+        .max_rows = 2,
+    }, rows[0..], columns[0..], 0));
+    try std.testing.expectError(error.RelationalRowsCteMaterializationRejected, windowFromSourceRowsWithColumnsAlloc(alloc, .{
+        .windows = windows[0..],
+        .select = &.{"id"},
+        .max_bytes = observed_bytes - 1,
+    }, rows[0..], columns[0..], 0));
 }
 
 test "relational rows window plan supports boolean aggregate windows" {
@@ -21463,6 +21607,54 @@ test "relational rows set operation plan executes typed set semantics" {
         .right = right_plan,
         .max_rows = 2,
     }));
+}
+
+test "relational rows cte spill reloads across reopen and cleans up" {
+    const DB = @import("mod.zig").DB;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    const source_rows = [_][]const u8{
+        "{\"id\":\"a\",\"amount\":10}",
+        "{\"id\":\"b\",\"amount\":20}",
+        "{\"id\":\"c\",\"amount\":30}",
+    };
+    const materialized_bytes = types.relationalRowsCteMaterializedJsonBytes(source_rows[0..]) orelse return error.UnsupportedQueryRequest;
+    var spill: RelationalRowsSpilledCte = undefined;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        spill = try db.testSpillRelationalRowsCteResultAlloc(alloc, .{
+            .rows = @constCast(source_rows[0..]),
+            .total = @intCast(source_rows.len),
+        }, materialized_bytes);
+    }
+    defer spill.deinit(alloc);
+    try std.testing.expectEqual(source_rows.len, spill.row_count);
+    try std.testing.expectEqual(materialized_bytes, spill.materialized_bytes);
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{});
+        defer reopened.close();
+
+        var loaded = try reopened.testLoadRelationalRowsSpilledCteAlloc(alloc, spill);
+        defer loaded.deinit(alloc);
+        try std.testing.expectEqual(@as(u32, source_rows.len), loaded.total);
+        try std.testing.expectEqual(source_rows.len, loaded.rows.len);
+        try std.testing.expectEqualStrings(source_rows[0], loaded.rows[0]);
+        try std.testing.expectEqualStrings(source_rows[1], loaded.rows[1]);
+        try std.testing.expectEqualStrings(source_rows[2], loaded.rows[2]);
+
+        reopened.testDeleteRelationalRowsSpilledCte(alloc, spill);
+        const spill_root = [_]u8{ internal_keys.replay_namespace, internal_keys.relational_cte_spill_kind };
+        const remaining_spills = try reopened.core.scanStorePrefix(alloc, spill_root[0..]);
+        defer docstore_mod.DocStore.freeResults(alloc, remaining_spills);
+        try std.testing.expectEqual(@as(usize, 0), remaining_spills.len);
+    }
 }
 
 test "relational rows query doc key range scopes indexed and scanned candidates" {

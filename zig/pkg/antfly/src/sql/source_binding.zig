@@ -1440,6 +1440,11 @@ fn appendDocumentSqlViewMappingVirtualFieldAlloc(
     nullable: ?bool,
 ) !void {
     if (documentSqlDeclaredVirtualFieldCanBecomeViewMapping(fields, name, path, field_type, array_item_type, nullable)) |index| {
+        if (!std.mem.eql(u8, fields.items[index].path, path)) {
+            const owned_path = try alloc.dupe(u8, path);
+            alloc.free(@constCast(fields.items[index].path));
+            fields.items[index].path = owned_path;
+        }
         fields.items[index].source = .view_mapping;
         if (field_type) |field_type_value| fields.items[index].field_type = field_type_value;
         if (array_item_type) |array_item_type_value| fields.items[index].array_item_type = array_item_type_value;
@@ -2487,7 +2492,7 @@ test "source binding classifies relational document and lake schemas" {
         if (std.mem.eql(u8, field.name, "status")) {
             saw_status_view_overlay = true;
             try std.testing.expectEqual(DocumentSqlVirtualFieldSource.view_mapping, field.source);
-            try std.testing.expectEqualStrings("status", field.path);
+            try std.testing.expectEqualStrings("/status", field.path);
             try std.testing.expectEqual(runtime_schema.AntflyType.keyword, field.field_type.?);
             try std.testing.expectEqual(true, field.nullable.?);
         }

@@ -5,11 +5,11 @@
       "id": "cte-stream-spill-resumability",
       "relational_slices_section": "Routed reads, joins, CTEs, and streaming",
       "surface": "cte_stream_spill",
-      "status": "partial_release_gated",
-      "current_evidence": "Recursive CTE lowering admits materialization through stream spill policy and routed materialization tracking shares spill and hard-cap accounting for bounded execution.",
-      "missing_evidence": "CTE and recursive CTE execution still needs durable spill-store streaming with backpressure, resumable cursors, bounded memory, spill accounting, and reopen/resume evidence instead of bounded in-memory materialization only.",
-      "evidence_file": "zig/pkg/antfly/src/api/table_reads/relational_rows.zig",
-      "evidence_symbol": "lowered sql recursive cte materialization admission uses stream spill policy",
+      "status": "release_evidence",
+      "current_evidence": "Recursive CTE lowering admits materialization through stream spill policy and routed materialization tracking shares spill and hard-cap accounting for bounded execution. CTE spill rows are persisted in the internal spill store with row-count/materialized-byte accounting, reload successfully after DB close/reopen, preserve row order and contents, and clean up spill keys after resume.",
+      "missing_evidence": "",
+      "evidence_file": "zig/pkg/antfly/src/storage/db/relational_rows.zig",
+      "evidence_symbol": "relational rows cte spill reloads across reopen and cleans up",
       "release_gate": "relational-release-gate"
     },
     {

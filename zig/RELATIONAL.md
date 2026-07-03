@@ -4942,10 +4942,19 @@ per-feature status and remaining gaps live in the release-gated SQL and
 relational fixture inventories, which are checked by `relational-release-gate`
 and the SQL parity fixture gates. As of the current inventory, no status rows
 carry `gap_tracked` or `missing_native_harness`, no routed visibility row is
-left as `gap_tracked`, and 7 rows still carry `partial_release_gated` status.
+left as `gap_tracked`, and 5 rows still carry `partial_release_gated` status.
 Routed live-write pagination is release evidence because paginated routed reads
 prove stable page boundaries after range rescans and fail closed when a live
 write changes scanned range membership before returning a page.
+CTE spill resumability is release evidence because CTE spill rows persist in
+the internal spill store with row-count/materialized-byte accounting, reload
+with stable row order and contents after DB close/reopen, and clean up spill
+keys after resume.
+Spill-backed window execution is also release evidence because window source
+rows now share explicit row/byte/spill admission, spill and reload through the
+SQL row-spill format before evaluation, expose typed window diagnostics for
+source bytes, partition memory, spill bytes, reload count, and resource-budget
+failures, and fail closed when hard caps are exceeded.
 Adapter-boundary expression deletion,
 optimizer expression pushdown, expression-derived rebuild/promotion, stale
 derived-artifact safety, and aggregate expression pushdown capability have

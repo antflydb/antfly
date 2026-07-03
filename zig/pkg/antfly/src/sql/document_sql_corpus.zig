@@ -37,6 +37,12 @@ pub const DocumentSqlUnsupportedExpressionCaseJson = struct {
 
 pub const DocumentSqlReadPlanExpectationJson = struct {
     producer: ?[]const u8 = null,
+    aggregate_op: ?[]const u8 = null,
+    aggregate_input: ?[]const u8 = null,
+    group_by: ?[]const u8 = null,
+    having: ?usize = null,
+    order_by: ?[]const u8 = null,
+    limit: ?u32 = null,
     native_query_json: ?[]const u8 = null,
     residual_filter_json: ?[]const u8 = null,
     filter_query_contains: []const []const u8 = &.{},
@@ -125,6 +131,8 @@ pub const ExpectedError = enum {
     UnsupportedSqlShape,
     InvalidRowsRequest,
     InvalidSqlCatalog,
+    DocumentSqlAggregateUnsupported,
+    DocumentSqlBoundedScanMissingExactProducer,
     DocumentSqlWriteJoinMissingCardinalityProof,
     DocumentSqlWriteJoinMissingExactProducer,
     DocumentSqlWriteJoinMissingIndexProof,
@@ -151,6 +159,8 @@ pub fn errorFromName(name: []const u8) !ExpectedError {
     if (std.mem.eql(u8, name, "UnsupportedSqlShape")) return .UnsupportedSqlShape;
     if (std.mem.eql(u8, name, "InvalidRowsRequest")) return .InvalidRowsRequest;
     if (std.mem.eql(u8, name, "InvalidSqlCatalog")) return .InvalidSqlCatalog;
+    if (std.mem.eql(u8, name, "DocumentSqlAggregateUnsupported")) return .DocumentSqlAggregateUnsupported;
+    if (std.mem.eql(u8, name, "DocumentSqlBoundedScanMissingExactProducer")) return .DocumentSqlBoundedScanMissingExactProducer;
     if (std.mem.eql(u8, name, "DocumentSqlWriteJoinMissingCardinalityProof")) return .DocumentSqlWriteJoinMissingCardinalityProof;
     if (std.mem.eql(u8, name, "DocumentSqlWriteJoinMissingExactProducer")) return .DocumentSqlWriteJoinMissingExactProducer;
     if (std.mem.eql(u8, name, "DocumentSqlWriteJoinMissingIndexProof")) return .DocumentSqlWriteJoinMissingIndexProof;
@@ -179,6 +189,8 @@ pub fn errorValue(expected: ExpectedError) anyerror {
         .UnsupportedSqlShape => error.UnsupportedSqlShape,
         .InvalidRowsRequest => error.InvalidRowsRequest,
         .InvalidSqlCatalog => error.InvalidSqlCatalog,
+        .DocumentSqlAggregateUnsupported => error.DocumentSqlAggregateUnsupported,
+        .DocumentSqlBoundedScanMissingExactProducer => error.DocumentSqlBoundedScanMissingExactProducer,
         .DocumentSqlWriteJoinMissingCardinalityProof => error.DocumentSqlWriteJoinMissingCardinalityProof,
         .DocumentSqlWriteJoinMissingExactProducer => error.DocumentSqlWriteJoinMissingExactProducer,
         .DocumentSqlWriteJoinMissingIndexProof => error.DocumentSqlWriteJoinMissingIndexProof,

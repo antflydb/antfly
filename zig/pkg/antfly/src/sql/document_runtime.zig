@@ -15,6 +15,7 @@ const sql_adapter = @import("document_plan.zig");
 const sql_plan = @import("plan.zig");
 const source_binding = @import("source_binding.zig");
 const storage_schema = @import("../storage/schema.zig");
+const tokenized = @import("tokenized.zig");
 
 pub const LookupOptions = struct {};
 
@@ -5219,6 +5220,179 @@ test "document sql native index query requests forward raw body" {
     defer capped_req.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, capped_req.body_json, "\"limit\":25") != null);
     try std.testing.expect(std.mem.indexOf(u8, capped_req.body_json, "\"limit\":5") == null);
+}
+
+test "document sql native derived-index producers execute equivalent native requests" {
+    const alloc = std.testing.allocator;
+
+    const schema = storage_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "body", .path = "body", .field_type = .text },
+            .{ .name = "status", .path = "status", .field_type = .keyword },
+        },
+    };
+
+    const RecordingSource = struct {
+        calls: usize = 0,
+        last_table: ?[]u8 = null,
+        last_body: ?[]u8 = null,
+
+        fn deinit(self: *@This(), source_alloc: std.mem.Allocator) void {
+            if (self.last_table) |value| source_alloc.free(value);
+            if (self.last_body) |value| source_alloc.free(value);
+            self.* = undefined;
+        }
+
+        fn source(self: *@This()) Source {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+                .native_table_name = "docs",
+                .public_table_name = "docs",
+            };
+        }
+
+        fn replaceOwned(
+            slot: *?[]u8,
+            source_alloc: std.mem.Allocator,
+            value: []const u8,
+        ) !void {
+            if (slot.*) |old| source_alloc.free(old);
+            slot.* = try source_alloc.dupe(u8, value);
+        }
+
+        fn lookup(
+            ptr: *anyopaque,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            opts: LookupOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            _ = ptr;
+            _ = lookup_alloc;
+            _ = table_name;
+            _ = key;
+            _ = opts;
+            _ = consistency;
+            return null;
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: ScanOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            _ = ptr;
+            _ = scan_alloc;
+            _ = table_name;
+            _ = from_key;
+            _ = to_key;
+            _ = opts;
+            _ = consistency;
+            return null;
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            query_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: QueryRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !?QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = consistency;
+            self.calls += 1;
+            try replaceOwned(&self.last_table, query_alloc, table_name);
+            try replaceOwned(&self.last_body, query_alloc, req.body_json);
+            return .{ .json = try query_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":1,\"hits\":[{\"_id\":\"doc:hit\",\"_source\":{\"status\":\"active\",\"rank\":7}}]}}]}") };
+        }
+    };
+
+    const Case = struct {
+        name: []const u8,
+        indexes_json: []const u8,
+        sql: []const u8,
+        required_body_fragments: []const []const u8,
+    };
+    const cases = [_]Case{
+        .{
+            .name = "vector",
+            .indexes_json = "{\"docs_embedding_hnsw\":{\"type\":\"aknn\",\"index_generation\":11,\"expected_index_generation\":11}}",
+            .sql = "SELECT _id FROM docs WHERE antfly.vector_search(table_name => 'docs', index => 'docs_embedding_hnsw', vector => '[0.1,0.2,0.3]', limit => 5) LIMIT 5",
+            .required_body_fragments = &.{ "\"embeddings\"", "\"docs_embedding_hnsw\"", "\"limit\":5" },
+        },
+        .{
+            .name = "semantic",
+            .indexes_json = "{\"docs_body_semantic\":{\"type\":\"semantic\",\"generation\":12,\"required_index_generation\":12}}",
+            .sql = "SELECT _id FROM docs WHERE antfly.semantic_search(table_name => 'docs', index => 'docs_body_semantic', query => 'automatic embeddings', limit => 7) LIMIT 7",
+            .required_body_fragments = &.{ "\"semantic_search\":\"automatic embeddings\"", "\"docs_body_semantic\"", "\"limit\":7" },
+        },
+        .{
+            .name = "hybrid",
+            .indexes_json = "{\"docs_body_fts\":{\"type\":\"full_text\"},\"docs_body_semantic\":{\"type\":\"semantic\",\"generation\":12,\"required_index_generation\":12},\"docs_hybrid\":{\"type\":\"hybrid\",\"index_generation\":13,\"expected_index_generation\":13}}",
+            .sql = "SELECT _id FROM docs WHERE antfly.hybrid_search(table_name => 'docs', full_text_index => 'docs_body_fts', semantic_index => 'docs_body_semantic', field => 'body', query => 'hybrid refund', fusion => 'rrf', limit => 9) LIMIT 9",
+            .required_body_fragments = &.{ "\"semantic_search\":\"hybrid refund\"", "\"full_text_search\"", "\"merge_config\"", "\"limit\":9" },
+        },
+        .{
+            .name = "graph traverse",
+            .indexes_json = "{\"docs_edge_graph\":{\"type\":\"graph\",\"index_generation\":14,\"expected_index_generation\":14}}",
+            .sql = "SELECT _id FROM docs WHERE antfly.graph_traverse(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', max_depth => 2, limit => 11) LIMIT 11",
+            .required_body_fragments = &.{ "\"graph_searches\"", "\"type\":\"traverse\"", "\"index_name\":\"docs_edge_graph\"", "\"limit\":11" },
+        },
+        .{
+            .name = "graph shortest path",
+            .indexes_json = "{\"docs_edge_graph\":{\"type\":\"graph\",\"index_generation\":14,\"expected_index_generation\":14}}",
+            .sql = "SELECT _id FROM docs WHERE antfly.graph_shortest_path(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', target => 'doc:z', max_depth => 4, limit => 4) LIMIT 4",
+            .required_body_fragments = &.{ "\"graph_searches\"", "\"type\":\"shortest_path\"", "\"target_nodes\"", "\"limit\":4" },
+        },
+        .{
+            .name = "graph metric",
+            .indexes_json = "{\"docs_pagerank\":{\"type\":\"graph_metric\",\"graph_index\":\"docs_edge_graph\",\"index_generation\":15,\"expected_index_generation\":15}}",
+            .sql = "SELECT _id FROM docs WHERE antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 2, limit => 2) LIMIT 2",
+            .required_body_fragments = &.{ "\"graph_metric\"", "\"index\":\"docs_edge_graph\"", "\"metric\":\"pagerank\"", "\"limit\":2" },
+        },
+        .{
+            .name = "graph metric rerank",
+            .indexes_json = "{\"docs_body_fts\":{\"type\":\"full_text\"},\"docs_pagerank\":{\"type\":\"graph_metric\",\"graph_index\":\"docs_edge_graph\",\"index_generation\":16,\"expected_index_generation\":16}}",
+            .sql = "SELECT _id FROM docs WHERE antfly.graph_metric_rerank(table_name => 'docs', full_text_index => 'docs_body_fts', field => 'body', query => 'refund', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', limit => 6) LIMIT 6",
+            .required_body_fragments = &.{ "\"full_text_search\"", "\"graph_metric_rerank\"", "\"index\":\"docs_edge_graph\"", "\"limit\":6" },
+        },
+    };
+
+    for (cases) |case| {
+        errdefer std.debug.print("document sql native runtime parity case failed: {s}\n", .{case.name});
+        var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonAlloc(alloc, schema, case.indexes_json);
+        defer source_binding.deinitDocumentSqlCapabilities(alloc, &capabilities);
+        var parsed = try tokenized.ParsedSql.initAlloc(alloc, case.sql);
+        defer parsed.deinit(alloc);
+        var lowered = try sql_adapter.lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &parsed, schema, capabilities);
+        defer lowered.deinit(alloc);
+        var source = RecordingSource{};
+        defer source.deinit(alloc);
+
+        var result = (try executeReadPlanAlloc(alloc, source.source(), lowered, .stale)).?;
+        defer result.deinit(alloc);
+
+        try std.testing.expectEqual(@as(usize, 1), source.calls);
+        try std.testing.expectEqualStrings("docs", source.last_table.?);
+        const body = source.last_body orelse return error.TestUnexpectedResult;
+        for (case.required_body_fragments) |fragment| {
+            try std.testing.expect(std.mem.indexOf(u8, body, fragment) != null);
+        }
+        try std.testing.expectEqual(@as(u32, 1), result.total);
+        try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+        try std.testing.expectEqualStrings("{\"_id\":\"doc:hit\"}", result.rows[0]);
+    }
 }
 
 test "document sql native filter rewrite only maps field identifiers" {

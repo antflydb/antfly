@@ -45,14 +45,6 @@ document SQL implementation gates.
   predicate families require an exact indexed/native producer or fail with
   `document_sql_bounded_scan_missing_exact_producer`.
 
-  - [ ] Finish `derived-index-producer-types` runtime hardening. Ready vector,
-        semantic, hybrid, graph traversal, graph shortest-path, graph metric,
-        and graph-metric-rerank producers have read-plan corpus coverage,
-        required SQL/API coverage buckets, and fixture-backed native/API
-        equivalence. Remaining work is executable runtime result parity for
-        those native request bodies plus explicit partial, ordered, and
-        rebuild-in-progress lifecycle cases that prove SQL and native reads
-        return the same rows or the same rejection.
   - [ ] Admit `document-aggregates`: add `document_sql_corpus.json` cases for
         mapped-field `COUNT`, `MIN`/`MAX`, `SUM`/`AVG`, grouped aggregates,
         `HAVING`, order, and limit shapes; add required coverage buckets and

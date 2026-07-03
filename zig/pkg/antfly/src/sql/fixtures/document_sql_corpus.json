@@ -3090,6 +3090,30 @@
       }
     },
     {
+      "name": "vector search ordered read requires bounded candidate policy",
+      "schema": "vector_with_status",
+      "sql": "SELECT _id, status FROM docs WHERE antfly.vector_search(table_name => 'docs', index => 'docs_embedding_hnsw', vector => '[0.1,0.2,0.3]', limit => 5) ORDER BY status ASC LIMIT 2",
+      "expected": {
+        "expected_error": "DocumentSqlBoundedScanPolicyRequired"
+      }
+    },
+    {
+      "name": "vector search ordered read lowers under bounded candidate policy",
+      "schema": "vector_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id, status FROM docs WHERE antfly.vector_search(table_name => 'docs', index => 'docs_embedding_hnsw', vector => '[0.1,0.2,0.3]', limit => 5) ORDER BY status ASC LIMIT 2",
+      "expected": {
+        "producer": "native_query",
+        "native_query_json": "{\"embeddings\":{\"docs_embedding_hnsw\":[0.1,0.2,0.3]},\"indexes\":[\"docs_embedding_hnsw\"],\"limit\":5}",
+        "native_query_contains": [
+          "\"embeddings\"",
+          "\"docs_embedding_hnsw\"",
+          "\"limit\":5"
+        ],
+        "max_candidate_rows": 25
+      }
+    },
+    {
       "name": "semantic search predicate with semantic capability lowers to native query producer",
       "schema": "semantic_ready",
       "sql": "SELECT _id FROM docs WHERE antfly.semantic_search(table_name => 'docs', index => 'docs_body_semantic', query => 'alpha', limit => 5)",
@@ -3150,6 +3174,24 @@
       "name": "semantic search predicate with stale catalog semantic capability rejects during binding",
       "schema": "text_only",
       "indexes_json": "{\"docs_body_semantic\":{\"type\":\"semantic\",\"lifecycle\":\"building\"}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.semantic_search(table_name => 'docs', index => 'docs_body_semantic', query => 'alpha', limit => 5)",
+      "expected": {
+        "expected_error": "InvalidSqlCatalog"
+      }
+    },
+    {
+      "name": "semantic search predicate with partial catalog semantic capability rejects during binding",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_body_semantic\":{\"type\":\"semantic\",\"lifecycle\":\"partial\"}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.semantic_search(table_name => 'docs', index => 'docs_body_semantic', query => 'alpha', limit => 5)",
+      "expected": {
+        "expected_error": "InvalidSqlCatalog"
+      }
+    },
+    {
+      "name": "semantic search predicate with rebuild-in-progress catalog semantic capability rejects during binding",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_body_semantic\":{\"type\":\"semantic\",\"lifecycle\":\"rebuilding\"}}",
       "sql": "SELECT _id FROM docs WHERE antfly.semantic_search(table_name => 'docs', index => 'docs_body_semantic', query => 'alpha', limit => 5)",
       "expected": {
         "expected_error": "InvalidSqlCatalog"
@@ -3602,6 +3644,111 @@
         ],
         "residual_filter_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
         "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "aggregate count with full text candidate and scalar residual lowers under bounded policy",
+      "schema": "aggregate_ready",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT count(*) AS row_count FROM docs WHERE full_text_search('body:alpha') AND category = 'release'",
+      "expected": {
+        "producer": "indexed_filter",
+        "aggregate_op": "count",
+        "residual_filter_json": "{\"term\":{\"path\":\"/category\",\"value\":\"release\"}}",
+        "residual_filter_contains": [
+          "\"/category\"",
+          "\"release\""
+        ],
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "aggregate min over mapped numeric field lowers to bounded scan",
+      "schema": "aggregate_ready",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT min(amount) AS min_amount FROM docs",
+      "expected": {
+        "producer": "bounded_scan",
+        "aggregate_op": "min",
+        "aggregate_input": "/amount",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "aggregate max over filtered mapped numeric field lowers to indexed candidate",
+      "schema": "aggregate_ready",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT max(amount) AS max_amount FROM docs WHERE status = 'active'",
+      "expected": {
+        "producer": "indexed_filter",
+        "aggregate_op": "max",
+        "aggregate_input": "/amount",
+        "filter_query_contains": [
+          "\"/status\"",
+          "\"active\""
+        ],
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "aggregate sum over mapped numeric field lowers to bounded scan",
+      "schema": "aggregate_ready",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT sum(amount) AS total_amount FROM docs",
+      "expected": {
+        "producer": "bounded_scan",
+        "aggregate_op": "sum",
+        "aggregate_input": "/amount",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "aggregate avg materialization lowers without bounded scan fallback",
+      "schema": "aggregate_ready",
+      "indexes_json": "{\"amount_alg\":{\"type\":\"algebraic\",\"materializations\":[{\"name\":\"avg_by_status\",\"op\":\"avg\",\"group_by\":[\"status\"],\"measure\":\"amount\"}]}}",
+      "sql": "SELECT avg(amount) AS avg_amount FROM docs GROUP BY status LIMIT 10",
+      "expected": {
+        "producer": "algebraic_materialization",
+        "aggregate_op": "avg",
+        "aggregate_input": "/amount",
+        "group_by": "/status",
+        "limit": 10
+      }
+    },
+    {
+      "name": "aggregate grouped having order and limit lowers to bounded candidate",
+      "schema": "aggregate_ready",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT count(*) AS row_count FROM docs WHERE status = 'active' GROUP BY status HAVING row_count > 0 ORDER BY status ASC LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "aggregate_op": "count",
+        "group_by": "/status",
+        "having": 1,
+        "order_by": "group",
+        "limit": 10,
+        "filter_query_contains": [
+          "\"/status\"",
+          "\"active\""
+        ],
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "aggregate unbounded scan rejects without bounded policy",
+      "schema": "aggregate_ready",
+      "sql": "SELECT count(*) AS row_count FROM docs",
+      "expected": {
+        "expected_error": "DocumentSqlBoundedScanMissingExactProducer"
+      }
+    },
+    {
+      "name": "aggregate non numeric input rejects under bounded policy",
+      "schema": "aggregate_ready",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT sum(status) AS status_sum FROM docs",
+      "expected": {
+        "expected_error": "DocumentSqlAggregateUnsupported"
       }
     }
   ]
