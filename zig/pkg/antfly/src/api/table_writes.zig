@@ -9048,13 +9048,13 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?runtime_status.LocalTableRuntimeStatuses {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (hostedManagedDbCacheForRootIfPresent(self.replica_root_dir)) |hosted_cache| {
-            if (try hosted_cache.runtime_status_cache.snapshot(alloc, table_name)) |statuses| {
-                return statuses;
+            {
+                lockAtomic(&hosted_cache.mutex);
+                defer hosted_cache.mutex.unlock();
+                const statuses = try hosted_cache.write_cache.snapshotRuntimeStatusesLocked(alloc, table_name);
+                if (statuses) |owned| return owned;
             }
-            lockAtomic(&hosted_cache.mutex);
-            defer hosted_cache.mutex.unlock();
-            const statuses = try hosted_cache.write_cache.snapshotRuntimeStatusesLocked(alloc, table_name);
-            if (statuses) |owned| return owned;
+            if (try hosted_cache.runtime_status_cache.snapshot(alloc, table_name)) |statuses| return statuses;
         }
         return try snapshotLocalTableRuntimeStatusesUncached(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name);
     }
@@ -23979,6 +23979,137 @@ test "hosted write cache opens current visible root generation" {
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, statuses.items[0].metadata.source);
     try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, statuses.items[0].metadata.freshness);
+}
+
+test "hosted runtime status prefers live writer over stale hosted snapshot" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-runtime-status-live-writer", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"indexes\":[]}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const Router = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, group_id: u64) raft_mod.HostedReplicaStatus {
+            return if (group_id == 7001) .active else .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, group_id: u64) ?u64 {
+            return if (group_id == 7001) 1 else null;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
+            _ = node_id;
+            return if (group_id == 7001) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+    };
+
+    const Executor = struct {
+        fn iface() http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return error.UnexpectedHttpRequest;
+        }
+    };
+
+    var source = HostedProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface(), Router.iface(), Executor.iface());
+    defer source.invalidateManagedCache("docs");
+
+    const hosted_cache = try hostedManagedDbCacheForRoot(replica_root_dir);
+    var opened = try source.getOrOpenCachedDbMode(hosted_cache, path, 7001, "docs", .default_async);
+    opened.deinit(hosted_cache.write_cache.alloc);
+
+    try hosted_cache.runtime_status_cache.upsertGroupStatusPreservingMetadata("docs", .{
+        .group_id = 7001,
+        .metadata = .{
+            .source = .live_writer_publish,
+            .freshness = .fresh,
+            .updated_at_ns = 1,
+        },
+        .stats = .{ .doc_count = 99 },
+    });
+
+    _ = try source.source().batchGroupLocal(alloc, 7001, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .sync_level = .full_index,
+    });
+
+    var cached_only = (try hosted_cache.runtime_status_cache.snapshot(alloc, "docs")).?;
+    defer cached_only.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 99), cached_only.items[0].stats.doc_count);
+
+    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, statuses.items[0].metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, statuses.items[0].metadata.freshness);
+    try std.testing.expect(statuses.items[0].metadata.updated_at_ns != 1);
+    try std.testing.expect(statuses.items[0].stats.doc_count != 99);
 }
 
 test "write cache adopts just-created db across reconcile generation bump" {
