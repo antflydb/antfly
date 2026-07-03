@@ -1573,12 +1573,22 @@ pub const DBStats = struct {
     async_indexing: AsyncIndexingStats = .{},
 };
 
-pub const EmbeddingArtifactRepairReason = enum {
-    missing_embedding_artifact,
-    corrupt_embedding_artifact,
+pub const ArtifactRepairKind = enum {
+    embedding,
+    asset,
+    chunk,
+    graph,
+    full_text,
 };
 
-pub const EmbeddingArtifactRepairIssue = struct {
+pub const ArtifactRepairReason = enum {
+    missing_artifact,
+    corrupt_artifact,
+    unreadable_artifact,
+};
+
+pub const ArtifactRepairIssue = struct {
+    artifact_kind: ArtifactRepairKind = .embedding,
     index_name: []const u8 = "",
     doc_key: []const u8 = "",
     parent_doc_key: []const u8 = "",
@@ -1587,13 +1597,13 @@ pub const EmbeddingArtifactRepairIssue = struct {
     artifact_key: []const u8 = "",
     chunk_id: ?u32 = null,
     sequence: u64 = 0,
-    reason: EmbeddingArtifactRepairReason = .missing_embedding_artifact,
+    reason: ArtifactRepairReason = .missing_artifact,
     attempts: u64 = 0,
     first_seen_ns: u64 = 0,
     last_seen_ns: u64 = 0,
     last_error: []const u8 = "",
 
-    pub fn deinit(self: *EmbeddingArtifactRepairIssue, alloc: Allocator) void {
+    pub fn deinit(self: *ArtifactRepairIssue, alloc: Allocator) void {
         if (self.index_name.len > 0) alloc.free(@constCast(self.index_name));
         if (self.doc_key.len > 0) alloc.free(@constCast(self.doc_key));
         if (self.parent_doc_key.len > 0) alloc.free(@constCast(self.parent_doc_key));
@@ -1605,18 +1615,26 @@ pub const EmbeddingArtifactRepairIssue = struct {
     }
 };
 
-pub fn freeEmbeddingArtifactRepairIssues(alloc: Allocator, issues: []EmbeddingArtifactRepairIssue) void {
+pub fn freeArtifactRepairIssues(alloc: Allocator, issues: []ArtifactRepairIssue) void {
     for (issues) |*issue| issue.deinit(alloc);
     if (issues.len > 0) alloc.free(issues);
 }
 
-pub const EmbeddingArtifactRepairResult = struct {
+pub const ArtifactRepairResult = struct {
     scanned: u64 = 0,
     reprocessed: u64 = 0,
     repaired: u64 = 0,
     missing_source_docs: u64 = 0,
     failed: u64 = 0,
 };
+
+pub const EmbeddingArtifactRepairReason = ArtifactRepairReason;
+pub const EmbeddingArtifactRepairIssue = ArtifactRepairIssue;
+pub const EmbeddingArtifactRepairResult = ArtifactRepairResult;
+
+pub fn freeEmbeddingArtifactRepairIssues(alloc: Allocator, issues: []EmbeddingArtifactRepairIssue) void {
+    freeArtifactRepairIssues(alloc, issues);
+}
 
 pub const AlgebraicCandidateStatus = struct {
     recommendation: []const u8,

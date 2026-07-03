@@ -38,7 +38,8 @@ pub const ha_applied_lsn_key = [_]u8{ replay_namespace, 0xff, 0x04 };
 pub const artifact_presence_key = [_]u8{ replay_namespace, 0xff, 0x20 };
 pub const asset_artifact_source_index_kind: u8 = 0x21;
 pub const document_child_range_outbox_kind: u8 = 0x22;
-pub const embedding_artifact_repair_issue_kind: u8 = 0x23;
+pub const artifact_repair_issue_kind: u8 = 0x23;
+pub const embedding_artifact_repair_issue_kind: u8 = artifact_repair_issue_kind;
 pub const identity_doc_to_ordinal_kind: u8 = 0x01;
 pub const identity_ordinal_to_doc_kind: u8 = 0x02;
 pub const identity_ordinal_state_kind: u8 = 0x03;
@@ -284,19 +285,44 @@ pub fn documentChildRangeOutboxKeyAlloc(alloc: Allocator, sequence: u64, ordinal
     return try list.toOwnedSlice(alloc);
 }
 
-pub fn embeddingArtifactRepairIssueRootPrefixAlloc(alloc: Allocator) ![]u8 {
+pub fn artifactRepairIssueRootPrefixAlloc(alloc: Allocator) ![]u8 {
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);
-    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, embedding_artifact_repair_issue_kind });
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_issue_kind });
     return try list.toOwnedSlice(alloc);
 }
 
-pub fn embeddingArtifactRepairIssueIndexPrefixAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+pub fn artifactRepairIssueIndexPrefixAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);
-    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, embedding_artifact_repair_issue_kind });
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_issue_kind });
     try appendEncodedComponent(&list, alloc, index_name);
     return try list.toOwnedSlice(alloc);
+}
+
+pub fn artifactRepairIssueKeyAlloc(
+    alloc: Allocator,
+    index_name: []const u8,
+    repair_artifact_kind: []const u8,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_issue_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    try appendEncodedComponent(&list, alloc, repair_artifact_kind);
+    try appendEncodedComponent(&list, alloc, doc_key);
+    try appendEncodedComponent(&list, alloc, artifact_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn embeddingArtifactRepairIssueRootPrefixAlloc(alloc: Allocator) ![]u8 {
+    return try artifactRepairIssueRootPrefixAlloc(alloc);
+}
+
+pub fn embeddingArtifactRepairIssueIndexPrefixAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+    return try artifactRepairIssueIndexPrefixAlloc(alloc, index_name);
 }
 
 pub fn embeddingArtifactRepairIssueKeyAlloc(
@@ -305,13 +331,7 @@ pub fn embeddingArtifactRepairIssueKeyAlloc(
     doc_key: []const u8,
     artifact_name: []const u8,
 ) ![]u8 {
-    var list = std.ArrayListUnmanaged(u8).empty;
-    defer list.deinit(alloc);
-    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, embedding_artifact_repair_issue_kind });
-    try appendEncodedComponent(&list, alloc, index_name);
-    try appendEncodedComponent(&list, alloc, doc_key);
-    try appendEncodedComponent(&list, alloc, artifact_name);
-    return try list.toOwnedSlice(alloc);
+    return try artifactRepairIssueKeyAlloc(alloc, index_name, "embedding", doc_key, artifact_name);
 }
 
 pub fn chunkArtifactKeyAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const u8, chunk_id: u32) ![]u8 {

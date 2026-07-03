@@ -5702,7 +5702,7 @@ pub const IndexManager = struct {
             &fallback_scratch,
             &unreadable_artifact_keys,
         )) {
-            if (unreadable_artifact_keys.items.len > 0) return error.EmbeddingArtifactRepairRequired;
+            if (unreadable_artifact_keys.items.len > 0) return error.ArtifactRepairRequired;
         }
     }
 
@@ -5759,15 +5759,15 @@ pub const IndexManager = struct {
         try artifact_read_txn.getManySorted(read_keys, read_values);
 
         for (read_values) |maybe_raw| {
-            const raw = maybe_raw orelse return error.EmbeddingArtifactRepairRequired;
+            const raw = maybe_raw orelse return error.ArtifactRepairRequired;
             const maybe_view = enrichment_artifact_codec.sparseEmbeddingVectorView(raw) catch |err| {
-                if (isRecoverableEmbeddingArtifactError(err)) return error.EmbeddingArtifactRepairRequired;
+                if (isRecoverableEmbeddingArtifactError(err)) return error.ArtifactRepairRequired;
                 return err;
             };
             if (maybe_view != null) continue;
 
             var decoded = enrichment_artifact_codec.decodeSparseEmbeddingAlloc(self.alloc, raw) catch |err| {
-                if (isRecoverableEmbeddingArtifactError(err)) return error.EmbeddingArtifactRepairRequired;
+                if (isRecoverableEmbeddingArtifactError(err)) return error.ArtifactRepairRequired;
                 return err;
             };
             decoded.deinit(self.alloc);
@@ -9062,7 +9062,7 @@ pub const IndexManager = struct {
             &preloaded_artifact_vector_scratch,
             &unreadable_artifact_keys,
         )) {
-            if (unreadable_artifact_keys.items.len > 0) return error.EmbeddingArtifactRepairRequired;
+            if (unreadable_artifact_keys.items.len > 0) return error.ArtifactRepairRequired;
         }
         for (preloaded_artifact_vectors) |maybe_vector| {
             if (maybe_vector) |vector| preloaded_vector_bytes += @as(u64, @intCast(vector.len * @sizeOf(f32)));
@@ -11074,7 +11074,7 @@ pub const IndexManager = struct {
                 });
             }
             if (profile_enabled) profile.artifact_decode_ns = platform_time.monotonicNs() - decode_start_ns;
-            if (unreadable_artifact_keys.items.len > 0) return error.EmbeddingArtifactRepairRequired;
+            if (unreadable_artifact_keys.items.len > 0) return error.ArtifactRepairRequired;
 
             if (delete_keys.items.len > 0) {
                 const delete_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;

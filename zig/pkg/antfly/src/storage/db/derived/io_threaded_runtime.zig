@@ -1019,7 +1019,7 @@ fn closeWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, success: b
 fn isRecoverablePublishError(worker: *const Worker, err: anyerror) bool {
     return switch (err) {
         error.NotFound => catch_up_policy.forIndex(worker.kind, worker.runtime.backlog.resource_manager).not_found_is_recoverable,
-        error.ReplayDocumentNotVisible, error.EmbeddingArtifactRepairRequired, error.WriterLocked => true,
+        error.ReplayDocumentNotVisible, error.ArtifactRepairRequired, error.WriterLocked => true,
         else => false,
     };
 }
@@ -1028,7 +1028,7 @@ fn isRecoverableCatchUpError(worker: *const Worker, err: anyerror) bool {
     return switch (err) {
         error.WriterLocked,
         error.ReplayDocumentNotVisible,
-        error.EmbeddingArtifactRepairRequired,
+        error.ArtifactRepairRequired,
         => true,
         error.NotFound => catch_up_policy.forIndex(worker.kind, worker.runtime.backlog.resource_manager).not_found_is_recoverable,
         else => false,
