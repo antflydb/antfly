@@ -1117,6 +1117,7 @@ pub const SearchRequest = struct {
     resolved_doc_filter_owned: bool = false,
     resolved_doc_filter_wire_context: ?ResolvedDocFilterWireContext = null,
     identity_read_generation: ?u64 = null,
+    execution_deadline_ns: ?u64 = null,
     require_algebraic_filter_resolution: bool = false,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
 };

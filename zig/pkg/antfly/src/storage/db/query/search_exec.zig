@@ -2258,6 +2258,11 @@ fn enforceLateVisibilityExactCandidateBudget(candidate_limit: u32, budget: u32) 
     return error.QueryCandidateBudgetExceeded;
 }
 
+fn checkSearchRequestDeadline(req: types.SearchRequest) !void {
+    const deadline_ns = req.execution_deadline_ns orelse return;
+    if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+}
+
 test "text late visibility requirement overrides positive native filter" {
     const callbacks = struct {
         fn requiresFullCandidateVisibilityFilter(_: ?*anyopaque, _: ?u64) anyerror!bool {
@@ -2536,6 +2541,7 @@ fn sortAndPageSearchResultInPlace(
     load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
 ) !void {
     if (req.order_by.len == 0 or req.count_only) return;
+    try checkSearchRequestDeadline(req);
 
     const alloc = result.alloc;
     var decorated = try alloc.alloc(DecoratedSortHit, result.hits.len);
@@ -2545,6 +2551,7 @@ fn sortAndPageSearchResultInPlace(
         if (decorated.len > 0) alloc.free(decorated);
     }
     for (result.hits, 0..) |*hit, i| {
+        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
         decorated[i] = try decorateSortHitAlloc(alloc, req, hit.*, load_ctx, load_stored);
         hit.* = undefined;
         initialized += 1;
@@ -2552,7 +2559,9 @@ fn sortAndPageSearchResultInPlace(
     if (result.hits.len > 0) alloc.free(result.hits);
     result.hits = &.{};
 
+    try checkSearchRequestDeadline(req);
     std.sort.pdq(DecoratedSortHit, decorated, req, decoratedLessThan);
+    try checkSearchRequestDeadline(req);
 
     var start: usize = 0;
     var end: usize = decorated.len;
@@ -2580,6 +2589,7 @@ fn sortAndPageSearchResultInPlace(
         if (selected.len > 0) alloc.free(selected);
     }
     for (decorated, 0..) |*item, i| {
+        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
         if (i >= start and i < end) {
             selected[selected_initialized] = item.hit;
             item.hit = undefined;
@@ -3906,6 +3916,7 @@ pub fn searchTextQuery(
     text_query: types.TextQuery,
     executor: SearchTextQueryExecutor,
 ) !types.SearchResult {
+    try checkSearchRequestDeadline(req);
     const bench_query_profile = shouldLogBenchQueryProfile();
     const total_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     const text_entry = (try executor.text_index_entry(executor.ctx, req.index_name)) orelse return switch (text_query) {
@@ -4023,6 +4034,7 @@ pub fn searchTextQuery(
     var postprocess_ns: u64 = 0;
 
     while (true) {
+        try checkSearchRequestDeadline(effective_req);
         candidate_iterations += 1;
         var postprocess_req = effective_req;
         if (late_visibility_paginate or requires_stored_sort) {
@@ -4063,6 +4075,7 @@ pub fn searchTextQuery(
         }
 
         for (result.hits, 0..) |hit, i| {
+            if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
             const doc_ordinal = try snapshot.docOrdinal(hit.doc_id);
             const id = hit.id orelse {
                 const stored = snapshot.storedDoc(hit.doc_id) orelse return error.StoredDocMissing;
@@ -4135,6 +4148,7 @@ pub fn searchTextQuery(
             });
             return error.QueryCandidateBudgetExceeded;
         }
+        try checkSearchRequestDeadline(effective_req);
         if (requires_stored_sort) {
             try sortAndPageSearchResultInPlace(&out, effective_req, executor.ctx, executor.load_stored);
         } else if (late_visibility_paginate and !effective_req.count_only) {
@@ -5856,6 +5870,7 @@ pub fn searchMatchAll(
     req: types.SearchRequest,
     executor: MatchAllExecutor,
 ) !types.SearchResult {
+    try checkSearchRequestDeadline(req);
     var candidates = try executor.collect_candidates(executor.ctx, alloc, req);
     defer candidates.deinit(alloc);
 
@@ -5870,6 +5885,7 @@ pub fn searchMatchAll(
     });
     defer native_constraints.deinit(alloc);
     try applyMatchAllDocIdConstraintsAlloc(alloc, &candidates, &native_constraints);
+    try checkSearchRequestDeadline(req);
     if (req.order_by.len > 0) {
         const candidate_count: u32 = @intCast(@min(candidates.items.len, @as(usize, std.math.maxInt(u32))));
         enforceLateVisibilityExactCandidateBudget(candidate_count, lateVisibilityExactCandidateBudget()) catch |err| {
@@ -5890,6 +5906,7 @@ pub fn searchMatchAll(
             if (hits.len > 0) alloc.free(hits);
         }
         for (candidates.items, 0..) |*candidate, i| {
+            if (i % 1024 == 0) try checkSearchRequestDeadline(req);
             hits[i] = .{
                 .id = candidate.id,
                 .doc_ordinal = candidate.ordinal,
@@ -5920,7 +5937,8 @@ pub fn searchMatchAll(
             filtered_owned = false;
             errdefer filtered.deinit();
             if (req.include_stored) {
-                for (filtered.hits) |*hit| {
+                for (filtered.hits, 0..) |*hit, i| {
+                    if (i % 1024 == 0) try checkSearchRequestDeadline(req);
                     if (hit.stored_data == null) {
                         hit.stored_data = try executor.load_projected_document(executor.ctx, alloc, req, hit.id);
                     }
@@ -5933,7 +5951,8 @@ pub fn searchMatchAll(
         filtered_owned = false;
         errdefer paged.deinit();
         if (req.include_stored) {
-            for (paged.hits) |*hit| {
+            for (paged.hits, 0..) |*hit, i| {
+                if (i % 1024 == 0) try checkSearchRequestDeadline(req);
                 hit.stored_data = try executor.load_projected_document(executor.ctx, alloc, req, hit.id);
             }
         }
@@ -5952,6 +5971,7 @@ pub fn searchMatchAll(
     errdefer alloc.free(hits);
 
     for (candidates.items, 0..) |*candidate, i| {
+        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
         if (i < start_usize or i >= end_usize) continue;
         hits[i - start_usize] = .{
             .id = candidate.id,
@@ -7001,6 +7021,20 @@ test "match_all consumes resolved ordinal filters without doc id projection" {
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+}
+
+test "match_all rejects expired execution deadline" {
+    const alloc = std.testing.allocator;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+    };
+
+    try std.testing.expectError(error.Timeout, searchMatchAll(alloc, .{
+        .include_stored = false,
+        .limit = 10,
+        .execution_deadline_ns = platform_time.monotonicNs(),
+    }, testMatchAllExecutor(&ctx)));
 }
 
 test "match_all applies stored pattern filters before paging" {

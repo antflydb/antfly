@@ -69,6 +69,25 @@ fn benchQueryApiPhaseProfileEnabled() bool {
         std.c.getenv("ANTFLY_BENCH_QUERY_PROFILE_EVERY\x00") != null;
 }
 
+const default_aggregation_full_result_budget: u32 = 100_000;
+
+fn aggregationFullResultBudgetFromRaw(raw: ?[*:0]u8) u32 {
+    const value = raw orelse return default_aggregation_full_result_budget;
+    const slice = std.mem.span(value);
+    if (slice.len == 0) return default_aggregation_full_result_budget;
+    const parsed = std.fmt.parseUnsigned(u32, slice, 10) catch return default_aggregation_full_result_budget;
+    return if (parsed == 0) std.math.maxInt(u32) else parsed;
+}
+
+fn aggregationFullResultBudget() u32 {
+    return aggregationFullResultBudgetFromRaw(std.c.getenv("ANTFLY_AGGREGATION_FULL_RESULT_BUDGET\x00"));
+}
+
+fn checkQueryDeadline(req: db_mod.types.SearchRequest) !void {
+    const deadline_ns = req.execution_deadline_ns orelse return;
+    if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+}
+
 fn nsToUsFloat(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1000.0;
 }
@@ -2088,6 +2107,7 @@ pub const BoundTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        try checkQueryDeadline(req);
 
         const start_ns = platform_time.monotonicNs();
         const phase_profile = benchQueryApiPhaseProfileEnabled();
@@ -2096,6 +2116,7 @@ pub const BoundTableReadSource = struct {
         const prepare_ns = if (phase_profile) platform_time.monotonicNs() - prepare_start_ns else 0;
         const snapshot_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
         const snapshot_req = try self.db.searchRequestAtCurrentIdentityGeneration(req);
+        try checkQueryDeadline(snapshot_req);
         const snapshot_ns = if (phase_profile) platform_time.monotonicNs() - snapshot_start_ns else 0;
         var execution: LocalQueryExecution = .{ .request = snapshot_req, .result = undefined };
         const search_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
@@ -2113,6 +2134,7 @@ pub const BoundTableReadSource = struct {
             };
         }
         const search_ns = if (phase_profile) platform_time.monotonicNs() - search_start_ns else 0;
+        try checkQueryDeadline(snapshot_req);
         var result = execution.result;
         defer result.deinit();
         const response_req = execution.request;
@@ -2125,6 +2147,7 @@ pub const BoundTableReadSource = struct {
         const agg_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
         try applyBoundQueryAggregations(self, alloc, response_req, &result, &meta, consistency);
         const agg_ns = if (phase_profile) platform_time.monotonicNs() - agg_start_ns else 0;
+        try checkQueryDeadline(response_req);
         const post_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
         try applyQueryPostProcessing(alloc, response_req, &result, &meta, null, null);
         const post_ns = if (phase_profile) platform_time.monotonicNs() - post_start_ns else 0;
@@ -2586,6 +2609,7 @@ pub const ProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
+        try checkQueryDeadline(req);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, readPreparationKindForQuery(req));
         const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
         defer alloc.free(group_ids);
@@ -2595,6 +2619,7 @@ pub const ProvisionedTableReadSource = struct {
         const start_ns = platform_time.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
             const execution = try queryHostedLocalDetailed(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.managedReadRuntimeConfig(), table_name, req, consistency);
+            try checkQueryDeadline(execution.request);
             var result = execution.result;
             defer result.deinit();
             const response_req = execution.request;
@@ -2605,6 +2630,7 @@ pub const ProvisionedTableReadSource = struct {
             };
             defer meta.deinit(alloc);
             try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, response_req, &result, &meta, consistency);
+            try checkQueryDeadline(response_req);
             try applyQueryPostProcessing(alloc, response_req, &result, &meta, self.antfly_provider, self.secret_store);
             return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
         }
@@ -2614,6 +2640,7 @@ pub const ProvisionedTableReadSource = struct {
             base_req.graph_queries = &.{};
             base_req.expand_strategy = null;
             var merged = try queryProvisionedAcrossGroups(self, alloc, group_ids, base_req, table_name, consistency);
+            try checkQueryDeadline(base_req);
             defer merged.deinit();
             const graph_req = requestWithResultIdentityGeneration(req, merged);
 
@@ -2628,10 +2655,12 @@ pub const ProvisionedTableReadSource = struct {
             };
             defer meta.deinit(alloc);
             try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, graph_req, &merged, &meta, consistency);
+            try checkQueryDeadline(graph_req);
             try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, self.antfly_provider, self.secret_store);
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
         }
         var merged = try queryProvisionedAcrossGroups(self, alloc, group_ids, req, table_name, consistency);
+        try checkQueryDeadline(req);
         defer merged.deinit();
         var meta: query_api.QueryResponseMeta = .{
             .took_ms = @intCast(@divTrunc(platform_time.monotonicNs() - start_ns, std.time.ns_per_ms)),
@@ -2640,6 +2669,7 @@ pub const ProvisionedTableReadSource = struct {
         };
         defer meta.deinit(alloc);
         try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &merged, &meta, consistency);
+        try checkQueryDeadline(req);
         try applyQueryPostProcessing(alloc, req, &merged, &meta, self.antfly_provider, self.secret_store);
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
     }
@@ -3212,6 +3242,7 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try checkQueryDeadline(req);
         const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
@@ -3224,6 +3255,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
             if (route == .local) {
                 const execution = try queryHostedLocalDetailed(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), .{ .backend_runtime = self.backend_runtime }, table_name, req, consistency);
+                try checkQueryDeadline(execution.request);
                 var result = execution.result;
                 defer result.deinit();
                 const response_req = execution.request;
@@ -3234,6 +3266,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 };
                 defer meta.deinit(alloc);
                 try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, response_req, &result, &meta, consistency);
+                try checkQueryDeadline(response_req);
                 try applyQueryPostProcessing(alloc, response_req, &result, &meta, null, null);
                 return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
             }
@@ -3244,6 +3277,7 @@ pub const HostedProvisionedTableReadSource = struct {
             base_req.graph_queries = &.{};
             base_req.expand_strategy = null;
             var merged = try queryHostedAcrossGroups(self, alloc, group_ids, base_req, table_name, consistency);
+            try checkQueryDeadline(base_req);
             defer merged.deinit();
             const graph_req = requestWithResultIdentityGeneration(req, merged);
 
@@ -3258,10 +3292,12 @@ pub const HostedProvisionedTableReadSource = struct {
             };
             defer meta.deinit(alloc);
             try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, graph_req, &merged, &meta, consistency);
+            try checkQueryDeadline(graph_req);
             try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, null, null);
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
         }
         var merged = try queryHostedAcrossGroups(self, alloc, group_ids, req, table_name, consistency);
+        try checkQueryDeadline(req);
         defer merged.deinit();
         var meta: query_api.QueryResponseMeta = .{
             .took_ms = @intCast(@divTrunc(platform_time.monotonicNs() - start_ns, std.time.ns_per_ms)),
@@ -3270,6 +3306,7 @@ pub const HostedProvisionedTableReadSource = struct {
         };
         defer meta.deinit(alloc);
         try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &merged, &meta, consistency);
+        try checkQueryDeadline(req);
         try applyQueryPostProcessing(alloc, req, &merged, &meta, null, null);
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
     }
@@ -9024,8 +9061,18 @@ fn aggregationCanUseCurrentResult(req: db_mod.types.SearchRequest, result: db_mo
     return !req.count_only and result.hits.len == result.total_hits;
 }
 
-fn aggregationFullResultLimit(result: db_mod.types.SearchResult) !u32 {
+fn aggregationFullResultLimit(req: db_mod.types.SearchRequest, result: db_mod.types.SearchResult, operation: []const u8) !u32 {
+    try checkQueryDeadline(req);
     if (result.total_hits_relation != .exact) return error.UnsupportedQueryRequest;
+    const budget = aggregationFullResultBudget();
+    if (result.total_hits > budget) {
+        std.log.warn("query aggregation full-result rerun budget exceeded operation={s} total_hits={d} budget={d}", .{
+            operation,
+            result.total_hits,
+            budget,
+        });
+        return error.QueryCandidateBudgetExceeded;
+    }
     return result.total_hits;
 }
 
@@ -9057,12 +9104,18 @@ test "aggregation completeness requires exact total relation" {
         .total_hits = 1,
         .total_hits_relation = .gte,
     }));
-    try std.testing.expectError(error.UnsupportedQueryRequest, aggregationFullResultLimit(.{
+    try std.testing.expectError(error.UnsupportedQueryRequest, aggregationFullResultLimit(.{}, .{
         .alloc = std.testing.allocator,
         .hits = @constCast(hits[0..]),
         .total_hits = 1,
         .total_hits_relation = .gte,
-    }));
+    }, "test"));
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, aggregationFullResultLimit(.{}, .{
+        .alloc = std.testing.allocator,
+        .hits = @constCast(hits[0..]),
+        .total_hits = default_aggregation_full_result_budget + 1,
+        .total_hits_relation = .exact,
+    }, "test"));
 }
 
 fn applyBoundQueryAggregations(
@@ -9080,7 +9133,7 @@ fn applyBoundQueryAggregations(
     }
 
     const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result.*);
-    const full_limit = try aggregationFullResultLimit(result.*);
+    const full_limit = try aggregationFullResultLimit(req, result.*, "bound");
     var full_req = req;
     full_req.identity_read_generation = identity_read_generation;
     full_req.offset = 0;
@@ -9116,7 +9169,7 @@ fn applyProvisionedQueryAggregations(
 
         var reads = raft_mod.FeatureDBReads.init(group_ids[0], self.requester);
         const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result.*);
-        const full_limit = try aggregationFullResultLimit(result.*);
+        const full_limit = try aggregationFullResultLimit(req, result.*, "provisioned-local");
         var full_req = req;
         full_req.identity_read_generation = identity_read_generation;
         full_req.offset = 0;
@@ -9142,7 +9195,7 @@ fn applyProvisionedQueryAggregations(
     }
 
     const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result.*);
-    const full_limit = try aggregationFullResultLimit(result.*);
+    const full_limit = try aggregationFullResultLimit(req, result.*, "provisioned-distributed");
     var full_req = req;
     full_req.identity_read_generation = identity_read_generation;
     full_req.offset = 0;
@@ -9318,7 +9371,7 @@ fn applyHostedProvisionedQueryAggregations(
 
                 var reads = raft_mod.FeatureDBReads.init(group_ids[0], self.requester);
                 const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result.*);
-                const full_limit = try aggregationFullResultLimit(result.*);
+                const full_limit = try aggregationFullResultLimit(req, result.*, "hosted-local");
                 var full_req = req;
                 full_req.identity_read_generation = identity_read_generation;
                 full_req.offset = 0;
@@ -9347,7 +9400,7 @@ fn applyHostedProvisionedQueryAggregations(
     }
 
     const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result.*);
-    const full_limit = try aggregationFullResultLimit(result.*);
+    const full_limit = try aggregationFullResultLimit(req, result.*, "hosted-distributed");
     var full_req = req;
     full_req.identity_read_generation = identity_read_generation;
     full_req.offset = 0;

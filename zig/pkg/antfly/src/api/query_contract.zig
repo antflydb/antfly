@@ -29,6 +29,7 @@ const metadata_openapi = @import("antfly_metadata_openapi");
 const query_openapi = @import("antfly_query_openapi");
 const reranking_mod = @import("antfly_reranking");
 const vector_codec = @import("antfly_vector").codec;
+const platform_time = @import("../platform/time.zig");
 const algebraic_ir = db_mod.algebraic.ir;
 const algebraic_law = db_mod.algebraic.law;
 const algebraic_lexical = db_mod.algebraic.lexical;
@@ -1845,6 +1846,26 @@ fn freeClonedJsonValues(alloc: std.mem.Allocator, values: []const std.json.Value
     db_mod.types.freeJsonValues(alloc, @constCast(values));
 }
 
+fn parseQueryTimeoutMs(alloc: std.mem.Allocator, body: []const u8) !?u64 {
+    if (std.mem.indexOf(u8, body, "\"timeout_ms\"") == null) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    const value = parsed.value.object.get("timeout_ms") orelse return null;
+    return switch (value) {
+        .null => null,
+        .integer => |v| if (v >= 0) @as(u64, @intCast(v)) else error.InvalidQueryRequest,
+        .float => |v| if (v >= 0 and v <= @as(f64, @floatFromInt(std.math.maxInt(u64)))) @as(u64, @intFromFloat(v)) else error.InvalidQueryRequest,
+        .number_string => |v| std.fmt.parseUnsigned(u64, v, 10) catch error.InvalidQueryRequest,
+        else => error.InvalidQueryRequest,
+    };
+}
+
+fn applyQueryExecutionDeadline(alloc: std.mem.Allocator, body: []const u8, req: *db_mod.types.SearchRequest) !void {
+    const timeout_ms = (try parseQueryTimeoutMs(alloc, body)) orelse return;
+    req.execution_deadline_ns = platform_time.monotonicNs() +| timeout_ms *| std.time.ns_per_ms;
+}
+
 pub fn parseQueryRequest(
     alloc: std.mem.Allocator,
     semantic_resolver: ?SemanticResolver,
@@ -1858,17 +1879,22 @@ pub fn parseQueryRequest(
     // Skip the extra JSON parse unless the request even mentions embeddings.
     if (std.mem.indexOf(u8, body, "\"embeddings\"") != null and fastDensePublicQueryMayApply(body)) {
         if (try tryParseFastDensePublicQueryRequest(alloc, body)) |fast| {
-            return fast;
+            var owned = fast;
+            errdefer owned.deinit(alloc);
+            try applyQueryExecutionDeadline(alloc, body, &owned.req);
+            return owned;
         }
     }
 
     const has_internal_shard_fields = try queryBodyHasInternalShardFields(alloc, body);
     const has_public_doc_filter_bindings = try queryBodyHasPublicDocFilterBindings(alloc, body);
     const has_public_hierarchy_controls = try queryBodyHasPublicHierarchyControls(alloc, body);
+    const has_query_timeout = std.mem.indexOf(u8, body, "\"timeout_ms\"") != null;
     const contract_body = try queryBodyForGeneratedContractAlloc(alloc, body, .{
         .strip_internal_shard_fields = has_internal_shard_fields,
         .strip_public_doc_filter_bindings = has_public_doc_filter_bindings,
         .strip_public_hierarchy_controls = has_public_hierarchy_controls,
+        .strip_query_timeout = has_query_timeout,
     });
     defer if (contract_body) |owned| alloc.free(owned);
     const body_for_contract = contract_body orelse body;
@@ -1886,6 +1912,7 @@ pub fn parseQueryRequest(
     errdefer freeSearchRequest(alloc, &req);
 
     try applyCommonSearchRequestOptions(alloc, request, &req);
+    try applyQueryExecutionDeadline(alloc, body, &req);
     try applyPublicHierarchyControls(alloc, body, &req);
     req.distributed_text_stats = try parseDistributedTextStatsAlloc(alloc, body);
     try parseInternalDocIdConstraintsAlloc(alloc, body, &req);
@@ -5264,6 +5291,7 @@ const QueryContractStripOptions = struct {
     strip_internal_shard_fields: bool = false,
     strip_public_doc_filter_bindings: bool = false,
     strip_public_hierarchy_controls: bool = false,
+    strip_query_timeout: bool = false,
 };
 
 fn queryBodyForGeneratedContractAlloc(
@@ -5271,7 +5299,7 @@ fn queryBodyForGeneratedContractAlloc(
     body: []const u8,
     options: QueryContractStripOptions,
 ) !?[]u8 {
-    if (!options.strip_internal_shard_fields and !options.strip_public_doc_filter_bindings and !options.strip_public_hierarchy_controls) return null;
+    if (!options.strip_internal_shard_fields and !options.strip_public_doc_filter_bindings and !options.strip_public_hierarchy_controls and !options.strip_query_timeout) return null;
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
@@ -5285,6 +5313,9 @@ fn queryBodyForGeneratedContractAlloc(
     }
     if (options.strip_internal_shard_fields) {
         removeInternalShardFields(&parsed.value.object);
+    }
+    if (options.strip_query_timeout) {
+        _ = parsed.value.object.orderedRemove("timeout_ms");
     }
 
     return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
@@ -6168,6 +6199,21 @@ test "api query contract public parser rejects internal shard doc identity contr
         \\{"full_text_search":{"query":"mentions native_doc_id_constraints and _identity_read_generation"}}
     ;
     try std.testing.expect(!try testing.bodyHasForbiddenPublicDocIdentityControls(alloc, literal_body));
+
+    const timeout_before_ns = platform_time.monotonicNs();
+    var timeout_request = try parsePublicQueryRequest(alloc, null, "docs",
+        \\{"query":{"match_all":{}},"timeout_ms":250}
+    );
+    defer timeout_request.deinit(alloc);
+    const timeout_after_ns = platform_time.monotonicNs();
+    const deadline_ns = timeout_request.req.execution_deadline_ns orelse return error.TestExpectedDeadline;
+    try std.testing.expect(deadline_ns >= timeout_before_ns);
+    try std.testing.expect(deadline_ns >= timeout_after_ns);
+    try std.testing.expect(deadline_ns <= timeout_after_ns + 250 * std.time.ns_per_ms);
+
+    try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs",
+        \\{"query":{"match_all":{}},"timeout_ms":-1}
+    ));
 }
 
 test "api query contract treats canonical typed scalar term as structured filter" {
@@ -7181,6 +7227,30 @@ test "api query contract accepts native doc id constraint envelope on internal q
     try std.testing.expectEqual(@as(usize, 1), parsed.req.exclude_doc_ids.len);
     try std.testing.expectEqualStrings("doc:c", parsed.req.exclude_doc_ids[0]);
     try std.testing.expectEqual(@as(?u64, 42), parsed.req.identity_read_generation);
+}
+
+test "api query contract maps timeout_ms to execution deadline" {
+    const alloc = std.testing.allocator;
+    const before_ns = platform_time.monotonicNs();
+    var parsed = try parseQueryRequest(alloc, null, "docs",
+        \\{"query":{"match_all":{}},"timeout_ms":250}
+    );
+    defer parsed.deinit(alloc);
+    const after_ns = platform_time.monotonicNs();
+
+    const deadline_ns = parsed.req.execution_deadline_ns orelse return error.TestExpectedDeadline;
+    try std.testing.expect(deadline_ns >= before_ns);
+    try std.testing.expect(deadline_ns >= after_ns);
+    try std.testing.expect(deadline_ns <= after_ns + 250 * std.time.ns_per_ms);
+}
+
+test "api query contract rejects invalid timeout_ms" {
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
+        \\{"query":{"match_all":{}},"timeout_ms":-1}
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
+        \\{"query":{"match_all":{}},"timeout_ms":"bad"}
+    ));
 }
 
 test "api query contract rejects legacy native doc id constraint fields" {
