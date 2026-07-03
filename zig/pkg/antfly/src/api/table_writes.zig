@@ -8339,6 +8339,8 @@ pub const HostedProvisionedTableWriteSource = struct {
     router: table_router.HostedGroupRouter,
     executor: http_common.RequestExecutor,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
+    antfly_provider: ?managed_embedder.AntflyProvider = null,
+    inference_api_url: ?[]const u8 = null,
     group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
@@ -8360,6 +8362,31 @@ pub const HostedProvisionedTableWriteSource = struct {
 
     pub fn withBackendRuntime(self: *HostedProvisionedTableWriteSource, backend_runtime: *db_mod.background_runtime.BackendRuntime) *HostedProvisionedTableWriteSource {
         self.backend_runtime = backend_runtime;
+        if (hostedManagedDbCacheForRootIfPresent(self.replica_root_dir)) |cache| {
+            cache.write_cache.backend_runtime = backend_runtime;
+        }
+        return self;
+    }
+
+    pub fn withAntflyProvider(
+        self: *HostedProvisionedTableWriteSource,
+        provider: ?managed_embedder.AntflyProvider,
+    ) *HostedProvisionedTableWriteSource {
+        self.antfly_provider = provider;
+        if (hostedManagedDbCacheForRootIfPresent(self.replica_root_dir)) |cache| {
+            cache.write_cache.antfly_provider = provider;
+        }
+        return self;
+    }
+
+    pub fn withInferenceAPIURL(
+        self: *HostedProvisionedTableWriteSource,
+        inference_api_url: ?[]const u8,
+    ) *HostedProvisionedTableWriteSource {
+        self.inference_api_url = inference_api_url;
+        if (hostedManagedDbCacheForRootIfPresent(self.replica_root_dir)) |cache| {
+            cache.write_cache.inference_api_url = inference_api_url;
+        }
         return self;
     }
 
@@ -8422,7 +8449,9 @@ pub const HostedProvisionedTableWriteSource = struct {
         mode: ManagedDbOpenMode,
     ) !ProvisionedTableWriteCache.CachedDb {
         const lsm_root_generation = self.visibleRootGeneration(group_id);
-        if (cache.write_cache.backend_runtime == null) cache.write_cache.backend_runtime = self.backend_runtime;
+        if (self.backend_runtime) |runtime| cache.write_cache.backend_runtime = runtime;
+        cache.write_cache.antfly_provider = self.antfly_provider;
+        cache.write_cache.inference_api_url = self.inference_api_url;
         cache.write_cache.secret_store = self.secret_store;
         cache.write_cache.remote_content = self.remote_content;
         const identity_namespace = try loadTableIdentityNamespaceForGroup(cache.write_cache.alloc, self.catalog, table_name, group_id);
@@ -8548,6 +8577,12 @@ pub const HostedProvisionedTableWriteSource = struct {
         table_name: []const u8,
         index_name: []const u8,
     ) !void {
+        var metadata: ?struct { indexes_json: []u8, schema_json: []u8 } = null;
+        defer if (metadata) |loaded| {
+            alloc.free(loaded.indexes_json);
+            alloc.free(loaded.schema_json);
+        };
+
         const group_ids = try table_catalog.resolveGroupsForSpanEventually(
             alloc,
             self.catalog,
@@ -8573,9 +8608,28 @@ pub const HostedProvisionedTableWriteSource = struct {
                 hosted_cache = cache;
                 break :blk cache;
             };
+            if (metadata == null) {
+                const loaded = try cachedTableMetadataFromCatalog(alloc, self.catalog, &cache.write_cache, table_name);
+                metadata = .{
+                    .indexes_json = loaded.indexes_json,
+                    .schema_json = loaded.schema_json,
+                };
+            }
 
             var cached = try self.getOrOpenCachedDbMode(cache, path, group_id, table_name, .default_async);
             defer cached.deinit(cache.write_cache.alloc);
+
+            try applyIndexCreateToCachedDb(
+                alloc,
+                cached.db,
+                metadata.?.indexes_json,
+                index_name,
+                cache.write_cache.backend_runtime,
+                cache.write_cache.antfly_provider,
+                cache.write_cache.inference_api_url,
+                cache.write_cache.secret_store,
+                cache.write_cache.remote_content,
+            );
 
             if (try cached.db.core.indexRequiresEnrichmentReplay(index_name)) {
                 _ = try seedManagedIndexReplayFromStoredDocsIfNeeded(alloc, cached.db, index_name);
@@ -8629,8 +8683,10 @@ pub const HostedProvisionedTableWriteSource = struct {
         _: []const u8,
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        self.invalidateManagedCache(table_name);
-        try self.reconcileCachedIndexCreate(alloc, table_name, index_name);
+        self.reconcileCachedIndexCreate(alloc, table_name, index_name) catch |err| {
+            self.invalidateManagedCache(table_name);
+            return err;
+        };
     }
 
     fn putArtifactEnrichment(

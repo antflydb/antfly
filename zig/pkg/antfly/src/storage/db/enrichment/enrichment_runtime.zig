@@ -6278,20 +6278,32 @@ fn chunkEmbeddingSourceSetForRequest(
 
         for (chunks) |chunk| {
             const key = try internal_keys.chunkArtifactKeyAlloc(runtime.alloc, request.doc_key, artifact_name, @intCast(chunk.chunk_id));
-            errdefer runtime.alloc.free(key);
-            try keys.append(runtime.alloc, try runtime.alloc.dupe(u8, key));
+            var key_owned = true;
+            errdefer if (key_owned) runtime.alloc.free(key);
+            const desired_key = try runtime.alloc.dupe(u8, key);
+            var desired_key_owned = true;
+            errdefer if (desired_key_owned) runtime.alloc.free(desired_key);
+            try keys.append(runtime.alloc, desired_key);
+            desired_key_owned = false;
             const source = chunk.text orelse {
                 runtime.alloc.free(key);
+                key_owned = false;
                 continue;
             };
             if (source.len == 0) {
                 runtime.alloc.free(key);
+                key_owned = false;
                 continue;
             }
+            const text = try runtime.alloc.dupe(u8, source);
+            var text_owned = true;
+            errdefer if (text_owned) runtime.alloc.free(text);
             try sources.append(runtime.alloc, .{
                 .key = key,
-                .text = try runtime.alloc.dupe(u8, source),
+                .text = text,
             });
+            key_owned = false;
+            text_owned = false;
         }
 
         const owned_sources = try sources.toOwnedSlice(runtime.alloc);
