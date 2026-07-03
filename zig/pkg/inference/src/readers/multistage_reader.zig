@@ -34,6 +34,32 @@ pub const LoadedMultiStageReader = struct {
         defer metadata.deinit();
         if (!metadata_mod.isMultiStage(&metadata)) return error.InvalidMetadata;
 
+        for (session_manager.preferred_backends) |backend| {
+            if (!backend.supportsDirectSessionLoad()) continue;
+            var single_backend = [_]backends.BackendType{backend};
+            var stage_session_manager = session_manager.*;
+            stage_session_manager.preferred_backends = single_backend[0..];
+            return loadFromDirWithSessionManager(
+                allocator,
+                model_path,
+                &metadata,
+                &stage_session_manager,
+            ) catch |err| {
+                if (err == error.MultiStageReaderNotYetSupported) return err;
+                std.log.err("multistage reader backend {s} failed for {s}: {s}", .{ @tagName(backend), model_path, @errorName(err) });
+                continue;
+            };
+        }
+
+        return error.NoBackendAvailable;
+    }
+
+    fn loadFromDirWithSessionManager(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        metadata: *const metadata_mod.MultiStageMetadata,
+        session_manager: *backends.SessionManager,
+    ) !LoadedMultiStageReader {
         const detection_stage = metadata.stages.get("detection") orelse return error.InvalidMetadata;
         const detection_file = detection_stage.model_file orelse return error.InvalidMetadata;
         const detection_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_path, detection_file });
@@ -45,7 +71,7 @@ pub const LoadedMultiStageReader = struct {
         const detection_preprocess = try loadStagePreprocessConfig(
             allocator,
             model_path,
-            &metadata,
+            metadata,
             &detection_stage,
             detector,
             .detection,
@@ -80,7 +106,7 @@ pub const LoadedMultiStageReader = struct {
                 const recognition_preprocess = try loadStagePreprocessConfig(
                     allocator,
                     model_path,
-                    &metadata,
+                    metadata,
                     &recognition_stage,
                     rec_session,
                     .recognition,
