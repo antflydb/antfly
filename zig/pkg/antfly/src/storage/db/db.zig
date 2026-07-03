@@ -10489,15 +10489,6 @@ pub const DB = struct {
                 }
                 break :blk false;
             };
-            if (persisted_resume == null and
-                !force_reset and
-                !watermark_regressed and
-                projection_checkpoint.status == .clean and
-                projection_checkpoint.generation != 0 and
-                applied_sequence >= target_sequence)
-            {
-                continue;
-            }
             try candidates.append(alloc, .{
                 .dense_index_idx = dense_index_idx,
                 .persisted_resume = persisted_resume,
@@ -47887,6 +47878,68 @@ test "db dense artifact rebuild rejects clean checkpoint for stale config identi
     defer reopened.close();
 
     try std.testing.expect(try reopened.hasPendingDenseArtifactRebuild(alloc));
+}
+
+test "db dense artifact rebuild checks artifact counters before clean checkpoint skip" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const dense_cfg: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(dense_cfg);
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(stored_key);
+        try db.core.store.putBatch(&.{
+            .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
+        }, &.{});
+        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dense_idx");
+        defer alloc.free(artifact_key);
+        try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0, 0 });
+
+        const target_sequence = db.core.nextDerivedSequence() -| 1;
+        try db.core.saveProjectionCheckpoint("dense_idx", .{
+            .applied_sequence = target_sequence,
+            .status = .clean,
+            .generation = 7,
+            .config_hash = types.indexConfigHash(dense_cfg),
+        });
+    }
+
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const dense_index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
+    defer alloc.free(dense_index_path);
+    try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    try std.testing.expect(try reopened.hasPendingDenseArtifactRebuild(alloc));
+    try std.testing.expectEqual(@as(usize, 1), try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
+    try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
+
+    const stats = try reopened.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(usize, 1), stats.indexes.len);
+    try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].doc_count);
 }
 
 test "db dense artifact rebuild uses durable artifact counters instead of recount" {
