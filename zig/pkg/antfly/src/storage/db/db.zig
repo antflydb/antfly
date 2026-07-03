@@ -3019,6 +3019,7 @@ pub const DB = struct {
             if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
                 _ = try db.rebuildArtifactRepairSummaryIfMissing(alloc);
                 _ = try db.rebuildArtifactRepairKindIndexIfMissing(alloc);
+                try db.persistIndexLoadFailuresFromManager(alloc);
             }
             db.recordStartupOpenStats(profile);
             if (opts.open_mode.allowsReplay()) {
@@ -5119,7 +5120,7 @@ pub const DB = struct {
         const store_batch_options: backend_types.BatchOptions = if (opts.store_batch_options.mode != .default)
             opts.store_batch_options
         else if (self.bulk_ingest_coalescer.active)
-            .{ .mode = .bulk_ingest }
+            .{ .mode = .bulk_ingest, .defer_commit_flush = true }
         else
             .{};
         var ha_applied_lsn_value_buf: [ha_applied_lsn_value_len]u8 = undefined;
@@ -5746,7 +5747,7 @@ pub const DB = struct {
             .writes = view.writes,
             .deletes = view.deletes,
             .sync_level = sync_level,
-        }, profile, .{ .store_batch_options = .{ .mode = .bulk_ingest } });
+        }, profile, .{ .store_batch_options = .{ .mode = .bulk_ingest, .defer_commit_flush = true } });
 
         lockApply(self);
         defer self.core.unlockApply();
@@ -6415,7 +6416,7 @@ pub const DB = struct {
             }
             try self.appendArtifactRepairSummaryRebuildInvalidation(alloc, null, &deletes, &owned_delete_keys);
             const writes = [_]docstore_mod.KVPair{.{ .key = ready_key, .value = "1" }};
-            try self.core.store.putBatch(writes[0..], deletes.items);
+            try self.core.store.putBatchWithReplayWithOptions(null, writes[0..], deletes.items, null, .{ .defer_commit_flush = true });
             return false;
         }
         if (raw_progress == null) {
@@ -6427,7 +6428,9 @@ pub const DB = struct {
                 owned_delete_keys.deinit(alloc);
             }
             try self.appendArtifactRepairSummaryRebuildInvalidation(alloc, null, &deletes, &owned_delete_keys);
-            if (deletes.items.len != 0) try self.core.store.putBatch(&.{}, deletes.items);
+            if (deletes.items.len != 0) {
+                try self.core.store.putBatchWithReplayWithOptions(null, &.{}, deletes.items, null, .{ .defer_commit_flush = true });
+            }
         }
 
         const prefix = try internal_keys.artifactRepairIssueRootPrefixAlloc(alloc);
@@ -6594,10 +6597,10 @@ pub const DB = struct {
             try owned_keys.append(alloc, progress_key_copy);
             const progress_value = try alloc.dupe(u8, last_key);
             try writes.append(alloc, .{ .key = progress_key_copy, .value = progress_value });
-            try self.core.store.putBatch(writes.items, deletes.items);
+            try self.core.store.putBatchWithReplayWithOptions(null, writes.items, deletes.items, null, .{ .defer_commit_flush = true });
             return true;
         }
-        try self.core.store.putBatch(writes.items, deletes.items);
+        try self.core.store.putBatchWithReplayWithOptions(null, writes.items, deletes.items, null, .{ .defer_commit_flush = true });
         return false;
     }
 
@@ -6688,7 +6691,7 @@ pub const DB = struct {
             errdefer alloc.free(ready_value);
             try writes.append(alloc, .{ .key = ready_key, .value = ready_value });
             const deletes = [_][]const u8{progress_key};
-            try self.core.store.putBatch(writes.items, deletes[0..]);
+            try self.core.store.putBatchWithReplayWithOptions(null, writes.items, deletes[0..], null, .{ .defer_commit_flush = true });
             return false;
         }
 
@@ -6700,7 +6703,7 @@ pub const DB = struct {
             try writes.append(alloc, .{ .key = progress_key_copy, .value = progress_value });
         }
 
-        try self.core.store.putBatch(writes.items, &.{});
+        try self.core.store.putBatchWithReplayWithOptions(null, writes.items, &.{}, null, .{ .defer_commit_flush = true });
         return true;
     }
 
@@ -7072,6 +7075,8 @@ pub const DB = struct {
         alloc: Allocator,
         req: types.ArtifactRepairRunRequest,
     ) !types.ArtifactRepairResult {
+        if (req.target == .index) return try self.repairIndexIssuesWithRequest(alloc, req);
+
         const page = try self.listArtifactRepairIssuesPage(alloc, .{
             .artifact_kind = req.artifact_kind,
             .index_name = req.index_name,
@@ -7159,6 +7164,73 @@ pub const DB = struct {
             };
             try self.runArtifactRepairMetadataMaintenanceUntilIdle();
         }
+        return result;
+    }
+
+    fn repairIndexIssuesWithRequest(
+        self: *DB,
+        alloc: Allocator,
+        req: types.ArtifactRepairRunRequest,
+    ) !types.ArtifactRepairResult {
+        if (req.cursor != null) return error.InvalidArgument;
+        const limit = if (req.limit == 0) @as(u32, 100) else req.limit;
+        var result = types.ArtifactRepairResult{ .limit = limit };
+
+        const configs = try self.core.listIndexes(alloc);
+        defer types.freeIndexConfigs(alloc, configs);
+        for (configs) |cfg| {
+            if (result.scanned >= limit) {
+                result.has_more = true;
+                result.debt_remaining = true;
+                break;
+            }
+            if (req.index_name) |index_name| {
+                if (!std.mem.eql(u8, cfg.name, index_name)) continue;
+            }
+            if (req.artifact_kind) |kind| {
+                const matches_kind = switch (cfg.kind) {
+                    .dense_vector, .sparse_vector => kind == .embedding,
+                    .graph => kind == .graph,
+                    .full_text => kind == .full_text,
+                    .algebraic => false,
+                };
+                if (!matches_kind) continue;
+            }
+
+            result.scanned += 1;
+            const before_load_failure = self.core.index_manager.loadFailure(cfg.name) != null;
+            if (before_load_failure) result.indexes_degraded += 1;
+
+            const rebuilt = switch (cfg.kind) {
+                .dense_vector => blk: {
+                    try self.core.index_manager.resetDenseIndexForArtifactRebuild(cfg.name);
+                    const count = try rebuildDenseIndexForTargetCoverageContext(self.async_context, cfg.name, 2048);
+                    try self.core.index_manager.syncIndexByName(cfg.name, true);
+                    break :blk count;
+                },
+                .sparse_vector => blk: {
+                    const count = try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(self.async_context, cfg.name, 2048);
+                    try self.core.index_manager.syncIndexByName(cfg.name, true);
+                    break :blk count;
+                },
+                .graph => blk: {
+                    try self.rebuildGraphIndexesForTargetCoverage(alloc);
+                    try self.core.index_manager.syncIndexByName(cfg.name, true);
+                    break :blk @as(usize, 1);
+                },
+                .full_text, .algebraic => blk: {
+                    result.unsupported += 1;
+                    result.unresolved += 1;
+                    result.debt_remaining = true;
+                    break :blk @as(usize, 0);
+                },
+            };
+            if (rebuilt == 0 and (cfg.kind == .full_text or cfg.kind == .algebraic)) continue;
+            result.reprocessed += rebuilt;
+            result.repaired += 1;
+            result.indexes_rebuilt += 1;
+        }
+        if (req.index_name != null and result.scanned == 0) return error.NotFound;
         return result;
     }
 
@@ -9999,6 +10071,14 @@ pub const DB = struct {
         return entry.embedding_name orelse entry.config.name;
     }
 
+    fn denseArtifactRefMatchesEntry(entry: anytype, artifact_name: []const u8) bool {
+        if (std.mem.eql(u8, entry.config.name, artifact_name)) return true;
+        if (entry.embedding_name) |embedding_name| {
+            if (std.mem.eql(u8, embedding_name, artifact_name)) return true;
+        }
+        return false;
+    }
+
     fn collectDenseArtifactTargetCounts(
         self: *DB,
         alloc: Allocator,
@@ -10052,7 +10132,7 @@ pub const DB = struct {
                 var matched = false;
                 for (state.tracked_indices) |dense_index_idx| {
                     const entry = &state.db.core.index_manager.dense_indexes.items[dense_index_idx];
-                    if (!std.mem.eql(u8, denseArtifactNameForEntry(entry), artifact_ref.name)) continue;
+                    if (!denseArtifactRefMatchesEntry(entry, artifact_ref.name)) continue;
                     if (entry.dims != dims) continue;
                     const count = state.counts.per_target_index.getPtr(dense_index_idx).?;
                     count.* += 1;
@@ -10079,6 +10159,7 @@ pub const DB = struct {
             persisted_resume: ?[]u8 = null,
             applied_sequence: u64,
             target_sequence: u64,
+            watermark_count: u64 = 0,
             force_reset: bool = false,
 
             fn deinit(candidate: *@This(), local_alloc: Allocator) void {
@@ -10108,7 +10189,13 @@ pub const DB = struct {
 
         for (self.core.index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
             const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null;
-            if (!artifact_backed) continue;
+            const status_snapshot = try self.loadIndexStatusSnapshot(alloc, entry.config.name);
+            const watermark_count = if (status_snapshot) |status_value|
+                if (status_value.kind == .dense_vector) status_value.doc_count else 0
+            else
+                0;
+            const watermark_regressed = watermark_count > entry.index.stats().active_count;
+            if (!artifact_backed and !watermark_regressed) continue;
 
             const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
             defer alloc.free(rebuild_root_path);
@@ -10141,6 +10228,7 @@ pub const DB = struct {
                 .persisted_resume = persisted_resume,
                 .applied_sequence = applied_sequence,
                 .target_sequence = target_sequence,
+                .watermark_count = watermark_count,
                 .force_reset = force_reset,
             });
         }
@@ -10157,7 +10245,10 @@ pub const DB = struct {
         for (candidates.items) |*candidate| {
             const dense_index_idx = candidate.dense_index_idx;
             const entry = &self.core.index_manager.dense_indexes.items[dense_index_idx];
-            const artifact_target_count = target_counts.per_target_index.get(dense_index_idx) orelse 0;
+            const artifact_target_count = @max(
+                target_counts.per_target_index.get(dense_index_idx) orelse 0,
+                candidate.watermark_count,
+            );
             const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
             defer alloc.free(rebuild_root_path);
             const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
@@ -10907,6 +10998,7 @@ pub const DB = struct {
     const index_status_prefix = "\x00\x00__metadata__:index_status:";
     const index_status_magic: u64 = 0x3153544154584449; // "IDXTATS1" little-endian
     const index_status_encoded_len = 8 * 8;
+    const index_load_failure_prefix = "\x00\x00__metadata__:index_load_failure:";
 
     fn indexStatusKeyAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
         return try std.fmt.allocPrint(alloc, "{s}{s}", .{ index_status_prefix, index_name });
@@ -11086,6 +11178,62 @@ pub const DB = struct {
         item.edge_count = status_snapshot.edge_count;
         item.node_count = status_snapshot.node_count;
         item.root_node = status_snapshot.root_node;
+    }
+
+    fn indexLoadFailureKeyAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+        return try std.fmt.allocPrint(alloc, "{s}{s}", .{ index_load_failure_prefix, index_name });
+    }
+
+    fn loadPersistedIndexLoadFailure(self: *DB, alloc: Allocator, index_name: []const u8) !?[]u8 {
+        const key = try indexLoadFailureKeyAlloc(alloc, index_name);
+        defer alloc.free(key);
+        const raw = self.core.store.get(alloc, key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        return raw;
+    }
+
+    fn persistIndexLoadFailuresFromManager(self: *DB, alloc: Allocator) !void {
+        const configs = try self.core.listIndexes(alloc);
+        defer types.freeIndexConfigs(alloc, configs);
+        var failure_batch = try self.core.store.beginWriteBatchWithOptions(.{ .defer_commit_flush = true });
+        errdefer failure_batch.abort();
+        var wrote = false;
+        for (configs) |cfg| {
+            const key = try indexLoadFailureKeyAlloc(alloc, cfg.name);
+            defer alloc.free(key);
+            if (self.core.index_manager.loadFailure(cfg.name)) |err_name| {
+                try failure_batch.put(key, err_name);
+                wrote = true;
+            } else {
+                const persisted = self.core.store.get(alloc, key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (persisted) |value| {
+                    alloc.free(value);
+                    failure_batch.delete(key) catch {};
+                    wrote = true;
+                }
+            }
+        }
+        if (wrote) try failure_batch.commit() else failure_batch.abort();
+    }
+
+    fn applyTerminalLoadFailureStatus(item: *types.DBIndexStats) void {
+        item.replay_catch_up_required = false;
+        item.catch_up_active = false;
+        item.backfill_active = false;
+        item.repair_degraded = true;
+    }
+
+    fn markDenseCoverageRegressionIfNeeded(self: *DB, alloc: Allocator, index_name: []const u8, item: *types.DBIndexStats) !void {
+        const status_snapshot = (try self.loadIndexStatusSnapshot(alloc, index_name)) orelse return;
+        if (status_snapshot.kind != .dense_vector) return;
+        if (status_snapshot.doc_count <= item.doc_count) return;
+        item.repair_degraded = true;
+        item.repair_issue_count +|= 1;
     }
 
     fn applyGraphAlgebraicRuntimeStats(item: *types.DBIndexStats, graph_index: *const graph_mod.GraphIndex) void {
@@ -11446,6 +11594,7 @@ pub const DB = struct {
         }
 
         var visible_doc_count: u64 = 0;
+        var any_index_repair_degraded = false;
         var term_doc_freq_cache_hits: u64 = 0;
         var term_doc_freq_cache_misses: u64 = 0;
         for (configs) |cfg| {
@@ -11471,14 +11620,13 @@ pub const DB = struct {
             if (self.core.index_manager.loadFailure(cfg.name)) |load_error| {
                 item.load_error = try alloc.dupe(u8, load_error);
                 // A quarantined index has no runtime; it is broken, not warming.
-                item.backfill_active = false;
-                item.catch_up_active = false;
+                applyTerminalLoadFailureStatus(&item);
             }
             const index_repair_summary = try self.artifactRepairSummaryIndexSnapshotForStats(alloc, cfg.name, repair_summary.ready, &repair_index_fallback);
             item.repair_issue_count = index_repair_summary.count;
             item.repair_summary_ready = index_repair_summary.ready;
             item.repair_issue_count_estimated = !index_repair_summary.ready;
-            item.repair_degraded = !index_repair_summary.ready or item.repair_issue_count != 0;
+            item.repair_degraded = item.repair_degraded or !index_repair_summary.ready or item.repair_issue_count != 0;
 
             switch (cfg.kind) {
                 .full_text => {
@@ -11501,6 +11649,7 @@ pub const DB = struct {
                         item.root_node = hbc_stats.root_node;
                         item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
+                        try self.markDenseCoverageRegressionIfNeeded(alloc, cfg.name, &item);
                     }
                     if (async_indexing.dense_catch_up.active) {
                         item.catch_up_active = true;
@@ -11539,6 +11688,7 @@ pub const DB = struct {
                 },
                 .algebraic => try self.populateAlgebraicIndexStats(alloc, cfg.name, &item, false),
             }
+            any_index_repair_degraded = any_index_repair_degraded or item.repair_degraded;
             index_stats[index_count] = item;
             index_count += 1;
         }
@@ -11547,7 +11697,7 @@ pub const DB = struct {
             .doc_count = visible_doc_count,
             .index_count = @intCast(self.core.indexCount()),
             .indexes = index_stats[0..index_count],
-            .repair_degraded = !repair_summary.ready or repair_issue_count != 0,
+            .repair_degraded = any_index_repair_degraded or !repair_summary.ready or repair_issue_count != 0,
             .repair_issue_count = repair_issue_count,
             .repair_summary_ready = repair_summary.ready,
             .repair_issue_count_estimated = !repair_summary.ready,
@@ -11599,6 +11749,7 @@ pub const DB = struct {
 
         var index_stats = try alloc.alloc(types.DBIndexStats, configs.len);
         var index_count: usize = 0;
+        var any_index_repair_degraded = false;
         errdefer {
             for (index_stats[0..index_count]) |item| freeDBIndexStatsItem(alloc, item);
             alloc.free(index_stats);
@@ -11610,6 +11761,13 @@ pub const DB = struct {
                 .kind = cfg.kind,
             };
             errdefer freeDBIndexStatsItem(alloc, item);
+            if (self.core.index_manager.loadFailure(cfg.name)) |load_error| {
+                item.load_error = try alloc.dupe(u8, load_error);
+                applyTerminalLoadFailureStatus(&item);
+            } else if (try self.loadPersistedIndexLoadFailure(alloc, cfg.name)) |load_error| {
+                item.load_error = load_error;
+                applyTerminalLoadFailureStatus(&item);
+            }
             for (replay_debt) |status| {
                 if (!std.mem.eql(u8, status.index_name, cfg.name)) continue;
                 item.replay_applied_sequence = status.applied_sequence;
@@ -11620,11 +11778,12 @@ pub const DB = struct {
                 item.catch_up_active = false;
                 break;
             }
+            if (item.load_error != null) applyTerminalLoadFailureStatus(&item);
             const index_repair_summary = try self.artifactRepairSummaryIndexSnapshotForStats(alloc, cfg.name, repair_summary.ready, &repair_index_fallback);
             item.repair_issue_count = index_repair_summary.count;
             item.repair_summary_ready = index_repair_summary.ready;
             item.repair_issue_count_estimated = !index_repair_summary.ready;
-            item.repair_degraded = !index_repair_summary.ready or item.repair_issue_count != 0;
+            item.repair_degraded = item.repair_degraded or !index_repair_summary.ready or item.repair_issue_count != 0;
             switch (cfg.kind) {
                 .full_text => {
                     if (self.core.textIndex(cfg.name)) |entry| {
@@ -11648,6 +11807,7 @@ pub const DB = struct {
                         item.root_node = hbc_stats.root_node;
                         item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
                         item.hbc_posting = dbHbcPostingStats(try entry.index.postingBacklogStats(), entry.index.getWriteProfile());
+                        try self.markDenseCoverageRegressionIfNeeded(alloc, cfg.name, &item);
                         if (async_indexing.dense_catch_up.active) {
                             item.catch_up_active = true;
                             item.backfill_active = true;
@@ -11715,6 +11875,7 @@ pub const DB = struct {
                 },
                 .algebraic => try self.populateAlgebraicIndexStats(alloc, cfg.name, &item, true),
             }
+            any_index_repair_degraded = any_index_repair_degraded or item.repair_degraded;
             index_stats[index_count] = item;
             index_count += 1;
         }
@@ -11729,7 +11890,7 @@ pub const DB = struct {
             .doc_count = visible_doc_count,
             .index_count = @intCast(self.core.indexCount()),
             .indexes = index_stats[0..index_count],
-            .repair_degraded = !repair_summary.ready or repair_issue_count != 0,
+            .repair_degraded = any_index_repair_degraded or !repair_summary.ready or repair_issue_count != 0,
             .repair_issue_count = repair_issue_count,
             .repair_summary_ready = repair_summary.ready,
             .repair_issue_count_estimated = !repair_summary.ready,
@@ -11786,6 +11947,7 @@ pub const DB = struct {
 
         var index_stats = try alloc.alloc(types.DBIndexStats, configs.len);
         var index_count: usize = 0;
+        var any_index_repair_degraded = false;
         errdefer {
             for (index_stats[0..index_count]) |item| freeDBIndexStatsItem(alloc, item);
             alloc.free(index_stats);
@@ -11813,9 +11975,10 @@ pub const DB = struct {
             }
             if (self.core.index_manager.loadFailure(cfg.name)) |load_error| {
                 item.load_error = try alloc.dupe(u8, load_error);
-                // A quarantined index has no runtime; it is broken, not warming.
-                item.backfill_active = false;
-                item.catch_up_active = false;
+                applyTerminalLoadFailureStatus(&item);
+            } else if (try self.loadPersistedIndexLoadFailure(alloc, cfg.name)) |load_error| {
+                item.load_error = load_error;
+                applyTerminalLoadFailureStatus(&item);
             }
             if (try self.loadIndexStatusSnapshot(alloc, cfg.name)) |status_snapshot| {
                 applyIndexStatusSnapshot(&item, status_snapshot);
@@ -11825,10 +11988,11 @@ pub const DB = struct {
             item.repair_issue_count = index_repair_summary.count;
             item.repair_summary_ready = index_repair_summary.ready;
             item.repair_issue_count_estimated = !index_repair_summary.ready;
-            item.repair_degraded = !index_repair_summary.ready or item.repair_issue_count != 0;
+            item.repair_degraded = item.repair_degraded or !index_repair_summary.ready or item.repair_issue_count != 0;
             if (cfg.kind == .full_text) {
                 item.text_merge = self.core.index_manager.textMergeStatsSnapshotForIndex(cfg.name);
             }
+            any_index_repair_degraded = any_index_repair_degraded or item.repair_degraded;
             index_stats[index_count] = item;
             index_count += 1;
         }
@@ -11837,7 +12001,7 @@ pub const DB = struct {
             .doc_count = visible_doc_count,
             .index_count = @intCast(self.core.indexCount()),
             .indexes = index_stats[0..index_count],
-            .repair_degraded = !repair_summary.ready or repair_issue_count != 0,
+            .repair_degraded = any_index_repair_degraded or !repair_summary.ready or repair_issue_count != 0,
             .repair_issue_count = repair_issue_count,
             .repair_summary_ready = repair_summary.ready,
             .repair_issue_count_estimated = !repair_summary.ready,

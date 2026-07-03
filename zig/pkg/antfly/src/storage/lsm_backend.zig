@@ -1332,10 +1332,14 @@ pub const Backend = struct {
     }
 
     pub fn sync(self: *Backend, force: bool) !void {
-        _ = force;
         if (self.root_dir == null) return;
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
+        if (force and !self.options.backend.read_only and self.options.wal_enabled) {
+            var wal_lock = try self.acquireWalOperationLock(.exclusive);
+            defer wal_lock.release();
+            try wal_mod.syncCurrentState(self.storage.?, self.allocator, self.root_dir.?);
+        }
         try self.finalizeDeferredStorageWorkLocked();
     }
 

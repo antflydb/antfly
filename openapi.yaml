@@ -7369,9 +7369,10 @@ components:
         - unreadable_artifact
     RepairTarget:
       type: string
-      description: Repair subsystem to inspect or run. This release implements artifact repair.
+      description: Repair subsystem to inspect or run.
       enum:
         - artifact
+        - index
     ArtifactRepairIssue:
       type: object
       description: Durable repair debt for a derived artifact. This is an operator-facing record and includes
@@ -7493,7 +7494,7 @@ components:
           $ref: '#/components/schemas/ArtifactRepairKind'
         index:
           type: string
-          description: Restrict artifact repair attempts to one index name.
+          description: Restrict repair attempts to one index name.
         cursor:
           type: string
           description: Opaque cursor returned by a prior repair response.
@@ -7516,6 +7517,8 @@ components:
         - failed
         - unsupported
         - unresolved
+        - indexes_rebuilt
+        - indexes_degraded
         - limit
         - has_more
         - debt_remaining
@@ -7553,6 +7556,14 @@ components:
           type: integer
           format: uint64
           description: Number of attempted repair records that remained queued after this pass.
+        indexes_rebuilt:
+          type: integer
+          format: uint64
+          description: Number of indexes rebuilt by this pass when target is index.
+        indexes_degraded:
+          type: integer
+          format: uint64
+          description: Number of selected indexes that were already degraded or quarantined before repair.
         limit:
           type: integer
           format: uint32

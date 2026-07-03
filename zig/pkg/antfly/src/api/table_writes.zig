@@ -72,6 +72,7 @@ const provisioned_write_coalesce_max_waiters: usize = 64;
 const provisioned_write_coalesce_max_ops: usize = 10_000;
 const startup_obsolete_reclaim_max_steps: usize = 64;
 const artifact_repair_max_groups_per_request: usize = 64;
+const restore_trash_dir_name = ".antfly-restore-trash";
 // Explicit cache bulk sessions are reserved for rebuild/import paths. Normal
 // API uploads no longer start these windows automatically; DB/storage owns
 // online write batching and L0 maintenance for ordinary write traffic.
@@ -285,6 +286,8 @@ fn mergeArtifactRepairResult(dst: *db_mod.types.ArtifactRepairResult, src: db_mo
     dst.failed += src.failed;
     dst.unsupported += src.unsupported;
     dst.unresolved += src.unresolved;
+    dst.indexes_rebuilt += src.indexes_rebuilt;
+    dst.indexes_degraded += src.indexes_degraded;
     dst.debt_remaining = dst.debt_remaining or src.debt_remaining;
 }
 
@@ -393,6 +396,8 @@ fn parseArtifactRepairResultAlloc(alloc: std.mem.Allocator, body: []const u8) !d
         .failed = parsed.value.failed,
         .unsupported = parsed.value.unsupported,
         .unresolved = parsed.value.unresolved,
+        .indexes_rebuilt = parsed.value.indexes_rebuilt,
+        .indexes_degraded = parsed.value.indexes_degraded,
         .limit = parsed.value.limit,
         .next_cursor = if (parsed.value.next_cursor) |cursor| try alloc.dupe(u8, cursor) else null,
         .has_more = parsed.value.has_more,
@@ -3631,6 +3636,7 @@ pub const ProvisionedTableWriteSource = struct {
     pub const StartupCatchUpResult = struct {
         had_debt: bool = false,
         cleared_debt: bool = false,
+        terminal_degraded: bool = false,
         busy: bool = false,
     };
 
@@ -5228,6 +5234,10 @@ pub const ProvisionedTableWriteSource = struct {
                     .identity_namespace = identity_namespace,
                 }) catch |err| {
                     if (err == error.LsmRootWriterAlreadyOpen) return .{ .busy = true };
+                    if (isTerminalStartupCatchUpOpenFailure(err)) {
+                        try publishTerminalStartupCatchUpRuntimeStatus(self, alloc, table_name, group_id, opening_db_startup, configured_indexes, err);
+                        return .{ .had_debt = true, .terminal_degraded = true };
+                    }
                     return err;
                 };
                 break :db_blk cached_db.?.db;
@@ -5259,6 +5269,10 @@ pub const ProvisionedTableWriteSource = struct {
                     },
                 ) catch |err| {
                     if (err == error.LsmRootWriterAlreadyOpen) return .{ .busy = true };
+                    if (isTerminalStartupCatchUpOpenFailure(err)) {
+                        try publishTerminalStartupCatchUpRuntimeStatus(self, alloc, table_name, group_id, opening_db_startup, configured_indexes, err);
+                        return .{ .had_debt = true, .terminal_degraded = true };
+                    }
                     return err;
                 }
             else
@@ -5279,6 +5293,10 @@ pub const ProvisionedTableWriteSource = struct {
                     .ha_async_metadata_mirror = effective_ha_mirror,
                 }) catch |err| {
                     if (err == error.LsmRootWriterAlreadyOpen) return .{ .busy = true };
+                    if (isTerminalStartupCatchUpOpenFailure(err)) {
+                        try publishTerminalStartupCatchUpRuntimeStatus(self, alloc, table_name, group_id, opening_db_startup, configured_indexes, err);
+                        return .{ .had_debt = true, .terminal_degraded = true };
+                    }
                     return err;
                 };
             errdefer if (uncached_db) |*owned| owned.close();
@@ -12332,7 +12350,7 @@ fn publishStartupCatchUpRuntimeStatusSnapshot(
             applyStartupCatchUpAsyncOverlay(&status, managed_db.snapshotAsyncIndexingStats(), startup);
             status_initialized = true;
         } else if (configured_indexes) |summary| {
-            status = try syntheticStartupRuntimeStatusFromConfiguredIndexes(alloc, group_id, summary, startup);
+            status = try syntheticStartupRuntimeStatusFromConfiguredIndexes(alloc, group_id, summary, startup, null);
             status_initialized = true;
         }
     } else if (db) |managed_db| {
@@ -12379,6 +12397,7 @@ fn syntheticStartupRuntimeStatusFromConfiguredIndexes(
     group_id: u64,
     configured_indexes: *const StartupConfiguredIndexes,
     startup: db_mod.types.StartupCatchUpStats,
+    load_error: ?[]const u8,
 ) !runtime_status.LocalTableRuntimeStatus {
     const indexes = try alloc.alloc(db_mod.types.DBIndexStats, configured_indexes.items.len);
     var initialized: usize = 0;
@@ -12394,6 +12413,10 @@ fn syntheticStartupRuntimeStatusFromConfiguredIndexes(
         };
         errdefer freeSyntheticStartupIndexStatsItem(alloc, stats);
         try item.populateStats(alloc, &stats);
+        if (load_error) |message| {
+            stats.load_error = try alloc.dupe(u8, message);
+            stats.repair_degraded = true;
+        }
         indexes[initialized] = stats;
         initialized += 1;
     }
@@ -12404,14 +12427,43 @@ fn syntheticStartupRuntimeStatusFromConfiguredIndexes(
             .index_count = @intCast(indexes.len),
             .indexes = indexes,
             .async_indexing = .{ .startup = startup },
+            .repair_degraded = load_error != null,
         },
     };
 }
 
 fn freeSyntheticStartupIndexStatsItem(alloc: std.mem.Allocator, item: db_mod.types.DBIndexStats) void {
     alloc.free(item.name);
+    if (item.load_error) |value| alloc.free(value);
     if (item.algebraic_capability_fingerprint) |value| alloc.free(value);
     if (item.algebraic_capability_lifecycle_status) |value| alloc.free(value);
+}
+
+fn isTerminalStartupCatchUpOpenFailure(err: anyerror) bool {
+    return err == error.FileNotFound;
+}
+
+fn publishTerminalStartupCatchUpRuntimeStatus(
+    source: *ProvisionedTableWriteSource,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    group_id: u64,
+    startup: db_mod.types.StartupCatchUpStats,
+    configured_indexes: ?*const StartupConfiguredIndexes,
+    err: anyerror,
+) !void {
+    const snapshot_cache = source.runtime_status_cache orelse return;
+    const summary = configured_indexes orelse return;
+    const message = try std.fmt.allocPrint(alloc, "startup catch-up open failed: {s}", .{@errorName(err)});
+    defer alloc.free(message);
+    var terminal_startup = startup;
+    terminal_startup.active = false;
+    terminal_startup.phase = .idle;
+    terminal_startup.lsm_open_failed += 1;
+    var status = try syntheticStartupRuntimeStatusFromConfiguredIndexes(alloc, group_id, summary, terminal_startup, message);
+    defer status.deinit(alloc);
+    setRuntimeStatusMetadata(&status, .startup_catch_up, .stale);
+    try snapshot_cache.upsertGroupStatusPreservingMetadata(table_name, status);
 }
 
 fn catchUpManagedDb(
@@ -12469,6 +12521,7 @@ fn catchUpManagedDb(
         std.log.warn("managed startup catch-up dense rebuild probe failed table={s} err={}", .{ table_name, err });
         return err;
     };
+    const initial_repair_debt = had_debt or restore_repair_needed or needs_dense_artifact_rebuild;
 
     var repaired_restore_runtime = false;
     var repaired_dense_artifacts: usize = 0;
@@ -12519,7 +12572,7 @@ fn catchUpManagedDb(
         try db.core.index_manager.syncAll(false);
     }
 
-    if (!had_debt and !restore_repair_needed and !needs_dense_artifact_rebuild) {
+    if (!initial_repair_debt) {
         try publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .idle, db);
         return .{};
     }
@@ -12541,7 +12594,7 @@ fn catchUpManagedDb(
         try publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db);
     }
 
-    if (!had_debt and !repaired_restore_runtime and repaired_dense_artifacts == 0) {
+    if (!initial_repair_debt and !repaired_restore_runtime and repaired_dense_artifacts == 0) {
         return .{};
     }
 
@@ -12568,7 +12621,7 @@ fn catchUpManagedDb(
     for (after) |status| {
         if (status.catch_up_required) {
             return .{
-                .had_debt = had_debt or restore_repair_needed,
+                .had_debt = initial_repair_debt,
                 .cleared_debt = false,
             };
         }
@@ -12578,7 +12631,7 @@ fn catchUpManagedDb(
         return err;
     }) {
         return .{
-            .had_debt = had_debt or restore_repair_needed,
+            .had_debt = initial_repair_debt,
             .cleared_debt = false,
         };
     }
@@ -12587,13 +12640,13 @@ fn catchUpManagedDb(
         return err;
     }) {
         return .{
-            .had_debt = had_debt or restore_repair_needed,
+            .had_debt = initial_repair_debt,
             .cleared_debt = false,
         };
     }
     return .{
-        .had_debt = had_debt or restore_repair_needed,
-        .cleared_debt = had_debt or repaired_restore_runtime,
+        .had_debt = initial_repair_debt,
+        .cleared_debt = had_debt or repaired_restore_runtime or repaired_dense_artifacts > 0,
     };
 }
 
@@ -12648,11 +12701,34 @@ fn prepareLocalTablePathForRestore(alloc: std.mem.Allocator, path: []const u8) !
 
     const indexes_path = try std.fmt.allocPrint(alloc, "{s}/indexes", .{path});
     defer alloc.free(indexes_path);
-    std.Io.Dir.cwd().deleteTree(io, indexes_path) catch {};
+    try moveRestorePathToTrashIfPresent(alloc, io, path, indexes_path, "indexes");
 
     const snapshots_path = try std.fmt.allocPrint(alloc, "{s}.snapshots", .{path});
     defer alloc.free(snapshots_path);
     std.Io.Dir.cwd().deleteTree(io, snapshots_path) catch {};
+}
+
+fn moveRestorePathToTrashIfPresent(
+    alloc: std.mem.Allocator,
+    io: anytype,
+    table_path: []const u8,
+    source_path: []const u8,
+    name: []const u8,
+) !void {
+    const trash_dir_path = try std.fmt.allocPrint(alloc, "{s}/../{s}", .{ table_path, restore_trash_dir_name });
+    defer alloc.free(trash_dir_path);
+    try fs_paths.createDirPathPortable(io, trash_dir_path);
+
+    const trash_path = try std.fmt.allocPrint(alloc, "{s}/{s}-{d}", .{
+        trash_dir_path,
+        name,
+        platform_time.monotonicNs(),
+    });
+    defer alloc.free(trash_path);
+    std.Io.Dir.rename(std.Io.Dir.cwd(), source_path, std.Io.Dir.cwd(), trash_path, io) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
 }
 
 fn sleepNs(duration_ns: u64) void {
@@ -19760,6 +19836,7 @@ test "provisioned table write source read cache overlay preserves live replay st
             .index_name = "semantic_idx",
             .dense = .{ .vector = query_vec[0..], .k = 1 },
             .limit = 1,
+            .include_stored = false,
         };
         var profiled = try read_lease.db.searchDenseProfiled(alloc, req, req.dense.?);
         defer profiled.result.deinit();
@@ -19842,14 +19919,23 @@ test "provisioned table write source restore repair completion retires cached ve
     defer alloc.free(replica_root_dir);
     const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
     defer alloc.free(path);
+    const identity_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 7001, .range_id = 7001 };
 
     {
-        var db = try openManagedDbWithIndexesJson(
+        var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
             alloc,
             path,
             "{\"semantic_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}}",
+            null,
+            null,
+            table_reads.backend_current_root_generation,
+            null,
+            .default,
+            null,
+            identity_namespace,
         );
         defer db.close();
+        try doc_identity.writeNamespaceToStore(db.core.store, identity_namespace);
         try db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"semantic_idx\":[1,2]}}" }},
             .sync_level = .write,
@@ -19868,26 +19954,31 @@ test "provisioned table write source restore repair completion retires cached ve
         defer read_lease.release();
 
         const query_vec = [_]f32{ 1.0, 2.0 };
-        var result = try read_lease.db.search(alloc, .{
+        const req: db_mod.types.SearchRequest = .{
             .index_name = "semantic_idx",
             .dense = .{ .vector = query_vec[0..], .k = 1 },
             .limit = 1,
-        });
-        defer result.deinit();
-        try std.testing.expect(result.hits.len >= 1);
+            .include_stored = false,
+        };
+        var profiled = try read_lease.db.searchDenseProfiled(alloc, req, req.dense.?);
+        defer profiled.result.deinit();
+        try std.testing.expect(profiled.result.hits.len >= 1);
     }
 
     try std.testing.expect(hbc_cache.global_stats.total_bytes > 0);
     const stats_before = read_cache.cacheStats();
     {
-        var repair_db = try openManagedDbWithIndexesJsonAndCache(
+        var repair_db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
             alloc,
             path,
             "{\"semantic_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}}",
             null,
             &hbc_cache,
-            0,
+            table_reads.backend_current_root_generation,
             null,
+            .default,
+            null,
+            identity_namespace,
         );
         defer repair_db.close();
         repair_db.clearDenseHbcCaches();
@@ -22296,8 +22387,8 @@ test "managed startup catch-up uses provided indexes json without catalog fetch"
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expect(!statuses.items[0].stats.async_indexing.startup.active);
-    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.synthetic_config, statuses.items[0].metadata.source);
-    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.stale, statuses.items[0].metadata.freshness);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, statuses.items[0].metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, statuses.items[0].metadata.freshness);
 }
 
 test "managed startup catch-up reclaims due obsolete primary run files" {
@@ -23747,6 +23838,7 @@ test "managed startup catch-up repairs external dense doc gaps from stored artif
     defer alloc.free(replica_root_dir);
     const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
     defer alloc.free(path);
+    const identity_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 7001, .range_id = 7001 };
 
     const Catalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -23785,8 +23877,12 @@ test "managed startup catch-up repairs external dense doc gaps from stored artif
     };
 
     {
-        var db = try db_mod.DB.open(alloc, path, .{});
+        var db = try db_mod.DB.open(alloc, path, .{
+            .identity_namespace = identity_namespace,
+            .prefer_existing_identity_namespace = true,
+        });
         defer db.close();
+        try doc_identity.writeNamespaceToStore(db.core.store, identity_namespace);
 
         try db.addIndex(.{
             .name = "dense_idx",
@@ -23823,9 +23919,6 @@ test "managed startup catch-up repairs external dense doc gaps from stored artif
     source.runtime_status_cache = &snapshot_cache;
 
     const result = try source.catchUpTableGroupBestEffort(alloc, 7001, "docs");
-    try std.testing.expect(!result.busy);
-    try std.testing.expect(result.had_debt);
-    try std.testing.expect(result.cleared_debt);
 
     var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
     defer statuses.deinit(alloc);
@@ -23836,6 +23929,9 @@ test "managed startup catch-up repairs external dense doc gaps from stored artif
         if (!std.mem.eql(u8, index.name, "dense_idx")) continue;
         dense_doc_count = index.doc_count;
     }
+    try std.testing.expect(!result.busy);
+    try std.testing.expect(result.had_debt);
+    try std.testing.expect(result.cleared_debt);
     try std.testing.expectEqual(@as(?u64, 3), dense_doc_count);
 }
 

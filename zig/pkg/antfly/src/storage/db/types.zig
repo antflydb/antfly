@@ -1585,6 +1585,11 @@ pub const ArtifactRepairKind = enum {
     full_text,
 };
 
+pub const RepairTarget = enum {
+    artifact,
+    index,
+};
+
 pub const ArtifactRepairReason = enum {
     missing_artifact,
     corrupt_artifact,
@@ -1652,6 +1657,7 @@ pub const ArtifactRepairListResult = struct {
 };
 
 pub const ArtifactRepairRunRequest = struct {
+    target: RepairTarget = .artifact,
     artifact_kind: ?ArtifactRepairKind = null,
     index_name: ?[]const u8 = null,
     limit: u32 = 100,
@@ -1667,6 +1673,8 @@ pub const ArtifactRepairResult = struct {
     failed: u64 = 0,
     unsupported: u64 = 0,
     unresolved: u64 = 0,
+    indexes_rebuilt: u64 = 0,
+    indexes_degraded: u64 = 0,
     limit: u32 = 0,
     next_cursor: ?[]u8 = null,
     has_more: bool = false,

@@ -421,13 +421,15 @@ pub const ArtifactRepairReason = enum {
     }
 };
 
-/// Repair subsystem to inspect or run. This release implements artifact repair.
+/// Repair subsystem to inspect or run.
 pub const RepairTarget = enum {
     artifact,
+    index,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .artifact => "artifact",
+            .index => "index",
         };
         try jw.write(s);
     }
@@ -439,6 +441,7 @@ pub const RepairTarget = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "artifact", .artifact },
+            .{ "index", .index },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -462,6 +465,10 @@ pub const ArtifactRepairRunResult = struct {
     unsupported: i64,
     /// Number of attempted repair records that remained queued after this pass.
     unresolved: i64,
+    /// Number of indexes rebuilt by this pass when target is index.
+    indexes_rebuilt: i64,
+    /// Number of selected indexes that were already degraded or quarantined before repair.
+    indexes_degraded: i64,
     /// Effective repair limit.
     limit: i64,
     /// Opaque cursor for the next repair pass when has_more is true.
@@ -4244,7 +4251,7 @@ pub const ArtifactRepairIssue = struct {
 pub const RepairRunRequest = struct {
     target: ?RepairTarget = null,
     kind: ?ArtifactRepairKind = null,
-    /// Restrict artifact repair attempts to one index name.
+    /// Restrict repair attempts to one index name.
     index: ?[]const u8 = null,
     /// Opaque cursor returned by a prior repair response.
     cursor: ?[]const u8 = null,

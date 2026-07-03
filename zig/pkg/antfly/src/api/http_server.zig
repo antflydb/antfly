@@ -7221,7 +7221,8 @@ pub const ApiHttpServer = struct {
 
     pub fn handlePublicListArtifactRepairIssues(self: *ApiHttpServer, table_name: []const u8, query: []const u8) !http_common.HttpResponse {
         const source = self.table_writes orelse return try textResponse(self.alloc, 405, "method not allowed");
-        parseRepairTargetQuery(query) catch return try textResponse(self.alloc, 400, "invalid repair target");
+        const target = parseRepairTargetQuery(query) catch return try textResponse(self.alloc, 400, "invalid repair target");
+        if (target != .artifact) return try textResponse(self.alloc, 400, "invalid repair target");
         const artifact_kind = parseArtifactRepairKindQuery(query) catch return try textResponse(self.alloc, 400, "invalid artifact repair kind");
         const index_name = parseSimpleQueryParamDecodedAlloc(self.alloc, query, "index") catch return try textResponse(self.alloc, 400, "invalid index");
         defer if (index_name) |value| self.alloc.free(value);
@@ -7272,8 +7273,9 @@ pub const ApiHttpServer = struct {
             return try textResponse(self.alloc, 400, "invalid repair request");
         };
         defer parsed.deinit();
-        parseRepairTargetQuery(query) catch return try textResponse(self.alloc, 400, "invalid repair target");
-        if (!std.mem.eql(u8, parsed.value.target, "artifact")) return try textResponse(self.alloc, 400, "invalid repair target");
+        const query_target = parseRepairTargetQuery(query) catch return try textResponse(self.alloc, 400, "invalid repair target");
+        const body_target = std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) orelse return try textResponse(self.alloc, 400, "invalid repair target");
+        const target = query_target orelse body_target;
         const query_kind = parseArtifactRepairKindQuery(query) catch return try textResponse(self.alloc, 400, "invalid artifact repair kind");
         const artifact_kind = query_kind orelse parsed.value.kind;
         const query_index_name = parseSimpleQueryParamDecodedAlloc(self.alloc, query, "index") catch return try textResponse(self.alloc, 400, "invalid index");
@@ -7287,6 +7289,7 @@ pub const ApiHttpServer = struct {
         if (raw_limit == 0) return try textResponse(self.alloc, 400, "invalid limit");
         const limit: u32 = @intCast(@min(raw_limit, 1000));
         var result = (source.repairArtifactIssues(self.alloc, table_name, .{
+            .target = target,
             .artifact_kind = artifact_kind,
             .index_name = index_name,
             .limit = limit,
@@ -7301,7 +7304,7 @@ pub const ApiHttpServer = struct {
         defer result.deinit(self.alloc);
         const response_body = try std.json.Stringify.valueAlloc(self.alloc, .{
             .table = table_name,
-            .target = "artifact",
+            .target = @tagName(target),
             .limit = limit,
             .result = result,
         }, .{ .emit_null_optional_fields = false });
@@ -10003,9 +10006,9 @@ fn parseArtifactRepairKindQuery(query: []const u8) !?db_mod.types.ArtifactRepair
     return std.meta.stringToEnum(db_mod.types.ArtifactRepairKind, value) orelse error.InvalidArtifactRepairKind;
 }
 
-fn parseRepairTargetQuery(query: []const u8) !void {
-    const value = parseSimpleQueryParam(query, "target") orelse return;
-    if (!std.mem.eql(u8, value, "artifact")) return error.InvalidRepairTarget;
+fn parseRepairTargetQuery(query: []const u8) !?db_mod.types.RepairTarget {
+    const value = parseSimpleQueryParam(query, "target") orelse return null;
+    return std.meta.stringToEnum(db_mod.types.RepairTarget, value) orelse error.InvalidRepairTarget;
 }
 
 test "artifact repair query params decode percent encoded values" {
