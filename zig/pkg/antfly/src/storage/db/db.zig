@@ -21582,8 +21582,67 @@ fn appendArtifactRepairSummaryWriteForStore(
         return;
     }
     const value = try alloc.alloc(u8, @sizeOf(u64));
+    errdefer alloc.free(value);
     std.mem.writeInt(u64, value[0..8], updated, .little);
     try writes.append(alloc, .{ .key = key, .value = value });
+}
+
+fn artifactRepairSummaryReadyInStore(alloc: Allocator, store: *docstore_mod.DocStore) !bool {
+    const ready_key = try internal_keys.artifactRepairSummaryReadyKeyAlloc(alloc);
+    defer alloc.free(ready_key);
+    const ready = store.get(alloc, ready_key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    alloc.free(ready);
+    return true;
+}
+
+fn appendKeysForPrefixDeleteInStore(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_keys: *std.ArrayListUnmanaged([]const u8),
+    prefix: []const u8,
+) !void {
+    const upper = try internal_keys.nextPrefixAlloc(alloc, prefix);
+    defer if (upper) |buf| alloc.free(buf);
+    const ScanState = struct {
+        alloc: Allocator,
+        deletes: *std.ArrayListUnmanaged([]const u8),
+        owned_keys: *std.ArrayListUnmanaged([]const u8),
+
+        fn scanEntry(ctx: ?*anyopaque, key: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            const key_copy = try state.alloc.dupe(u8, key);
+            errdefer state.alloc.free(key_copy);
+            const owned_len = state.owned_keys.items.len;
+            try state.owned_keys.append(state.alloc, key_copy);
+            errdefer state.owned_keys.shrinkRetainingCapacity(owned_len);
+            try state.deletes.append(state.alloc, key_copy);
+            return .@"continue";
+        }
+    };
+    var state = ScanState{ .alloc = alloc, .deletes = deletes, .owned_keys = owned_keys };
+    try store.scanWithContext(prefix, if (upper) |buf| buf else "", .{}, &state, ScanState.scanEntry);
+}
+
+fn appendArtifactRepairSummaryRebuildInvalidationForStore(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_keys: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    const progress_key = try internal_keys.artifactRepairSummaryProgressKeyAlloc(alloc);
+    errdefer alloc.free(progress_key);
+    const owned_len = owned_keys.items.len;
+    try owned_keys.append(alloc, progress_key);
+    errdefer owned_keys.shrinkRetainingCapacity(owned_len);
+    try deletes.append(alloc, progress_key);
+
+    const rebuild_prefix = try internal_keys.artifactRepairSummaryRebuildRootKeyAlloc(alloc);
+    defer alloc.free(rebuild_prefix);
+    try appendKeysForPrefixDeleteInStore(alloc, store, deletes, owned_keys, rebuild_prefix);
 }
 
 fn saveArtifactRepairIssueToStoreWithSummary(
@@ -21606,10 +21665,11 @@ fn saveArtifactRepairIssueToStoreWithSummary(
         return;
     }
 
-    const root_summary_key = try internal_keys.artifactRepairSummaryRootKeyAlloc(alloc);
-    defer alloc.free(root_summary_key);
-    const index_summary_key = try internal_keys.artifactRepairSummaryIndexKeyAlloc(alloc, issue.index_name);
-    defer alloc.free(index_summary_key);
+    const summary_ready = try artifactRepairSummaryReadyInStore(alloc, store);
+    const root_summary_key = if (summary_ready) try internal_keys.artifactRepairSummaryRootKeyAlloc(alloc) else null;
+    defer if (root_summary_key) |value| alloc.free(value);
+    const index_summary_key = if (summary_ready) try internal_keys.artifactRepairSummaryIndexKeyAlloc(alloc, issue.index_name) else null;
+    defer if (index_summary_key) |value| alloc.free(value);
 
     var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer {
@@ -21620,11 +21680,20 @@ fn saveArtifactRepairIssueToStoreWithSummary(
     }
     var deletes = std.ArrayListUnmanaged([]const u8).empty;
     defer deletes.deinit(alloc);
+    var owned_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (owned_delete_keys.items) |owned_key| alloc.free(@constCast(owned_key));
+        owned_delete_keys.deinit(alloc);
+    }
 
     try writes.append(alloc, .{ .key = key, .value = encoded });
     try writes.append(alloc, .{ .key = kind_key, .value = encoded });
-    try appendArtifactRepairSummaryWriteForStore(alloc, store, &writes, &deletes, root_summary_key, 1);
-    try appendArtifactRepairSummaryWriteForStore(alloc, store, &writes, &deletes, index_summary_key, 1);
+    if (summary_ready) {
+        try appendArtifactRepairSummaryWriteForStore(alloc, store, &writes, &deletes, root_summary_key.?, 1);
+        try appendArtifactRepairSummaryWriteForStore(alloc, store, &writes, &deletes, index_summary_key.?, 1);
+    } else {
+        try appendArtifactRepairSummaryRebuildInvalidationForStore(alloc, store, &deletes, &owned_delete_keys);
+    }
     try store.putBatch(writes.items, deletes.items);
 }
 
@@ -35405,6 +35474,102 @@ test "db artifact repair summary rebuild invalidates partial counters on mutatio
         const rebuild_root_summary_key = try internal_keys.artifactRepairSummaryRebuildRootKeyAlloc(alloc);
         defer alloc.free(rebuild_root_summary_key);
         try std.testing.expectError(error.NotFound, db.core.store.get(alloc, rebuild_root_summary_key));
+    }
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 1024), stats.repair_issue_count);
+    }
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const ready_key = try internal_keys.artifactRepairSummaryReadyKeyAlloc(alloc);
+        defer alloc.free(ready_key);
+        const ready = try db.core.store.get(alloc, ready_key);
+        defer alloc.free(ready);
+
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expect(stats.repair_degraded);
+        try std.testing.expectEqual(@as(u64, seeded_count + 1), stats.repair_issue_count);
+    }
+}
+
+test "db artifact repair summary store writer invalidates partial rebuild" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const seeded_count: usize = 1030;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        for (0..seeded_count) |i| {
+            const doc_key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i});
+            defer alloc.free(doc_key);
+            var issue = types.ArtifactRepairIssue{
+                .artifact_kind = .asset,
+                .index_name = try alloc.dupe(u8, "document_units_v1"),
+                .doc_key = try alloc.dupe(u8, doc_key),
+                .artifact_name = try alloc.dupe(u8, "document_units_v1"),
+                .reason = .corrupt_artifact,
+                .sequence = @intCast(i + 1),
+            };
+            defer issue.deinit(alloc);
+            const key = try artifactRepairIssueKeyForIssueAlloc(alloc, issue);
+            defer alloc.free(key);
+            const value = try encodeArtifactRepairIssueValueAlloc(alloc, issue);
+            defer alloc.free(value);
+            try db.core.store.put(key, value);
+        }
+        const ready_key = try internal_keys.artifactRepairSummaryReadyKeyAlloc(alloc);
+        defer alloc.free(ready_key);
+        const progress_key = try internal_keys.artifactRepairSummaryProgressKeyAlloc(alloc);
+        defer alloc.free(progress_key);
+        const root_summary_key = try internal_keys.artifactRepairSummaryRootKeyAlloc(alloc);
+        defer alloc.free(root_summary_key);
+        try db.core.store.putBatch(&.{}, &.{ ready_key, progress_key, root_summary_key });
+    }
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 1024), stats.repair_issue_count);
+
+        var issue = types.ArtifactRepairIssue{
+            .artifact_kind = .asset,
+            .index_name = try alloc.dupe(u8, "document_units_v1"),
+            .doc_key = try alloc.dupe(u8, "doc:0001-extra"),
+            .artifact_name = try alloc.dupe(u8, "document_units_v1"),
+            .reason = .corrupt_artifact,
+            .sequence = 9999,
+        };
+        defer issue.deinit(alloc);
+        const key = try artifactRepairIssueKeyForIssueAlloc(alloc, issue);
+        defer alloc.free(key);
+        try saveArtifactRepairIssueToStoreWithSummary(alloc, db.core.store, key, issue, true);
+
+        const progress_key = try internal_keys.artifactRepairSummaryProgressKeyAlloc(alloc);
+        defer alloc.free(progress_key);
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, progress_key));
+        const rebuild_root_summary_key = try internal_keys.artifactRepairSummaryRebuildRootKeyAlloc(alloc);
+        defer alloc.free(rebuild_root_summary_key);
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, rebuild_root_summary_key));
+        const root_summary_key = try internal_keys.artifactRepairSummaryRootKeyAlloc(alloc);
+        defer alloc.free(root_summary_key);
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, root_summary_key));
     }
 
     {
