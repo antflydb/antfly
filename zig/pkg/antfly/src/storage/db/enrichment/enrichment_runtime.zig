@@ -3960,6 +3960,7 @@ fn processMaterializedChunkDenseRequest(
         runtime: *EnrichmentRuntime,
         prefix: []const u8,
         source_field: []const u8,
+        embedding_artifact_name: []const u8,
         desired: *std.StringHashMapUnmanaged(void),
         existing_embeddings: *std.ArrayListUnmanaged([]u8),
 
@@ -3967,6 +3968,7 @@ fn processMaterializedChunkDenseRequest(
             const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr orelse return error.InvalidArgument));
             if (!std.mem.startsWith(u8, key, ctx.prefix)) return .stop;
             if (internal_keys.isDerivedEmbeddingArtifactKey(key)) {
+                if (!internal_keys.matchesDerivedEmbeddingArtifactName(key, ctx.embedding_artifact_name)) return .@"continue";
                 try appendUniqueDupeKey(ctx.runtime.alloc, ctx.existing_embeddings, key);
                 return .@"continue";
             }
@@ -3980,6 +3982,7 @@ fn processMaterializedChunkDenseRequest(
         .runtime = runtime,
         .prefix = prefix,
         .source_field = request.source_field,
+        .embedding_artifact_name = embedding_artifact_name,
         .desired = &desired_chunk_keys,
         .existing_embeddings = &existing_embedding_keys,
     };
@@ -4166,6 +4169,7 @@ fn processMaterializedChunkSparseRequest(
         runtime: *EnrichmentRuntime,
         prefix: []const u8,
         source_field: []const u8,
+        embedding_artifact_name: []const u8,
         desired: *std.StringHashMapUnmanaged(void),
         existing_embeddings: *std.ArrayListUnmanaged([]u8),
 
@@ -4173,6 +4177,7 @@ fn processMaterializedChunkSparseRequest(
             const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr orelse return error.InvalidArgument));
             if (!std.mem.startsWith(u8, key, ctx.prefix)) return .stop;
             if (internal_keys.isDerivedEmbeddingArtifactKey(key)) {
+                if (!internal_keys.matchesDerivedEmbeddingArtifactName(key, ctx.embedding_artifact_name)) return .@"continue";
                 try appendUniqueDupeKey(ctx.runtime.alloc, ctx.existing_embeddings, key);
                 return .@"continue";
             }
@@ -4186,6 +4191,7 @@ fn processMaterializedChunkSparseRequest(
         .runtime = runtime,
         .prefix = prefix,
         .source_field = request.source_field,
+        .embedding_artifact_name = embedding_artifact_name,
         .desired = &desired_chunk_keys,
         .existing_embeddings = &existing_embedding_keys,
     };
@@ -6622,9 +6628,9 @@ fn deleteStaleChunkEmbeddingArtifacts(
     var artifact_delete_keys = std.ArrayListUnmanaged([]u8).empty;
     errdefer freeKeyList(runtime.alloc, artifact_delete_keys.items);
 
-    _ = embedding_artifact_name;
     for (existing) |entry| {
         if (!internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) continue;
+        if (!internal_keys.matchesDerivedEmbeddingArtifactName(entry.key, embedding_artifact_name)) continue;
         if (derivedEmbeddingBelongsToDesiredChunk(entry.key, desired_chunk_keys)) continue;
         if (try internal_keys.derivedEmbeddingBaseKeyAlloc(runtime.alloc, entry.key)) |base_key| {
             try appendUniqueOwnedKey(runtime.alloc, &stale_vector_keys, base_key);

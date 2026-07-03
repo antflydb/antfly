@@ -34540,6 +34540,13 @@ test "db document extraction chunks units through source artifact enrichment" {
         .expected_dims = 3,
     });
     try db.addEnrichment(.{
+        .name = "document_chunk_caption_dense_v1",
+        .kind = .embedding,
+        .field = "caption",
+        .source_artifact_name = "document_chunks_v1",
+        .expected_dims = 3,
+    });
+    try db.addEnrichment(.{
         .name = "document_chunk_sparse_v1",
         .kind = .embedding,
         .field = "text",
@@ -34554,6 +34561,11 @@ test "db document extraction chunks units through source artifact enrichment" {
         .name = "document_vectors",
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
+    });
+    try db.addIndex(.{
+        .name = "document_caption_vectors",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_caption_dense_v1\"}",
     });
     try db.addIndex(.{
         .name = "document_chunk_sparse_v1",
@@ -34588,6 +34600,7 @@ test "db document extraction chunks units through source artifact enrichment" {
     defer enrichment_types.deinitGeneratedRequests(alloc, planned);
     var saw_document_asset = false;
     var saw_document_chunk_dense = false;
+    var saw_document_chunk_caption_dense = false;
     var saw_document_chunk_sparse = false;
     for (planned) |request| {
         if (request.kind == .asset and std.mem.eql(u8, request.artifact_name, "document_units_v1")) saw_document_asset = true;
@@ -34597,6 +34610,13 @@ test "db document extraction chunks units through source artifact enrichment" {
             request.chunk_size == 256)
         {
             saw_document_chunk_dense = true;
+        }
+        if (request.kind == .dense_embedding and
+            std.mem.eql(u8, request.artifact_name, "document_chunks_v1") and
+            std.mem.eql(u8, request.embedding_name, "document_chunk_caption_dense_v1") and
+            request.chunk_size == 256)
+        {
+            saw_document_chunk_caption_dense = true;
         }
         if (request.kind == .sparse_embedding and
             std.mem.eql(u8, request.artifact_name, "document_chunks_v1") and
@@ -34608,6 +34628,7 @@ test "db document extraction chunks units through source artifact enrichment" {
     }
     try std.testing.expect(saw_document_asset);
     try std.testing.expect(saw_document_chunk_dense);
+    try std.testing.expect(saw_document_chunk_caption_dense);
     try std.testing.expect(saw_document_chunk_sparse);
 
     try db.batch(.{
@@ -34779,6 +34800,10 @@ test "db document extraction chunks units through source artifact enrichment" {
     const updated_chunk_payload = try db.core.store.get(alloc, chunk_key);
     defer alloc.free(updated_chunk_payload);
     try std.testing.expect(std.mem.indexOf(u8, updated_chunk_payload, "\"text\":\"alpha beta delta\"") != null);
+    const refreshed_dense_artifact_payload = try db.core.store.get(alloc, dense_artifact_key);
+    defer alloc.free(refreshed_dense_artifact_payload);
+    const refreshed_sparse_artifact_payload = try db.core.store.get(alloc, sparse_artifact_key);
+    defer alloc.free(refreshed_sparse_artifact_payload);
 
     try db.batch(.{
         .writes = &.{.{
