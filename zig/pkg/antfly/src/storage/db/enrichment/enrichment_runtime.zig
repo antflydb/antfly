@@ -3778,6 +3778,20 @@ fn freeChunkedDenseWindowItems(
     for (items) |item| alloc.free(item.chunk_key);
 }
 
+fn clearChunkedDenseBatch(
+    alloc: Allocator,
+    chunk_texts: *std.ArrayListUnmanaged([]const u8),
+    chunk_items: *std.ArrayListUnmanaged(ChunkedDenseWindowItem),
+    owns_texts: bool,
+) void {
+    if (owns_texts) {
+        for (chunk_texts.items) |text| alloc.free(@constCast(text));
+    }
+    freeChunkedDenseWindowItems(alloc, chunk_items.items);
+    chunk_items.clearRetainingCapacity();
+    chunk_texts.clearRetainingCapacity();
+}
+
 fn flushChunkedDenseItems(
     runtime: *EnrichmentRuntime,
     dense_embedder: embedder_mod.DenseEmbedder,
@@ -3787,6 +3801,7 @@ fn flushChunkedDenseItems(
     chunk_texts: *std.ArrayListUnmanaged([]const u8),
     chunk_items: *std.ArrayListUnmanaged(ChunkedDenseWindowItem),
     window: *GeneratedReplayWindow,
+    owns_texts: bool,
 ) !bool {
     if (chunk_items.items.len == 0) return true;
 
@@ -3800,9 +3815,7 @@ fn flushChunkedDenseItems(
         noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
         if (isRetryableEnrichmentError(err)) return err;
         for (batch_items) |item| recordIsolatedRequestError(runtime, item.request, err);
-        freeChunkedDenseWindowItems(runtime.alloc, chunk_items.items);
-        chunk_items.clearRetainingCapacity();
-        chunk_texts.clearRetainingCapacity();
+        clearChunkedDenseBatch(runtime.alloc, chunk_texts, chunk_items, owns_texts);
         return false;
     };
     noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
@@ -3860,10 +3873,100 @@ fn flushChunkedDenseItems(
     }
     try appendOwnedDenseEmbeddingsToWindow(runtime, window, &expanded);
 
-    freeChunkedDenseWindowItems(runtime.alloc, chunk_items.items);
-    chunk_items.clearRetainingCapacity();
-    chunk_texts.clearRetainingCapacity();
+    clearChunkedDenseBatch(runtime.alloc, chunk_texts, chunk_items, owns_texts);
     return true;
+}
+
+fn processMaterializedChunkDenseRequest(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    chunk_artifact_name: []const u8,
+    embedding_artifact_name: []const u8,
+    dense_embedder: embedder_mod.DenseEmbedder,
+    consumer_indexes: []const []const u8,
+    window: *GeneratedReplayWindow,
+) !void {
+    const max_window_items = generatedReplayWindowItems();
+    const max_batch_items = generatedEmbedBatchItems();
+    const max_batch_bytes = generatedEmbedBatchBytes();
+
+    var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (chunk_texts.items) |text| runtime.alloc.free(@constCast(text));
+        chunk_texts.deinit(runtime.alloc);
+    }
+    var chunk_items = std.ArrayListUnmanaged(ChunkedDenseWindowItem).empty;
+    defer {
+        freeChunkedDenseWindowItems(runtime.alloc, chunk_items.items);
+        chunk_items.deinit(runtime.alloc);
+    }
+    var desired_chunk_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer freeKeyList(runtime.alloc, desired_chunk_keys.items);
+    var existing_embedding_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer freeKeyList(runtime.alloc, existing_embedding_keys.items);
+
+    const prefix = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "chunk", chunk_artifact_name);
+    defer runtime.alloc.free(prefix);
+    const existing = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, prefix);
+    defer backend_scan.freeResults(runtime.alloc, existing);
+
+    var batch_source_bytes: usize = 0;
+    for (existing) |entry| {
+        if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) {
+            try appendUniqueDupeKey(runtime.alloc, &existing_embedding_keys, entry.key);
+            continue;
+        }
+        if (!internal_keys.isChunkArtifactRecordKey(entry.key)) continue;
+
+        const text = (try chunkPayloadTextAlloc(runtime.alloc, entry.value, request.source_field)) orelse continue;
+        var text_owned = true;
+        errdefer if (text_owned) runtime.alloc.free(text);
+        try appendUniqueDupeKey(runtime.alloc, &desired_chunk_keys, entry.key);
+        const source_hash = enrichment_artifact_codec.hashSource(text);
+        const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, entry.key, embedding_artifact_name);
+        defer runtime.alloc.free(embedding_key);
+        if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
+            runtime.alloc.free(text);
+            text_owned = false;
+            try appendCachedChunkDenseEmbeddingToWindow(runtime, window, request, entry.key, embedding_key, consumer_indexes);
+            try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
+            continue;
+        }
+        if (chunk_items.items.len > 0 and
+            (chunk_items.items.len >= max_batch_items or batch_source_bytes + text.len > max_batch_bytes))
+        {
+            _ = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, request.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true);
+            try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
+            batch_source_bytes = 0;
+        }
+        try chunk_texts.append(runtime.alloc, text);
+        text_owned = false;
+        try chunk_items.append(runtime.alloc, .{
+            .request = request,
+            .parent_doc_key = request.doc_key,
+            .source_field = request.source_field,
+            .artifact_name = embedding_artifact_name,
+            .chunk_key = try runtime.alloc.dupe(u8, entry.key),
+            .source_hash = source_hash,
+        });
+        batch_source_bytes += text.len;
+        if (chunk_items.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
+            _ = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, request.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true);
+            try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
+            batch_source_bytes = 0;
+        }
+    }
+
+    _ = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, request.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true);
+
+    for (existing_embedding_keys.items) |embedding_key| {
+        if (derivedEmbeddingBelongsToDesiredChunk(embedding_key, desired_chunk_keys.items)) continue;
+        if (try internal_keys.derivedEmbeddingBaseKeyAlloc(runtime.alloc, embedding_key)) |base_key| {
+            try appendUniqueOwnedKey(runtime.alloc, &window.deleted_keys, base_key);
+        }
+        try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, embedding_key);
+    }
+    try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
 }
 
 fn collectPlainDenseBatchItem(
@@ -4064,6 +4167,11 @@ fn processChunkedDenseWindow(
             processed[j] = true;
 
             const chunk_artifact_name = requestArtifactName(request);
+            if (requestUsesMaterializedChunkArtifact(runtime, chunk_artifact_name)) {
+                try processMaterializedChunkDenseRequest(runtime, request, chunk_artifact_name, embedding_artifact_name, dense_embedder, consumer_indexes, window);
+                continue;
+            }
+
             var source_set = try chunkEmbeddingSourceSetForRequest(runtime, request, chunk_artifact_name, chunk_cache);
             defer source_set.deinit(runtime.alloc);
             const request_stale = try deleteStaleChunkEmbeddingArtifacts(runtime, request.doc_key, chunk_artifact_name, embedding_artifact_name, source_set.desired_chunk_keys);
@@ -4084,7 +4192,7 @@ fn processChunkedDenseWindow(
                 if (chunk_items.items.len > 0 and
                     (chunk_items.items.len >= max_batch_items or batch_source_bytes + source.text.len > max_batch_bytes))
                 {
-                    _ = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window);
+                    _ = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, false);
                     try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
                     batch_source_bytes = 0;
                 }
@@ -4099,7 +4207,7 @@ fn processChunkedDenseWindow(
                 });
                 batch_source_bytes += source.text.len;
                 if (chunk_items.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
-                    _ = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window);
+                    _ = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, false);
                     try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
                     batch_source_bytes = 0;
                 }
@@ -4107,7 +4215,7 @@ fn processChunkedDenseWindow(
         }
 
         if (chunk_items.items.len == 0) continue;
-        _ = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window);
+        _ = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, false);
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
     }
 }

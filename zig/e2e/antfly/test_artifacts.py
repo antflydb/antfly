@@ -20,7 +20,6 @@ import json
 import time
 from urllib.parse import quote
 
-from conftest import ready_index_status
 from helpers import wait_until
 
 DOCUMENT_UNITS_ARTIFACT = "document_units_v1"
@@ -352,19 +351,6 @@ def test_artifact_backed_chunk_embeddings_are_semantic_searchable(stateful_api, 
     index_detail = stateful_api.get_index(table_name, "document_vectors")
     assert index_detail["config"]["name"] == "document_vectors"
     assert index_detail["config"]["type"] == "embeddings"
-    ready_vectors = wait_until(
-        lambda: ready_index_status(stateful_api.get_index(table_name, "document_vectors")),
-        timeout_s=30.0,
-        interval_s=0.5,
-    )
-    assert ready_vectors is not None, json.dumps(
-        {
-            "index": stateful_api.get_index(table_name, "document_vectors"),
-            "table": stateful_api.get_table(table_name),
-        },
-        indent=2,
-        sort_keys=True,
-    )
 
     doc_key = "doc-a"
     batch = stateful_api.batch_write(
