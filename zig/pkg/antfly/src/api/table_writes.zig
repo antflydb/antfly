@@ -1449,6 +1449,7 @@ pub const ProvisionedTableWriteCache = struct {
                 .group_id = entry.group_id,
                 .stats = try entry.db.runtimeStatusStatsConsistent(alloc),
             };
+            markRuntimeStatusFromDb(&items[initialized], .idle);
             initialized += 1;
         }
         return .{ .items = items };
@@ -2181,6 +2182,7 @@ const HostedManagedDbCache = struct {
     replica_root_dir: []u8,
     mutex: std.atomic.Mutex = .unlocked,
     write_cache: ProvisionedTableWriteCache,
+    runtime_status_cache: runtime_status.TableRuntimeSnapshotCache,
 
     fn init(alloc: std.mem.Allocator, replica_root_dir: []const u8) !*HostedManagedDbCache {
         const cache = try alloc.create(HostedManagedDbCache);
@@ -2188,6 +2190,7 @@ const HostedManagedDbCache = struct {
         cache.* = .{
             .replica_root_dir = try alloc.dupe(u8, replica_root_dir),
             .write_cache = ProvisionedTableWriteCache.init(alloc),
+            .runtime_status_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc),
         };
         return cache;
     }
@@ -2234,6 +2237,7 @@ pub fn closeHostedManagedDbCacheForRoot(replica_root_dir: []const u8) void {
     const cache = removed orelse return;
     lockAtomic(&cache.mutex);
     cache.write_cache.deinit();
+    cache.runtime_status_cache.deinit();
     cache.mutex.unlock();
     alloc.free(cache.replica_root_dir);
     alloc.destroy(cache);
@@ -8438,6 +8442,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         lockAtomic(&hosted_cache.mutex);
         defer hosted_cache.mutex.unlock();
         hosted_cache.write_cache.invalidateTable(table_name);
+        hosted_cache.runtime_status_cache.invalidateTable(table_name);
     }
 
     fn getOrOpenCachedDbMode(
@@ -8639,6 +8644,13 @@ pub const HostedProvisionedTableWriteSource = struct {
                 _ = try cached.db.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
             }
             try drainManagedDbBeforeClose(cached.db);
+            try publishRuntimeStatusSnapshotToCacheConsistent(
+                &cache.runtime_status_cache,
+                alloc,
+                table_name,
+                group_id,
+                cached.db,
+            );
         }
     }
 
@@ -9036,6 +9048,9 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?runtime_status.LocalTableRuntimeStatuses {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (hostedManagedDbCacheForRootIfPresent(self.replica_root_dir)) |hosted_cache| {
+            if (try hosted_cache.runtime_status_cache.snapshot(alloc, table_name)) |statuses| {
+                return statuses;
+            }
             lockAtomic(&hosted_cache.mutex);
             defer hosted_cache.mutex.unlock();
             const statuses = try hosted_cache.write_cache.snapshotRuntimeStatusesLocked(alloc, table_name);
@@ -11387,8 +11402,30 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
     db: *db_mod.DB,
 ) !void {
     const snapshot_cache = source.runtime_status_cache orelse return;
+    try publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(snapshot_cache, alloc, table_name, group_id, phase, mode, db);
+}
+
+fn publishRuntimeStatusSnapshotToCacheConsistent(
+    snapshot_cache: *runtime_status.TableRuntimeSnapshotCache,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    group_id: u64,
+    db: *db_mod.DB,
+) !void {
+    try publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(snapshot_cache, alloc, table_name, group_id, .idle, .consistent, db);
+}
+
+fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
+    snapshot_cache: *runtime_status.TableRuntimeSnapshotCache,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    group_id: u64,
+    phase: db_mod.types.StartupCatchUpPhase,
+    mode: RuntimeStatusSnapshotMode,
+    db: *db_mod.DB,
+) !void {
     const async_stats = db.snapshotAsyncIndexingStats();
-    if (mode == .best_effort and source.startup_catch_up_active.load(.monotonic) and phase != .idle) {
+    if (mode == .best_effort and phase != .idle) {
         if (try snapshot_cache.snapshotGroupStatus(alloc, table_name, group_id)) |cached_status| {
             var status = cached_status;
             defer status.deinit(alloc);
@@ -23936,6 +23973,12 @@ test "hosted write cache opens current visible root generation" {
     cached_second.deinit(hosted_cache.write_cache.alloc);
     try std.testing.expectEqual(@as(usize, 1), hosted_cache.write_cache.entries.items.len);
     try std.testing.expectEqual(@as(u64, 2), hosted_cache.write_cache.entries.items[0].lsm_root_generation);
+
+    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, statuses.items[0].metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, statuses.items[0].metadata.freshness);
 }
 
 test "write cache adopts just-created db across reconcile generation bump" {
