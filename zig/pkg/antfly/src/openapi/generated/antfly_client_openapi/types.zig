@@ -2609,6 +2609,18 @@ pub const FullTextIndexStats = struct {
     backfill_progress: ?f64 = null,
     /// Number of documents indexed during current rebuild
     backfill_items_processed: ?i64 = null,
+    /// Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required.
+    projection_checkpoint_status: ?[]const u8 = null,
+    /// Highest derived-log sequence covered by the durable projection checkpoint.
+    projection_checkpoint_applied_sequence: ?i64 = null,
+    /// Projection generation associated with the durable checkpoint.
+    projection_checkpoint_generation: ?i64 = null,
+    /// Projection configuration identity associated with the durable checkpoint.
+    projection_checkpoint_config_hash: ?i64 = null,
+    /// Number of derived-log sequences after the durable checkpoint that still need replay.
+    checkpoint_replay_tail_sequence_count: ?i64 = null,
+    /// Repair issues found by explicit repair-scan accounting for this projection.
+    repair_scan_issue_count: ?i64 = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -2656,6 +2668,18 @@ pub const EmbeddingsIndexStats = struct {
     backfill_progress: ?f64 = null,
     /// Total items processed during backfill
     backfill_items_processed: ?i64 = null,
+    /// Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required.
+    projection_checkpoint_status: ?[]const u8 = null,
+    /// Highest derived-log sequence covered by the durable projection checkpoint.
+    projection_checkpoint_applied_sequence: ?i64 = null,
+    /// Projection generation associated with the durable checkpoint.
+    projection_checkpoint_generation: ?i64 = null,
+    /// Projection configuration identity associated with the durable checkpoint.
+    projection_checkpoint_config_hash: ?i64 = null,
+    /// Number of derived-log sequences after the durable checkpoint that still need replay.
+    checkpoint_replay_tail_sequence_count: ?i64 = null,
+    /// Repair issues found by explicit repair-scan accounting for this projection.
+    repair_scan_issue_count: ?i64 = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -2697,6 +2721,18 @@ pub const GraphIndexStats = struct {
     backfill_progress: ?f64 = null,
     /// Number of edges indexed during current rebuild
     backfill_items_processed: ?i64 = null,
+    /// Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required.
+    projection_checkpoint_status: ?[]const u8 = null,
+    /// Highest derived-log sequence covered by the durable projection checkpoint.
+    projection_checkpoint_applied_sequence: ?i64 = null,
+    /// Projection generation associated with the durable checkpoint.
+    projection_checkpoint_generation: ?i64 = null,
+    /// Projection configuration identity associated with the durable checkpoint.
+    projection_checkpoint_config_hash: ?i64 = null,
+    /// Number of derived-log sequences after the durable checkpoint that still need replay.
+    checkpoint_replay_tail_sequence_count: ?i64 = null,
+    /// Repair issues found by explicit repair-scan accounting for this projection.
+    repair_scan_issue_count: ?i64 = null,
     /// Algebraic graph execution health for bounded semiring traversal.
     algebraic_graph: ?std.json.Value = null,
 };
@@ -2766,6 +2802,18 @@ pub const AlgebraicIndexStats = struct {
     active_progress_lifecycle: ?[]const u8 = null,
     active_progress_rows_processed: ?i64 = null,
     active_progress_target_rows: ?i64 = null,
+    /// Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required.
+    projection_checkpoint_status: ?[]const u8 = null,
+    /// Highest derived-log sequence covered by the durable projection checkpoint.
+    projection_checkpoint_applied_sequence: ?i64 = null,
+    /// Projection generation associated with the durable checkpoint.
+    projection_checkpoint_generation: ?i64 = null,
+    /// Projection configuration identity associated with the durable checkpoint.
+    projection_checkpoint_config_hash: ?i64 = null,
+    /// Number of derived-log sequences after the durable checkpoint that still need replay.
+    checkpoint_replay_tail_sequence_count: ?i64 = null,
+    /// Repair issues found by explicit repair-scan accounting for this projection.
+    repair_scan_issue_count: ?i64 = null,
 };
 
 /// Available tool names for retrieval agents. - add_filter: Add search filters (field constraints) - ask_clarification: Ask user for clarification - web_search: Search the web (requires web_search_connection or web_search_config) - fetch: Fetch URL content (subject to security controls) - semantic_search: Execute semantic/vector search against an index - full_text_search: Execute full-text BM25 search against an index - tree_search: Execute tree search with beam search navigation - graph_search: Execute graph traversal search - aggregate: Execute aggregations against an index

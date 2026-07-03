@@ -194,6 +194,35 @@ components:
           type: integer
           format: uint64
           description: "Number of documents indexed during current rebuild"
+        projection_checkpoint_status:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required."
+        projection_checkpoint_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Highest derived-log sequence covered by the durable projection checkpoint."
+        projection_checkpoint_generation:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Projection generation associated with the durable checkpoint."
+        projection_checkpoint_config_hash:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Projection configuration identity associated with the durable checkpoint."
+        checkpoint_replay_tail_sequence_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of derived-log sequences after the durable checkpoint that still need replay."
+        repair_scan_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Repair issues found by explicit repair-scan accounting for this projection."
     EmbeddingsIndexConfig:
       type: object
       description: >-
@@ -324,6 +353,35 @@ components:
           type: integer
           format: uint64
           description: "Total items processed during backfill"
+        projection_checkpoint_status:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required."
+        projection_checkpoint_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Highest derived-log sequence covered by the durable projection checkpoint."
+        projection_checkpoint_generation:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Projection generation associated with the durable checkpoint."
+        projection_checkpoint_config_hash:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Projection configuration identity associated with the durable checkpoint."
+        checkpoint_replay_tail_sequence_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of derived-log sequences after the durable checkpoint that still need replay."
+        repair_scan_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Repair issues found by explicit repair-scan accounting for this projection."
     IndexStats:
       type: object
       description: "Statistics for an index"
@@ -466,6 +524,35 @@ components:
           x-go-type-skip-optional-pointer: true
           type: integer
           format: uint64
+        projection_checkpoint_status:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required."
+        projection_checkpoint_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Highest derived-log sequence covered by the durable projection checkpoint."
+        projection_checkpoint_generation:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Projection generation associated with the durable checkpoint."
+        projection_checkpoint_config_hash:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Projection configuration identity associated with the durable checkpoint."
+        checkpoint_replay_tail_sequence_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of derived-log sequences after the durable checkpoint that still need replay."
+        repair_scan_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Repair issues found by explicit repair-scan accounting for this projection."
     MergeStrategy:
       type: string
       enum:
@@ -696,6 +783,35 @@ components:
           type: integer
           format: uint64
           description: "Number of edges indexed during current rebuild"
+        projection_checkpoint_status:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required."
+        projection_checkpoint_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Highest derived-log sequence covered by the durable projection checkpoint."
+        projection_checkpoint_generation:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Projection generation associated with the durable checkpoint."
+        projection_checkpoint_config_hash:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Projection configuration identity associated with the durable checkpoint."
+        checkpoint_replay_tail_sequence_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of derived-log sequences after the durable checkpoint that still need replay."
+        repair_scan_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Repair issues found by explicit repair-scan accounting for this projection."
         algebraic_graph:
           x-go-type-skip-optional-pointer: true
           type: object

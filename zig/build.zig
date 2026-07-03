@@ -2783,6 +2783,7 @@ pub fn build(b: *std.Build) void {
         "batch parser preserves oversized value errors",
         "batch parser accepts raw payload value under public request cap",
         "linear merge request parser accepts raw payload value under public request cap",
+        "public index contract exposes runtime status metadata",
         "artifact enrichment request permits asset full text routing",
         "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
         "provisioned group storage wires remote content to writer caches",
