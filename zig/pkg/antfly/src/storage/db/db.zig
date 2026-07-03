@@ -47574,11 +47574,12 @@ test "db dense artifact rebuild trusts clean projection checkpoint without artif
             .generation = 3,
         });
         const checkpoint_path = db.core.applied_sequence_checkpoint_path orelse return error.TestUnexpectedResult;
+        const mirrored_ahead_sequence: u64 = 1000;
         try apply_state.saveProjectionCheckpointWithSidecar(alloc, db.core.store, checkpoint_path, "dense_idx", .{
-            .applied_sequence = 0,
-            .status = .repair_required,
+            .applied_sequence = mirrored_ahead_sequence,
+            .status = .clean,
             .generation = 99,
-            .config_hash = 0xdead,
+            .config_hash = types.indexConfigHash(dense_cfg),
         });
 
         const stale_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:stale", "dense_idx");
@@ -47597,6 +47598,7 @@ test "db dense artifact rebuild trusts clean projection checkpoint without artif
 
     const checkpoint = try reopened.core.loadProjectionCheckpoint(alloc, "dense_idx");
     try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
+    try std.testing.expect(checkpoint.applied_sequence < 1000);
     try std.testing.expectEqual(@as(u64, 3), checkpoint.generation);
     try std.testing.expectEqual(types.indexConfigHash(.{
         .name = "dense_idx",
