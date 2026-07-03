@@ -4111,8 +4111,23 @@ pub const ProvisionedTableWriteSource = struct {
         self.invalidateRuntimeStatusCache(table_name);
     }
 
+    fn beginLocalStructuralIndexCacheUpdate(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        self.beginStructuralTableActivity(table_name);
+        lockAtomic(&self.local_db_mutex);
+        self.invalidateReadCache(table_name);
+        self.invalidateRuntimeStatusCache(table_name);
+    }
+
     fn finishLocalStructuralCacheUpdate(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         self.invalidateReadCache(table_name);
+        self.local_db_mutex.unlock();
+        self.endStructuralTableActivity(table_name);
+    }
+
+    fn abortLocalStructuralIndexCacheUpdate(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        self.invalidateWriteCache(table_name);
+        self.invalidateReadCache(table_name);
+        self.invalidateRuntimeStatusCache(table_name);
         self.local_db_mutex.unlock();
         self.endStructuralTableActivity(table_name);
     }
@@ -6704,8 +6719,8 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.localWriteOwnerSource()) |owner| return try owner.createIndex(alloc, table_name, index_name, index_json);
         try enforceHAWriteGateOptional(self.ha_write_gate);
-        self.beginLocalStructuralCacheUpdate(table_name);
-        errdefer self.abortLocalStructuralCacheUpdate(table_name);
+        self.beginLocalStructuralIndexCacheUpdate(table_name);
+        errdefer self.abortLocalStructuralIndexCacheUpdate(table_name);
         const managed_visibility_changed = try reconcileLocalTableIndexCreate(self, alloc, table_name, index_name);
         self.finishLocalStructuralCacheUpdate(table_name);
         self.notifyLocalChange(table_name, .structural);
@@ -6724,8 +6739,8 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.localWriteOwnerSource()) |owner| return try owner.dropIndex(alloc, table_name, index_name);
         try enforceHAWriteGateOptional(self.ha_write_gate);
-        self.beginLocalStructuralCacheUpdate(table_name);
-        errdefer self.abortLocalStructuralCacheUpdate(table_name);
+        self.beginLocalStructuralIndexCacheUpdate(table_name);
+        errdefer self.abortLocalStructuralIndexCacheUpdate(table_name);
         runTestBeforeDropIndexWorkHook();
         if (self.write_cache) |cache| {
             _ = try reconcileCachedLocalTableIndexDrop(self, alloc, cache, table_name, index_name);
