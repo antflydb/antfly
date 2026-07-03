@@ -2626,15 +2626,15 @@ pub const QueryRequest = struct {
     fields: ?[]const []const u8 = null,
     /// Maximum number of results to return. For semantic_search, this is the topk parameter. Default varies by query type (typically 10).
     limit: ?i64 = null,
-    /// Number of results to skip for pagination. Only available for full_text_search queries. Not supported for semantic_search due to vector index limitations.
+    /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Not supported for semantic_search due to vector index limitations.
     offset: ?i64 = null,
     /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504.
     timeout_ms: ?i64 = null,
-    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Only applicable for full_text_search queries. Semantic searches are always sorted by similarity score.
+    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Supported for exact text-backed, match_all, and filter-only requests. Stored-field sorting is exact and may return 422 if the required candidate window exceeds the server's exact-sort budget. Semantic searches are always sorted by similarity score.
     order_by: ?[]const SortField = null,
-    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, null remains null, and strings remain strings. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
+    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, null remains null, and strings remain strings. Mutually exclusive with `offset`. Requires `order_by` to be set. Supported for text-backed, match_all, and filter-only requests; not supported for semantic_search.
     search_after: ?[]const std.json.Value = null,
-    /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, null remains null, and strings remain strings. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
+    /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, null remains null, and strings remain strings. Mutually exclusive with `offset`. Requires `order_by` to be set. Supported for text-backed, match_all, and filter-only requests; not supported for semantic_search.
     search_before: ?[]const std.json.Value = null,
     /// Maximum distance threshold for semantic similarity search. Results with distance greater than this value are excluded. Lower distances indicate higher similarity. Useful for filtering out low-confidence matches.
     distance_under: ?f32 = null,
@@ -2757,15 +2757,15 @@ pub const RetrievalQueryRequest = struct {
     fields: ?[]const []const u8 = null,
     /// Maximum number of results to return. For semantic_search, this is the topk parameter. Default varies by query type (typically 10).
     limit: ?i64 = null,
-    /// Number of results to skip for pagination. Only available for full_text_search queries. Not supported for semantic_search due to vector index limitations.
+    /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Not supported for semantic_search due to vector index limitations.
     offset: ?i64 = null,
     /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504.
     timeout_ms: ?i64 = null,
-    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Only applicable for full_text_search queries. Semantic searches are always sorted by similarity score.
+    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Supported for exact text-backed, match_all, and filter-only requests. Stored-field sorting is exact and may return 422 if the required candidate window exceeds the server's exact-sort budget. Semantic searches are always sorted by similarity score.
     order_by: ?[]const SortField = null,
-    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, null remains null, and strings remain strings. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
+    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, null remains null, and strings remain strings. Mutually exclusive with `offset`. Requires `order_by` to be set. Supported for text-backed, match_all, and filter-only requests; not supported for semantic_search.
     search_after: ?[]const std.json.Value = null,
-    /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, null remains null, and strings remain strings. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
+    /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, null remains null, and strings remain strings. Mutually exclusive with `offset`. Requires `order_by` to be set. Supported for text-backed, match_all, and filter-only requests; not supported for semantic_search.
     search_before: ?[]const std.json.Value = null,
     /// Maximum distance threshold for semantic similarity search. Results with distance greater than this value are excluded. Lower distances indicate higher similarity. Useful for filtering out low-confidence matches.
     distance_under: ?f32 = null,

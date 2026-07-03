@@ -5086,8 +5086,9 @@ export interface components {
              */
             limit?: number;
             /**
-             * @description Number of results to skip for pagination. Only available for full_text_search queries.
-             *     Not supported for semantic_search due to vector index limitations.
+             * @description Number of results to skip for pagination. Supported for text-backed,
+             *     match_all, and filter-only requests. Not supported for semantic_search
+             *     due to vector index limitations.
              * @example 0
              */
             offset?: number;
@@ -5102,7 +5103,10 @@ export interface components {
             /**
              * @description Sort order for results. Array of sort fields with direction.
              *     Antfly appends `_id` ascending as a stable tie-breaker when it is omitted.
-             *     Only applicable for full_text_search queries. Semantic searches are always sorted by similarity score.
+             *     Supported for exact text-backed, match_all, and filter-only requests.
+             *     Stored-field sorting is exact and may return 422 if the required
+             *     candidate window exceeds the server's exact-sort budget. Semantic
+             *     searches are always sorted by similarity score.
              * @example [
              *       {
              *         "field": "created_at",
@@ -5121,7 +5125,8 @@ export interface components {
              *     Values preserve their JSON types; for example numbers remain numbers,
              *     booleans remain booleans, null remains null, and strings remain strings.
              *     Mutually exclusive with `offset`.
-             *     Requires `order_by` to be set. Only supported for full_text_search queries.
+             *     Requires `order_by` to be set. Supported for text-backed, match_all,
+             *     and filter-only requests; not supported for semantic_search.
              */
             search_after?: unknown[];
             /**
@@ -5130,7 +5135,8 @@ export interface components {
              *     Values preserve their JSON types; for example numbers remain numbers,
              *     booleans remain booleans, null remains null, and strings remain strings.
              *     Mutually exclusive with `offset`.
-             *     Requires `order_by` to be set. Only supported for full_text_search queries.
+             *     Requires `order_by` to be set. Supported for text-backed, match_all,
+             *     and filter-only requests; not supported for semantic_search.
              */
             search_before?: unknown[];
             /**
