@@ -5106,7 +5106,8 @@ export interface components {
              *     Supported for exact text-backed, match_all, and filter-only requests.
              *     Stored-field sorting is exact and may return 422 if the required
              *     candidate window exceeds the server's exact-sort budget. Semantic
-             *     searches are always sorted by similarity score.
+             *     searches are always sorted by similarity score. Not supported when
+             *     `count` is true.
              * @example [
              *       {
              *         "field": "created_at",
@@ -5126,7 +5127,8 @@ export interface components {
              *     booleans remain booleans, null remains null, and strings remain strings.
              *     Mutually exclusive with `offset`.
              *     Requires `order_by` to be set. Supported for text-backed, match_all,
-             *     and filter-only requests; not supported for semantic_search.
+             *     and filter-only requests; not supported for semantic_search or
+             *     count-only requests.
              */
             search_after?: unknown[];
             /**
@@ -5136,7 +5138,8 @@ export interface components {
              *     booleans remain booleans, null remains null, and strings remain strings.
              *     Mutually exclusive with `offset`.
              *     Requires `order_by` to be set. Supported for text-backed, match_all,
-             *     and filter-only requests; not supported for semantic_search.
+             *     and filter-only requests; not supported for semantic_search or
+             *     count-only requests.
              */
             search_before?: unknown[];
             /**
@@ -5164,7 +5167,9 @@ export interface components {
             merge_config?: components["schemas"]["MergeConfig"];
             /**
              * @description If true, returns only the total count of matching documents without retrieving the actual documents.
-             *     Useful for pagination and displaying result counts.
+             *     Useful for pagination and displaying result counts. Count-only requests
+             *     do not return an ordered result page, so `order_by`, `search_after`,
+             *     and `search_before` are not supported when this is true.
              * @example false
              */
             count?: boolean;

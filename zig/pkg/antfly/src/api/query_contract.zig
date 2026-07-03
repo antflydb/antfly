@@ -1746,6 +1746,14 @@ fn applyCommonSearchRequestOptions(
     if (request.limit) |limit| req.limit = @intCast(limit);
     if (request.offset) |offset| req.offset = @intCast(offset);
     if (request.count) |count| req.count_only = count;
+    const has_result_page_options =
+        request.order_by != null or
+        request.search_after != null or
+        request.search_before != null;
+    const has_result_page_transforms = request.reranker != null;
+    if (req.count_only and (has_result_page_options or has_result_page_transforms)) {
+        return error.UnsupportedQueryRequest;
+    }
     if (request.profile) |profile| req.profile = profile;
     if (request.aggregations) |aggregations| {
         req.aggregations_json = try jsonStringifyAlloc(alloc, aggregations);
@@ -1778,7 +1786,6 @@ fn applyCommonSearchRequestOptions(
     if (req.search_before.len > 0 and req.search_before.len != req.order_by.len) return error.UnsupportedQueryRequest;
     if (request.embedding_template != null and request.semantic_search == null) return error.UnsupportedQueryRequest;
     if (request.embedding_template != null and request.embeddings != null) return error.UnsupportedQueryRequest;
-    if (req.count_only and req.reranker != null) return error.UnsupportedQueryRequest;
 }
 
 fn cloneSortFieldsWithStableTiebreaker(
@@ -6410,6 +6417,47 @@ test "api query contract preflight rejects count with reranker" {
     defer parsed.deinit();
 
     try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed.value));
+}
+
+test "api query contract rejects count with stored sort" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "count": true,
+        \\  "order_by": [{"field":"created_at","desc":true}]
+        \\}
+    ;
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
+}
+
+test "api query contract rejects count with search_after cursor" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "count": true,
+        \\  "order_by": [{"field":"created_at","desc":true}],
+        \\  "search_after": ["2026-01-01", "doc-9"]
+        \\}
+    ;
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
+}
+
+test "api query contract rejects count with search_before cursor" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "count": true,
+        \\  "order_by": [{"field":"created_at","desc":true}],
+        \\  "search_before": ["2026-01-01", "doc-9"]
+        \\}
+    ;
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
 }
 
 test "api query contract preflight rejects cursor pagination without sort" {
