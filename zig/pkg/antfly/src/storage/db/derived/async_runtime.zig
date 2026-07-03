@@ -1012,6 +1012,108 @@ test "async dense zero-applied replay window advances only through target covera
     try std.testing.expectEqual(@as(u64, 1), runtime.appliedSequence("dense_idx").?);
 }
 
+const DenseTargetAdvanceSessionCapture = struct {
+    active_sessions: std.atomic.Value(u64) = .init(0),
+    begin_calls: std.atomic.Value(u64) = .init(0),
+    finish_calls: std.atomic.Value(u64) = .init(0),
+    apply_calls: std.atomic.Value(u64) = .init(0),
+    target_advance_calls: std.atomic.Value(u64) = .init(0),
+    persist_calls: std.atomic.Value(u64) = .init(0),
+    persisted_sequence: std.atomic.Value(u64) = .init(0),
+};
+
+fn testDenseTargetAdvanceSessionApply(ctx: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !bool {
+    _ = batch;
+    try std.testing.expectEqual(types.IndexKind.dense_vector, index_ref.kind);
+    const capture: *DenseTargetAdvanceSessionCapture = @ptrCast(@alignCast(ctx));
+    _ = capture.apply_calls.fetchAdd(1, .monotonic);
+    return false;
+}
+
+fn testDenseTargetAdvanceSessionPersist(ctx: *anyopaque, index_name: []const u8, sequence: u64, force: bool) !bool {
+    _ = index_name;
+    _ = force;
+    const capture: *DenseTargetAdvanceSessionCapture = @ptrCast(@alignCast(ctx));
+    _ = capture.persist_calls.fetchAdd(1, .monotonic);
+    capture.persisted_sequence.store(sequence, .monotonic);
+    return true;
+}
+
+fn testDenseTargetAdvanceSessionBegin(ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) !void {
+    try std.testing.expectEqual(types.IndexKind.dense_vector, index_ref.kind);
+    const capture: *DenseTargetAdvanceSessionCapture = @ptrCast(@alignCast(ctx));
+    _ = capture.begin_calls.fetchAdd(1, .monotonic);
+    _ = capture.active_sessions.fetchAdd(1, .monotonic);
+}
+
+fn testDenseTargetAdvanceSessionFinish(ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, success: bool) !void {
+    try std.testing.expectEqual(types.IndexKind.dense_vector, index_ref.kind);
+    try std.testing.expect(success);
+    const capture: *DenseTargetAdvanceSessionCapture = @ptrCast(@alignCast(ctx));
+    _ = capture.finish_calls.fetchAdd(1, .monotonic);
+    const active = capture.active_sessions.fetchSub(1, .monotonic);
+    try std.testing.expect(active > 0);
+}
+
+fn testDenseTargetAdvanceWhileSessionOpen(ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) !bool {
+    try std.testing.expectEqual(types.IndexKind.dense_vector, index_ref.kind);
+    try std.testing.expect(target_sequence > from_sequence);
+    const capture: *DenseTargetAdvanceSessionCapture = @ptrCast(@alignCast(ctx));
+    _ = capture.target_advance_calls.fetchAdd(1, .monotonic);
+    try std.testing.expect(capture.active_sessions.load(.monotonic) > 0);
+    return true;
+}
+
+test "async dense workers advance zero-applied target while catch-up sessions are open" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/async-dense-worker-target-advance-open-session-journal", .{tmp.sub_path});
+    defer alloc.free(journal_path);
+    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    defer alloc.free(journal_path_z);
+
+    var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
+    defer journal.close();
+
+    try appendTestChangeJournalRecord(&journal, alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:text-only"},
+        .target_hints = &.{.dense_vector},
+    });
+
+    var capture = DenseTargetAdvanceSessionCapture{};
+    var runtime = DerivedRuntime.init(
+        alloc,
+        replay_source_mod.Source.fromJournal(&journal),
+        &capture,
+        testDenseTargetAdvanceSessionApply,
+        testDenseTargetAdvanceSessionPersist,
+        testRuntimeTruncate,
+        testDenseTargetAdvanceSessionBegin,
+        testDenseTargetAdvanceSessionFinish,
+        testDenseTargetAdvanceWhileSessionOpen,
+        null,
+    );
+    defer runtime.deinit();
+
+    try runtime.addWorker("dense_a", .{ .name = "dense_a", .kind = .dense_vector }, 0);
+    try runtime.addWorker("dense_b", .{ .name = "dense_b", .kind = .dense_vector }, 0);
+    runtime.notifySequence(1);
+    try runtime.waitForAll(1);
+    try runtime.failIfUnhealthy();
+
+    try std.testing.expectEqual(@as(u64, 1), runtime.appliedSequence("dense_a").?);
+    try std.testing.expectEqual(@as(u64, 1), runtime.appliedSequence("dense_b").?);
+    try std.testing.expectEqual(@as(u64, 2), capture.apply_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2), capture.target_advance_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2), capture.begin_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2), capture.finish_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), capture.active_sessions.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), capture.persisted_sequence.load(.monotonic));
+}
+
 test "async dense publish NotFound retries without failing runtime" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

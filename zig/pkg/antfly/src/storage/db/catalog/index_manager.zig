@@ -3046,11 +3046,11 @@ pub const IndexManager = struct {
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
                 self.freeTextIndexEntry(entry);
                 _ = self.text_indexes.orderedRemove(i);
+                defer self.dropIndexLoadStateNoLock(name);
                 try self.persistCatalog(store);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 deleteIndexDirIfPresent(index_path);
-                self.dropIndexLoadStateNoLock(name);
                 return true;
             }
         }
@@ -3071,13 +3071,13 @@ pub const IndexManager = struct {
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
                 self.freeDenseIndexEntry(entry);
                 _ = self.dense_indexes.orderedRemove(i);
+                defer self.dropIndexLoadStateNoLock(name);
                 try self.persistCatalog(store);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 try self.deleteDenseIndexMetadata(store, name);
                 try self.deleteOwnedGeneratedArtifacts(store, owned_chunk_name, owned_embedding_name);
                 deleteIndexDirIfPresent(index_path);
-                self.dropIndexLoadStateNoLock(name);
                 return true;
             }
         }
@@ -3098,12 +3098,12 @@ pub const IndexManager = struct {
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
                 self.freeSparseIndexEntry(entry);
                 _ = self.sparse_indexes.orderedRemove(i);
+                defer self.dropIndexLoadStateNoLock(name);
                 try self.persistCatalog(store);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 try self.deleteOwnedGeneratedArtifacts(store, owned_chunk_name, owned_embedding_name);
                 deleteIndexDirIfPresent(index_path);
-                self.dropIndexLoadStateNoLock(name);
                 return true;
             }
         }
@@ -3114,11 +3114,26 @@ pub const IndexManager = struct {
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
                 self.freeGraphIndexEntry(entry);
                 _ = self.graph_indexes.orderedRemove(i);
+                defer self.dropIndexLoadStateNoLock(name);
                 try self.persistCatalog(store);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 deleteIndexDirIfPresent(index_path);
-                self.dropIndexLoadStateNoLock(name);
+                return true;
+            }
+        }
+        for (self.algebraic_indexes.items, 0..) |*entry, i| {
+            if (std.mem.eql(u8, entry.config.name, name)) {
+                const index_path = try self.indexPath(name);
+                defer self.alloc.free(index_path);
+                const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
+                self.freeAlgebraicIndexEntry(entry);
+                _ = self.algebraic_indexes.orderedRemove(i);
+                defer self.dropIndexLoadStateNoLock(name);
+                try self.persistCatalog(store);
+                self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
+                try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
+                deleteIndexDirIfPresent(index_path);
                 return true;
             }
         }
@@ -3159,6 +3174,7 @@ pub const IndexManager = struct {
             }
             self.alloc.free(self.status_only_index_configs);
             self.status_only_index_configs = replacement;
+            defer self.dropIndexLoadStateNoLock(name);
 
             const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCache();
             try self.persistCatalog(store);
@@ -3168,7 +3184,6 @@ pub const IndexManager = struct {
             try self.deleteOwnedGeneratedArtifacts(store, owned_chunk_name, owned_embedding_name);
             deleteIndexDirIfPresent(index_path);
             removed.deinit(self.alloc);
-            self.dropIndexLoadStateNoLock(name);
             return true;
         }
         return false;
@@ -7283,6 +7298,14 @@ pub const IndexManager = struct {
             if (std.mem.eql(u8, entry.config.name, name)) {
                 self.freeGraphIndexEntry(entry);
                 _ = self.graph_indexes.orderedRemove(i);
+                self.dropIndexLoadStateNoLock(name);
+                return;
+            }
+        }
+        for (self.algebraic_indexes.items, 0..) |*entry, i| {
+            if (std.mem.eql(u8, entry.config.name, name)) {
+                self.freeAlgebraicIndexEntry(entry);
+                _ = self.algebraic_indexes.orderedRemove(i);
                 self.dropIndexLoadStateNoLock(name);
                 return;
             }
@@ -16569,6 +16592,41 @@ test "remove drops runtime index load state" {
     try std.testing.expectEqual(@as(usize, 0), manager.index_load_states.count());
 }
 
+test "remove drops algebraic runtime index load state" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "runtime-algebraic-index-load-state-remove");
+    defer cleanupIndexManagerDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    try manager.add(&store, .{
+        .name = "alg_v1",
+        .kind = .algebraic,
+        .config_json =
+        \\{
+        \\  "table": "docs",
+        \\  "schema_version": 1,
+        \\  "capability_fingerprint": "test-capability",
+        \\  "group_fields": [{"name":"customer","path":"customer","type":"string"}],
+        \\  "measure_fields": [{"name":"amount","path":"amount","type":"number"}],
+        \\  "materializations": []
+        \\}
+        ,
+    });
+    try std.testing.expect(manager.algebraicIndex("alg_v1") != null);
+    try std.testing.expectEqual(@as(usize, 1), manager.index_load_states.count());
+
+    try std.testing.expect(try manager.remove(&store, "alg_v1"));
+    try std.testing.expect(manager.algebraicIndex("alg_v1") == null);
+    try std.testing.expectEqual(@as(usize, 0), manager.index_load_states.count());
+}
+
 test "removeInMemory drops rollback index load state" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -16592,6 +16650,41 @@ test "removeInMemory drops rollback index load state" {
 
     manager.removeInMemory("ft_v1");
     try std.testing.expect(manager.textIndexEntry("ft_v1") == null);
+    try std.testing.expectEqual(@as(usize, 0), manager.index_load_states.count());
+}
+
+test "removeInMemory drops algebraic rollback index load state" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "rollback-algebraic-index-load-state-remove");
+    defer cleanupIndexManagerDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    try manager.openConfiguredIndex(&store, .{
+        .name = "alg_v1",
+        .kind = .algebraic,
+        .config_json =
+        \\{
+        \\  "table": "docs",
+        \\  "schema_version": 1,
+        \\  "capability_fingerprint": "test-capability",
+        \\  "group_fields": [{"name":"customer","path":"customer","type":"string"}],
+        \\  "measure_fields": [{"name":"amount","path":"amount","type":"number"}],
+        \\  "materializations": []
+        \\}
+        ,
+    }, true, false);
+    try std.testing.expect(manager.algebraicIndex("alg_v1") != null);
+    try std.testing.expectEqual(@as(usize, 1), manager.index_load_states.count());
+
+    manager.removeInMemory("alg_v1");
+    try std.testing.expect(manager.algebraicIndex("alg_v1") == null);
     try std.testing.expectEqual(@as(usize, 0), manager.index_load_states.count());
 }
 
