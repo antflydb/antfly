@@ -47,6 +47,7 @@ const Worker = struct {
     catch_up_open: bool = false,
     replay_cursor: ?replay_source_mod.MatchingCursor = null,
     replay_cursor_open_sequence: u64 = 0,
+    last_replay_tail_records: u64 = 0,
 };
 
 fn forcePersistAppliedSequence(worker: *const Worker) bool {
@@ -427,6 +428,8 @@ fn workerMain(worker: *Worker) void {
         const from_sequence = worker.applied_sequence;
         const persisted_sequence = worker.persisted_sequence;
         const target_sequence = worker.target_sequence;
+        const replay_tail_records = target_sequence -| from_sequence;
+        if (replay_tail_records > 0) worker.last_replay_tail_records = replay_tail_records;
         runtime.mutex.unlock();
         if (target_sequence <= from_sequence) {
             if (from_sequence > persisted_sequence) {
@@ -665,6 +668,7 @@ fn closeWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, success: b
     closeWorkerReplayCursor(runtime, worker);
     if (!worker.catch_up_open) return;
     worker.catch_up_open = false;
+    worker.last_replay_tail_records = 0;
     if (runtime.finish_catch_up_fn) |finish_catch_up| try finish_catch_up(runtime.ctx, worker.kind, success);
 }
 
@@ -689,10 +693,11 @@ fn isRecoverableCatchUpError(worker: *const Worker, err: anyerror) bool {
 
 fn waitForCatchUpSessionReuse(runtime: *DerivedRuntime, worker: *Worker, from_sequence: u64) bool {
     const policy = catch_up_policy.forIndex(worker.kind, runtime.backlog.resource_manager);
-    if (!worker.catch_up_open or policy.session_idle_ns == 0) return false;
+    const idle_wait_ns = catch_up_policy.sessionIdleMaxWaitNs(policy, worker.last_replay_tail_records);
+    if (!worker.catch_up_open or idle_wait_ns == 0) return false;
     var waited_ns: u64 = 0;
     const delay_ns = @max(@as(u64, std.time.ns_per_ms), policy.coalesce_delay_ns);
-    while (waited_ns < policy.session_idle_ns) {
+    while (waited_ns < idle_wait_ns) {
         lock(runtime);
         const shutdown = runtime.shutdown or worker.stop or runtime.last_error_name != null;
         const target = worker.target_sequence;
@@ -700,20 +705,20 @@ fn waitForCatchUpSessionReuse(runtime: *DerivedRuntime, worker: *Worker, from_se
         runtime.mutex.unlock();
         if (shutdown) return false;
         if (target > from_sequence or force_sequence > from_sequence) return true;
-        sleepNs(delay_ns);
-        waited_ns +|= delay_ns;
+        const sleep_ns = @min(delay_ns, idle_wait_ns - waited_ns);
+        sleepNs(sleep_ns);
+        waited_ns +|= sleep_ns;
     }
     return false;
 }
 
 fn waitForReplayWindow(runtime: *DerivedRuntime, worker: *Worker, from_sequence: u64) void {
     const policy = catch_up_policy.forIndex(worker.kind, runtime.backlog.resource_manager);
-    const min_records = policy.coalesce_min_records;
     const delay_ns = policy.coalesce_delay_ns;
-    if (min_records == 0 or delay_ns == 0) return;
+    if (delay_ns == 0) return;
 
     var waited_ns: u64 = 0;
-    while (waited_ns < policy.coalesce_max_wait_ns) {
+    while (true) {
         lock(runtime);
         const shutdown = runtime.shutdown or worker.stop or runtime.last_error_name != null;
         const target = worker.target_sequence;
@@ -721,10 +726,12 @@ fn waitForReplayWindow(runtime: *DerivedRuntime, worker: *Worker, from_sequence:
         const force_sequence = runtime.force_catch_up_sequence;
         runtime.mutex.unlock();
 
-        if (shutdown or pending_records == 0 or pending_records >= min_records or force_sequence > from_sequence) return;
+        const max_wait_ns = catch_up_policy.replayWindowMaxWaitNs(policy, pending_records);
+        if (shutdown or pending_records == 0 or max_wait_ns == 0 or force_sequence > from_sequence or waited_ns >= max_wait_ns) return;
 
-        sleepNs(delay_ns);
-        waited_ns +|= delay_ns;
+        const sleep_ns = @min(delay_ns, max_wait_ns - waited_ns);
+        sleepNs(sleep_ns);
+        waited_ns +|= sleep_ns;
     }
 }
 
@@ -855,6 +862,33 @@ fn testInMemoryJournalOpenOptions() change_journal_mod.OpenOptions {
             .obsolete_retention_ns = 0,
         },
     };
+}
+
+test "async dense replay wait policy scales with pending tail" {
+    const policy = catch_up_policy.Policy{
+        .coalesce_min_records = 256,
+        .coalesce_delay_ns = 50 * std.time.ns_per_ms,
+        .coalesce_max_wait_ns = 2_000 * std.time.ns_per_ms,
+    };
+
+    try std.testing.expectEqual(@as(u64, 0), catch_up_policy.replayWindowMaxWaitNs(policy, 0));
+    try std.testing.expectEqual(@as(u64, 7_812_500), catch_up_policy.replayWindowMaxWaitNs(policy, 1));
+    try std.testing.expectEqual(@as(u64, 54_687_500), catch_up_policy.replayWindowMaxWaitNs(policy, 7));
+    try std.testing.expectEqual(@as(u64, 1_000 * std.time.ns_per_ms), catch_up_policy.replayWindowMaxWaitNs(policy, 128));
+    try std.testing.expectEqual(@as(u64, 0), catch_up_policy.replayWindowMaxWaitNs(policy, 256));
+}
+
+test "async dense session idle policy scales with recent replay tail" {
+    const policy = catch_up_policy.Policy{
+        .coalesce_min_records = 256,
+        .session_idle_ns = 5 * std.time.ns_per_s,
+    };
+
+    try std.testing.expectEqual(@as(u64, 0), catch_up_policy.sessionIdleMaxWaitNs(policy, 0));
+    try std.testing.expectEqual(@as(u64, 19_531_250), catch_up_policy.sessionIdleMaxWaitNs(policy, 1));
+    try std.testing.expectEqual(@as(u64, 136_718_750), catch_up_policy.sessionIdleMaxWaitNs(policy, 7));
+    try std.testing.expectEqual(@as(u64, 2_500 * std.time.ns_per_ms), catch_up_policy.sessionIdleMaxWaitNs(policy, 128));
+    try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_s), catch_up_policy.sessionIdleMaxWaitNs(policy, 256));
 }
 
 test "async non-tail replay cursor refreshes before watermark advance" {

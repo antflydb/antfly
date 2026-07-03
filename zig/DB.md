@@ -209,6 +209,10 @@ Current implementation notes:
   status snapshot without invalidating cached query DBs. Read-cache invalidation
   remains reserved for visible-root/data publishes, blocking publish repair, and
   explicit table invalidation.
+- Dense catch-up pacing sizes replay-window coalescing and catch-up session
+  reuse waits to the current derived-log tail. Small restart tails no longer pay
+  the full 256-record/2s coalesce window or 5s session-idle ceiling; those
+  ceilings remain available for large hot-ingest backlogs.
 
 Acceptance criteria:
 
