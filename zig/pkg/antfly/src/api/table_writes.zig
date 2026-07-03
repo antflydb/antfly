@@ -7194,7 +7194,7 @@ pub const ProvisionedTableWriteSource = struct {
                 cache.secret_store = self.secret_store;
                 cache.remote_content = self.remote_content;
             }
-            var opened: ?db_mod.DB = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+            var opened: ?db_mod.DB = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                 alloc,
                 path,
                 indexes_json,
@@ -7208,6 +7208,10 @@ pub const ProvisionedTableWriteSource = struct {
                 self.secret_store,
                 self.remote_content,
                 identity_namespace,
+                .{
+                    .inference_api_url = self.inference_api_url,
+                    .provision_with_quiet_open = true,
+                },
             );
             defer if (opened) |*db| db.close();
             try applyLocalTableSchemaJson(alloc, &opened.?, schema_json);
@@ -11854,6 +11858,7 @@ const ManagedDbOpenOptions = struct {
     ha_async_effect_mirror: ?db_mod.HAAsyncEffectMirror = null,
     ha_async_batch_mirror: ?db_mod.HAAsyncBatchMirror = null,
     ha_async_metadata_mirror: ?db_mod.HAAsyncMetadataMirror = null,
+    provision_with_quiet_open: bool = false,
 };
 
 const ManagedDbEnrichmentSet = struct {
@@ -11942,7 +11947,11 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
     identity_namespace: ?doc_identity.Namespace,
     options: ManagedDbOpenOptions,
 ) !db_mod.DB {
-    var enrichments = if (mode == .startup_catch_up)
+    const initial_mode: ManagedDbOpenMode = if (options.provision_with_quiet_open and (mode == .default or mode == .default_async or mode == .writer_no_replay))
+        .startup_catch_up
+    else
+        mode;
+    var enrichments = if (initial_mode == .startup_catch_up)
         ManagedDbEnrichmentSet{}
     else
         try createManagedDbEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.inference_api_url, secret_store, remote_content);
@@ -12175,7 +12184,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
 
     var db = blk: {
         const enrichment_cfg = if (enrichments.enabled()) enrichments.config() else null;
-        const opened = try openDb(alloc, path, enrichment_cfg, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content, identity_namespace, options);
+        const opened = try openDb(alloc, path, enrichment_cfg, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, initial_mode, backend_runtime, secret_store, remote_content, identity_namespace, options);
         enrichments.forgetTransferred();
         break :blk opened;
     };
@@ -12188,9 +12197,11 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
     const summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
         .drain_resolver_backfill = options.drain_resolver_backfill,
     });
-    if (summary.indexManagerCatalogChanged()) {
+    if (summary.indexManagerCatalogChanged() or initial_mode != mode) {
         // First-open provisioning can mutate the live index manager. Reopen so
-        // request work runs against the stabilized post-reconcile state.
+        // request work runs against the stabilized post-reconcile state. Some
+        // create-table paths also use a quiet temporary open for provisioning;
+        // never return or cache that background-free DB as the live writer.
         db.close();
         db_open = false;
         enrichments = if (mode == .startup_catch_up)
