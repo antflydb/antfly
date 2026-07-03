@@ -22558,6 +22558,7 @@ fn saveAppliedSequencesBatchContext(
         );
         defer seq_lock.unlock();
         try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+        try checkpointDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
         try apply_state.saveAppliedSequencesWithCheckpoint(
             ctx.alloc,
             ctx.store,
@@ -22568,6 +22569,7 @@ fn saveAppliedSequencesBatchContext(
         return;
     }
     try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+    try checkpointDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
     try apply_state.saveAppliedSequencesWithCheckpoint(
         ctx.alloc,
         ctx.store,
@@ -22605,6 +22607,19 @@ fn saveDenseProjectionMetadataForAppliedSequenceUpdates(
             .status = current.status,
             .generation = if (update.generation != 0) update.generation else current.generation,
             .config_hash = if (update.config_hash != 0) update.config_hash else current.config_hash,
+        });
+    }
+}
+
+fn checkpointDenseProjectionMetadataForAppliedSequenceUpdates(
+    index_manager: *index_manager_mod.IndexManager,
+    updates: []const apply_state.AppliedSequenceUpdate,
+) !void {
+    for (updates) |update| {
+        if (index_manager.denseProjectionCheckpointMetadata(update.index_name) == null) continue;
+        try index_manager.checkpointLsmWalForManagedIndex(.{
+            .name = update.index_name,
+            .kind = .dense_vector,
         });
     }
 }
@@ -27175,7 +27190,6 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
             &ctx.stats.applied_sequence_mutex,
         );
         defer seq_lock.unlock();
-        try ctx.index_manager.checkpointLsmWalForManagedIndex(index_ref);
         const published = try flushFinishedDenseAppliedSequenceLocked(ctx, index_ref.name);
         break :blk published;
     };
@@ -27684,6 +27698,7 @@ fn flushFinishedDenseAppliedSequenceLocked(ctx: *AsyncContext, index_name: []con
     const enriched_updates = try appliedSequenceUpdatesWithConfigHashes(ctx.alloc, ctx.index_manager, &raw_update);
     defer ctx.alloc.free(enriched_updates);
     try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+    try checkpointDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
     try apply_state.saveAppliedSequencesWithCheckpoint(ctx.alloc, ctx.store, ctx.applied_sequence_checkpoint_path, enriched_updates);
     try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
     const save_ns = elapsedSince(save_start_ns);
@@ -27723,6 +27738,7 @@ fn flushPendingAppliedSequencesLocked(ctx: *AsyncContext, force: bool) !bool {
     // Index apply/publish paths own index-state durability. The checkpoint
     // writer only persists small applied watermarks used for replay retention.
     try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+    try checkpointDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
     try apply_state.saveAppliedSequencesWithCheckpoint(
         ctx.alloc,
         ctx.store,
@@ -53996,7 +54012,13 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
                     self.status_calls += 1;
                     if (changed_db) |hook_db| {
                         if (hook_db.core.denseIndex("dense_idx")) |entry| if (entry.index.snapshotLsmMaintenanceStats()) |stats| {
-                            if (stats.wal_checkpoint_current_segment > 0 and stats.wal_checkpoint_lag_segments == 0) {
+                            const checkpoint = hook_db.core.index_manager.denseProjectionCheckpointMetadata("dense_idx") orelse return;
+                            if (checkpoint.applied_sequence >= 4 and
+                                stats.mutable_entries == 0 and
+                                stats.immutable_memtables == 0 and
+                                stats.wal_checkpoint_current_segment > 0 and
+                                stats.wal_checkpoint_lag_segments == 0)
+                            {
                                 self.status_calls_after_wal_checkpoint += 1;
                             }
                         };

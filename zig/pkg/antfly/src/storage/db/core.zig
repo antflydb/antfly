@@ -735,6 +735,10 @@ pub const DBCore = struct {
                 .generation = checkpoint.generation,
                 .config_hash = if (config_hash != 0) config_hash else checkpoint.config_hash,
             });
+            try self.index_manager.checkpointLsmWalForManagedIndex(.{
+                .name = index_name,
+                .kind = .dense_vector,
+            });
         }
         try apply_state.saveAppliedSequenceUpdateWithCheckpoint(
             self.alloc,
@@ -757,6 +761,10 @@ pub const DBCore = struct {
         }
         if (self.index_manager.denseProjectionCheckpointMetadata(index_name) != null) {
             try self.index_manager.saveDenseProjectionCheckpointMetadata(index_name, checkpoint_with_identity);
+            try self.index_manager.checkpointLsmWalForManagedIndex(.{
+                .name = index_name,
+                .kind = .dense_vector,
+            });
         }
         try apply_state.saveProjectionCheckpointWithSidecar(
             self.alloc,
