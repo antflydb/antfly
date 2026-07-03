@@ -45,6 +45,7 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
 }
 
 const default_balanced_search_effort: f32 = 0.5;
+const default_late_visibility_exact_candidate_budget: u32 = 100_000;
 var bench_query_profile_counter: std.atomic.Value(u64) = .init(0);
 const bench_query_profile_unknown = std.math.maxInt(u64);
 const bench_query_profile_disabled = std.math.maxInt(u64) - 1;
@@ -2218,6 +2219,22 @@ fn searchTextNeedsLateVisibilityFilter(
     return true;
 }
 
+fn lateVisibilityExactCandidateBudgetFromRaw(raw: ?[]const u8) u32 {
+    const value = raw orelse return default_late_visibility_exact_candidate_budget;
+    if (value.len == 0) return default_late_visibility_exact_candidate_budget;
+    const parsed = std.fmt.parseUnsigned(u32, value, 10) catch return default_late_visibility_exact_candidate_budget;
+    return if (parsed == 0) std.math.maxInt(u32) else parsed;
+}
+
+fn lateVisibilityExactCandidateBudget() u32 {
+    return lateVisibilityExactCandidateBudgetFromRaw(getenv("ANTFLY_TEXT_LATE_VISIBILITY_EXACT_CANDIDATE_BUDGET"));
+}
+
+fn enforceLateVisibilityExactCandidateBudget(full_candidate_limit: u32, budget: u32) !void {
+    if (full_candidate_limit <= budget) return;
+    return error.QueryCandidateBudgetExceeded;
+}
+
 test "text late visibility requirement overrides positive native filter" {
     const callbacks = struct {
         fn requiresFullCandidateVisibilityFilter(_: ?*anyopaque, _: ?u64) anyerror!bool {
@@ -2235,6 +2252,19 @@ test "text late visibility requirement overrides positive native filter" {
         .postprocess = undefined,
     }, true, true, null);
     try std.testing.expect(needs_late_filter);
+}
+
+test "text late visibility exact candidate budget parses disabled and fallback values" {
+    try std.testing.expectEqual(default_late_visibility_exact_candidate_budget, lateVisibilityExactCandidateBudgetFromRaw(null));
+    try std.testing.expectEqual(default_late_visibility_exact_candidate_budget, lateVisibilityExactCandidateBudgetFromRaw(""));
+    try std.testing.expectEqual(default_late_visibility_exact_candidate_budget, lateVisibilityExactCandidateBudgetFromRaw("bad"));
+    try std.testing.expectEqual(@as(u32, 42), lateVisibilityExactCandidateBudgetFromRaw("42"));
+    try std.testing.expectEqual(std.math.maxInt(u32), lateVisibilityExactCandidateBudgetFromRaw("0"));
+}
+
+test "text late visibility exact candidate budget rejects oversized exact windows" {
+    try enforceLateVisibilityExactCandidateBudget(100, 100);
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, enforceLateVisibilityExactCandidateBudget(101, 100));
 }
 
 fn paginateSearchResultInPlace(result: *types.SearchResult, offset: u32, limit: u32) !void {
@@ -3652,6 +3682,25 @@ pub fn searchTextQuery(
             effective_req.aggregations_json.len != 0 or
             effective_req.graph_queries.len != 0 or
             group_chunk_parents);
+    if (exact_late_visibility_totals) {
+        const exact_candidate_budget = lateVisibilityExactCandidateBudget();
+        enforceLateVisibilityExactCandidateBudget(full_candidate_limit, exact_candidate_budget) catch |err| {
+            std.log.warn(
+                "text query exact late visibility candidate budget exceeded index={s} candidates={d} budget={d} count_only={} limit={d} aggregations={} graph_queries={d} chunk_parent_grouping={}",
+                .{
+                    effective_req.index_name orelse "",
+                    full_candidate_limit,
+                    exact_candidate_budget,
+                    effective_req.count_only,
+                    effective_req.limit,
+                    effective_req.aggregations_json.len != 0,
+                    effective_req.graph_queries.len,
+                    group_chunk_parents,
+                },
+            );
+            return err;
+        };
+    }
     const adaptive_late_visibility = late_visibility_paginate and !exact_late_visibility_totals;
     const requested_visible_end = effective_req.offset +| effective_req.limit;
     const collect_window_candidates = group_chunk_parents or late_visibility_paginate;
@@ -3760,7 +3809,8 @@ pub fn searchTextQuery(
         errdefer out.deinit();
         if (bench_query_profile) postprocess_ns += platform_time.monotonicNs() - postprocess_start_ns;
 
-        if (adaptive_late_visibility and !candidates_exhausted and out.total_hits < requested_visible_end) {
+        const visible_candidate_count: u32 = @intCast(@min(out.hits.len, @as(usize, std.math.maxInt(u32))));
+        if (adaptive_late_visibility and !candidates_exhausted and visible_candidate_count < requested_visible_end) {
             out.deinit();
             const grown_limit = @min(full_candidate_limit, @max(candidate_limit +| 1, candidate_limit *| 2));
             if (grown_limit == candidate_limit) return error.InvalidQueryRequest;
@@ -3768,6 +3818,7 @@ pub fn searchTextQuery(
             continue;
         }
         if (adaptive_late_visibility and !candidates_exhausted) {
+            out.total_hits = visible_candidate_count;
             out.total_hits_relation = .gte;
         }
         if (late_visibility_paginate and !effective_req.count_only) {

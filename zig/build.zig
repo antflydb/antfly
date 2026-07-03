@@ -2679,7 +2679,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_common_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"provider registry"},
+        .filters = &.{ "provider registry", "std http listener" },
     });
     const run_lib_common_tests = b.addRunArtifact(lib_common_tests);
     const lib_common_test_step = b.step("lib-common-test", "Run common/provider registry tests");
@@ -3224,6 +3224,20 @@ pub fn build(b: *std.Build) void {
     const run_lib_db_query_tests = b.addRunArtifact(lib_db_query_tests);
     const lib_db_query_step = b.step("lib-db-query-test", "Run root-module DB query/indexing tests");
     lib_db_query_step.dependOn(&run_lib_db_query_tests.step);
+
+    const lib_db_text_query_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "text late visibility",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_db_text_query_tests = b.addRunArtifact(lib_db_text_query_tests);
+    const lib_db_text_query_step = b.step("lib-db-text-query-test", "Run focused full-text query guardrail tests");
+    lib_db_text_query_step.dependOn(&run_lib_db_text_query_tests.step);
 
     const lib_db_result_shape_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -4381,6 +4395,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lite_native_tests.step);
     unit_test_step.dependOn(&run_lite_cli_tests.step);
     unit_test_step.dependOn(&run_lib_db_tests.step);
+    unit_test_step.dependOn(&run_lib_db_text_query_tests.step);
     unit_test_step.dependOn(&run_lib_db_result_shape_tests.step);
     unit_test_step.dependOn(&run_serverless_tests.step);
     unit_test_step.dependOn(&run_lib_data_runtime_tests.step);

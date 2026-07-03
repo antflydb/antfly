@@ -6958,6 +6958,7 @@ pub const ApiHttpServer = struct {
             authenticated_identity,
         ) catch |err| switch (err) {
             error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
+            error.QueryCandidateBudgetExceeded => return try textResponse(self.alloc, 422, "query candidate budget exceeded"),
             error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
             error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
@@ -7018,6 +7019,7 @@ pub const ApiHttpServer = struct {
                 authenticated_identity,
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
+                error.QueryCandidateBudgetExceeded => return try textResponse(self.alloc, 422, "query candidate budget exceeded"),
                 error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
                 error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
                 error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
