@@ -52,10 +52,24 @@ const MatmulHeuristicResult = extern struct {
     reserved: [4]c_int,
 };
 
+const Bf16PlanKey = struct {
+    rows: u32,
+    in_dim: u32,
+    out_dim: u32,
+    workspace_bytes: usize,
+};
+
+const Bf16Plan = struct {
+    algo: MatmulAlgo,
+    workspace_size: usize,
+};
+
 pub const CublasLt = struct {
+    allocator: ?std.mem.Allocator = null,
     lib: std.DynLib,
     handle: Handle,
     fns: Table,
+    bf16_plans: std.AutoHashMapUnmanaged(Bf16PlanKey, Bf16Plan) = .empty,
 
     const Table = struct {
         cublasLtCreate: *const fn (*Handle) callconv(.c) Status,
@@ -101,6 +115,10 @@ pub const CublasLt = struct {
     };
 
     pub fn open() Error!CublasLt {
+        return openWithAllocator(null);
+    }
+
+    pub fn openWithAllocator(allocator: ?std.mem.Allocator) Error!CublasLt {
         var lib = openLibrary() catch return error.CublasLtUnavailable;
         errdefer lib.close();
         const fns = Table{
@@ -119,10 +137,18 @@ pub const CublasLt = struct {
         };
         var handle: Handle = null;
         if (fns.cublasLtCreate(&handle) != CUBLAS_STATUS_SUCCESS) return error.CublasLtUnavailable;
-        return .{ .lib = lib, .handle = handle, .fns = fns };
+        return .{
+            .allocator = allocator,
+            .lib = lib,
+            .handle = handle,
+            .fns = fns,
+        };
     }
 
     pub fn deinit(self: *CublasLt) void {
+        if (self.allocator) |allocator| {
+            self.bf16_plans.deinit(allocator);
+        }
         if (self.handle != null) {
             _ = self.fns.cublasLtDestroy(self.handle);
             self.handle = null;
@@ -136,6 +162,7 @@ pub const CublasLt = struct {
         dst: buffer_mod.DeviceBuffer,
         input_bf16: buffer_mod.DeviceBuffer,
         weight_bf16: buffer_mod.DeviceBuffer,
+        workspace: buffer_mod.DeviceBuffer,
         rows: usize,
         in_dim: usize,
         out_dim: usize,
@@ -168,19 +195,15 @@ pub const CublasLt = struct {
         try self.check(self.fns.cublasLtMatrixLayoutCreate(&d_desc, CUDA_R_32F, out_dim, rows, @intCast(out_dim)));
         defer _ = self.fns.cublasLtMatrixLayoutDestroy(d_desc);
 
-        var pref: MatmulPreference = null;
-        try self.check(self.fns.cublasLtMatmulPreferenceCreate(&pref));
-        defer _ = self.fns.cublasLtMatmulPreferenceDestroy(pref);
-        var max_workspace: usize = 0;
-        try self.check(self.fns.cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &max_workspace, @sizeOf(usize)));
-
-        var heuristic: [1]MatmulHeuristicResult = undefined;
-        var returned: c_int = 0;
-        try self.check(self.fns.cublasLtMatmulAlgoGetHeuristic(self.handle, op_desc, a_desc, b_desc, c_desc, d_desc, pref, 1, &heuristic, &returned));
-        if (returned <= 0 or heuristic[0].state != CUBLAS_STATUS_SUCCESS) return error.CublasLtUnsupported;
+        const plan = try self.bf16PlanFor(rows, in_dim, out_dim, workspace.len, op_desc, a_desc, b_desc, c_desc, d_desc);
+        try checkRawBytes(workspace, plan.workspace_size);
 
         var alpha: f32 = 1.0;
         var beta: f32 = 0.0;
+        const workspace_ptr: ?*anyopaque = if (workspace.ptr != 0 and plan.workspace_size > 0)
+            @ptrFromInt(workspace.ptr)
+        else
+            null;
         ctx.makeCurrent() catch return error.CublasLtError;
         try self.check(self.fns.cublasLtMatmul(
             self.handle,
@@ -195,11 +218,52 @@ pub const CublasLt = struct {
             c_desc,
             @ptrFromInt(dst.ptr),
             d_desc,
-            &heuristic[0].algo,
-            null,
-            0,
+            &plan.algo,
+            workspace_ptr,
+            plan.workspace_size,
             ctx.stream,
         ));
+    }
+
+    fn bf16PlanFor(
+        self: *CublasLt,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        workspace_bytes: usize,
+        op_desc: MatmulDesc,
+        a_desc: MatrixLayout,
+        b_desc: MatrixLayout,
+        c_desc: MatrixLayout,
+        d_desc: MatrixLayout,
+    ) Error!Bf16Plan {
+        const key = Bf16PlanKey{
+            .rows = @intCast(rows),
+            .in_dim = @intCast(in_dim),
+            .out_dim = @intCast(out_dim),
+            .workspace_bytes = workspace_bytes,
+        };
+        if (self.bf16_plans.get(key)) |plan| return plan;
+
+        var pref: MatmulPreference = null;
+        try self.check(self.fns.cublasLtMatmulPreferenceCreate(&pref));
+        defer _ = self.fns.cublasLtMatmulPreferenceDestroy(pref);
+        var max_workspace = workspace_bytes;
+        try self.check(self.fns.cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &max_workspace, @sizeOf(usize)));
+
+        var heuristic: [1]MatmulHeuristicResult = undefined;
+        var returned: c_int = 0;
+        try self.check(self.fns.cublasLtMatmulAlgoGetHeuristic(self.handle, op_desc, a_desc, b_desc, c_desc, d_desc, pref, 1, &heuristic, &returned));
+        if (returned <= 0 or heuristic[0].state != CUBLAS_STATUS_SUCCESS) return error.CublasLtUnsupported;
+
+        const plan = Bf16Plan{
+            .algo = heuristic[0].algo,
+            .workspace_size = heuristic[0].workspace_size,
+        };
+        if (self.allocator) |allocator| {
+            self.bf16_plans.put(allocator, key, plan) catch {};
+        }
+        return plan;
     }
 
     pub fn matmulF32WeightF32Out(

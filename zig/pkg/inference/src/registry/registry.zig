@@ -774,6 +774,9 @@ fn manifestTypeFromTasks(tasks: []const []const u8, fallback: manifest_mod.Model
         if (std.mem.eql(u8, task, "classify") or std.mem.eql(u8, task, "classifiers")) return .classifier;
     }
     for (tasks) |task| {
+        if (std.mem.eql(u8, task, "generate") or std.mem.eql(u8, task, "generators")) return .generator;
+    }
+    for (tasks) |task| {
         if (std.mem.eql(u8, task, "read") or std.mem.eql(u8, task, "readers")) return .reader;
     }
     for (tasks) |task| {
@@ -784,9 +787,6 @@ fn manifestTypeFromTasks(tasks: []const []const u8, fallback: manifest_mod.Model
     }
     for (tasks) |task| {
         if (std.mem.eql(u8, task, "chunk") or std.mem.eql(u8, task, "chunkers")) return .chunker;
-    }
-    for (tasks) |task| {
-        if (std.mem.eql(u8, task, "generate") or std.mem.eql(u8, task, "generators")) return .generator;
     }
     for (tasks) |task| {
         if (std.mem.eql(u8, task, "embed") or std.mem.eql(u8, task, "embedders")) return .embedder;
@@ -1018,6 +1018,35 @@ test "synthesized pulled manifest accepts plural task directory hints" {
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"tasks\":[\"read\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"inputs\":[\"image\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"capabilities\"") == null);
+}
+
+test "synthesized pulled manifest keeps generate read gguf as generator" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "models/google/gemma-4-E4B-it-qat-q4_0-gguf");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/google/gemma-4-E4B-it-qat-q4_0-gguf/gemma-4-E4B_q4_0-it.gguf",
+        .data = "",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/google/gemma-4-E4B-it-qat-q4_0-gguf/gemma-4-E4B-it-mmproj.gguf",
+        .data = "",
+    });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models/google/gemma-4-E4B-it-qat-q4_0-gguf" });
+    defer allocator.free(model_dir);
+
+    const manifest_json = try synthesizePulledModelManifestJson(allocator, io, model_dir, "generate,read", "text,image,audio");
+    defer allocator.free(manifest_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"type\":\"generator\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"tasks\":[\"generate\",\"read\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"capabilities\":[\"text\",\"image\",\"audio\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"inputs\":[\"text\",\"image\"]") != null);
 }
 
 test "synthesized pulled manifest treats rerank-named sequence classifiers as rerankers" {
