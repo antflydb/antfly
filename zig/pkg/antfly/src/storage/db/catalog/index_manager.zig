@@ -6464,7 +6464,8 @@ pub const IndexManager = struct {
                 );
                 const latest_replay_sequence = store.nextReplaySequence(1) -| 1;
                 const graph_replay_pending = applied_sequence < latest_replay_sequence;
-                if (allow_backfill and (resume_from != null or ((reverse_store_missing or reverse_edges == 0) and !graph_replay_pending))) {
+                const has_replay_history = latest_replay_sequence != 0;
+                if (allow_backfill and (resume_from != null or (has_replay_history and (reverse_store_missing or reverse_edges == 0) and !graph_replay_pending))) {
                     const backfill_started_ns = nowNs();
                     try rebuild_state.update(if (resume_from) |buf| buf else "");
                     _ = try entry.index.rebuildReverseFromOwnedOutgoingEdgesResume(self.alloc, self.byte_range.start, self.byte_range.end, resume_from);
