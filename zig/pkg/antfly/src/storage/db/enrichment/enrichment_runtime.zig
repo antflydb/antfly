@@ -683,6 +683,11 @@ const ChunkEmbeddingSource = struct {
     text: []u8,
 };
 
+const CachedChunkDenseWindowItem = struct {
+    chunk_key: []u8,
+    embedding_key: []u8,
+};
+
 fn freeChunkEmbeddingSources(alloc: Allocator, sources: []const ChunkEmbeddingSource) void {
     for (sources) |source| {
         alloc.free(source.key);
@@ -3778,6 +3783,16 @@ fn freeChunkedDenseWindowItems(
     for (items) |item| alloc.free(item.chunk_key);
 }
 
+fn freeCachedChunkDenseWindowItems(
+    alloc: Allocator,
+    items: []const CachedChunkDenseWindowItem,
+) void {
+    for (items) |item| {
+        alloc.free(item.chunk_key);
+        alloc.free(item.embedding_key);
+    }
+}
+
 fn clearChunkedDenseBatch(
     alloc: Allocator,
     chunk_texts: *std.ArrayListUnmanaged([]const u8),
@@ -3877,6 +3892,22 @@ fn flushChunkedDenseItems(
     return true;
 }
 
+fn processCachedChunkDenseItems(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    consumer_indexes: []const []const u8,
+    window: *GeneratedReplayWindow,
+    cached_items: *std.ArrayListUnmanaged(CachedChunkDenseWindowItem),
+    max_window_items: usize,
+) !void {
+    for (cached_items.items) |item| {
+        try appendCachedChunkDenseEmbeddingToWindow(runtime, window, request, item.chunk_key, item.embedding_key, consumer_indexes);
+        try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
+    }
+    freeCachedChunkDenseWindowItems(runtime.alloc, cached_items.items);
+    cached_items.clearRetainingCapacity();
+}
+
 fn processMaterializedChunkDenseRequest(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
@@ -3900,71 +3931,149 @@ fn processMaterializedChunkDenseRequest(
         freeChunkedDenseWindowItems(runtime.alloc, chunk_items.items);
         chunk_items.deinit(runtime.alloc);
     }
-    var desired_chunk_keys = std.ArrayListUnmanaged([]u8).empty;
-    defer freeKeyList(runtime.alloc, desired_chunk_keys.items);
+    var cached_items = std.ArrayListUnmanaged(CachedChunkDenseWindowItem).empty;
+    defer {
+        freeCachedChunkDenseWindowItems(runtime.alloc, cached_items.items);
+        cached_items.deinit(runtime.alloc);
+    }
+    var desired_chunk_keys = std.StringHashMapUnmanaged(void).empty;
+    defer freeOwnedKeySet(runtime.alloc, &desired_chunk_keys);
     var existing_embedding_keys = std.ArrayListUnmanaged([]u8).empty;
     defer freeKeyList(runtime.alloc, existing_embedding_keys.items);
 
     const prefix = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "chunk", chunk_artifact_name);
     defer runtime.alloc.free(prefix);
-    const existing = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, prefix);
-    defer backend_scan.freeResults(runtime.alloc, existing);
+
+    const upper = try internal_keys.nextPrefixAlloc(runtime.alloc, prefix);
+    defer if (upper) |key| runtime.alloc.free(key);
+    const upper_bound = if (upper) |key| key else "";
+
+    const Discovery = struct {
+        runtime: *EnrichmentRuntime,
+        prefix: []const u8,
+        source_field: []const u8,
+        desired: *std.StringHashMapUnmanaged(void),
+        existing_embeddings: *std.ArrayListUnmanaged([]u8),
+
+        fn scan(ctx_ptr: ?*anyopaque, key: []const u8, value: []const u8) anyerror!backend_scan.ScanAction {
+            const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr orelse return error.InvalidArgument));
+            if (!std.mem.startsWith(u8, key, ctx.prefix)) return .stop;
+            if (internal_keys.isDerivedEmbeddingArtifactKey(key)) {
+                try appendUniqueDupeKey(ctx.runtime.alloc, ctx.existing_embeddings, key);
+                return .@"continue";
+            }
+            if (!internal_keys.isChunkArtifactRecordKey(key)) return .@"continue";
+            if (!try chunkPayloadHasText(ctx.runtime.alloc, value, ctx.source_field)) return .@"continue";
+            try putOwnedKeySetDupeKey(ctx.runtime.alloc, ctx.desired, key);
+            return .@"continue";
+        }
+    };
+    var discovery = Discovery{
+        .runtime = runtime,
+        .prefix = prefix,
+        .source_field = request.source_field,
+        .desired = &desired_chunk_keys,
+        .existing_embeddings = &existing_embedding_keys,
+    };
+    try backend_scan.scanWithContext(&runtime.store, prefix, upper_bound, .{}, &discovery, Discovery.scan);
 
     var batch_source_bytes: usize = 0;
-    for (existing) |entry| {
-        if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) {
-            try appendUniqueDupeKey(runtime.alloc, &existing_embedding_keys, entry.key);
-            continue;
-        }
-        if (!internal_keys.isChunkArtifactRecordKey(entry.key)) continue;
+    var lower = try runtime.alloc.dupe(u8, prefix);
+    defer runtime.alloc.free(lower);
+    while (true) {
+        const Collect = struct {
+            runtime: *EnrichmentRuntime,
+            request: enrichment_types.GeneratedEnrichmentRequest,
+            prefix: []const u8,
+            embedding_artifact_name: []const u8,
+            chunk_texts: *std.ArrayListUnmanaged([]const u8),
+            chunk_items: *std.ArrayListUnmanaged(ChunkedDenseWindowItem),
+            cached_items: *std.ArrayListUnmanaged(CachedChunkDenseWindowItem),
+            batch_source_bytes: *usize,
+            max_batch_items: usize,
+            max_batch_bytes: usize,
+            stopped_for_batch: bool = false,
+            last_key: ?[]u8 = null,
 
-        const text = (try chunkPayloadTextAlloc(runtime.alloc, entry.value, request.source_field)) orelse continue;
-        var text_owned = true;
-        errdefer if (text_owned) runtime.alloc.free(text);
-        try appendUniqueDupeKey(runtime.alloc, &desired_chunk_keys, entry.key);
-        const source_hash = enrichment_artifact_codec.hashSource(text);
-        const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, entry.key, embedding_artifact_name);
-        defer runtime.alloc.free(embedding_key);
-        if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
-            runtime.alloc.free(text);
-            text_owned = false;
-            try appendCachedChunkDenseEmbeddingToWindow(runtime, window, request, entry.key, embedding_key, consumer_indexes);
-            try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
-            continue;
-        }
-        if (chunk_items.items.len > 0 and
-            (chunk_items.items.len >= max_batch_items or batch_source_bytes + text.len > max_batch_bytes))
-        {
-            _ = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, request.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true);
-            try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
-            batch_source_bytes = 0;
-        }
-        try chunk_texts.append(runtime.alloc, text);
-        text_owned = false;
-        try chunk_items.append(runtime.alloc, .{
+            fn scan(ctx_ptr: ?*anyopaque, key: []const u8, value: []const u8) anyerror!backend_scan.ScanAction {
+                const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr orelse return error.InvalidArgument));
+                if (!std.mem.startsWith(u8, key, ctx.prefix)) return .stop;
+                if (!internal_keys.isChunkArtifactRecordKey(key)) return .@"continue";
+
+                const text = (try chunkPayloadTextAlloc(ctx.runtime.alloc, value, ctx.request.source_field)) orelse return .@"continue";
+                var text_owned = true;
+                errdefer if (text_owned) ctx.runtime.alloc.free(text);
+                const source_hash = enrichment_artifact_codec.hashSource(text);
+                const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(ctx.runtime.alloc, key, ctx.embedding_artifact_name);
+                var embedding_key_owned = true;
+                errdefer if (embedding_key_owned) ctx.runtime.alloc.free(embedding_key);
+                if (try shouldSkipEmbeddingArtifact(ctx.runtime, embedding_key, source_hash)) {
+                    ctx.runtime.alloc.free(text);
+                    text_owned = false;
+                    try ctx.cached_items.append(ctx.runtime.alloc, .{
+                        .chunk_key = try ctx.runtime.alloc.dupe(u8, key),
+                        .embedding_key = embedding_key,
+                    });
+                    embedding_key_owned = false;
+                } else {
+                    try ctx.chunk_texts.append(ctx.runtime.alloc, text);
+                    text_owned = false;
+                    try ctx.chunk_items.append(ctx.runtime.alloc, .{
+                        .request = ctx.request,
+                        .parent_doc_key = ctx.request.doc_key,
+                        .source_field = ctx.request.source_field,
+                        .artifact_name = ctx.embedding_artifact_name,
+                        .chunk_key = try ctx.runtime.alloc.dupe(u8, key),
+                        .source_hash = source_hash,
+                    });
+                    ctx.batch_source_bytes.* += text.len;
+                    ctx.runtime.alloc.free(embedding_key);
+                    embedding_key_owned = false;
+                }
+
+                if (ctx.chunk_items.items.len + ctx.cached_items.items.len >= ctx.max_batch_items or
+                    ctx.batch_source_bytes.* >= ctx.max_batch_bytes)
+                {
+                    ctx.stopped_for_batch = true;
+                    ctx.last_key = try ctx.runtime.alloc.dupe(u8, key);
+                    return .stop;
+                }
+                return .@"continue";
+            }
+        };
+        var collect = Collect{
+            .runtime = runtime,
             .request = request,
-            .parent_doc_key = request.doc_key,
-            .source_field = request.source_field,
-            .artifact_name = embedding_artifact_name,
-            .chunk_key = try runtime.alloc.dupe(u8, entry.key),
-            .source_hash = source_hash,
-        });
-        batch_source_bytes += text.len;
-        if (chunk_items.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
-            _ = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, request.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true);
-            try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
-            batch_source_bytes = 0;
-        }
+            .prefix = prefix,
+            .embedding_artifact_name = embedding_artifact_name,
+            .chunk_texts = &chunk_texts,
+            .chunk_items = &chunk_items,
+            .cached_items = &cached_items,
+            .batch_source_bytes = &batch_source_bytes,
+            .max_batch_items = max_batch_items,
+            .max_batch_bytes = max_batch_bytes,
+        };
+        try backend_scan.scanWithContext(&runtime.store, lower, upper_bound, .{}, &collect, Collect.scan);
+
+        try processCachedChunkDenseItems(runtime, request, consumer_indexes, window, &cached_items, max_window_items);
+        _ = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, request.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true);
+        try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
+        batch_source_bytes = 0;
+
+        if (!collect.stopped_for_batch) break;
+        const next_lower = try keyAfterAlloc(runtime.alloc, collect.last_key.?);
+        runtime.alloc.free(collect.last_key.?);
+        runtime.alloc.free(lower);
+        lower = next_lower;
     }
 
-    _ = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, request.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true);
-
     for (existing_embedding_keys.items) |embedding_key| {
-        if (derivedEmbeddingBelongsToDesiredChunk(embedding_key, desired_chunk_keys.items)) continue;
+        if (try derivedEmbeddingBelongsToDesiredChunkSet(runtime.alloc, embedding_key, &desired_chunk_keys)) continue;
         if (try internal_keys.derivedEmbeddingBaseKeyAlloc(runtime.alloc, embedding_key)) |base_key| {
             try appendUniqueOwnedKey(runtime.alloc, &window.deleted_keys, base_key);
         }
         try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, embedding_key);
+        try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
     }
     try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
 }
@@ -6371,6 +6480,14 @@ fn chunkArtifactSourceHash(runtime: *EnrichmentRuntime, chunk_key: []const u8, s
     return enrichment_artifact_codec.hashSource(source.string);
 }
 
+fn chunkPayloadHasText(alloc: Allocator, payload: []const u8, source_field: []const u8) !bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const source = parsed.value.object.get(source_field) orelse return false;
+    return source == .string and source.string.len > 0;
+}
+
 fn chunkPayloadTextAlloc(alloc: Allocator, payload: []const u8, source_field: []const u8) !?[]u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch return null;
     defer parsed.deinit();
@@ -6562,6 +6679,27 @@ fn freeKeyList(alloc: Allocator, keys: []const []u8) void {
     alloc.free(keys);
 }
 
+fn freeOwnedKeySet(alloc: Allocator, keys: *std.StringHashMapUnmanaged(void)) void {
+    var it = keys.iterator();
+    while (it.next()) |entry| alloc.free(@constCast(entry.key_ptr.*));
+    keys.deinit(alloc);
+    keys.* = .empty;
+}
+
+fn putOwnedKeySetDupeKey(alloc: Allocator, keys: *std.StringHashMapUnmanaged(void), key: []const u8) !void {
+    if (keys.contains(key)) return;
+    const owned = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned);
+    try keys.put(alloc, owned, {});
+}
+
+fn keyAfterAlloc(alloc: Allocator, key: []const u8) ![]u8 {
+    const out = try alloc.alloc(u8, key.len + 1);
+    @memcpy(out[0..key.len], key);
+    out[key.len] = 0;
+    return out;
+}
+
 fn keyInList(key: []const u8, keys: []const []const u8) bool {
     for (keys) |candidate| {
         if (std.mem.eql(u8, key, candidate)) return true;
@@ -6592,6 +6730,16 @@ fn derivedEmbeddingBelongsToDesiredChunk(key: []const u8, desired_chunk_keys: []
         if (std.mem.startsWith(u8, key, chunk_key)) return true;
     }
     return false;
+}
+
+fn derivedEmbeddingBelongsToDesiredChunkSet(
+    alloc: Allocator,
+    key: []const u8,
+    desired_chunk_keys: *const std.StringHashMapUnmanaged(void),
+) !bool {
+    const base_key = (try internal_keys.derivedEmbeddingBaseKeyAlloc(alloc, key)) orelse return false;
+    defer alloc.free(base_key);
+    return desired_chunk_keys.contains(base_key);
 }
 
 fn assetSourceIndexKeyForArtifactAlloc(alloc: Allocator, artifact_key: []const u8) !?[]u8 {

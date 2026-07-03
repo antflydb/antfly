@@ -6525,7 +6525,6 @@ pub const ApiHttpServer = struct {
                 error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
                 else => {
                     std.log.err("public artifact enrichment local apply failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
-                    return error.InternalFailure;
                 },
             };
         }
@@ -6565,7 +6564,6 @@ pub const ApiHttpServer = struct {
                 error.EnrichmentInUse, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
                 else => {
                     std.log.err("public artifact enrichment local delete failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
-                    return error.InternalFailure;
                 },
             };
         }

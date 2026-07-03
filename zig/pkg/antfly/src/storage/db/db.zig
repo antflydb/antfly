@@ -16900,6 +16900,14 @@ fn freeChunkEmbeddingSources(alloc: Allocator, sources: []const ChunkEmbeddingSo
     if (sources.len > 0) alloc.free(sources);
 }
 
+fn clearChunkEmbeddingSourceList(alloc: Allocator, sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource)) void {
+    for (sources.items) |source| {
+        alloc.free(source.key);
+        alloc.free(source.text);
+    }
+    sources.clearRetainingCapacity();
+}
+
 fn containsChunkEmbeddingSource(sources: []const ChunkEmbeddingSource, key: []const u8) bool {
     for (sources) |source| {
         if (std.mem.eql(u8, source.key, key)) return true;
@@ -16914,6 +16922,13 @@ fn chunkPayloadTextAlloc(alloc: Allocator, payload: []const u8, source_field: []
     const source = parsed.value.object.get(source_field) orelse return null;
     if (source != .string or source.string.len == 0) return null;
     return try alloc.dupe(u8, source.string);
+}
+
+fn keyAfterAlloc(alloc: Allocator, key: []const u8) ![]u8 {
+    const out = try alloc.alloc(u8, key.len + 1);
+    @memcpy(out[0..key.len], key);
+    out[key.len] = 0;
+    return out;
 }
 
 fn collectChunkEmbeddingSourcesFromWrites(
@@ -17103,6 +17118,159 @@ fn flushGeneratedSparseChunkBatch(
     source_indexes.clearRetainingCapacity();
 }
 
+fn flushGeneratedDenseChunkSourceBatch(
+    alloc: Allocator,
+    db: *DB,
+    dense_embedder: embedder_mod.DenseEmbedder,
+    embedding_name: []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    dense_embeddings: anytype,
+    sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
+    consumer_indexes: []const []const u8,
+    skip_unchanged_artifacts: bool,
+    pending_lookup: ?*const PendingArtifactWriteIndex,
+    comptime appendForConsumers: anytype,
+) !void {
+    if (sources.items.len == 0) return;
+    defer clearChunkEmbeddingSourceList(alloc, sources);
+
+    var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
+    defer chunk_texts.deinit(alloc);
+    var source_indexes = std.ArrayListUnmanaged(usize).empty;
+    defer source_indexes.deinit(alloc);
+
+    for (sources.items, 0..) |source, i| {
+        const source_hash = enrichment_artifact_codec.hashSource(source.text);
+        const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
+        defer alloc.free(artifact_key);
+        if (skip_unchanged_artifacts) {
+            if (try storedOrPendingEmbeddingSourceHash(alloc, db, pending_lookup, artifact_key)) |existing_hash| {
+                if (existing_hash == source_hash) {
+                    try appendForConsumers(alloc, dense_embeddings, source.key, request.doc_key, artifact_key, &.{}, consumer_indexes);
+                    continue;
+                }
+            }
+        }
+        try chunk_texts.append(alloc, source.text);
+        try source_indexes.append(alloc, i);
+    }
+
+    try flushGeneratedDenseChunkBatch(alloc, dense_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources.items, &source_indexes, &chunk_texts, consumer_indexes, appendForConsumers);
+}
+
+fn flushGeneratedSparseChunkSourceBatch(
+    alloc: Allocator,
+    db: *DB,
+    sparse_embedder: embedder_mod.SparseEmbedder,
+    embedding_name: []const u8,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
+    sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
+    consumer_indexes: []const []const u8,
+    pending_lookup: *const PendingArtifactWriteIndex,
+) !void {
+    if (sources.items.len == 0) return;
+    defer clearChunkEmbeddingSourceList(alloc, sources);
+
+    var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
+    defer chunk_texts.deinit(alloc);
+    var source_indexes = std.ArrayListUnmanaged(usize).empty;
+    defer source_indexes.deinit(alloc);
+
+    for (sources.items, 0..) |source, i| {
+        const source_hash = enrichment_artifact_codec.hashSource(source.text);
+        const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
+        defer alloc.free(artifact_key);
+        if (try storedOrPendingEmbeddingSourceHash(alloc, db, pending_lookup, artifact_key)) |existing_hash| {
+            if (existing_hash == source_hash) {
+                try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, source.key, artifact_key, &.{}, &.{}, consumer_indexes);
+                continue;
+            }
+        }
+        try chunk_texts.append(alloc, source.text);
+        try source_indexes.append(alloc, i);
+    }
+
+    try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, sources.items, &source_indexes, &chunk_texts, consumer_indexes);
+}
+
+fn appendMaterializedChunkSourceToBatch(
+    alloc: Allocator,
+    sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
+    batch_source_bytes: *usize,
+    key: []const u8,
+    value: []const u8,
+    source_field: []const u8,
+) !bool {
+    const text = (try chunkPayloadTextAlloc(alloc, value, source_field)) orelse return false;
+    var text_owned = true;
+    errdefer if (text_owned) alloc.free(text);
+    try sources.append(alloc, .{
+        .key = try alloc.dupe(u8, key),
+        .text = text,
+    });
+    text_owned = false;
+    batch_source_bytes.* += text.len;
+    return true;
+}
+
+fn scanMaterializedChunkSourceStoreBatch(
+    alloc: Allocator,
+    db: *DB,
+    prefix: []const u8,
+    upper_bound: []const u8,
+    lower: []const u8,
+    source_field: []const u8,
+    pending_chunk_keys: *const std.StringHashMapUnmanaged(void),
+    sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
+    batch_source_bytes: *usize,
+    max_batch_items: usize,
+    max_batch_bytes: usize,
+) !?[]u8 {
+    const ScanCtx = struct {
+        alloc: Allocator,
+        prefix: []const u8,
+        source_field: []const u8,
+        pending_chunk_keys: *const std.StringHashMapUnmanaged(void),
+        sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
+        batch_source_bytes: *usize,
+        max_batch_items: usize,
+        max_batch_bytes: usize,
+        stopped_key: ?[]u8 = null,
+
+        fn consume(ctx_ptr: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr orelse return error.InvalidArgument));
+            if (!std.mem.startsWith(u8, key, ctx.prefix)) return .stop;
+            if (!internal_keys.isChunkArtifactRecordKey(key)) return .@"continue";
+            if (ctx.pending_chunk_keys.contains(key)) return .@"continue";
+            if (!try appendMaterializedChunkSourceToBatch(ctx.alloc, ctx.sources, ctx.batch_source_bytes, key, value, ctx.source_field)) return .@"continue";
+            if (ctx.sources.items.len >= ctx.max_batch_items or ctx.batch_source_bytes.* >= ctx.max_batch_bytes) {
+                ctx.stopped_key = try ctx.alloc.dupe(u8, key);
+                return .stop;
+            }
+            return .@"continue";
+        }
+    };
+
+    var scan_ctx = ScanCtx{
+        .alloc = alloc,
+        .prefix = prefix,
+        .source_field = source_field,
+        .pending_chunk_keys = pending_chunk_keys,
+        .sources = sources,
+        .batch_source_bytes = batch_source_bytes,
+        .max_batch_items = max_batch_items,
+        .max_batch_bytes = max_batch_bytes,
+    };
+    try db.core.store.scanWithContext(lower, upper_bound, .{}, &scan_ctx, ScanCtx.consume);
+    if (scan_ctx.stopped_key) |key| {
+        defer alloc.free(key);
+        return try keyAfterAlloc(alloc, key);
+    }
+    return null;
+}
+
 fn computeDenseRequest(
     alloc: Allocator,
     db: *DB,
@@ -17125,6 +17293,70 @@ fn computeDenseRequestDerived(
     cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
 ) !void {
     return computeDenseRequestImpl(alloc, db, doc_value, request, artifact_writes, dense_embeddings, cache, true, appendDerivedDenseEmbeddingForConsumers);
+}
+
+fn computeDenseMaterializedChunkRequestImpl(
+    alloc: Allocator,
+    db: *DB,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    dense_embeddings: anytype,
+    skip_unchanged_artifacts: bool,
+    comptime appendForConsumers: anytype,
+    dense_embedder: embedder_mod.DenseEmbedder,
+    embedding_name: []const u8,
+    consumer_indexes: []const []const u8,
+) !void {
+    const artifact_name = requestArtifactName(request);
+    var pending_writes = if (skip_unchanged_artifacts)
+        try PendingArtifactWriteIndex.init(alloc, artifact_writes.items)
+    else
+        PendingArtifactWriteIndex{};
+    defer pending_writes.deinit(alloc);
+    const pending_lookup: ?*const PendingArtifactWriteIndex = if (skip_unchanged_artifacts) &pending_writes else null;
+
+    const max_batch_items = generatedEmbedBatchItems();
+    const max_batch_bytes = generatedEmbedBatchBytes();
+    var sources = std.ArrayListUnmanaged(ChunkEmbeddingSource).empty;
+    defer {
+        clearChunkEmbeddingSourceList(alloc, &sources);
+        sources.deinit(alloc);
+    }
+    var batch_source_bytes: usize = 0;
+    var pending_chunk_keys = std.StringHashMapUnmanaged(void).empty;
+    defer pending_chunk_keys.deinit(alloc);
+
+    for (artifact_writes.items) |write| {
+        if (!internal_keys.matchesChunkArtifactName(write.key, artifact_name)) continue;
+        if (pending_chunk_keys.contains(write.key)) continue;
+        try pending_chunk_keys.put(alloc, write.key, {});
+        _ = try appendMaterializedChunkSourceToBatch(alloc, &sources, &batch_source_bytes, write.key, write.value, request.source_field);
+        if (sources.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
+            try flushGeneratedDenseChunkSourceBatch(alloc, db, dense_embedder, embedding_name, request, artifact_writes, dense_embeddings, &sources, consumer_indexes, skip_unchanged_artifacts, pending_lookup, appendForConsumers);
+            batch_source_bytes = 0;
+        }
+    }
+    try flushGeneratedDenseChunkSourceBatch(alloc, db, dense_embedder, embedding_name, request, artifact_writes, dense_embeddings, &sources, consumer_indexes, skip_unchanged_artifacts, pending_lookup, appendForConsumers);
+    batch_source_bytes = 0;
+
+    const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "chunk", artifact_name);
+    defer alloc.free(prefix);
+    const upper = try internal_keys.nextPrefixAlloc(alloc, prefix);
+    defer if (upper) |key| alloc.free(key);
+    const upper_bound = if (upper) |key| key else "";
+    var lower = try alloc.dupe(u8, prefix);
+    defer alloc.free(lower);
+    while (true) {
+        const next_lower = try scanMaterializedChunkSourceStoreBatch(alloc, db, prefix, upper_bound, lower, request.source_field, &pending_chunk_keys, &sources, &batch_source_bytes, max_batch_items, max_batch_bytes);
+        try flushGeneratedDenseChunkSourceBatch(alloc, db, dense_embedder, embedding_name, request, artifact_writes, dense_embeddings, &sources, consumer_indexes, skip_unchanged_artifacts, pending_lookup, appendForConsumers);
+        batch_source_bytes = 0;
+        if (next_lower) |owned_next| {
+            alloc.free(lower);
+            lower = owned_next;
+            continue;
+        }
+        break;
+    }
 }
 
 fn computeDenseRequestImpl(
@@ -17152,6 +17384,10 @@ fn computeDenseRequestImpl(
     if (consumer_indexes.len == 0) return;
 
     if (requestHasChunking(request) and requestArtifactName(request).len > 0) {
+        if (requestUsesMaterializedChunkArtifact(db, requestArtifactName(request))) {
+            try computeDenseMaterializedChunkRequestImpl(alloc, db, request, artifact_writes, dense_embeddings, skip_unchanged_artifacts, appendForConsumers, dense_embedder, embedding_name, consumer_indexes);
+            return;
+        }
         const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, artifact_writes.items, cache);
         defer freeChunkEmbeddingSources(alloc, sources);
         if (sources.len == 0) return;
@@ -17253,6 +17489,64 @@ fn computeDenseRequestImpl(
     try appendForConsumers(alloc, dense_embeddings, request.doc_key, null, artifact_key, vector, consumer_indexes);
 }
 
+fn computeSparseMaterializedChunkRequest(
+    alloc: Allocator,
+    db: *DB,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
+    sparse_embedder: embedder_mod.SparseEmbedder,
+    embedding_name: []const u8,
+    consumer_indexes: []const []const u8,
+) !void {
+    const artifact_name = requestArtifactName(request);
+    var pending_writes = try PendingArtifactWriteIndex.init(alloc, artifact_writes.items);
+    defer pending_writes.deinit(alloc);
+
+    const max_batch_items = generatedEmbedBatchItems();
+    const max_batch_bytes = generatedEmbedBatchBytes();
+    var sources = std.ArrayListUnmanaged(ChunkEmbeddingSource).empty;
+    defer {
+        clearChunkEmbeddingSourceList(alloc, &sources);
+        sources.deinit(alloc);
+    }
+    var batch_source_bytes: usize = 0;
+    var pending_chunk_keys = std.StringHashMapUnmanaged(void).empty;
+    defer pending_chunk_keys.deinit(alloc);
+
+    for (artifact_writes.items) |write| {
+        if (!internal_keys.matchesChunkArtifactName(write.key, artifact_name)) continue;
+        if (pending_chunk_keys.contains(write.key)) continue;
+        try pending_chunk_keys.put(alloc, write.key, {});
+        _ = try appendMaterializedChunkSourceToBatch(alloc, &sources, &batch_source_bytes, write.key, write.value, request.source_field);
+        if (sources.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
+            try flushGeneratedSparseChunkSourceBatch(alloc, db, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
+            batch_source_bytes = 0;
+        }
+    }
+    try flushGeneratedSparseChunkSourceBatch(alloc, db, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
+    batch_source_bytes = 0;
+
+    const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "chunk", artifact_name);
+    defer alloc.free(prefix);
+    const upper = try internal_keys.nextPrefixAlloc(alloc, prefix);
+    defer if (upper) |key| alloc.free(key);
+    const upper_bound = if (upper) |key| key else "";
+    var lower = try alloc.dupe(u8, prefix);
+    defer alloc.free(lower);
+    while (true) {
+        const next_lower = try scanMaterializedChunkSourceStoreBatch(alloc, db, prefix, upper_bound, lower, request.source_field, &pending_chunk_keys, &sources, &batch_source_bytes, max_batch_items, max_batch_bytes);
+        try flushGeneratedSparseChunkSourceBatch(alloc, db, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
+        batch_source_bytes = 0;
+        if (next_lower) |owned_next| {
+            alloc.free(lower);
+            lower = owned_next;
+            continue;
+        }
+        break;
+    }
+}
+
 fn computeSparseRequestDerived(
     alloc: Allocator,
     db: *DB,
@@ -17276,6 +17570,10 @@ fn computeSparseRequestDerived(
     if (consumer_indexes.len == 0) return;
 
     if (requestHasChunking(request) and requestArtifactName(request).len > 0) {
+        if (requestUsesMaterializedChunkArtifact(db, requestArtifactName(request))) {
+            try computeSparseMaterializedChunkRequest(alloc, db, request, artifact_writes, sparse_embeddings, sparse_embedder, embedding_name, consumer_indexes);
+            return;
+        }
         const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, artifact_writes.items, cache);
         defer freeChunkEmbeddingSources(alloc, sources);
         if (sources.len == 0) return;

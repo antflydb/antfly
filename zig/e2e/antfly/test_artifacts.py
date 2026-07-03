@@ -105,12 +105,10 @@ def _table_has_artifact_enrichment(
         table = api.get_table(table_name)
     except Exception:
         return None
-    encoded = json.dumps(table, sort_keys=True)
-    if f'"name": "{artifact_name}"' not in encoded:
-        return None
-    if f'"kind": "{kind}"' not in encoded:
-        return None
-    return table
+    for enrichment in table.get("artifact_enrichments", []):
+        if enrichment.get("name") == artifact_name and enrichment.get("kind") == kind:
+            return table
+    return None
 
 
 def test_document_artifact_manifest_and_reprocess_job_e2e(stateful_api):
