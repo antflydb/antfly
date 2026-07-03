@@ -3013,6 +3013,9 @@ pub const DB = struct {
             if (opts.open_mode != .status_only) {
                 try db.rebaseManagedIndexAppliedSequencesIfNeeded();
             }
+            if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
+                try db.rebuildArtifactRepairSummaryIfMissing(alloc);
+            }
             db.recordStartupOpenStats(profile);
             if (opts.open_mode.allowsReplay()) {
                 const replay_started_ns = monotonicTimeNs();
@@ -6038,6 +6041,200 @@ pub const DB = struct {
         return try loadArtifactRepairIssueFromStoreByKey(alloc, self.core.store, key);
     }
 
+    fn loadArtifactRepairSummaryCountByKey(self: *DB, alloc: Allocator, key: []const u8) !?u64 {
+        const raw = self.core.store.get(alloc, key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer alloc.free(raw);
+        if (raw.len != @sizeOf(u64)) return error.InvalidArtifactPayload;
+        return std.mem.readInt(u64, raw[0..8], .little);
+    }
+
+    fn loadArtifactRepairSummaryCountOrScan(
+        self: *DB,
+        alloc: Allocator,
+        key: []const u8,
+        scan_prefix: []const u8,
+    ) !u64 {
+        if (try self.loadArtifactRepairSummaryCountByKey(alloc, key)) |count| return count;
+
+        var count: u64 = 0;
+        const upper = try internal_keys.nextPrefixAlloc(alloc, scan_prefix);
+        defer if (upper) |buf| alloc.free(buf);
+        const ScanState = struct {
+            count: *u64,
+            fn scanEntry(ctx: ?*anyopaque, _: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                state.count.* += 1;
+                return .@"continue";
+            }
+        };
+        var state = ScanState{ .count = &count };
+        try self.core.store.scanWithContext(scan_prefix, if (upper) |buf| buf else "", .{}, &state, ScanState.scanEntry);
+        return count;
+    }
+
+    fn artifactRepairSummaryRootCount(self: *DB, alloc: Allocator) !u64 {
+        const key = try internal_keys.artifactRepairSummaryRootKeyAlloc(alloc);
+        defer alloc.free(key);
+        const prefix = try internal_keys.artifactRepairIssueRootPrefixAlloc(alloc);
+        defer alloc.free(prefix);
+        return try self.loadArtifactRepairSummaryCountOrScan(alloc, key, prefix);
+    }
+
+    fn artifactRepairSummaryIndexCount(self: *DB, alloc: Allocator, index_name: []const u8) !u64 {
+        const key = try internal_keys.artifactRepairSummaryIndexKeyAlloc(alloc, index_name);
+        defer alloc.free(key);
+        const prefix = try internal_keys.artifactRepairIssueIndexPrefixAlloc(alloc, index_name);
+        defer alloc.free(prefix);
+        return try self.loadArtifactRepairSummaryCountOrScan(alloc, key, prefix);
+    }
+
+    fn appendArtifactRepairSummaryWrite(
+        self: *DB,
+        alloc: Allocator,
+        writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+        deletes: *std.ArrayListUnmanaged([]const u8),
+        key: []const u8,
+        delta: i64,
+    ) !void {
+        const existing = (try self.loadArtifactRepairSummaryCountByKey(alloc, key)) orelse 0;
+        const updated = if (delta >= 0) existing +| @as(u64, @intCast(delta)) else existing -| @as(u64, @intCast(-delta));
+        if (updated == 0) {
+            try deletes.append(alloc, key);
+            return;
+        }
+        const value = try alloc.alloc(u8, @sizeOf(u64));
+        std.mem.writeInt(u64, value[0..8], updated, .little);
+        try writes.append(alloc, .{ .key = key, .value = value });
+    }
+
+    fn saveArtifactRepairIssueWithSummary(
+        self: *DB,
+        alloc: Allocator,
+        key: []const u8,
+        issue: types.ArtifactRepairIssue,
+        new_issue: bool,
+    ) !void {
+        const encoded = try self.encodeArtifactRepairIssueAlloc(alloc, issue);
+        defer alloc.free(encoded);
+        if (!new_issue) {
+            try self.core.store.put(key, encoded);
+            return;
+        }
+
+        const root_summary_key = try internal_keys.artifactRepairSummaryRootKeyAlloc(alloc);
+        defer alloc.free(root_summary_key);
+        const index_summary_key = try internal_keys.artifactRepairSummaryIndexKeyAlloc(alloc, issue.index_name);
+        defer alloc.free(index_summary_key);
+
+        var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer {
+            for (writes.items) |item| {
+                if (item.value.ptr != encoded.ptr) alloc.free(@constCast(item.value));
+            }
+            writes.deinit(alloc);
+        }
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(alloc);
+
+        try writes.append(alloc, .{ .key = key, .value = encoded });
+        try self.appendArtifactRepairSummaryWrite(alloc, &writes, &deletes, root_summary_key, 1);
+        try self.appendArtifactRepairSummaryWrite(alloc, &writes, &deletes, index_summary_key, 1);
+        try self.core.store.putBatch(writes.items, deletes.items);
+    }
+
+    fn clearArtifactRepairIssueWithSummary(self: *DB, alloc: Allocator, issue: types.ArtifactRepairIssue) !void {
+        const key = try self.repairIssueKeyForIssueAlloc(alloc, issue);
+        defer alloc.free(key);
+
+        const existing = (try self.loadArtifactRepairIssueByKey(alloc, key)) orelse return;
+        var existing_issue = existing;
+        defer existing_issue.deinit(alloc);
+
+        const root_summary_key = try internal_keys.artifactRepairSummaryRootKeyAlloc(alloc);
+        defer alloc.free(root_summary_key);
+        const index_summary_key = try internal_keys.artifactRepairSummaryIndexKeyAlloc(alloc, existing_issue.index_name);
+        defer alloc.free(index_summary_key);
+
+        var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer {
+            for (writes.items) |item| alloc.free(@constCast(item.value));
+            writes.deinit(alloc);
+        }
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(alloc);
+
+        try deletes.append(alloc, key);
+        try self.appendArtifactRepairSummaryWrite(alloc, &writes, &deletes, root_summary_key, -1);
+        try self.appendArtifactRepairSummaryWrite(alloc, &writes, &deletes, index_summary_key, -1);
+        try self.core.store.putBatch(writes.items, deletes.items);
+    }
+
+    fn rebuildArtifactRepairSummaryIfMissing(self: *DB, alloc: Allocator) !void {
+        const root_summary_key = try internal_keys.artifactRepairSummaryRootKeyAlloc(alloc);
+        defer alloc.free(root_summary_key);
+        if ((try self.loadArtifactRepairSummaryCountByKey(alloc, root_summary_key)) != null) return;
+
+        const prefix = try internal_keys.artifactRepairIssueRootPrefixAlloc(alloc);
+        defer alloc.free(prefix);
+        const upper = try internal_keys.nextPrefixAlloc(alloc, prefix);
+        defer if (upper) |buf| alloc.free(buf);
+
+        const ScanState = struct {
+            alloc: Allocator,
+            root_count: u64 = 0,
+            per_index: std.StringHashMapUnmanaged(u64) = .empty,
+
+            fn deinit(state: *@This()) void {
+                var it = state.per_index.iterator();
+                while (it.next()) |entry| state.alloc.free(entry.key_ptr.*);
+                state.per_index.deinit(state.alloc);
+            }
+
+            fn scanEntry(ctx: ?*anyopaque, _: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                var issue = try decodeArtifactRepairIssueValueAlloc(state.alloc, value);
+                defer issue.deinit(state.alloc);
+                state.root_count += 1;
+                const result = try state.per_index.getOrPut(state.alloc, issue.index_name);
+                if (!result.found_existing) {
+                    result.key_ptr.* = try state.alloc.dupe(u8, issue.index_name);
+                    result.value_ptr.* = 0;
+                }
+                result.value_ptr.* += 1;
+                return .@"continue";
+            }
+        };
+
+        var state = ScanState{ .alloc = alloc };
+        defer state.deinit();
+        try self.core.store.scanWithContext(prefix, if (upper) |buf| buf else "", .{}, &state, ScanState.scanEntry);
+
+        var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        var owned_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (writes.items) |item| alloc.free(@constCast(item.value));
+            for (owned_keys.items) |owned_key| alloc.free(@constCast(owned_key));
+            owned_keys.deinit(alloc);
+            writes.deinit(alloc);
+        }
+        var root_value = try alloc.alloc(u8, @sizeOf(u64));
+        std.mem.writeInt(u64, root_value[0..8], state.root_count, .little);
+        try writes.append(alloc, .{ .key = root_summary_key, .value = root_value });
+
+        var it = state.per_index.iterator();
+        while (it.next()) |entry| {
+            const key = try internal_keys.artifactRepairSummaryIndexKeyAlloc(alloc, entry.key_ptr.*);
+            try owned_keys.append(alloc, key);
+            var value = try alloc.alloc(u8, @sizeOf(u64));
+            std.mem.writeInt(u64, value[0..8], entry.value_ptr.*, .little);
+            try writes.append(alloc, .{ .key = key, .value = value });
+        }
+        try self.core.store.putBatch(writes.items, &.{});
+    }
+
     pub fn recordArtifactRepairIssue(
         self: *DB,
         alloc: Allocator,
@@ -6047,8 +6244,9 @@ pub const DB = struct {
         defer alloc.free(key);
 
         const now_ns = currentTimeNs();
-        var stored = if (try self.loadArtifactRepairIssueByKey(alloc, key)) |existing|
-            existing
+        const existing = try self.loadArtifactRepairIssueByKey(alloc, key);
+        var stored = if (existing) |loaded|
+            loaded
         else
             try cloneArtifactRepairIssueAlloc(alloc, issue);
         defer stored.deinit(alloc);
@@ -6068,7 +6266,7 @@ pub const DB = struct {
             stored.source_artifact_name = try alloc.dupe(u8, issue.source_artifact_name);
         }
 
-        try saveArtifactRepairIssueToStore(alloc, self.core.store, stored);
+        try self.saveArtifactRepairIssueWithSummary(alloc, key, stored, existing == null);
     }
 
     fn recordEmbeddingArtifactRepairIssue(
@@ -6086,8 +6284,9 @@ pub const DB = struct {
         defer alloc.free(key);
 
         const now_ns = currentTimeNs();
-        var issue = if (try self.loadArtifactRepairIssueByKey(alloc, key)) |existing|
-            existing
+        const existing = try self.loadArtifactRepairIssueByKey(alloc, key);
+        var issue = if (existing) |loaded|
+            loaded
         else
             types.ArtifactRepairIssue{
                 .artifact_kind = .embedding,
@@ -6116,9 +6315,98 @@ pub const DB = struct {
             issue.source_artifact_name = try alloc.dupe(u8, identity.source_artifact_name orelse "");
         }
 
-        const encoded = try self.encodeArtifactRepairIssueAlloc(alloc, issue);
-        defer alloc.free(encoded);
-        try self.core.store.put(key, encoded);
+        try self.saveArtifactRepairIssueWithSummary(alloc, key, issue, existing == null);
+    }
+
+    fn artifactRepairScanLowerBoundAlloc(
+        self: *DB,
+        alloc: Allocator,
+        prefix: []const u8,
+        cursor: ?[]const u8,
+    ) ![]u8 {
+        _ = self;
+        const raw_cursor = cursor orelse return try alloc.dupe(u8, prefix);
+        if (raw_cursor.len == 0) return try alloc.dupe(u8, prefix);
+        const key = hexToBytesAlloc(alloc, raw_cursor) catch return error.InvalidArgument;
+        defer alloc.free(key);
+        if (!std.mem.startsWith(u8, key, prefix)) return error.InvalidArgument;
+        var lower = try alloc.alloc(u8, key.len + 1);
+        @memcpy(lower[0..key.len], key);
+        lower[key.len] = 0;
+        return lower;
+    }
+
+    pub fn listArtifactRepairIssuesPage(
+        self: *DB,
+        alloc: Allocator,
+        req: types.ArtifactRepairListRequest,
+    ) !types.ArtifactRepairListResult {
+        const prefix = if (req.index_name) |name|
+            try internal_keys.artifactRepairIssueIndexPrefixAlloc(alloc, name)
+        else
+            try internal_keys.artifactRepairIssueRootPrefixAlloc(alloc);
+        defer alloc.free(prefix);
+        const upper = try internal_keys.nextPrefixAlloc(alloc, prefix);
+        defer if (upper) |buf| alloc.free(buf);
+        const lower = try self.artifactRepairScanLowerBoundAlloc(alloc, prefix, req.cursor);
+        defer alloc.free(lower);
+
+        const ScanState = struct {
+            alloc: Allocator,
+            db: *DB,
+            artifact_kind: ?types.ArtifactRepairKind,
+            limit: u32,
+            scanned: u64 = 0,
+            has_more: bool = false,
+            last_cursor: ?[]u8 = null,
+            issues: std.ArrayListUnmanaged(types.ArtifactRepairIssue) = .empty,
+
+            fn deinitPartial(state: *@This()) void {
+                for (state.issues.items) |*issue| issue.deinit(state.alloc);
+                state.issues.deinit(state.alloc);
+                if (state.last_cursor) |cursor| state.alloc.free(cursor);
+            }
+
+            fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                state.scanned += 1;
+                var issue = try state.db.decodeArtifactRepairIssueAlloc(state.alloc, value);
+                errdefer issue.deinit(state.alloc);
+                if (state.artifact_kind) |kind| {
+                    if (issue.artifact_kind != kind) {
+                        issue.deinit(state.alloc);
+                        return .@"continue";
+                    }
+                }
+                if (state.limit != 0 and state.issues.items.len >= state.limit) {
+                    issue.deinit(state.alloc);
+                    state.has_more = true;
+                    return .stop;
+                }
+                try state.issues.append(state.alloc, issue);
+                if (state.last_cursor) |cursor| state.alloc.free(cursor);
+                state.last_cursor = try bytesToHexAlloc(state.alloc, key);
+                return .@"continue";
+            }
+        };
+
+        var state = ScanState{ .alloc = alloc, .db = self, .artifact_kind = req.artifact_kind, .limit = req.limit };
+        errdefer state.deinitPartial();
+        try self.core.store.scanWithContext(lower, if (upper) |buf| buf else "", .{}, &state, ScanState.scanEntry);
+        const issues = try state.issues.toOwnedSlice(alloc);
+        state.issues = .empty;
+        const next_cursor = if (state.has_more) state.last_cursor else null;
+        if (!state.has_more) {
+            if (state.last_cursor) |cursor| alloc.free(cursor);
+        }
+        state.last_cursor = null;
+        return .{
+            .issues = issues,
+            .limit = req.limit,
+            .scanned = state.scanned,
+            .next_cursor = next_cursor,
+            .has_more = state.has_more,
+        };
     }
 
     pub fn listArtifactRepairIssues(
@@ -6128,37 +6416,13 @@ pub const DB = struct {
         index_name: ?[]const u8,
         limit: usize,
     ) ![]types.ArtifactRepairIssue {
-        const prefix = if (index_name) |name|
-            try internal_keys.artifactRepairIssueIndexPrefixAlloc(alloc, name)
-        else
-            try internal_keys.artifactRepairIssueRootPrefixAlloc(alloc);
-        defer alloc.free(prefix);
-
-        const rows = try self.core.store.scanPrefix(alloc, prefix);
-        defer docstore_mod.DocStore.freeResults(alloc, rows);
-
-        const max_items = if (limit == 0) rows.len else @min(rows.len, limit);
-        var issues = try alloc.alloc(types.ArtifactRepairIssue, max_items);
-        var count: usize = 0;
-        errdefer {
-            for (issues[0..count]) |*issue| issue.deinit(alloc);
-            alloc.free(issues);
-        }
-
-        for (rows) |row| {
-            if (limit != 0 and count >= limit) break;
-            var issue = try self.decodeArtifactRepairIssueAlloc(alloc, row.value);
-            errdefer issue.deinit(alloc);
-            if (artifact_kind) |kind| {
-                if (issue.artifact_kind != kind) {
-                    issue.deinit(alloc);
-                    continue;
-                }
-            }
-            issues[count] = issue;
-            count += 1;
-        }
-        return issues[0..count];
+        const page = try self.listArtifactRepairIssuesPage(alloc, .{
+            .artifact_kind = artifact_kind,
+            .index_name = index_name,
+            .limit = @intCast(@min(limit, std.math.maxInt(u32))),
+        });
+        if (page.next_cursor) |cursor| alloc.free(cursor);
+        return page.issues;
     }
 
     pub fn listEmbeddingArtifactRepairIssues(
@@ -6183,26 +6447,8 @@ pub const DB = struct {
         return issues;
     }
 
-    fn countArtifactRepairIssues(self: *DB, alloc: Allocator) !u64 {
-        const prefix = try internal_keys.artifactRepairIssueRootPrefixAlloc(alloc);
-        defer alloc.free(prefix);
-        const rows = try self.core.store.scanPrefix(alloc, prefix);
-        defer docstore_mod.DocStore.freeResults(alloc, rows);
-        return @intCast(rows.len);
-    }
-
-    fn countArtifactRepairIssuesForIndex(self: *DB, alloc: Allocator, index_name: []const u8) !u64 {
-        const prefix = try internal_keys.artifactRepairIssueIndexPrefixAlloc(alloc, index_name);
-        defer alloc.free(prefix);
-        const rows = try self.core.store.scanPrefix(alloc, prefix);
-        defer docstore_mod.DocStore.freeResults(alloc, rows);
-        return @intCast(rows.len);
-    }
-
     fn clearArtifactRepairIssue(self: *DB, alloc: Allocator, issue: types.ArtifactRepairIssue) !void {
-        const key = try self.repairIssueKeyForIssueAlloc(alloc, issue);
-        defer alloc.free(key);
-        try self.core.store.putBatch(&.{}, &.{key});
+        try self.clearArtifactRepairIssueWithSummary(alloc, issue);
     }
 
     fn artifactNowReadable(self: *DB, alloc: Allocator, issue: types.ArtifactRepairIssue) !bool {
@@ -6287,20 +6533,46 @@ pub const DB = struct {
         };
     }
 
-    pub fn repairArtifactIssues(
+    fn artifactRepairKindHasReprocessor(kind: types.ArtifactRepairKind) bool {
+        return switch (kind) {
+            .embedding, .asset => true,
+            .chunk, .graph, .full_text => false,
+        };
+    }
+
+    pub fn repairArtifactIssuesWithRequest(
         self: *DB,
         alloc: Allocator,
-        artifact_kind: ?types.ArtifactRepairKind,
-        limit: usize,
+        req: types.ArtifactRepairRunRequest,
     ) !types.ArtifactRepairResult {
-        const issues = try self.listArtifactRepairIssues(alloc, artifact_kind, null, limit);
-        defer types.freeArtifactRepairIssues(alloc, issues);
+        const page = try self.listArtifactRepairIssuesPage(alloc, .{
+            .artifact_kind = req.artifact_kind,
+            .limit = req.limit,
+            .cursor = req.cursor,
+        });
+        defer {
+            types.freeArtifactRepairIssues(alloc, page.issues);
+            if (page.next_cursor) |cursor| alloc.free(cursor);
+        }
 
-        var result: types.ArtifactRepairResult = .{};
-        for (issues) |*issue| {
+        var result: types.ArtifactRepairResult = .{
+            .limit = req.limit,
+            .has_more = page.has_more,
+        };
+        if (page.next_cursor) |cursor| {
+            result.next_cursor = try alloc.dupe(u8, cursor);
+        }
+        for (page.issues) |*issue| {
             result.scanned += 1;
             issue.attempts += 1;
             issue.last_seen_ns = currentTimeNs();
+
+            if (!artifactRepairKindHasReprocessor(issue.artifact_kind)) {
+                try replaceRepairIssueLastError(alloc, issue, "artifact_reprocessor_unavailable");
+                try saveArtifactRepairIssueToStore(alloc, self.core.store, issue.*);
+                result.unsupported += 1;
+                continue;
+            }
 
             const reprocessed = self.reprocessArtifactIssue(alloc, issue.*) catch |err| switch (err) {
                 error.NotFound => {
@@ -6343,6 +6615,18 @@ pub const DB = struct {
             };
         }
         return result;
+    }
+
+    pub fn repairArtifactIssues(
+        self: *DB,
+        alloc: Allocator,
+        artifact_kind: ?types.ArtifactRepairKind,
+        limit: usize,
+    ) !types.ArtifactRepairResult {
+        return try self.repairArtifactIssuesWithRequest(alloc, .{
+            .artifact_kind = artifact_kind,
+            .limit = @intCast(@min(limit, std.math.maxInt(u32))),
+        });
     }
 
     pub fn repairEmbeddingArtifactIssues(self: *DB, alloc: Allocator, limit: usize) !types.EmbeddingArtifactRepairResult {
@@ -10531,7 +10815,7 @@ pub const DB = struct {
         const async_indexing = self.snapshotAsyncIndexingStats();
         const identity_stats = dbDocIdentityStats(try doc_identity.fastStatsFromStore(self.core.store), self.core.identity_namespace);
         const primary_doc_count = self.scanPrimaryDocCount(self.core.byteRange()) catch 0;
-        const repair_issue_count = try self.countArtifactRepairIssues(alloc);
+        const repair_issue_count = try self.artifactRepairSummaryRootCount(alloc);
 
         var index_stats = try alloc.alloc(types.DBIndexStats, configs.len);
         var index_count: usize = 0;
@@ -10569,7 +10853,7 @@ pub const DB = struct {
                 item.backfill_active = false;
                 item.catch_up_active = false;
             }
-            item.repair_issue_count = try self.countArtifactRepairIssuesForIndex(alloc, cfg.name);
+            item.repair_issue_count = try self.artifactRepairSummaryIndexCount(alloc, cfg.name);
             item.repair_degraded = item.repair_issue_count != 0;
 
             switch (cfg.kind) {
@@ -10682,7 +10966,7 @@ pub const DB = struct {
         const visible_doc_count = indexed_doc_count orelse try self.scanPrimaryDocCount(byte_range);
         const async_indexing = self.async_context.stats.snapshot();
         const identity_stats = try self.diagnosticDocIdentityStats(byte_range);
-        const repair_issue_count = try self.countArtifactRepairIssues(alloc);
+        const repair_issue_count = try self.artifactRepairSummaryRootCount(alloc);
 
         var index_stats = try alloc.alloc(types.DBIndexStats, configs.len);
         var index_count: usize = 0;
@@ -10707,7 +10991,7 @@ pub const DB = struct {
                 item.catch_up_active = false;
                 break;
             }
-            item.repair_issue_count = try self.countArtifactRepairIssuesForIndex(alloc, cfg.name);
+            item.repair_issue_count = try self.artifactRepairSummaryIndexCount(alloc, cfg.name);
             item.repair_degraded = item.repair_issue_count != 0;
             switch (cfg.kind) {
                 .full_text => {
@@ -10861,7 +11145,7 @@ pub const DB = struct {
         const target_sequence = self.core.nextDerivedSequence();
         var visible_doc_count: u64 = 0;
         const identity_stats = dbDocIdentityStats(try doc_identity.fastStatsFromStore(self.core.store), self.core.identity_namespace);
-        const repair_issue_count = try self.countArtifactRepairIssues(alloc);
+        const repair_issue_count = try self.artifactRepairSummaryRootCount(alloc);
 
         var index_stats = try alloc.alloc(types.DBIndexStats, configs.len);
         var index_count: usize = 0;
@@ -10900,7 +11184,7 @@ pub const DB = struct {
                 applyIndexStatusSnapshot(&item, status_snapshot);
                 visible_doc_count = @max(visible_doc_count, item.doc_count);
             }
-            item.repair_issue_count = try self.countArtifactRepairIssuesForIndex(alloc, cfg.name);
+            item.repair_issue_count = try self.artifactRepairSummaryIndexCount(alloc, cfg.name);
             item.repair_degraded = item.repair_issue_count != 0;
             if (cfg.kind == .full_text) {
                 item.text_merge = self.core.index_manager.textMergeStatsSnapshotForIndex(cfg.name);
@@ -20896,6 +21180,74 @@ fn saveArtifactRepairIssueToStore(
     try store.put(key, encoded);
 }
 
+fn loadArtifactRepairSummaryCountFromStoreByKey(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    key: []const u8,
+) !?u64 {
+    const raw = store.get(alloc, key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    if (raw.len != @sizeOf(u64)) return error.InvalidArtifactPayload;
+    return std.mem.readInt(u64, raw[0..8], .little);
+}
+
+fn appendArtifactRepairSummaryWriteForStore(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    key: []const u8,
+    delta: i64,
+) !void {
+    const existing = (try loadArtifactRepairSummaryCountFromStoreByKey(alloc, store, key)) orelse 0;
+    const updated = if (delta >= 0) existing +| @as(u64, @intCast(delta)) else existing -| @as(u64, @intCast(-delta));
+    if (updated == 0) {
+        try deletes.append(alloc, key);
+        return;
+    }
+    const value = try alloc.alloc(u8, @sizeOf(u64));
+    std.mem.writeInt(u64, value[0..8], updated, .little);
+    try writes.append(alloc, .{ .key = key, .value = value });
+}
+
+fn saveArtifactRepairIssueToStoreWithSummary(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    key: []const u8,
+    issue: types.ArtifactRepairIssue,
+    new_issue: bool,
+) !void {
+    const encoded = try encodeArtifactRepairIssueValueAlloc(alloc, issue);
+    defer alloc.free(encoded);
+    if (!new_issue) {
+        try store.put(key, encoded);
+        return;
+    }
+
+    const root_summary_key = try internal_keys.artifactRepairSummaryRootKeyAlloc(alloc);
+    defer alloc.free(root_summary_key);
+    const index_summary_key = try internal_keys.artifactRepairSummaryIndexKeyAlloc(alloc, issue.index_name);
+    defer alloc.free(index_summary_key);
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (writes.items) |item| {
+            if (item.value.ptr != encoded.ptr) alloc.free(@constCast(item.value));
+        }
+        writes.deinit(alloc);
+    }
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+
+    try writes.append(alloc, .{ .key = key, .value = encoded });
+    try appendArtifactRepairSummaryWriteForStore(alloc, store, &writes, &deletes, root_summary_key, 1);
+    try appendArtifactRepairSummaryWriteForStore(alloc, store, &writes, &deletes, index_summary_key, 1);
+    try store.putBatch(writes.items, deletes.items);
+}
+
 fn recordEmbeddingArtifactRepairIssueContext(
     ctx: *const AsyncContext,
     index_name: []const u8,
@@ -20910,8 +21262,9 @@ fn recordEmbeddingArtifactRepairIssueContext(
     defer ctx.alloc.free(issue_key);
 
     const now_ns = currentTimeNs();
-    var issue = if (try loadArtifactRepairIssueFromStoreByKey(ctx.alloc, ctx.store, issue_key)) |existing|
-        existing
+    const existing = try loadArtifactRepairIssueFromStoreByKey(ctx.alloc, ctx.store, issue_key);
+    var issue = if (existing) |loaded|
+        loaded
     else
         types.ArtifactRepairIssue{
             .artifact_kind = .embedding,
@@ -20940,7 +21293,7 @@ fn recordEmbeddingArtifactRepairIssueContext(
         issue.source_artifact_name = try ctx.alloc.dupe(u8, identity.source_artifact_name orelse "");
     }
 
-    try saveArtifactRepairIssueToStore(ctx.alloc, ctx.store, issue);
+    try saveArtifactRepairIssueToStoreWithSummary(ctx.alloc, ctx.store, issue_key, issue, existing == null);
 }
 
 fn denseEmbeddingArtifactRepairReason(
@@ -34489,6 +34842,130 @@ test "db generic artifact repair queue reprocesses document asset artifacts" {
     try std.testing.expect(after.manifest_json.len > 0);
 }
 
+test "db artifact repair summary is persisted for status-only reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        var issue = types.ArtifactRepairIssue{
+            .artifact_kind = .asset,
+            .index_name = try alloc.dupe(u8, "document_units_v1"),
+            .doc_key = try alloc.dupe(u8, "doc:a"),
+            .artifact_name = try alloc.dupe(u8, "document_units_v1"),
+            .reason = .corrupt_artifact,
+            .sequence = 7,
+        };
+        defer issue.deinit(alloc);
+        try db.recordArtifactRepairIssue(alloc, issue);
+
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expect(stats.repair_degraded);
+        try std.testing.expectEqual(@as(u64, 1), stats.repair_issue_count);
+    }
+
+    var status_db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .status_only,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer status_db.close();
+
+    const status_stats = try status_db.stats(alloc);
+    defer types.freeDBStats(alloc, status_stats);
+    try std.testing.expect(status_stats.repair_degraded);
+    try std.testing.expectEqual(@as(u64, 1), status_stats.repair_issue_count);
+}
+
+test "db artifact repair list cursor pages durable repair debt" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    var first_issue = types.ArtifactRepairIssue{
+        .artifact_kind = .asset,
+        .index_name = try alloc.dupe(u8, "document_units_v1"),
+        .doc_key = try alloc.dupe(u8, "doc:a"),
+        .artifact_name = try alloc.dupe(u8, "document_units_v1"),
+        .reason = .corrupt_artifact,
+        .sequence = 1,
+    };
+    defer first_issue.deinit(alloc);
+    try db.recordArtifactRepairIssue(alloc, first_issue);
+
+    var second_issue = types.ArtifactRepairIssue{
+        .artifact_kind = .asset,
+        .index_name = try alloc.dupe(u8, "document_units_v1"),
+        .doc_key = try alloc.dupe(u8, "doc:b"),
+        .artifact_name = try alloc.dupe(u8, "document_units_v1"),
+        .reason = .corrupt_artifact,
+        .sequence = 2,
+    };
+    defer second_issue.deinit(alloc);
+    try db.recordArtifactRepairIssue(alloc, second_issue);
+
+    var first_page = try db.listArtifactRepairIssuesPage(alloc, .{ .artifact_kind = .asset, .limit = 1 });
+    defer first_page.deinit(alloc);
+    try std.testing.expect(first_page.has_more);
+    try std.testing.expect(first_page.next_cursor != null);
+    try std.testing.expectEqual(@as(usize, 1), first_page.issues.len);
+    try std.testing.expectEqualStrings("doc:a", first_page.issues[0].doc_key);
+
+    var second_page = try db.listArtifactRepairIssuesPage(alloc, .{ .artifact_kind = .asset, .limit = 1, .cursor = first_page.next_cursor.? });
+    defer second_page.deinit(alloc);
+    try std.testing.expect(!second_page.has_more);
+    try std.testing.expect(second_page.next_cursor == null);
+    try std.testing.expectEqual(@as(usize, 1), second_page.issues.len);
+    try std.testing.expectEqualStrings("doc:b", second_page.issues[0].doc_key);
+}
+
+test "db artifact repair reports unsupported artifact kinds without clearing debt" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    var issue = types.ArtifactRepairIssue{
+        .artifact_kind = .graph,
+        .index_name = try alloc.dupe(u8, "entity_graph_v1"),
+        .doc_key = try alloc.dupe(u8, "doc:a"),
+        .artifact_name = try alloc.dupe(u8, "entity_graph_v1"),
+        .reason = .corrupt_artifact,
+        .sequence = 9,
+    };
+    defer issue.deinit(alloc);
+    try db.recordArtifactRepairIssue(alloc, issue);
+
+    var repair = try db.repairArtifactIssuesWithRequest(alloc, .{ .artifact_kind = .graph, .limit = 10 });
+    defer repair.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), repair.scanned);
+    try std.testing.expectEqual(@as(u64, 0), repair.reprocessed);
+    try std.testing.expectEqual(@as(u64, 0), repair.repaired);
+    try std.testing.expectEqual(@as(u64, 0), repair.failed);
+    try std.testing.expectEqual(@as(u64, 1), repair.unsupported);
+
+    const issues = try db.listArtifactRepairIssues(alloc, .graph, "entity_graph_v1", 0);
+    defer types.freeArtifactRepairIssues(alloc, issues);
+    try std.testing.expectEqual(@as(usize, 1), issues.len);
+    try std.testing.expectEqual(@as(u64, 1), issues[0].attempts);
+    try std.testing.expectEqualStrings("artifact_reprocessor_unavailable", issues[0].last_error);
+}
+
 test "db document extraction unit ranges split by text bytes" {
     const alloc = std.testing.allocator;
     const text_a = try alloc.alloc(u8, 600 * 1024);
@@ -41740,6 +42217,70 @@ test "db replay blocks and preserves corrupt dense embedding artifacts" {
     try std.testing.expectEqual(@as(usize, 1), issues_after_repair.len);
     try std.testing.expectEqual(@as(u64, 1), issues_after_repair[0].attempts);
     try std.testing.expectEqualStrings("embedding_enrichment_unavailable", issues_after_repair[0].last_error);
+}
+
+test "db replay records wrong-dimension dense embedding artifact as repair debt" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var appended_sequence: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+        });
+
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(stored_key);
+        try db.core.store.put(stored_key, "{\"title\":\"alpha\"}");
+
+        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+        defer alloc.free(artifact_key);
+        try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0, 0 });
+
+        const derived_batch = derived_types.DerivedBatch{
+            .dense_embeddings = &.{
+                .{
+                    .index_name = "dv_v1",
+                    .doc_key = "doc:a",
+                    .artifact_key = artifact_key,
+                    .vector = &[_]f32{ 1, 0 },
+                },
+            },
+        };
+        appended_sequence = try appendDerivedBatchRecord(&db, derived_batch);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const issues = try reopened.listEmbeddingArtifactRepairIssues(alloc, "dv_v1", 0);
+    defer types.freeEmbeddingArtifactRepairIssues(alloc, issues);
+    try std.testing.expectEqual(@as(usize, 1), issues.len);
+    try std.testing.expectEqual(.corrupt_embedding_artifact, issues[0].reason);
+    try std.testing.expectEqualStrings("doc:a", issues[0].doc_key);
+    try std.testing.expectEqualStrings("dv_v1", issues[0].artifact_name);
+
+    const degraded_stats = try reopened.stats(alloc);
+    defer types.freeDBStats(alloc, degraded_stats);
+    try std.testing.expect(degraded_stats.repair_degraded);
+    try std.testing.expectEqual(@as(u64, 1), degraded_stats.repair_issue_count);
+    try std.testing.expect(degraded_stats.indexes[0].repair_degraded);
+    try std.testing.expectEqual(@as(u64, 1), degraded_stats.indexes[0].repair_issue_count);
+
+    const dense_applied = try reopened.core.loadAppliedSequence(alloc, "dv_v1");
+    try std.testing.expectEqual(@as(u64, 0), dense_applied);
+    try std.testing.expect(appended_sequence > dense_applied);
 }
 
 test "db repair queue reprocesses corrupt generated dense embedding artifacts" {

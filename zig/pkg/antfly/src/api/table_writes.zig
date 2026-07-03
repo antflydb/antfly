@@ -257,6 +257,137 @@ fn documentArtifactReprocessRequestForCursor(
     };
 }
 
+fn appendOwnedArtifactRepairIssues(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(db_mod.types.ArtifactRepairIssue),
+    issues: []db_mod.types.ArtifactRepairIssue,
+) !void {
+    var moved: usize = 0;
+    errdefer {
+        for (issues[moved..]) |*issue| issue.deinit(alloc);
+        if (issues.len > 0) alloc.free(issues);
+    }
+    for (issues) |*issue| {
+        try out.append(alloc, issue.*);
+        issue.* = undefined;
+        moved += 1;
+    }
+    if (issues.len > 0) alloc.free(issues);
+}
+
+fn mergeArtifactRepairResult(dst: *db_mod.types.ArtifactRepairResult, src: db_mod.types.ArtifactRepairResult) void {
+    dst.scanned += src.scanned;
+    dst.reprocessed += src.reprocessed;
+    dst.repaired += src.repaired;
+    dst.missing_source_docs += src.missing_source_docs;
+    dst.failed += src.failed;
+    dst.unsupported += src.unsupported;
+}
+
+const ArtifactRepairTableCursor = struct {
+    group_id: u64,
+    local_cursor: []const u8,
+};
+
+fn parseArtifactRepairTableCursor(cursor: ?[]const u8) !?ArtifactRepairTableCursor {
+    const raw = cursor orelse return null;
+    if (raw.len == 0) return null;
+    const sep = std.mem.indexOfScalar(u8, raw, ':') orelse return error.InvalidArgument;
+    const group_id = try std.fmt.parseUnsigned(u64, raw[0..sep], 10);
+    return .{ .group_id = group_id, .local_cursor = raw[sep + 1 ..] };
+}
+
+fn formatArtifactRepairTableCursorAlloc(alloc: std.mem.Allocator, group_id: u64, local_cursor: ?[]const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{d}:{s}", .{ group_id, local_cursor orelse "" });
+}
+
+fn artifactRepairListRequestForShard(
+    req: db_mod.types.ArtifactRepairListRequest,
+    limit: u32,
+    cursor: ?[]const u8,
+) db_mod.types.ArtifactRepairListRequest {
+    return .{
+        .artifact_kind = req.artifact_kind,
+        .index_name = req.index_name,
+        .limit = limit,
+        .cursor = cursor,
+    };
+}
+
+fn artifactRepairRunRequestForShard(
+    req: db_mod.types.ArtifactRepairRunRequest,
+    limit: u32,
+    cursor: ?[]const u8,
+) db_mod.types.ArtifactRepairRunRequest {
+    return .{
+        .artifact_kind = req.artifact_kind,
+        .limit = limit,
+        .cursor = cursor,
+    };
+}
+
+fn cloneArtifactRepairIssueAlloc(alloc: std.mem.Allocator, issue: db_mod.types.ArtifactRepairIssue) !db_mod.types.ArtifactRepairIssue {
+    var out = db_mod.types.ArtifactRepairIssue{
+        .artifact_kind = issue.artifact_kind,
+        .chunk_id = issue.chunk_id,
+        .sequence = issue.sequence,
+        .reason = issue.reason,
+        .attempts = issue.attempts,
+        .first_seen_ns = issue.first_seen_ns,
+        .last_seen_ns = issue.last_seen_ns,
+    };
+    errdefer out.deinit(alloc);
+    out.index_name = try alloc.dupe(u8, issue.index_name);
+    out.doc_key = try alloc.dupe(u8, issue.doc_key);
+    out.parent_doc_key = try alloc.dupe(u8, issue.parent_doc_key);
+    out.source_artifact_name = try alloc.dupe(u8, issue.source_artifact_name);
+    out.artifact_name = try alloc.dupe(u8, issue.artifact_name);
+    out.artifact_key = try alloc.dupe(u8, issue.artifact_key);
+    out.last_error = try alloc.dupe(u8, issue.last_error);
+    return out;
+}
+
+fn parseArtifactRepairListResultAlloc(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.ArtifactRepairListResult {
+    var parsed = try std.json.parseFromSlice(db_mod.types.ArtifactRepairListResult, alloc, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    var issues = try alloc.alloc(db_mod.types.ArtifactRepairIssue, parsed.value.issues.len);
+    var initialized_issues: usize = 0;
+    errdefer {
+        for (issues[0..initialized_issues]) |*issue| issue.deinit(alloc);
+        if (issues.len > 0) alloc.free(issues);
+    }
+    for (parsed.value.issues, issues) |issue, *out| {
+        out.* = try cloneArtifactRepairIssueAlloc(alloc, issue);
+        initialized_issues += 1;
+    }
+
+    return .{
+        .issues = issues,
+        .limit = parsed.value.limit,
+        .scanned = parsed.value.scanned,
+        .next_cursor = if (parsed.value.next_cursor) |cursor| try alloc.dupe(u8, cursor) else null,
+        .has_more = parsed.value.has_more,
+    };
+}
+
+fn parseArtifactRepairResultAlloc(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.ArtifactRepairResult {
+    var parsed = try std.json.parseFromSlice(db_mod.types.ArtifactRepairResult, alloc, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    return .{
+        .scanned = parsed.value.scanned,
+        .reprocessed = parsed.value.reprocessed,
+        .repaired = parsed.value.repaired,
+        .missing_source_docs = parsed.value.missing_source_docs,
+        .failed = parsed.value.failed,
+        .unsupported = parsed.value.unsupported,
+        .limit = parsed.value.limit,
+        .next_cursor = if (parsed.value.next_cursor) |cursor| try alloc.dupe(u8, cursor) else null,
+        .has_more = parsed.value.has_more,
+    };
+}
+
 fn parseDocumentArtifactTableReprocessResultAlloc(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.DocumentArtifactTableReprocessResult {
     const RemoteFailure = struct {
         key: []const u8,
@@ -2486,6 +2617,18 @@ pub const TableWriteSource = struct {
             artifact_name: []const u8,
             req: db_mod.types.DocumentArtifactTableReprocessRequest,
         ) anyerror!?db_mod.types.DocumentArtifactTableReprocessResult = null,
+        list_artifact_repair_issues: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_mod.types.ArtifactRepairListRequest,
+        ) anyerror!?db_mod.types.ArtifactRepairListResult = null,
+        repair_artifact_issues: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_mod.types.ArtifactRepairRunRequest,
+        ) anyerror!?db_mod.types.ArtifactRepairResult = null,
         update_document_artifact_child_range_placement: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -2519,6 +2662,20 @@ pub const TableWriteSource = struct {
             artifact_name: []const u8,
             req: db_mod.types.DocumentArtifactTableReprocessRequest,
         ) anyerror!?db_mod.types.DocumentArtifactTableReprocessResult = null,
+        list_artifact_repair_issues_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_mod.types.ArtifactRepairListRequest,
+        ) anyerror!?db_mod.types.ArtifactRepairListResult = null,
+        repair_artifact_issues_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_mod.types.ArtifactRepairRunRequest,
+        ) anyerror!?db_mod.types.ArtifactRepairResult = null,
         update_document_artifact_child_range_placement_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -2786,6 +2943,48 @@ pub const TableWriteSource = struct {
         return try fn_ptr(self.ptr, alloc, table_name, artifact_name, req);
     }
 
+    pub fn listArtifactRepairIssues(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairListRequest,
+    ) !?db_mod.types.ArtifactRepairListResult {
+        const fn_ptr = self.vtable.list_artifact_repair_issues orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, req);
+    }
+
+    pub fn repairArtifactIssues(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+    ) !?db_mod.types.ArtifactRepairResult {
+        const fn_ptr = self.vtable.repair_artifact_issues orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, req);
+    }
+
+    pub fn listArtifactRepairIssuesGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairListRequest,
+    ) !?db_mod.types.ArtifactRepairListResult {
+        const fn_ptr = self.vtable.list_artifact_repair_issues_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, req);
+    }
+
+    pub fn repairArtifactIssuesGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+    ) !?db_mod.types.ArtifactRepairResult {
+        const fn_ptr = self.vtable.repair_artifact_issues_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, req);
+    }
+
     pub fn updateDocumentArtifactChildRangePlacement(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -2960,6 +3159,10 @@ pub const BoundTableWriteSource = struct {
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .reprocess_document_artifact = reprocessDocumentArtifact,
                 .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
+                .list_artifact_repair_issues = listArtifactRepairIssues,
+                .repair_artifact_issues = repairArtifactIssues,
+                .list_artifact_repair_issues_group_local = listArtifactRepairIssuesGroupLocal,
+                .repair_artifact_issues_group_local = repairArtifactIssuesGroupLocal,
                 .update_document_artifact_child_range_placement = updateDocumentArtifactChildRangePlacement,
                 .apply_document_artifact_child_range_batch = applyDocumentArtifactChildRangeBatch,
                 .apply_document_artifact_child_range_batch_group_local = applyDocumentArtifactChildRangeBatchGroupLocal,
@@ -3017,6 +3220,50 @@ pub const BoundTableWriteSource = struct {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table_name)) return null;
         return try self.db.reprocessDocumentArtifactRange(alloc, artifact_name, req);
+    }
+
+    fn listArtifactRepairIssues(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairListRequest,
+    ) !?db_mod.types.ArtifactRepairListResult {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
+        return try self.db.listArtifactRepairIssuesPage(alloc, req);
+    }
+
+    fn repairArtifactIssues(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+    ) !?db_mod.types.ArtifactRepairResult {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
+        return try self.db.repairArtifactIssuesWithRequest(alloc, req);
+    }
+
+    fn listArtifactRepairIssuesGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairListRequest,
+    ) !?db_mod.types.ArtifactRepairListResult {
+        _ = group_id;
+        return try listArtifactRepairIssues(ptr, alloc, table_name, req);
+    }
+
+    fn repairArtifactIssuesGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+    ) !?db_mod.types.ArtifactRepairResult {
+        _ = group_id;
+        return try repairArtifactIssues(ptr, alloc, table_name, req);
     }
 
     fn updateDocumentArtifactChildRangePlacement(
@@ -6463,10 +6710,14 @@ pub const ProvisionedTableWriteSource = struct {
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .reprocess_document_artifact = reprocessDocumentArtifact,
                 .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
+                .list_artifact_repair_issues = listArtifactRepairIssues,
+                .repair_artifact_issues = repairArtifactIssues,
                 .update_document_artifact_child_range_placement = updateDocumentArtifactChildRangePlacement,
                 .apply_document_artifact_child_range_batch = applyDocumentArtifactChildRangeBatch,
                 .reprocess_document_artifact_group_local = reprocessDocumentArtifactGroupLocal,
                 .reprocess_document_artifact_range_group_local = reprocessDocumentArtifactRangeGroupLocal,
+                .list_artifact_repair_issues_group_local = listArtifactRepairIssuesGroupLocal,
+                .repair_artifact_issues_group_local = repairArtifactIssuesGroupLocal,
                 .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
                 .apply_document_artifact_child_range_batch_group_local = applyDocumentArtifactChildRangeBatchGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
@@ -7916,6 +8167,145 @@ pub const ProvisionedTableWriteSource = struct {
         return result;
     }
 
+    fn listArtifactRepairIssues(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairListRequest,
+    ) !?db_mod.types.ArtifactRepairListResult {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.listArtifactRepairIssues(alloc, table_name, req);
+        self.beginTableRequest(table_name);
+        defer self.endTableRequest(table_name);
+
+        const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+            alloc,
+            self.catalog,
+            table_name,
+            "",
+            "",
+            5 * std.time.ns_per_s,
+            10,
+        );
+        defer alloc.free(group_ids);
+        if (group_ids.len == 0) return null;
+
+        const parsed_cursor = try parseArtifactRepairTableCursor(req.cursor);
+        var start_index: usize = 0;
+        var start_cursor: ?[]const u8 = null;
+        if (parsed_cursor) |cursor| {
+            while (start_index < group_ids.len and group_ids[start_index] != cursor.group_id) : (start_index += 1) {}
+            if (start_index == group_ids.len) return error.InvalidArgument;
+            start_cursor = cursor.local_cursor;
+        }
+
+        var result = db_mod.types.ArtifactRepairListResult{ .limit = req.limit };
+        errdefer result.deinit(alloc);
+        var out = std.ArrayListUnmanaged(db_mod.types.ArtifactRepairIssue).empty;
+        errdefer {
+            for (out.items) |*issue| issue.deinit(alloc);
+            out.deinit(alloc);
+        }
+
+        for (group_ids[start_index..], start_index..) |group_id, idx| {
+            if (req.limit != 0 and out.items.len >= req.limit) {
+                result.has_more = true;
+                result.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, null);
+                break;
+            }
+            self.beginGroupOperation(table_name, group_id);
+            defer self.endGroupOperation(table_name, group_id);
+
+            const remaining: u32 = if (req.limit == 0) 0 else @intCast(req.limit - @as(u32, @intCast(out.items.len)));
+            var group_result = (try listArtifactRepairIssuesGroupLocal(ptr, alloc, group_id, table_name, artifactRepairListRequestForShard(
+                req,
+                remaining,
+                if (idx == start_index) start_cursor else null,
+            ))) orelse continue;
+            defer group_result.deinit(alloc);
+            result.scanned += group_result.scanned;
+            try appendOwnedArtifactRepairIssues(alloc, &out, group_result.issues);
+            group_result.issues = &.{};
+            if (group_result.has_more) {
+                result.has_more = true;
+                result.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, group_result.next_cursor);
+                break;
+            }
+        }
+
+        result.issues = try out.toOwnedSlice(alloc);
+        out = .empty;
+        return result;
+    }
+
+    fn repairArtifactIssues(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+    ) !?db_mod.types.ArtifactRepairResult {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.repairArtifactIssues(alloc, table_name, req);
+        try enforceHAWriteGateOptional(self.ha_write_gate);
+        self.beginTableRequest(table_name);
+        defer self.endTableRequest(table_name);
+
+        const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+            alloc,
+            self.catalog,
+            table_name,
+            "",
+            "",
+            5 * std.time.ns_per_s,
+            10,
+        );
+        defer alloc.free(group_ids);
+        if (group_ids.len == 0) return null;
+
+        const parsed_cursor = try parseArtifactRepairTableCursor(req.cursor);
+        var start_index: usize = 0;
+        var start_cursor: ?[]const u8 = null;
+        if (parsed_cursor) |cursor| {
+            while (start_index < group_ids.len and group_ids[start_index] != cursor.group_id) : (start_index += 1) {}
+            if (start_index == group_ids.len) return error.InvalidArgument;
+            start_cursor = cursor.local_cursor;
+        }
+
+        var total = db_mod.types.ArtifactRepairResult{ .limit = req.limit };
+        errdefer total.deinit(alloc);
+        for (group_ids[start_index..], start_index..) |group_id, idx| {
+            if (req.limit != 0 and total.scanned >= req.limit) {
+                total.has_more = true;
+                total.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, null);
+                break;
+            }
+            self.beginGroupOperation(table_name, group_id);
+            defer self.endGroupOperation(table_name, group_id);
+
+            const remaining: u32 = if (req.limit == 0) 0 else @intCast(req.limit - @as(u32, @intCast(total.scanned)));
+            var result = (try repairArtifactIssuesGroupLocal(ptr, alloc, group_id, table_name, artifactRepairRunRequestForShard(
+                req,
+                remaining,
+                if (idx == start_index) start_cursor else null,
+            ))) orelse continue;
+            defer result.deinit(alloc);
+            if (result.has_more) {
+                total.has_more = true;
+                total.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, result.next_cursor);
+            }
+            mergeArtifactRepairResult(&total, result);
+            if (total.has_more) break;
+        }
+        if (total.scanned > 0) {
+            lockAtomic(&self.local_db_mutex);
+            self.invalidateReadCache(table_name);
+            self.markWriteCacheDirty(table_name);
+            self.local_db_mutex.unlock();
+            self.notifyLocalChange(table_name, .data);
+        }
+        return total;
+    }
+
     fn updateDocumentArtifactChildRangePlacement(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -8194,6 +8584,112 @@ pub const ProvisionedTableWriteSource = struct {
         };
         errdefer result.deinit(alloc);
         if (result.reprocessed > 0 or result.failed > 0) {
+            lockAtomic(&self.local_db_mutex);
+            self.invalidateReadCache(table_name);
+            self.markWriteCacheDirty(table_name);
+            self.local_db_mutex.unlock();
+            self.notifyLocalChange(table_name, .data);
+        }
+        return result;
+    }
+
+    fn listArtifactRepairIssuesGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairListRequest,
+    ) !?db_mod.types.ArtifactRepairListResult {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.listArtifactRepairIssuesGroupLocal(alloc, group_id, table_name, req);
+        self.beginTableRequest(table_name);
+        defer self.endTableRequest(table_name);
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        return if (self.write_cache) |cache| blk: {
+            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
+            defer cached.deinit(alloc);
+            break :blk try cached.db.listArtifactRepairIssuesPage(alloc, req);
+        } else blk: {
+            const indexes_json = try loadTableIndexesJson(alloc, self.catalog, table_name);
+            defer if (indexes_json) |value| alloc.free(value);
+            var db = if (indexes_json) |value|
+                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+                    alloc,
+                    path,
+                    value,
+                    null,
+                    null,
+                    self.visibleRootGeneration(group_id),
+                    null,
+                    .default,
+                    self.backend_runtime,
+                    self.antfly_provider,
+                    self.secret_store,
+                    self.remote_content,
+                    try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
+                )
+            else
+                try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
+            defer db.close();
+            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
+            break :blk try db.listArtifactRepairIssuesPage(alloc, req);
+        };
+    }
+
+    fn repairArtifactIssuesGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+    ) !?db_mod.types.ArtifactRepairResult {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.repairArtifactIssuesGroupLocal(alloc, group_id, table_name, req);
+        try enforceHAWriteGateOptional(self.ha_write_gate);
+        self.beginTableRequest(table_name);
+        defer self.endTableRequest(table_name);
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        var result = if (self.write_cache) |cache| blk: {
+            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
+            defer cached.deinit(alloc);
+            break :blk try cached.db.repairArtifactIssuesWithRequest(alloc, req);
+        } else blk: {
+            const indexes_json = try loadTableIndexesJson(alloc, self.catalog, table_name);
+            defer if (indexes_json) |value| alloc.free(value);
+            var db = if (indexes_json) |value|
+                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+                    alloc,
+                    path,
+                    value,
+                    null,
+                    null,
+                    self.visibleRootGeneration(group_id),
+                    null,
+                    .default,
+                    self.backend_runtime,
+                    self.antfly_provider,
+                    self.secret_store,
+                    self.remote_content,
+                    try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
+                )
+            else
+                try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
+            defer db.close();
+            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
+            const group_result = try db.repairArtifactIssuesWithRequest(alloc, req);
+            if (group_result.scanned > 0) self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
+            break :blk group_result;
+        };
+        errdefer result.deinit(alloc);
+        if (result.scanned > 0) {
             lockAtomic(&self.local_db_mutex);
             self.invalidateReadCache(table_name);
             self.markWriteCacheDirty(table_name);
@@ -8494,10 +8990,14 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .reprocess_document_artifact = reprocessDocumentArtifact,
                 .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
+                .list_artifact_repair_issues = listArtifactRepairIssues,
+                .repair_artifact_issues = repairArtifactIssues,
                 .update_document_artifact_child_range_placement = updateDocumentArtifactChildRangePlacement,
                 .apply_document_artifact_child_range_batch = applyDocumentArtifactChildRangeBatch,
                 .reprocess_document_artifact_group_local = reprocessDocumentArtifactGroupLocal,
                 .reprocess_document_artifact_range_group_local = reprocessDocumentArtifactRangeGroupLocal,
+                .list_artifact_repair_issues_group_local = listArtifactRepairIssuesGroupLocal,
+                .repair_artifact_issues_group_local = repairArtifactIssuesGroupLocal,
                 .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
                 .apply_document_artifact_child_range_batch_group_local = applyDocumentArtifactChildRangeBatchGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
@@ -8989,6 +9489,154 @@ pub const HostedProvisionedTableWriteSource = struct {
         return result;
     }
 
+    fn listArtifactRepairIssues(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairListRequest,
+    ) !?db_mod.types.ArtifactRepairListResult {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+            alloc,
+            self.catalog,
+            table_name,
+            "",
+            "",
+            5 * std.time.ns_per_s,
+            10,
+        );
+        defer alloc.free(group_ids);
+        if (group_ids.len == 0) return null;
+
+        const parsed_cursor = try parseArtifactRepairTableCursor(req.cursor);
+        var start_index: usize = 0;
+        var start_cursor: ?[]const u8 = null;
+        if (parsed_cursor) |cursor| {
+            while (start_index < group_ids.len and group_ids[start_index] != cursor.group_id) : (start_index += 1) {}
+            if (start_index == group_ids.len) return error.InvalidArgument;
+            start_cursor = cursor.local_cursor;
+        }
+
+        var result = db_mod.types.ArtifactRepairListResult{ .limit = req.limit };
+        errdefer result.deinit(alloc);
+        var out = std.ArrayListUnmanaged(db_mod.types.ArtifactRepairIssue).empty;
+        errdefer {
+            for (out.items) |*issue| issue.deinit(alloc);
+            out.deinit(alloc);
+        }
+
+        for (group_ids[start_index..], start_index..) |group_id, idx| {
+            if (req.limit != 0 and out.items.len >= req.limit) {
+                result.has_more = true;
+                result.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, null);
+                break;
+            }
+            const remaining: u32 = if (req.limit == 0) 0 else @intCast(req.limit - @as(u32, @intCast(out.items.len)));
+            const group_req = artifactRepairListRequestForShard(req, remaining, if (idx == start_index) start_cursor else null);
+            const body = try std.json.Stringify.valueAlloc(alloc, group_req, .{ .emit_null_optional_fields = false });
+            defer alloc.free(body);
+
+            var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
+            var group_result = if (resolved_route) |*route| blk: {
+                defer route.deinit(alloc);
+                break :blk switch (route.*) {
+                    .local => (try listArtifactRepairIssuesGroupLocal(ptr, alloc, group_id, table_name, group_req)) orelse continue,
+                    .remote => |remote| remote_blk: {
+                        var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                        var response = client.fetchGroupArtifactRepairIssues(remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
+                            else => return err,
+                        };
+                        defer response.deinit(alloc);
+                        break :remote_blk try parseArtifactRepairListResultAlloc(alloc, response.body);
+                    },
+                };
+            } else (try listArtifactRepairIssuesGroupLocal(ptr, alloc, group_id, table_name, group_req)) orelse continue;
+            defer group_result.deinit(alloc);
+            result.scanned += group_result.scanned;
+            try appendOwnedArtifactRepairIssues(alloc, &out, group_result.issues);
+            group_result.issues = &.{};
+            if (group_result.has_more) {
+                result.has_more = true;
+                result.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, group_result.next_cursor);
+                break;
+            }
+        }
+
+        result.issues = try out.toOwnedSlice(alloc);
+        out = .empty;
+        return result;
+    }
+
+    fn repairArtifactIssues(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+    ) !?db_mod.types.ArtifactRepairResult {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+            alloc,
+            self.catalog,
+            table_name,
+            "",
+            "",
+            5 * std.time.ns_per_s,
+            10,
+        );
+        defer alloc.free(group_ids);
+        if (group_ids.len == 0) return null;
+
+        const parsed_cursor = try parseArtifactRepairTableCursor(req.cursor);
+        var start_index: usize = 0;
+        var start_cursor: ?[]const u8 = null;
+        if (parsed_cursor) |cursor| {
+            while (start_index < group_ids.len and group_ids[start_index] != cursor.group_id) : (start_index += 1) {}
+            if (start_index == group_ids.len) return error.InvalidArgument;
+            start_cursor = cursor.local_cursor;
+        }
+
+        var total = db_mod.types.ArtifactRepairResult{ .limit = req.limit };
+        errdefer total.deinit(alloc);
+        for (group_ids[start_index..], start_index..) |group_id, idx| {
+            if (req.limit != 0 and total.scanned >= req.limit) {
+                total.has_more = true;
+                total.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, null);
+                break;
+            }
+            const remaining: u32 = if (req.limit == 0) 0 else @intCast(req.limit - @as(u32, @intCast(total.scanned)));
+            const group_req = artifactRepairRunRequestForShard(req, remaining, if (idx == start_index) start_cursor else null);
+            const body = try std.json.Stringify.valueAlloc(alloc, group_req, .{ .emit_null_optional_fields = false });
+            defer alloc.free(body);
+
+            var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
+            var group_result = if (resolved_route) |*route| blk: {
+                defer route.deinit(alloc);
+                break :blk switch (route.*) {
+                    .local => (try repairArtifactIssuesGroupLocal(ptr, alloc, group_id, table_name, group_req)) orelse continue,
+                    .remote => |remote| remote_blk: {
+                        var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                        var response = client.fetchGroupArtifactRepairRun(remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
+                            else => return err,
+                        };
+                        defer response.deinit(alloc);
+                        break :remote_blk try parseArtifactRepairResultAlloc(alloc, response.body);
+                    },
+                };
+            } else (try repairArtifactIssuesGroupLocal(ptr, alloc, group_id, table_name, group_req)) orelse continue;
+            defer group_result.deinit(alloc);
+            if (group_result.has_more) {
+                total.has_more = true;
+                total.next_cursor = try formatArtifactRepairTableCursorAlloc(alloc, group_id, group_result.next_cursor);
+            }
+            mergeArtifactRepairResult(&total, group_result);
+            if (total.has_more) break;
+        }
+
+        if (total.scanned == 0) return total;
+        self.invalidateManagedCache(table_name);
+        return total;
+    }
+
     fn updateDocumentArtifactChildRangePlacement(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -9142,6 +9790,45 @@ pub const HostedProvisionedTableWriteSource = struct {
         var result = try cached.db.reprocessDocumentArtifactRange(alloc, artifact_name, req);
         errdefer result.deinit(alloc);
         if (result.reprocessed > 0 or result.failed > 0) {
+            try drainManagedDbBeforeClose(cached.db);
+            self.invalidateManagedCache(table_name);
+        }
+        return result;
+    }
+
+    fn listArtifactRepairIssuesGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairListRequest,
+    ) !?db_mod.types.ArtifactRepairListResult {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        return try cached.db.listArtifactRepairIssuesPage(alloc, req);
+    }
+
+    fn repairArtifactIssuesGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+    ) !?db_mod.types.ArtifactRepairResult {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        self.invalidateManagedCache(table_name);
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        var result = try cached.db.repairArtifactIssuesWithRequest(alloc, req);
+        errdefer result.deinit(alloc);
+        if (result.scanned > 0) {
             try drainManagedDbBeforeClose(cached.db);
             self.invalidateManagedCache(table_name);
         }

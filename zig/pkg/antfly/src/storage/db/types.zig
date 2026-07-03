@@ -1622,12 +1622,48 @@ pub fn freeArtifactRepairIssues(alloc: Allocator, issues: []ArtifactRepairIssue)
     if (issues.len > 0) alloc.free(issues);
 }
 
+pub const ArtifactRepairListRequest = struct {
+    artifact_kind: ?ArtifactRepairKind = null,
+    index_name: ?[]const u8 = null,
+    limit: u32 = 50,
+    cursor: ?[]const u8 = null,
+};
+
+pub const ArtifactRepairListResult = struct {
+    issues: []ArtifactRepairIssue = &.{},
+    limit: u32 = 0,
+    scanned: u64 = 0,
+    next_cursor: ?[]u8 = null,
+    has_more: bool = false,
+
+    pub fn deinit(self: *ArtifactRepairListResult, alloc: Allocator) void {
+        freeArtifactRepairIssues(alloc, self.issues);
+        if (self.next_cursor) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const ArtifactRepairRunRequest = struct {
+    artifact_kind: ?ArtifactRepairKind = null,
+    limit: u32 = 100,
+    cursor: ?[]const u8 = null,
+};
+
 pub const ArtifactRepairResult = struct {
     scanned: u64 = 0,
     reprocessed: u64 = 0,
     repaired: u64 = 0,
     missing_source_docs: u64 = 0,
     failed: u64 = 0,
+    unsupported: u64 = 0,
+    limit: u32 = 0,
+    next_cursor: ?[]u8 = null,
+    has_more: bool = false,
+
+    pub fn deinit(self: *ArtifactRepairResult, alloc: Allocator) void {
+        if (self.next_cursor) |value| alloc.free(value);
+        self.* = undefined;
+    }
 };
 
 pub const EmbeddingArtifactRepairReason = enum {

@@ -9256,7 +9256,10 @@ pub const IndexManager = struct {
             };
             if (enrichment_artifact_codec.denseEmbeddingVectorView(raw)) |maybe_view| {
                 if (maybe_view) |view| {
-                    if (view.len != dims_usize) return error.InvalidVectorDimensions;
+                    if (view.len != dims_usize) {
+                        try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
+                        continue;
+                    }
                     continue;
                 }
                 fallback_count += 1;
@@ -9279,6 +9282,10 @@ pub const IndexManager = struct {
             };
             if (enrichment_artifact_codec.denseEmbeddingVectorView(raw)) |maybe_view| {
                 if (maybe_view) |view| {
+                    if (view.len != dims_usize) {
+                        try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
+                        continue;
+                    }
                     out_vectors[item.write_index] = view;
                     continue;
                 }
@@ -9299,7 +9306,8 @@ pub const IndexManager = struct {
                 return err;
             };
             if (vector.len != dims_usize) {
-                return error.InvalidVectorDimensions;
+                try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
+                continue;
             }
             out_vectors[item.write_index] = vector;
         }
@@ -9355,7 +9363,10 @@ pub const IndexManager = struct {
             };
             if (enrichment_artifact_codec.denseEmbeddingVectorView(raw)) |maybe_view| {
                 if (maybe_view) |view| {
-                    if (view.len != dims_usize) return error.InvalidVectorDimensions;
+                    if (view.len != dims_usize) {
+                        try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
+                        continue;
+                    }
                     continue;
                 }
                 fallback_count += 1;
@@ -9378,6 +9389,10 @@ pub const IndexManager = struct {
             };
             if (enrichment_artifact_codec.denseEmbeddingVectorView(raw)) |maybe_view| {
                 if (maybe_view) |view| {
+                    if (view.len != dims_usize) {
+                        try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
+                        continue;
+                    }
                     out_vectors[item.write_index] = view;
                     continue;
                 }
@@ -9398,7 +9413,8 @@ pub const IndexManager = struct {
                 return err;
             };
             if (vector.len != dims_usize) {
-                return error.InvalidVectorDimensions;
+                try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
+                continue;
             }
             out_vectors[item.write_index] = vector;
         }
