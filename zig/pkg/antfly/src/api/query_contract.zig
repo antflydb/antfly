@@ -2254,7 +2254,7 @@ pub fn encodeQueryResponses(
 fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit) !metadata_openapi.QueryHit {
     return .{
         ._id = hit.id,
-        ._score = hit.score orelse 0,
+        ._score = if (hit.score) |score| finiteScoreOrZero(score) else 0,
         ._index_scores = try indexScoresJsonValue(alloc, hit.index_scores),
         ._source = if (hit.stored_data) |stored_data|
             if (req.defer_stored_projection)
@@ -2268,6 +2268,10 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
             null,
         .hierarchy = try searchHitHierarchyJsonValue(alloc, req, hit),
     };
+}
+
+fn finiteScoreOrZero(score: f32) f32 {
+    return if (std.math.isFinite(score)) score else 0;
 }
 
 fn searchHitHierarchyJsonValue(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit) !?std.json.Value {

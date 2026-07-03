@@ -2254,7 +2254,14 @@ fn normalizeRetrievalQueryResponsesJson(
             else
                 &.{};
             if (hits_value.object.get("total") == null) {
-                try hits_value.object.put(alloc, "total", .{ .integer = @intCast(hit_items.len) });
+                var total_obj = std.json.ObjectMap.empty;
+                errdefer {
+                    var total_value = std.json.Value{ .object = total_obj };
+                    json_helpers.deinitJsonValue(alloc, &total_value);
+                }
+                try total_obj.put(alloc, try alloc.dupe(u8, "value"), .{ .integer = @intCast(hit_items.len) });
+                try total_obj.put(alloc, try alloc.dupe(u8, "relation"), .{ .string = try alloc.dupe(u8, "exact") });
+                try hits_value.object.put(alloc, "total", .{ .object = total_obj });
             }
             if (hits_value.object.get("max_score") == null) {
                 try hits_value.object.put(alloc, "max_score", .{ .float = computeNormalizedMaxScore(hit_items) });

@@ -5118,6 +5118,10 @@ fn scalarJsonValueStringAlloc(alloc: std.mem.Allocator, value: std.json.Value) !
     return try json_helpers.scalarJsonValueStringAlloc(alloc, value);
 }
 
+fn finiteScoreOrZero(score: f32) f64 {
+    return if (std.math.isFinite(score)) score else 0;
+}
+
 fn appendSearchHitAsJsonHit(
     alloc: std.mem.Allocator,
     hits: *std.json.Array,
@@ -5137,7 +5141,7 @@ fn appendSearchHitAsJsonHit(
     if (hit.doc_ordinal) |ordinal| {
         try hit_obj.put(alloc, try alloc.dupe(u8, join_model.internal_doc_identity_key_field), .{ .string = try std.fmt.allocPrint(alloc, "o:{d}", .{ordinal}) });
     }
-    try hit_obj.put(alloc, try alloc.dupe(u8, "_score"), if (hit.score) |score| .{ .float = score } else .{ .float = 0 });
+    try hit_obj.put(alloc, try alloc.dupe(u8, "_score"), .{ .float = if (hit.score) |score| finiteScoreOrZero(score) else 0 });
     const source_value = if (hit.stored_data) |stored_data| blk: {
         var parsed = try json_helpers.parseJsonValueAlloc(alloc, stored_data);
         defer parsed.deinit();
@@ -5155,6 +5159,40 @@ fn appendSearchHitsAsJsonHits(
     for (search_hits) |hit| {
         try appendSearchHitAsJsonHit(alloc, hits, hit);
     }
+}
+
+test "distributed join search hit JSON normalizes non-finite scores" {
+    const alloc = std.testing.allocator;
+    var hits = std.json.Array.init(alloc);
+    defer {
+        for (hits.items) |*hit| deinitJsonValue(alloc, hit);
+        hits.deinit();
+    }
+
+    const id = try alloc.dupe(u8, "doc:nan");
+    defer alloc.free(id);
+    const stored_data = try alloc.dupe(u8, "{\"customer_id\":\"cust:a\"}");
+    defer alloc.free(stored_data);
+
+    try appendSearchHitAsJsonHit(alloc, &hits, .{
+        .id = id,
+        .score = std.math.nan(f32),
+        .stored_data = stored_data,
+    });
+
+    var root = std.json.Value{ .object = std.json.ObjectMap.empty };
+    defer deinitJsonValue(alloc, &root);
+    try putOwnedJsonField(alloc, &root.object, "hits", .{ .array = hits });
+    hits = std.json.Array.init(alloc);
+
+    const encoded = try stringifyJsonValueAlloc(alloc, root);
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "nan") == null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+    defer parsed.deinit();
+    const parsed_hits = parsed.value.object.get("hits").?.array.items;
+    try std.testing.expectEqual(@as(f64, 0), parsed_hits[0].object.get("_score").?.float);
 }
 
 fn buildForeignRightJoinHit(
