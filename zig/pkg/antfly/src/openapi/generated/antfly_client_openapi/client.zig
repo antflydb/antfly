@@ -787,9 +787,9 @@ pub const Client = struct {
         return ApiResponse(types.ArtifactRepairIssueList).fromResponse(self.allocator, &resp);
     }
 
-    /// Run a bounded artifact repair pass
+    /// Run a bounded table repair pass
     /// POST /db/v1/tables/{tableName}/repair/run
-    pub fn repairArtifactIssues(self: *@This(), table_name: []const u8, body: types.RepairRunRequest) !ApiResponse(types.ArtifactRepairRunResponse) {
+    pub fn runTableRepair(self: *@This(), table_name: []const u8, body: types.RepairRunRequest) !ApiResponse(types.ArtifactRepairRunResponse) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/repair/run", .{ self.base_url, encoded_table_name });

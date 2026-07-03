@@ -31,6 +31,7 @@ const backup_restore = @import("../raft/storage/backup_restore.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
+const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
 const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
 const backend_types = @import("../storage/backend_types.zig");
 const hbc_mod = @import("../storage/hbc_adapter.zig");
@@ -327,11 +328,28 @@ fn artifactRepairRunRequestForShard(
     cursor: ?[]const u8,
 ) db_mod.types.ArtifactRepairRunRequest {
     return .{
+        .target = req.target,
         .artifact_kind = req.artifact_kind,
         .index_name = req.index_name,
         .limit = limit,
         .cursor = cursor,
     };
+}
+
+test "artifact repair shard run request preserves repair target" {
+    const shard_req = artifactRepairRunRequestForShard(.{
+        .target = .index,
+        .artifact_kind = .embedding,
+        .index_name = "semantic",
+        .limit = 10,
+        .cursor = "idx_b",
+    }, 2, "idx_c");
+
+    try std.testing.expectEqual(db_mod.types.RepairTarget.index, shard_req.target);
+    try std.testing.expectEqual(db_mod.types.ArtifactRepairKind.embedding, shard_req.artifact_kind.?);
+    try std.testing.expectEqualStrings("semantic", shard_req.index_name.?);
+    try std.testing.expectEqual(@as(u32, 2), shard_req.limit);
+    try std.testing.expectEqualStrings("idx_c", shard_req.cursor.?);
 }
 
 fn cloneArtifactRepairIssueAlloc(alloc: std.mem.Allocator, issue: db_mod.types.ArtifactRepairIssue) !db_mod.types.ArtifactRepairIssue {
@@ -599,6 +617,7 @@ pub const ProvisionedTableWriteCache = struct {
     miss_count: std.atomic.Value(u64) = .init(0),
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
     retired_entries: std.ArrayListUnmanaged(*Entry) = .empty,
+    closing_entries: std.ArrayListUnmanaged(*Entry) = .empty,
     table_metadata: std.ArrayListUnmanaged(TableMetadata) = .empty,
     active_bulk_ingest_sessions: std.ArrayListUnmanaged(ActiveBulkIngestSession) = .empty,
 
@@ -683,6 +702,7 @@ pub const ProvisionedTableWriteCache = struct {
     const GetOrPrepareOpen = union(enum) {
         cached: CachedDb,
         prepared: PreparedOpen,
+        pending_close,
     };
 
     const Entry = struct {
@@ -1037,6 +1057,11 @@ pub const ProvisionedTableWriteCache = struct {
             self.alloc.destroy(entry);
         }
         self.retired_entries.deinit(self.alloc);
+        for (self.closing_entries.items) |entry| {
+            entry.deinit(self.alloc);
+            self.alloc.destroy(entry);
+        }
+        self.closing_entries.deinit(self.alloc);
         for (self.table_metadata.items) |*metadata| metadata.deinit(self.alloc);
         self.table_metadata.deinit(self.alloc);
         for (self.active_bulk_ingest_sessions.items) |*session| session.deinit(self.alloc);
@@ -1050,6 +1075,7 @@ pub const ProvisionedTableWriteCache = struct {
             if (entry.active_leases > 0) leased_retirements += 1;
         }
         self.retired_entries.ensureUnusedCapacity(self.alloc, leased_retirements) catch return;
+        self.closing_entries.ensureUnusedCapacity(self.alloc, self.entries.items.len - leased_retirements) catch return;
 
         for (self.entries.items) |entry| self.retireEntryLocked(entry);
         self.entries.clearRetainingCapacity();
@@ -1089,7 +1115,7 @@ pub const ProvisionedTableWriteCache = struct {
     pub fn diagnosticsLocked(self: *const ProvisionedTableWriteCache) Diagnostics {
         var stats = Diagnostics{
             .cached_entries = @intCast(self.entries.items.len),
-            .retired_entries = @intCast(self.retired_entries.items.len),
+            .retired_entries = @intCast(self.retired_entries.items.len + self.closing_entries.items.len),
             .table_metadata_entries = @intCast(self.table_metadata.items.len),
             .active_bulk_sessions = @intCast(self.active_bulk_ingest_sessions.items.len),
         };
@@ -1102,6 +1128,12 @@ pub const ProvisionedTableWriteCache = struct {
         }
         for (self.retired_entries.items) |entry| {
             stats.retired_active_leases += entry.active_leases;
+            if (entry.bulk_ingest_session_open) stats.bulk_ingest_open_entries += 1;
+            if (entry.auto_bulk_ingest_session_open) stats.auto_bulk_ingest_open_entries += 1;
+            if (entry.auto_bulk_ingest_finish_requested) stats.auto_bulk_ingest_finish_requested_entries += 1;
+            accumulateDiagnosticsLsmStats(&stats, entry.db.trySnapshotLsmMaintenanceStats());
+        }
+        for (self.closing_entries.items) |entry| {
             if (entry.bulk_ingest_session_open) stats.bulk_ingest_open_entries += 1;
             if (entry.auto_bulk_ingest_session_open) stats.auto_bulk_ingest_open_entries += 1;
             if (entry.auto_bulk_ingest_finish_requested) stats.auto_bulk_ingest_finish_requested_entries += 1;
@@ -1232,6 +1264,9 @@ pub const ProvisionedTableWriteCache = struct {
         const metadata = try self.getOrLoadMetadataLocked(catalog, table_name);
         const identity_namespace = try loadTableIdentityNamespaceForGroup(self.alloc, catalog, table_name, group_id);
         try self.pruneStaleEntriesForGroupTableLocked(group_id, lsm_root_generation, table_name);
+        if (self.hasPendingCloseForGroupTableLocked(group_id, table_name)) {
+            return error.LsmRootWriterAlreadyOpen;
+        }
         if (mode != .status_only and mode != .query_readonly and self.hasRetiredActiveLeaseForGroupTableLocked(group_id, table_name)) {
             return error.LsmRootWriterAlreadyOpen;
         }
@@ -1360,6 +1395,9 @@ pub const ProvisionedTableWriteCache = struct {
         if (self.hasRetiredActiveLeaseForGroupTableLocked(group_id, table_name)) {
             return error.LsmRootWriterAlreadyOpen;
         }
+        if (self.hasPendingCloseForGroupTableLocked(group_id, table_name)) {
+            return .pending_close;
+        }
         for (self.entries.items) |entry| {
             if (entry.group_id == group_id and entry.lsm_root_generation == lsm_root_generation and std.mem.eql(u8, entry.table_name, table_name)) {
                 _ = self.hit_count.fetchAdd(1, .monotonic);
@@ -1456,6 +1494,9 @@ pub const ProvisionedTableWriteCache = struct {
         prepared: *PreparedOpen,
     ) !CachedDb {
         try self.pruneStaleEntriesForGroupTableLocked(group_id, lsm_root_generation, table_name);
+        if (self.hasPendingCloseForGroupTableLocked(group_id, table_name)) {
+            return error.LsmRootWriterAlreadyOpen;
+        }
         for (self.entries.items) |entry| {
             if (entry.group_id == group_id and entry.lsm_root_generation == lsm_root_generation and std.mem.eql(u8, entry.table_name, table_name)) {
                 if (opened.*) |*db| db.close();
@@ -1627,9 +1668,10 @@ pub const ProvisionedTableWriteCache = struct {
                 i += 1;
                 continue;
             }
+            try self.closing_entries.ensureUnusedCapacity(self.alloc, 1);
             _ = self.entries.orderedRemove(i);
-            entry.deinit(self.alloc);
-            self.alloc.destroy(entry);
+            entry.retired = true;
+            self.closing_entries.appendAssumeCapacity(entry);
         }
     }
 
@@ -1649,11 +1691,17 @@ pub const ProvisionedTableWriteCache = struct {
 
     fn retireDbEntriesForTableLocked(self: *ProvisionedTableWriteCache, table_name: []const u8) !void {
         var leased_retirements: usize = 0;
+        var close_retirements: usize = 0;
         for (self.entries.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
-            if (entry.active_leases > 0) leased_retirements += 1;
+            if (entry.active_leases > 0) {
+                leased_retirements += 1;
+            } else {
+                close_retirements += 1;
+            }
         }
         try self.retired_entries.ensureUnusedCapacity(self.alloc, leased_retirements);
+        try self.closing_entries.ensureUnusedCapacity(self.alloc, close_retirements);
 
         var i: usize = 0;
         while (i < self.entries.items.len) {
@@ -1702,6 +1750,25 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.retired_entries.items) |entry| {
             if (entry.group_id != group_id) continue;
             if (entry.active_leases == 0) continue;
+            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            return true;
+        }
+        return false;
+    }
+
+    fn hasPendingCloseForGroupTableLocked(
+        self: *const ProvisionedTableWriteCache,
+        group_id: u64,
+        table_name: []const u8,
+    ) bool {
+        for (self.closing_entries.items) |entry| {
+            if (entry.group_id != group_id) continue;
+            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            return true;
+        }
+        for (self.retired_entries.items) |entry| {
+            if (entry.group_id != group_id) continue;
+            if (entry.active_leases != 0) continue;
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
             return true;
         }
@@ -2191,6 +2258,8 @@ pub const ProvisionedTableWriteCache = struct {
             if (existing_index) |dest_i| {
                 if (dest.entries.items[dest_i].active_leases > 0) {
                     try dest.retired_entries.ensureUnusedCapacity(dest.alloc, 1);
+                } else {
+                    try dest.closing_entries.ensureUnusedCapacity(dest.alloc, 1);
                 }
                 const removed = dest.entries.orderedRemove(dest_i);
                 dest.retireEntryLocked(removed);
@@ -2224,6 +2293,10 @@ pub const ProvisionedTableWriteCache = struct {
                 continue;
             }
 
+            self.closing_entries.ensureUnusedCapacity(self.alloc, 1) catch {
+                i += 1;
+                continue;
+            };
             const removed = self.entries.orderedRemove(i);
             self.retireEntryLocked(removed);
             retired += 1;
@@ -2283,7 +2356,9 @@ pub const ProvisionedTableWriteCache = struct {
         std.debug.assert(entry.active_leases > 0);
         entry.active_leases -= 1;
         if (entry.active_leases == 0 and entry.retired) {
-            self.destroyRetiredEntryLocked(entry);
+            self.queueRetiredEntryForCloseLocked(entry) catch |err| {
+                std.log.err("failed to queue retired writer-cache entry for close: {}", .{err});
+            };
         }
     }
 
@@ -2293,8 +2368,7 @@ pub const ProvisionedTableWriteCache = struct {
         if (entry.retired) return;
         entry.retired = true;
         if (entry.active_leases == 0) {
-            entry.deinit(self.alloc);
-            self.alloc.destroy(entry);
+            self.closing_entries.appendAssumeCapacity(entry);
             return;
         }
         self.retired_entries.appendAssumeCapacity(entry);
@@ -2313,15 +2387,87 @@ pub const ProvisionedTableWriteCache = struct {
         entry.retired = true;
     }
 
-    fn destroyRetiredEntryLocked(self: *ProvisionedTableWriteCache, entry: *Entry) void {
+    fn queueRetiredEntryForCloseLocked(self: *ProvisionedTableWriteCache, entry: *Entry) !void {
+        try self.closing_entries.ensureUnusedCapacity(self.alloc, 1);
         var i: usize = 0;
         while (i < self.retired_entries.items.len) : (i += 1) {
             if (self.retired_entries.items[i] != entry) continue;
             _ = self.retired_entries.orderedRemove(i);
             break;
         }
+        self.closing_entries.appendAssumeCapacity(entry);
+    }
+
+    fn closeEntryNow(self: *ProvisionedTableWriteCache, entry: *Entry) void {
         entry.deinit(self.alloc);
         self.alloc.destroy(entry);
+    }
+
+    fn drainPendingClosesForGroupTableAssumeOpenMutexHeld(
+        self: *ProvisionedTableWriteCache,
+        group_id: u64,
+        table_name: []const u8,
+    ) void {
+        while (true) {
+            var entry_to_close: ?*Entry = null;
+            lockAtomic(&self.entry_lifecycle_mutex);
+            var i: usize = 0;
+            while (i < self.retired_entries.items.len) : (i += 1) {
+                const entry = self.retired_entries.items[i];
+                if (entry.group_id != group_id) continue;
+                if (entry.active_leases != 0) continue;
+                if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+                entry_to_close = self.retired_entries.orderedRemove(i);
+                break;
+            }
+            if (entry_to_close == null) {
+                i = 0;
+                while (i < self.closing_entries.items.len) : (i += 1) {
+                    const entry = self.closing_entries.items[i];
+                    if (entry.group_id != group_id) continue;
+                    if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+                    entry_to_close = self.closing_entries.orderedRemove(i);
+                    break;
+                }
+            }
+            self.entry_lifecycle_mutex.unlock();
+
+            const entry = entry_to_close orelse return;
+            self.closeEntryNow(entry);
+        }
+    }
+
+    fn drainPendingClosesForGroupTable(
+        self: *ProvisionedTableWriteCache,
+        group_id: u64,
+        table_name: []const u8,
+    ) void {
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
+        self.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
+    }
+
+    fn drainPendingCloses(self: *ProvisionedTableWriteCache) void {
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
+        while (true) {
+            var entry_to_close: ?*Entry = null;
+            lockAtomic(&self.entry_lifecycle_mutex);
+            var i: usize = 0;
+            while (i < self.retired_entries.items.len) : (i += 1) {
+                const entry = self.retired_entries.items[i];
+                if (entry.active_leases != 0) continue;
+                entry_to_close = self.retired_entries.orderedRemove(i);
+                break;
+            }
+            if (entry_to_close == null and self.closing_entries.items.len != 0) {
+                entry_to_close = self.closing_entries.orderedRemove(0);
+            }
+            self.entry_lifecycle_mutex.unlock();
+
+            const entry = entry_to_close orelse return;
+            self.closeEntryNow(entry);
+        }
     }
 };
 
@@ -4297,9 +4443,15 @@ pub const ProvisionedTableWriteSource = struct {
         self.invalidateRuntimeStatusCache(table_name);
     }
 
+    fn drainWriteCachePendingCloses(self: *ProvisionedTableWriteSource) void {
+        if (self.write_cache) |cache| cache.drainPendingCloses();
+        if (self.startup_write_cache) |cache| cache.drainPendingCloses();
+    }
+
     fn finishLocalStructuralMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         self.invalidateReadCache(table_name);
         self.local_db_mutex.unlock();
+        self.drainWriteCachePendingCloses();
         self.endStructuralTableActivity(table_name);
     }
 
@@ -4313,6 +4465,7 @@ pub const ProvisionedTableWriteSource = struct {
     fn finishLocalStructuralCacheUpdate(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         self.invalidateReadCache(table_name);
         self.local_db_mutex.unlock();
+        self.drainWriteCachePendingCloses();
         self.endStructuralTableActivity(table_name);
     }
 
@@ -4320,6 +4473,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.invalidateReadCache(table_name);
         self.invalidateRuntimeStatusCache(table_name);
         self.local_db_mutex.unlock();
+        self.drainWriteCachePendingCloses();
         self.endStructuralTableActivity(table_name);
     }
 
@@ -4330,6 +4484,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.invalidateReadCache(table_name);
         self.invalidateRuntimeStatusCache(table_name);
         self.local_db_mutex.unlock();
+        self.drainWriteCachePendingCloses();
     }
 
     fn finishLocalRestoreMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
@@ -4338,6 +4493,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.invalidateReadCache(table_name);
         self.invalidateRuntimeStatusCache(table_name);
         self.local_db_mutex.unlock();
+        self.drainWriteCachePendingCloses();
         self.endStructuralTableActivity(table_name);
     }
 
@@ -4347,6 +4503,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.invalidateWriteCache(table_name);
         self.invalidateRuntimeStatusCache(table_name);
         self.local_db_mutex.unlock();
+        self.drainWriteCachePendingCloses();
         self.endStructuralTableActivity(table_name);
     }
 
@@ -4355,6 +4512,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.invalidateWriteCache(table_name);
         self.invalidateRuntimeStatusCache(table_name);
         self.local_db_mutex.unlock();
+        self.drainWriteCachePendingCloses();
         self.endStructuralTableActivity(table_name);
     }
 
@@ -4446,52 +4604,88 @@ pub const ProvisionedTableWriteSource = struct {
         var prepared_open: ?ProvisionedTableWriteCache.PreparedOpen = null;
         defer if (prepared_open) |*prepared| prepared.deinit(cache.alloc);
 
-        {
+        while (true) {
             lockAtomic(&self.local_db_mutex);
-            defer self.local_db_mutex.unlock();
             if (finish_expired_auto_bulk_now_ns) |now_ns| {
                 _ = cache.finishExpiredAutoBulkIngestLocked(now_ns) catch |err| {
+                    self.local_db_mutex.unlock();
                     if (!isTransientReplayVisibilityError(err)) return err;
                     std.log.warn("auto bulk ingest expired finish deferred table={s} group_id={} err={s}", .{
                         table_name,
                         group_id,
                         @errorName(err),
                     });
+                    continue;
                 };
             }
-            switch (try cache.getOrPrepareOpenLocked(group_id, lsm_root_generation, table_name)) {
+            const open_state = cache.getOrPrepareOpenLocked(group_id, lsm_root_generation, table_name) catch |err| {
+                self.local_db_mutex.unlock();
+                return err;
+            };
+            switch (open_state) {
                 .cached => |cached| {
+                    if (ensure_auto_bulk_now_ns) |now_ns| {
+                        cache.ensureAutoBulkIngestLocked(group_id, table_name, now_ns) catch |err| {
+                            self.local_db_mutex.unlock();
+                            return err;
+                        };
+                    }
+                    self.local_db_mutex.unlock();
                     try validateProvisionedDbIdentityNamespaceExpected(expected_identity_namespace, cached.db);
                     if (mode == .default or mode == .default_async) {
                         cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
                     }
-                    if (ensure_auto_bulk_now_ns) |now_ns| try cache.ensureAutoBulkIngestLocked(group_id, table_name, now_ns);
                     return cached;
                 },
-                .prepared => |prepared| prepared_open = prepared,
+                .prepared => |prepared| {
+                    self.local_db_mutex.unlock();
+                    prepared_open = prepared;
+                    break;
+                },
+                .pending_close => {
+                    self.local_db_mutex.unlock();
+                    cache.drainPendingClosesForGroupTable(group_id, table_name);
+                    continue;
+                },
             }
         }
 
         lockAtomic(&cache.open_mutex);
         defer cache.open_mutex.unlock();
 
-        {
+        while (true) {
             lockAtomic(&self.local_db_mutex);
-            defer self.local_db_mutex.unlock();
-            switch (try cache.getOrPrepareOpenLocked(group_id, lsm_root_generation, table_name)) {
+            const open_state = cache.getOrPrepareOpenLocked(group_id, lsm_root_generation, table_name) catch |err| {
+                self.local_db_mutex.unlock();
+                return err;
+            };
+            switch (open_state) {
                 .cached => |cached| {
+                    if (ensure_auto_bulk_now_ns) |now_ns| {
+                        cache.ensureAutoBulkIngestLocked(group_id, table_name, now_ns) catch |err| {
+                            self.local_db_mutex.unlock();
+                            return err;
+                        };
+                    }
+                    self.local_db_mutex.unlock();
                     try validateProvisionedDbIdentityNamespaceExpected(expected_identity_namespace, cached.db);
                     prepared_open.?.deinit(cache.alloc);
                     prepared_open = null;
                     if (mode == .default or mode == .default_async) {
                         cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
                     }
-                    if (ensure_auto_bulk_now_ns) |now_ns| try cache.ensureAutoBulkIngestLocked(group_id, table_name, now_ns);
                     return cached;
                 },
                 .prepared => |prepared| {
+                    self.local_db_mutex.unlock();
                     prepared_open.?.deinit(cache.alloc);
                     prepared_open = prepared;
+                    break;
+                },
+                .pending_close => {
+                    self.local_db_mutex.unlock();
+                    cache.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
+                    continue;
                 },
             }
         }
@@ -4648,8 +4842,9 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn invalidateWriteCacheForTable(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         lockAtomic(&self.local_db_mutex);
-        defer self.local_db_mutex.unlock();
         if (self.write_cache) |cache| cache.invalidateTable(table_name);
+        self.local_db_mutex.unlock();
+        self.drainWriteCachePendingCloses();
     }
 
     fn invalidateRuntimeStatusCache(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
@@ -4894,9 +5089,13 @@ pub const ProvisionedTableWriteSource = struct {
                         i += 1;
                         continue;
                     }
+                    cache.closing_entries.ensureUnusedCapacity(cache.alloc, 1) catch {
+                        i += 1;
+                        continue;
+                    };
                     _ = cache.entries.orderedRemove(i);
-                    entry.deinit(cache.alloc);
-                    cache.alloc.destroy(entry);
+                    entry.retired = true;
+                    cache.closing_entries.appendAssumeCapacity(entry);
                 }
 
                 var session_index: usize = 0;
@@ -5037,8 +5236,9 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn clearStartupWriteCache(self: *ProvisionedTableWriteSource) void {
         lockAtomic(&self.local_db_mutex);
-        defer self.local_db_mutex.unlock();
         self.clearStartupWriteCacheLocked();
+        self.local_db_mutex.unlock();
+        self.drainWriteCachePendingCloses();
     }
 
     pub fn clearWriteCacheLocked(self: *ProvisionedTableWriteSource) void {
@@ -5049,8 +5249,9 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn clearWriteCache(self: *ProvisionedTableWriteSource) void {
         lockAtomic(&self.local_db_mutex);
-        defer self.local_db_mutex.unlock();
         self.clearWriteCacheLocked();
+        self.local_db_mutex.unlock();
+        self.drainWriteCachePendingCloses();
     }
 
     pub fn warmTableGroup(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8) !void {
@@ -5535,9 +5736,11 @@ pub const ProvisionedTableWriteSource = struct {
         lockAtomic(&self.local_db_mutex);
         const has_leases = self.collectRuntimeStatusLeasesFromWriteCacheLocked(alloc, table_name, &leases) catch {
             self.local_db_mutex.unlock();
+            self.drainWriteCachePendingCloses();
             return;
         };
         self.local_db_mutex.unlock();
+        self.drainWriteCachePendingCloses();
         if (!has_leases) return;
 
         self.publishRuntimeStatusLeaseSnapshots(alloc, leases.items);
@@ -6009,9 +6212,11 @@ pub const ProvisionedTableWriteSource = struct {
         lockAtomic(&self.local_db_mutex);
         const has_leases = self.collectRuntimeStatusLeasesFromWriteCacheLocked(alloc, table_name, &leases) catch |err| {
             self.local_db_mutex.unlock();
+            self.drainWriteCachePendingCloses();
             return err;
         };
         self.local_db_mutex.unlock();
+        self.drainWriteCachePendingCloses();
         if (!has_leases) return;
 
         var live_statuses = (try self.runtimeStatusesFromCachedDbLeasesBestEffort(alloc, table_name, leases.items)) orelse return;
@@ -7927,9 +8132,10 @@ pub const ProvisionedTableWriteSource = struct {
                 i += 1;
                 continue;
             }
+            try cache.closing_entries.ensureUnusedCapacity(cache.alloc, 1);
             _ = cache.entries.orderedRemove(i);
-            entry.deinit(cache.alloc);
-            cache.alloc.destroy(entry);
+            entry.retired = true;
+            cache.closing_entries.appendAssumeCapacity(entry);
         }
 
         var matching_entries: usize = 0;
@@ -8834,8 +9040,9 @@ pub const HostedProvisionedTableWriteSource = struct {
     fn invalidateManagedCache(self: *HostedProvisionedTableWriteSource, table_name: []const u8) void {
         const hosted_cache = hostedManagedDbCacheForRootIfPresent(self.replica_root_dir) orelse return;
         lockAtomic(&hosted_cache.mutex);
-        defer hosted_cache.mutex.unlock();
         hosted_cache.write_cache.invalidateTable(table_name);
+        hosted_cache.mutex.unlock();
+        hosted_cache.write_cache.drainPendingCloses();
     }
 
     fn getOrOpenCachedDbMode(
@@ -8863,32 +9070,56 @@ pub const HostedProvisionedTableWriteSource = struct {
         var prepared_open: ?ProvisionedTableWriteCache.PreparedOpen = null;
         defer if (prepared_open) |*prepared| prepared.deinit(cache.write_cache.alloc);
 
-        {
+        while (true) {
             lockAtomic(&cache.mutex);
-            defer cache.mutex.unlock();
-            switch (try cache.write_cache.getOrPrepareOpenLocked(group_id, lsm_root_generation, table_name)) {
+            const open_state = cache.write_cache.getOrPrepareOpenLocked(group_id, lsm_root_generation, table_name) catch |err| {
+                cache.mutex.unlock();
+                return err;
+            };
+            switch (open_state) {
                 .cached => |cached| {
+                    cache.mutex.unlock();
                     try validateProvisionedDbIdentityNamespaceExpected(expected_identity_namespace, cached.db);
                     return cached;
                 },
-                .prepared => |prepared| prepared_open = prepared,
+                .prepared => |prepared| {
+                    cache.mutex.unlock();
+                    prepared_open = prepared;
+                    break;
+                },
+                .pending_close => {
+                    cache.mutex.unlock();
+                    cache.write_cache.drainPendingClosesForGroupTable(group_id, table_name);
+                    continue;
+                },
             }
         }
 
         lockAtomic(&cache.write_cache.open_mutex);
         defer cache.write_cache.open_mutex.unlock();
 
-        {
+        while (true) {
             lockAtomic(&cache.mutex);
-            defer cache.mutex.unlock();
-            switch (try cache.write_cache.getOrPrepareOpenLocked(group_id, lsm_root_generation, table_name)) {
+            const open_state = cache.write_cache.getOrPrepareOpenLocked(group_id, lsm_root_generation, table_name) catch |err| {
+                cache.mutex.unlock();
+                return err;
+            };
+            switch (open_state) {
                 .cached => |cached| {
+                    cache.mutex.unlock();
                     try validateProvisionedDbIdentityNamespaceExpected(expected_identity_namespace, cached.db);
                     return cached;
                 },
                 .prepared => |prepared| {
+                    cache.mutex.unlock();
                     prepared_open.?.deinit(cache.write_cache.alloc);
                     prepared_open = prepared;
+                    break;
+                },
+                .pending_close => {
+                    cache.mutex.unlock();
+                    cache.write_cache.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
+                    continue;
                 },
             }
         }
@@ -10753,7 +10984,7 @@ fn catchUpManagedIndexCreate(
         if (db.enrichment_runtime != null) {
             const scheduled = try db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
             if (scheduled > 0) {
-                try db.core.index_manager.syncAll(false);
+                try db.core.index_manager.syncAll(true);
                 return;
             }
         } else {
@@ -10771,7 +11002,7 @@ fn catchUpManagedIndexCreate(
         try db.catchUpPendingDerivedReplay();
         try db.runUntilIdle();
     }
-    try db.core.index_manager.syncAll(false);
+    try db.core.index_manager.syncAll(true);
 }
 
 fn managedIndexReplayDebtRequired(replay_debt: anytype, index_name: []const u8) bool {
@@ -10790,6 +11021,15 @@ fn managedIndexCoverageIncomplete(alloc: std.mem.Allocator, db: *db_mod.DB, inde
     for (stats.indexes) |item| {
         if (!std.mem.eql(u8, item.name, index_name)) continue;
         return item.doc_count < primary_doc_count;
+    }
+    return false;
+}
+
+fn managedDbHasIndexLoadFailure(alloc: std.mem.Allocator, db: *db_mod.DB) !bool {
+    const configs = try db.core.listIndexes(alloc);
+    defer db_mod.types.freeIndexConfigs(alloc, configs);
+    for (configs) |cfg| {
+        if (db.core.index_manager.loadFailure(cfg.name) != null) return true;
     }
     return false;
 }
@@ -11696,7 +11936,7 @@ fn drainManagedDbBeforeClose(db: *db_mod.DB) !void {
     // Provisioned writes open a managed DB per request, so queued enrichment
     // must drain before the DB is closed or semantic indexes can stay empty.
     try db.runUntilIdle();
-    try db.core.index_manager.syncAll(false);
+    try db.core.index_manager.syncAll(true);
 }
 
 fn publishRuntimeStatusSnapshot(
@@ -12521,6 +12761,11 @@ fn catchUpManagedDb(
         std.log.warn("managed startup catch-up dense rebuild probe failed table={s} err={}", .{ table_name, err });
         return err;
     };
+    const has_index_load_failure = try managedDbHasIndexLoadFailure(alloc, db);
+    if (has_index_load_failure) {
+        try publishRuntimeStatusSnapshotWithStartupPhaseMode(source, alloc, table_name, group_id, .idle, .consistent, db);
+        return .{ .had_debt = true, .terminal_degraded = true };
+    }
     const initial_repair_debt = had_debt or restore_repair_needed or needs_dense_artifact_rebuild;
 
     var repaired_restore_runtime = false;
@@ -12569,7 +12814,7 @@ fn catchUpManagedDb(
             if (next_debt_signature.applied_sum <= last_debt_signature.applied_sum and next_debt_signature.target_sum <= last_debt_signature.target_sum) break;
             last_debt_signature = next_debt_signature;
         }
-        try db.core.index_manager.syncAll(false);
+        try db.core.index_manager.syncAll(true);
     }
 
     if (!initial_repair_debt) {
@@ -12589,7 +12834,7 @@ fn catchUpManagedDb(
                 std.log.warn("managed startup catch-up dense rebuild idle drain failed table={s} err={}", .{ table_name, err });
                 return err;
             };
-            try db.core.index_manager.syncAll(false);
+            try db.core.index_manager.syncAll(true);
         }
         try publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db);
     }
@@ -22391,6 +22636,99 @@ test "managed startup catch-up uses provided indexes json without catalog fetch"
     try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, statuses.items[0].metadata.freshness);
 }
 
+test "managed startup catch-up marks FileNotFound index open terminal degraded" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-catch-up-terminal-missing-index", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+    const indexes_json = "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}";
+    const identity_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 7001, .range_id = 7001 };
+
+    {
+        var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+            alloc,
+            path,
+            indexes_json,
+            null,
+            null,
+            table_reads.backend_current_root_generation,
+            null,
+            .default,
+            null,
+            null,
+            null,
+            null,
+            identity_namespace,
+        );
+        defer db.close();
+    }
+
+    const CountingCatalog = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var catalog = CountingCatalog{};
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var startup_write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer startup_write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
+    source.runtime_status_cache = &snapshot_cache;
+    source.startup_write_cache = &startup_write_cache;
+
+    index_manager_mod.test_inject_index_open_error = error.FileNotFound;
+    defer index_manager_mod.test_inject_index_open_error = null;
+
+    const result = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
+        .indexes_json = indexes_json,
+        .schema_json = "",
+        .identity_namespace = identity_namespace,
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), catalog.calls);
+    try std.testing.expect(!result.busy);
+    try std.testing.expect(result.had_debt);
+    try std.testing.expect(result.terminal_degraded);
+    try std.testing.expect(!result.cleared_debt);
+
+    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    const status = statuses.items[0];
+    try std.testing.expect(!status.stats.async_indexing.startup.active);
+    try std.testing.expectEqual(db_mod.types.StartupCatchUpPhase.idle, status.stats.async_indexing.startup.phase);
+    try std.testing.expect(status.stats.repair_degraded);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, status.metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, status.metadata.freshness);
+    try std.testing.expectEqual(@as(usize, 1), status.stats.indexes.len);
+    try std.testing.expect(status.stats.indexes[0].repair_degraded);
+    try std.testing.expect(status.stats.indexes[0].load_error != null);
+    try std.testing.expectEqualStrings("FileNotFound", status.stats.indexes[0].load_error.?);
+}
+
 test "managed startup catch-up reclaims due obsolete primary run files" {
     const alloc = std.testing.allocator;
 
@@ -23078,6 +23416,11 @@ test "write cache blocks same-root generation replacement while stale lease stay
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items[0].active_leases);
 
+    try std.testing.expectError(
+        error.LsmRootWriterAlreadyOpen,
+        write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 1, "docs"),
+    );
+    write_cache.drainPendingClosesForGroupTable(7001, "docs");
     var gen1 = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 1, "docs");
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(u64, 1), write_cache.entries.items[0].lsm_root_generation);

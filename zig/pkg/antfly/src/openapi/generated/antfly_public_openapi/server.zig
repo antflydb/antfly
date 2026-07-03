@@ -319,14 +319,14 @@ pub const ListArtifactRepairIssuesParams = struct {
     target: ?[]const u8 = null,
 };
 
-/// Run a bounded artifact repair pass
-pub const RepairArtifactIssuesPathParams = struct {
+/// Run a bounded table repair pass
+pub const RunTableRepairPathParams = struct {
     /// Name of the table
     table_name: []const u8,
 };
 
-/// Parse the JSON request body for repairArtifactIssues.
-pub fn parseRepairArtifactIssuesBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RepairRunRequest) {
+/// Parse the JSON request body for runTableRepair.
+pub fn parseRunTableRepairBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RepairRunRequest) {
     return std.json.parseFromSlice(types.RepairRunRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
@@ -704,7 +704,7 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests" },
     .{ .method = "GET", .path = "/tables/{tableName}/artifacts", .operation_id = "listArtifactEnrichments" },
     .{ .method = "GET", .path = "/tables/{tableName}/repair/issues", .operation_id = "listArtifactRepairIssues" },
-    .{ .method = "POST", .path = "/tables/{tableName}/repair/run", .operation_id = "repairArtifactIssues" },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/run", .operation_id = "runTableRepair" },
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifactRange" },
     .{ .method = "PUT", .path = "/tables/{tableName}/artifacts/{artifactName}/enrichment", .operation_id = "putArtifactEnrichment" },
     .{ .method = "DELETE", .path = "/tables/{tableName}/artifacts/{artifactName}/enrichment", .operation_id = "deleteArtifactEnrichment" },
@@ -788,7 +788,7 @@ pub const routes = [_]Route{
 //   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !httpx.Response
 //   fn listArtifactEnrichments(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn listArtifactRepairIssues(self: *Impl, ctx: *httpx.Context, table_name: []const u8, params: ListArtifactRepairIssuesParams) !httpx.Response
-//   fn repairArtifactIssues(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn runTableRepair(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn reprocessDocumentArtifactRange(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn putArtifactEnrichment(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn deleteArtifactEnrichment(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response

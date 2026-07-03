@@ -7172,17 +7172,27 @@ pub const DB = struct {
         alloc: Allocator,
         req: types.ArtifactRepairRunRequest,
     ) !types.ArtifactRepairResult {
-        if (req.cursor != null) return error.InvalidArgument;
+        if (req.index_name != null and req.cursor != null and req.cursor.?.len != 0) return error.InvalidArgument;
         const limit = if (req.limit == 0) @as(u32, 100) else req.limit;
         var result = types.ArtifactRepairResult{ .limit = limit };
 
         const configs = try self.core.listIndexes(alloc);
         defer types.freeIndexConfigs(alloc, configs);
+        std.mem.sort(types.IndexConfig, configs, {}, indexConfigNameLessThan);
+        const cursor_name = if (req.cursor) |cursor| blk: {
+            if (cursor.len == 0) break :blk null;
+            break :blk cursor;
+        } else null;
+        var graph_artifact_keys: ?[][]const u8 = null;
+        defer if (graph_artifact_keys) |keys| freeOwnedConstStringSlice(alloc, keys);
+        var cursor_found = cursor_name == null;
         for (configs) |cfg| {
-            if (result.scanned >= limit) {
-                result.has_more = true;
-                result.debt_remaining = true;
-                break;
+            if (!cursor_found) {
+                if (std.mem.eql(u8, cfg.name, cursor_name.?)) {
+                    cursor_found = true;
+                } else {
+                    continue;
+                }
             }
             if (req.index_name) |index_name| {
                 if (!std.mem.eql(u8, cfg.name, index_name)) continue;
@@ -7195,6 +7205,12 @@ pub const DB = struct {
                     .algebraic => false,
                 };
                 if (!matches_kind) continue;
+            }
+            if (result.scanned >= limit) {
+                result.has_more = true;
+                result.debt_remaining = true;
+                result.next_cursor = try alloc.dupe(u8, cfg.name);
+                break;
             }
 
             result.scanned += 1;
@@ -7214,9 +7230,17 @@ pub const DB = struct {
                     break :blk count;
                 },
                 .graph => blk: {
-                    try self.rebuildGraphIndexesForTargetCoverage(alloc);
+                    if (graph_artifact_keys == null) {
+                        graph_artifact_keys = try collectGraphArtifactKeysInRangeAlloc(alloc, self.core.store, "", "");
+                    }
+                    const count = try applySplitGraphArtifactsForIndex(
+                        self.core.store,
+                        self.core.index_manager,
+                        graph_artifact_keys.?,
+                        cfg.name,
+                    );
                     try self.core.index_manager.syncIndexByName(cfg.name, true);
-                    break :blk @as(usize, 1);
+                    break :blk count;
                 },
                 .full_text, .algebraic => blk: {
                     result.unsupported += 1;
@@ -7230,8 +7254,13 @@ pub const DB = struct {
             result.repaired += 1;
             result.indexes_rebuilt += 1;
         }
+        if (!cursor_found) return error.InvalidArgument;
         if (req.index_name != null and result.scanned == 0) return error.NotFound;
         return result;
+    }
+
+    fn indexConfigNameLessThan(_: void, lhs: types.IndexConfig, rhs: types.IndexConfig) bool {
+        return std.mem.lessThan(u8, lhs.name, rhs.name);
     }
 
     pub fn repairArtifactIssues(
@@ -25721,16 +25750,30 @@ fn applySplitGraphArtifacts(
     if (artifact_keys.len == 0) return;
 
     for (dest_indexes.graph_indexes.items) |entry| {
-        var graph_mutations = try collectGraphMutationsForArtifacts(
-            dest_indexes.alloc,
-            dest_store,
-            artifact_keys,
-            entry.config.name,
-            .{},
-        );
-        defer graph_mutations.deinit();
-        try dest_indexes.applyGraphMutationsByName(entry.config.name, graph_mutations.writes, graph_mutations.deletes);
+        _ = try applySplitGraphArtifactsForIndex(dest_store, dest_indexes, artifact_keys, entry.config.name);
     }
+}
+
+fn applySplitGraphArtifactsForIndex(
+    dest_store: *docstore_mod.DocStore,
+    dest_indexes: *index_manager_mod.IndexManager,
+    artifact_keys: []const []const u8,
+    index_name: []const u8,
+) !usize {
+    _ = dest_indexes.graphIndex(index_name) orelse return error.IndexNotFound;
+    if (artifact_keys.len == 0) return 0;
+
+    var graph_mutations = try collectGraphMutationsForArtifacts(
+        dest_indexes.alloc,
+        dest_store,
+        artifact_keys,
+        index_name,
+        .{},
+    );
+    defer graph_mutations.deinit();
+    const mutation_count = graph_mutations.writes.len + graph_mutations.deletes.len;
+    try dest_indexes.applyGraphMutationsByName(index_name, graph_mutations.writes, graph_mutations.deletes);
+    return mutation_count;
 }
 
 fn applySplitGraphArtifactsInRange(
@@ -36661,6 +36704,97 @@ test "db artifact repair reports unsupported artifact kinds without clearing deb
     try std.testing.expectEqualStrings("graph_reprocessor_unavailable", issues[0].last_error);
 }
 
+test "db index repair cursor advances beyond bounded page" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{ .name = "ft_c", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{ .name = "ft_a", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{ .name = "ft_b", .kind = .full_text, .config_json = "{}" });
+
+    var first = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .limit = 2,
+    });
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), first.scanned);
+    try std.testing.expectEqual(@as(u64, 2), first.unsupported);
+    try std.testing.expect(first.has_more);
+    try std.testing.expect(first.debt_remaining);
+    try std.testing.expectEqualStrings("ft_c", first.next_cursor.?);
+
+    var second = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .limit = 2,
+        .cursor = first.next_cursor,
+    });
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), second.scanned);
+    try std.testing.expectEqual(@as(u64, 1), second.unsupported);
+    try std.testing.expect(!second.has_more);
+    try std.testing.expect(second.next_cursor == null);
+    try std.testing.expect(second.debt_remaining);
+
+    try std.testing.expectError(error.InvalidArgument, db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .cursor = "missing-index",
+    }));
+}
+
+test "db index repair targets one graph index per selected config" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{ .name = "graph_a", .kind = .graph, .config_json = "{}" });
+    try db.addIndex(.{ .name = "graph_b", .kind = .graph, .config_json = "{}" });
+
+    const key_a = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "graph_a", "mentions", "doc:b");
+    defer alloc.free(key_a);
+    const value_a = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 0.7, 0, 0, "");
+    defer alloc.free(value_a);
+    const key_b = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "graph_b", "mentions", "doc:c");
+    defer alloc.free(key_b);
+    const value_b = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 0.9, 0, 0, "");
+    defer alloc.free(value_b);
+    try db.core.store.putBatch(&.{
+        .{ .key = key_a, .value = value_a },
+        .{ .key = key_b, .value = value_b },
+    }, &.{});
+
+    var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .artifact_kind = .graph,
+        .index_name = "graph_a",
+        .limit = 1,
+    });
+    defer repair.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), repair.scanned);
+    try std.testing.expectEqual(@as(u64, 1), repair.reprocessed);
+    try std.testing.expectEqual(@as(u64, 1), repair.repaired);
+    try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
+
+    const edges_a = try db.getEdges(alloc, "graph_a", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges_a);
+    try std.testing.expectEqual(@as(usize, 1), edges_a.len);
+    try std.testing.expectEqualStrings("doc:b", edges_a[0].target);
+
+    const edges_b = try db.getEdges(alloc, "graph_b", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges_b);
+    try std.testing.expectEqual(@as(usize, 0), edges_b.len);
+}
+
 test "db artifact repair records corrupt graph edge artifacts during replay" {
     const alloc = std.testing.allocator;
 
@@ -46072,26 +46206,50 @@ test "db rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded repairs externa
         const stats = try reopened.stats(alloc);
         defer types.freeDBStats(alloc, stats);
         try std.testing.expectEqual(@as(u64, 3), stats.doc_count);
+        try std.testing.expect(stats.repair_degraded);
         var dense_doc_count: ?u64 = null;
+        var dense_repair_degraded = false;
+        var dense_repair_issue_count: ?u64 = null;
         for (stats.indexes) |index| {
             if (!std.mem.eql(u8, index.name, "dense_idx")) continue;
             dense_doc_count = index.doc_count;
+            dense_repair_degraded = index.repair_degraded;
+            dense_repair_issue_count = index.repair_issue_count;
         }
         try std.testing.expectEqual(@as(?u64, 0), dense_doc_count);
+        try std.testing.expect(dense_repair_degraded);
+        try std.testing.expectEqual(@as(?u64, 1), dense_repair_issue_count);
     }
 
-    const rebuilt = try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
-    try std.testing.expect(rebuilt > 0);
+    var repair = try reopened.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .artifact_kind = .embedding,
+        .index_name = "dense_idx",
+        .limit = 1,
+    });
+    defer repair.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), repair.scanned);
+    try std.testing.expectEqual(@as(u64, 3), repair.reprocessed);
+    try std.testing.expectEqual(@as(u64, 1), repair.repaired);
+    try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
+    try std.testing.expect(!repair.debt_remaining);
     try reopened.runUntilIdle();
 
     const stats = try reopened.stats(alloc);
     defer types.freeDBStats(alloc, stats);
+    try std.testing.expect(!stats.repair_degraded);
     var dense_doc_count: ?u64 = null;
+    var dense_repair_degraded = true;
+    var dense_repair_issue_count: ?u64 = null;
     for (stats.indexes) |index| {
         if (!std.mem.eql(u8, index.name, "dense_idx")) continue;
         dense_doc_count = index.doc_count;
+        dense_repair_degraded = index.repair_degraded;
+        dense_repair_issue_count = index.repair_issue_count;
     }
     try std.testing.expectEqual(@as(?u64, 3), dense_doc_count);
+    try std.testing.expect(!dense_repair_degraded);
+    try std.testing.expectEqual(@as(?u64, 0), dense_repair_issue_count);
 
     var result = try reopened.search(alloc, .{
         .index_name = "dense_idx",

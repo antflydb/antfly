@@ -3958,7 +3958,7 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTableArtifactRepairRun(uri_parts.path)) |repair_route| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, repair_route.table_name);
                 defer self.alloc.free(table_name);
-                return try self.handlePublicRepairArtifactIssues(table_name, uri_parts.query, req.body);
+                return try self.handlePublicRunTableRepair(table_name, uri_parts.query, req.body);
             }
             if (routes.Routes.matchTableArtifactReprocessJobs(uri_parts.path)) |job_route| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
@@ -7267,7 +7267,7 @@ pub const ApiHttpServer = struct {
         limit: ?u32 = null,
     };
 
-    pub fn handlePublicRepairArtifactIssues(self: *ApiHttpServer, table_name: []const u8, query: []const u8, body: []const u8) !http_common.HttpResponse {
+    pub fn handlePublicRunTableRepair(self: *ApiHttpServer, table_name: []const u8, query: []const u8, body: []const u8) !http_common.HttpResponse {
         const source = self.table_writes orelse return try textResponse(self.alloc, 405, "method not allowed");
         var parsed = std.json.parseFromSlice(PublicRepairRunRequest, self.alloc, if (body.len > 0) body else "{}", .{ .ignore_unknown_fields = true }) catch {
             return try textResponse(self.alloc, 400, "invalid repair request");
@@ -7297,8 +7297,8 @@ pub const ApiHttpServer = struct {
         }) catch |err| switch (err) {
             error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid cursor"),
             else => {
-                std.log.err("artifact repair failed table={s} err={}", .{ table_name, err });
-                return try textResponse(self.alloc, 500, "artifact repair failed");
+                std.log.err("table repair failed table={s} err={}", .{ table_name, err });
+                return try textResponse(self.alloc, 500, "table repair failed");
             },
         }) orelse return try textResponse(self.alloc, 404, "not found");
         defer result.deinit(self.alloc);

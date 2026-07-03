@@ -3512,6 +3512,7 @@ pub fn build(b: *std.Build) void {
         "provisioned table write source seeds doc identity namespace from table range",
         "provisioned table write source cached runtime status does not fetch catalog coverage",
         "managed startup catch-up uses provided indexes json without catalog fetch",
+        "managed startup catch-up marks FileNotFound index open terminal degraded",
         "idle startup runtime status preserves live empty cached status",
         "api http server serves table batch transforms",
         "api http server updates local table schema through bound write source",
@@ -3840,6 +3841,7 @@ pub fn build(b: *std.Build) void {
             "best effort startup runtime status publishes live db when cache is empty",
             "idle startup runtime status publish is live when startup flag is still set",
             "managed startup catch-up uses provided indexes json without catalog fetch",
+            "managed startup catch-up marks FileNotFound index open terminal degraded",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

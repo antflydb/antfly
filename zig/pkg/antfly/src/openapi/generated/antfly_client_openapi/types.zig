@@ -4259,7 +4259,7 @@ pub const RepairRunRequest = struct {
     limit: ?i64 = null,
 };
 
-/// Response for a bounded artifact repair pass.
+/// Response for a bounded table repair pass.
 pub const ArtifactRepairRunResponse = struct {
     /// Table whose repair queue was processed.
     table: []const u8,

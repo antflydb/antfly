@@ -4072,22 +4072,24 @@ paths:
         schema:
           type: string
     post:
-      summary: Run a bounded artifact repair pass
+      summary: Run a bounded table repair pass
       description: >
-        Attempts to repair queued table issues. This release supports
+        Attempts to repair queued table issues. `target=artifact` reprocesses
 
-        `target=artifact`, which reprocesses supported artifact kinds and
+        supported artifact kinds and replays derived state. `target=index`
 
-        replays derived state. The operation is bounded by `limit`, returns an
+        rebuilds selected index state from stored artifacts for supported index
 
-        opaque continuation cursor when more scanned issues remain in the page
+        kinds. The operation is bounded by `limit`, returns an opaque
 
-        stream, reports unresolved debt separately, and requires table admin
+        continuation cursor when another page of repair work is available,
 
-        permission when authentication is enabled.
+        reports unresolved debt separately, and requires table admin permission
+
+        when authentication is enabled.
       tags:
         - data_operations
-      operationId: repairArtifactIssues
+      operationId: runTableRepair
       requestBody:
         required: false
         content:
@@ -4096,7 +4098,7 @@ paths:
               $ref: '#/components/schemas/RepairRunRequest'
       responses:
         '202':
-          description: Bounded artifact repair pass was accepted
+          description: Bounded table repair pass was accepted
           content:
             application/json:
               schema:
@@ -7581,7 +7583,7 @@ components:
             absent, rerun repair from the beginning after addressing failed or unsupported records.
     ArtifactRepairRunResponse:
       type: object
-      description: Response for a bounded artifact repair pass.
+      description: Response for a bounded table repair pass.
       required:
         - table
         - target
