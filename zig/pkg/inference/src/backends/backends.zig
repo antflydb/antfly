@@ -221,7 +221,8 @@ pub const SessionManager = struct {
     }
 
     fn shouldUseImportedOnnxGraphRuntime(self: *const SessionManager, model_path: []const u8) bool {
-        return self.graph_runtime_strategy != null and isOnnxFilePath(model_path);
+        _ = self;
+        return isOnnxFilePath(model_path);
     }
 
     fn shouldUseExternalOnnxRuntime(self: *const SessionManager, model_path: []const u8) bool {
@@ -242,7 +243,7 @@ fn configuredPreferredBackends() []const BackendType {
     if (preferredBackendOverride()) |backend| {
         return preferredBackendsForOverride(backend);
     }
-    return &.{ .onnx, .metal, .native };
+    return &.{ .metal, .native };
 }
 
 fn preferredBackendsForOverride(backend: BackendType) []const BackendType {
@@ -288,13 +289,20 @@ test "preferred backend override keeps fallback backends" {
 
 test "explicit graph runtime is independent from onnx runtime backend availability" {
     var manager = SessionManager.init(std.testing.allocator);
-    try std.testing.expect(!manager.shouldUseImportedOnnxGraphRuntime("model.onnx"));
+    try std.testing.expect(manager.shouldUseImportedOnnxGraphRuntime("model.onnx"));
     try std.testing.expectEqual(build_options.enable_onnx, manager.shouldUseExternalOnnxRuntime("model.onnx"));
     manager.graph_runtime_strategy = .partitioned;
     try std.testing.expect(manager.shouldUseImportedOnnxGraphRuntime("model.onnx"));
     try std.testing.expectEqual(build_options.enable_onnx, manager.shouldUseExternalOnnxRuntime("model.onnx"));
     try std.testing.expect(!manager.shouldUseImportedOnnxGraphRuntime("model.gguf"));
     try std.testing.expect(!manager.shouldUseExternalOnnxRuntime("model.gguf"));
+}
+
+test "auto backend order keeps external onnx runtime opt-in" {
+    if (!build_options.enable_wasm) {
+        try std.testing.expectEqualSlices(BackendType, &.{ .metal, .native }, configuredPreferredBackends());
+    }
+    try std.testing.expectEqualSlices(BackendType, &.{ .onnx, .metal, .native }, preferredBackendsForOverride(.onnx));
 }
 
 fn preferredBackendOverride() ?BackendType {

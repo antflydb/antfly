@@ -149,6 +149,8 @@ pub const MetadataServer = struct {
                 data_router,
                 svc.raft.host.http_host.request_executor,
             );
+            _ = public_write_source.withBackendRuntime(try svc.ensureBackendRuntime());
+            _ = public_write_source.withInferenceAPIURL(if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null);
             _ = public_write_source.withSecretStore(cfg.api_server_cfg.secret_store);
             _ = public_write_source.withRemoteContent(cfg.api_server_cfg.remote_content);
             owned_public_write_source = public_write_source;

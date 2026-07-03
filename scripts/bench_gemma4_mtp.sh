@@ -20,14 +20,29 @@ Environment:
   BACKEND_BUDGET_MB=19000
   KV_BUDGET_MB=512
   SCRATCH_BUDGET_MB=1024
+  CACHE_DTYPE=
+  TURBOQUANT_MIN_TOKENS=
   PREFILL_CHUNK_SIZE=
   SPECULATION_POLICY=auto|force|off
   SPECULATION_CALIBRATION=none|probe|positive
   MTP_TARGET_REPLAY=auto|force|off
+  MTP_REPLAY_CONTEXT_KEY=auto|0|1
+  MTP_UNSAFE_TARGET_REPLAY=auto|0|1
+  MTP_REPLAY_VERIFY_ROWS=1,2,3,4,5
+  MTP_ASSISTANT_REPLAY=auto|0|1
+  MTP_MATERIALIZE_REPLAY=auto|0|1
   MTP_DEDICATED_RUNTIME=auto|0|1
   MTP_VERIFY_DEVICE_RESULT=auto|0|1
+  MTP_MASKED_SELECT_HIDDEN_FUSION=auto|0|1
+  MTP_POSITION_MODE=target_constant|target_absolute|legacy_one
+  MTP_TARGET_HIDDEN_SOURCE=final|pre_norm
+  MTP_CONCAT_ORDER=embedding_activation|activation_embedding
+  MTP_KV_DONOR_MODE=shared_type|tail_base|assistant_index|non_shared_tail_base|first_shared_base
+  DRAFT_EMBED_CACHE=256
+  JSON_TOKEN_IDS=0|1
   CUDA_TEMP_SLOT_PERIOD=
   CUDA_TEMP_SLOT_SKIP=
+  CUDA_CAPTURE_PERSISTENT_REPLAY=auto|0|1
   ADAPTIVE_K=auto|0|1
   HIDDEN_ONLY_MATERIALIZE=auto|0|1
   ACCEPT_BONUS=auto|0|1
@@ -56,14 +71,29 @@ COMBINED_BUDGET_MB="${COMBINED_BUDGET_MB:-22000}"
 BACKEND_BUDGET_MB="${BACKEND_BUDGET_MB:-19000}"
 KV_BUDGET_MB="${KV_BUDGET_MB:-512}"
 SCRATCH_BUDGET_MB="${SCRATCH_BUDGET_MB:-1024}"
+CACHE_DTYPE="${CACHE_DTYPE:-}"
+TURBOQUANT_MIN_TOKENS="${TURBOQUANT_MIN_TOKENS:-}"
 PREFILL_CHUNK_SIZE="${PREFILL_CHUNK_SIZE:-}"
 SPECULATION_POLICY="${SPECULATION_POLICY:-}"
 SPECULATION_CALIBRATION="${SPECULATION_CALIBRATION:-}"
 MTP_TARGET_REPLAY="${MTP_TARGET_REPLAY:-}"
+MTP_REPLAY_CONTEXT_KEY="${MTP_REPLAY_CONTEXT_KEY:-auto}"
+MTP_UNSAFE_TARGET_REPLAY="${MTP_UNSAFE_TARGET_REPLAY:-auto}"
+MTP_REPLAY_VERIFY_ROWS="${MTP_REPLAY_VERIFY_ROWS:-}"
+MTP_ASSISTANT_REPLAY="${MTP_ASSISTANT_REPLAY:-auto}"
+MTP_MATERIALIZE_REPLAY="${MTP_MATERIALIZE_REPLAY:-auto}"
 MTP_DEDICATED_RUNTIME="${MTP_DEDICATED_RUNTIME:-auto}"
 MTP_VERIFY_DEVICE_RESULT="${MTP_VERIFY_DEVICE_RESULT:-auto}"
+MTP_MASKED_SELECT_HIDDEN_FUSION="${MTP_MASKED_SELECT_HIDDEN_FUSION:-auto}"
+MTP_POSITION_MODE="${MTP_POSITION_MODE:-}"
+MTP_TARGET_HIDDEN_SOURCE="${MTP_TARGET_HIDDEN_SOURCE:-}"
+MTP_CONCAT_ORDER="${MTP_CONCAT_ORDER:-}"
+MTP_KV_DONOR_MODE="${MTP_KV_DONOR_MODE:-}"
+DRAFT_EMBED_CACHE="${DRAFT_EMBED_CACHE:-}"
+JSON_TOKEN_IDS="${JSON_TOKEN_IDS:-0}"
 CUDA_TEMP_SLOT_PERIOD="${CUDA_TEMP_SLOT_PERIOD:-}"
 CUDA_TEMP_SLOT_SKIP="${CUDA_TEMP_SLOT_SKIP:-}"
+CUDA_CAPTURE_PERSISTENT_REPLAY="${CUDA_CAPTURE_PERSISTENT_REPLAY:-auto}"
 ADAPTIVE_K="${ADAPTIVE_K:-auto}"
 HIDDEN_ONLY_MATERIALIZE="${HIDDEN_ONLY_MATERIALIZE:-auto}"
 ACCEPT_BONUS="${ACCEPT_BONUS:-auto}"
@@ -145,13 +175,32 @@ run_case() {
   local -a mode_args=()
   local -a draft_args=()
   local -a prefill_args=()
+  local -a cache_args=()
 
   env_args+=("ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MB=$TEMP_CACHE_MB")
+  if [[ "$JSON_TOKEN_IDS" == "1" ]]; then
+    env_args+=("ANTFLY_INFERENCE_JSON_TOKEN_IDS=1")
+  fi
 
   if [[ -n "$assistant" ]]; then
     env_args+=("ANTFLY_GEMMA4_MTP_ALLOW_UNSHARED_TARGET=1")
     if [[ -n "$MTP_TARGET_REPLAY" ]]; then
       env_args+=("ANTFLY_GEMMA4_MTP_TARGET_REPLAY=$MTP_TARGET_REPLAY")
+    fi
+    if [[ "$MTP_REPLAY_CONTEXT_KEY" != "auto" ]]; then
+      env_args+=("ANTFLY_GEMMA4_MTP_REPLAY_CONTEXT_KEY=$MTP_REPLAY_CONTEXT_KEY")
+    fi
+    if [[ "$MTP_UNSAFE_TARGET_REPLAY" != "auto" ]]; then
+      env_args+=("ANTFLY_GEMMA4_MTP_UNSAFE_TARGET_REPLAY=$MTP_UNSAFE_TARGET_REPLAY")
+    fi
+    if [[ -n "$MTP_REPLAY_VERIFY_ROWS" ]]; then
+      env_args+=("ANTFLY_GEMMA4_MTP_REPLAY_VERIFY_ROWS=$MTP_REPLAY_VERIFY_ROWS")
+    fi
+    if [[ "$MTP_ASSISTANT_REPLAY" != "auto" ]]; then
+      env_args+=("ANTFLY_GEMMA4_MTP_ASSISTANT_REPLAY=$MTP_ASSISTANT_REPLAY")
+    fi
+    if [[ "$MTP_MATERIALIZE_REPLAY" != "auto" ]]; then
+      env_args+=("ANTFLY_GEMMA4_MTP_MATERIALIZE_REPLAY=$MTP_MATERIALIZE_REPLAY")
     fi
     if [[ "$MTP_DEDICATED_RUNTIME" != "auto" ]]; then
       env_args+=("ANTFLY_GEMMA4_MTP_DEDICATED_RUNTIME=$MTP_DEDICATED_RUNTIME")
@@ -159,11 +208,32 @@ run_case() {
     if [[ "$MTP_VERIFY_DEVICE_RESULT" != "auto" ]]; then
       env_args+=("ANTFLY_GEMMA4_MTP_VERIFY_DEVICE_RESULT=$MTP_VERIFY_DEVICE_RESULT")
     fi
+    if [[ "$MTP_MASKED_SELECT_HIDDEN_FUSION" != "auto" ]]; then
+      env_args+=("ANTFLY_GEMMA4_MTP_MASKED_SELECT_HIDDEN_FUSION=$MTP_MASKED_SELECT_HIDDEN_FUSION")
+    fi
+    if [[ -n "$MTP_POSITION_MODE" ]]; then
+      env_args+=("ANTFLY_GEMMA4_MTP_POSITION_MODE=$MTP_POSITION_MODE")
+    fi
+    if [[ -n "$MTP_TARGET_HIDDEN_SOURCE" ]]; then
+      env_args+=("ANTFLY_GEMMA4_MTP_TARGET_HIDDEN_SOURCE=$MTP_TARGET_HIDDEN_SOURCE")
+    fi
+    if [[ -n "$MTP_CONCAT_ORDER" ]]; then
+      env_args+=("ANTFLY_GEMMA4_MTP_CONCAT_ORDER=$MTP_CONCAT_ORDER")
+    fi
+    if [[ -n "$MTP_KV_DONOR_MODE" ]]; then
+      env_args+=("ANTFLY_GEMMA4_MTP_KV_DONOR_MODE=$MTP_KV_DONOR_MODE")
+    fi
     if [[ -n "$CUDA_TEMP_SLOT_PERIOD" ]]; then
       env_args+=("ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD=$CUDA_TEMP_SLOT_PERIOD")
     fi
     if [[ -n "$CUDA_TEMP_SLOT_SKIP" ]]; then
       env_args+=("ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP=$CUDA_TEMP_SLOT_SKIP")
+    fi
+    if [[ "$CUDA_CAPTURE_PERSISTENT_REPLAY" != "auto" ]]; then
+      env_args+=("ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY=$CUDA_CAPTURE_PERSISTENT_REPLAY")
+    fi
+    if [[ -n "$DRAFT_EMBED_CACHE" ]]; then
+      env_args+=("ANTFLY_GEMMA4_MTP_DRAFT_EMBED_CACHE=$DRAFT_EMBED_CACHE")
     fi
   fi
   if [[ "$ADAPTIVE_K" != "auto" ]]; then
@@ -189,6 +259,7 @@ run_case() {
   fi
   if [[ "$MODE" == "profile" || "$MODE" == "profile_sync" ]]; then
     env_args+=("ANTFLY_GEMMA4_MTP_PROFILE=1")
+    env_args+=("ANTFLY_INFERENCE_CUDA_LAZY_PROFILE=1")
   fi
   if [[ "$MODE" == "profile_sync" ]]; then
     env_args+=("ANTFLY_GEMMA4_MTP_PROFILE_SYNC=1")
@@ -205,11 +276,20 @@ run_case() {
   if [[ -n "$PREFILL_CHUNK_SIZE" ]]; then
     prefill_args+=("--prefill-chunk-size" "$PREFILL_CHUNK_SIZE")
   fi
+  if [[ -n "$CACHE_DTYPE" ]]; then
+    cache_args+=("--cache-dtype" "$CACHE_DTYPE")
+    case "$CACHE_DTYPE" in
+      polar4|turbo3)
+        env_args+=("ANTFLY_INFERENCE_CUDA_TURBOQUANT_MIN_TOKENS=${TURBOQUANT_MIN_TOKENS:-0}")
+        ;;
+    esac
+  fi
 
   echo "running label=$label k=$spec_k case=$case_name mode=$prompt_mode"
   if env "${env_args[@]}" timeout "$RUN_TIMEOUT" "$BIN" generate "$TARGET_MODEL" "$prompt" \
     --backend cuda \
     "${draft_args[@]}" \
+    "${cache_args[@]}" \
     --max-tokens "$MAX_TOKENS" \
     --temperature 0 \
     --combined-budget-mb "$COMBINED_BUDGET_MB" \
@@ -268,6 +348,7 @@ headers = [
     "case",
     "status",
     "tokens",
+    "finish_reason",
     "decode_tok_s",
     "policy",
     "calibration",
@@ -311,6 +392,14 @@ headers = [
     "bonus_materializations",
     "bonus_skips",
     "profile_draft_ms",
+    "profile_draft_embedding_ms",
+    "profile_draft_concat_ms",
+    "profile_draft_preprojection_ms",
+    "profile_draft_assistant_ms",
+    "profile_draft_postprojection_ms",
+    "profile_draft_argmax_ms",
+    "profile_draft_lm_head_ms",
+    "profile_draft_selection_ms",
     "profile_verify_ms",
     "profile_activation_copy_ms",
     "profile_materialization_ms",
@@ -321,6 +410,12 @@ headers = [
     "target_syncs_per_tok",
     "target_d2h",
     "target_d2d",
+    "target_graph_begins",
+    "target_graph_replays",
+    "target_graph_persistent_replays",
+    "target_graph_discards",
+    "target_graph_capacity_skips",
+    "target_graph_replay_us",
     "draft_launches",
     "draft_syncs",
     "draft_launches_per_tok",
@@ -328,10 +423,32 @@ headers = [
     "draft_h2d",
     "draft_d2h",
     "draft_d2d",
+    "draft_graph_begins",
+    "draft_graph_replays",
+    "draft_graph_persistent_replays",
+    "draft_graph_discards",
+    "draft_graph_capacity_skips",
+    "draft_graph_replay_us",
     "draft_cross_copies",
     "draft_cross_bytes",
     "draft_event_waits",
     "draft_sync_fallbacks",
+    "draft_mtp_preproject_fused_hits",
+    "draft_mtp_preproject_fused_f32_weight_hits",
+    "draft_mtp_preproject_fused_bf16_weight_hits",
+    "draft_mtp_preproject_fused_f16_weight_hits",
+    "draft_mtp_preproject_fused_fallbacks",
+    "draft_mtp_masked_select_fused_hits",
+    "draft_mtp_masked_select_fused_f32_weight_hits",
+    "draft_mtp_masked_select_fused_bf16_weight_hits",
+    "draft_mtp_masked_select_fused_f16_weight_hits",
+    "draft_mtp_masked_select_fused_fallbacks",
+    "draft_mtp_masked_select_hidden_fused_hits",
+    "draft_mtp_masked_select_hidden_fused_bf16_hits",
+    "draft_mtp_masked_select_hidden_multiblock_hits",
+    "draft_mtp_masked_select_hidden_fused_fallbacks",
+    "draft_mtp_masked_argmax_hits",
+    "draft_mtp_masked_argmax_fallbacks",
     "draft_kv_attempts",
     "draft_kv_successes",
     "draft_kv_reads",
@@ -339,6 +456,12 @@ headers = [
     "draft_kv_fail_read",
     "draft_kv_fail_shape",
     "draft_decode_profile_events",
+    "draft_embed_cache_hits",
+    "draft_embed_cache_misses",
+    "draft_embed_cache_inserts",
+    "draft_embed_cache_evictions",
+    "draft_embed_cache_disabled",
+    "draft_embedding_cross_copies",
 ]
 rows = []
 draft_re = re.compile(
@@ -435,6 +558,7 @@ for stem in sorted(stems):
         case_name,
         status,
         data.get("tokens", ""),
+        data.get("finish_reason", ""),
         f"{data.get('decode_tok_per_s', 0):.3f}",
         policy,
         calibration,
@@ -478,6 +602,14 @@ for stem in sorted(stems):
         field(profile, "bonus_materializations"),
         field(profile, "bonus_skips"),
         ms_from_ns(field(profile, "draft_token_ns", "")),
+        ms_from_ns(field(profile, "draft_target_embedding_ns", "")),
+        ms_from_ns(field(profile, "draft_concat_ns", "")),
+        ms_from_ns(field(profile, "draft_preprojection_ns", "")),
+        ms_from_ns(field(profile, "draft_assistant_ns", "")),
+        ms_from_ns(field(profile, "draft_postprojection_ns", "")),
+        ms_from_ns(field(profile, "draft_argmax_ns", "")),
+        ms_from_ns(field(profile, "draft_lm_head_ns", "")),
+        ms_from_ns(field(profile, "draft_selection_ns", "")),
         ms_from_ns(field(profile, "target_verify_ns", "")),
         ms_from_ns(field(profile, "activation_copy_ns", "")),
         ms_from_ns(field(profile, "materialization_ns", "")),
@@ -488,6 +620,12 @@ for stem in sorted(stems):
         field(cuda, "syncs_per_token"),
         field(cuda, "d2h_bytes"),
         field(cuda, "d2d_bytes"),
+        field(cuda, "graph_capture_begins"),
+        field(cuda, "graph_capture_replays"),
+        field(cuda, "graph_capture_persistent_replays"),
+        field(cuda, "graph_capture_discards"),
+        field(cuda, "graph_capture_capacity_skips"),
+        field(cuda, "decode_profile_graph_replay_us"),
         draft_field("kernel_launches"),
         draft_field("stream_syncs"),
         draft_field("launches_per_token"),
@@ -495,10 +633,32 @@ for stem in sorted(stems):
         draft_field("h2d_bytes"),
         draft_field("d2h_bytes"),
         draft_field("d2d_bytes"),
+        draft_field("graph_capture_begins"),
+        draft_field("graph_capture_replays"),
+        draft_field("graph_capture_persistent_replays"),
+        draft_field("graph_capture_discards"),
+        draft_field("graph_capture_capacity_skips"),
+        draft_field("decode_profile_graph_replay_us"),
         draft_field("cross_backend_copies"),
         draft_field("cross_backend_copy_bytes"),
         draft_field("cross_backend_event_waits"),
         draft_field("cross_backend_sync_fallbacks"),
+        draft_field("mtp_preproject_fused_hits"),
+        draft_field("mtp_preproject_fused_f32_weight_hits"),
+        draft_field("mtp_preproject_fused_bf16_weight_hits"),
+        draft_field("mtp_preproject_fused_f16_weight_hits"),
+        draft_field("mtp_preproject_fused_fallbacks"),
+        draft_field("mtp_masked_select_fused_hits"),
+        draft_field("mtp_masked_select_fused_f32_weight_hits"),
+        draft_field("mtp_masked_select_fused_bf16_weight_hits"),
+        draft_field("mtp_masked_select_fused_f16_weight_hits"),
+        draft_field("mtp_masked_select_fused_fallbacks"),
+        draft_field("mtp_masked_select_hidden_fused_hits"),
+        draft_field("mtp_masked_select_hidden_fused_bf16_hits"),
+        draft_field("mtp_masked_select_hidden_multiblock_hits"),
+        draft_field("mtp_masked_select_hidden_fused_fallbacks"),
+        draft_field("mtp_masked_argmax_hits"),
+        draft_field("mtp_masked_argmax_fallbacks"),
         draft_field("device_kv_attempts"),
         draft_field("device_kv_successes"),
         draft_field("device_kv_reads"),
@@ -506,6 +666,12 @@ for stem in sorted(stems):
         draft_field("device_kv_fail_read"),
         draft_field("device_kv_fail_shape"),
         draft_field("decode_profile_events"),
+        field(profile, "draft_embedding_cache_hits"),
+        field(profile, "draft_embedding_cache_misses"),
+        field(profile, "draft_embedding_cache_inserts"),
+        field(profile, "draft_embedding_cache_evictions"),
+        field(profile, "draft_embedding_cache_disabled"),
+        field(profile, "draft_target_embedding_cross_copies"),
     ])
 
 summary_path = out_dir / "summary.tsv"

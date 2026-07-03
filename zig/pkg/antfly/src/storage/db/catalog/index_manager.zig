@@ -3500,8 +3500,7 @@ pub const IndexManager = struct {
                 if (embedding_cfg.expected_dims > 0 and embedding_cfg.expected_dims != entry.dims) continue;
                 if (embedding_cfg.source_artifact_name.len > 0) {
                     const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
-                    if (chunk_cfg.source_artifact_name.len > 0) continue;
-                    if (!hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
+                    if (chunk_cfg.source_artifact_name.len == 0 and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
                         try requests.append(alloc, .{
                             .kind = .chunk_text,
                             .index_name = try alloc.dupe(u8, entry.config.name),
@@ -3591,8 +3590,7 @@ pub const IndexManager = struct {
                 if (embedding_cfg.expected_dims != 0) continue;
                 if (embedding_cfg.source_artifact_name.len > 0) {
                     const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
-                    if (chunk_cfg.source_artifact_name.len > 0) continue;
-                    if (!hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
+                    if (chunk_cfg.source_artifact_name.len == 0 and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
                         try requests.append(alloc, .{
                             .kind = .chunk_text,
                             .index_name = try alloc.dupe(u8, entry.config.name),
@@ -12539,6 +12537,12 @@ fn parseDenseGeneratorConfig(alloc: Allocator, raw: []const u8) !?GeneratorConfi
     if (source_field != .string) return error.InvalidIndexConfig;
     const artifact_value = generator.object.get("artifact_name");
     const chunk_name_value = generator.object.get("chunk_name");
+    const chunker_json = try parseGeneratorChunkerJson(alloc, generator.object);
+    errdefer if (chunker_json.len > 0) alloc.free(chunker_json);
+    const full_text_index = if (chunker_json.len > 0)
+        try chunking_types.parseHasFullTextIndexFromSlice(alloc, chunker_json)
+    else
+        false;
 
     return .{
         .source_field = try alloc.dupe(u8, source_field.string),
@@ -12564,7 +12568,8 @@ fn parseDenseGeneratorConfig(alloc: Allocator, raw: []const u8) !?GeneratorConfi
             std.math.cast(u32, value.integer) orelse return error.InvalidIndexConfig
         else
             0,
-        .chunker_json = try parseGeneratorChunkerJson(alloc, generator.object),
+        .chunker_json = chunker_json,
+        .full_text_index = full_text_index,
     };
 }
 
@@ -12588,6 +12593,12 @@ fn parseSparseGeneratorConfig(alloc: Allocator, raw: []const u8) !?GeneratorConf
     if (source_field != .string) return error.InvalidIndexConfig;
     const artifact_value = generator.object.get("artifact_name");
     const chunk_name_value = generator.object.get("chunk_name");
+    const chunker_json = try parseGeneratorChunkerJson(alloc, generator.object);
+    errdefer if (chunker_json.len > 0) alloc.free(chunker_json);
+    const full_text_index = if (chunker_json.len > 0)
+        try chunking_types.parseHasFullTextIndexFromSlice(alloc, chunker_json)
+    else
+        false;
 
     return .{
         .source_field = try alloc.dupe(u8, source_field.string),
@@ -12613,7 +12624,8 @@ fn parseSparseGeneratorConfig(alloc: Allocator, raw: []const u8) !?GeneratorConf
             std.math.cast(u32, value.integer) orelse return error.InvalidIndexConfig
         else
             0,
-        .chunker_json = try parseGeneratorChunkerJson(alloc, generator.object),
+        .chunker_json = chunker_json,
+        .full_text_index = full_text_index,
     };
 }
 
@@ -12732,6 +12744,7 @@ fn resolveChunkGenerator(self: *const IndexManager, generator: GeneratorConfig) 
             .chunk_size = cfg.chunk_size,
             .chunk_overlap = cfg.chunk_overlap,
             .chunker_json = if (cfg.chunker_json.len > 0) @constCast(cfg.chunker_json) else &.{},
+            .full_text_index = cfg.full_text_index,
         };
     }
     return generator;
@@ -14917,6 +14930,17 @@ test "parseDenseGeneratorConfig without source_template" {
 
     try std.testing.expectEqualStrings("body", generator.source_field);
     try std.testing.expectEqual(@as(usize, 0), generator.source_template.len);
+}
+
+test "parseDenseGeneratorConfig promotes chunker full text flag" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"field":"embedding","dims":384,"generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"body_chunks","chunker":{"provider":"antfly","store_chunks":false,"full_text_index":{},"text":{"target_tokens":128}}}}
+    ;
+    const generator = try parseDenseGeneratorConfig(alloc, json) orelse return error.TestUnexpectedResult;
+    defer generator.deinit(alloc);
+
+    try std.testing.expect(generator.full_text_index);
 }
 
 test "parseSparseGeneratorConfig parses source_template" {

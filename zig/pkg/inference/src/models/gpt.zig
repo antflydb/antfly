@@ -311,6 +311,17 @@ pub const Config = struct {
         return ((layer_index + 1) % self.sliding_window_pattern) != 0;
     }
 
+    /// True when at least one layer attends globally (no sliding window).
+    /// Such layers need the full KV history: trimming the shared KV pool to
+    /// the sliding window silently truncates their context.
+    pub fn hasGlobalAttentionLayers(self: Config) bool {
+        const layer_count: usize = @intCast(self.num_hidden_layers);
+        for (0..layer_count) |layer| {
+            if (!self.layerUsesSlidingAttention(layer)) return true;
+        }
+        return false;
+    }
+
     pub fn layerRopeTheta(self: Config, layer_index: usize) f32 {
         if (self.family == .deepseek_v4 and
             self.deepseekV4AttentionKind(layer_index) != .sliding_attention and

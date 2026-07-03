@@ -31,9 +31,62 @@ fn captureParamTraceIndex(ctx: *context_mod.CudaContext) ?usize {
     return index;
 }
 
+fn fastGqaDecodeDisabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_CUDA_DISABLE_FAST_GQA_DECODE", false);
+}
+
+fn fastGqaPrefillEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_FAST", false);
+}
+
+fn tiledGqaPrefillEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_TILED", false);
+}
+
+fn mmaGqaPrefillEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_MMA", false);
+}
+
+fn mmaM32GqaPrefillEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_MMA_M32", true);
+}
+
+fn fastGqaDecodeEligible(batch: usize, q_seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, mask_len: usize, bias_mode: u32) bool {
+    return batch == 1 and
+        q_seq_len == 1 and
+        mask_len == 0 and
+        bias_mode == 0 and
+        num_kv_heads != 0 and
+        num_heads % num_kv_heads == 0 and
+        head_dim <= 512 and
+        head_dim % 32 == 0;
+}
+
+fn gqaPrefillShapeEligible(batch: usize, q_seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, mask_len: usize, bias_mode: u32) bool {
+    return batch == 1 and
+        q_seq_len > 1 and
+        mask_len == 0 and
+        bias_mode == 0 and
+        num_kv_heads != 0 and
+        num_heads % num_kv_heads == 0 and
+        head_dim <= 512 and
+        head_dim % 32 == 0;
+}
+
+fn fastGqaPrefillEligible(batch: usize, q_seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, mask_len: usize, bias_mode: u32) bool {
+    return fastGqaPrefillEnabled() and
+        gqaPrefillShapeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode);
+}
+
 pub const GqaAttentionLaunchKind = enum {
     none,
     decode,
+    decode_fast,
+    decode_fast_fallback,
+    prefill_fast,
+    prefill_tiled,
+    prefill_mma,
+    prefill_mma_m32,
     scalar,
 };
 
@@ -45,17 +98,34 @@ pub const QMatmulVariant = enum {
     tc_hmma,
 };
 
+pub const Q4_0Q8_1PrefillRowsVariant = enum {
+    none,
+    single,
+    generic_rows,
+    tile8_rows,
+    tile8_w8_rows,
+    rows2,
+    rows4,
+    rows8_c2,
+    rows8_c4,
+    rows16_c1,
+    e4b_down_rows,
+};
+
 pub const KernelModule = struct {
     module: driver_mod.CUmodule = null,
     fill_f32: driver_mod.CUfunction = null,
     copy_f32: driver_mod.CUfunction = null,
     copy_u8: driver_mod.CUfunction = null,
     f32_to_bf16: driver_mod.CUfunction = null,
+    dequant_q4_0_bf16: driver_mod.CUfunction = null,
     scale_f32: driver_mod.CUfunction = null,
     add_scalar_f32: driver_mod.CUfunction = null,
     binary_scalar_f32: driver_mod.CUfunction = null,
     add_mul_scalar_f32: driver_mod.CUfunction = null,
+    add_weighted_scalars_f32: driver_mod.CUfunction = null,
     linear_f32: driver_mod.CUfunction = null,
+    linear_f32_tiled: driver_mod.CUfunction = null,
     linear_bf16_weight_f32_tiled: driver_mod.CUfunction = null,
     argmax_last_row_f32: driver_mod.CUfunction = null,
     argmax_rows_f32: driver_mod.CUfunction = null,
@@ -66,8 +136,23 @@ pub const KernelModule = struct {
     argmax_reduce_pairs_f32: driver_mod.CUfunction = null,
     linear_q8_0_argmax_rows_stage1_tile4: driver_mod.CUfunction = null,
     linear_q4_0_argmax_rows_stage1_tile4: driver_mod.CUfunction = null,
+    linear_q4_0_argmax_rows_stage1_tile16: driver_mod.CUfunction = null,
     linear_q4_k_argmax_rows_stage1_tile4: driver_mod.CUfunction = null,
+    linear_q6_k_argmax_rows_stage1_tile4: driver_mod.CUfunction = null,
+    linear_q6_k_argmax_rows_stage1_tile8: driver_mod.CUfunction = null,
+    linear_q6_k_argmax_rows_stage1_tile16: driver_mod.CUfunction = null,
+    linear_q6_k_q8_1_argmax_rows_stage1_tile8: driver_mod.CUfunction = null,
+    linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b: driver_mod.CUfunction = null,
+    linear_q6_k_q8_1_f32_tile8_e4b: driver_mod.CUfunction = null,
     argmax_reduce_rows_pairs_f32: driver_mod.CUfunction = null,
+    argmax_reduce_rows_pairs_f32_w16: driver_mod.CUfunction = null,
+    gemma4_mtp_preproject_f32: driver_mod.CUfunction = null,
+    gemma4_mtp_masked_select_f32: driver_mod.CUfunction = null,
+    gemma4_mtp_masked_select_hidden_f32: driver_mod.CUfunction = null,
+    gemma4_mtp_centroid_scores_hidden_f32: driver_mod.CUfunction = null,
+    gemma4_mtp_centroid_topk_u32: driver_mod.CUfunction = null,
+    gemma4_mtp_restricted_lm_head_scores_f32: driver_mod.CUfunction = null,
+    gemma4_mtp_reduce_token_scores_f32: driver_mod.CUfunction = null,
     gemma4_mtp_masked_argmax_f32: driver_mod.CUfunction = null,
     gemma4_mtp_verify_commit_u32: driver_mod.CUfunction = null,
     linear_bias_f32: driver_mod.CUfunction = null,
@@ -79,6 +164,8 @@ pub const KernelModule = struct {
     linear_pair_bias_f32_tile4_r2: driver_mod.CUfunction = null,
     linear_triple_bias_f32_tile4_r2: driver_mod.CUfunction = null,
     rms_norm_f32: driver_mod.CUfunction = null,
+    rms_norm_f32_bf16: driver_mod.CUfunction = null,
+    rms_norm_add_f32_bf16: driver_mod.CUfunction = null,
     rms_norm_add_f32: driver_mod.CUfunction = null,
     rms_norm_add_mul_scalar_f32: driver_mod.CUfunction = null,
     rms_norm_add_output_scale_f32: driver_mod.CUfunction = null,
@@ -112,6 +199,7 @@ pub const KernelModule = struct {
     florence_vision_tail_sources_f32: driver_mod.CUfunction = null,
     rope_f32: driver_mod.CUfunction = null,
     rope_decode_scalars_f32: driver_mod.CUfunction = null,
+    decode_scalars_advance: driver_mod.CUfunction = null,
     rope_scaled_f32: driver_mod.CUfunction = null,
     rope_scaled_decode_scalars_f32: driver_mod.CUfunction = null,
     rope_per_item_f32: driver_mod.CUfunction = null,
@@ -119,8 +207,23 @@ pub const KernelModule = struct {
     rms_norm_heads_rope_decode_scalars_f32: driver_mod.CUfunction = null,
     gqa_attention_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_scalars_fast_f32: driver_mod.CUfunction = null,
+    gqa_attention_prefill_fast_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_scalars_f32: driver_mod.CUfunction = null,
     kv_write_suffix_decode_scalars_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_turboquant_fast_f32: driver_mod.CUfunction = null,
+    gqa_attention_prefill_turboquant_fast_f32: driver_mod.CUfunction = null,
+    gqa_attention_prefill_turboquant_tiled_f32: driver_mod.CUfunction = null,
+    gqa_attention_prefill_turboquant_mma_f32: driver_mod.CUfunction = null,
+    gqa_attention_prefill_turboquant_mma_m32_f32: driver_mod.CUfunction = null,
+    /// The mma prefill kernels need 64-95KB dynamic smem, above the 48KB
+    /// default; CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES is raised
+    /// once per module load (per function).
+    gqa_prefill_mma_smem_opted_in: bool = false,
+    gqa_prefill_mma_m32_smem_opted_in: bool = false,
+    gqa_attention_decode_turboquant_split_stage1_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_turboquant_split_stage2_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_turboquant_f32: driver_mod.CUfunction = null,
     kv_write_suffix_turboquant_f32: driver_mod.CUfunction = null,
     deberta_attention_f32: driver_mod.CUfunction = null,
@@ -145,7 +248,30 @@ pub const KernelModule = struct {
     linear_q8_0_bias_add_f32_tc_hmma: driver_mod.CUfunction = null,
     linear_q8_0_f32_tile4: driver_mod.CUfunction = null,
     linear_q8_0_gated_down_f32_tile4: driver_mod.CUfunction = null,
+    quantize_f32_q8_1_rows: driver_mod.CUfunction = null,
+    quantize_gated_f32_q8_1_rows: driver_mod.CUfunction = null,
     linear_q4_0_f32: driver_mod.CUfunction = null,
+    linear_q4_0_f32_tile4: driver_mod.CUfunction = null,
+    linear_q4_0_f32_tile4_w4: driver_mod.CUfunction = null,
+    linear_q4_0_q8_1_f32_tile4: driver_mod.CUfunction = null,
+    linear_q4_0_q8_1_f32_tile4_e4b_attn_2048: driver_mod.CUfunction = null,
+    linear_q4_0_q8_1_f32_tile4_e4b_attn_4096: driver_mod.CUfunction = null,
+    linear_q4_0_q8_1_f32_tile4_w8: driver_mod.CUfunction = null,
+    linear_q4_0_q8_1_f32_tile4_w8_rows2: driver_mod.CUfunction = null,
+    linear_q4_0_q8_1_f32_tile4_w8_rows4: driver_mod.CUfunction = null,
+    linear_q4_0_q8_1_f32_tile4_w8_rows8_c4: driver_mod.CUfunction = null,
+    linear_q4_0_q8_1_f32_tile4_w8_e4b_down: driver_mod.CUfunction = null,
+    linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows: driver_mod.CUfunction = null,
+    linear_q4_0_q8_1_f32_tile4_w10_e4b_down: driver_mod.CUfunction = null,
+    linear_q4_0_q8_1_f32_tile8: driver_mod.CUfunction = null,
+    linear_q4_0_f32_tile8: driver_mod.CUfunction = null,
+    linear_q4_0_activation_slice_last_dim_f32_tile4: driver_mod.CUfunction = null,
+    linear_q4_0_activation_slice_last_dim_f32_tile4_w4: driver_mod.CUfunction = null,
+    linear_q4_0_activation_slice_last_dim_q8_1_f32_tile4: driver_mod.CUfunction = null,
+    linear_q4_0_gated_down_f32_tile4: driver_mod.CUfunction = null,
+    linear_q4_0_gated_down_f32_tile4_w4: driver_mod.CUfunction = null,
+    linear_q4_0_gated_down_f32_tile8: driver_mod.CUfunction = null,
+    linear_q4_0_gated_down_f32_tile16: driver_mod.CUfunction = null,
     linear_q4_k_f32: driver_mod.CUfunction = null,
     linear_q4_k_bias_f32: driver_mod.CUfunction = null,
     linear_q4_k_f32_tiled: driver_mod.CUfunction = null,
@@ -190,10 +316,34 @@ pub const KernelModule = struct {
     linear_q4_k_triple_bias_f32_tiled: driver_mod.CUfunction = null,
     linear_q4_k_pair_bias_f32_tiled: driver_mod.CUfunction = null,
     linear_q8_0_pair_nobias_f32_tile4: driver_mod.CUfunction = null,
+    linear_q4_0_pair_nobias_f32_tile4: driver_mod.CUfunction = null,
+    linear_q4_0_pair_nobias_f32_tile4_w4: driver_mod.CUfunction = null,
+    linear_q4_0_pair_nobias_q8_1_f32_tile4: driver_mod.CUfunction = null,
+    linear_q4_0_pair_nobias_q8_1_f32_tile4_w8: driver_mod.CUfunction = null,
+    linear_q4_0_pair_nobias_q8_1_f32_tile8: driver_mod.CUfunction = null,
+    linear_q4_0_pair_activation_f32_tile4_w4: driver_mod.CUfunction = null,
+    linear_q4_0_pair_activation_q8_1_f32_tile4: driver_mod.CUfunction = null,
+    linear_q4_0_pair_activation_q8_1_f32_tile4_w8: driver_mod.CUfunction = null,
+    linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn: driver_mod.CUfunction = null,
+    linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn: driver_mod.CUfunction = null,
+    linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn: driver_mod.CUfunction = null,
+    linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2: driver_mod.CUfunction = null,
+    linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4: driver_mod.CUfunction = null,
+    linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows8_c2: driver_mod.CUfunction = null,
+    linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows16_c1: driver_mod.CUfunction = null,
+    linear_q4_0_pair_activation_q8_1_f32_tile8: driver_mod.CUfunction = null,
+    linear_q4_0_pair_nobias_f32_tile8: driver_mod.CUfunction = null,
     linear_q4_k_pair_nobias_f32_tile4: driver_mod.CUfunction = null,
     linear_f32_qkv_nobias_tiled: driver_mod.CUfunction = null,
     linear_bf16_weight_f32_qkv_nobias_tiled: driver_mod.CUfunction = null,
     linear_q8_0_qkv_nobias_f32_tile4: driver_mod.CUfunction = null,
+    linear_q4_0_qkv_nobias_f32_tile4: driver_mod.CUfunction = null,
+    linear_q4_0_qkv_nobias_f32_tile4_w4: driver_mod.CUfunction = null,
+    linear_q4_0_qkv_nobias_q8_1_f32_tile4: driver_mod.CUfunction = null,
+    linear_q4_0_qkv_nobias_q8_1_f32_tile8: driver_mod.CUfunction = null,
+    linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4: driver_mod.CUfunction = null,
+    linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8: driver_mod.CUfunction = null,
+    linear_q4_0_qkv_nobias_f32_tile8: driver_mod.CUfunction = null,
     linear_q4_k_qkv_nobias_f32_tiled: driver_mod.CUfunction = null,
     linear_q4_k_q4_k_f32_qkv_nobias_tiled: driver_mod.CUfunction = null,
     embedding_lookup_q8_0_f32: driver_mod.CUfunction = null,
@@ -204,6 +354,8 @@ pub const KernelModule = struct {
     embedding_lookup_i32_q4_k_f32: driver_mod.CUfunction = null,
     embedding_lookup_q6_k_f32: driver_mod.CUfunction = null,
     embedding_lookup_i32_q6_k_f32: driver_mod.CUfunction = null,
+    embedding_add_weighted_i32_q6_k_f32: driver_mod.CUfunction = null,
+    rms_norm_add_weighted_embedding_i32_q6_k_f32: driver_mod.CUfunction = null,
     slice_last_dim_f32: driver_mod.CUfunction = null,
 
     pub fn load(ctx: *context_mod.CudaContext) driver_mod.Error!KernelModule {
@@ -217,6 +369,7 @@ pub const KernelModule = struct {
         const copy_f32 = loadOptionalFunction(ctx, module, "termite_copy_f32");
         const copy_u8 = loadOptionalFunction(ctx, module, "termite_copy_u8");
         const f32_to_bf16 = loadOptionalFunction(ctx, module, "termite_f32_to_bf16");
+        const dequant_q4_0_bf16 = loadOptionalFunction(ctx, module, "termite_dequant_q4_0_bf16");
         var scale_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&scale_f32, module, "termite_scale_f32"));
         var add_scalar_f32: driver_mod.CUfunction = null;
@@ -225,8 +378,11 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&binary_scalar_f32, module, "termite_binary_scalar_f32"));
         var add_mul_scalar_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&add_mul_scalar_f32, module, "termite_add_mul_scalar_f32"));
+        var add_weighted_scalars_f32: driver_mod.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&add_weighted_scalars_f32, module, "termite_add_weighted_scalars_f32"));
         var linear_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_f32, module, "termite_linear_f32"));
+        const linear_f32_tiled = loadOptionalFunction(ctx, module, "termite_linear_f32_tiled");
         const linear_bf16_weight_f32_tiled = loadOptionalFunction(ctx, module, "termite_linear_bf16_weight_f32_tiled");
         var argmax_last_row_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&argmax_last_row_f32, module, "termite_argmax_last_row_f32"));
@@ -238,8 +394,23 @@ pub const KernelModule = struct {
         const argmax_reduce_pairs_f32 = loadOptionalFunction(ctx, module, "termite_argmax_reduce_pairs_f32");
         const linear_q8_0_argmax_rows_stage1_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q8_0_argmax_rows_stage1_tile4");
         const linear_q4_0_argmax_rows_stage1_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_argmax_rows_stage1_tile4");
+        const linear_q4_0_argmax_rows_stage1_tile16 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_argmax_rows_stage1_tile16");
         const linear_q4_k_argmax_rows_stage1_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_argmax_rows_stage1_tile4");
+        const linear_q6_k_argmax_rows_stage1_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q6_k_argmax_rows_stage1_tile4");
+        const linear_q6_k_argmax_rows_stage1_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q6_k_argmax_rows_stage1_tile8");
+        const linear_q6_k_argmax_rows_stage1_tile16 = loadOptionalFunction(ctx, module, "termite_linear_q6_k_argmax_rows_stage1_tile16");
+        const linear_q6_k_q8_1_argmax_rows_stage1_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8");
+        const linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b = loadOptionalFunction(ctx, module, "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b");
+        const linear_q6_k_q8_1_f32_tile8_e4b = loadOptionalFunction(ctx, module, "termite_linear_q6_k_q8_1_f32_tile8_e4b");
         const argmax_reduce_rows_pairs_f32 = loadOptionalFunction(ctx, module, "termite_argmax_reduce_rows_pairs_f32");
+        const argmax_reduce_rows_pairs_f32_w16 = loadOptionalFunction(ctx, module, "termite_argmax_reduce_rows_pairs_f32_w16");
+        const gemma4_mtp_preproject_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_mtp_preproject_f32");
+        const gemma4_mtp_masked_select_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_mtp_masked_select_f32");
+        const gemma4_mtp_masked_select_hidden_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_mtp_masked_select_hidden_f32");
+        const gemma4_mtp_centroid_scores_hidden_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_mtp_centroid_scores_hidden_f32");
+        const gemma4_mtp_centroid_topk_u32 = loadOptionalFunction(ctx, module, "termite_gemma4_mtp_centroid_topk_u32");
+        const gemma4_mtp_restricted_lm_head_scores_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_mtp_restricted_lm_head_scores_f32");
+        const gemma4_mtp_reduce_token_scores_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_mtp_reduce_token_scores_f32");
         const gemma4_mtp_masked_argmax_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_mtp_masked_argmax_f32");
         const gemma4_mtp_verify_commit_u32 = loadOptionalFunction(ctx, module, "termite_gemma4_mtp_verify_commit_u32");
         var linear_bias_f32: driver_mod.CUfunction = null;
@@ -260,6 +431,8 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_triple_bias_f32_tile4_r2, module, "termite_linear_triple_bias_f32_tile4_r2"));
         var rms_norm_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&rms_norm_f32, module, "termite_rms_norm_f32"));
+        const rms_norm_f32_bf16 = loadOptionalFunction(ctx, module, "termite_rms_norm_f32_bf16");
+        const rms_norm_add_f32_bf16 = loadOptionalFunction(ctx, module, "termite_rms_norm_add_f32_bf16");
         var rms_norm_add_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&rms_norm_add_f32, module, "termite_rms_norm_add_f32"));
         var rms_norm_add_mul_scalar_f32: driver_mod.CUfunction = null;
@@ -311,6 +484,7 @@ pub const KernelModule = struct {
         const florence_vision_tail_sources_f32 = loadOptionalFunction(ctx, module, "termite_florence_vision_tail_sources_f32");
         const rope_f32 = loadOptionalFunction(ctx, module, "termite_rope_f32");
         const rope_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_rope_decode_scalars_f32");
+        const decode_scalars_advance = loadOptionalFunction(ctx, module, "termite_decode_scalars_advance");
         const rope_scaled_f32 = loadOptionalFunction(ctx, module, "termite_rope_scaled_f32");
         const rope_scaled_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_rope_scaled_decode_scalars_f32");
         const rope_per_item_f32 = loadOptionalFunction(ctx, module, "termite_rope_per_item_f32");
@@ -318,8 +492,18 @@ pub const KernelModule = struct {
         const rms_norm_heads_rope_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_rms_norm_heads_rope_decode_scalars_f32");
         const gqa_attention_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_f32");
         const gqa_attention_decode_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_f32");
+        const gqa_attention_decode_scalars_fast_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_scalars_fast_f32");
+        const gqa_attention_prefill_fast_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_fast_f32");
         const gqa_attention_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_scalars_f32");
         const kv_write_suffix_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_kv_write_suffix_decode_scalars_f32");
+        const gqa_attention_decode_turboquant_fast_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_fast_f32");
+        const gqa_attention_prefill_turboquant_fast_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_turboquant_fast_f32");
+        const gqa_attention_prefill_turboquant_tiled_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_turboquant_tiled_f32");
+        const gqa_attention_prefill_turboquant_mma_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_turboquant_mma_f32");
+        const gqa_attention_prefill_turboquant_mma_m32_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_turboquant_mma_m32_f32");
+        const gqa_attention_decode_turboquant_split_stage1_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_split_stage1_f32");
+        const gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32");
+        const gqa_attention_decode_turboquant_split_stage2_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_split_stage2_f32");
         const gqa_attention_decode_turboquant_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_f32");
         const kv_write_suffix_turboquant_f32 = loadOptionalFunction(ctx, module, "termite_kv_write_suffix_turboquant_f32");
         var deberta_attention_f32: driver_mod.CUfunction = null;
@@ -352,6 +536,8 @@ pub const KernelModule = struct {
         const linear_q8_0_bias_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q8_0_bias_f32_tc_hmma");
         const linear_q8_0_bias_gelu_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q8_0_bias_gelu_f32_tc_hmma");
         const linear_q8_0_bias_add_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q8_0_bias_add_f32_tc_hmma");
+        const quantize_f32_q8_1_rows = loadOptionalFunction(ctx, module, "termite_quantize_f32_q8_1_rows");
+        const quantize_gated_f32_q8_1_rows = loadOptionalFunction(ctx, module, "termite_quantize_gated_f32_q8_1_rows");
         var linear_q4_0_f32: driver_mod.CUfunction = null;
         const q4_result = ctx.driver.fns.cuModuleGetFunction(&linear_q4_0_f32, module, "termite_linear_q4_0_f32");
         if (q4_result != driver_mod.CUDA_SUCCESS) {
@@ -359,6 +545,27 @@ pub const KernelModule = struct {
         } else {
             try ctx.driver.check(q4_result);
         }
+        const linear_q4_0_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_f32_tile4");
+        const linear_q4_0_f32_tile4_w4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_f32_tile4_w4");
+        const linear_q4_0_q8_1_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4");
+        const linear_q4_0_q8_1_f32_tile4_e4b_attn_2048 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_e4b_attn_2048");
+        const linear_q4_0_q8_1_f32_tile4_e4b_attn_4096 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_e4b_attn_4096");
+        const linear_q4_0_q8_1_f32_tile4_w8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_w8");
+        const linear_q4_0_q8_1_f32_tile4_w8_rows2 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_w8_rows2");
+        const linear_q4_0_q8_1_f32_tile4_w8_rows4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_w8_rows4");
+        const linear_q4_0_q8_1_f32_tile4_w8_rows8_c4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_w8_rows8_c4");
+        const linear_q4_0_q8_1_f32_tile4_w8_e4b_down = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down");
+        const linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows");
+        const linear_q4_0_q8_1_f32_tile4_w10_e4b_down = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_w10_e4b_down");
+        const linear_q4_0_q8_1_f32_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile8");
+        const linear_q4_0_f32_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_f32_tile8");
+        const linear_q4_0_activation_slice_last_dim_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_activation_slice_last_dim_f32_tile4");
+        const linear_q4_0_activation_slice_last_dim_f32_tile4_w4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_activation_slice_last_dim_f32_tile4_w4");
+        const linear_q4_0_activation_slice_last_dim_q8_1_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_activation_slice_last_dim_q8_1_f32_tile4");
+        const linear_q4_0_gated_down_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_gated_down_f32_tile4");
+        const linear_q4_0_gated_down_f32_tile4_w4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_gated_down_f32_tile4_w4");
+        const linear_q4_0_gated_down_f32_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_gated_down_f32_tile8");
+        const linear_q4_0_gated_down_f32_tile16 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_gated_down_f32_tile16");
         var linear_q4_k_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_f32, module, "termite_linear_q4_k_f32"));
         var linear_q4_k_bias_f32: driver_mod.CUfunction = null;
@@ -419,10 +626,34 @@ pub const KernelModule = struct {
         var linear_q4_k_pair_bias_f32_tiled: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_pair_bias_f32_tiled, module, "termite_linear_q4_k_pair_bias_f32_tiled"));
         const linear_q8_0_pair_nobias_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q8_0_pair_nobias_f32_tile4");
+        const linear_q4_0_pair_nobias_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_nobias_f32_tile4");
+        const linear_q4_0_pair_nobias_f32_tile4_w4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_nobias_f32_tile4_w4");
+        const linear_q4_0_pair_nobias_q8_1_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_nobias_q8_1_f32_tile4");
+        const linear_q4_0_pair_nobias_q8_1_f32_tile4_w8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_nobias_q8_1_f32_tile4_w8");
+        const linear_q4_0_pair_nobias_q8_1_f32_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_nobias_q8_1_f32_tile8");
+        const linear_q4_0_pair_activation_f32_tile4_w4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_f32_tile4_w4");
+        const linear_q4_0_pair_activation_q8_1_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_f32_tile4");
+        const linear_q4_0_pair_activation_q8_1_f32_tile4_w8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w8");
+        const linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn");
+        const linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn");
+        const linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn");
+        const linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2");
+        const linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4");
+        const linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows8_c2 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows8_c2");
+        const linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows16_c1 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows16_c1");
+        const linear_q4_0_pair_activation_q8_1_f32_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_f32_tile8");
+        const linear_q4_0_pair_nobias_f32_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_nobias_f32_tile8");
         const linear_q4_k_pair_nobias_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_pair_nobias_f32_tile4");
         const linear_f32_qkv_nobias_tiled = loadOptionalFunction(ctx, module, "termite_linear_f32_qkv_nobias_tiled");
         const linear_bf16_weight_f32_qkv_nobias_tiled = loadOptionalFunction(ctx, module, "termite_linear_bf16_weight_f32_qkv_nobias_tiled");
         const linear_q8_0_qkv_nobias_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q8_0_qkv_nobias_f32_tile4");
+        const linear_q4_0_qkv_nobias_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_qkv_nobias_f32_tile4");
+        const linear_q4_0_qkv_nobias_f32_tile4_w4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_qkv_nobias_f32_tile4_w4");
+        const linear_q4_0_qkv_nobias_q8_1_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_qkv_nobias_q8_1_f32_tile4");
+        const linear_q4_0_qkv_nobias_q8_1_f32_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8");
+        const linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4");
+        const linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8");
+        const linear_q4_0_qkv_nobias_f32_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_qkv_nobias_f32_tile8");
         const linear_q4_k_qkv_nobias_f32_tiled = loadOptionalFunction(ctx, module, "termite_linear_q4_k_qkv_nobias_f32_tiled");
         const linear_q4_k_q4_k_f32_qkv_nobias_tiled = loadOptionalFunction(ctx, module, "termite_linear_q4_k_q4_k_f32_qkv_nobias_tiled");
         var embedding_lookup_q8_0_f32: driver_mod.CUfunction = null;
@@ -441,6 +672,9 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_q6_k_f32, module, "termite_embedding_lookup_q6_k_f32"));
         var embedding_lookup_i32_q6_k_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_i32_q6_k_f32, module, "termite_embedding_lookup_i32_q6_k_f32"));
+        var embedding_add_weighted_i32_q6_k_f32: driver_mod.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_add_weighted_i32_q6_k_f32, module, "termite_embedding_add_weighted_i32_q6_k_f32"));
+        const rms_norm_add_weighted_embedding_i32_q6_k_f32 = loadOptionalFunction(ctx, module, "termite_rms_norm_add_weighted_embedding_i32_q6_k_f32");
         var slice_last_dim_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&slice_last_dim_f32, module, "termite_slice_last_dim_f32"));
 
@@ -450,11 +684,14 @@ pub const KernelModule = struct {
             .copy_f32 = copy_f32,
             .copy_u8 = copy_u8,
             .f32_to_bf16 = f32_to_bf16,
+            .dequant_q4_0_bf16 = dequant_q4_0_bf16,
             .scale_f32 = scale_f32,
             .add_scalar_f32 = add_scalar_f32,
             .binary_scalar_f32 = binary_scalar_f32,
             .add_mul_scalar_f32 = add_mul_scalar_f32,
+            .add_weighted_scalars_f32 = add_weighted_scalars_f32,
             .linear_f32 = linear_f32,
+            .linear_f32_tiled = linear_f32_tiled,
             .linear_bf16_weight_f32_tiled = linear_bf16_weight_f32_tiled,
             .argmax_last_row_f32 = argmax_last_row_f32,
             .argmax_rows_f32 = argmax_rows_f32,
@@ -465,8 +702,23 @@ pub const KernelModule = struct {
             .argmax_reduce_pairs_f32 = argmax_reduce_pairs_f32,
             .linear_q8_0_argmax_rows_stage1_tile4 = linear_q8_0_argmax_rows_stage1_tile4,
             .linear_q4_0_argmax_rows_stage1_tile4 = linear_q4_0_argmax_rows_stage1_tile4,
+            .linear_q4_0_argmax_rows_stage1_tile16 = linear_q4_0_argmax_rows_stage1_tile16,
             .linear_q4_k_argmax_rows_stage1_tile4 = linear_q4_k_argmax_rows_stage1_tile4,
+            .linear_q6_k_argmax_rows_stage1_tile4 = linear_q6_k_argmax_rows_stage1_tile4,
+            .linear_q6_k_argmax_rows_stage1_tile8 = linear_q6_k_argmax_rows_stage1_tile8,
+            .linear_q6_k_argmax_rows_stage1_tile16 = linear_q6_k_argmax_rows_stage1_tile16,
+            .linear_q6_k_q8_1_argmax_rows_stage1_tile8 = linear_q6_k_q8_1_argmax_rows_stage1_tile8,
+            .linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b = linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b,
+            .linear_q6_k_q8_1_f32_tile8_e4b = linear_q6_k_q8_1_f32_tile8_e4b,
             .argmax_reduce_rows_pairs_f32 = argmax_reduce_rows_pairs_f32,
+            .argmax_reduce_rows_pairs_f32_w16 = argmax_reduce_rows_pairs_f32_w16,
+            .gemma4_mtp_preproject_f32 = gemma4_mtp_preproject_f32,
+            .gemma4_mtp_masked_select_f32 = gemma4_mtp_masked_select_f32,
+            .gemma4_mtp_masked_select_hidden_f32 = gemma4_mtp_masked_select_hidden_f32,
+            .gemma4_mtp_centroid_scores_hidden_f32 = gemma4_mtp_centroid_scores_hidden_f32,
+            .gemma4_mtp_centroid_topk_u32 = gemma4_mtp_centroid_topk_u32,
+            .gemma4_mtp_restricted_lm_head_scores_f32 = gemma4_mtp_restricted_lm_head_scores_f32,
+            .gemma4_mtp_reduce_token_scores_f32 = gemma4_mtp_reduce_token_scores_f32,
             .gemma4_mtp_masked_argmax_f32 = gemma4_mtp_masked_argmax_f32,
             .gemma4_mtp_verify_commit_u32 = gemma4_mtp_verify_commit_u32,
             .linear_bias_f32 = linear_bias_f32,
@@ -478,6 +730,8 @@ pub const KernelModule = struct {
             .linear_pair_bias_f32_tile4_r2 = linear_pair_bias_f32_tile4_r2,
             .linear_triple_bias_f32_tile4_r2 = linear_triple_bias_f32_tile4_r2,
             .rms_norm_f32 = rms_norm_f32,
+            .rms_norm_f32_bf16 = rms_norm_f32_bf16,
+            .rms_norm_add_f32_bf16 = rms_norm_add_f32_bf16,
             .rms_norm_add_f32 = rms_norm_add_f32,
             .rms_norm_add_mul_scalar_f32 = rms_norm_add_mul_scalar_f32,
             .rms_norm_add_output_scale_f32 = rms_norm_add_output_scale_f32,
@@ -511,6 +765,7 @@ pub const KernelModule = struct {
             .florence_vision_tail_sources_f32 = florence_vision_tail_sources_f32,
             .rope_f32 = rope_f32,
             .rope_decode_scalars_f32 = rope_decode_scalars_f32,
+            .decode_scalars_advance = decode_scalars_advance,
             .rope_scaled_f32 = rope_scaled_f32,
             .rope_scaled_decode_scalars_f32 = rope_scaled_decode_scalars_f32,
             .rope_per_item_f32 = rope_per_item_f32,
@@ -518,8 +773,18 @@ pub const KernelModule = struct {
             .rms_norm_heads_rope_decode_scalars_f32 = rms_norm_heads_rope_decode_scalars_f32,
             .gqa_attention_f32 = gqa_attention_f32,
             .gqa_attention_decode_f32 = gqa_attention_decode_f32,
+            .gqa_attention_decode_scalars_fast_f32 = gqa_attention_decode_scalars_fast_f32,
+            .gqa_attention_prefill_fast_f32 = gqa_attention_prefill_fast_f32,
             .gqa_attention_decode_scalars_f32 = gqa_attention_decode_scalars_f32,
             .kv_write_suffix_decode_scalars_f32 = kv_write_suffix_decode_scalars_f32,
+            .gqa_attention_decode_turboquant_fast_f32 = gqa_attention_decode_turboquant_fast_f32,
+            .gqa_attention_prefill_turboquant_fast_f32 = gqa_attention_prefill_turboquant_fast_f32,
+            .gqa_attention_prefill_turboquant_tiled_f32 = gqa_attention_prefill_turboquant_tiled_f32,
+            .gqa_attention_prefill_turboquant_mma_f32 = gqa_attention_prefill_turboquant_mma_f32,
+            .gqa_attention_prefill_turboquant_mma_m32_f32 = gqa_attention_prefill_turboquant_mma_m32_f32,
+            .gqa_attention_decode_turboquant_split_stage1_f32 = gqa_attention_decode_turboquant_split_stage1_f32,
+            .gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32 = gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32,
+            .gqa_attention_decode_turboquant_split_stage2_f32 = gqa_attention_decode_turboquant_split_stage2_f32,
             .gqa_attention_decode_turboquant_f32 = gqa_attention_decode_turboquant_f32,
             .kv_write_suffix_turboquant_f32 = kv_write_suffix_turboquant_f32,
             .deberta_attention_f32 = deberta_attention_f32,
@@ -543,7 +808,30 @@ pub const KernelModule = struct {
             .linear_q8_0_bias_f32_tc_hmma = linear_q8_0_bias_f32_tc_hmma,
             .linear_q8_0_bias_gelu_f32_tc_hmma = linear_q8_0_bias_gelu_f32_tc_hmma,
             .linear_q8_0_bias_add_f32_tc_hmma = linear_q8_0_bias_add_f32_tc_hmma,
+            .quantize_f32_q8_1_rows = quantize_f32_q8_1_rows,
+            .quantize_gated_f32_q8_1_rows = quantize_gated_f32_q8_1_rows,
             .linear_q4_0_f32 = linear_q4_0_f32,
+            .linear_q4_0_f32_tile4 = linear_q4_0_f32_tile4,
+            .linear_q4_0_f32_tile4_w4 = linear_q4_0_f32_tile4_w4,
+            .linear_q4_0_q8_1_f32_tile4 = linear_q4_0_q8_1_f32_tile4,
+            .linear_q4_0_q8_1_f32_tile4_e4b_attn_2048 = linear_q4_0_q8_1_f32_tile4_e4b_attn_2048,
+            .linear_q4_0_q8_1_f32_tile4_e4b_attn_4096 = linear_q4_0_q8_1_f32_tile4_e4b_attn_4096,
+            .linear_q4_0_q8_1_f32_tile4_w8 = linear_q4_0_q8_1_f32_tile4_w8,
+            .linear_q4_0_q8_1_f32_tile4_w8_rows2 = linear_q4_0_q8_1_f32_tile4_w8_rows2,
+            .linear_q4_0_q8_1_f32_tile4_w8_rows4 = linear_q4_0_q8_1_f32_tile4_w8_rows4,
+            .linear_q4_0_q8_1_f32_tile4_w8_rows8_c4 = linear_q4_0_q8_1_f32_tile4_w8_rows8_c4,
+            .linear_q4_0_q8_1_f32_tile4_w8_e4b_down = linear_q4_0_q8_1_f32_tile4_w8_e4b_down,
+            .linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows = linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows,
+            .linear_q4_0_q8_1_f32_tile4_w10_e4b_down = linear_q4_0_q8_1_f32_tile4_w10_e4b_down,
+            .linear_q4_0_q8_1_f32_tile8 = linear_q4_0_q8_1_f32_tile8,
+            .linear_q4_0_f32_tile8 = linear_q4_0_f32_tile8,
+            .linear_q4_0_activation_slice_last_dim_f32_tile4 = linear_q4_0_activation_slice_last_dim_f32_tile4,
+            .linear_q4_0_activation_slice_last_dim_f32_tile4_w4 = linear_q4_0_activation_slice_last_dim_f32_tile4_w4,
+            .linear_q4_0_activation_slice_last_dim_q8_1_f32_tile4 = linear_q4_0_activation_slice_last_dim_q8_1_f32_tile4,
+            .linear_q4_0_gated_down_f32_tile4 = linear_q4_0_gated_down_f32_tile4,
+            .linear_q4_0_gated_down_f32_tile4_w4 = linear_q4_0_gated_down_f32_tile4_w4,
+            .linear_q4_0_gated_down_f32_tile8 = linear_q4_0_gated_down_f32_tile8,
+            .linear_q4_0_gated_down_f32_tile16 = linear_q4_0_gated_down_f32_tile16,
             .linear_q4_k_f32 = linear_q4_k_f32,
             .linear_q4_k_bias_f32 = linear_q4_k_bias_f32,
             .linear_q4_k_f32_tiled = linear_q4_k_f32_tiled,
@@ -587,10 +875,34 @@ pub const KernelModule = struct {
             .linear_q4_k_triple_bias_f32_tiled = linear_q4_k_triple_bias_f32_tiled,
             .linear_q4_k_pair_bias_f32_tiled = linear_q4_k_pair_bias_f32_tiled,
             .linear_q8_0_pair_nobias_f32_tile4 = linear_q8_0_pair_nobias_f32_tile4,
+            .linear_q4_0_pair_nobias_f32_tile4 = linear_q4_0_pair_nobias_f32_tile4,
+            .linear_q4_0_pair_nobias_f32_tile4_w4 = linear_q4_0_pair_nobias_f32_tile4_w4,
+            .linear_q4_0_pair_nobias_q8_1_f32_tile4 = linear_q4_0_pair_nobias_q8_1_f32_tile4,
+            .linear_q4_0_pair_nobias_q8_1_f32_tile4_w8 = linear_q4_0_pair_nobias_q8_1_f32_tile4_w8,
+            .linear_q4_0_pair_nobias_q8_1_f32_tile8 = linear_q4_0_pair_nobias_q8_1_f32_tile8,
+            .linear_q4_0_pair_activation_f32_tile4_w4 = linear_q4_0_pair_activation_f32_tile4_w4,
+            .linear_q4_0_pair_activation_q8_1_f32_tile4 = linear_q4_0_pair_activation_q8_1_f32_tile4,
+            .linear_q4_0_pair_activation_q8_1_f32_tile4_w8 = linear_q4_0_pair_activation_q8_1_f32_tile4_w8,
+            .linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn = linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn,
+            .linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn = linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn,
+            .linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn = linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn,
+            .linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2 = linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2,
+            .linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4 = linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4,
+            .linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows8_c2 = linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows8_c2,
+            .linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows16_c1 = linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows16_c1,
+            .linear_q4_0_pair_activation_q8_1_f32_tile8 = linear_q4_0_pair_activation_q8_1_f32_tile8,
+            .linear_q4_0_pair_nobias_f32_tile8 = linear_q4_0_pair_nobias_f32_tile8,
             .linear_q4_k_pair_nobias_f32_tile4 = linear_q4_k_pair_nobias_f32_tile4,
             .linear_f32_qkv_nobias_tiled = linear_f32_qkv_nobias_tiled,
             .linear_bf16_weight_f32_qkv_nobias_tiled = linear_bf16_weight_f32_qkv_nobias_tiled,
             .linear_q8_0_qkv_nobias_f32_tile4 = linear_q8_0_qkv_nobias_f32_tile4,
+            .linear_q4_0_qkv_nobias_f32_tile4 = linear_q4_0_qkv_nobias_f32_tile4,
+            .linear_q4_0_qkv_nobias_f32_tile4_w4 = linear_q4_0_qkv_nobias_f32_tile4_w4,
+            .linear_q4_0_qkv_nobias_q8_1_f32_tile4 = linear_q4_0_qkv_nobias_q8_1_f32_tile4,
+            .linear_q4_0_qkv_nobias_q8_1_f32_tile8 = linear_q4_0_qkv_nobias_q8_1_f32_tile8,
+            .linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4 = linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4,
+            .linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8 = linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8,
+            .linear_q4_0_qkv_nobias_f32_tile8 = linear_q4_0_qkv_nobias_f32_tile8,
             .linear_q4_k_qkv_nobias_f32_tiled = linear_q4_k_qkv_nobias_f32_tiled,
             .linear_q4_k_q4_k_f32_qkv_nobias_tiled = linear_q4_k_q4_k_f32_qkv_nobias_tiled,
             .embedding_lookup_q8_0_f32 = embedding_lookup_q8_0_f32,
@@ -601,6 +913,8 @@ pub const KernelModule = struct {
             .embedding_lookup_i32_q4_k_f32 = embedding_lookup_i32_q4_k_f32,
             .embedding_lookup_q6_k_f32 = embedding_lookup_q6_k_f32,
             .embedding_lookup_i32_q6_k_f32 = embedding_lookup_i32_q6_k_f32,
+            .embedding_add_weighted_i32_q6_k_f32 = embedding_add_weighted_i32_q6_k_f32,
+            .rms_norm_add_weighted_embedding_i32_q6_k_f32 = rms_norm_add_weighted_embedding_i32_q6_k_f32,
             .slice_last_dim_f32 = slice_last_dim_f32,
         };
     }
@@ -612,11 +926,14 @@ pub const KernelModule = struct {
             self.module = null;
             self.fill_f32 = null;
             self.f32_to_bf16 = null;
+            self.dequant_q4_0_bf16 = null;
             self.scale_f32 = null;
             self.add_scalar_f32 = null;
             self.binary_scalar_f32 = null;
             self.add_mul_scalar_f32 = null;
+            self.add_weighted_scalars_f32 = null;
             self.linear_f32 = null;
+            self.linear_f32_tiled = null;
             self.linear_bf16_weight_f32_tiled = null;
             self.argmax_last_row_f32 = null;
             self.argmax_rows_f32 = null;
@@ -627,8 +944,23 @@ pub const KernelModule = struct {
             self.argmax_reduce_pairs_f32 = null;
             self.linear_q8_0_argmax_rows_stage1_tile4 = null;
             self.linear_q4_0_argmax_rows_stage1_tile4 = null;
+            self.linear_q4_0_argmax_rows_stage1_tile16 = null;
             self.linear_q4_k_argmax_rows_stage1_tile4 = null;
+            self.linear_q6_k_argmax_rows_stage1_tile4 = null;
+            self.linear_q6_k_argmax_rows_stage1_tile8 = null;
+            self.linear_q6_k_argmax_rows_stage1_tile16 = null;
+            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8 = null;
+            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b = null;
+            self.linear_q6_k_q8_1_f32_tile8_e4b = null;
             self.argmax_reduce_rows_pairs_f32 = null;
+            self.argmax_reduce_rows_pairs_f32_w16 = null;
+            self.gemma4_mtp_preproject_f32 = null;
+            self.gemma4_mtp_masked_select_f32 = null;
+            self.gemma4_mtp_masked_select_hidden_f32 = null;
+            self.gemma4_mtp_centroid_scores_hidden_f32 = null;
+            self.gemma4_mtp_centroid_topk_u32 = null;
+            self.gemma4_mtp_restricted_lm_head_scores_f32 = null;
+            self.gemma4_mtp_reduce_token_scores_f32 = null;
             self.gemma4_mtp_masked_argmax_f32 = null;
             self.gemma4_mtp_verify_commit_u32 = null;
             self.linear_bias_f32 = null;
@@ -640,6 +972,8 @@ pub const KernelModule = struct {
             self.linear_pair_bias_f32_tile4_r2 = null;
             self.linear_triple_bias_f32_tile4_r2 = null;
             self.rms_norm_f32 = null;
+            self.rms_norm_f32_bf16 = null;
+            self.rms_norm_add_f32_bf16 = null;
             self.rms_norm_add_mul_scalar_f32 = null;
             self.rms_norm_add_output_scale_f32 = null;
             self.rms_norm_bare_f32 = null;
@@ -679,8 +1013,20 @@ pub const KernelModule = struct {
             self.rms_norm_heads_rope_decode_scalars_f32 = null;
             self.gqa_attention_f32 = null;
             self.gqa_attention_decode_f32 = null;
+            self.gqa_attention_decode_scalars_fast_f32 = null;
+            self.gqa_attention_prefill_fast_f32 = null;
             self.gqa_attention_decode_scalars_f32 = null;
             self.kv_write_suffix_decode_scalars_f32 = null;
+            self.gqa_attention_decode_turboquant_fast_f32 = null;
+            self.gqa_attention_prefill_turboquant_fast_f32 = null;
+            self.gqa_attention_prefill_turboquant_tiled_f32 = null;
+            self.gqa_attention_prefill_turboquant_mma_f32 = null;
+            self.gqa_attention_prefill_turboquant_mma_m32_f32 = null;
+            self.gqa_prefill_mma_smem_opted_in = false;
+            self.gqa_prefill_mma_m32_smem_opted_in = false;
+            self.gqa_attention_decode_turboquant_split_stage1_f32 = null;
+            self.gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32 = null;
+            self.gqa_attention_decode_turboquant_split_stage2_f32 = null;
             self.gqa_attention_decode_turboquant_f32 = null;
             self.kv_write_suffix_turboquant_f32 = null;
             self.deberta_attention_f32 = null;
@@ -704,7 +1050,30 @@ pub const KernelModule = struct {
             self.linear_q8_0_bias_f32_tc_hmma = null;
             self.linear_q8_0_bias_gelu_f32_tc_hmma = null;
             self.linear_q8_0_bias_add_f32_tc_hmma = null;
+            self.quantize_f32_q8_1_rows = null;
+            self.quantize_gated_f32_q8_1_rows = null;
             self.linear_q4_0_f32 = null;
+            self.linear_q4_0_f32_tile4 = null;
+            self.linear_q4_0_f32_tile4_w4 = null;
+            self.linear_q4_0_q8_1_f32_tile4 = null;
+            self.linear_q4_0_q8_1_f32_tile4_e4b_attn_2048 = null;
+            self.linear_q4_0_q8_1_f32_tile4_e4b_attn_4096 = null;
+            self.linear_q4_0_q8_1_f32_tile4_w8 = null;
+            self.linear_q4_0_q8_1_f32_tile4_w8_rows2 = null;
+            self.linear_q4_0_q8_1_f32_tile4_w8_rows4 = null;
+            self.linear_q4_0_q8_1_f32_tile4_w8_rows8_c4 = null;
+            self.linear_q4_0_q8_1_f32_tile4_w8_e4b_down = null;
+            self.linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows = null;
+            self.linear_q4_0_q8_1_f32_tile4_w10_e4b_down = null;
+            self.linear_q4_0_q8_1_f32_tile8 = null;
+            self.linear_q4_0_f32_tile8 = null;
+            self.linear_q4_0_activation_slice_last_dim_f32_tile4 = null;
+            self.linear_q4_0_activation_slice_last_dim_f32_tile4_w4 = null;
+            self.linear_q4_0_activation_slice_last_dim_q8_1_f32_tile4 = null;
+            self.linear_q4_0_gated_down_f32_tile4 = null;
+            self.linear_q4_0_gated_down_f32_tile4_w4 = null;
+            self.linear_q4_0_gated_down_f32_tile8 = null;
+            self.linear_q4_0_gated_down_f32_tile16 = null;
             self.linear_q4_k_f32 = null;
             self.linear_q4_k_bias_f32 = null;
             self.linear_q4_k_f32_tiled = null;
@@ -748,10 +1117,34 @@ pub const KernelModule = struct {
             self.linear_q4_k_triple_bias_f32_tiled = null;
             self.linear_q4_k_pair_bias_f32_tiled = null;
             self.linear_q8_0_pair_nobias_f32_tile4 = null;
+            self.linear_q4_0_pair_nobias_f32_tile4 = null;
+            self.linear_q4_0_pair_nobias_f32_tile4_w4 = null;
+            self.linear_q4_0_pair_nobias_q8_1_f32_tile4 = null;
+            self.linear_q4_0_pair_nobias_q8_1_f32_tile4_w8 = null;
+            self.linear_q4_0_pair_nobias_q8_1_f32_tile8 = null;
+            self.linear_q4_0_pair_activation_f32_tile4_w4 = null;
+            self.linear_q4_0_pair_activation_q8_1_f32_tile4 = null;
+            self.linear_q4_0_pair_activation_q8_1_f32_tile4_w8 = null;
+            self.linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn = null;
+            self.linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn = null;
+            self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn = null;
+            self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2 = null;
+            self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4 = null;
+            self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows8_c2 = null;
+            self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows16_c1 = null;
+            self.linear_q4_0_pair_activation_q8_1_f32_tile8 = null;
+            self.linear_q4_0_pair_nobias_f32_tile8 = null;
             self.linear_q4_k_pair_nobias_f32_tile4 = null;
             self.linear_f32_qkv_nobias_tiled = null;
             self.linear_bf16_weight_f32_qkv_nobias_tiled = null;
             self.linear_q8_0_qkv_nobias_f32_tile4 = null;
+            self.linear_q4_0_qkv_nobias_f32_tile4 = null;
+            self.linear_q4_0_qkv_nobias_f32_tile4_w4 = null;
+            self.linear_q4_0_qkv_nobias_q8_1_f32_tile4 = null;
+            self.linear_q4_0_qkv_nobias_q8_1_f32_tile8 = null;
+            self.linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4 = null;
+            self.linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8 = null;
+            self.linear_q4_0_qkv_nobias_f32_tile8 = null;
             self.linear_q4_k_qkv_nobias_f32_tiled = null;
             self.linear_q4_k_q4_k_f32_qkv_nobias_tiled = null;
             self.embedding_lookup_q8_0_f32 = null;
@@ -762,6 +1155,8 @@ pub const KernelModule = struct {
             self.embedding_lookup_i32_q4_k_f32 = null;
             self.embedding_lookup_q6_k_f32 = null;
             self.embedding_lookup_i32_q6_k_f32 = null;
+            self.embedding_add_weighted_i32_q6_k_f32 = null;
+            self.rms_norm_add_weighted_embedding_i32_q6_k_f32 = null;
             self.slice_last_dim_f32 = null;
         }
     }
@@ -771,6 +1166,7 @@ pub const KernelModule = struct {
             self.rope_per_item_f32 != null and
             self.gqa_attention_f32 != null and
             self.add_mul_scalar_f32 != null and
+            self.add_weighted_scalars_f32 != null and
             self.rms_norm_add_mul_scalar_f32 != null and
             self.rms_norm_heads_rope_f32 != null and
             self.gemma4_mtp_masked_argmax_f32 != null;
@@ -867,6 +1263,36 @@ pub const KernelModule = struct {
             self.embedding_lookup_q4_k_f32 != null and
             self.embedding_lookup_q6_k_f32 != null and
             self.slice_last_dim_f32 != null;
+    }
+
+    pub fn q4_0Q8_1Tile4W8PrefillRowsVariant(self: *const KernelModule, rows: usize, in_dim: usize, out_dim: usize) Q4_0Q8_1PrefillRowsVariant {
+        if (rows <= 1) return .single;
+        if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_ROWS8_C4", false) and
+            self.linear_q4_0_q8_1_f32_tile4_w8_rows8_c4 != null) return .rows8_c4;
+        if (self.linear_q4_0_q8_1_f32_tile4_w8_rows4 != null) return .rows4;
+        if (self.linear_q4_0_q8_1_f32_tile4_w8_rows2 != null) return .rows2;
+        if (in_dim == 10240 and out_dim == 2560 and self.linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows != null) return .e4b_down_rows;
+        if (self.linear_q4_0_q8_1_f32_tile4_w8 != null) return .generic_rows;
+        return .none;
+    }
+
+    pub fn q4_0PairActivationQ8_1Tile32W5E4BPrefillRowsVariant(self: *const KernelModule, rows: usize) Q4_0Q8_1PrefillRowsVariant {
+        if (rows <= 1) return .single;
+        if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_ROWS16_C1", false) and
+            self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows16_c1 != null) return .rows16_c1;
+        if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_ROWS8_C2", false) and
+            self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows8_c2 != null) return .rows8_c2;
+        if (self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4 != null) return .rows4;
+        if (self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2 != null) return .rows2;
+        if (self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn != null) return .generic_rows;
+        return .none;
+    }
+
+    pub fn q4_0QkvNoBiasQ8_1Tile8PrefillRowsVariant(self: *const KernelModule, rows: usize) Q4_0Q8_1PrefillRowsVariant {
+        if (rows <= 1) return .single;
+        if (self.linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4 != null) return .rows4;
+        if (self.linear_q4_0_qkv_nobias_q8_1_f32_tile8 != null) return .tile8_rows;
+        return .none;
     }
 
     pub fn requireGemma4DecoderPrimitives(self: *const KernelModule) driver_mod.Error!void {
@@ -990,6 +1416,66 @@ pub const KernelModule = struct {
             @ptrCast(&out_dim_u32),
         };
         try launch1d(self.linear_f32, ctx, out_count, &params);
+    }
+
+    pub fn launchLinearF32Tiled(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_f32_tiled orelse return error.CudaKernelUnavailable;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkBytes(weight, try checkedTensorElements(out_dim, in_dim));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launchBlocks(function, ctx, out_count, f32_tiled_threads, &params);
+    }
+
+    pub fn launchDequantQ4_0Bf16(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        src: buffer_mod.DeviceBuffer,
+        block_count: usize,
+    ) driver_mod.Error!void {
+        const function = self.dequant_q4_0_bf16 orelse return error.CudaKernelUnavailable;
+        try checkRawBytes(dst, try checkedTensorElements(block_count, 32 * @sizeOf(u16)));
+        try checkRawBytes(src, try checkedTensorElements(block_count, 18));
+        if (block_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var src_ptr = src.ptr;
+        var block_count_u32 = try toU32(block_count);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&src_ptr),
+            @ptrCast(&block_count_u32),
+        };
+        const threads: usize = 256;
+        const max_grid: usize = 65535;
+        const blocks = @min((block_count + threads - 1) / threads, max_grid);
+        try launchBlocks(function, ctx, blocks, threads, &params);
     }
 
     pub fn launchF32ToBf16(
@@ -1157,6 +1643,38 @@ pub const KernelModule = struct {
             @ptrCast(&count_u32),
         };
         try launch1d(self.add_mul_scalar_f32, ctx, count, &params);
+    }
+
+    pub fn launchAddWeightedScalarsF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        a: buffer_mod.DeviceBuffer,
+        b: buffer_mod.DeviceBuffer,
+        scale_a: f32,
+        scale_b: f32,
+        count: usize,
+    ) driver_mod.Error!void {
+        try checkBytes(dst, count);
+        try checkBytes(a, count);
+        try checkBytes(b, count);
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var a_ptr = a.ptr;
+        var b_ptr = b.ptr;
+        var scale_a_value = scale_a;
+        var scale_b_value = scale_b;
+        var count_u32 = try toU32(count);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&a_ptr),
+            @ptrCast(&b_ptr),
+            @ptrCast(&scale_a_value),
+            @ptrCast(&scale_b_value),
+            @ptrCast(&count_u32),
+        };
+        try launch1d(self.add_weighted_scalars_f32, ctx, count, &params);
     }
 
     pub fn launchSiluMultiplyF32(
@@ -1622,6 +2140,67 @@ pub const KernelModule = struct {
         try launchBlocks(reduce, ctx, rows, f32_tiled_threads, &reduce_params);
     }
 
+    pub fn launchLinearQ4_0ArgmaxRowsTile16F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        partial_values: buffer_mod.DeviceBuffer,
+        partial_indices: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        suppress_token_ids: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        suppress_count: usize,
+    ) driver_mod.Error!void {
+        const stage1 = self.linear_q4_0_argmax_rows_stage1_tile16 orelse return error.CudaKernelUnavailable;
+        const reduce = self.argmax_reduce_rows_pairs_f32 orelse return error.CudaKernelUnavailable;
+        if (rows == 0 or in_dim == 0 or out_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const col_tiles = (out_dim + q4_0_col_tile16 - 1) / q4_0_col_tile16;
+        const partial_count = try checkedTensorElements(rows, col_tiles);
+        try checkRawBytes(dst, try checkedTensorElements(rows, @sizeOf(u32)));
+        try checkBytes(partial_values, partial_count);
+        try checkRawBytes(partial_indices, try checkedTensorElements(partial_count, @sizeOf(u32)));
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
+
+        var partial_values_ptr = partial_values.ptr;
+        var partial_indices_ptr = partial_indices.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var suppress_ptr = suppress_token_ids.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var suppress_count_u32 = try toU32(suppress_count);
+        var stage1_params = [_]?*anyopaque{
+            @ptrCast(&partial_values_ptr),
+            @ptrCast(&partial_indices_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&suppress_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+            @ptrCast(&suppress_count_u32),
+        };
+        try launchBlocks(stage1, ctx, partial_count, q8_0_tiled_threads, &stage1_params);
+
+        var dst_ptr = dst.ptr;
+        var col_tiles_u32 = try toU32(col_tiles);
+        var reduce_params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&partial_values_ptr),
+            @ptrCast(&partial_indices_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&col_tiles_u32),
+        };
+        try launchBlocks(reduce, ctx, rows, f32_tiled_threads, &reduce_params);
+    }
+
     pub fn launchLinearQ4KArgmaxRowsTile4F32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -1681,6 +2260,539 @@ pub const KernelModule = struct {
             @ptrCast(&col_tiles_u32),
         };
         try launchBlocks(reduce, ctx, rows, f32_tiled_threads, &reduce_params);
+    }
+
+    pub fn launchLinearQ6KArgmaxRowsTile4F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        partial_values: buffer_mod.DeviceBuffer,
+        partial_indices: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        suppress_token_ids: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        suppress_count: usize,
+    ) driver_mod.Error!void {
+        const stage1 = self.linear_q6_k_argmax_rows_stage1_tile4 orelse return error.CudaKernelUnavailable;
+        const reduce = self.argmax_reduce_rows_pairs_f32 orelse return error.CudaKernelUnavailable;
+        if (rows == 0 or in_dim == 0 or out_dim == 0 or in_dim % q6_k_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q6_k_values_per_block;
+        const col_tiles = (out_dim + q4_k_col_tile - 1) / q4_k_col_tile;
+        const partial_count = try checkedTensorElements(rows, col_tiles);
+        try checkRawBytes(dst, try checkedTensorElements(rows, @sizeOf(u32)));
+        try checkBytes(partial_values, partial_count);
+        try checkRawBytes(partial_indices, try checkedTensorElements(partial_count, @sizeOf(u32)));
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q6_k_block_bytes));
+        try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
+
+        var partial_values_ptr = partial_values.ptr;
+        var partial_indices_ptr = partial_indices.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var suppress_ptr = suppress_token_ids.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var suppress_count_u32 = try toU32(suppress_count);
+        var stage1_params = [_]?*anyopaque{
+            @ptrCast(&partial_values_ptr),
+            @ptrCast(&partial_indices_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&suppress_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+            @ptrCast(&suppress_count_u32),
+        };
+        try launchBlocks(stage1, ctx, partial_count, q4_k_tiled_threads, &stage1_params);
+
+        var dst_ptr = dst.ptr;
+        var col_tiles_u32 = try toU32(col_tiles);
+        var reduce_params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&partial_values_ptr),
+            @ptrCast(&partial_indices_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&col_tiles_u32),
+        };
+        try launchBlocks(reduce, ctx, rows, f32_tiled_threads, &reduce_params);
+    }
+
+    pub fn launchLinearQ6KArgmaxRowsTile8F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        partial_values: buffer_mod.DeviceBuffer,
+        partial_indices: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        suppress_token_ids: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        suppress_count: usize,
+    ) driver_mod.Error!void {
+        const stage1 = self.linear_q6_k_argmax_rows_stage1_tile8 orelse return error.CudaKernelUnavailable;
+        const reduce = self.argmax_reduce_rows_pairs_f32 orelse return error.CudaKernelUnavailable;
+        if (rows == 0 or in_dim == 0 or out_dim == 0 or in_dim % q6_k_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q6_k_values_per_block;
+        const col_tiles = (out_dim + q6_k_col_tile8 - 1) / q6_k_col_tile8;
+        const partial_count = try checkedTensorElements(rows, col_tiles);
+        try checkRawBytes(dst, try checkedTensorElements(rows, @sizeOf(u32)));
+        try checkBytes(partial_values, partial_count);
+        try checkRawBytes(partial_indices, try checkedTensorElements(partial_count, @sizeOf(u32)));
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q6_k_block_bytes));
+        try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
+
+        var partial_values_ptr = partial_values.ptr;
+        var partial_indices_ptr = partial_indices.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var suppress_ptr = suppress_token_ids.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var suppress_count_u32 = try toU32(suppress_count);
+        var stage1_params = [_]?*anyopaque{
+            @ptrCast(&partial_values_ptr),
+            @ptrCast(&partial_indices_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&suppress_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+            @ptrCast(&suppress_count_u32),
+        };
+        try launchBlocks(stage1, ctx, partial_count, q4_k_tiled_threads, &stage1_params);
+
+        var dst_ptr = dst.ptr;
+        var col_tiles_u32 = try toU32(col_tiles);
+        var reduce_params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&partial_values_ptr),
+            @ptrCast(&partial_indices_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&col_tiles_u32),
+        };
+        try launchBlocks(reduce, ctx, rows, f32_tiled_threads, &reduce_params);
+    }
+
+    pub fn launchLinearQ6KArgmaxRowsTile16F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        partial_values: buffer_mod.DeviceBuffer,
+        partial_indices: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        suppress_token_ids: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        suppress_count: usize,
+    ) driver_mod.Error!void {
+        const stage1 = self.linear_q6_k_argmax_rows_stage1_tile16 orelse return error.CudaKernelUnavailable;
+        const reduce = self.argmax_reduce_rows_pairs_f32 orelse return error.CudaKernelUnavailable;
+        if (rows == 0 or in_dim == 0 or out_dim == 0 or in_dim % q6_k_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q6_k_values_per_block;
+        const col_tiles = (out_dim + q6_k_col_tile16 - 1) / q6_k_col_tile16;
+        const partial_count = try checkedTensorElements(rows, col_tiles);
+        try checkRawBytes(dst, try checkedTensorElements(rows, @sizeOf(u32)));
+        try checkBytes(partial_values, partial_count);
+        try checkRawBytes(partial_indices, try checkedTensorElements(partial_count, @sizeOf(u32)));
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q6_k_block_bytes));
+        try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
+
+        var partial_values_ptr = partial_values.ptr;
+        var partial_indices_ptr = partial_indices.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var suppress_ptr = suppress_token_ids.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var suppress_count_u32 = try toU32(suppress_count);
+        var stage1_params = [_]?*anyopaque{
+            @ptrCast(&partial_values_ptr),
+            @ptrCast(&partial_indices_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&suppress_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+            @ptrCast(&suppress_count_u32),
+        };
+        try launchBlocks(stage1, ctx, partial_count, q4_k_tiled_threads, &stage1_params);
+
+        var dst_ptr = dst.ptr;
+        var col_tiles_u32 = try toU32(col_tiles);
+        var reduce_params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&partial_values_ptr),
+            @ptrCast(&partial_indices_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&col_tiles_u32),
+        };
+        try launchBlocks(reduce, ctx, rows, f32_tiled_threads, &reduce_params);
+    }
+
+    pub fn launchLinearQ6KQ8_1F32Tile8E4B(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q6_k_q8_1_f32_tile8_e4b orelse return error.CudaKernelUnavailable;
+        // The kernel body hardcodes 10 Q6_K blocks per column (in_dim 2560).
+        if (in_dim != 2560 or out_dim == 0 or out_dim % 8 != 0) return error.CudaKernelUnavailable;
+        try checkBytes(dst, out_dim);
+        try checkRawBytes(input_q8_1, (in_dim / 32) * 36);
+        try checkRawBytes(weight_raw, try checkedTensorElements(out_dim, (in_dim / 256) * 210));
+        var dst_ptr = dst.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&out_dim_u32),
+        };
+        try launchBlocks(function, ctx, out_dim / 8, 160, &params);
+    }
+
+    pub fn launchLinearQ6KQ8_1ArgmaxRowsTile8F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        partial_values: buffer_mod.DeviceBuffer,
+        partial_indices: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        suppress_token_ids: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        suppress_count: usize,
+    ) driver_mod.Error!void {
+        const use_e4b_stage1 =
+            rows == 1 and in_dim == 2560 and out_dim == 262144 and suppress_count == 0 and
+            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b != null;
+        const stage1 = if (use_e4b_stage1)
+            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b orelse return error.CudaKernelUnavailable
+        else
+            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8 orelse return error.CudaKernelUnavailable;
+        const reduce = self.argmax_reduce_rows_pairs_f32_w16 orelse (self.argmax_reduce_rows_pairs_f32 orelse return error.CudaKernelUnavailable);
+        if (rows == 0 or in_dim == 0 or out_dim == 0 or in_dim % q6_k_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q6_k_values_per_block;
+        const q8_row_blocks = in_dim / q8_1_values_per_block;
+        const col_tiles = (out_dim + q6_k_col_tile8 - 1) / q6_k_col_tile8;
+        const partial_count = try checkedTensorElements(rows, col_tiles);
+        try checkRawBytes(dst, try checkedTensorElements(rows, @sizeOf(u32)));
+        try checkBytes(partial_values, partial_count);
+        try checkRawBytes(partial_indices, try checkedTensorElements(partial_count, @sizeOf(u32)));
+        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, q8_row_blocks), q8_1_block_bytes));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q6_k_block_bytes));
+        try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
+
+        var partial_values_ptr = partial_values.ptr;
+        var partial_indices_ptr = partial_indices.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var suppress_ptr = suppress_token_ids.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var suppress_count_u32 = try toU32(suppress_count);
+        var stage1_params = [_]?*anyopaque{
+            @ptrCast(&partial_values_ptr),
+            @ptrCast(&partial_indices_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&suppress_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+            @ptrCast(&suppress_count_u32),
+        };
+        const stage1_threads: usize = if (use_e4b_stage1) 160 else q6KQ8_1Tile8Stage1Threads(row_blocks);
+        try launchBlocks(stage1, ctx, partial_count, stage1_threads, &stage1_params);
+
+        var dst_ptr = dst.ptr;
+        var col_tiles_u32 = try toU32(col_tiles);
+        var reduce_params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&partial_values_ptr),
+            @ptrCast(&partial_indices_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&col_tiles_u32),
+        };
+        const reduce_threads: usize = if (self.argmax_reduce_rows_pairs_f32_w16 != null) 512 else f32_tiled_threads;
+        try launchBlocks(reduce, ctx, rows, reduce_threads, &reduce_params);
+    }
+
+    pub fn launchGemma4MtpPreprojectF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        target_embedding: buffer_mod.DeviceBuffer,
+        activation: buffer_mod.DeviceBuffer,
+        weight: buffer_mod.DeviceBuffer,
+        backbone_hidden: usize,
+        draft_hidden: usize,
+        concat_order: u32,
+        weight_dtype: u32,
+    ) driver_mod.Error!bool {
+        if (self.gemma4_mtp_preproject_f32 == null) return false;
+        if (backbone_hidden == 0 or draft_hidden == 0) return error.InvalidCudaState;
+        try checkBytes(dst, draft_hidden);
+        try checkBytes(target_embedding, backbone_hidden);
+        try checkBytes(activation, backbone_hidden);
+        const weight_elems = try checkedTensorElements(draft_hidden, try checkedTensorElements(backbone_hidden, 2));
+        try checkTypedTailWeightBytes(weight, weight_elems, weight_dtype);
+
+        var dst_ptr = dst.ptr;
+        var target_embedding_ptr = target_embedding.ptr;
+        var activation_ptr = activation.ptr;
+        var weight_ptr = weight.ptr;
+        var backbone_hidden_u32 = try toU32(backbone_hidden);
+        var draft_hidden_u32 = try toU32(draft_hidden);
+        var concat_order_u32 = concat_order;
+        var weight_dtype_u32 = weight_dtype;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&target_embedding_ptr),
+            @ptrCast(&activation_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&backbone_hidden_u32),
+            @ptrCast(&draft_hidden_u32),
+            @ptrCast(&concat_order_u32),
+            @ptrCast(&weight_dtype_u32),
+        };
+        try launchBlocks(self.gemma4_mtp_preproject_f32, ctx, draft_hidden, f32_tiled_threads, &params);
+        return true;
+    }
+
+    pub fn launchGemma4MtpMaskedSelectF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        assistant_hidden: buffer_mod.DeviceBuffer,
+        logits: buffer_mod.DeviceBuffer,
+        centroid_weight: buffer_mod.DeviceBuffer,
+        token_ordering: buffer_mod.DeviceBuffer,
+        hidden_size: usize,
+        vocab_size: usize,
+        num_centroids: usize,
+        top_k: usize,
+        use_inverse_ordering: bool,
+        centroid_weight_dtype: u32,
+    ) driver_mod.Error!bool {
+        if (self.gemma4_mtp_masked_select_f32 == null) return false;
+        if (hidden_size == 0 or vocab_size == 0 or num_centroids == 0 or top_k == 0) return error.InvalidCudaState;
+        if (num_centroids > 4096) return error.InvalidCudaState;
+        try checkRawBytes(dst, @sizeOf(u32));
+        try checkBytes(assistant_hidden, hidden_size);
+        try checkBytes(logits, vocab_size);
+        try checkBytes(token_ordering, vocab_size);
+        const centroid_weight_elems = try checkedTensorElements(num_centroids, hidden_size);
+        try checkTypedTailWeightBytes(centroid_weight, centroid_weight_elems, centroid_weight_dtype);
+
+        var dst_ptr = dst.ptr;
+        var assistant_hidden_ptr = assistant_hidden.ptr;
+        var logits_ptr = logits.ptr;
+        var centroid_weight_ptr = centroid_weight.ptr;
+        var token_ordering_ptr = token_ordering.ptr;
+        var hidden_size_u32 = try toU32(hidden_size);
+        var vocab_size_u32 = try toU32(vocab_size);
+        var num_centroids_u32 = try toU32(num_centroids);
+        var top_k_u32 = try toU32(top_k);
+        var inverse_u32: u32 = if (use_inverse_ordering) 1 else 0;
+        var centroid_weight_dtype_u32 = centroid_weight_dtype;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&assistant_hidden_ptr),
+            @ptrCast(&logits_ptr),
+            @ptrCast(&centroid_weight_ptr),
+            @ptrCast(&token_ordering_ptr),
+            @ptrCast(&hidden_size_u32),
+            @ptrCast(&vocab_size_u32),
+            @ptrCast(&num_centroids_u32),
+            @ptrCast(&top_k_u32),
+            @ptrCast(&inverse_u32),
+            @ptrCast(&centroid_weight_dtype_u32),
+        };
+        try launchBlocks(self.gemma4_mtp_masked_select_f32, ctx, 1, f32_tiled_threads, &params);
+        return true;
+    }
+
+    pub fn launchGemma4MtpMaskedSelectHiddenF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        assistant_hidden: buffer_mod.DeviceBuffer,
+        lm_head_weight: buffer_mod.DeviceBuffer,
+        centroid_weight: buffer_mod.DeviceBuffer,
+        token_ordering: buffer_mod.DeviceBuffer,
+        hidden_size: usize,
+        vocab_size: usize,
+        num_centroids: usize,
+        top_k: usize,
+        use_inverse_ordering: bool,
+        lm_head_dtype: u32,
+        centroid_weight_dtype: u32,
+    ) driver_mod.Error!bool {
+        if (self.gemma4_mtp_masked_select_hidden_f32 == null) return false;
+        if (hidden_size == 0 or vocab_size == 0 or num_centroids == 0 or top_k == 0) return error.InvalidCudaState;
+        if (num_centroids > 4096) return error.InvalidCudaState;
+        try checkRawBytes(dst, @sizeOf(u32));
+        try checkBytes(assistant_hidden, hidden_size);
+        try checkBytes(token_ordering, vocab_size);
+        try checkTypedTailWeightBytes(lm_head_weight, try checkedTensorElements(vocab_size, hidden_size), lm_head_dtype);
+        try checkTypedTailWeightBytes(centroid_weight, try checkedTensorElements(num_centroids, hidden_size), centroid_weight_dtype);
+
+        var dst_ptr = dst.ptr;
+        var assistant_hidden_ptr = assistant_hidden.ptr;
+        var lm_head_weight_ptr = lm_head_weight.ptr;
+        var centroid_weight_ptr = centroid_weight.ptr;
+        var token_ordering_ptr = token_ordering.ptr;
+        var hidden_size_u32 = try toU32(hidden_size);
+        var vocab_size_u32 = try toU32(vocab_size);
+        var num_centroids_u32 = try toU32(num_centroids);
+        var top_k_u32 = try toU32(top_k);
+        var inverse_u32: u32 = if (use_inverse_ordering) 1 else 0;
+        var lm_head_dtype_u32 = lm_head_dtype;
+        var centroid_weight_dtype_u32 = centroid_weight_dtype;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&assistant_hidden_ptr),
+            @ptrCast(&lm_head_weight_ptr),
+            @ptrCast(&centroid_weight_ptr),
+            @ptrCast(&token_ordering_ptr),
+            @ptrCast(&hidden_size_u32),
+            @ptrCast(&vocab_size_u32),
+            @ptrCast(&num_centroids_u32),
+            @ptrCast(&top_k_u32),
+            @ptrCast(&inverse_u32),
+            @ptrCast(&lm_head_dtype_u32),
+            @ptrCast(&centroid_weight_dtype_u32),
+        };
+        try launchBlocks(self.gemma4_mtp_masked_select_hidden_f32, ctx, 1, f32_tiled_threads, &params);
+        return true;
+    }
+
+    pub fn launchGemma4MtpMaskedSelectHiddenMultiF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        centroid_scores: buffer_mod.DeviceBuffer,
+        top_centroids: buffer_mod.DeviceBuffer,
+        partial_values: buffer_mod.DeviceBuffer,
+        partial_tokens: buffer_mod.DeviceBuffer,
+        assistant_hidden: buffer_mod.DeviceBuffer,
+        lm_head_weight: buffer_mod.DeviceBuffer,
+        centroid_weight: buffer_mod.DeviceBuffer,
+        token_ordering: buffer_mod.DeviceBuffer,
+        hidden_size: usize,
+        vocab_size: usize,
+        num_centroids: usize,
+        top_k: usize,
+        lm_head_dtype: u32,
+        centroid_weight_dtype: u32,
+    ) driver_mod.Error!bool {
+        if (self.gemma4_mtp_centroid_scores_hidden_f32 == null or
+            self.gemma4_mtp_centroid_topk_u32 == null or
+            self.gemma4_mtp_restricted_lm_head_scores_f32 == null or
+            self.gemma4_mtp_reduce_token_scores_f32 == null)
+        {
+            return false;
+        }
+        if (hidden_size == 0 or vocab_size == 0 or num_centroids == 0 or top_k == 0) return error.InvalidCudaState;
+        if (num_centroids > 4096) return error.InvalidCudaState;
+        if (top_k > 128) return error.InvalidCudaState;
+        if (vocab_size % num_centroids != 0) return error.InvalidCudaState;
+        const cluster_size = vocab_size / num_centroids;
+        const candidate_count = try checkedTensorElements(top_k, cluster_size);
+        if (candidate_count == 0) return error.InvalidCudaState;
+        try checkRawBytes(dst, @sizeOf(u32));
+        try checkBytes(centroid_scores, num_centroids);
+        try checkRawBytes(top_centroids, try checkedTensorElements(top_k, @sizeOf(u32)));
+        try checkBytes(partial_values, candidate_count);
+        try checkRawBytes(partial_tokens, try checkedTensorElements(candidate_count, @sizeOf(u32)));
+        try checkBytes(assistant_hidden, hidden_size);
+        try checkBytes(token_ordering, vocab_size);
+        try checkTypedTailWeightBytes(lm_head_weight, try checkedTensorElements(vocab_size, hidden_size), lm_head_dtype);
+        try checkTypedTailWeightBytes(centroid_weight, try checkedTensorElements(num_centroids, hidden_size), centroid_weight_dtype);
+
+        var centroid_scores_ptr = centroid_scores.ptr;
+        var assistant_hidden_ptr = assistant_hidden.ptr;
+        var centroid_weight_ptr = centroid_weight.ptr;
+        var hidden_size_u32 = try toU32(hidden_size);
+        var num_centroids_u32 = try toU32(num_centroids);
+        var centroid_weight_dtype_u32 = centroid_weight_dtype;
+        var centroid_params = [_]?*anyopaque{
+            @ptrCast(&centroid_scores_ptr),
+            @ptrCast(&assistant_hidden_ptr),
+            @ptrCast(&centroid_weight_ptr),
+            @ptrCast(&hidden_size_u32),
+            @ptrCast(&num_centroids_u32),
+            @ptrCast(&centroid_weight_dtype_u32),
+        };
+        try launchBlocks(self.gemma4_mtp_centroid_scores_hidden_f32, ctx, num_centroids, f32_tiled_threads, &centroid_params);
+
+        var top_centroids_ptr = top_centroids.ptr;
+        var top_k_u32 = try toU32(top_k);
+        var topk_params = [_]?*anyopaque{
+            @ptrCast(&top_centroids_ptr),
+            @ptrCast(&centroid_scores_ptr),
+            @ptrCast(&num_centroids_u32),
+            @ptrCast(&top_k_u32),
+        };
+        try launchBlocks(self.gemma4_mtp_centroid_topk_u32, ctx, 1, f32_tiled_threads, &topk_params);
+
+        var partial_values_ptr = partial_values.ptr;
+        var partial_tokens_ptr = partial_tokens.ptr;
+        var lm_head_weight_ptr = lm_head_weight.ptr;
+        var token_ordering_ptr = token_ordering.ptr;
+        var vocab_size_u32 = try toU32(vocab_size);
+        var lm_head_dtype_u32 = lm_head_dtype;
+        var score_params = [_]?*anyopaque{
+            @ptrCast(&partial_values_ptr),
+            @ptrCast(&partial_tokens_ptr),
+            @ptrCast(&assistant_hidden_ptr),
+            @ptrCast(&lm_head_weight_ptr),
+            @ptrCast(&token_ordering_ptr),
+            @ptrCast(&top_centroids_ptr),
+            @ptrCast(&hidden_size_u32),
+            @ptrCast(&vocab_size_u32),
+            @ptrCast(&num_centroids_u32),
+            @ptrCast(&top_k_u32),
+            @ptrCast(&lm_head_dtype_u32),
+        };
+        try launchBlocks(self.gemma4_mtp_restricted_lm_head_scores_f32, ctx, candidate_count, f32_tiled_threads, &score_params);
+
+        var dst_ptr = dst.ptr;
+        var candidate_count_u32 = try toU32(candidate_count);
+        var reduce_params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&partial_values_ptr),
+            @ptrCast(&partial_tokens_ptr),
+            @ptrCast(&candidate_count_u32),
+        };
+        try launchBlocks(self.gemma4_mtp_reduce_token_scores_f32, ctx, 1, f32_tiled_threads, &reduce_params);
+        return true;
     }
 
     pub fn launchGemma4MtpMaskedArgmaxF32(
@@ -2090,6 +3202,86 @@ pub const KernelModule = struct {
         try launchRows(self.rms_norm_f32, ctx, total_rows, &params);
     }
 
+    pub fn launchRmsNormF32Bf16(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        dst_bf16: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight: buffer_mod.DeviceBuffer,
+        total_rows: usize,
+        dim: usize,
+        eps: f32,
+    ) driver_mod.Error!void {
+        const count = try checkedTensorElements(total_rows, dim);
+        try checkBytes(dst, count);
+        try checkRawBytes(dst_bf16, try checkedTensorElements(count, @sizeOf(u16)));
+        try checkBytes(input, count);
+        try checkBytes(weight, dim);
+        if (count == 0) return;
+
+        const function = self.rms_norm_f32_bf16 orelse return error.CudaKernelUnavailable;
+        var dst_ptr = dst.ptr;
+        var dst_bf16_ptr = dst_bf16.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight.ptr;
+        var rows_u32 = try toU32(total_rows);
+        var dim_u32 = try toU32(dim);
+        var eps_value = eps;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&dst_bf16_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&dim_u32),
+            @ptrCast(&eps_value),
+        };
+        try launchRows(function, ctx, total_rows, &params);
+    }
+
+    pub fn launchRmsNormAddF32Bf16(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        dst_bf16: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight: buffer_mod.DeviceBuffer,
+        residual: buffer_mod.DeviceBuffer,
+        total_rows: usize,
+        dim: usize,
+        eps: f32,
+    ) driver_mod.Error!void {
+        const count = try checkedTensorElements(total_rows, dim);
+        try checkBytes(dst, count);
+        try checkRawBytes(dst_bf16, try checkedTensorElements(count, @sizeOf(u16)));
+        try checkBytes(input, count);
+        try checkBytes(weight, dim);
+        try checkBytes(residual, count);
+        if (count == 0) return;
+
+        const function = self.rms_norm_add_f32_bf16 orelse return error.CudaKernelUnavailable;
+        var dst_ptr = dst.ptr;
+        var dst_bf16_ptr = dst_bf16.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight.ptr;
+        var residual_ptr = residual.ptr;
+        var rows_u32 = try toU32(total_rows);
+        var dim_u32 = try toU32(dim);
+        var eps_value = eps;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&dst_bf16_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&residual_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&dim_u32),
+            @ptrCast(&eps_value),
+        };
+        try launchRows(function, ctx, total_rows, &params);
+    }
+
     pub fn launchRmsNormAddF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -2188,12 +3380,12 @@ pub const KernelModule = struct {
         try checkBytes(scalar, 1);
         if (count == 0) return;
 
-        const function = self.rms_norm_add_output_scale_f32 orelse return error.CudaKernelUnavailable;
         var dst_ptr = dst.ptr;
         var input_ptr = input.ptr;
         var weight_ptr = weight.ptr;
         var residual_ptr = residual.ptr;
         var scalar_ptr = scalar.ptr;
+        const function = self.rms_norm_add_output_scale_f32 orelse return error.CudaKernelUnavailable;
         var rows_u32 = try toU32(total_rows);
         var dim_u32 = try toU32(dim);
         var eps_value = eps;
@@ -2354,6 +3546,7 @@ pub const KernelModule = struct {
         ids: buffer_mod.DeviceBuffer,
         total: usize,
         dim: usize,
+        scale: f32,
     ) driver_mod.Error!void {
         const count = try checkedTensorElements(total, dim);
         try checkBytes(dst, count);
@@ -2366,12 +3559,14 @@ pub const KernelModule = struct {
         var ids_ptr = ids.ptr;
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
+        var scale_value = scale;
         var params = [_]?*anyopaque{
             @ptrCast(&dst_ptr),
             @ptrCast(&weight_ptr),
             @ptrCast(&ids_ptr),
             @ptrCast(&total_u32),
             @ptrCast(&dim_u32),
+            @ptrCast(&scale_value),
         };
         try launch1d(self.embedding_lookup_f32, ctx, count, &params);
     }
@@ -2384,6 +3579,7 @@ pub const KernelModule = struct {
         ids: buffer_mod.DeviceBuffer,
         total: usize,
         dim: usize,
+        scale: f32,
     ) driver_mod.Error!void {
         const function = self.embedding_lookup_bf16_weight_f32 orelse return error.CudaKernelUnavailable;
         const count = try checkedTensorElements(total, dim);
@@ -2397,12 +3593,14 @@ pub const KernelModule = struct {
         var ids_ptr = ids.ptr;
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
+        var scale_value = scale;
         var params = [_]?*anyopaque{
             @ptrCast(&dst_ptr),
             @ptrCast(&weight_ptr),
             @ptrCast(&ids_ptr),
             @ptrCast(&total_u32),
             @ptrCast(&dim_u32),
+            @ptrCast(&scale_value),
         };
         try launch1d(function, ctx, count, &params);
     }
@@ -2415,6 +3613,7 @@ pub const KernelModule = struct {
         ids: buffer_mod.DeviceBuffer,
         total: usize,
         dim: usize,
+        scale: f32,
     ) driver_mod.Error!void {
         const count = try checkedTensorElements(total, dim);
         try checkBytes(dst, count);
@@ -2427,12 +3626,14 @@ pub const KernelModule = struct {
         var ids_ptr = ids.ptr;
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
+        var scale_value = scale;
         var params = [_]?*anyopaque{
             @ptrCast(&dst_ptr),
             @ptrCast(&weight_ptr),
             @ptrCast(&ids_ptr),
             @ptrCast(&total_u32),
             @ptrCast(&dim_u32),
+            @ptrCast(&scale_value),
         };
         try launch1d(self.embedding_lookup_i32_f32, ctx, count, &params);
     }
@@ -2652,6 +3853,7 @@ pub const KernelModule = struct {
         ids: buffer_mod.DeviceBuffer,
         total: usize,
         dim: usize,
+        scale: f32,
     ) driver_mod.Error!void {
         if (dim == 0 or dim % q4_k_values_per_block != 0) return error.InvalidCudaState;
         const count = try checkedTensorElements(total, dim);
@@ -2664,12 +3866,14 @@ pub const KernelModule = struct {
         var ids_ptr = ids.ptr;
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
+        var scale_value = scale;
         var params = [_]?*anyopaque{
             @ptrCast(&dst_ptr),
             @ptrCast(&weight_ptr),
             @ptrCast(&ids_ptr),
             @ptrCast(&total_u32),
             @ptrCast(&dim_u32),
+            @ptrCast(&scale_value),
         };
         try launch1d(self.embedding_lookup_q4_k_f32, ctx, count, &params);
     }
@@ -2682,6 +3886,7 @@ pub const KernelModule = struct {
         ids: buffer_mod.DeviceBuffer,
         total: usize,
         dim: usize,
+        scale: f32,
     ) driver_mod.Error!void {
         if (dim == 0 or dim % q6_k_values_per_block != 0) return error.InvalidCudaState;
         const count = try checkedTensorElements(total, dim);
@@ -2696,12 +3901,14 @@ pub const KernelModule = struct {
         var ids_ptr = ids.ptr;
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
+        var scale_value = scale;
         var params = [_]?*anyopaque{
             @ptrCast(&dst_ptr),
             @ptrCast(&weight_ptr),
             @ptrCast(&ids_ptr),
             @ptrCast(&total_u32),
             @ptrCast(&dim_u32),
+            @ptrCast(&scale_value),
         };
         try launch1d(self.embedding_lookup_q6_k_f32, ctx, count, &params);
     }
@@ -2714,6 +3921,7 @@ pub const KernelModule = struct {
         ids: buffer_mod.DeviceBuffer,
         total: usize,
         dim: usize,
+        scale: f32,
     ) driver_mod.Error!void {
         if (dim == 0 or dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
         const count = try checkedTensorElements(total, dim);
@@ -2728,12 +3936,14 @@ pub const KernelModule = struct {
         var ids_ptr = ids.ptr;
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
+        var scale_value = scale;
         var params = [_]?*anyopaque{
             @ptrCast(&dst_ptr),
             @ptrCast(&weight_ptr),
             @ptrCast(&ids_ptr),
             @ptrCast(&total_u32),
             @ptrCast(&dim_u32),
+            @ptrCast(&scale_value),
         };
         try launch1d(self.embedding_lookup_q4_0_f32, ctx, count, &params);
     }
@@ -2746,6 +3956,7 @@ pub const KernelModule = struct {
         ids: buffer_mod.DeviceBuffer,
         total: usize,
         dim: usize,
+        scale: f32,
     ) driver_mod.Error!void {
         if (dim == 0 or dim % q8_0_values_per_block != 0) return error.InvalidCudaState;
         const count = try checkedTensorElements(total, dim);
@@ -2760,12 +3971,14 @@ pub const KernelModule = struct {
         var ids_ptr = ids.ptr;
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
+        var scale_value = scale;
         var params = [_]?*anyopaque{
             @ptrCast(&dst_ptr),
             @ptrCast(&weight_ptr),
             @ptrCast(&ids_ptr),
             @ptrCast(&total_u32),
             @ptrCast(&dim_u32),
+            @ptrCast(&scale_value),
         };
         try launch1d(self.embedding_lookup_q8_0_f32, ctx, count, &params);
     }
@@ -2778,6 +3991,7 @@ pub const KernelModule = struct {
         ids: buffer_mod.DeviceBuffer,
         total: usize,
         dim: usize,
+        scale: f32,
     ) driver_mod.Error!void {
         if (dim == 0 or dim % q4_k_values_per_block != 0) return error.InvalidCudaState;
         const count = try checkedTensorElements(total, dim);
@@ -2790,12 +4004,14 @@ pub const KernelModule = struct {
         var ids_ptr = ids.ptr;
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
+        var scale_value = scale;
         var params = [_]?*anyopaque{
             @ptrCast(&dst_ptr),
             @ptrCast(&weight_ptr),
             @ptrCast(&ids_ptr),
             @ptrCast(&total_u32),
             @ptrCast(&dim_u32),
+            @ptrCast(&scale_value),
         };
         try launch1d(self.embedding_lookup_i32_q4_k_f32, ctx, count, &params);
     }
@@ -2808,6 +4024,7 @@ pub const KernelModule = struct {
         ids: buffer_mod.DeviceBuffer,
         total: usize,
         dim: usize,
+        scale: f32,
     ) driver_mod.Error!void {
         if (dim == 0 or dim % q6_k_values_per_block != 0) return error.InvalidCudaState;
         const count = try checkedTensorElements(total, dim);
@@ -2822,14 +4039,116 @@ pub const KernelModule = struct {
         var ids_ptr = ids.ptr;
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
+        var scale_value = scale;
         var params = [_]?*anyopaque{
             @ptrCast(&dst_ptr),
             @ptrCast(&weight_ptr),
             @ptrCast(&ids_ptr),
             @ptrCast(&total_u32),
             @ptrCast(&dim_u32),
+            @ptrCast(&scale_value),
         };
         try launch1d(self.embedding_lookup_i32_q6_k_f32, ctx, count, &params);
+    }
+
+    pub fn launchEmbeddingAddWeightedI32Q6KF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        ids: buffer_mod.DeviceBuffer,
+        rhs: buffer_mod.DeviceBuffer,
+        total: usize,
+        dim: usize,
+        lhs_scale: f32,
+        rhs_scale: f32,
+    ) driver_mod.Error!void {
+        if (dim == 0 or dim % q6_k_values_per_block != 0) return error.InvalidCudaState;
+        const count = try checkedTensorElements(total, dim);
+        try checkBytes(dst, count);
+        try checkBytes(rhs, count);
+        try checkRawBytes(ids, try checkedTensorElements(total, @sizeOf(i32)));
+        const row_blocks = dim / q6_k_values_per_block;
+        try checkRawBytes(weight_raw, try checkedTensorElements(row_blocks, q6_k_block_bytes));
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var ids_ptr = ids.ptr;
+        var rhs_ptr = rhs.ptr;
+        var total_u32 = try toU32(total);
+        var dim_u32 = try toU32(dim);
+        var lhs_scale_value = lhs_scale;
+        var rhs_scale_value = rhs_scale;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&ids_ptr),
+            @ptrCast(&rhs_ptr),
+            @ptrCast(&total_u32),
+            @ptrCast(&dim_u32),
+            @ptrCast(&lhs_scale_value),
+            @ptrCast(&rhs_scale_value),
+        };
+        try launch1d(self.embedding_add_weighted_i32_q6_k_f32, ctx, count, &params);
+    }
+
+    pub fn launchRmsNormAddWeightedEmbeddingI32Q6KF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        norm_weight: buffer_mod.DeviceBuffer,
+        embedding_weight_raw: buffer_mod.DeviceBuffer,
+        ids: buffer_mod.DeviceBuffer,
+        total: usize,
+        num_groups: usize,
+        group_dim: usize,
+        eps: f32,
+        lhs_scale: f32,
+        rhs_scale: f32,
+    ) driver_mod.Error!void {
+        const function = self.rms_norm_add_weighted_embedding_i32_q6_k_f32 orelse return error.CudaKernelUnavailable;
+        if (group_dim == 0 or num_groups == 0) return error.InvalidCudaState;
+        const embedding_dim = try checkedTensorElements(num_groups, group_dim);
+        if (embedding_dim % q6_k_values_per_block != 0) return error.InvalidCudaState;
+        const count = try checkedTensorElements(total, embedding_dim);
+        const rows = try checkedTensorElements(total, num_groups);
+        try checkBytes(dst, count);
+        try checkBytes(input, count);
+        try checkBytes(norm_weight, group_dim);
+        try checkRawBytes(ids, try checkedTensorElements(total, @sizeOf(i32)));
+        const row_blocks = embedding_dim / q6_k_values_per_block;
+        try checkRawBytes(embedding_weight_raw, try checkedTensorElements(row_blocks, q6_k_block_bytes));
+        if (count == 0 or rows == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var norm_weight_ptr = norm_weight.ptr;
+        var embedding_weight_ptr = embedding_weight_raw.ptr;
+        var ids_ptr = ids.ptr;
+        var total_u32 = try toU32(total);
+        var num_groups_u32 = try toU32(num_groups);
+        var group_dim_u32 = try toU32(group_dim);
+        var embedding_dim_u32 = try toU32(embedding_dim);
+        var eps_value = eps;
+        var lhs_scale_value = lhs_scale;
+        var rhs_scale_value = rhs_scale;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&norm_weight_ptr),
+            @ptrCast(&embedding_weight_ptr),
+            @ptrCast(&ids_ptr),
+            @ptrCast(&total_u32),
+            @ptrCast(&num_groups_u32),
+            @ptrCast(&group_dim_u32),
+            @ptrCast(&embedding_dim_u32),
+            @ptrCast(&eps_value),
+            @ptrCast(&lhs_scale_value),
+            @ptrCast(&rhs_scale_value),
+        };
+        try launchBlocks(function, ctx, rows, 256, &params);
     }
 
     pub fn launchEmbeddingLookupI32Q4_0F32(
@@ -2840,6 +4159,7 @@ pub const KernelModule = struct {
         ids: buffer_mod.DeviceBuffer,
         total: usize,
         dim: usize,
+        scale: f32,
     ) driver_mod.Error!void {
         if (dim == 0 or dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
         const count = try checkedTensorElements(total, dim);
@@ -2854,12 +4174,14 @@ pub const KernelModule = struct {
         var ids_ptr = ids.ptr;
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
+        var scale_value = scale;
         var params = [_]?*anyopaque{
             @ptrCast(&dst_ptr),
             @ptrCast(&weight_ptr),
             @ptrCast(&ids_ptr),
             @ptrCast(&total_u32),
             @ptrCast(&dim_u32),
+            @ptrCast(&scale_value),
         };
         try launch1d(self.embedding_lookup_i32_q4_0_f32, ctx, count, &params);
     }
@@ -2872,6 +4194,7 @@ pub const KernelModule = struct {
         ids: buffer_mod.DeviceBuffer,
         total: usize,
         dim: usize,
+        scale: f32,
     ) driver_mod.Error!void {
         if (dim == 0 or dim % q8_0_values_per_block != 0) return error.InvalidCudaState;
         const count = try checkedTensorElements(total, dim);
@@ -2886,12 +4209,14 @@ pub const KernelModule = struct {
         var ids_ptr = ids.ptr;
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
+        var scale_value = scale;
         var params = [_]?*anyopaque{
             @ptrCast(&dst_ptr),
             @ptrCast(&weight_ptr),
             @ptrCast(&ids_ptr),
             @ptrCast(&total_u32),
             @ptrCast(&dim_u32),
+            @ptrCast(&scale_value),
         };
         try launch1d(self.embedding_lookup_i32_q8_0_f32, ctx, count, &params);
     }
@@ -3557,6 +4882,51 @@ pub const KernelModule = struct {
         try launch1d(function, ctx, count, &params);
     }
 
+    pub fn supportsDecodeScalarsAdvance(self: *const KernelModule) bool {
+        return self.decode_scalars_advance != null;
+    }
+
+    pub fn launchDecodeScalarsAdvance(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        decode_scalars: buffer_mod.DeviceBuffer,
+        position_delta: u32,
+        query_position_delta: u32,
+        kv_seq_delta: u32,
+        total_sequence_delta: u32,
+        kv_position_delta: u32,
+    ) driver_mod.Error!void {
+        const function = self.decode_scalars_advance orelse return error.CudaKernelUnavailable;
+        try checkRawBytes(decode_scalars, 5 * @sizeOf(u32));
+        var decode_scalars_ptr = decode_scalars.ptr;
+        var position_delta_arg = position_delta;
+        var query_position_delta_arg = query_position_delta;
+        var kv_seq_delta_arg = kv_seq_delta;
+        var total_sequence_delta_arg = total_sequence_delta;
+        var kv_position_delta_arg = kv_position_delta;
+        var params = [_]?*anyopaque{
+            @ptrCast(&decode_scalars_ptr),
+            @ptrCast(&position_delta_arg),
+            @ptrCast(&query_position_delta_arg),
+            @ptrCast(&kv_seq_delta_arg),
+            @ptrCast(&total_sequence_delta_arg),
+            @ptrCast(&kv_position_delta_arg),
+        };
+        if (captureParamTraceIndex(ctx)) |trace_index| {
+            std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=decode_scalars_advance scalars=0x{x} deltas={d},{d},{d},{d},{d}", .{
+                ctx.debug_graph_capture_id,
+                trace_index,
+                decode_scalars_ptr,
+                position_delta_arg,
+                query_position_delta_arg,
+                kv_seq_delta_arg,
+                total_sequence_delta_arg,
+                kv_position_delta_arg,
+            });
+        }
+        try launch1d(function, ctx, 1, &params);
+    }
+
     pub fn launchRopeScaledF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -3981,6 +5351,28 @@ pub const KernelModule = struct {
                 bias_mode_u32,
             });
         }
+        if (self.gqa_attention_prefill_fast_f32) |prefill_function| {
+            if (fastGqaPrefillEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode)) {
+                const block: c_uint = if (head_dim <= 256) 256 else 512;
+                const grid = try toU32(try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), num_heads));
+                try ctx.makeCurrent();
+                try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+                    prefill_function,
+                    grid,
+                    1,
+                    1,
+                    block,
+                    1,
+                    1,
+                    0,
+                    ctx.stream,
+                    &params,
+                    null,
+                ));
+                ctx.noteKernelLaunch();
+                return .prefill_fast;
+            }
+        }
         if (self.gqa_attention_decode_f32) |decode_function| {
             if (head_dim <= 512) {
                 const block: c_uint = if (head_dim <= 256) 256 else 512;
@@ -4031,7 +5423,7 @@ pub const KernelModule = struct {
         mask_len: usize,
         bias_mode: u32,
     ) driver_mod.Error!GqaAttentionLaunchKind {
-        const function = self.gqa_attention_decode_scalars_f32 orelse return error.CudaKernelUnavailable;
+        const fallback_function = self.gqa_attention_decode_scalars_f32 orelse return error.CudaKernelUnavailable;
         if (head_dim > 512) return error.CudaKernelUnavailable;
         const q_hidden = try checkedTensorElements(num_heads, head_dim);
         const kv_hidden = try checkedTensorElements(num_kv_heads, head_dim);
@@ -4086,10 +5478,23 @@ pub const KernelModule = struct {
             @ptrCast(&bias_mode_u32),
             @ptrCast(&decode_scalars_ptr),
         };
+        var function = fallback_function;
+        var launch_kind: GqaAttentionLaunchKind = .decode;
+        if (fastGqaDecodeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode)) {
+            launch_kind = .decode_fast_fallback;
+            if (!fastGqaDecodeDisabled()) {
+                if (self.gqa_attention_decode_scalars_fast_f32) |fast_function| {
+                    function = fast_function;
+                    launch_kind = .decode_fast;
+                }
+            }
+        }
         if (captureParamTraceIndex(ctx)) |trace_index| {
-            std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=gqa_attention_decode_scalars dst=0x{x} q=0x{x} k=0x{x} v=0x{x} scalars=0x{x} fallback_query_position_offset={d} fallback_kv_seq_len={d} fallback_total_sequence_len={d}", .{
+            const kernel_name = if (launch_kind == .decode_fast) "gqa_attention_decode_scalars_fast" else "gqa_attention_decode_scalars";
+            std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel={s} dst=0x{x} q=0x{x} k=0x{x} v=0x{x} scalars=0x{x} fallback_query_position_offset={d} fallback_kv_seq_len={d} fallback_total_sequence_len={d}", .{
                 ctx.debug_graph_capture_id,
                 trace_index,
+                kernel_name,
                 dst_ptr,
                 q_ptr,
                 k_ptr,
@@ -4117,7 +5522,7 @@ pub const KernelModule = struct {
             null,
         ));
         ctx.noteKernelLaunch();
-        return .decode;
+        return launch_kind;
     }
 
     pub fn launchKvWriteSuffixDecodeScalarsF32(
@@ -4305,8 +5710,9 @@ pub const KernelModule = struct {
         format: u32,
         value_format: u32,
         physical_token_capacity: usize,
+        decode_scalars: buffer_mod.DeviceBuffer,
     ) driver_mod.Error!GqaAttentionLaunchKind {
-        const function = self.gqa_attention_decode_turboquant_f32 orelse return error.CudaKernelUnavailable;
+        const fallback_function = self.gqa_attention_decode_turboquant_f32 orelse return error.CudaKernelUnavailable;
         if (head_dim > 512 or key_row_bytes == 0 or base_key_row_bytes == 0 or value_row_bytes == 0 or base_key_row_bytes > key_row_bytes) return error.CudaKernelUnavailable;
         const q_hidden = try checkedTensorElements(num_heads, head_dim);
         const q_count = try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), q_hidden);
@@ -4317,6 +5723,7 @@ pub const KernelModule = struct {
         if (block_count != 0) try checkRawBytes(block_table, try checkedTensorElements(block_count, @sizeOf(u32)));
         if (mask_len != 0) try checkRawBytes(attn_or_mask, mask_len);
         if (bias_mode != 0) try checkBytes(bias, try checkedTensorElements(if (bias_mode == 2) batch * num_heads else num_heads, try checkedTensorElements(q_seq_len, kv_seq_len)));
+        if (decode_scalars.ptr != 0) try checkRawBytes(decode_scalars, 5 * @sizeOf(u32));
         if (q_count == 0) return .none;
 
         var dst_ptr = dst.ptr;
@@ -4346,6 +5753,7 @@ pub const KernelModule = struct {
         var format_u32 = format;
         var value_format_u32 = value_format;
         var physical_token_capacity_u32 = try toU32(physical_token_capacity);
+        var decode_scalars_ptr = decode_scalars.ptr;
         var params = [_]?*anyopaque{
             @ptrCast(&dst_ptr),
             @ptrCast(&q_ptr),
@@ -4374,11 +5782,73 @@ pub const KernelModule = struct {
             @ptrCast(&format_u32),
             @ptrCast(&value_format_u32),
             @ptrCast(&physical_token_capacity_u32),
+            @ptrCast(&decode_scalars_ptr),
         };
+        var function = fallback_function;
+        var launch_kind: GqaAttentionLaunchKind = .decode;
+        if ((format == 0 or format == 2) and
+            base_key_row_bytes == key_row_bytes and
+            decode_scalars.ptr == 0 and
+            (fastGqaPrefillEnabled() or tiledGqaPrefillEnabled() or mmaGqaPrefillEnabled()) and
+            gqaPrefillShapeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode))
+        {
+            if (fastGqaPrefillEnabled()) {
+                if (self.gqa_attention_prefill_turboquant_fast_f32) |prefill_function| {
+                    function = prefill_function;
+                    launch_kind = .prefill_fast;
+                }
+            }
+            if (tiledGqaPrefillEnabled()) {
+                if (self.gqa_attention_prefill_turboquant_tiled_f32) |tiled_function| {
+                    function = tiled_function;
+                    launch_kind = .prefill_tiled;
+                }
+            }
+            // Tensor-core prefill. The >48KB dynamic-smem opt-in needs
+            // cuFuncSetAttribute. head_dim <= 256 runs everywhere; the
+            // head_dim-512 global layers and the TILE_M=32 variant need the
+            // larger sm80+ shared-memory budget (89-97KB per block).
+            if (mmaGqaPrefillEnabled() and ctx.driver.fns.cuFuncSetAttribute != null) {
+                const sm80_plus = ctx.info.compute_major >= 8;
+                const mma_hd_ok = head_dim <= 256 or (head_dim <= 512 and sm80_plus);
+                if (head_dim <= 256 and sm80_plus and mmaM32GqaPrefillEnabled()) {
+                    if (self.gqa_attention_prefill_turboquant_mma_m32_f32) |mma_m32_function| {
+                        function = mma_m32_function;
+                        launch_kind = .prefill_mma_m32;
+                    }
+                }
+                if (launch_kind != .prefill_mma_m32 and mma_hd_ok) {
+                    if (self.gqa_attention_prefill_turboquant_mma_f32) |mma_function| {
+                        function = mma_function;
+                        launch_kind = .prefill_mma;
+                    }
+                }
+            }
+        } else if ((format == 0 or format == 2) and
+            base_key_row_bytes == key_row_bytes and
+            fastGqaDecodeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode))
+        {
+            launch_kind = .decode_fast_fallback;
+            if (!fastGqaDecodeDisabled()) {
+                if (self.gqa_attention_decode_turboquant_fast_f32) |fast_function| {
+                    function = fast_function;
+                    launch_kind = .decode_fast;
+                }
+            }
+        }
         if (captureParamTraceIndex(ctx)) |trace_index| {
-            std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=gqa_attention_decode_turboquant dst=0x{x} q=0x{x} k=0x{x} v=0x{x} block_table=0x{x} mask=0x{x} bias=0x{x} batch={d} q_seq_len={d} kv_seq_len={d} num_heads={d} num_kv_heads={d} head_dim={d} key_row_bytes={d} base_key_row_bytes={d} value_row_bytes={d} block_count={d} page_size={d} format={d} value_format={d}", .{
+            const kernel_name = switch (launch_kind) {
+                .decode_fast => "gqa_attention_decode_turboquant_fast",
+                .prefill_fast => "gqa_attention_prefill_turboquant_fast",
+                .prefill_tiled => "gqa_attention_prefill_turboquant_tiled",
+                .prefill_mma => "gqa_attention_prefill_turboquant_mma",
+                .prefill_mma_m32 => "gqa_attention_prefill_turboquant_mma_m32",
+                else => "gqa_attention_decode_turboquant",
+            };
+            std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel={s} dst=0x{x} q=0x{x} k=0x{x} v=0x{x} block_table=0x{x} mask=0x{x} bias=0x{x} scalars=0x{x} batch={d} q_seq_len={d} kv_seq_len={d} num_heads={d} num_kv_heads={d} head_dim={d} key_row_bytes={d} base_key_row_bytes={d} value_row_bytes={d} block_count={d} page_size={d} format={d} value_format={d}", .{
                 ctx.debug_graph_capture_id,
                 trace_index,
+                kernel_name,
                 dst_ptr,
                 q_ptr,
                 k_ptr,
@@ -4386,6 +5856,7 @@ pub const KernelModule = struct {
                 block_table_ptr,
                 mask_ptr,
                 bias_ptr,
+                decode_scalars_ptr,
                 batch_u32,
                 q_seq_len_u32,
                 kv_seq_len_u32,
@@ -4401,24 +5872,184 @@ pub const KernelModule = struct {
                 value_format_u32,
             });
         }
-        const block: c_uint = if (head_dim <= 256) 256 else 512;
-        const grid = try toU32(try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), num_heads));
+        var block: c_uint = if (head_dim <= 256) 256 else 512;
+        var grid_x = try toU32(try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), num_heads));
+        var grid_y: c_uint = 1;
+        var shared_bytes: c_uint = 0;
+        if (launch_kind == .prefill_tiled) {
+            // Tiled prefill: grid = (num_heads, ceil(q_seq_len / TILE_M)), TILE_M = 16.
+            // Dynamic smem holds one BF16 K/V tile: tile_n * (head_dim + 2) * 2 bytes.
+            block = 256;
+            grid_x = try toU32(num_heads);
+            grid_y = try toU32((q_seq_len + 15) / 16);
+            const tile_n: usize = if (head_dim <= 256) 32 else 16;
+            shared_bytes = try toU32(tile_n * (head_dim + 2) * @sizeOf(u16));
+        } else if (launch_kind == .prefill_mma) {
+            // MMA prefill: same grid shape as tiled. Dynamic smem holds the
+            // f16 Q tile (16*hd), one tile_n-key f16 K/V tile (tile_n*(hd+8)),
+            // the f32 score tile (16*72), the f16 P tile (16*72), and the f32
+            // output tile (16*hd). tile_n is 64 for head_dim <= 256 (224*hd +
+            // 7936 bytes) and 32 for the 512-dim global layers (160*hd + 7424).
+            block = 256;
+            grid_x = try toU32(num_heads);
+            grid_y = try toU32((q_seq_len + 15) / 16);
+            shared_bytes = if (head_dim <= 256)
+                try toU32(224 * head_dim + 7936)
+            else
+                try toU32(160 * head_dim + 7424);
+        } else if (launch_kind == .prefill_mma_m32) {
+            // TILE_M=32 MMA prefill: 32 query rows per block, 64-key tiles.
+            // Dynamic smem: 320*hd + 14848 bytes (96768 at head_dim 256).
+            block = 256;
+            grid_x = try toU32(num_heads);
+            grid_y = try toU32((q_seq_len + 31) / 32);
+            shared_bytes = try toU32(320 * head_dim + 14848);
+        }
         try ctx.makeCurrent();
+        if (launch_kind == .prefill_mma and !self.gqa_prefill_mma_smem_opted_in) {
+            // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8. The
+            // attribute must cover this function's largest launch: 89344 for
+            // the head_dim-512 config on sm80+, 65280 (head_dim 256, within
+            // Turing's 64KB opt-in cap) otherwise.
+            const set_attr = ctx.driver.fns.cuFuncSetAttribute.?;
+            const max_shared: c_int = if (ctx.info.compute_major >= 8) 89344 else 65280;
+            try ctx.driver.check(set_attr(function, 8, max_shared));
+            self.gqa_prefill_mma_smem_opted_in = true;
+        }
+        if (launch_kind == .prefill_mma_m32 and !self.gqa_prefill_mma_m32_smem_opted_in) {
+            const set_attr = ctx.driver.fns.cuFuncSetAttribute.?;
+            try ctx.driver.check(set_attr(function, 8, 96768));
+            self.gqa_prefill_mma_m32_smem_opted_in = true;
+        }
         try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
             function,
-            grid,
-            1,
+            grid_x,
+            grid_y,
             1,
             block,
             1,
             1,
-            0,
+            shared_bytes,
             ctx.stream,
             &params,
             null,
         ));
         ctx.noteKernelLaunch();
-        return .decode;
+        return launch_kind;
+    }
+
+    pub fn launchGqaAttentionDecodeTurboquantSplitF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        partial_acc: buffer_mod.DeviceBuffer,
+        partial_meta: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        block_table: buffer_mod.DeviceBuffer,
+        q_count: usize,
+        kv_seq_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        query_position_offset: usize,
+        kv_position_offset: usize,
+        sliding_window: usize,
+        key_row_bytes: usize,
+        value_row_bytes: usize,
+        block_count: usize,
+        page_size_tokens: usize,
+        format: u32,
+        value_format: u32,
+        physical_token_capacity: usize,
+        decode_scalars: buffer_mod.DeviceBuffer,
+        chunk_size: usize,
+        chunk_count: usize,
+    ) driver_mod.Error!bool {
+        const stage1 = if (format == 0 and value_format == 1 and block_count == 0)
+            (self.gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32 orelse self.gqa_attention_decode_turboquant_split_stage1_f32 orelse return false)
+        else
+            (self.gqa_attention_decode_turboquant_split_stage1_f32 orelse return false);
+        const stage2 = self.gqa_attention_decode_turboquant_split_stage2_f32 orelse return false;
+        if ((format != 0 and format != 2) or chunk_size == 0 or chunk_count <= 1 or chunk_count > 128) return false;
+        if (!fastGqaDecodeEligible(1, 1, num_heads, num_kv_heads, head_dim, 0, 0)) return false;
+        if (key_row_bytes == 0 or value_row_bytes == 0) return false;
+
+        try checkBytes(dst, q_count);
+        try checkBytes(q, q_count);
+        try checkRawBytes(k, try checkedTensorElements(physical_token_capacity, key_row_bytes));
+        try checkRawBytes(v, try checkedTensorElements(physical_token_capacity, value_row_bytes));
+        if (block_count != 0) try checkRawBytes(block_table, try checkedTensorElements(block_count, @sizeOf(u32)));
+        if (decode_scalars.ptr != 0) try checkRawBytes(decode_scalars, 5 * @sizeOf(u32));
+        try checkBytes(partial_acc, try checkedTensorElements(try checkedTensorElements(num_heads, chunk_count), head_dim));
+        try checkBytes(partial_meta, try checkedTensorElements(try checkedTensorElements(num_heads, chunk_count), @as(usize, 2)));
+
+        var partial_acc_ptr = partial_acc.ptr;
+        var partial_meta_ptr = partial_meta.ptr;
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var block_table_ptr = block_table.ptr;
+        var kv_seq_len_u32 = try toU32(kv_seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var num_kv_heads_u32 = try toU32(num_kv_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var query_position_offset_u32 = try toU32(query_position_offset);
+        var kv_position_offset_u32 = try toU32(kv_position_offset);
+        var sliding_window_u32 = try toU32(sliding_window);
+        var key_row_bytes_u32 = try toU32(key_row_bytes);
+        var value_row_bytes_u32 = try toU32(value_row_bytes);
+        var block_count_u32 = try toU32(block_count);
+        var page_size_tokens_u32 = try toU32(page_size_tokens);
+        var format_u32 = format;
+        var value_format_u32 = value_format;
+        var physical_token_capacity_u32 = try toU32(physical_token_capacity);
+        var decode_scalars_ptr = decode_scalars.ptr;
+        var chunk_size_u32 = try toU32(chunk_size);
+        var chunk_count_u32 = try toU32(chunk_count);
+
+        var stage1_params = [_]?*anyopaque{
+            @ptrCast(&partial_acc_ptr),
+            @ptrCast(&partial_meta_ptr),
+            @ptrCast(&q_ptr),
+            @ptrCast(&k_ptr),
+            @ptrCast(&v_ptr),
+            @ptrCast(&block_table_ptr),
+            @ptrCast(&kv_seq_len_u32),
+            @ptrCast(&num_heads_u32),
+            @ptrCast(&num_kv_heads_u32),
+            @ptrCast(&head_dim_u32),
+            @ptrCast(&query_position_offset_u32),
+            @ptrCast(&kv_position_offset_u32),
+            @ptrCast(&sliding_window_u32),
+            @ptrCast(&key_row_bytes_u32),
+            @ptrCast(&value_row_bytes_u32),
+            @ptrCast(&block_count_u32),
+            @ptrCast(&page_size_tokens_u32),
+            @ptrCast(&format_u32),
+            @ptrCast(&value_format_u32),
+            @ptrCast(&physical_token_capacity_u32),
+            @ptrCast(&decode_scalars_ptr),
+            @ptrCast(&chunk_size_u32),
+            @ptrCast(&chunk_count_u32),
+        };
+        try launch2d(stage1, ctx, num_heads, chunk_count, if (head_dim <= 256) 256 else 512, &stage1_params);
+
+        var stage2_params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&partial_acc_ptr),
+            @ptrCast(&partial_meta_ptr),
+            @ptrCast(&num_heads_u32),
+            @ptrCast(&head_dim_u32),
+            @ptrCast(&kv_seq_len_u32),
+            @ptrCast(&decode_scalars_ptr),
+            @ptrCast(&chunk_size_u32),
+            @ptrCast(&chunk_count_u32),
+        };
+        try launchBlocks(stage2, ctx, num_heads, if (head_dim <= 256) 256 else 512, &stage2_params);
+        return true;
     }
 
     pub fn launchDebertaAttentionF32(
@@ -4622,6 +6253,182 @@ pub const KernelModule = struct {
             @ptrCast(&activation_u32),
         };
         try launch2d(function, ctx, (out_dim + q8_0_col_tile - 1) / q8_0_col_tile, rows, q8_0_tiled_threads, &params);
+    }
+
+    pub fn launchLinearQ4_0GatedDownTile4F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        gate: buffer_mod.DeviceBuffer,
+        up: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        activation: u8,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_gated_down_f32_tile4 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const in_count = try checkedTensorElements(rows, in_dim);
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(gate, in_count);
+        try checkBytes(up, in_count);
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var gate_ptr = gate.ptr;
+        var up_ptr = up.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var activation_u32: u32 = activation;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&gate_ptr),
+            @ptrCast(&up_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+            @ptrCast(&activation_u32),
+        };
+        try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads, &params);
+    }
+
+    pub fn launchLinearQ4_0GatedDownTile4W4F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        gate: buffer_mod.DeviceBuffer,
+        up: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        activation: u8,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_gated_down_f32_tile4_w4 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const in_count = try checkedTensorElements(rows, in_dim);
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(gate, in_count);
+        try checkBytes(up, in_count);
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var gate_ptr = gate.ptr;
+        var up_ptr = up.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var activation_u32: u32 = activation;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&gate_ptr),
+            @ptrCast(&up_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+            @ptrCast(&activation_u32),
+        };
+        try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads_w4, &params);
+    }
+
+    pub fn launchLinearQ4_0GatedDownTile8F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        gate: buffer_mod.DeviceBuffer,
+        up: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        activation: u8,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_gated_down_f32_tile8 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const in_count = try checkedTensorElements(rows, in_dim);
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(gate, in_count);
+        try checkBytes(up, in_count);
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var gate_ptr = gate.ptr;
+        var up_ptr = up.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var activation_u32: u32 = activation;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&gate_ptr),
+            @ptrCast(&up_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+            @ptrCast(&activation_u32),
+        };
+        try launch2d(function, ctx, (out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8, rows, q4_0_tiled_threads, &params);
+    }
+
+    pub fn launchLinearQ4_0GatedDownTile16F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        gate: buffer_mod.DeviceBuffer,
+        up: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        activation: u8,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_gated_down_f32_tile16 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const in_count = try checkedTensorElements(rows, in_dim);
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(gate, in_count);
+        try checkBytes(up, in_count);
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var gate_ptr = gate.ptr;
+        var up_ptr = up.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var activation_u32: u32 = activation;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&gate_ptr),
+            @ptrCast(&up_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+            @ptrCast(&activation_u32),
+        };
+        try launch2d(function, ctx, (out_dim + q4_0_col_tile16 - 1) / q4_0_col_tile16, rows, q4_0_tiled_threads, &params);
     }
 
     pub fn launchLinearQ8_0VariantF32(
@@ -4961,6 +6768,544 @@ pub const KernelModule = struct {
             @ptrCast(&out_dim_u32),
         };
         try launch1d(self.linear_q4_0_f32, ctx, out_count, &params);
+    }
+
+    pub fn launchLinearQ4_0Tile4F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_f32_tile4 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads, &params);
+    }
+
+    pub fn launchLinearQ4_0Tile4W4F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_f32_tile4_w4 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads_w4, &params);
+    }
+
+    pub fn launchQuantizeF32Q8_1Rows(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst_q8_1: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.quantize_f32_q8_1_rows orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q8_1_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q8_1_values_per_block;
+        const total_blocks = try checkedTensorElements(rows, row_blocks);
+        try checkRawBytes(dst_q8_1, try checkedTensorElements(total_blocks, q8_1_block_bytes));
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        if (total_blocks == 0) return;
+
+        var dst_ptr = dst_q8_1.ptr;
+        var input_ptr = input.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+        };
+        try launchBlocks(function, ctx, (total_blocks + q8_1_quantize_warps - 1) / q8_1_quantize_warps, q8_1_quantize_threads, &params);
+    }
+
+    pub fn launchQuantizeGatedF32Q8_1Rows(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst_q8_1: buffer_mod.DeviceBuffer,
+        gate: buffer_mod.DeviceBuffer,
+        up: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        activation: u8,
+    ) driver_mod.Error!void {
+        const function = self.quantize_gated_f32_q8_1_rows orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q8_1_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q8_1_values_per_block;
+        const total_blocks = try checkedTensorElements(rows, row_blocks);
+        const in_count = try checkedTensorElements(rows, in_dim);
+        try checkRawBytes(dst_q8_1, try checkedTensorElements(total_blocks, q8_1_block_bytes));
+        try checkBytes(gate, in_count);
+        try checkBytes(up, in_count);
+        if (total_blocks == 0) return;
+
+        var dst_ptr = dst_q8_1.ptr;
+        var gate_ptr = gate.ptr;
+        var up_ptr = up.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var activation_u32: u32 = activation;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&gate_ptr),
+            @ptrCast(&up_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&activation_u32),
+        };
+        try launchBlocks(function, ctx, (total_blocks + q8_1_quantize_warps - 1) / q8_1_quantize_warps, q8_1_quantize_threads, &params);
+    }
+
+    pub fn launchLinearQ4_0Q8_1Tile4F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0 or q4_0_values_per_block != q8_1_values_per_block) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, row_blocks), q8_1_block_bytes));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_ptr = weight_raw.ptr;
+        if (rows == 1 and out_dim == 2560) {
+            if (in_dim == 2048) {
+                if (self.linear_q4_0_q8_1_f32_tile4_e4b_attn_2048) |function| {
+                    var params = [_]?*anyopaque{
+                        @ptrCast(&dst_ptr),
+                        @ptrCast(&input_ptr),
+                        @ptrCast(&weight_ptr),
+                    };
+                    try launchBlocks(function, ctx, out_dim / q4_0_col_tile, q4_0_tiled_threads_w4, &params);
+                    return;
+                }
+            } else if (in_dim == 4096) {
+                if (self.linear_q4_0_q8_1_f32_tile4_e4b_attn_4096) |function| {
+                    var params = [_]?*anyopaque{
+                        @ptrCast(&dst_ptr),
+                        @ptrCast(&input_ptr),
+                        @ptrCast(&weight_ptr),
+                    };
+                    try launchBlocks(function, ctx, out_dim / q4_0_col_tile, q4_0_tiled_threads_w4, &params);
+                    return;
+                }
+            }
+        }
+
+        const function = self.linear_q4_0_q8_1_f32_tile4 orelse return error.CudaKernelUnavailable;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads_w4, &params);
+    }
+
+    pub fn launchLinearQ4_0Q8_1Tile4W8F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0 or q4_0_values_per_block != q8_1_values_per_block) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, row_blocks), q8_1_block_bytes));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_ptr = weight_raw.ptr;
+        if (rows > 1) {
+            if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_ROWS8_C4", false)) {
+                if (self.linear_q4_0_q8_1_f32_tile4_w8_rows8_c4) |function| {
+                    var rows_u32 = try toU32(rows);
+                    var in_dim_u32 = try toU32(in_dim);
+                    var out_dim_u32 = try toU32(out_dim);
+                    var params = [_]?*anyopaque{
+                        @ptrCast(&dst_ptr),
+                        @ptrCast(&input_ptr),
+                        @ptrCast(&weight_ptr),
+                        @ptrCast(&rows_u32),
+                        @ptrCast(&in_dim_u32),
+                        @ptrCast(&out_dim_u32),
+                    };
+                    try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, (rows + 7) / 8, q4_0_tiled_threads, &params);
+                    return;
+                }
+            }
+            if (self.linear_q4_0_q8_1_f32_tile4_w8_rows4) |function| {
+                var rows_u32 = try toU32(rows);
+                var in_dim_u32 = try toU32(in_dim);
+                var out_dim_u32 = try toU32(out_dim);
+                var params = [_]?*anyopaque{
+                    @ptrCast(&dst_ptr),
+                    @ptrCast(&input_ptr),
+                    @ptrCast(&weight_ptr),
+                    @ptrCast(&rows_u32),
+                    @ptrCast(&in_dim_u32),
+                    @ptrCast(&out_dim_u32),
+                };
+                try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, (rows + 3) / 4, q4_0_tiled_threads, &params);
+                return;
+            }
+            if (self.linear_q4_0_q8_1_f32_tile4_w8_rows2) |function| {
+                var rows_u32 = try toU32(rows);
+                var in_dim_u32 = try toU32(in_dim);
+                var out_dim_u32 = try toU32(out_dim);
+                var params = [_]?*anyopaque{
+                    @ptrCast(&dst_ptr),
+                    @ptrCast(&input_ptr),
+                    @ptrCast(&weight_ptr),
+                    @ptrCast(&rows_u32),
+                    @ptrCast(&in_dim_u32),
+                    @ptrCast(&out_dim_u32),
+                };
+                try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, (rows + 1) / 2, q4_0_tiled_threads, &params);
+                return;
+            }
+        }
+        if (in_dim == 10240 and out_dim == 2560) {
+            if (rows == 1 and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN", false)) {
+                if (self.linear_q4_0_q8_1_f32_tile4_w10_e4b_down) |function| {
+                    var params = [_]?*anyopaque{
+                        @ptrCast(&dst_ptr),
+                        @ptrCast(&input_ptr),
+                        @ptrCast(&weight_ptr),
+                    };
+                    try launchBlocks(function, ctx, out_dim / q4_0_col_tile, q4_0_tiled_threads_w10, &params);
+                    return;
+                }
+            }
+            if (rows > 1) {
+                if (self.linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows) |function| {
+                    var params = [_]?*anyopaque{
+                        @ptrCast(&dst_ptr),
+                        @ptrCast(&input_ptr),
+                        @ptrCast(&weight_ptr),
+                    };
+                    try launch2d(function, ctx, out_dim / q4_0_col_tile, rows, q4_0_tiled_threads, &params);
+                    return;
+                }
+            } else if (self.linear_q4_0_q8_1_f32_tile4_w8_e4b_down) |function| {
+                var params = [_]?*anyopaque{
+                    @ptrCast(&dst_ptr),
+                    @ptrCast(&input_ptr),
+                    @ptrCast(&weight_ptr),
+                };
+                try launchBlocks(function, ctx, out_dim / q4_0_col_tile, q4_0_tiled_threads, &params);
+                return;
+            }
+        }
+
+        const function = self.linear_q4_0_q8_1_f32_tile4_w8 orelse return error.CudaKernelUnavailable;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads, &params);
+    }
+
+    pub fn launchLinearQ4_0Q8_1Tile8F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_q8_1_f32_tile8 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0 or q4_0_values_per_block != q8_1_values_per_block) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, row_blocks), q8_1_block_bytes));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launch2d(function, ctx, (out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8, rows, q4_0_tiled_threads_w4, &params);
+    }
+
+    pub fn launchLinearQ4_0Tile8F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_f32_tile8 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launch2d(function, ctx, (out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8, rows, q4_0_tiled_threads, &params);
+    }
+
+    pub fn launchLinearQ4_0ActivationSliceLastDimTile4F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        source: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        source_cols: usize,
+        source_start: usize,
+        activation: u8,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_activation_slice_last_dim_f32_tile4 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        if (source_start > source_cols or out_dim > source_cols - source_start) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        try checkBytes(source, try checkedTensorElements(rows, source_cols));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var source_ptr = source.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var source_cols_u32 = try toU32(source_cols);
+        var source_start_u32 = try toU32(source_start);
+        var activation_u32: u32 = activation;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&source_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+            @ptrCast(&source_cols_u32),
+            @ptrCast(&source_start_u32),
+            @ptrCast(&activation_u32),
+        };
+        try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads, &params);
+    }
+
+    pub fn launchLinearQ4_0ActivationSliceLastDimTile4W4F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        source: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        source_cols: usize,
+        source_start: usize,
+        activation: u8,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_activation_slice_last_dim_f32_tile4_w4 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        if (source_start > source_cols or out_dim > source_cols - source_start) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        try checkBytes(source, try checkedTensorElements(rows, source_cols));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var source_ptr = source.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var source_cols_u32 = try toU32(source_cols);
+        var source_start_u32 = try toU32(source_start);
+        var activation_u32: u32 = activation;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&source_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+            @ptrCast(&source_cols_u32),
+            @ptrCast(&source_start_u32),
+            @ptrCast(&activation_u32),
+        };
+        try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads_w4, &params);
+    }
+
+    pub fn launchLinearQ4_0ActivationSliceLastDimQ8_1Tile4F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        source: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        source_cols: usize,
+        source_start: usize,
+        activation: u8,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_activation_slice_last_dim_q8_1_f32_tile4 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0 or q4_0_values_per_block != q8_1_values_per_block) return error.InvalidCudaState;
+        if (source_start > source_cols or out_dim > source_cols - source_start) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, row_blocks), q8_1_block_bytes));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        try checkBytes(source, try checkedTensorElements(rows, source_cols));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var source_ptr = source.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var source_cols_u32 = try toU32(source_cols);
+        var source_start_u32 = try toU32(source_start);
+        var activation_u32: u32 = activation;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&source_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+            @ptrCast(&source_cols_u32),
+            @ptrCast(&source_start_u32),
+            @ptrCast(&activation_u32),
+        };
+        try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads_w4, &params);
     }
 
     pub fn launchLinearQ4KF32(
@@ -6274,6 +8619,604 @@ pub const KernelModule = struct {
         try launchBlocks(function, ctx, total_tiles, q8_0_tiled_threads, &params);
     }
 
+    pub fn launchLinearQ4_0PairNoBiasTile4F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst_a: buffer_mod.DeviceBuffer,
+        dst_b: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_a: buffer_mod.DeviceBuffer,
+        weight_b: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_pair_nobias_f32_tile4 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes);
+        try checkBytes(dst_a, out_count);
+        try checkBytes(dst_b, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_a, weight_bytes);
+        try checkRawBytes(weight_b, weight_bytes);
+        const col_tiles = (out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
+        const tiles_per_row = try checkedTensorElements(col_tiles, 2);
+        const total_tiles = try checkedTensorElements(rows, tiles_per_row);
+        if (total_tiles == 0) return;
+
+        var dst_a_ptr = dst_a.ptr;
+        var dst_b_ptr = dst_b.ptr;
+        var input_ptr = input.ptr;
+        var weight_a_ptr = weight_a.ptr;
+        var weight_b_ptr = weight_b.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_a_ptr),
+            @ptrCast(&dst_b_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_a_ptr),
+            @ptrCast(&weight_b_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
+    }
+
+    pub fn launchLinearQ4_0PairNoBiasTile4W4F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst_a: buffer_mod.DeviceBuffer,
+        dst_b: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_a: buffer_mod.DeviceBuffer,
+        weight_b: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_pair_nobias_f32_tile4_w4 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes);
+        try checkBytes(dst_a, out_count);
+        try checkBytes(dst_b, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_a, weight_bytes);
+        try checkRawBytes(weight_b, weight_bytes);
+        const col_tiles = (out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
+        const tiles_per_row = try checkedTensorElements(col_tiles, 2);
+        const total_tiles = try checkedTensorElements(rows, tiles_per_row);
+        if (total_tiles == 0) return;
+
+        var dst_a_ptr = dst_a.ptr;
+        var dst_b_ptr = dst_b.ptr;
+        var input_ptr = input.ptr;
+        var weight_a_ptr = weight_a.ptr;
+        var weight_b_ptr = weight_b.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_a_ptr),
+            @ptrCast(&dst_b_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_a_ptr),
+            @ptrCast(&weight_b_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
+    }
+
+    pub fn launchLinearQ4_0PairNoBiasQ8_1Tile4F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst_a: buffer_mod.DeviceBuffer,
+        dst_b: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_a: buffer_mod.DeviceBuffer,
+        weight_b: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_pair_nobias_q8_1_f32_tile4 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0 or q4_0_values_per_block != q8_1_values_per_block) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes);
+        try checkBytes(dst_a, out_count);
+        try checkBytes(dst_b, out_count);
+        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, row_blocks), q8_1_block_bytes));
+        try checkRawBytes(weight_a, weight_bytes);
+        try checkRawBytes(weight_b, weight_bytes);
+        const col_tiles = (out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
+        const tiles_per_row = try checkedTensorElements(col_tiles, 2);
+        const total_tiles = try checkedTensorElements(rows, tiles_per_row);
+        if (total_tiles == 0) return;
+
+        var dst_a_ptr = dst_a.ptr;
+        var dst_b_ptr = dst_b.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_a_ptr = weight_a.ptr;
+        var weight_b_ptr = weight_b.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_a_ptr),
+            @ptrCast(&dst_b_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_a_ptr),
+            @ptrCast(&weight_b_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
+    }
+
+    pub fn launchLinearQ4_0PairNoBiasQ8_1Tile4W8F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst_a: buffer_mod.DeviceBuffer,
+        dst_b: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_a: buffer_mod.DeviceBuffer,
+        weight_b: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_pair_nobias_q8_1_f32_tile4_w8 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0 or q4_0_values_per_block != q8_1_values_per_block) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes);
+        try checkBytes(dst_a, out_count);
+        try checkBytes(dst_b, out_count);
+        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, row_blocks), q8_1_block_bytes));
+        try checkRawBytes(weight_a, weight_bytes);
+        try checkRawBytes(weight_b, weight_bytes);
+        const col_tiles = (out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
+        const tiles_per_row = try checkedTensorElements(col_tiles, 2);
+        const total_tiles = try checkedTensorElements(rows, tiles_per_row);
+        if (total_tiles == 0) return;
+
+        var dst_a_ptr = dst_a.ptr;
+        var dst_b_ptr = dst_b.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_a_ptr = weight_a.ptr;
+        var weight_b_ptr = weight_b.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_a_ptr),
+            @ptrCast(&dst_b_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_a_ptr),
+            @ptrCast(&weight_b_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
+    }
+
+    pub fn launchLinearQ4_0PairNoBiasQ8_1Tile8F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst_a: buffer_mod.DeviceBuffer,
+        dst_b: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_a: buffer_mod.DeviceBuffer,
+        weight_b: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_pair_nobias_q8_1_f32_tile8 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0 or q4_0_values_per_block != q8_1_values_per_block) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes);
+        try checkBytes(dst_a, out_count);
+        try checkBytes(dst_b, out_count);
+        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, row_blocks), q8_1_block_bytes));
+        try checkRawBytes(weight_a, weight_bytes);
+        try checkRawBytes(weight_b, weight_bytes);
+        const col_tiles = (out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8;
+        const tiles_per_row = try checkedTensorElements(col_tiles, 2);
+        const total_tiles = try checkedTensorElements(rows, tiles_per_row);
+        if (total_tiles == 0) return;
+
+        var dst_a_ptr = dst_a.ptr;
+        var dst_b_ptr = dst_b.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_a_ptr = weight_a.ptr;
+        var weight_b_ptr = weight_b.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_a_ptr),
+            @ptrCast(&dst_b_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_a_ptr),
+            @ptrCast(&weight_b_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
+    }
+
+    pub fn launchLinearQ4_0PairActivationTile4W4F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_gate: buffer_mod.DeviceBuffer,
+        weight_up: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        activation: u8,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_pair_activation_f32_tile4_w4 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes);
+        try checkBytes(dst, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_gate, weight_bytes);
+        try checkRawBytes(weight_up, weight_bytes);
+        const col_tiles = (out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
+        const tiles_per_row = try checkedTensorElements(col_tiles, 2);
+        const total_tiles = try checkedTensorElements(rows, tiles_per_row);
+        if (total_tiles == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_gate_ptr = weight_gate.ptr;
+        var weight_up_ptr = weight_up.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var activation_u32: u32 = activation;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_gate_ptr),
+            @ptrCast(&weight_up_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+            @ptrCast(&activation_u32),
+        };
+        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
+    }
+
+    pub fn launchLinearQ4_0PairActivationQ8_1Tile4F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_gate: buffer_mod.DeviceBuffer,
+        weight_up: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        activation: u8,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_pair_activation_q8_1_f32_tile4 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0 or q4_0_values_per_block != q8_1_values_per_block) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes);
+        try checkBytes(dst, out_count);
+        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, row_blocks), q8_1_block_bytes));
+        try checkRawBytes(weight_gate, weight_bytes);
+        try checkRawBytes(weight_up, weight_bytes);
+        const col_tiles = (out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
+        const total_tiles = try checkedTensorElements(rows, col_tiles);
+        if (total_tiles == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_gate_ptr = weight_gate.ptr;
+        var weight_up_ptr = weight_up.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var activation_u32: u32 = activation;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_gate_ptr),
+            @ptrCast(&weight_up_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+            @ptrCast(&activation_u32),
+        };
+        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
+    }
+
+    pub fn launchLinearQ4_0PairActivationQ8_1Tile4W8F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_gate: buffer_mod.DeviceBuffer,
+        weight_up: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        activation: u8,
+    ) driver_mod.Error!void {
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0 or q4_0_values_per_block != q8_1_values_per_block) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes);
+        try checkBytes(dst, out_count);
+        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, row_blocks), q8_1_block_bytes));
+        try checkRawBytes(weight_gate, weight_bytes);
+        try checkRawBytes(weight_up, weight_bytes);
+        const col_tiles = (out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
+        const total_tiles = try checkedTensorElements(rows, col_tiles);
+        if (total_tiles == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_gate_ptr = weight_gate.ptr;
+        var weight_up_ptr = weight_up.ptr;
+        var activation_u32: u32 = activation;
+        if (rows == 1 and in_dim == 2560 and out_dim == 10240) {
+            if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_TILE4_W5_E4B_FFN", true)) {
+                if (self.linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn) |function| {
+                    var params = [_]?*anyopaque{
+                        @ptrCast(&dst_ptr),
+                        @ptrCast(&input_ptr),
+                        @ptrCast(&weight_gate_ptr),
+                        @ptrCast(&weight_up_ptr),
+                        @ptrCast(&activation_u32),
+                    };
+                    try launchBlocks(function, ctx, out_dim / q4_0_col_tile, q4_0_tiled_threads_w5, &params);
+                    return;
+                }
+            }
+            if (self.linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn) |function| {
+                var params = [_]?*anyopaque{
+                    @ptrCast(&dst_ptr),
+                    @ptrCast(&input_ptr),
+                    @ptrCast(&weight_gate_ptr),
+                    @ptrCast(&weight_up_ptr),
+                    @ptrCast(&activation_u32),
+                };
+                try launchBlocks(function, ctx, out_dim / q4_0_col_tile, q4_0_tiled_threads, &params);
+                return;
+            }
+        }
+
+        const function = self.linear_q4_0_pair_activation_q8_1_f32_tile4_w8 orelse return error.CudaKernelUnavailable;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_gate_ptr),
+            @ptrCast(&weight_up_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+            @ptrCast(&activation_u32),
+        };
+        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
+    }
+
+    // E4B FFN-specific: the CUDA body bakes in 2560 input columns and
+    // 10240 activated columns to keep row-aware Q8_1 prefill fast.
+    pub fn launchLinearQ4_0PairActivationQ8_1Tile32W5E4BFfnQ8_1(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst_q8_1: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_gate: buffer_mod.DeviceBuffer,
+        weight_up: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        activation: u8,
+    ) driver_mod.Error!void {
+        if (rows == 0 or in_dim != 2560 or out_dim != 10240) return error.InvalidCudaState;
+        const input_row_blocks = in_dim / q8_1_values_per_block;
+        const out_row_blocks = out_dim / q8_1_values_per_block;
+        const total_out_blocks = try checkedTensorElements(rows, out_row_blocks);
+        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, input_row_blocks), q4_0_block_bytes);
+        try checkRawBytes(dst_q8_1, try checkedTensorElements(total_out_blocks, q8_1_block_bytes));
+        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, input_row_blocks), q8_1_block_bytes));
+        try checkRawBytes(weight_gate, weight_bytes);
+        try checkRawBytes(weight_up, weight_bytes);
+
+        var dst_ptr = dst_q8_1.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_gate_ptr = weight_gate.ptr;
+        var weight_up_ptr = weight_up.ptr;
+        var activation_u32: u32 = activation;
+        if (rows > 1) {
+            if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_ROWS16_C1", false)) {
+                if (self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows16_c1) |function| {
+                    var rows_u32 = try toU32(rows);
+                    var params = [_]?*anyopaque{
+                        @ptrCast(&dst_ptr),
+                        @ptrCast(&input_ptr),
+                        @ptrCast(&weight_gate_ptr),
+                        @ptrCast(&weight_up_ptr),
+                        @ptrCast(&rows_u32),
+                        @ptrCast(&activation_u32),
+                    };
+                    try launchBlocks(function, ctx, try checkedTensorElements((rows + 15) / 16, out_row_blocks), q4_0_pair_activation_q8_1_tile32_w5_rows16_threads, &params);
+                    return;
+                }
+            }
+            if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_ROWS8_C2", false)) {
+                if (self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows8_c2) |function| {
+                    var rows_u32 = try toU32(rows);
+                    var params = [_]?*anyopaque{
+                        @ptrCast(&dst_ptr),
+                        @ptrCast(&input_ptr),
+                        @ptrCast(&weight_gate_ptr),
+                        @ptrCast(&weight_up_ptr),
+                        @ptrCast(&rows_u32),
+                        @ptrCast(&activation_u32),
+                    };
+                    try launchBlocks(function, ctx, try checkedTensorElements((rows + 7) / 8, out_row_blocks), q4_0_pair_activation_q8_1_tile32_w5_threads, &params);
+                    return;
+                }
+            }
+            if (self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4) |function| {
+                var rows_u32 = try toU32(rows);
+                var params = [_]?*anyopaque{
+                    @ptrCast(&dst_ptr),
+                    @ptrCast(&input_ptr),
+                    @ptrCast(&weight_gate_ptr),
+                    @ptrCast(&weight_up_ptr),
+                    @ptrCast(&rows_u32),
+                    @ptrCast(&activation_u32),
+                };
+                try launchBlocks(function, ctx, try checkedTensorElements((rows + 3) / 4, out_row_blocks), q4_0_pair_activation_q8_1_tile32_w5_threads, &params);
+                return;
+            }
+            if (self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2) |function| {
+                var rows_u32 = try toU32(rows);
+                var params = [_]?*anyopaque{
+                    @ptrCast(&dst_ptr),
+                    @ptrCast(&input_ptr),
+                    @ptrCast(&weight_gate_ptr),
+                    @ptrCast(&weight_up_ptr),
+                    @ptrCast(&rows_u32),
+                    @ptrCast(&activation_u32),
+                };
+                try launchBlocks(function, ctx, try checkedTensorElements((rows + 1) / 2, out_row_blocks), q4_0_pair_activation_q8_1_tile32_w5_threads, &params);
+                return;
+            }
+        }
+        const function = self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn orelse return error.CudaKernelUnavailable;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_gate_ptr),
+            @ptrCast(&weight_up_ptr),
+            @ptrCast(&activation_u32),
+        };
+        try launchBlocks(function, ctx, total_out_blocks, q4_0_pair_activation_q8_1_tile32_w5_threads, &params);
+    }
+
+    pub fn launchLinearQ4_0PairActivationQ8_1Tile8F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_gate: buffer_mod.DeviceBuffer,
+        weight_up: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        activation: u8,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_pair_activation_q8_1_f32_tile8 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0 or q4_0_values_per_block != q8_1_values_per_block) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes);
+        try checkBytes(dst, out_count);
+        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, row_blocks), q8_1_block_bytes));
+        try checkRawBytes(weight_gate, weight_bytes);
+        try checkRawBytes(weight_up, weight_bytes);
+        const col_tiles = (out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8;
+        const total_tiles = try checkedTensorElements(rows, col_tiles);
+        if (total_tiles == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_gate_ptr = weight_gate.ptr;
+        var weight_up_ptr = weight_up.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var activation_u32: u32 = activation;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_gate_ptr),
+            @ptrCast(&weight_up_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+            @ptrCast(&activation_u32),
+        };
+        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
+    }
+
+    pub fn launchLinearQ4_0PairNoBiasTile8F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst_a: buffer_mod.DeviceBuffer,
+        dst_b: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_a: buffer_mod.DeviceBuffer,
+        weight_b: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_pair_nobias_f32_tile8 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes);
+        try checkBytes(dst_a, out_count);
+        try checkBytes(dst_b, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_a, weight_bytes);
+        try checkRawBytes(weight_b, weight_bytes);
+        const col_tiles = (out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8;
+        const tiles_per_row = try checkedTensorElements(col_tiles, 2);
+        const total_tiles = try checkedTensorElements(rows, tiles_per_row);
+        if (total_tiles == 0) return;
+
+        var dst_a_ptr = dst_a.ptr;
+        var dst_b_ptr = dst_b.ptr;
+        var input_ptr = input.ptr;
+        var weight_a_ptr = weight_a.ptr;
+        var weight_b_ptr = weight_b.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_a_ptr),
+            @ptrCast(&dst_b_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_a_ptr),
+            @ptrCast(&weight_b_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
+    }
+
     pub fn launchLinearQ4KPairNoBiasTile4F32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -6499,6 +9442,403 @@ pub const KernelModule = struct {
             @ptrCast(&kv_out_dim_u32),
         };
         try launchBlocks(function, ctx, total_tiles, q8_0_tiled_threads, &params);
+    }
+
+    pub fn launchLinearQ4_0QkvNoBiasTile4F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst_q: buffer_mod.DeviceBuffer,
+        dst_k: buffer_mod.DeviceBuffer,
+        dst_v: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_q: buffer_mod.DeviceBuffer,
+        weight_k: buffer_mod.DeviceBuffer,
+        weight_v: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        q_out_dim: usize,
+        kv_out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_qkv_nobias_f32_tile4 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const q_count = try checkedTensorElements(rows, q_out_dim);
+        const kv_count = try checkedTensorElements(rows, kv_out_dim);
+        const q_weight_bytes = try checkedTensorElements(try checkedTensorElements(q_out_dim, row_blocks), q4_0_block_bytes);
+        const kv_weight_bytes = try checkedTensorElements(try checkedTensorElements(kv_out_dim, row_blocks), q4_0_block_bytes);
+        try checkBytes(dst_q, q_count);
+        try checkBytes(dst_k, kv_count);
+        try checkBytes(dst_v, kv_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_q, q_weight_bytes);
+        try checkRawBytes(weight_k, kv_weight_bytes);
+        try checkRawBytes(weight_v, kv_weight_bytes);
+        const q_tiles = (q_out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
+        const kv_tiles = (kv_out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
+        const tiles_per_row = try checkedTensorElements(q_tiles + kv_tiles, 1);
+        const tiles_with_v = try checkedTensorElements(tiles_per_row + kv_tiles, 1);
+        const total_tiles = try checkedTensorElements(rows, tiles_with_v);
+        if (total_tiles == 0) return;
+
+        var dst_q_ptr = dst_q.ptr;
+        var dst_k_ptr = dst_k.ptr;
+        var dst_v_ptr = dst_v.ptr;
+        var input_ptr = input.ptr;
+        var weight_q_ptr = weight_q.ptr;
+        var weight_k_ptr = weight_k.ptr;
+        var weight_v_ptr = weight_v.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var q_out_dim_u32 = try toU32(q_out_dim);
+        var kv_out_dim_u32 = try toU32(kv_out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_q_ptr),
+            @ptrCast(&dst_k_ptr),
+            @ptrCast(&dst_v_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_q_ptr),
+            @ptrCast(&weight_k_ptr),
+            @ptrCast(&weight_v_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&q_out_dim_u32),
+            @ptrCast(&kv_out_dim_u32),
+        };
+        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
+    }
+
+    pub fn launchLinearQ4_0QkvNoBiasTile4W4F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst_q: buffer_mod.DeviceBuffer,
+        dst_k: buffer_mod.DeviceBuffer,
+        dst_v: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_q: buffer_mod.DeviceBuffer,
+        weight_k: buffer_mod.DeviceBuffer,
+        weight_v: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        q_out_dim: usize,
+        kv_out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_qkv_nobias_f32_tile4_w4 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const q_count = try checkedTensorElements(rows, q_out_dim);
+        const kv_count = try checkedTensorElements(rows, kv_out_dim);
+        const q_weight_bytes = try checkedTensorElements(try checkedTensorElements(q_out_dim, row_blocks), q4_0_block_bytes);
+        const kv_weight_bytes = try checkedTensorElements(try checkedTensorElements(kv_out_dim, row_blocks), q4_0_block_bytes);
+        try checkBytes(dst_q, q_count);
+        try checkBytes(dst_k, kv_count);
+        try checkBytes(dst_v, kv_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_q, q_weight_bytes);
+        try checkRawBytes(weight_k, kv_weight_bytes);
+        try checkRawBytes(weight_v, kv_weight_bytes);
+        const q_tiles = (q_out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
+        const kv_tiles = (kv_out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
+        const tiles_per_row = try checkedTensorElements(q_tiles + kv_tiles, 1);
+        const tiles_with_v = try checkedTensorElements(tiles_per_row + kv_tiles, 1);
+        const total_tiles = try checkedTensorElements(rows, tiles_with_v);
+        if (total_tiles == 0) return;
+
+        var dst_q_ptr = dst_q.ptr;
+        var dst_k_ptr = dst_k.ptr;
+        var dst_v_ptr = dst_v.ptr;
+        var input_ptr = input.ptr;
+        var weight_q_ptr = weight_q.ptr;
+        var weight_k_ptr = weight_k.ptr;
+        var weight_v_ptr = weight_v.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var q_out_dim_u32 = try toU32(q_out_dim);
+        var kv_out_dim_u32 = try toU32(kv_out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_q_ptr),
+            @ptrCast(&dst_k_ptr),
+            @ptrCast(&dst_v_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_q_ptr),
+            @ptrCast(&weight_k_ptr),
+            @ptrCast(&weight_v_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&q_out_dim_u32),
+            @ptrCast(&kv_out_dim_u32),
+        };
+        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
+    }
+
+    pub fn launchLinearQ4_0QkvNoBiasQ8_1Tile4F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst_q: buffer_mod.DeviceBuffer,
+        dst_k: buffer_mod.DeviceBuffer,
+        dst_v: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_q: buffer_mod.DeviceBuffer,
+        weight_k: buffer_mod.DeviceBuffer,
+        weight_v: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        q_out_dim: usize,
+        kv_out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_qkv_nobias_q8_1_f32_tile4 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0 or q4_0_values_per_block != q8_1_values_per_block) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const q_count = try checkedTensorElements(rows, q_out_dim);
+        const kv_count = try checkedTensorElements(rows, kv_out_dim);
+        const q_weight_bytes = try checkedTensorElements(try checkedTensorElements(q_out_dim, row_blocks), q4_0_block_bytes);
+        const kv_weight_bytes = try checkedTensorElements(try checkedTensorElements(kv_out_dim, row_blocks), q4_0_block_bytes);
+        try checkBytes(dst_q, q_count);
+        try checkBytes(dst_k, kv_count);
+        try checkBytes(dst_v, kv_count);
+        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, row_blocks), q8_1_block_bytes));
+        try checkRawBytes(weight_q, q_weight_bytes);
+        try checkRawBytes(weight_k, kv_weight_bytes);
+        try checkRawBytes(weight_v, kv_weight_bytes);
+        const q_tiles = (q_out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
+        const kv_tiles = (kv_out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
+        const tiles_per_row = try checkedTensorElements(q_tiles + kv_tiles, 1);
+        const tiles_with_v = try checkedTensorElements(tiles_per_row + kv_tiles, 1);
+        const total_tiles = try checkedTensorElements(rows, tiles_with_v);
+        if (total_tiles == 0) return;
+
+        var dst_q_ptr = dst_q.ptr;
+        var dst_k_ptr = dst_k.ptr;
+        var dst_v_ptr = dst_v.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_q_ptr = weight_q.ptr;
+        var weight_k_ptr = weight_k.ptr;
+        var weight_v_ptr = weight_v.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var q_out_dim_u32 = try toU32(q_out_dim);
+        var kv_out_dim_u32 = try toU32(kv_out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_q_ptr),
+            @ptrCast(&dst_k_ptr),
+            @ptrCast(&dst_v_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_q_ptr),
+            @ptrCast(&weight_k_ptr),
+            @ptrCast(&weight_v_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&q_out_dim_u32),
+            @ptrCast(&kv_out_dim_u32),
+        };
+        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
+    }
+
+    pub fn launchLinearQ4_0QkvNoBiasQ8_1Tile8F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst_q: buffer_mod.DeviceBuffer,
+        dst_k: buffer_mod.DeviceBuffer,
+        dst_v: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_q: buffer_mod.DeviceBuffer,
+        weight_k: buffer_mod.DeviceBuffer,
+        weight_v: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        q_out_dim: usize,
+        kv_out_dim: usize,
+    ) driver_mod.Error!void {
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0 or q4_0_values_per_block != q8_1_values_per_block) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const q_count = try checkedTensorElements(rows, q_out_dim);
+        const kv_count = try checkedTensorElements(rows, kv_out_dim);
+        const q_weight_bytes = try checkedTensorElements(try checkedTensorElements(q_out_dim, row_blocks), q4_0_block_bytes);
+        const kv_weight_bytes = try checkedTensorElements(try checkedTensorElements(kv_out_dim, row_blocks), q4_0_block_bytes);
+        try checkBytes(dst_q, q_count);
+        try checkBytes(dst_k, kv_count);
+        try checkBytes(dst_v, kv_count);
+        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, row_blocks), q8_1_block_bytes));
+        try checkRawBytes(weight_q, q_weight_bytes);
+        try checkRawBytes(weight_k, kv_weight_bytes);
+        try checkRawBytes(weight_v, kv_weight_bytes);
+        const q_tiles = (q_out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8;
+        const kv_tiles = (kv_out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8;
+        const tiles_per_row = try checkedTensorElements(q_tiles + kv_tiles, 1);
+        const tiles_with_v = try checkedTensorElements(tiles_per_row + kv_tiles, 1);
+        const total_tiles = try checkedTensorElements(rows, tiles_with_v);
+        if (total_tiles == 0) return;
+
+        var dst_q_ptr = dst_q.ptr;
+        var dst_k_ptr = dst_k.ptr;
+        var dst_v_ptr = dst_v.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_q_ptr = weight_q.ptr;
+        var weight_k_ptr = weight_k.ptr;
+        var weight_v_ptr = weight_v.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var q_out_dim_u32 = try toU32(q_out_dim);
+        var kv_out_dim_u32 = try toU32(kv_out_dim);
+        if (rows > 1) {
+            if (self.linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4) |function| {
+                var params = [_]?*anyopaque{
+                    @ptrCast(&dst_q_ptr),
+                    @ptrCast(&dst_k_ptr),
+                    @ptrCast(&dst_v_ptr),
+                    @ptrCast(&input_ptr),
+                    @ptrCast(&weight_q_ptr),
+                    @ptrCast(&weight_k_ptr),
+                    @ptrCast(&weight_v_ptr),
+                    @ptrCast(&rows_u32),
+                    @ptrCast(&in_dim_u32),
+                    @ptrCast(&q_out_dim_u32),
+                    @ptrCast(&kv_out_dim_u32),
+                };
+                try launchBlocks(function, ctx, try checkedTensorElements((rows + 3) / 4, tiles_with_v), q4_0_tiled_threads_w4, &params);
+                return;
+            }
+        }
+        const function = self.linear_q4_0_qkv_nobias_q8_1_f32_tile8 orelse return error.CudaKernelUnavailable;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_q_ptr),
+            @ptrCast(&dst_k_ptr),
+            @ptrCast(&dst_v_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_q_ptr),
+            @ptrCast(&weight_k_ptr),
+            @ptrCast(&weight_v_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&q_out_dim_u32),
+            @ptrCast(&kv_out_dim_u32),
+        };
+        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
+    }
+
+    pub fn launchLinearQ4_0QkvNoBiasQ8_1Tile8W8F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst_q: buffer_mod.DeviceBuffer,
+        dst_k: buffer_mod.DeviceBuffer,
+        dst_v: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_q: buffer_mod.DeviceBuffer,
+        weight_k: buffer_mod.DeviceBuffer,
+        weight_v: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        q_out_dim: usize,
+        kv_out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0 or q4_0_values_per_block != q8_1_values_per_block) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const q_count = try checkedTensorElements(rows, q_out_dim);
+        const kv_count = try checkedTensorElements(rows, kv_out_dim);
+        const q_weight_bytes = try checkedTensorElements(try checkedTensorElements(q_out_dim, row_blocks), q4_0_block_bytes);
+        const kv_weight_bytes = try checkedTensorElements(try checkedTensorElements(kv_out_dim, row_blocks), q4_0_block_bytes);
+        try checkBytes(dst_q, q_count);
+        try checkBytes(dst_k, kv_count);
+        try checkBytes(dst_v, kv_count);
+        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, row_blocks), q8_1_block_bytes));
+        try checkRawBytes(weight_q, q_weight_bytes);
+        try checkRawBytes(weight_k, kv_weight_bytes);
+        try checkRawBytes(weight_v, kv_weight_bytes);
+        const q_tiles = (q_out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8;
+        const kv_tiles = (kv_out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8;
+        const tiles_per_row = try checkedTensorElements(q_tiles + kv_tiles, 1);
+        const tiles_with_v = try checkedTensorElements(tiles_per_row + kv_tiles, 1);
+        const total_tiles = try checkedTensorElements(rows, tiles_with_v);
+        if (total_tiles == 0) return;
+
+        var dst_q_ptr = dst_q.ptr;
+        var dst_k_ptr = dst_k.ptr;
+        var dst_v_ptr = dst_v.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_q_ptr = weight_q.ptr;
+        var weight_k_ptr = weight_k.ptr;
+        var weight_v_ptr = weight_v.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var q_out_dim_u32 = try toU32(q_out_dim);
+        var kv_out_dim_u32 = try toU32(kv_out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_q_ptr),
+            @ptrCast(&dst_k_ptr),
+            @ptrCast(&dst_v_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_q_ptr),
+            @ptrCast(&weight_k_ptr),
+            @ptrCast(&weight_v_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&q_out_dim_u32),
+            @ptrCast(&kv_out_dim_u32),
+        };
+        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
+    }
+
+    pub fn launchLinearQ4_0QkvNoBiasTile8F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst_q: buffer_mod.DeviceBuffer,
+        dst_k: buffer_mod.DeviceBuffer,
+        dst_v: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_q: buffer_mod.DeviceBuffer,
+        weight_k: buffer_mod.DeviceBuffer,
+        weight_v: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        q_out_dim: usize,
+        kv_out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_qkv_nobias_f32_tile8 orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const q_count = try checkedTensorElements(rows, q_out_dim);
+        const kv_count = try checkedTensorElements(rows, kv_out_dim);
+        const q_weight_bytes = try checkedTensorElements(try checkedTensorElements(q_out_dim, row_blocks), q4_0_block_bytes);
+        const kv_weight_bytes = try checkedTensorElements(try checkedTensorElements(kv_out_dim, row_blocks), q4_0_block_bytes);
+        try checkBytes(dst_q, q_count);
+        try checkBytes(dst_k, kv_count);
+        try checkBytes(dst_v, kv_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_q, q_weight_bytes);
+        try checkRawBytes(weight_k, kv_weight_bytes);
+        try checkRawBytes(weight_v, kv_weight_bytes);
+        const q_tiles = (q_out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8;
+        const kv_tiles = (kv_out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8;
+        const tiles_per_row = try checkedTensorElements(q_tiles + kv_tiles, 1);
+        const tiles_with_v = try checkedTensorElements(tiles_per_row + kv_tiles, 1);
+        const total_tiles = try checkedTensorElements(rows, tiles_with_v);
+        if (total_tiles == 0) return;
+
+        var dst_q_ptr = dst_q.ptr;
+        var dst_k_ptr = dst_k.ptr;
+        var dst_v_ptr = dst_v.ptr;
+        var input_ptr = input.ptr;
+        var weight_q_ptr = weight_q.ptr;
+        var weight_k_ptr = weight_k.ptr;
+        var weight_v_ptr = weight_v.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var q_out_dim_u32 = try toU32(q_out_dim);
+        var kv_out_dim_u32 = try toU32(kv_out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_q_ptr),
+            @ptrCast(&dst_k_ptr),
+            @ptrCast(&dst_v_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_q_ptr),
+            @ptrCast(&weight_k_ptr),
+            @ptrCast(&weight_v_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&q_out_dim_u32),
+            @ptrCast(&kv_out_dim_u32),
+        };
+        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
     }
 
     pub fn launchLinearBf16WeightF32QkvNoBiasTiled(
@@ -6928,18 +10268,45 @@ const q8_0_tiled_threads: usize = 256;
 const q8_0_col_tile: usize = 4;
 
 const q8_0_row_tile: usize = 2;
+const q8_1_values_per_block: usize = 32;
+const q8_1_block_bytes: usize = 36;
+const q8_1_quantize_threads: usize = 128;
+const q8_1_quantize_warps: usize = q8_1_quantize_threads / 32;
 const q4_0_values_per_block: usize = 32;
 const q4_0_block_bytes: usize = 18;
+const q4_0_tiled_threads: usize = 256;
+const q4_0_tiled_threads_w4: usize = 128;
+const q4_0_tiled_threads_w5: usize = 160;
+const q4_0_tiled_threads_w10: usize = 320;
+const q4_0_pair_activation_q8_1_tile32_w5_threads: usize = 640;
+const q4_0_pair_activation_q8_1_tile32_w5_rows16_threads: usize = 512;
 const q4_0_col_tile: usize = 4;
+const q4_0_col_tile8: usize = 8;
+const q4_0_col_tile16: usize = 16;
 const q4_k_values_per_block: usize = 256;
 const q4_k_block_bytes: usize = 144;
 const q6_k_values_per_block: usize = 256;
 const q6_k_block_bytes: usize = 210;
+const q6_k_col_tile8: usize = 8;
+const q6_k_col_tile16: usize = 16;
+const q6_k_col_tile32: usize = 32;
 
 const q4_k_tc_block_bytes: usize = 148;
 const q4_k_tiled_threads: usize = 256;
+const q4_k_tiled_threads_w4: usize = 128;
 const q4_k_col_tile: usize = 4;
 const q4_k_row_tile: usize = 2;
+
+fn q6KQ8_1Tile8Stage1Threads(row_blocks: usize) usize {
+    if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS", false)) {
+        return q4_k_tiled_threads;
+    }
+    const task_count = row_blocks * 16;
+    if (task_count == 0 or task_count > q4_k_tiled_threads) return q4_k_tiled_threads;
+    const rounded = ((task_count + 31) / 32) * 32;
+    if (rounded == 0 or rounded > q4_k_tiled_threads) return q4_k_tiled_threads;
+    return rounded;
+}
 
 const q4_k_span_col_tile: usize = 8;
 const q4_k_span_row_tile: usize = 2;
@@ -7248,6 +10615,7 @@ pub fn smokeTurboquantKv(allocator: std.mem.Allocator) !void {
 
     try smokeTurboquantKvFormat(allocator, &ctx, &module, 0);
     try smokeTurboquantKvFormat(allocator, &ctx, &module, 1);
+    try smokeTurboquantKvFormat(allocator, &ctx, &module, 2);
 }
 
 fn smokeTurboquantKvFormat(
@@ -7264,14 +10632,20 @@ fn smokeTurboquantKvFormat(
     const base_key_row_bytes = switch (format) {
         0 => turboquant.polar4KeyBytes(num_kv_heads, head_dim),
         1 => turboquant.turbo3KeyBytes(num_kv_heads, head_dim),
+        2 => kv_pool_mod.KvDType.f16.bytesForKeyRow(@intCast(num_kv_heads), @intCast(head_dim)),
         else => return error.CudaSmokeMismatch,
     };
     const key_row_bytes = switch (format) {
         0 => base_key_row_bytes,
         1 => base_key_row_bytes + turboquant.turbo3ResidualBytes(num_kv_heads, head_dim),
+        2 => base_key_row_bytes,
         else => unreachable,
     };
-    const value_row_bytes = kv_pool_mod.KvDType.int8.bytesForValueRow(@intCast(num_kv_heads), @intCast(head_dim));
+    const value_format: u32 = if (format == 2) 2 else 1;
+    const value_row_bytes = if (value_format == 2)
+        kv_pool_mod.KvDType.f16.bytesForValueRow(@intCast(num_kv_heads), @intCast(head_dim))
+    else
+        kv_pool_mod.KvDType.int8.bytesForValueRow(@intCast(num_kv_heads), @intCast(head_dim));
     const page_size_tokens: usize = 1;
     const block_table_host = [_]u32{ 1, 3 };
     const physical_token_capacity: usize = 4;
@@ -7326,7 +10700,7 @@ fn smokeTurboquantKvFormat(
         block_table_host.len,
         page_size_tokens,
         format,
-        1,
+        value_format,
         physical_token_capacity,
     );
     try ctx.synchronize();
@@ -7343,6 +10717,8 @@ fn smokeTurboquantKvFormat(
     try ctx.synchronize();
     const value_expected = try allocator.alloc(u8, token_count * value_row_bytes);
     defer allocator.free(value_expected);
+    const key_dequant = try allocator.alloc(f32, token_count * row_width);
+    defer allocator.free(key_dequant);
     const value_dequant = try allocator.alloc(f32, token_count * row_width);
     defer allocator.free(value_dequant);
     for (0..token_count) |token| {
@@ -7354,12 +10730,29 @@ fn smokeTurboquantKvFormat(
                 try turboquant.encodeTurbo3Key(src_row, dst_row[0..base_key_row_bytes], num_kv_heads, head_dim);
                 try turboquant.encodeTurbo3ResidualSketch(src_row, dst_row[0..base_key_row_bytes], dst_row[base_key_row_bytes..], num_kv_heads, head_dim);
             },
+            2 => {
+                for (src_row, 0..) |value, i| {
+                    const half_bits: u16 = @bitCast(@as(f16, @floatCast(value)));
+                    dst_row[i * 2] = @intCast(half_bits & 0xff);
+                    dst_row[i * 2 + 1] = @intCast(half_bits >> 8);
+                    key_dequant[token * row_width + i] = @floatCast(@as(f16, @bitCast(half_bits)));
+                }
+            },
             else => unreachable,
         }
         const value_src = v_host[token * row_width ..][0..row_width];
         const value_dst = value_expected[token * value_row_bytes ..][0..value_row_bytes];
-        kv_pool_mod.quantizeF32ToInt8PerHead(value_src, value_dst, @intCast(num_kv_heads), @intCast(head_dim));
-        kv_pool_mod.dequantizeInt8PerHeadToF32(value_dst, value_dequant[token * row_width ..][0..row_width], @intCast(num_kv_heads), @intCast(head_dim));
+        if (value_format == 2) {
+            for (value_src, 0..) |value, i| {
+                const half_bits: u16 = @bitCast(@as(f16, @floatCast(value)));
+                value_dst[i * 2] = @intCast(half_bits & 0xff);
+                value_dst[i * 2 + 1] = @intCast(half_bits >> 8);
+                value_dequant[token * row_width + i] = @floatCast(@as(f16, @bitCast(half_bits)));
+            }
+        } else {
+            kv_pool_mod.quantizeF32ToInt8PerHead(value_src, value_dst, @intCast(num_kv_heads), @intCast(head_dim));
+            kv_pool_mod.dequantizeInt8PerHeadToF32(value_dst, value_dequant[token * row_width ..][0..row_width], @intCast(num_kv_heads), @intCast(head_dim));
+        }
     }
     for (0..token_count) |token| {
         const physical = @as(usize, block_table_host[token]) * page_size_tokens;
@@ -7398,8 +10791,9 @@ fn smokeTurboquantKvFormat(
         block_table_host.len,
         page_size_tokens,
         format,
-        1,
+        value_format,
         physical_token_capacity,
+        .{},
     );
     try ctx.synchronize();
     const out_host = try allocator.alloc(f32, q_host.len);
@@ -7420,6 +10814,12 @@ fn smokeTurboquantKvFormat(
                 const residual_score = try turboquant.dotTurbo3ProjectedResidualSketch(&projected_query, residual, num_kv_heads, head_dim, 0);
                 break :blk try turboquant.dotTurbo3KeyFast(&q_host, base, num_kv_heads, head_dim, 0) +
                     turboquant.turbo3_residual_default_scale * residual_score;
+            },
+            2 => blk: {
+                const key_row = key_dequant[token * row_width ..][0..row_width];
+                var sum: f32 = 0.0;
+                for (0..head_dim) |d| sum += q_host[d] * key_row[d];
+                break :blk sum;
             },
             else => unreachable,
         };
@@ -7482,7 +10882,7 @@ fn smokeBf16WeightPrimitives(allocator: std.mem.Allocator, ctx: *context_mod.Cud
     defer embed_output.free(ctx);
     try embed_weight.copyFromHost(ctx, std.mem.sliceAsBytes(&embed_weight_data));
     try ids.copyFromHost(ctx, std.mem.sliceAsBytes(&ids_data));
-    try module.launchEmbeddingLookupBf16WeightF32(ctx, embed_output, embed_weight, ids, ids_data.len, embed_dim);
+    try module.launchEmbeddingLookupBf16WeightF32(ctx, embed_output, embed_weight, ids, ids_data.len, embed_dim, 1.0);
     try ctx.synchronize();
 
     const embed_out = try allocator.alloc(f32, ids_data.len * embed_dim);
@@ -8016,7 +11416,7 @@ fn smokeEmbeddingConcatConvF32(allocator: std.mem.Allocator, ctx: *context_mod.C
     defer embed.free(ctx);
     try weight.copyFromHost(ctx, std.mem.sliceAsBytes(&weight_data));
     try ids.copyFromHost(ctx, std.mem.sliceAsBytes(&ids_data));
-    try module.launchEmbeddingLookupF32(ctx, embed, weight, ids, ids_data.len, 2);
+    try module.launchEmbeddingLookupF32(ctx, embed, weight, ids, ids_data.len, 2, 1.0);
     try ctx.synchronize();
     const embed_out = try allocator.alloc(f32, expected_embed.len);
     defer allocator.free(embed_out);
@@ -8030,7 +11430,7 @@ fn smokeEmbeddingConcatConvF32(allocator: std.mem.Allocator, ctx: *context_mod.C
     var embed_i32 = try buffer_mod.DeviceBuffer.alloc(ctx, expected_embed.len * @sizeOf(f32));
     defer embed_i32.free(ctx);
     try ids_i32.copyFromHost(ctx, std.mem.sliceAsBytes(&ids_i32_data));
-    try module.launchEmbeddingLookupI32F32(ctx, embed_i32, weight, ids_i32, ids_i32_data.len, 2);
+    try module.launchEmbeddingLookupI32F32(ctx, embed_i32, weight, ids_i32, ids_i32_data.len, 2, 1.0);
     try ctx.synchronize();
     const embed_i32_out = try allocator.alloc(f32, expected_embed.len);
     defer allocator.free(embed_i32_out);
@@ -8524,13 +11924,13 @@ pub fn smokeQ8_0(allocator: std.mem.Allocator) !void {
     const embed_actual = try allocator.alloc(f32, ids_i64.len * in_dim);
     defer allocator.free(embed_actual);
 
-    try module.launchEmbeddingLookupQ8_0F32(&ctx, embed_out, weight, ids64, ids_i64.len, in_dim);
+    try module.launchEmbeddingLookupQ8_0F32(&ctx, embed_out, weight, ids64, ids_i64.len, in_dim, 1.0);
     try ctx.synchronize();
     try embed_out.copyToHost(&ctx, std.mem.sliceAsBytes(embed_actual));
     try ctx.synchronize();
     try expectApproxSlice(embed_actual, embed_expected, 0.0001);
 
-    try module.launchEmbeddingLookupI32Q8_0F32(&ctx, embed_out, weight, ids32, ids_i32.len, in_dim);
+    try module.launchEmbeddingLookupI32Q8_0F32(&ctx, embed_out, weight, ids32, ids_i32.len, in_dim, 1.0);
     try ctx.synchronize();
     try embed_out.copyToHost(&ctx, std.mem.sliceAsBytes(embed_actual));
     try ctx.synchronize();
@@ -8586,6 +11986,214 @@ pub fn smokeQ4_0(allocator: std.mem.Allocator) !void {
         if (@abs(out[i] - want) > 0.01) return error.CudaSmokeMismatch;
     }
 
+    try module.launchLinearQ4_0Tile4F32(&ctx, output, input, weight, rows, in_dim, out_dim);
+    try ctx.synchronize();
+    try output.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 0.01);
+
+    try module.launchLinearQ4_0Tile8F32(&ctx, output, input, weight, rows, in_dim, out_dim);
+    try ctx.synchronize();
+    try output.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 0.01);
+
+    var input_q8_1 = try buffer_mod.DeviceBuffer.alloc(&ctx, rows * (in_dim / q8_1_values_per_block) * q8_1_block_bytes);
+    defer input_q8_1.free(&ctx);
+    try module.launchQuantizeF32Q8_1Rows(&ctx, input_q8_1, input, rows, in_dim);
+    try ctx.synchronize();
+
+    try module.launchLinearQ4_0Q8_1Tile4F32(&ctx, output, input_q8_1, weight, rows, in_dim, out_dim);
+    try ctx.synchronize();
+    try output.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 4.0);
+
+    try module.launchLinearQ4_0Q8_1Tile8F32(&ctx, output, input_q8_1, weight, rows, in_dim, out_dim);
+    try ctx.synchronize();
+    try output.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 4.0);
+
+    const large_rows: usize = 1;
+    const large_in_dim: usize = 512;
+    const large_out_dim: usize = 8;
+    const large_row_blocks = large_in_dim / q4_0_values_per_block;
+    var large_input_data: [large_rows * large_in_dim]f32 = undefined;
+    for (&large_input_data, 0..) |*value, i| {
+        const signed: i32 = @intCast((i * 17 + 11) % 97);
+        const centered: f32 = @as(f32, @floatFromInt(signed - 48)) / 19.0;
+        const ripple: f32 = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7) % 9)) - 4)) / 43.0;
+        value.* = centered + ripple;
+    }
+    var large_weight_raw = [_]u8{0} ** (large_out_dim * large_row_blocks * q4_0_block_bytes);
+    for (0..large_out_dim) |col| {
+        for (0..large_row_blocks) |block| {
+            var values = [_]i4{0} ** q4_0_values_per_block;
+            for (&values, 0..) |*value, lane_index| {
+                const raw: i32 = @intCast((col * 31 + block * 13 + lane_index * 5) % 15);
+                value.* = @intCast(raw - 7);
+            }
+            const scale = 0.0175 + @as(f32, @floatFromInt((col * 3 + block) % 11)) * 0.00425;
+            const offset = (col * large_row_blocks + block) * q4_0_block_bytes;
+            writeQ4_0SmokeRowValues(large_weight_raw[offset .. offset + q4_0_block_bytes], scale, &values);
+        }
+    }
+
+    var large_input = try buffer_mod.DeviceBuffer.alloc(&ctx, large_input_data.len * @sizeOf(f32));
+    defer large_input.free(&ctx);
+    var large_weight = try buffer_mod.DeviceBuffer.alloc(&ctx, large_weight_raw.len);
+    defer large_weight.free(&ctx);
+    var large_exact = try buffer_mod.DeviceBuffer.alloc(&ctx, large_rows * large_out_dim * @sizeOf(f32));
+    defer large_exact.free(&ctx);
+    var large_q8 = try buffer_mod.DeviceBuffer.alloc(&ctx, large_rows * large_out_dim * @sizeOf(f32));
+    defer large_q8.free(&ctx);
+    var large_input_q8_1 = try buffer_mod.DeviceBuffer.alloc(&ctx, large_rows * large_row_blocks * q8_1_block_bytes);
+    defer large_input_q8_1.free(&ctx);
+    try large_input.copyFromHost(&ctx, std.mem.sliceAsBytes(&large_input_data));
+    try large_weight.copyFromHost(&ctx, &large_weight_raw);
+    try module.launchLinearQ4_0Tile4F32(&ctx, large_exact, large_input, large_weight, large_rows, large_in_dim, large_out_dim);
+    try module.launchQuantizeF32Q8_1Rows(&ctx, large_input_q8_1, large_input, large_rows, large_in_dim);
+    try module.launchLinearQ4_0Q8_1Tile4F32(&ctx, large_q8, large_input_q8_1, large_weight, large_rows, large_in_dim, large_out_dim);
+    try ctx.synchronize();
+    const large_exact_host = try allocator.alloc(f32, large_rows * large_out_dim);
+    defer allocator.free(large_exact_host);
+    const large_q8_host = try allocator.alloc(f32, large_rows * large_out_dim);
+    defer allocator.free(large_q8_host);
+    try large_exact.copyToHost(&ctx, std.mem.sliceAsBytes(large_exact_host));
+    try large_q8.copyToHost(&ctx, std.mem.sliceAsBytes(large_q8_host));
+    try ctx.synchronize();
+    try expectApproxSlice(large_q8_host, large_exact_host, 0.35);
+
+    try module.launchLinearQ4_0Q8_1Tile8F32(&ctx, large_q8, large_input_q8_1, large_weight, large_rows, large_in_dim, large_out_dim);
+    try ctx.synchronize();
+    try large_q8.copyToHost(&ctx, std.mem.sliceAsBytes(large_q8_host));
+    try ctx.synchronize();
+    try expectApproxSlice(large_q8_host, large_exact_host, 0.35);
+
+    var pair_a = try buffer_mod.DeviceBuffer.alloc(&ctx, rows * out_dim * @sizeOf(f32));
+    defer pair_a.free(&ctx);
+    var pair_b = try buffer_mod.DeviceBuffer.alloc(&ctx, rows * out_dim * @sizeOf(f32));
+    defer pair_b.free(&ctx);
+    try module.launchLinearQ4_0PairNoBiasTile4F32(&ctx, pair_a, pair_b, input, weight, weight, rows, in_dim, out_dim);
+    try ctx.synchronize();
+    try pair_a.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 0.01);
+    try pair_b.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 0.01);
+
+    try module.launchLinearQ4_0PairNoBiasTile4W4F32(&ctx, pair_a, pair_b, input, weight, weight, rows, in_dim, out_dim);
+    try ctx.synchronize();
+    try pair_a.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 0.01);
+    try pair_b.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 0.01);
+
+    try module.launchLinearQ4_0PairNoBiasTile8F32(&ctx, pair_a, pair_b, input, weight, weight, rows, in_dim, out_dim);
+    try ctx.synchronize();
+    try pair_a.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 0.01);
+    try pair_b.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 0.01);
+
+    try module.launchLinearQ4_0PairNoBiasQ8_1Tile4F32(&ctx, pair_a, pair_b, input_q8_1, weight, weight, rows, in_dim, out_dim);
+    try ctx.synchronize();
+    try pair_a.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 4.0);
+    try pair_b.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 4.0);
+
+    try module.launchLinearQ4_0PairNoBiasQ8_1Tile8F32(&ctx, pair_a, pair_b, input_q8_1, weight, weight, rows, in_dim, out_dim);
+    try ctx.synchronize();
+    try pair_a.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 4.0);
+    try pair_b.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 4.0);
+
+    var q_out = try buffer_mod.DeviceBuffer.alloc(&ctx, rows * out_dim * @sizeOf(f32));
+    defer q_out.free(&ctx);
+    var k_out = try buffer_mod.DeviceBuffer.alloc(&ctx, rows * out_dim * @sizeOf(f32));
+    defer k_out.free(&ctx);
+    var v_out = try buffer_mod.DeviceBuffer.alloc(&ctx, rows * out_dim * @sizeOf(f32));
+    defer v_out.free(&ctx);
+    try module.launchLinearQ4_0QkvNoBiasTile4F32(&ctx, q_out, k_out, v_out, input, weight, weight, weight, rows, in_dim, out_dim, out_dim);
+    try ctx.synchronize();
+    try q_out.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 0.01);
+    try k_out.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 0.01);
+    try v_out.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 0.01);
+
+    try module.launchLinearQ4_0QkvNoBiasTile8F32(&ctx, q_out, k_out, v_out, input, weight, weight, weight, rows, in_dim, out_dim, out_dim);
+    try ctx.synchronize();
+    try q_out.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 0.01);
+    try k_out.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 0.01);
+    try v_out.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 0.01);
+
+    try module.launchLinearQ4_0QkvNoBiasQ8_1Tile4F32(&ctx, q_out, k_out, v_out, input_q8_1, weight, weight, weight, rows, in_dim, out_dim, out_dim);
+    try ctx.synchronize();
+    try q_out.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 4.0);
+    try k_out.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 4.0);
+    try v_out.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 4.0);
+
+    const gate_data = [_]f32{1.0} ** (rows * in_dim);
+    var gate = try buffer_mod.DeviceBuffer.alloc(&ctx, gate_data.len * @sizeOf(f32));
+    defer gate.free(&ctx);
+    try gate.copyFromHost(&ctx, std.mem.sliceAsBytes(&gate_data));
+    try module.launchLinearQ4_0GatedDownTile4F32(&ctx, output, gate, input, weight, rows, in_dim, out_dim, 3);
+    try ctx.synchronize();
+    try output.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 0.01);
+
+    try module.launchLinearQ4_0GatedDownTile8F32(&ctx, output, gate, input, weight, rows, in_dim, out_dim, 3);
+    try ctx.synchronize();
+    try output.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 0.01);
+
+    try module.launchLinearQ4_0GatedDownTile16F32(&ctx, output, gate, input, weight, rows, in_dim, out_dim, 3);
+    try ctx.synchronize();
+    try output.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 0.01);
+
+    var gated_q8_1 = try buffer_mod.DeviceBuffer.alloc(&ctx, rows * (in_dim / q8_1_values_per_block) * q8_1_block_bytes);
+    defer gated_q8_1.free(&ctx);
+    try module.launchQuantizeGatedF32Q8_1Rows(&ctx, gated_q8_1, gate, input, rows, in_dim, 3);
+    try ctx.synchronize();
+    try module.launchLinearQ4_0Q8_1Tile4F32(&ctx, output, gated_q8_1, weight, rows, in_dim, out_dim);
+    try ctx.synchronize();
+    try output.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected[0..], 4.0);
+
     const col_tiles = (out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
     var argmax_output = try buffer_mod.DeviceBuffer.alloc(&ctx, rows * @sizeOf(u32));
     defer argmax_output.free(&ctx);
@@ -8615,6 +12223,93 @@ pub fn smokeQ4_0(allocator: std.mem.Allocator) !void {
     const argmax_expected = [_]u32{ 0, 2 };
     for (argmax_expected, 0..) |want, i| {
         if (argmax_actual[i] != want) return error.CudaSmokeMismatch;
+    }
+}
+
+pub fn smokeQ4_0E4BPairActivationQ8_1Rows(allocator: std.mem.Allocator) !void {
+    var ctx = try context_mod.CudaContext.initDefault();
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+
+    const rows: usize = 8;
+    const in_dim: usize = 2560;
+    const out_dim: usize = 10240;
+    const input_row_blocks = in_dim / q8_1_values_per_block;
+    const out_row_blocks = out_dim / q8_1_values_per_block;
+    const weight_bytes = out_dim * input_row_blocks * q4_0_block_bytes;
+
+    const input_data = try allocator.alloc(f32, rows * in_dim);
+    defer allocator.free(input_data);
+    for (0..in_dim) |col| {
+        const signed: i32 = @intCast((col * 17 + 11) % 97);
+        const centered: f32 = @as(f32, @floatFromInt(signed - 48)) / 19.0;
+        const ripple: f32 = @as(f32, @floatFromInt(@as(i32, @intCast((col * 7) % 9)) - 4)) / 43.0;
+        input_data[col] = centered + ripple;
+    }
+    for (1..rows) |row| {
+        @memcpy(input_data[row * in_dim .. (row + 1) * in_dim], input_data[0..in_dim]);
+    }
+
+    const gate_weight_raw = try allocator.alloc(u8, weight_bytes);
+    defer allocator.free(gate_weight_raw);
+    const up_weight_raw = try allocator.alloc(u8, weight_bytes);
+    defer allocator.free(up_weight_raw);
+    for (0..out_dim) |col| {
+        for (0..input_row_blocks) |block| {
+            var gate_values = [_]i4{0} ** q4_0_values_per_block;
+            var up_values = [_]i4{0} ** q4_0_values_per_block;
+            for (0..q4_0_values_per_block) |lane| {
+                const gate_raw: i32 = @intCast((col * 31 + block * 13 + lane * 5) % 15);
+                const up_raw: i32 = @intCast((col * 19 + block * 23 + lane * 7 + 3) % 15);
+                gate_values[lane] = @intCast(gate_raw - 7);
+                up_values[lane] = @intCast(up_raw - 7);
+            }
+            const gate_scale = 0.0175 + @as(f32, @floatFromInt((col * 3 + block) % 11)) * 0.00425;
+            const up_scale = 0.015 + @as(f32, @floatFromInt((col * 5 + block * 2) % 13)) * 0.00375;
+            const offset = (col * input_row_blocks + block) * q4_0_block_bytes;
+            writeQ4_0SmokeRowValues(gate_weight_raw[offset .. offset + q4_0_block_bytes], gate_scale, &gate_values);
+            writeQ4_0SmokeRowValues(up_weight_raw[offset .. offset + q4_0_block_bytes], up_scale, &up_values);
+        }
+    }
+
+    var input = try buffer_mod.DeviceBuffer.alloc(&ctx, input_data.len * @sizeOf(f32));
+    defer input.free(&ctx);
+    var input_q8_1 = try buffer_mod.DeviceBuffer.alloc(&ctx, rows * input_row_blocks * q8_1_block_bytes);
+    defer input_q8_1.free(&ctx);
+    var gate_weight = try buffer_mod.DeviceBuffer.alloc(&ctx, gate_weight_raw.len);
+    defer gate_weight.free(&ctx);
+    var up_weight = try buffer_mod.DeviceBuffer.alloc(&ctx, up_weight_raw.len);
+    defer up_weight.free(&ctx);
+    var output_q8_1 = try buffer_mod.DeviceBuffer.alloc(&ctx, rows * out_row_blocks * q8_1_block_bytes);
+    defer output_q8_1.free(&ctx);
+
+    try input.copyFromHost(&ctx, std.mem.sliceAsBytes(input_data));
+    try gate_weight.copyFromHost(&ctx, gate_weight_raw);
+    try up_weight.copyFromHost(&ctx, up_weight_raw);
+    try module.launchQuantizeF32Q8_1Rows(&ctx, input_q8_1, input, rows, in_dim);
+    try module.launchLinearQ4_0PairActivationQ8_1Tile32W5E4BFfnQ8_1(
+        &ctx,
+        output_q8_1,
+        input_q8_1,
+        gate_weight,
+        up_weight,
+        rows,
+        in_dim,
+        out_dim,
+        @intFromEnum(@import("../../graph/backend_contracts.zig").DecoderRuntimeActivationKind.gelu),
+    );
+    try ctx.synchronize();
+
+    const output_host = try allocator.alloc(u8, rows * out_row_blocks * q8_1_block_bytes);
+    defer allocator.free(output_host);
+    try output_q8_1.copyToHost(&ctx, output_host);
+    try ctx.synchronize();
+    const row_bytes = out_row_blocks * q8_1_block_bytes;
+    for (1..rows) |row| {
+        if (!std.mem.eql(u8, output_host[0..row_bytes], output_host[row * row_bytes .. (row + 1) * row_bytes])) {
+            return error.CudaSmokeMismatch;
+        }
     }
 }
 
@@ -8694,7 +12389,7 @@ pub fn smokeQ4_K(allocator: std.mem.Allocator) !void {
     var embed_out = try buffer_mod.DeviceBuffer.alloc(&ctx, ids_data.len * in_dim * @sizeOf(f32));
     defer embed_out.free(&ctx);
     try ids.copyFromHost(&ctx, std.mem.sliceAsBytes(&ids_data));
-    try module.launchEmbeddingLookupQ4KF32(&ctx, embed_out, weight, ids, ids_data.len, in_dim);
+    try module.launchEmbeddingLookupQ4KF32(&ctx, embed_out, weight, ids, ids_data.len, in_dim, 1.0);
     try ctx.synchronize();
     const embed = try allocator.alloc(f32, ids_data.len * in_dim);
     defer allocator.free(embed);
@@ -8770,13 +12465,13 @@ pub fn smokeQ6_K(allocator: std.mem.Allocator) !void {
     const actual = try allocator.alloc(f32, ids_i64.len * dim);
     defer allocator.free(actual);
 
-    try module.launchEmbeddingLookupQ6KF32(&ctx, embed_out, weight, ids64, ids_i64.len, dim);
+    try module.launchEmbeddingLookupQ6KF32(&ctx, embed_out, weight, ids64, ids_i64.len, dim, 1.0);
     try ctx.synchronize();
     try embed_out.copyToHost(&ctx, std.mem.sliceAsBytes(actual));
     try ctx.synchronize();
     try expectApproxSlice(actual, expected, 0.0001);
 
-    try module.launchEmbeddingLookupI32Q6KF32(&ctx, embed_out, weight, ids32, ids_i32.len, dim);
+    try module.launchEmbeddingLookupI32Q6KF32(&ctx, embed_out, weight, ids32, ids_i32.len, dim, 1.0);
     try ctx.synchronize();
     try embed_out.copyToHost(&ctx, std.mem.sliceAsBytes(actual));
     try ctx.synchronize();
@@ -9050,7 +12745,13 @@ fn bf16Bits(value: f32) u16 {
 fn expectApproxSlice(actual: []const f32, expected: []const f32, tolerance: f32) !void {
     if (actual.len != expected.len) return error.CudaSmokeMismatch;
     for (expected, 0..) |want, i| {
-        if (@abs(actual[i] - want) > tolerance) return error.CudaSmokeMismatch;
+        if (@abs(actual[i] - want) > tolerance) {
+            std.debug.print(
+                "cuda_smoke_mismatch: index={d} actual={d:.6} expected={d:.6} tolerance={d:.6}\n",
+                .{ i, actual[i], want, tolerance },
+            );
+            return error.CudaSmokeMismatch;
+        }
     }
 }
 

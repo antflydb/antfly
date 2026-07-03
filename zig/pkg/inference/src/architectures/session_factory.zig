@@ -4251,9 +4251,19 @@ pub fn getCudaRuntimeStats(session: Session) ?CudaRuntimeStats {
 pub fn recommendedKvDTypeForGptConfig(config: gpt_mod.Config, backend_kind: runtime.kv.pool.BackendKind) runtime.kv.pool.KvDType {
     return switch (backend_kind) {
         .native => .f32,
-        .cuda => if (config.family == .gemma) .f32 else .f16,
+        .cuda => if (shouldDefaultGemmaCudaKvDTypeToPolar4(config)) .polar4 else if (config.family == .gemma) .f32 else .f16,
         .metal => if (config.family == .gemma) metalGemmaKvDTypeOverride() orelse .f16 else .f16,
     };
+}
+
+fn shouldDefaultGemmaCudaKvDTypeToPolar4(config: gpt_mod.Config) bool {
+    if (config.family != .gemma) return false;
+    return config.num_kv_shared_layers > 0 or
+        config.global_head_dim > 0 or
+        config.ple_hidden_size > 0 or
+        config.gemma4_mtp_assistant or
+        config.attention_k_eq_v or
+        config.rope_dim_override > 0;
 }
 
 pub fn recommendedKvDTypeForSession(session: Session, backend_kind: runtime.kv.pool.BackendKind) runtime.kv.pool.KvDType {
@@ -4272,9 +4282,11 @@ test "parseMetalGemmaKvDTypeOverride only accepts staged Gemma Metal dtypes" {
 
 test "recommendedKvDTypeForGptConfig keeps backend defaults without a session" {
     const gemma = gpt_mod.Config{ .family = .gemma };
+    const gemma4 = gpt_mod.Config{ .family = .gemma, .num_kv_shared_layers = 20 };
     const llama = gpt_mod.Config{ .family = .llama };
     try std.testing.expectEqual(runtime.kv.pool.KvDType.f32, recommendedKvDTypeForGptConfig(gemma, .native));
     try std.testing.expectEqual(runtime.kv.pool.KvDType.f32, recommendedKvDTypeForGptConfig(gemma, .cuda));
+    try std.testing.expectEqual(runtime.kv.pool.KvDType.polar4, recommendedKvDTypeForGptConfig(gemma4, .cuda));
     try std.testing.expectEqual(runtime.kv.pool.KvDType.f16, recommendedKvDTypeForGptConfig(llama, .metal));
 }
 
