@@ -27247,6 +27247,7 @@ fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_
     const entry = ctx.index_manager.denseIndex(index_ref.name) orelse return true;
     if (!denseIndexIsArtifactBacked(entry)) return true;
     if (asyncContextHasActiveExternalDenseBulkWork(ctx)) return false;
+    if (ctx.active_dense_catch_up_sessions.load(.acquire) != 0) return true;
 
     const now_ns = monotonicTimeNs();
     if (!shouldRunTargetAdvanceRepair(ctx, index_ref.name, now_ns)) return false;

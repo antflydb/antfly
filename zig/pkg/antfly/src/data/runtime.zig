@@ -5354,7 +5354,7 @@ pub const DataServer = struct {
                 if (!result.had_debt) continue;
                 stats.groups_with_debt += 1;
                 if (result.terminal_degraded) {
-                    std.log.err("provisioned startup catch-up found terminal degraded state group={} table={s}", .{ group_id, table.name });
+                    std.log.warn("provisioned startup catch-up found terminal degraded state group={} table={s}", .{ group_id, table.name });
                     self.runtime_status_dirty.store(true, .release);
                     self.store_status_dirty = true;
                     continue;

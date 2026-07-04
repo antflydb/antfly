@@ -3837,6 +3837,7 @@ pub fn build(b: *std.Build) void {
             "write cache metadata refresh preserves inactive adoptable seed",
             "write cache adopts active just-created db across generation bump",
             "write cache local mutation reuses live stale-generation writer",
+            "write cache structural local mutation finishes auto bulk before reuse",
             "write cache local mutation preempts stale startup writer",
             "hosted runtime status prefers live writer over stale hosted snapshot",
             "runtime status collection leaves active stale write lease live",

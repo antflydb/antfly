@@ -6496,19 +6496,27 @@ pub const ApiHttpServer = struct {
             error.TableNotFound, error.IndexNotFound => return error.NotFound,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
-            else => return error.InternalFailure,
+            else => {
+                std.log.err("public delete index metadata update failed table={s} index={s} err={}", .{ table_name, index_name, err });
+                return error.InternalFailure;
+            },
         };
         const expected_indexes_json = (indexes_api.removeIndexFromTableIndexesJson(alloc, table_before.indexes_json, index_name) catch return error.InternalFailure) orelse {
             return error.NotFound;
         };
         defer alloc.free(expected_indexes_json);
         self.waitForMetadataProjection(table_name, null, expected_indexes_json) catch |err| {
-            return metadataAccessFailure(err);
+            if (isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+            std.log.err("public delete index metadata projection wait failed table={s} index={s} err={}", .{ table_name, index_name, err });
+            return error.InternalFailure;
         };
         if (self.table_writes) |table_writes_source| {
             _ = table_writes_source.dropIndex(alloc, table_name, index_name) catch |err| switch (err) {
                 error.IndexNotFound => {},
-                else => return error.InternalFailure,
+                else => {
+                    std.log.err("public delete index local apply failed table={s} index={s} err={}", .{ table_name, index_name, err });
+                    return error.InternalFailure;
+                },
             };
         }
     }

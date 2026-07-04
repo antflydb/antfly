@@ -4722,10 +4722,34 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         allow_bulk_session: bool,
     ) !ProvisionedTableWriteCache.CachedDb {
-        if (cache.leaseLiveEntryForLocalMutationLocked(group_id, table_name, allow_bulk_session)) |cached| {
+        if (try self.leaseLiveEntryForLocalMutationLocked(cache, group_id, table_name, allow_bulk_session)) |cached| {
             return cached;
         }
         return try self.getOrOpenCachedDbModeAlreadyLocked(cache, path, group_id, lsm_root_generation, table_name, .default_async);
+    }
+
+    fn leaseLiveEntryForLocalMutationLocked(
+        self: *ProvisionedTableWriteSource,
+        cache: *ProvisionedTableWriteCache,
+        group_id: u64,
+        table_name: []const u8,
+        allow_bulk_session: bool,
+    ) !?ProvisionedTableWriteCache.CachedDb {
+        if (cache.leaseLiveEntryForLocalMutationLocked(group_id, table_name, allow_bulk_session)) |cached| {
+            return cached;
+        }
+        if (allow_bulk_session) return null;
+
+        for (cache.entries.items) |entry| {
+            if (entry.group_id != group_id) continue;
+            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.auto_bulk_ingest_session_open) {
+                try self.finishEntryAutoBulkIngestForForegroundVisibility(cache, entry);
+                return cache.leaseEntryLocked(entry);
+            }
+            if (entry.bulk_ingest_session_open) return error.LsmRootWriterAlreadyOpen;
+        }
+        return null;
     }
 
     fn preemptStartupWriteCacheForLocalMutation(
@@ -4769,7 +4793,11 @@ pub const ProvisionedTableWriteSource = struct {
         while (true) {
             self.preemptStartupWriteCacheForLocalMutation(group_id, table_name);
             lockAtomic(&self.local_db_mutex);
-            if (cache.leaseLiveEntryForLocalMutationLocked(group_id, table_name, allow_bulk_session)) |cached| {
+            const maybe_cached = self.leaseLiveEntryForLocalMutationLocked(cache, group_id, table_name, allow_bulk_session) catch |err| {
+                self.local_db_mutex.unlock();
+                return err;
+            };
+            if (maybe_cached) |cached| {
                 self.local_db_mutex.unlock();
                 return cached;
             }
@@ -19499,6 +19527,14 @@ test "provisioned create index updates cached writer in place" {
     try std.testing.expect(write_cache.entries.items[0] == original_entry);
     try std.testing.expect(cached.db.core.index_manager.denseIndex("owner_forwarded_idx") != null);
 
+    Catalog.indexes_json_buf = "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3,\"external\":true}}";
+    _ = try source.source().dropIndex(alloc, "docs", "owner_forwarded_idx");
+
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
+    try std.testing.expect(write_cache.entries.items[0] == original_entry);
+    try std.testing.expect(cached.db.core.index_manager.denseIndex("owner_forwarded_idx") == null);
+
     _ = try outer_source.source().batch(alloc, "docs", .{
         .writes = &.{.{ .key = "doc:owner-forwarded", .value = "{\"body\":\"owner forwarded batch\"}" }},
         .sync_level = .write,
@@ -26378,6 +26414,81 @@ test "write cache local mutation reuses live stale-generation writer" {
     var cached = try source.getOrOpenCachedDbForLocalMutationAlreadyLocked(&write_cache, path, 7001, 2, "docs", false);
     try std.testing.expect(cached.entry.? == entry);
     try std.testing.expectEqual(@as(u64, 1), cached.entry.?.lsm_root_generation);
+    write_cache.publishCachedLeaseGeneration(&cached, 2);
+    cached.deinit(alloc);
+    source.local_db_mutex.unlock();
+
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.closing_entries.items.len);
+    try std.testing.expectEqual(@as(u64, 2), entry.lsm_root_generation);
+    try std.testing.expectEqual(misses_before, write_cache.miss_count.load(.monotonic));
+}
+
+test "write cache structural local mutation finishes auto bulk before reuse" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-structural-auto-bulk", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"indexes\":[]}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    source.write_cache = &write_cache;
+
+    var cached_initial = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 1, "docs");
+    cached_initial.deinit(alloc);
+    const entry = write_cache.entries.items[0];
+    try write_cache.ensureAutoBulkIngestLocked(7001, "docs", platform_time.monotonicNs());
+    try std.testing.expect(entry.auto_bulk_ingest_session_open);
+    const misses_before = write_cache.miss_count.load(.monotonic);
+
+    lockAtomic(&source.local_db_mutex);
+    var cached = try source.getOrOpenCachedDbForLocalMutationAlreadyLocked(&write_cache, path, 7001, 2, "docs", false);
+    try std.testing.expect(cached.entry.? == entry);
+    try std.testing.expect(!cached.entry.?.bulk_ingest_session_open);
+    try std.testing.expect(!cached.entry.?.auto_bulk_ingest_session_open);
     write_cache.publishCachedLeaseGeneration(&cached, 2);
     cached.deinit(alloc);
     source.local_db_mutex.unlock();
