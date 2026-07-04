@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const DecodeLimits = @import("limits.zig").DecodeLimits;
 
 const Allocator = std.mem.Allocator;
 
@@ -309,8 +310,21 @@ pub fn hasSignature(bytes: []const u8) bool {
 }
 
 pub fn decodeRgba(alloc: Allocator, webp_bytes: []const u8) !DecodedImage {
+    return try decodeRgbaChecked(alloc, webp_bytes, null);
+}
+
+pub fn decodeRgbaLimited(alloc: Allocator, webp_bytes: []const u8, limits: DecodeLimits) !DecodedImage {
+    return try decodeRgbaChecked(alloc, webp_bytes, limits);
+}
+
+fn decodeRgbaChecked(alloc: Allocator, webp_bytes: []const u8, limits: ?DecodeLimits) !DecodedImage {
     const parsed = try parseChunks(webp_bytes);
     if (parsed.info.animated) return error.AnimatedWebpUnsupported;
+    if (limits) |limit| {
+        const width = parsed.info.width orelse return error.WebpDecodeFailed;
+        const height = parsed.info.height orelse return error.WebpDecodeFailed;
+        try limit.validate(width, height);
+    }
     if (parsed.vp8l_payload) |payload| return try decodeVp8lRgba(alloc, payload);
     if (parsed.vp8_payload) |payload| {
         var decoded = try decodeVp8Rgba(alloc, payload);
@@ -345,6 +359,7 @@ fn parseChunks(webp_bytes: []const u8) !ParsedChunks {
     var vp8x_alpha = false;
     var saw_alph = false;
     var saw_image = false;
+    var saw_animation_chunk = false;
 
     while (cursor < riff_len) {
         if (riff_len - cursor < chunk_header_len) return error.WebpDecodeFailed;
@@ -381,6 +396,8 @@ fn parseChunks(webp_bytes: []const u8) !ParsedChunks {
             parsed.info.alpha = parsed.info.alpha or header.alpha;
             try mergeDimensions(&parsed.info, header.width, header.height);
         } else if (std.mem.eql(u8, fourcc, "ANIM") or std.mem.eql(u8, fourcc, "ANMF")) {
+            if (!saw_vp8x or !parsed.info.animated) return error.WebpDecodeFailed;
+            saw_animation_chunk = true;
             parsed.info.animated = true;
         }
 
@@ -389,7 +406,7 @@ fn parseChunks(webp_bytes: []const u8) !ParsedChunks {
     }
 
     if (cursor != riff_len) return error.WebpDecodeFailed;
-    if (!saw_image and !parsed.info.animated) return error.WebpDecodeFailed;
+    if (!saw_image and (!parsed.info.animated or !saw_animation_chunk)) return error.WebpDecodeFailed;
     if (saw_alph and !saw_vp8x) return error.WebpDecodeFailed;
     if (saw_alph and !vp8x_alpha) return error.WebpDecodeFailed;
     if (saw_alph and parsed.info.bitstream != .vp8) return error.WebpDecodeFailed;
@@ -5035,6 +5052,29 @@ test "decode explicitly rejects animated webp" {
     try std.testing.expectError(error.AnimatedWebpUnsupported, decodeRgba(std.testing.allocator, &webp_vp8x_animated_1x1));
 }
 
+test "probe rejects animation chunks without vp8x animation flag" {
+    const anim_without_vp8x = [_]u8{
+        'R', 'I', 'F', 'F', 12,  0,   0,   0,
+        'W', 'E', 'B', 'P', 'A', 'N', 'I', 'M',
+        0,   0,   0,   0,
+    };
+    try std.testing.expectError(error.WebpDecodeFailed, probe(&anim_without_vp8x));
+
+    var vp8x_without_animation_flag = webp_vp8x_animated_1x1;
+    vp8x_without_animation_flag[20] = 0;
+    try std.testing.expectError(error.WebpDecodeFailed, probe(&vp8x_without_animation_flag));
+}
+
+test "probe rejects vp8x animation flag without animation chunks" {
+    const vp8x_animation_only = [_]u8{
+        'R', 'I', 'F', 'F', 22,                  0,   0,   0,
+        'W', 'E', 'B', 'P', 'V',                 'P', '8', 'X',
+        10,  0,   0,   0,   vp8x_flag_animation, 0,   0,   0,
+        0,   0,   0,   0,   0,                   0,
+    };
+    try std.testing.expectError(error.WebpDecodeFailed, probe(&vp8x_animation_only));
+}
+
 test "decode rejects unsupported lossy vp8 frame flags" {
     try std.testing.expectError(error.UnsupportedWebpFormat, decodeRgba(std.testing.allocator, &webp_vp8_1x1));
 }
@@ -5115,6 +5155,18 @@ test "decode minimal vp8l literal image to rgba" {
         const pixel = decoded.rgba[i * 4 ..][0..4];
         try std.testing.expectEqualSlices(u8, &.{ 0x44, 0x22, 0x11, 0xff }, pixel);
     }
+}
+
+test "decode limited rejects oversized webp before full decode" {
+    const alloc = std.testing.allocator;
+    const webp = try testBuildLiteralVp8lWebp(alloc, 2, 3, .{ 0x44, 0x22, 0x11, 0xff });
+    defer alloc.free(webp);
+
+    const limits = DecodeLimits{
+        .max_pixels = 1,
+        .max_rgba_bytes = 4,
+    };
+    try std.testing.expectError(error.ImageTooLarge, decodeRgbaLimited(alloc, webp, limits));
 }
 
 test "decode vp8l two-symbol simple prefix literal pixels" {

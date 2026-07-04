@@ -25848,8 +25848,8 @@ const ImageDecodingPartsEmbedder = struct {
             };
 
             if (std.mem.eql(u8, binary.mime_type, "image/bmp")) {
-                const decoded = antfly_image.bmp.decodeRgba(alloc, binary.data) catch |err| switch (err) {
-                    error.BmpDecodeFailed, error.UnsupportedBmpFormat => return error.EmbedRequestFailed,
+                const decoded = antfly_image.bmp.decodeRgbaLimited(alloc, binary.data, antfly_image.DecodeLimits.inference_default) catch |err| switch (err) {
+                    error.BmpDecodeFailed, error.UnsupportedBmpFormat, error.ImageTooLarge => return error.EmbedRequestFailed,
                     else => return err,
                 };
                 defer alloc.free(decoded.rgba);
@@ -25858,10 +25858,11 @@ const ImageDecodingPartsEmbedder = struct {
             }
 
             if (std.mem.eql(u8, binary.mime_type, "image/webp")) {
-                const decoded = antfly_image.webp.decodeRgba(alloc, binary.data) catch |err| switch (err) {
+                const decoded = antfly_image.webp.decodeRgbaLimited(alloc, binary.data, antfly_image.DecodeLimits.inference_default) catch |err| switch (err) {
                     error.WebpDecodeFailed,
                     error.UnsupportedWebpFormat,
                     error.AnimatedWebpUnsupported,
+                    error.ImageTooLarge,
                     => return error.EmbedRequestFailed,
                     else => return err,
                 };

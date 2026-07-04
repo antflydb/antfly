@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const DecodeLimits = @import("limits.zig").DecodeLimits;
 const test_support = @import("test_support.zig");
 
 const Allocator = std.mem.Allocator;
@@ -62,6 +63,16 @@ pub fn probe(bmp_bytes: []const u8) !Info {
 }
 
 pub fn decodeRgba(alloc: Allocator, bmp_bytes: []const u8) !DecodedImage {
+    return try decodeRgbaChecked(alloc, bmp_bytes, null);
+}
+
+pub fn decodeRgbaLimited(alloc: Allocator, bmp_bytes: []const u8, limits: DecodeLimits) !DecodedImage {
+    const info = try probe(bmp_bytes);
+    try limits.validate(info.width, info.height);
+    return try decodeRgbaChecked(alloc, bmp_bytes, limits);
+}
+
+fn decodeRgbaChecked(alloc: Allocator, bmp_bytes: []const u8, limits: ?DecodeLimits) !DecodedImage {
     if (!hasSignature(bmp_bytes)) return error.BmpDecodeFailed;
     if (bmp_bytes.len < file_header_len + dib_bitmap_info_header_len) return error.BmpDecodeFailed;
 
@@ -91,6 +102,7 @@ pub fn decodeRgba(alloc: Allocator, bmp_bytes: []const u8) !DecodedImage {
     const height_abs_i = if (height_i < 0) -height_i else height_i;
     const height: u32 = @intCast(height_abs_i);
     const top_down = height_i < 0;
+    if (limits) |limit| try limit.validate(width, height);
 
     const row_bits = try std.math.mul(usize, @as(usize, width), bits_per_pixel);
     const src_row_stride = ((row_bits + 31) / 32) * 4;
@@ -299,6 +311,14 @@ test "decode rejects truecolor pixel data before dib header end" {
     bytes[12] = 0;
     bytes[13] = 0;
     try std.testing.expectError(error.BmpDecodeFailed, decodeRgba(std.testing.allocator, &bytes));
+}
+
+test "decode limited rejects oversized bmp before allocation" {
+    var bytes = bmp_24_2x2;
+    std.mem.writeInt(i32, bytes[18..22], 100_000, .little);
+    std.mem.writeInt(i32, bytes[22..26], 100_000, .little);
+
+    try std.testing.expectError(error.ImageTooLarge, decodeRgbaLimited(std.testing.allocator, &bytes, DecodeLimits.inference_default));
 }
 
 test "decode manifest-backed bmp success fixtures" {

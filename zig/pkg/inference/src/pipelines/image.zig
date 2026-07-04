@@ -144,8 +144,8 @@ fn decodeGif(allocator: std.mem.Allocator, image_bytes: []const u8) !Image {
 }
 
 fn decodeBmp(allocator: std.mem.Allocator, image_bytes: []const u8) !Image {
-    const decoded = antfly_image.bmp.decodeRgba(allocator, image_bytes) catch |err| switch (err) {
-        error.BmpDecodeFailed, error.UnsupportedBmpFormat => return error.ImageDecodeFailed,
+    const decoded = antfly_image.bmp.decodeRgbaLimited(allocator, image_bytes, antfly_image.DecodeLimits.inference_default) catch |err| switch (err) {
+        error.BmpDecodeFailed, error.UnsupportedBmpFormat, error.ImageTooLarge => return error.ImageDecodeFailed,
         else => return err,
     };
     errdefer allocator.free(decoded.rgba);
@@ -153,8 +153,8 @@ fn decodeBmp(allocator: std.mem.Allocator, image_bytes: []const u8) !Image {
 }
 
 fn decodeWebp(allocator: std.mem.Allocator, image_bytes: []const u8) !Image {
-    const decoded = antfly_image.webp.decodeRgba(allocator, image_bytes) catch |err| switch (err) {
-        error.WebpDecodeFailed, error.UnsupportedWebpFormat, error.AnimatedWebpUnsupported => return error.ImageDecodeFailed,
+    const decoded = antfly_image.webp.decodeRgbaLimited(allocator, image_bytes, antfly_image.DecodeLimits.inference_default) catch |err| switch (err) {
+        error.WebpDecodeFailed, error.UnsupportedWebpFormat, error.AnimatedWebpUnsupported, error.ImageTooLarge => return error.ImageDecodeFailed,
         else => return err,
     };
     errdefer allocator.free(decoded.rgba);
