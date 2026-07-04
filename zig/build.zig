@@ -1478,6 +1478,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    termite_ml_mod.addImport("antfly_platform", platform_mod);
     const ml_tabular_mod = b.addModule("ml_tabular", .{
         .root_source_file = b.path("lib/ml/tabular/src/root.zig"),
         .target = target,
@@ -1912,6 +1913,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSafe,
         .single_threaded = true,
     });
+    wasm_inference_ml_mod.addImport("antfly_platform", wasm_platform_mod);
     const wasm_inference_onnx_graph_mod = b.createModule(.{
         .root_source_file = b.path("lib/onnx/src/root.zig"),
         .target = wasm_target,
@@ -2213,6 +2215,13 @@ pub fn build(b: *std.Build) void {
     const run_lib_ml_tabular_tests = b.addRunArtifact(lib_ml_tabular_tests);
     const lib_ml_tabular_test_step = b.step("lib-ml-tabular-test", "Run standalone lib/ml/tabular tests");
     lib_ml_tabular_test_step.dependOn(&run_lib_ml_tabular_tests.step);
+
+    const lib_onnx_tests = b.addTest(.{
+        .root_module = termite_onnx_graph_mod,
+    });
+    const run_lib_onnx_tests = b.addRunArtifact(lib_onnx_tests);
+    const lib_onnx_test_step = b.step("lib-onnx-test", "Run standalone lib/onnx tests");
+    lib_onnx_test_step.dependOn(&run_lib_onnx_tests.step);
 
     const fuzz_tabular_loader = b.addTest(.{
         .root_module = b.createModule(.{
@@ -4891,6 +4900,7 @@ pub fn build(b: *std.Build) void {
     // are wired here once.
     dependOnAll(unit_test_step, &.{
         &run_lib_json_tests.step,
+        &run_lib_onnx_tests.step,
         &run_httpx_json_tests.step,
         &run_httpx_tests.step,
         &run_api_json_helpers_tests.step,

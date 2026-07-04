@@ -240,6 +240,7 @@ pub const ModelOutput = struct {
         vocab_size: usize,
         eps: f32,
         final_logit_softcap: f32 = 0.0,
+        greedy_token_id: ?i64 = null,
 
         fn logits(self: *PreparedTail) !?contracts.CT {
             return switch (self.norm) {
@@ -263,6 +264,7 @@ pub const ModelOutput = struct {
         }
 
         fn greedyToken(self: *PreparedTail) !?i64 {
+            if (self.greedy_token_id) |token_id| return token_id;
             // Final logit softcap is monotonic, so it changes sampling
             // probabilities but not the greedy argmax ordering.
             const token = switch (self.norm) {
@@ -384,6 +386,7 @@ pub const PrefillRequest = struct {
     query_seq_len: usize,
     attention_mode: cache_mod.AttentionMode,
     force_host_logits: bool = false,
+    prefer_greedy_token: bool = false,
 };
 
 pub const DecodeRequest = struct {

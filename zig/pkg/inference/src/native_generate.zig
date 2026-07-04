@@ -60,6 +60,11 @@ const ExecutionMode = enum {
 
 const CompiledTarget = graph_mod.compiled_backend.AttachmentTarget;
 
+fn debugGenerateSetup(comptime fmt: []const u8, args: anytype) void {
+    if (!platform.env.getenvBool("TERMITE_GEN_STAGE_DEBUG")) return;
+    std.debug.print("generate-setup: " ++ fmt ++ "\n", args);
+}
+
 fn shouldSkipAutoMtpDraftLoad(opts: Options, draft_cfg: gpt_mod.Config) bool {
     if (opts.speculation_policy != .auto) return false;
     if (!draft_cfg.gemma4_mtp_assistant) return false;
@@ -117,9 +122,15 @@ const Options = struct {
     json_timing_path: ?[]const u8 = null,
 };
 
+fn shouldDisableMetalAutoDraft(opts: Options) bool {
+    return opts.backend == .metal and
+        opts.speculation_policy == .auto and
+        !platform.env.getenvBool("ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO");
+}
+
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     const opts = try parseArgs(args);
-    const effective_draft_model = if (opts.speculation_policy == .off) null else opts.draft_model;
+    const effective_draft_model = if (opts.speculation_policy == .off or shouldDisableMetalAutoDraft(opts)) null else opts.draft_model;
     if (opts.raw_decode_bench and (opts.image_count > 0 or opts.audio_count > 0)) return error.RawDecodeBenchRequiresTextOnly;
     if (opts.raw_decode_bench and effective_draft_model != null) return error.RawDecodeBenchSpeculationUnsupported;
     if (opts.raw_decode_bench and opts.stream) return error.RawDecodeBenchStreamingUnsupported;
@@ -211,7 +222,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .prefill_chunk_size = opts.prefill_chunk_size,
         .draft_model = effective_draft_model,
         .speculative_k = opts.speculative_k,
-        .speculation_requested = opts.draft_model != null,
+        .speculation_requested = effective_draft_model != null,
         .speculation_policy = opts.speculation_policy,
         .speculation_calibration = opts.speculation_calibration,
         .cache_compaction_ratio = opts.cache_compaction_ratio,
@@ -370,7 +381,12 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     generation.gemma4_mtp_debug_override = opts.debug_mtp;
     try warmInitCudaBeforeLargeModelScan(opts.backend);
-    const model = try model_manager.loadFromDir(opts.model_dir);
+    debugGenerateSetup("load model begin dir={s}", .{opts.model_dir});
+    const model = model_manager.loadFromDir(opts.model_dir) catch |err| {
+        debugGenerateSetup("load model failed err={s}", .{@errorName(err)});
+        return err;
+    };
+    debugGenerateSetup("load model done backend={s}", .{@tagName(model.session.backend())});
     const loaded_model_at = std.Io.Timestamp.now(io, .awake);
     var gpt_config = session_factory.getGptConfig(model.session) orelse return error.InvalidModelForGeneration;
     if (opts.disable_gemma_embedding_scale and gpt_config.family == .gemma) {
@@ -391,7 +407,12 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                 break :blk null;
             }
         }
-        const loaded = try model_manager.loadFromDir(draft_model_dir);
+        debugGenerateSetup("load draft model begin dir={s}", .{draft_model_dir});
+        const loaded = model_manager.loadFromDir(draft_model_dir) catch |err| {
+            debugGenerateSetup("load draft model failed err={s}", .{@errorName(err)});
+            return err;
+        };
+        debugGenerateSetup("load draft model done backend={s}", .{@tagName(loaded.session.backend())});
         const draft_cfg = session_factory.getGptConfig(loaded.session) orelse return error.InvalidDraftModelForGeneration;
         try validateDraftTokenizerCompatibility(tokenizer, loaded.getTokenizer(), gpt_config, draft_cfg);
         draft_gpt_config = draft_cfg;
@@ -485,6 +506,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         };
     }
 
+    debugGenerateSetup("live whole-model executor probe begin", .{});
     if (try tryRunLiveWholeModelExecutorGenerate(
         allocator,
         io,
@@ -498,7 +520,11 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         started_at,
         loaded_model_at,
         encoded_prompt_at,
-    )) return;
+    )) {
+        debugGenerateSetup("live whole-model executor handled request", .{});
+        return;
+    }
+    debugGenerateSetup("live whole-model executor skipped", .{});
 
     if (!graph_mode) {
         graph_mod.executor_stats.printBypass("inference.generate", "native_generation_direct_decoder_runtime");
@@ -605,12 +631,15 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             };
         }
     }
+    debugGenerateSetup("compute backend begin", .{});
     var cb = session_factory.getComputeBackendWithBudget(model.session, allocator, &run_budget) catch |err| {
+        debugGenerateSetup("compute backend failed err={s}", .{@errorName(err)});
         if (err == error.MemoryBudgetExceeded) {
             printBudgetExceeded(model.session, &run_budget);
         }
         return err;
     };
+    debugGenerateSetup("compute backend done", .{});
     const created_backend_at = std.Io.Timestamp.now(io, .awake);
     defer cb.deinit();
     if (opts.debug_gemma4_target) {
@@ -941,6 +970,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     metal_snapshot.quant.gated_block_fast_attempts,
                 },
             );
+            printMetalQuantDispatchSummary(metal_snapshot);
             print(
                 "metal_gated_quantized_block: calls={d} quantized_branch={d} attn_calls={d} attn_nulls={d} attn_prefill_nulls={d} attn_decode_nulls={d} norm_nulls={d} f32_kv_calls={d} f32_kv_ok={d} f32_kv_nulls={d} f32_quant_direct_ok={d} f32_quant_direct_fail={d} compressed_f32_reroutes={d} active_bootstrap_misses={d}\n",
                 .{
@@ -3759,6 +3789,68 @@ fn writeJsonTiming(
     try compat.cwd().writeFile(io, .{ .sub_path = path, .data = json });
 }
 
+fn writeLiveWholeModelJsonTiming(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    model_dir: []const u8,
+    backend_name: []const u8,
+    tokens: usize,
+    finish_reason: []const u8,
+    load_model_ms: u64,
+    prompt_prep_ms: u64,
+    backend_setup_ms: u64,
+    runtime_prewarm_ms: u64,
+    generate_ms: u64,
+    total_ms: u64,
+    prefill_ms: u64,
+    decode_ms: u64,
+) !void {
+    const json = try std.fmt.allocPrint(
+        allocator,
+        \\{{
+        \\"model_dir":{f},
+        \\"backend":{f},
+        \\"tokens":{d},
+        \\"finish_reason":{f},
+        \\"decode_tok_per_s":{d:.6},
+        \\"timing_ms":{{
+        \\"load_model":{d},
+        \\"prompt_prep":{d},
+        \\"scheduler":0,
+        \\"backend_setup":{d},
+        \\"runtime_prewarm":{d},
+        \\"decode_setup":0,
+        \\"generate":{d},
+        \\"total":{d},
+        \\"prefill_inner":{d},
+        \\"decode_inner":{d},
+        \\"total_inner":{d}
+        \\}}
+        \\}}
+        \\
+    ,
+        .{
+            std.json.fmt(model_dir, .{}),
+            std.json.fmt(backend_name, .{}),
+            tokens,
+            std.json.fmt(finish_reason, .{}),
+            tokensPerSecond(tokens, decode_ms),
+            load_model_ms,
+            prompt_prep_ms,
+            backend_setup_ms,
+            runtime_prewarm_ms,
+            generate_ms,
+            total_ms,
+            prefill_ms,
+            decode_ms,
+            prefill_ms + decode_ms,
+        },
+    );
+    defer allocator.free(json);
+    try compat.cwd().writeFile(io, .{ .sub_path = path, .data = json });
+}
+
 fn printGpuHostedTimingDetails(cb_opt: ?*const ops.ComputeBackend) void {
     if (!build_options.enable_metal) {
         return;
@@ -3772,6 +3864,67 @@ fn printGpuHostedTimingDetails(cb_opt: ?*const ops.ComputeBackend) void {
         backend_stats,
         decoder_runtime_runtime_ready,
         decoder_runtime_embeddings_prepared,
+    );
+}
+
+fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot) void {
+    print(
+        "metal_q8_0_dispatch: scalar={d} mmv={d} small_batch={d} mm={d} rows_1={d} rows_2_8={d} rows_9_64={d} rows_65_plus={d} pair_act_mm_out_f16={d} linear_mm_in_f16={d} pair_act_rms_mmv_out_f16={d} linear_mmv_in_f16={d}\n",
+        .{
+            metal_snapshot.provider.metal_runtime_q8_0_linear_dispatch_scalar,
+            metal_snapshot.provider.metal_runtime_q8_0_linear_dispatch_mmv,
+            metal_snapshot.provider.metal_runtime_q8_0_linear_dispatch_small_batch,
+            metal_snapshot.provider.metal_runtime_q8_0_linear_dispatch_mm,
+            metal_snapshot.provider.metal_runtime_q8_0_linear_rows_1,
+            metal_snapshot.provider.metal_runtime_q8_0_linear_rows_2_8,
+            metal_snapshot.provider.metal_runtime_q8_0_linear_rows_9_64,
+            metal_snapshot.provider.metal_runtime_q8_0_linear_rows_65_plus,
+            metal_snapshot.provider.metal_runtime_q8_0_pair_activation_mm_f16_output,
+            metal_snapshot.provider.metal_runtime_q8_0_linear_mm_f16_input,
+            metal_snapshot.provider.metal_runtime_q8_0_pair_activation_rms_scale_mmv_f16_output,
+            metal_snapshot.provider.metal_runtime_q8_0_linear_mmv_f16_input,
+        },
+    );
+    print(
+        "metal_attention_dispatch: paged_1x={d}\n",
+        .{metal_snapshot.provider.metal_runtime_paged_attention_1x_calls},
+    );
+    print(
+        "metal_q4_0_dispatch: linear_reduce={d} linear_reduce_in_f16={d} linear_reduce_out_f16={d} linear_reduce_in_f16_out_f16={d} linear_reduce_sumsq={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} pair_act_rms_scale_reduce_out_f16={d} activation_rhs_reduce={d} activation_rhs_reduce_out_f16={d} rms_norm_add_sumsq={d} pair_reduce={d} pair={d}\n",
+        .{
+            metal_snapshot.provider.metal_runtime_q4_0_linear_reduce,
+            metal_snapshot.provider.metal_runtime_q4_0_linear_reduce_f16_input,
+            metal_snapshot.provider.metal_runtime_q4_0_linear_reduce_f16_output,
+            metal_snapshot.provider.metal_runtime_q4_0_linear_reduce_f16_input_f16_output,
+            metal_snapshot.provider.metal_runtime_q4_0_linear_reduce_sumsq,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_reduce,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_reduce_f16_output,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_rms_scale_reduce_f16_output,
+            metal_snapshot.provider.metal_runtime_q4_0_activation_rhs_reduce,
+            metal_snapshot.provider.metal_runtime_q4_0_activation_rhs_reduce_f16_output,
+            metal_snapshot.provider.metal_runtime_rms_norm_add_sumsq,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_reduce,
+            metal_snapshot.provider.metal_runtime_q4_0_pair,
+        },
+    );
+    print(
+        "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_in_f16={d}\n",
+        .{
+            metal_snapshot.provider.metal_runtime_q4_k_linear_reduce,
+            metal_snapshot.provider.metal_runtime_q4_k_pair_reduce,
+            metal_snapshot.provider.metal_runtime_q4_k_pair_activation_reduce,
+            metal_snapshot.provider.metal_runtime_q4_k_pair_activation_reduce_f16_output,
+            metal_snapshot.provider.metal_runtime_q4_k_activation_rhs_reduce,
+            metal_snapshot.provider.metal_runtime_q6_k_linear_reduce,
+            metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_f16_input,
+        },
+    );
+    print(
+        "metal_q4_0_ple_dispatch: activation_rhs_reduce_out_f16={d} linear_reduce_in_f16={d}\n",
+        .{
+            metal_snapshot.provider.metal_runtime_q4_0_ple_activation_rhs_reduce_f16_output,
+            metal_snapshot.provider.metal_runtime_q4_0_ple_linear_reduce_f16_input,
+        },
     );
 }
 
@@ -3790,6 +3943,51 @@ fn metalExecutorReuseProbeEnabled() bool {
 fn gemmaPrefillPrewarmEnabled() bool {
     if (envFlagEnabled("TERMITE_METAL_DISABLE_GEMMA_PREFILL_PREWARM")) return false;
     return envFlagEnabled("TERMITE_METAL_ENABLE_GEMMA_PREFILL_PREWARM");
+}
+
+fn prefillGreedyTokenEnabled() bool {
+    return !envFlagEnabled("TERMITE_METAL_DISABLE_PREFILL_GREEDY_TOKEN");
+}
+
+fn runtimeTokenDecodeEnabled() bool {
+    return !envFlagEnabled("TERMITE_METAL_DISABLE_RUNTIME_TOKEN_DECODE");
+}
+
+fn forcePrefillHostLogits() bool {
+    return envFlagEnabled("TERMITE_METAL_FORCE_PREFILL_HOST_LOGITS");
+}
+
+fn traceGenerateTopLogitsEnabled() bool {
+    return envFlagEnabled("TERMITE_METAL_TRACE_GENERATE_TOP_LOGITS");
+}
+
+fn traceGenerateTopLogits(label: []const u8, step: usize, logits: []const f32) void {
+    if (!traceGenerateTopLogitsEnabled()) return;
+    var top_ids = [_]usize{0} ** 8;
+    var top_vals = [_]f32{-std.math.inf(f32)} ** 8;
+    for (logits, 0..) |logit, idx| {
+        var insert_at: ?usize = null;
+        for (top_vals, 0..) |current, slot| {
+            if (logit > current) {
+                insert_at = slot;
+                break;
+            }
+        }
+        if (insert_at) |slot| {
+            var i: usize = top_vals.len - 1;
+            while (i > slot) : (i -= 1) {
+                top_vals[i] = top_vals[i - 1];
+                top_ids[i] = top_ids[i - 1];
+            }
+            top_vals[slot] = logit;
+            top_ids[slot] = idx;
+        }
+    }
+    std.debug.print("generate_top_logits step={d} label={s}:", .{ step, label });
+    for (top_ids, top_vals) |id, value| {
+        std.debug.print(" {d}:{d:.6}", .{ id, value });
+    }
+    std.debug.print("\n", .{});
 }
 
 fn kvSlidingTrimForced() bool {
@@ -3846,7 +4044,21 @@ fn isPureGreedyConfig(config: generation.GenerationConfig) bool {
         config.presence_penalty == 0;
 }
 
+fn liveWholeModelDeclineError(err: anyerror) bool {
+    return switch (err) {
+        error.UnsupportedOperation,
+        error.UnsupportedTensorType,
+        error.UnsupportedShape,
+        error.UnsupportedPrimitiveOp,
+        error.UnsupportedBackend,
+        error.UnsupportedCompileBackend,
+        => true,
+        else => false,
+    };
+}
+
 fn liveWholeModelExecutorRequested(opts: *const Options) bool {
+    if (envFlagEnabled("TERMITE_METAL_DISABLE_LIVE_WHOLE_MODEL_EXECUTOR")) return false;
     const explicit_whole_model = opts.mode != null and opts.mode.? == .compiled and
         opts.compiled_target != null and opts.compiled_target.? == .whole_model;
     if (explicit_whole_model) return false;
@@ -3889,6 +4101,8 @@ fn runLiveWholeModelExecutorReuseProbe(
             .seq_len = chunk_end,
             .query_seq_len = chunk_end - processed,
             .attention_mode = .paged_prefill,
+            .force_host_logits = forcePrefillHostLogits(),
+            .prefer_greedy_token = prefillGreedyTokenEnabled() and chunk_end == prompt_ids.len,
         });
         processed = chunk_end;
     }
@@ -3951,10 +4165,18 @@ fn tryRunLiveWholeModelExecutorGenerate(
         runtime.kv.pool.parseKvDType(name) orelse return error.InvalidCacheDType
     else
         session_factory.recommendedKvDTypeForSession(model.session, kv_backend_kind);
-    var executor = (try model.wholeModelExecutor(allocator, kv_dtype)) orelse return false;
+    var executor = (model.wholeModelExecutor(allocator, kv_dtype) catch |err| {
+        debugGenerateSetup("live whole-model executor unavailable err={s}", .{@errorName(err)});
+        if (liveWholeModelDeclineError(err)) return false;
+        return err;
+    }) orelse return false;
     defer executor.deinit();
 
-    var runtime_model = try executor.createRuntime(allocator);
+    var runtime_model = executor.createRuntime(allocator) catch |err| {
+        debugGenerateSetup("live whole-model runtime unavailable err={s}", .{@errorName(err)});
+        if (liveWholeModelDeclineError(err)) return false;
+        return err;
+    };
     defer runtime_model.deinit();
     if (opts.print_timing and model.session.backend().usesGpuHostedSession()) {
         runtime_model.resetDebugTimingStats();
@@ -4009,8 +4231,10 @@ fn tryRunLiveWholeModelExecutorGenerate(
         .frequency_penalty = config.frequency_penalty,
         .presence_penalty = config.presence_penalty,
     };
-    const use_greedy_decode = runtime_caps.supports_greedy_decode and isPureGreedyConfig(config);
-    const use_sample_decode = runtime_caps.supports_sample_decode and !use_greedy_decode;
+    const use_runtime_token_decode = runtimeTokenDecodeEnabled();
+    const use_greedy_decode = use_runtime_token_decode and runtime_caps.supports_greedy_decode and isPureGreedyConfig(config);
+    const use_sample_decode = use_runtime_token_decode and runtime_caps.supports_sample_decode and !use_greedy_decode;
+    const prefer_prefill_greedy_token = prefillGreedyTokenEnabled() and use_greedy_decode;
     var prefill_chunk_size = if (config.prefill_chunk_size > 0) config.prefill_chunk_size else prompt_ids.len;
     prefill_chunk_size = @max(@min(prefill_chunk_size, prompt_ids.len), 1);
     const prefill_started_at = std.Io.Timestamp.now(io, .awake);
@@ -4022,12 +4246,18 @@ fn tryRunLiveWholeModelExecutorGenerate(
         while (processed < prompt_ids.len) {
             const chunk_end = @min(prompt_ids.len, processed + prefill_chunk_size);
             if (output_accum) |*owned| owned.deinit(allocator);
-            output_accum = try runtime_model.prefill(allocator, .{
+            output_accum = runtime_model.prefill(allocator, .{
                 .input_ids = prompt_ids[processed..chunk_end],
                 .seq_len = chunk_end,
                 .query_seq_len = chunk_end - processed,
                 .attention_mode = .paged_prefill,
-            });
+                .force_host_logits = forcePrefillHostLogits(),
+                .prefer_greedy_token = prefer_prefill_greedy_token and chunk_end == prompt_ids.len,
+            }) catch |err| {
+                debugGenerateSetup("live whole-model prefill unavailable err={s}", .{@errorName(err)});
+                if (liveWholeModelDeclineError(err)) return false;
+                return err;
+            };
             processed = chunk_end;
         }
         break :blk output_accum.?;
@@ -4043,6 +4273,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
                 break :blk @intCast(try output.greedyToken(allocator, gpt_config.vocab_size));
             }
             const output_logits = try output.hostLogits(allocator);
+            traceGenerateTopLogits("prefill", generated, output_logits);
             break :blk @intCast(generation.sampleTokenFromLogits(
                 allocator,
                 output_logits,
@@ -4069,6 +4300,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
             break :blk @intCast(sampled.token_id);
         } else blk: {
             const output_logits = try output.hostLogits(allocator);
+            traceGenerateTopLogits("decode", generated, output_logits);
             break :blk @intCast(generation.sampleTokenFromLogits(
                 allocator,
                 output_logits,
@@ -4107,6 +4339,14 @@ fn tryRunLiveWholeModelExecutorGenerate(
     defer allocator.free(result_text);
 
     const finished_generate_at = std.Io.Timestamp.now(io, .awake);
+    const load_model_ms = durationMillis(started_at, loaded_model_at);
+    const prompt_prep_ms = durationMillis(loaded_model_at, encoded_prompt_at);
+    const backend_setup_ms = durationMillis(encoded_prompt_at, created_runtime_at);
+    const generate_ms = durationMillis(warmed_runtime_at, finished_generate_at);
+    const total_ms = durationMillis(started_at, finished_generate_at);
+    const prefill_ms = durationMillis(prefill_started_at, finished_prefill_at);
+    const decode_ms = durationMillis(finished_prefill_at, finished_generate_at);
+    const first_token_value_at = first_token_at orelse finished_generate_at;
     print("{s}\n", .{result_text});
     if (opts.print_token_ids) {
         print("token_ids:", .{});
@@ -4126,15 +4366,14 @@ fn tryRunLiveWholeModelExecutorGenerate(
         print(
             "timing_ms: load_model={d} prompt_prep={d} scheduler=0 backend_setup={d} runtime_prewarm={d} decode_setup=0 generate={d} total={d}\n",
             .{
-                durationMillis(started_at, loaded_model_at),
-                durationMillis(loaded_model_at, encoded_prompt_at),
-                durationMillis(encoded_prompt_at, created_runtime_at),
+                load_model_ms,
+                prompt_prep_ms,
+                backend_setup_ms,
                 runtime_prewarm_ms,
-                durationMillis(warmed_runtime_at, finished_generate_at),
-                durationMillis(started_at, finished_generate_at),
+                generate_ms,
+                total_ms,
             },
         );
-        const first_token_value_at = first_token_at orelse finished_generate_at;
         print(
             "first_token_ms: request={d} service={d} prefill={d} sample={d}\n",
             .{
@@ -4144,6 +4383,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
                 durationMillis(finished_prefill_at, first_token_value_at),
             },
         );
+        print("decode_tok_per_s={d:.3}\n", .{tokensPerSecond(result_token_ids.len, decode_ms)});
         if (model.session.backend().usesGpuHostedSession()) {
             printLiveWholeModelExecutorDetails(&runtime_model);
             if (metalExecutorReuseProbeEnabled()) {
@@ -4174,6 +4414,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
                     metal_snapshot.quant.gated_block_fast_attempts,
                 },
             );
+            printMetalQuantDispatchSummary(metal_snapshot);
             print(
                 "metal_gated_quantized_block: calls={d} quantized_branch={d} attn_calls={d} attn_nulls={d} attn_prefill_nulls={d} attn_decode_nulls={d} norm_nulls={d} f32_kv_calls={d} f32_kv_ok={d} f32_kv_nulls={d} f32_quant_direct_ok={d} f32_quant_direct_fail={d} compressed_f32_reroutes={d} active_bootstrap_misses={d}\n",
                 .{
@@ -4389,6 +4630,25 @@ fn tryRunLiveWholeModelExecutorGenerate(
                 },
             );
         }
+    }
+    if (opts.json_timing_path) |path| {
+        try writeLiveWholeModelJsonTiming(
+            allocator,
+            io,
+            path,
+            opts.model_dir,
+            @tagName(model.session.backend()),
+            result_token_ids.len,
+            finish_reason,
+            load_model_ms,
+            prompt_prep_ms,
+            backend_setup_ms,
+            runtime_prewarm_ms,
+            generate_ms,
+            total_ms,
+            prefill_ms,
+            decode_ms,
+        );
     }
     return true;
 }

@@ -11786,11 +11786,6 @@ fn reconcileCachedLocalTableIndexCreate(
             cached_active = false;
             return err;
         };
-        catchUpManagedIndexCreate(alloc, cached.db, index_name) catch |err| {
-            cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
-            cached_active = false;
-            return err;
-        };
         publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db) catch |err| {
             cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
             cached_active = false;
@@ -11996,6 +11991,7 @@ fn reconcileUncachedLocalTableIndexCreate(
     table_name: []const u8,
     index_name: []const u8,
 ) !bool {
+    _ = index_name;
     const group_ids = try table_catalog.resolveGroupsForSpanEventually(
         alloc,
         self.catalog,
@@ -12015,7 +12011,6 @@ fn reconcileUncachedLocalTableIndexCreate(
         var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
         defer db.close();
 
-        try catchUpManagedIndexCreate(alloc, &db, index_name);
         try publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, &db);
         managed_visibility_changed = true;
     }
