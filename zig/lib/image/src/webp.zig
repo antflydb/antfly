@@ -359,7 +359,8 @@ fn parseChunks(webp_bytes: []const u8) !ParsedChunks {
     var vp8x_alpha = false;
     var saw_alph = false;
     var saw_image = false;
-    var saw_animation_chunk = false;
+    var saw_animation_control = false;
+    var saw_animation_frame = false;
 
     while (cursor < riff_len) {
         if (riff_len - cursor < chunk_header_len) return error.WebpDecodeFailed;
@@ -392,13 +393,19 @@ fn parseChunks(webp_bytes: []const u8) !ParsedChunks {
             parsed.info.bitstream = .vp8l;
             parsed.vp8l_payload = payload;
             const header = try parseVp8lHeader(payload);
-            if (saw_vp8x and header.alpha and !vp8x_alpha) return error.WebpDecodeFailed;
+            if (saw_vp8x and header.alpha != vp8x_alpha) return error.WebpDecodeFailed;
             parsed.info.alpha = parsed.info.alpha or header.alpha;
             try mergeDimensions(&parsed.info, header.width, header.height);
-        } else if (std.mem.eql(u8, fourcc, "ANIM") or std.mem.eql(u8, fourcc, "ANMF")) {
+        } else if (std.mem.eql(u8, fourcc, "ANIM")) {
             if (!saw_vp8x or !parsed.info.animated) return error.WebpDecodeFailed;
-            saw_animation_chunk = true;
-            parsed.info.animated = true;
+            if (saw_animation_control or saw_animation_frame) return error.WebpDecodeFailed;
+            if (payload.len != 6) return error.WebpDecodeFailed;
+            saw_animation_control = true;
+        } else if (std.mem.eql(u8, fourcc, "ANMF")) {
+            if (!saw_vp8x or !parsed.info.animated) return error.WebpDecodeFailed;
+            if (!saw_animation_control) return error.WebpDecodeFailed;
+            if (payload.len < 16) return error.WebpDecodeFailed;
+            saw_animation_frame = true;
         }
 
         const padded_len = payload_len + (payload_len & 1);
@@ -406,7 +413,10 @@ fn parseChunks(webp_bytes: []const u8) !ParsedChunks {
     }
 
     if (cursor != riff_len) return error.WebpDecodeFailed;
-    if (!saw_image and (!parsed.info.animated or !saw_animation_chunk)) return error.WebpDecodeFailed;
+    if (parsed.info.animated) {
+        if (saw_image) return error.WebpDecodeFailed;
+        if (!saw_animation_control or !saw_animation_frame) return error.WebpDecodeFailed;
+    } else if (!saw_image) return error.WebpDecodeFailed;
     if (saw_alph and !saw_vp8x) return error.WebpDecodeFailed;
     if (saw_alph and !vp8x_alpha) return error.WebpDecodeFailed;
     if (saw_alph and parsed.info.bitstream != .vp8) return error.WebpDecodeFailed;
@@ -3323,11 +3333,15 @@ const webp_vp8x_alpha_1x1 = [_]u8{
 };
 
 const webp_vp8x_animated_1x1 = [_]u8{
-    'R', 'I', 'F', 'F', 30,                  0,   0,   0,
+    'R', 'I', 'F', 'F', 60,                  0,   0,   0,
     'W', 'E', 'B', 'P', 'V',                 'P', '8', 'X',
     10,  0,   0,   0,   vp8x_flag_animation, 0,   0,   0,
     0,   0,   0,   0,   0,                   0,   'A', 'N',
-    'I', 'M', 0,   0,   0,                   0,
+    'I', 'M', 6,   0,   0,                   0,   0,   0,
+    0,   0,   0,   0,   'A',                 'N', 'M', 'F',
+    16,  0,   0,   0,   0,                   0,   0,   0,
+    0,   0,   0,   0,   0,                   0,   0,   0,
+    0,   0,   0,   0,
 };
 
 fn testBuildVp8Payload(alloc: Allocator, width: u16, height: u16, first_partition: []const u8, token_partitions: []const []const u8) ![]u8 {
@@ -5048,6 +5062,15 @@ test "decode vp8x alpha flag with vp8l uses lossless alpha channel" {
     try std.testing.expectEqualSlices(u8, &expected, decoded.rgba);
 }
 
+test "probe rejects vp8x alpha flag mismatch with vp8l header" {
+    const alloc = std.testing.allocator;
+    const opaque_vp8l = try testBuildVp8xVp8lWebp(alloc, .{ 0x10, 0x20, 0x30, 0xff });
+    defer alloc.free(opaque_vp8l);
+
+    try std.testing.expectError(error.WebpDecodeFailed, probe(opaque_vp8l));
+    try std.testing.expectError(error.WebpDecodeFailed, decodeRgba(alloc, opaque_vp8l));
+}
+
 test "decode explicitly rejects animated webp" {
     try std.testing.expectError(error.AnimatedWebpUnsupported, decodeRgba(std.testing.allocator, &webp_vp8x_animated_1x1));
 }
@@ -5073,6 +5096,31 @@ test "probe rejects vp8x animation flag without animation chunks" {
         0,   0,   0,   0,   0,                   0,
     };
     try std.testing.expectError(error.WebpDecodeFailed, probe(&vp8x_animation_only));
+}
+
+test "probe rejects animated webp without animation frame" {
+    const anim_without_frame = [_]u8{
+        'R', 'I', 'F', 'F', 36,                  0,   0,   0,
+        'W', 'E', 'B', 'P', 'V',                 'P', '8', 'X',
+        10,  0,   0,   0,   vp8x_flag_animation, 0,   0,   0,
+        0,   0,   0,   0,   0,                   0,   'A', 'N',
+        'I', 'M', 6,   0,   0,                   0,   0,   0,
+        0,   0,   0,   0,
+    };
+    try std.testing.expectError(error.WebpDecodeFailed, probe(&anim_without_frame));
+}
+
+test "probe rejects animation frame before animation control" {
+    const frame_without_anim = [_]u8{
+        'R', 'I', 'F', 'F', 46,                  0,   0,   0,
+        'W', 'E', 'B', 'P', 'V',                 'P', '8', 'X',
+        10,  0,   0,   0,   vp8x_flag_animation, 0,   0,   0,
+        0,   0,   0,   0,   0,                   0,   'A', 'N',
+        'M', 'F', 16,  0,   0,                   0,   0,   0,
+        0,   0,   0,   0,   0,                   0,   0,   0,
+        0,   0,   0,   0,   0,                   0,
+    };
+    try std.testing.expectError(error.WebpDecodeFailed, probe(&frame_without_anim));
 }
 
 test "decode rejects unsupported lossy vp8 frame flags" {
