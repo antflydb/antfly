@@ -1698,8 +1698,13 @@ pub const Node = struct {
             });
         };
         const pipeline_start = embedTimingStart();
-        const embeddings = embedDenseInputs(ctx.allocator, &pipeline, &inputs) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+        const embeddings = embedDenseInputs(ctx.allocator, &pipeline, &inputs) catch |err| {
+            const failure = embedDenseInputFailure(err);
+            return ctx.status(failure.status).json(.{
+                .@"error" = failure.code,
+                .message = failure.message,
+            });
+        };
         logEmbedTiming("embed.pipeline", inputs.total_count, pipeline_start);
         defer {
             for (embeddings) |e| ctx.allocator.free(e);
@@ -6410,6 +6415,27 @@ fn embedInputParseErrorMessage(err: anyerror) []const u8 {
     };
 }
 
+const EmbedDenseInputFailure = struct {
+    status: u16,
+    code: []const u8,
+    message: []const u8,
+};
+
+fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
+    return switch (err) {
+        error.ImageDecodeFailed => .{
+            .status = 400,
+            .code = "INVALID_IMAGE",
+            .message = "unsupported or corrupt image input",
+        },
+        else => .{
+            .status = 500,
+            .code = "INFERENCE_FAILED",
+            .message = @errorName(err),
+        },
+    };
+}
+
 fn embedDenseInputs(
     allocator: std.mem.Allocator,
     pipeline: *embedding_mod.EmbeddingPipeline,
@@ -6846,6 +6872,17 @@ test "Antfly inference embed media-only usage does not require text tokens" {
     try std.testing.expectEqual(@as(usize, 2), inputs.total_count);
     try std.testing.expectEqual(@as(usize, 0), inputs.texts.items.len);
     try std.testing.expectEqual(@as(usize, 0), estimateParsedDenseEmbedPromptTokens(&inputs));
+}
+
+test "embedding image decode failures are permanent client input errors" {
+    const failure = embedDenseInputFailure(error.ImageDecodeFailed);
+    try std.testing.expectEqual(@as(u16, 400), failure.status);
+    try std.testing.expectEqualStrings("INVALID_IMAGE", failure.code);
+    try std.testing.expectEqualStrings("unsupported or corrupt image input", failure.message);
+
+    const runtime_failure = embedDenseInputFailure(error.OutOfMemory);
+    try std.testing.expectEqual(@as(u16, 500), runtime_failure.status);
+    try std.testing.expectEqualStrings("INFERENCE_FAILED", runtime_failure.code);
 }
 
 test "Antfly inference embed parser accepts data uri media payloads" {

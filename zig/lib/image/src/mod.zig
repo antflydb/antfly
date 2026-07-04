@@ -19,11 +19,13 @@ pub const png = @import("png.zig");
 pub const jpeg = @import("jpeg.zig");
 pub const jpeg2000 = @import("jpeg2000/mod.zig");
 pub const gif = @import("gif.zig");
+pub const bmp = @import("bmp.zig");
+pub const webp = @import("webp.zig");
 pub const ccitt = @import("ccitt.zig");
 pub const processing = @import("processing.zig");
 pub const conformance = conformance_impl;
 
-pub const Format = enum { png, jpeg, jpeg2000_jp2, jpeg2000_j2k, gif, unknown };
+pub const Format = enum { png, jpeg, jpeg2000_jp2, jpeg2000_j2k, gif, bmp, webp, unknown };
 
 pub fn detectFormat(bytes: []const u8) Format {
     if (png.hasSignature(bytes)) return .png;
@@ -31,6 +33,8 @@ pub fn detectFormat(bytes: []const u8) Format {
     if (jpeg2000.codestream.hasSoc(bytes)) return .jpeg2000_j2k;
     if (jpeg.hasSignature(bytes)) return .jpeg;
     if (gif.hasSignature(bytes)) return .gif;
+    if (bmp.hasSignature(bytes)) return .bmp;
+    if (webp.hasSignature(bytes)) return .webp;
     return .unknown;
 }
 
@@ -39,6 +43,8 @@ test {
     _ = jpeg;
     _ = jpeg2000;
     _ = gif;
+    _ = bmp;
+    _ = webp;
     _ = ccitt;
     _ = processing;
     _ = conformance;
@@ -49,6 +55,8 @@ test "detectFormat signatures" {
     try std.testing.expectEqual(Format.png, detectFormat(&.{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' }));
     try std.testing.expectEqual(Format.jpeg, detectFormat(&.{ 0xFF, 0xD8, 0xFF, 0xE0 }));
     try std.testing.expectEqual(Format.gif, detectFormat("GIF89a\x00"));
+    try std.testing.expectEqual(Format.bmp, detectFormat("BM\x00\x00"));
+    try std.testing.expectEqual(Format.webp, detectFormat("RIFF\x00\x00\x00\x00WEBP"));
     try std.testing.expectEqual(Format.jpeg2000_j2k, detectFormat(&.{ 0xFF, 0x4F, 0xFF, 0x51 }));
     try std.testing.expectEqual(Format.jpeg2000_jp2, detectFormat(&.{ 0x00, 0x00, 0x00, 0x0C, 'j', 'P', ' ', ' ', 0x0D, 0x0A, 0x87, 0x0A }));
     try std.testing.expectEqual(Format.unknown, detectFormat("hello"));

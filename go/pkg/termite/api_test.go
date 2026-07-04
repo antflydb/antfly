@@ -90,7 +90,9 @@ func TestValidateContentTypes(t *testing.T) {
 			{MIMEType: "text/plain"},
 			{MIMEType: "image/jpeg"},
 			{MIMEType: "image/png"},
-			{MIMEType: "image/*"},
+			{MIMEType: "image/gif"},
+			{MIMEType: "image/bmp"},
+			{MIMEType: "image/webp"},
 		},
 	}
 
@@ -118,21 +120,21 @@ func TestValidateContentTypes(t *testing.T) {
 			},
 		},
 		{
-			name: "image/gif accepted via wildcard",
+			name: "image/gif accepted (exact)",
 			contents: [][]ai.ContentPart{
 				{ai.BinaryContent{MIMEType: "image/gif", Data: []byte{0x47}}},
 			},
 		},
 		{
-			name: "image/webp accepted via wildcard",
+			name: "image/bmp accepted (exact)",
 			contents: [][]ai.ContentPart{
-				{ai.BinaryContent{MIMEType: "image/webp", Data: []byte{0x52}}},
+				{ai.BinaryContent{MIMEType: "image/bmp", Data: []byte{0x42}}},
 			},
 		},
 		{
-			name: "image/bmp accepted via wildcard",
+			name: "image/webp accepted (exact)",
 			contents: [][]ai.ContentPart{
-				{ai.BinaryContent{MIMEType: "image/bmp", Data: []byte{0x42}}},
+				{ai.BinaryContent{MIMEType: "image/webp", Data: []byte{0x52}}},
 			},
 		},
 		{
@@ -154,6 +156,40 @@ func TestValidateContentTypes(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := validateContentTypes(tt.contents, caps)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateContentTypes() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateContentTypes_ImageWildcard(t *testing.T) {
+	caps := embeddings.EmbedderCapabilities{
+		SupportedMIMETypes: []embeddings.MIMETypeSupport{
+			{MIMEType: "text/plain"},
+			{MIMEType: "image/jpeg"},
+			{MIMEType: "image/png"},
+			{MIMEType: "image/*"},
+		},
+	}
+
+	tests := []struct {
+		name     string
+		mimeType string
+		wantErr  bool
+	}{
+		{"image/gif via wildcard", "image/gif", false},
+		{"image/webp via wildcard", "image/webp", false},
+		{"image/bmp via wildcard", "image/bmp", false},
+		{"audio/wav rejected", "audio/wav", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			contents := [][]ai.ContentPart{
+				{ai.BinaryContent{MIMEType: tt.mimeType, Data: []byte{0x00}}},
+			}
+			err := validateContentTypes(contents, caps)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validateContentTypes() error = %v, wantErr %v", err, tt.wantErr)
 			}

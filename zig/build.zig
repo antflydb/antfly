@@ -2560,6 +2560,22 @@ pub fn build(b: *std.Build) void {
     run_lib_image_corpus_verify_gif_quiet.addArg("verify-gif");
     const run_lib_image_corpus_verify_gif_quiet_step = expectQuietSuccess(run_lib_image_corpus_verify_gif_quiet);
 
+    const run_lib_image_corpus_verify_bmp = b.addRunArtifact(lib_image_corpus);
+    run_lib_image_corpus_verify_bmp.addArg("verify-bmp");
+    lib_image_conformance_run_step.dependOn(&run_lib_image_corpus_verify_bmp.step);
+
+    const run_lib_image_corpus_verify_bmp_quiet = b.addRunArtifact(lib_image_corpus);
+    run_lib_image_corpus_verify_bmp_quiet.addArg("verify-bmp");
+    const run_lib_image_corpus_verify_bmp_quiet_step = expectQuietSuccess(run_lib_image_corpus_verify_bmp_quiet);
+
+    const run_lib_image_corpus_verify_webp = b.addRunArtifact(lib_image_corpus);
+    run_lib_image_corpus_verify_webp.addArg("verify-webp");
+    lib_image_conformance_run_step.dependOn(&run_lib_image_corpus_verify_webp.step);
+
+    const run_lib_image_corpus_verify_webp_quiet = b.addRunArtifact(lib_image_corpus);
+    run_lib_image_corpus_verify_webp_quiet.addArg("verify-webp");
+    const run_lib_image_corpus_verify_webp_quiet_step = expectQuietSuccess(run_lib_image_corpus_verify_webp_quiet);
+
     const image_jpeg_seed_corpora_e2e = b.addExecutable(.{
         .name = "image-jpeg-seed-corpora-e2e",
         .root_module = b.createModule(.{
@@ -2650,6 +2666,8 @@ pub fn build(b: *std.Build) void {
     lib_image_conformance_step.dependOn(&run_lib_image_corpus_verify_png.step);
     lib_image_conformance_step.dependOn(&run_lib_image_corpus_verify_png_spng.step);
     lib_image_conformance_step.dependOn(&run_lib_image_corpus_verify_gif.step);
+    lib_image_conformance_step.dependOn(&run_lib_image_corpus_verify_bmp.step);
+    lib_image_conformance_step.dependOn(&run_lib_image_corpus_verify_webp.step);
 
     const run_lib_image_conformance_tests_after_fetch_quiet = b.addRunArtifact(lib_image_conformance_tests);
     run_lib_image_conformance_tests_after_fetch_quiet.step.dependOn(fetch_lib_image_conformance_fixtures_quiet_step);
@@ -3005,6 +3023,8 @@ pub fn build(b: *std.Build) void {
         run_lib_image_corpus_verify_png_quiet_step,
         run_lib_image_corpus_verify_png_spng_quiet_step,
         run_lib_image_corpus_verify_gif_quiet_step,
+        run_lib_image_corpus_verify_bmp_quiet_step,
+        run_lib_image_corpus_verify_webp_quiet_step,
         run_image_jpeg_seed_corpora_e2e_after_fetch_quiet_step,
     });
 

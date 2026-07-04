@@ -16,6 +16,7 @@ const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const antfly_image = @import("antfly_image");
 const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -25748,6 +25749,84 @@ const CountingDenseEmbedder = struct {
     }
 };
 
+const ImageDecodingPartsEmbedder = struct {
+    calls: usize = 0,
+
+    fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+        return error.ExpectedContentParts;
+    }
+
+    fn embedDenseParts(ptr: *anyopaque, alloc: Allocator, _: []const u8, parts: []const template_mod.ContentPart, dims: u32) ![]f32 {
+        const self: *ImageDecodingPartsEmbedder = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        if (dims != 3) return error.InvalidVectorDimensions;
+
+        for (parts) |part| {
+            const binary = switch (part) {
+                .binary => |binary| binary,
+                else => continue,
+            };
+
+            if (std.mem.eql(u8, binary.mime_type, "image/bmp")) {
+                const decoded = antfly_image.bmp.decodeRgba(alloc, binary.data) catch |err| switch (err) {
+                    error.BmpDecodeFailed, error.UnsupportedBmpFormat => return error.EmbedRequestFailed,
+                    else => return err,
+                };
+                defer alloc.free(decoded.rgba);
+                if (decoded.width == 0 or decoded.height == 0) return error.EmbedRequestFailed;
+                return try dupeTestVector(alloc, &.{ 1.0, 0.0, 0.0 });
+            }
+
+            if (std.mem.eql(u8, binary.mime_type, "image/webp")) {
+                const decoded = antfly_image.webp.decodeRgba(alloc, binary.data) catch |err| switch (err) {
+                    error.WebpDecodeFailed,
+                    error.UnsupportedWebpFormat,
+                    error.AnimatedWebpUnsupported,
+                    => return error.EmbedRequestFailed,
+                    else => return err,
+                };
+                defer alloc.free(decoded.rgba);
+                return try dupeTestVector(alloc, &.{ 0.0, 1.0, 0.0 });
+            }
+
+            if (std.mem.startsWith(u8, binary.mime_type, "image/")) return error.EmbedRequestFailed;
+        }
+
+        return error.EmbedRequestFailed;
+    }
+
+    fn dupeTestVector(alloc: Allocator, values: *const [3]f32) ![]f32 {
+        const vector = try alloc.alloc(f32, 3);
+        @memcpy(vector, values);
+        return vector;
+    }
+
+    fn interface(self: *ImageDecodingPartsEmbedder) embedder_mod.DenseEmbedder {
+        return .{
+            .ptr = self,
+            .dense_embed_fn = embedDense,
+            .dense_embed_parts_fn = embedDenseParts,
+            .deinit_fn = null,
+        };
+    }
+};
+
+const remote_media_bmp_24_2x2 = [_]u8{
+    'B',  'M',  70,   0,    0,    0,    0,    0,    0,    0,    54,   0,    0,    0,
+    40,   0,    0,    0,    2,    0,    0,    0,    2,    0,    0,    0,    1,    0,
+    24,   0,    0,    0,    0,    0,    16,   0,    0,    0,    0,    0,    0,    0,
+    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0xff, 0x00,
+    0x00, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0xff, 0x00, 0x00, 0x00,
+};
+
+fn dataUriAlloc(alloc: Allocator, mime_type: []const u8, bytes: []const u8) ![]u8 {
+    const encoded_len = std.base64.standard.Encoder.calcSize(bytes.len);
+    const encoded = try alloc.alloc(u8, encoded_len);
+    defer alloc.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, bytes);
+    return try std.fmt.allocPrint(alloc, "data:{s};base64,{s}", .{ mime_type, encoded });
+}
+
 const GateDenseEmbedder = struct {
     allowed_successes: std.atomic.Value(usize) = .init(1),
     successful_requests: std.atomic.Value(usize) = .init(0),
@@ -27935,6 +28014,35 @@ fn testRemoteTemplateHostRenderJsonToPartsErrorDirective(
     return parts;
 }
 
+fn testRemoteMediaHostRenderJsonToParts(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    template_source: []const u8,
+    json_doc: []const u8,
+    _: template_remote.RenderConfig,
+) ![]template_mod.ContentPart {
+    if (std.mem.indexOf(u8, template_source, "{{remoteMedia") == null) return error.UnsupportedPlatform;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json_doc, .{});
+    defer parsed.deinit();
+
+    const url = if (std.mem.indexOf(u8, template_source, "url=this") != null) blk: {
+        if (parsed.value != .string) return error.InvalidTemplateInput;
+        break :blk parsed.value.string;
+    } else if (std.mem.indexOf(u8, template_source, "url=photo") != null) blk: {
+        if (parsed.value != .object) return error.InvalidTemplateInput;
+        const value = parsed.value.object.get("photo") orelse return error.InvalidTemplateInput;
+        if (value != .string) return error.InvalidTemplateInput;
+        break :blk value.string;
+    } else {
+        return error.UnsupportedPlatform;
+    };
+
+    const rendered = try std.fmt.allocPrint(alloc, "<<<dotprompt:media:url {s}>>>", .{url});
+    defer alloc.free(rendered);
+    return try template_mod.textToParts(alloc, rendered);
+}
+
 test "remote template host-rendered parts preserve prompt failures" {
     const alloc = std.testing.allocator;
     template_remote.setHostRenderer(.{
@@ -27952,6 +28060,108 @@ test "remote template host-rendered parts preserve prompt failures" {
             "\"https://example.com/photo.png\"",
         ),
     );
+}
+
+test "db embeddings index remoteMedia accepts bmp via shared image decode" {
+    const alloc = std.testing.allocator;
+    template_remote.setHostRenderer(.{
+        .render_json_to_parts = testRemoteMediaHostRenderJsonToParts,
+    });
+    defer template_remote.setHostRenderer(null);
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var image_embedder = ImageDecodingPartsEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{ .dense_embedder = image_embedder.interface() },
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "visual_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"photo\",\"source_template\":\"{{remoteMedia url=photo}}\"}}",
+    });
+
+    const photo = try dataUriAlloc(alloc, "image/bmp", &remote_media_bmp_24_2x2);
+    defer alloc.free(photo);
+    const value = try std.fmt.allocPrint(alloc, "{{\"photo\":{f}}}", .{std.json.fmt(photo, .{})});
+    defer alloc.free(value);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:bmp", .value = value }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(@as(usize, 1), image_embedder.calls);
+
+    var result = try db.searchDenseProfiled(alloc, .{
+        .index_name = "visual_idx",
+        .limit = 1,
+        .include_stored = false,
+    }, .{ .vector = &.{ 1.0, 0.0, 0.0 }, .k = 1 });
+    defer result.result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.result.total_hits);
+    try std.testing.expectEqualStrings("doc:bmp", result.result.hits[0].id);
+}
+
+test "db embeddings index remoteMedia accepts webp via shared image decode" {
+    const alloc = std.testing.allocator;
+    template_remote.setHostRenderer(.{
+        .render_json_to_parts = testRemoteMediaHostRenderJsonToParts,
+    });
+    defer template_remote.setHostRenderer(null);
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var image_embedder = ImageDecodingPartsEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{ .dense_embedder = image_embedder.interface() },
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "visual_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"photo\",\"source_template\":\"{{remoteMedia url=photo}}\"}}",
+    });
+
+    const webp_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "testdata/image/webp/lossy/minimal-vp8-1x1.webp",
+        alloc,
+        .limited(64 * 1024),
+    );
+    defer alloc.free(webp_bytes);
+
+    const photo = try dataUriAlloc(alloc, "image/webp", webp_bytes);
+    defer alloc.free(photo);
+    const value = try std.fmt.allocPrint(alloc, "{{\"photo\":{f}}}", .{std.json.fmt(photo, .{})});
+    defer alloc.free(value);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:webp", .value = value }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(@as(usize, 1), image_embedder.calls);
+
+    var result = try db.searchDenseProfiled(alloc, .{
+        .index_name = "visual_idx",
+        .limit = 1,
+        .include_stored = false,
+    }, .{ .vector = &.{ 0.0, 1.0, 0.0 }, .k = 1 });
+    defer result.result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.result.total_hits);
+    try std.testing.expectEqualStrings("doc:webp", result.result.hits[0].id);
 }
 
 test "db allocates final document ordinal with all index families present" {
