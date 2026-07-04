@@ -2833,7 +2833,7 @@ fn nativeSortValueFromTextDocValuesAlloc(
 ) !?SortValue {
     const resolved = snapshot.resolveDocId(native_text_doc_id) orelse return null;
     const segment = &snapshot.segments[resolved.seg_idx];
-    const section_data = segment.reader.getSection(field, .typed_doc_values) orelse return .null_value;
+    const section_data = segment.reader.getSection(field, .typed_doc_values) orelse return error.UnsupportedQueryRequest;
     var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
     return switch (reader.value_type) {
         .u64_val => {
@@ -6364,11 +6364,14 @@ fn requestNeedsNativeSortValues(req: types.SearchRequest) bool {
     return false;
 }
 
-fn snapshotHasTypedDocValuesField(snapshot: *const index_mod.IndexSnapshot, field: []const u8) bool {
+fn snapshotHasTypedDocValuesCoverage(snapshot: *const index_mod.IndexSnapshot, field: []const u8) bool {
+    var has_live_docs = false;
     for (snapshot.segments) |*segment| {
-        if (segment.reader.getSection(field, .typed_doc_values) != null) return true;
+        if (segment.liveDocCount() == 0) continue;
+        has_live_docs = true;
+        if (segment.reader.getSection(field, .typed_doc_values) == null) return false;
     }
-    return false;
+    return has_live_docs;
 }
 
 fn sortFieldMapping(schema: runtime_schema_mod.TableSchema, field: []const u8) ?runtime_schema_mod.FieldMapping {
@@ -6427,10 +6430,9 @@ fn planTextNativeSortFields(
             const mapping = sortFieldMapping(schema, field.field) orelse return error.UnsupportedQueryRequest;
             try validateMappedSortField(mapping);
             if (cursor.len > 0) try validateMappedSortCursorValue(mapping, cursor[i]);
-            continue;
         }
         if (snapshot.global_doc_count == 0) continue;
-        if (!snapshotHasTypedDocValuesField(snapshot, field.field)) return error.UnsupportedQueryRequest;
+        if (!snapshotHasTypedDocValuesCoverage(snapshot, field.field)) return error.UnsupportedQueryRequest;
     }
     return .{ .kind = .native_doc_values, .require_native = true, .runtime_schema = runtime_schema };
 }
@@ -7955,6 +7957,43 @@ test "required native sort does not fall back to stored json on doc value miss" 
     }));
 }
 
+test "required native sort fails on absent physical doc value section" {
+    const alloc = std.testing.allocator;
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    try seg_writer.addStoredDoc("doc:a", "{\"price\":30}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+
+    var hits = try alloc.alloc(types.SearchHit, 1);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .native_text_doc_id = 0, .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{.{ .field = "price", .desc = false }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 1,
+    }, null, testUnexpectedLoadStoredCallback, .{ .kind = .native_doc_values, .require_native = true }, .{
+        .ctx = @constCast(&native_sort_ctx),
+        .require_native = true,
+        .load = loadTextDocValueSortValue,
+    }));
+}
+
 test "sort paging rejects count-only ordered requests" {
     const alloc = std.testing.allocator;
 
@@ -8019,9 +8058,17 @@ test "native text sort validation rejects fields without typed doc values" {
 test "native text sort validation uses runtime sortable mappings" {
     const alloc = std.testing.allocator;
 
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .u64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .u64_val = 1 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
     var seg_writer = segment_mod.SegmentWriter.init(alloc);
     defer seg_writer.deinit();
-    try seg_writer.addStoredDoc("doc:a", "{\"created_at\":null,\"title\":\"alpha\"}");
+    const created_idx = try seg_writer.addField("created_at");
+    try seg_writer.addSection(created_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"created_at\":\"1970-01-01T00:00:00.000000001Z\",\"title\":\"alpha\"}");
     const seg_bytes = try seg_writer.build();
     defer alloc.free(seg_bytes);
 
@@ -8100,6 +8147,77 @@ test "native text sort validation uses runtime sortable mappings" {
         .order_by = &unknown_order_by,
         .limit = 10,
     }, snapshot, schema));
+}
+
+test "native text sort validation requires schema-backed physical doc values" {
+    const alloc = std.testing.allocator;
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    try seg_writer.addStoredDoc("doc:a", "{\"created_at\":\"1970-01-01T00:00:00.000000001Z\"}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "created_at",
+        .path_match = "created_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &templates,
+    };
+
+    const order_by = [_]types.SortField{.{ .field = "created_at", .desc = false }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, validateTextNativeSortFields(.{
+        .order_by = &order_by,
+        .limit = 10,
+    }, snapshot, schema));
+}
+
+test "native text sort validation requires typed doc values on every live segment" {
+    const alloc = std.testing.allocator;
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .f64_val = 10.0 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var covered_seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer covered_seg_writer.deinit();
+    const covered_price_idx = try covered_seg_writer.addField("price");
+    try covered_seg_writer.addSection(covered_price_idx, .typed_doc_values, dv_data);
+    try covered_seg_writer.addStoredDoc("doc:a", "{\"price\":10}");
+    const covered_seg_bytes = try covered_seg_writer.build();
+    defer alloc.free(covered_seg_bytes);
+
+    var missing_seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer missing_seg_writer.deinit();
+    try missing_seg_writer.addStoredDoc("doc:b", "{\"price\":20}");
+    const missing_seg_bytes = try missing_seg_writer.build();
+    defer alloc.free(missing_seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(covered_seg_bytes);
+    try writer.addSegment(missing_seg_bytes);
+    const snapshot = writer.snapshot();
+
+    const order_by = [_]types.SortField{.{ .field = "price", .desc = false }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, validateTextNativeSortFields(.{
+        .order_by = &order_by,
+        .limit = 10,
+    }, snapshot, null));
 }
 
 test "sort falls back to stored json when native text doc values are unavailable" {
