@@ -1478,6 +1478,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    termite_ml_mod.addImport("antfly_platform", platform_mod);
     const ml_tabular_mod = b.addModule("ml_tabular", .{
         .root_source_file = b.path("lib/ml/tabular/src/root.zig"),
         .target = target,
