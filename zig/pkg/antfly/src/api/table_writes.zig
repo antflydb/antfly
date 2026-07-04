@@ -4006,6 +4006,7 @@ pub const ProvisionedTableWriteSource = struct {
     local_change_hook: ?LocalChangeHook = null,
     raft_batcher: ?RaftBatcher = null,
     local_write_owner: ?*ProvisionedTableWriteSource = null,
+    seed_create_table_writers: bool = true,
     group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     inference_api_url: ?[]const u8 = null,
@@ -4198,6 +4199,11 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn withLocalWriteOwner(self: *ProvisionedTableWriteSource, owner: ?*ProvisionedTableWriteSource) *ProvisionedTableWriteSource {
         self.local_write_owner = if (owner == self) null else owner;
+        return self;
+    }
+
+    pub fn withCreateTableWriterSeeding(self: *ProvisionedTableWriteSource, enabled: bool) *ProvisionedTableWriteSource {
+        self.seed_create_table_writers = enabled;
         return self;
     }
 
@@ -7804,6 +7810,8 @@ pub const ProvisionedTableWriteSource = struct {
                 cache.secret_store = self.secret_store;
                 cache.remote_content = self.remote_content;
             }
+            const seed_create_table_writer = self.seed_create_table_writers and self.write_cache != null;
+            const open_mode: ManagedDbOpenMode = if (seed_create_table_writer) .default else .startup_catch_up;
             var opened: ?db_mod.DB = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                 alloc,
                 path,
@@ -7812,7 +7820,7 @@ pub const ProvisionedTableWriteSource = struct {
                 if (self.write_cache) |cache| cache.hbc_cache else null,
                 lsm_root_generation,
                 if (self.write_cache) |cache| cache.resource_manager else null,
-                .default,
+                open_mode,
                 if (self.write_cache) |cache| cache.backend_runtime else self.backend_runtime,
                 self.antfly_provider,
                 self.secret_store,
@@ -7820,7 +7828,6 @@ pub const ProvisionedTableWriteSource = struct {
                 identity_namespace,
                 .{
                     .inference_api_url = self.inference_api_url,
-                    .provision_with_quiet_open = true,
                 },
             );
             defer if (opened) |*db| db.close();
@@ -7830,8 +7837,8 @@ pub const ProvisionedTableWriteSource = struct {
             // resolvers are not, so do it here (idempotent: addResolver skips
             // names that already exist on reopen).
             _ = try metadata_table_provisioner.ensureResolvers(alloc, &opened.?, indexes_json);
-            if (self.write_cache) |cache| {
-                try cache.seedCreatedDbLocked(&opened, group_id, lsm_root_generation, table_name, indexes_json, schema_json);
+            if (seed_create_table_writer) {
+                try self.write_cache.?.seedCreatedDbLocked(&opened, group_id, lsm_root_generation, table_name, indexes_json, schema_json);
             }
             std.log.info("provisioned create table local group ready table={s} group_id={d}", .{ table_name, group_id });
         }
@@ -12676,7 +12683,6 @@ const ManagedDbOpenOptions = struct {
     ha_async_effect_mirror: ?db_mod.HAAsyncEffectMirror = null,
     ha_async_batch_mirror: ?db_mod.HAAsyncBatchMirror = null,
     ha_async_metadata_mirror: ?db_mod.HAAsyncMetadataMirror = null,
-    provision_with_quiet_open: bool = false,
 };
 
 const ManagedDbEnrichmentSet = struct {
@@ -12766,11 +12772,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
     identity_namespace: ?doc_identity.Namespace,
     options: ManagedDbOpenOptions,
 ) !db_mod.DB {
-    const initial_mode: ManagedDbOpenMode = if (options.provision_with_quiet_open and (mode == .default or mode == .default_async or mode == .writer_no_replay))
-        .startup_catch_up
-    else
-        mode;
-    var enrichments = if (initial_mode == .startup_catch_up)
+    var enrichments = if (mode == .startup_catch_up)
         ManagedDbEnrichmentSet{}
     else
         try createManagedDbEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.inference_api_url, secret_store, remote_content);
@@ -13003,7 +13005,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
 
     var db = blk: {
         const enrichment_cfg = if (enrichments.enabled()) enrichments.config() else null;
-        const opened = try openDb(alloc, path, enrichment_cfg, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, initial_mode, backend_runtime, secret_store, remote_content, identity_namespace, options);
+        const opened = try openDb(alloc, path, enrichment_cfg, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content, identity_namespace, options);
         enrichments.forgetTransferred();
         break :blk opened;
     };
@@ -13016,11 +13018,9 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
     const summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
         .drain_resolver_backfill = options.drain_resolver_backfill,
     });
-    if (summary.indexManagerCatalogChanged() or initial_mode != mode) {
+    if (summary.indexManagerCatalogChanged()) {
         // First-open provisioning can mutate the live index manager. Reopen so
-        // request work runs against the stabilized post-reconcile state. Some
-        // create-table paths also use a quiet temporary open for provisioning;
-        // never return or cache that background-free DB as the live writer.
+        // request work runs against the stabilized post-reconcile state.
         db.close();
         db_open = false;
         enrichments = if (mode == .startup_catch_up)
