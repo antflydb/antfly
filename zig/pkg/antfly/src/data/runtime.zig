@@ -3598,7 +3598,9 @@ pub const DataServer = struct {
     ) void {
         _ = table_name;
         self.runtime_status_dirty.store(true, .release);
-        if (kind == .data) self.provisioned_startup_catch_up_dirty.store(true, .release);
+        switch (kind) {
+            .data, .structural => self.provisioned_startup_catch_up_dirty.store(true, .release),
+        }
     }
 
     fn markLocalSplitKeyCacheDirty(self: *DataServer) void {
@@ -13509,7 +13511,7 @@ test "data runtime data changes mark provisioned startup catch-up dirty" {
     try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.acquire));
 }
 
-test "data runtime structural changes preserve writer-published runtime status" {
+test "data runtime structural changes preserve writer-published runtime status and schedule catch-up" {
     const alloc = std.testing.allocator;
     var server: DataServer = .{
         .alloc = alloc,
@@ -13533,7 +13535,7 @@ test "data runtime structural changes preserve writer-published runtime status" 
     server.markRuntimeStatusDirty("docs", .structural);
 
     try std.testing.expect(server.runtime_status_dirty.load(.acquire));
-    try std.testing.expect(!server.provisioned_startup_catch_up_dirty.load(.acquire));
+    try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.acquire));
     var statuses = (try server.provisioned_storage.runtime_status_cache.snapshot(alloc, "docs")).?;
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);

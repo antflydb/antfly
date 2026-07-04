@@ -1345,15 +1345,21 @@ pub const ApiHttpServer = struct {
         }
 
         var read_needs_refresh = false;
+        var read_statuses_present = false;
         if (self.table_reads) |source| {
             if (try source.localRuntimeStatuses(self.alloc, table_name)) |statuses| {
                 var owned = statuses;
-                errdefer owned.deinit(self.alloc);
-                read_needs_refresh = runtimeStatusesNeedDenseVisibilityRefresh(owned.items);
-                try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &owned, .append);
+                if (owned.items.len == 0) {
+                    owned.deinit(self.alloc);
+                } else {
+                    read_statuses_present = true;
+                    errdefer owned.deinit(self.alloc);
+                    read_needs_refresh = runtimeStatusesNeedWriterRefresh(owned.items);
+                    try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &owned, .append);
+                }
             }
         }
-        if ((self.table_reads == null or read_needs_refresh) and self.table_writes != null) {
+        if ((self.table_reads == null or !read_statuses_present or read_needs_refresh) and self.table_writes != null) {
             if (try self.table_writes.?.localRuntimeStatuses(self.alloc, table_name)) |statuses| {
                 var owned = statuses;
                 errdefer owned.deinit(self.alloc);
@@ -1387,9 +1393,16 @@ pub const ApiHttpServer = struct {
         return false;
     }
 
-    fn runtimeStatusesNeedDenseVisibilityRefresh(statuses: []const runtime_status.LocalTableRuntimeStatus) bool {
+    fn runtimeStatusNeedsWriterRefresh(status: runtime_status.LocalTableRuntimeStatus) bool {
+        if (runtimeStatusNeedsDenseVisibilityRefresh(status)) return true;
+        if (runtime_status.statusHasRuntimeFacts(status)) return false;
+        if (status.metadata.source == .live_writer_publish) return false;
+        return status.stats.indexes.len != 0;
+    }
+
+    fn runtimeStatusesNeedWriterRefresh(statuses: []const runtime_status.LocalTableRuntimeStatus) bool {
         for (statuses) |status| {
-            if (runtimeStatusNeedsDenseVisibilityRefresh(status)) return true;
+            if (runtimeStatusNeedsWriterRefresh(status)) return true;
         }
         return false;
     }
@@ -6477,6 +6490,9 @@ pub const ApiHttpServer = struct {
                 error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
                 else => {
                     std.log.err("public create index local apply failed table={s} index={s} err={}", .{ table_name, index_name, err });
+                    _ = table_writes_source.requestTableStructuralReconcile(alloc, table_name) catch |reconcile_err| {
+                        std.log.warn("public create index structural reconcile enqueue failed table={s} index={s} err={}", .{ table_name, index_name, reconcile_err });
+                    };
                 },
             };
         }
@@ -6515,6 +6531,9 @@ pub const ApiHttpServer = struct {
                 error.IndexNotFound => {},
                 else => {
                     std.log.warn("public delete index local apply deferred table={s} index={s} err={}", .{ table_name, index_name, err });
+                    _ = table_writes_source.requestTableStructuralReconcile(alloc, table_name) catch |reconcile_err| {
+                        std.log.warn("public delete index structural reconcile enqueue failed table={s} index={s} err={}", .{ table_name, index_name, reconcile_err });
+                    };
                 },
             };
         }
@@ -6565,6 +6584,9 @@ pub const ApiHttpServer = struct {
             _ = table_writes_source.putArtifactEnrichment(alloc, table_name, artifact_name, enrichment_json) catch |err| switch (err) {
                 else => {
                     std.log.err("public artifact enrichment local apply failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
+                    _ = table_writes_source.requestTableStructuralReconcile(alloc, table_name) catch |reconcile_err| {
+                        std.log.warn("public artifact enrichment structural reconcile enqueue failed table={s} artifact={s} err={}", .{ table_name, artifact_name, reconcile_err });
+                    };
                 },
             };
         }
@@ -6603,6 +6625,9 @@ pub const ApiHttpServer = struct {
             _ = table_writes_source.deleteArtifactEnrichment(alloc, table_name, artifact_name) catch |err| switch (err) {
                 else => {
                     std.log.err("public artifact enrichment local delete failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
+                    _ = table_writes_source.requestTableStructuralReconcile(alloc, table_name) catch |reconcile_err| {
+                        std.log.warn("public artifact enrichment delete structural reconcile enqueue failed table={s} artifact={s} err={}", .{ table_name, artifact_name, reconcile_err });
+                    };
                 },
             };
         }
@@ -19831,7 +19856,37 @@ test "api index status uses read runtime status without consulting write source"
     try std.testing.expectEqual(@as(?bool, false), shard_10.replay_catch_up_required);
 }
 
-test "api index status falls through to read runtime status when write cache is empty" {
+test "api index status refreshes synthetic configured index status from write source" {
+    const synthetic_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "vec",
+        .kind = .dense_vector,
+    }};
+    const synthetic_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .synthetic_config, .freshness = .stale },
+        .stats = .{
+            .index_count = synthetic_indexes.len,
+            .indexes = @constCast(synthetic_indexes[0..]),
+        },
+    }};
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefresh(synthetic_statuses[0..]));
+
+    const live_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "search",
+        .kind = .full_text,
+    }};
+    const live_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{
+            .index_count = live_indexes.len,
+            .indexes = @constCast(live_indexes[0..]),
+        },
+    }};
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefresh(live_statuses[0..]));
+}
+
+test "api index status asks write source when read runtime status is absent" {
     const alloc = std.testing.allocator;
 
     const FakeSource = struct {
@@ -19945,7 +20000,7 @@ test "api index status falls through to read runtime status when write cache is 
     defer resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqual(@as(u32, 1), reads.status_calls.load(.monotonic));
-    try std.testing.expectEqual(@as(u32, 0), writes.status_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), writes.status_calls.load(.monotonic));
 }
 
 test "api index status uses propagated remote store runtime status" {

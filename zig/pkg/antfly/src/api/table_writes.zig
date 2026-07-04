@@ -2939,6 +2939,11 @@ pub const TableWriteSource = struct {
             alloc: std.mem.Allocator,
             table_name: []const u8,
         ) anyerror!?runtime_status.LocalTableRuntimeStatuses = null,
+        request_table_structural_reconcile: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+        ) anyerror!?void = null,
     };
 
     pub fn batch(
@@ -3315,6 +3320,15 @@ pub const TableWriteSource = struct {
         table_name: []const u8,
     ) !?runtime_status.LocalTableRuntimeStatuses {
         const fn_ptr = self.vtable.local_runtime_statuses orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name);
+    }
+
+    pub fn requestTableStructuralReconcile(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.request_table_structural_reconcile orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name);
     }
 };
@@ -3945,6 +3959,9 @@ pub const ProvisionedTableWriteSource = struct {
     restore_repair_completion_group: Io.Group = .init,
     restore_repair_completion_scheduled: std.atomic.Value(bool) = .init(false),
     restore_repair_completions: std.ArrayListUnmanaged([]u8) = .empty,
+    structural_reconcile_mutex: Io.Mutex = .init,
+    structural_reconcile_scheduled: std.atomic.Value(bool) = .init(false),
+    structural_reconcile_tables: std.ArrayListUnmanaged([]u8) = .empty,
     runtime_status_cache: ?*runtime_status.TableRuntimeSnapshotCache = null,
     local_change_hook: ?LocalChangeHook = null,
     raft_batcher: ?RaftBatcher = null,
@@ -4156,6 +4173,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.restore_repair_work_group.cancel(io);
         self.restore_repair_completion_group.await(io) catch {};
         self.freeRestoreRepairCompletions();
+        self.freeStructuralReconcileTables();
         self.freeWriteCoalesceQueues();
         self.table_activity_mutex.lockUncancelable(io);
         for (self.active_table_activities.items) |entry| {
@@ -7215,6 +7233,281 @@ pub const ProvisionedTableWriteSource = struct {
         };
     }
 
+    fn freeStructuralReconcileTables(self: *ProvisionedTableWriteSource) void {
+        const io = self.table_activity_threaded.io();
+        const alloc = std.heap.page_allocator;
+        self.structural_reconcile_mutex.lockUncancelable(io);
+        defer self.structural_reconcile_mutex.unlock(io);
+        for (self.structural_reconcile_tables.items) |table_name| alloc.free(table_name);
+        self.structural_reconcile_tables.deinit(alloc);
+        self.structural_reconcile_tables = .empty;
+    }
+
+    fn enqueueTableStructuralReconcile(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        if (self.restore_repair_shutdown.load(.acquire)) return;
+        const alloc = std.heap.page_allocator;
+        const io = self.table_activity_threaded.io();
+
+        self.structural_reconcile_mutex.lockUncancelable(io);
+        defer self.structural_reconcile_mutex.unlock(io);
+
+        for (self.structural_reconcile_tables.items) |candidate| {
+            if (std.mem.eql(u8, candidate, table_name)) return;
+        }
+
+        const owned_table_name = alloc.dupe(u8, table_name) catch |err| {
+            std.log.warn("structural reconcile table name allocation failed table={s} err={}", .{ table_name, err });
+            return;
+        };
+        errdefer alloc.free(owned_table_name);
+        const appended_index = self.structural_reconcile_tables.items.len;
+        self.structural_reconcile_tables.append(alloc, owned_table_name) catch |err| {
+            std.log.warn("structural reconcile queue append failed table={s} err={}", .{ table_name, err });
+            return;
+        };
+
+        if (self.structural_reconcile_scheduled.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+        self.restore_repair_work_group.concurrent(io, drainStructuralReconcileTask, .{self}) catch |err| {
+            const removed = self.structural_reconcile_tables.orderedRemove(appended_index);
+            alloc.free(removed);
+            self.structural_reconcile_scheduled.store(false, .release);
+            std.log.warn("structural reconcile submit failed table={s} err={}", .{ table_name, err });
+        };
+    }
+
+    fn drainStructuralReconcileTask(self: *ProvisionedTableWriteSource) Io.Cancelable!void {
+        const alloc = std.heap.page_allocator;
+        const io = self.table_activity_threaded.io();
+        while (true) {
+            self.structural_reconcile_mutex.lockUncancelable(io);
+            if (self.structural_reconcile_tables.items.len == 0) {
+                self.structural_reconcile_scheduled.store(false, .release);
+                self.structural_reconcile_mutex.unlock(io);
+                return;
+            }
+            var pending = self.structural_reconcile_tables;
+            self.structural_reconcile_tables = .empty;
+            self.structural_reconcile_mutex.unlock(io);
+            defer pending.deinit(alloc);
+
+            for (pending.items) |table_name| {
+                defer alloc.free(table_name);
+                self.reconcileTableStructureUntilIdle(alloc, table_name) catch |err| {
+                    std.log.warn("structural reconcile failed table={s} err={s}", .{ table_name, @errorName(err) });
+                };
+            }
+        }
+    }
+
+    fn reconcileTableStructureUntilIdle(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !void {
+        const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+            alloc,
+            self.catalog,
+            table_name,
+            "",
+            "",
+            5 * std.time.ns_per_s,
+            10,
+        );
+        defer alloc.free(group_ids);
+
+        if (group_ids.len == 0) return;
+        const io = self.table_activity_threaded.io();
+        std.log.info("structural reconcile begin table={s} groups={d}", .{ table_name, group_ids.len });
+        lockAtomic(&self.local_db_mutex);
+        self.invalidateWriteCache(table_name);
+        self.invalidateReadCache(table_name);
+        self.invalidateRuntimeStatusCache(table_name);
+        self.local_db_mutex.unlock();
+        self.drainWriteCachePendingCloses();
+        var attempts: usize = 0;
+        while (true) {
+            if (self.restore_repair_shutdown.load(.acquire)) return;
+            attempts += 1;
+            var any_busy = false;
+            const metadata = (try loadTableManagedMetadata(alloc, self.catalog, table_name)) orelse return;
+            defer {
+                if (metadata.indexes_json) |value| alloc.free(value);
+                if (metadata.schema_json) |value| alloc.free(value);
+            }
+            for (group_ids) |group_id| {
+                if (try self.reconcileTableGroupStructureWithRuntime(alloc, group_id, table_name, .{
+                    .indexes_json = metadata.indexes_json,
+                    .schema_json = metadata.schema_json,
+                })) {
+                    any_busy = true;
+                    continue;
+                }
+            }
+            if (!any_busy) {
+                self.notifyLocalChange(table_name, .structural);
+                std.log.info("structural reconcile complete table={s} attempts={d}", .{ table_name, attempts });
+                return;
+            }
+            io.sleep(Io.Duration.fromMilliseconds(100), .awake) catch |err| switch (err) {
+                error.Canceled => return Io.recancel(io),
+            };
+        }
+    }
+
+    fn reconcileTableGroupStructureWithRuntime(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        metadata: StartupCatchUpMetadata,
+    ) !bool {
+        if (!self.tryBeginGroupOperation(table_name, group_id)) return true;
+        defer self.endGroupOperation(table_name, group_id);
+
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const lsm_root_generation = self.visibleRootGeneration(group_id);
+        const identity_namespace = metadata.identity_namespace orelse
+            try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
+
+        var configured_indexes_storage: ?StartupConfiguredIndexes = null;
+        if (metadata.indexes_json) |value| configured_indexes_storage = try parseStartupConfiguredIndexes(alloc, value);
+        defer if (configured_indexes_storage) |*summary| summary.deinit(alloc);
+
+        if (self.write_cache) |cache| {
+            var cached = self.getOrOpenCachedDbModeAtGeneration(alloc, cache, path, group_id, lsm_root_generation, table_name, .default_async, null, null, .{
+                .indexes_json = metadata.indexes_json,
+                .schema_json = metadata.schema_json,
+                .identity_namespace = identity_namespace,
+            }) catch |err| switch (err) {
+                error.LsmRootWriterAlreadyOpen, error.WriterLocked => return true,
+                else => return err,
+            };
+            var cached_active = true;
+            defer if (cached_active) cached.deinit(alloc);
+
+            if (metadata.schema_json) |schema_json| try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
+            if (configured_indexes_storage) |configured_indexes| {
+                for (configured_indexes.items) |item| {
+                    _ = cached.db.deleteIndex(item.name) catch |err| switch (err) {
+                        error.IndexNotFound => {},
+                        else => return err,
+                    };
+                }
+            }
+            if (metadata.indexes_json) |indexes_json| {
+                _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
+                    .drain_resolver_backfill = false,
+                });
+            }
+            if (configured_indexes_storage) |configured_indexes| {
+                for (configured_indexes.items) |item| {
+                    catchUpManagedIndexCreate(alloc, cached.db, item.name) catch |err| {
+                        lockAtomic(&self.local_db_mutex);
+                        defer self.local_db_mutex.unlock();
+                        cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
+                        cached_active = false;
+                        return err;
+                    };
+                }
+            } else {
+                cached.db.runUntilIdle() catch |err| {
+                    lockAtomic(&self.local_db_mutex);
+                    defer self.local_db_mutex.unlock();
+                    cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
+                    cached_active = false;
+                    return err;
+                };
+            }
+            publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db) catch |err| {
+                lockAtomic(&self.local_db_mutex);
+                defer self.local_db_mutex.unlock();
+                cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
+                cached_active = false;
+                return err;
+            };
+            cache.publishCachedLeaseGeneration(&cached, lsm_root_generation);
+            return false;
+        }
+
+        var db = if (metadata.indexes_json) |indexes_json|
+            openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
+                alloc,
+                path,
+                indexes_json,
+                null,
+                null,
+                lsm_root_generation,
+                null,
+                .default_async,
+                self.backend_runtime,
+                self.antfly_provider,
+                self.secret_store,
+                self.remote_content,
+                identity_namespace,
+                .{
+                    .drain_resolver_backfill = false,
+                    .inference_api_url = self.inference_api_url,
+                    .ha_write_gate = self.ha_write_gate,
+                    .ha_async_effect_mirror = self.ha_async_mirror,
+                    .ha_async_batch_mirror = self.ha_async_mirror,
+                    .ha_async_metadata_mirror = self.ha_async_mirror,
+                },
+            ) catch |err| switch (err) {
+                error.LsmRootWriterAlreadyOpen, error.WriterLocked => return true,
+                else => return err,
+            }
+        else
+            db_mod.DB.open(alloc, path, .{
+                .open_mode = .writer_no_replay,
+                .lsm_root_generation = lsm_root_generation,
+                .backend_runtime = self.backend_runtime,
+                .identity_namespace = identity_namespace,
+                .prefer_existing_identity_namespace = identity_namespace != null,
+                .ha_write_gate = self.ha_write_gate,
+                .ha_async_effect_mirror = self.ha_async_mirror,
+                .ha_async_batch_mirror = self.ha_async_mirror,
+                .ha_async_metadata_mirror = self.ha_async_mirror,
+            }) catch |err| switch (err) {
+                error.LsmRootWriterAlreadyOpen, error.WriterLocked => return true,
+                else => return err,
+            };
+        defer db.close();
+        try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
+        if (metadata.schema_json) |schema_json| try applyLocalTableSchemaJson(alloc, &db, schema_json);
+        if (configured_indexes_storage) |configured_indexes| {
+            for (configured_indexes.items) |item| {
+                _ = db.deleteIndex(item.name) catch |err| switch (err) {
+                    error.IndexNotFound => {},
+                    else => return err,
+                };
+            }
+        }
+        if (metadata.indexes_json) |indexes_json| {
+            _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
+                .drain_resolver_backfill = false,
+            });
+        }
+        if (configured_indexes_storage) |configured_indexes| {
+            for (configured_indexes.items) |item| try catchUpManagedIndexCreate(alloc, &db, item.name);
+        } else {
+            try db.runUntilIdle();
+        }
+        try publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, &db);
+        return false;
+    }
+
+    fn requestTableStructuralReconcile(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        table_name: []const u8,
+    ) !?void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.requestTableStructuralReconcile(std.heap.page_allocator, table_name);
+        self.enqueueTableStructuralReconcile(table_name);
+        return {};
+    }
+
     fn beginBulkIngest(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -7294,6 +7587,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
                 .apply_document_artifact_child_range_batch_group_local = applyDocumentArtifactChildRangeBatchGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
+                .request_table_structural_reconcile = requestTableStructuralReconcile,
             },
         };
     }
@@ -9762,10 +10056,22 @@ pub const HostedProvisionedTableWriteSource = struct {
         _: []const u8,
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        self.reconcileCachedIndexCreate(alloc, table_name, index_name) catch |err| {
-            self.invalidateManagedCache(table_name);
-            return err;
-        };
+        const deadline_ns = platform_time.monotonicNs() + replicated_apply_writer_open_timeout_ns;
+        while (true) {
+            self.reconcileCachedIndexCreate(alloc, table_name, index_name) catch |err| switch (err) {
+                error.LsmRootWriterAlreadyOpen, error.WriterLocked => {
+                    self.invalidateManagedCache(table_name);
+                    if (platform_time.monotonicNs() >= deadline_ns) return err;
+                    sleepNs(replicated_apply_writer_open_retry_ns);
+                    continue;
+                },
+                else => {
+                    self.invalidateManagedCache(table_name);
+                    return err;
+                },
+            };
+            return;
+        }
     }
 
     fn putArtifactEnrichment(
@@ -9800,9 +10106,20 @@ pub const HostedProvisionedTableWriteSource = struct {
         index_name: []const u8,
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        self.invalidateManagedCache(table_name);
-        try dropLocalTableIndex(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, index_name);
-        self.invalidateManagedCache(table_name);
+        const deadline_ns = platform_time.monotonicNs() + replicated_apply_writer_open_timeout_ns;
+        while (true) {
+            self.invalidateManagedCache(table_name);
+            dropLocalTableIndex(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, index_name) catch |err| switch (err) {
+                error.LsmRootWriterAlreadyOpen, error.WriterLocked => {
+                    if (platform_time.monotonicNs() >= deadline_ns) return err;
+                    sleepNs(replicated_apply_writer_open_retry_ns);
+                    continue;
+                },
+                else => return err,
+            };
+            self.invalidateManagedCache(table_name);
+            return;
+        }
     }
 
     fn batch(
@@ -11735,13 +12052,10 @@ fn catchUpManagedIndexCreate(
     db: *db_mod.DB,
     index_name: []const u8,
 ) !void {
-    if (try db.core.indexRequiresEnrichmentReplay(index_name)) {
+    const requires_enrichment_replay = try db.core.indexRequiresEnrichmentReplay(index_name);
+    if (requires_enrichment_replay) {
         if (db.enrichment_runtime != null) {
-            const scheduled = try db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
-            if (scheduled > 0) {
-                try db.core.index_manager.syncAll(true);
-                return;
-            }
+            _ = try db.reprocessGeneratedEnrichmentFromStoredDocs(alloc, managedIndexEmbeddingArtifactName(db, index_name));
         } else {
             _ = try seedManagedIndexReplayFromStoredDocsIfNeeded(alloc, db, index_name);
         }
@@ -11757,7 +12071,39 @@ fn catchUpManagedIndexCreate(
         try db.catchUpPendingDerivedReplay();
         try db.runUntilIdle();
     }
+    if (requires_enrichment_replay) try repairManagedEmbeddingArtifactsForIndex(alloc, db, index_name);
     try db.core.index_manager.syncAll(true);
+}
+
+fn managedIndexEmbeddingArtifactName(db: *db_mod.DB, index_name: []const u8) ?[]const u8 {
+    if (db.core.index_manager.denseEmbeddingName(index_name)) |name| return name;
+    if (db.core.index_manager.sparseEmbeddingName(index_name)) |name| return name;
+    return index_name;
+}
+
+fn repairManagedEmbeddingArtifactsForIndex(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    index_name: []const u8,
+) !void {
+    const max_passes: usize = 4;
+    var pass: usize = 0;
+    while (pass < max_passes) : (pass += 1) {
+        var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
+            .artifact_kind = .embedding,
+            .index_name = index_name,
+            .limit = 1024,
+        });
+        defer repair.deinit(alloc);
+
+        if (repair.reprocessed == 0 and repair.repaired == 0) return;
+        db.catchUpPendingDerivedReplay() catch |err| switch (err) {
+            error.ArtifactRepairRequired => {},
+            else => return err,
+        };
+        try db.runUntilIdle();
+        if (!repair.has_more and !repair.debt_remaining) return;
+    }
 }
 
 fn managedIndexReplayDebtRequired(replay_debt: anytype, index_name: []const u8) bool {

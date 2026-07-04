@@ -11051,6 +11051,68 @@ pub const DB = struct {
         return generated_ref_count;
     }
 
+    pub fn reprocessGeneratedEnrichmentFromStoredDocs(
+        self: *DB,
+        alloc: Allocator,
+        artifact_name: ?[]const u8,
+    ) !usize {
+        if (self.enrichment_runtime == null) return 0;
+
+        const lower = try self.core.documentRangeLowerAlloc("");
+        defer self.core.alloc.free(lower);
+        const docs = try self.core.scanStoreRange(alloc, lower, "");
+        defer docstore_mod.DocStore.freeResults(alloc, docs);
+
+        const chunk_size: usize = 128;
+        var index: usize = 0;
+        var reprocessed: usize = 0;
+        while (index < docs.len) {
+            var write_count: usize = 0;
+            var probe = index;
+            while (probe < docs.len and write_count < chunk_size) : (probe += 1) {
+                if (isPrimaryDocumentStoreKey(docs[probe].key)) write_count += 1;
+            }
+            if (write_count == 0) break;
+
+            var writes = try alloc.alloc(types.BatchWrite, write_count);
+            var filled: usize = 0;
+            defer {
+                for (writes[0..filled]) |write| alloc.free(@constCast(write.key));
+                alloc.free(writes);
+            }
+
+            while (index < docs.len and filled < write_count) : (index += 1) {
+                const doc = docs[index];
+                if (!isPrimaryDocumentStoreKey(doc.key)) continue;
+                const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, doc.key)) orelse continue;
+                errdefer alloc.free(raw_key);
+                writes[filled] = .{
+                    .key = raw_key,
+                    .value = doc.value,
+                };
+                filled += 1;
+            }
+            if (filled == 0) continue;
+
+            if (artifact_name) |name| {
+                const force_artifacts = [_][]const u8{name};
+                try self.batchInternal(.{
+                    .writes = writes[0..filled],
+                    .sync_level = .full_index,
+                }, null, .{
+                    .force_generated_artifact_names = &force_artifacts,
+                });
+            } else {
+                try self.batchInternal(.{
+                    .writes = writes[0..filled],
+                    .sync_level = .full_index,
+                }, null, .{});
+            }
+            reprocessed += filled;
+        }
+        return reprocessed;
+    }
+
     fn waitForSyncLevel(self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets) !void {
         switch (sync_level) {
             .propose, .write => try self.executor.failIfUnhealthy(),
