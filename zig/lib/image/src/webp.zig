@@ -2906,11 +2906,22 @@ fn decodeVp8lRgba(alloc: Allocator, payload: []const u8) !DecodedImage {
     var reader = BitReader.init(payload[1..]);
     const width = (try reader.readBits(14)) + 1;
     const height = (try reader.readBits(14)) + 1;
-    _ = try reader.readBits(1);
+    const alpha_is_used = (try reader.readBits(1)) != 0;
     const version = try reader.readBits(3);
     if (version != 0) return error.UnsupportedWebpFormat;
 
-    return try decodeVp8lImageStream(alloc, &reader, width, height, true);
+    const decoded = try decodeVp8lImageStream(alloc, &reader, width, height, true);
+    errdefer alloc.free(decoded.rgba);
+    if (!alpha_is_used and decodedRgbaHasNonOpaqueAlpha(decoded.rgba)) return error.WebpDecodeFailed;
+    return decoded;
+}
+
+fn decodedRgbaHasNonOpaqueAlpha(rgba: []const u8) bool {
+    var alpha_index: usize = 3;
+    while (alpha_index < rgba.len) : (alpha_index += 4) {
+        if (rgba[alpha_index] != 255) return true;
+    }
+    return false;
 }
 
 fn decodeAlphPlane(alloc: Allocator, payload: []const u8, width: u32, height: u32) ![]u8 {
@@ -5020,6 +5031,17 @@ test "probe standalone vp8l alpha bit" {
     const info = try probe(webp);
     try std.testing.expectEqual(Bitstream.vp8l, info.bitstream.?);
     try std.testing.expect(info.alpha);
+}
+
+test "decode rejects vp8l stream with undeclared alpha pixels" {
+    const alloc = std.testing.allocator;
+    const webp = try testBuildLiteralVp8lWebp(alloc, 1, 1, .{ 0x10, 0x20, 0x30, 0x40 });
+    defer alloc.free(webp);
+
+    webp[24] &= ~@as(u8, 0x10);
+    const info = try probe(webp);
+    try std.testing.expect(!info.alpha);
+    try std.testing.expectError(error.WebpDecodeFailed, decodeRgba(alloc, webp));
 }
 
 test "probe vp8x alpha chunk before lossy image" {
