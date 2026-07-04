@@ -2174,9 +2174,17 @@ fn singleBooleanExpressionCanStartAt(tokens: []const Token, index: usize, schema
 
 pub fn canParseAccessNotWhere(tokens: []const Token, pos: usize) bool {
     if (!parser.peekKeywordTag(tokens, pos, .not)) return false;
+    if (pos + 1 < tokens.len and parenthesizedWhereHasTopLevelOr(tokens, pos + 1)) return false;
     var i = pos + 1;
     while (i < tokens.len and tokens[i].kind == .lparen) : (i += 1) {}
     if (i >= tokens.len) return false;
+    const inner_start = i;
+    if (expr_operator.jsonExtractExpressionPredicateCanStartAt(tokens, inner_start) and
+        inner_start + 4 < tokens.len and
+        expr_token.tokenAtIsAnySomeOrAll(tokens, inner_start + 4))
+    {
+        return false;
+    }
     var depth: usize = 0;
     while (i < tokens.len) : (i += 1) {
         const token = tokens[i];
@@ -2189,6 +2197,9 @@ pub fn canParseAccessNotWhere(tokens: []const Token, pos: usize) bool {
             },
             .arrow_text, .arrow_json, .path_arrow_text, .path_arrow_json, .at_contains, .range_overlap, .question => return true,
             .identifier => {
+                if (depth == 0 and token.matchesKeywordTag(.in)) {
+                    return accessNotInListHasPlainFieldLhs(tokens, inner_start, i);
+                }
                 if (token.matchesKeywordTag(.like) or
                     token.matchesKeywordTag(.ilike))
                 {
@@ -2205,6 +2216,11 @@ pub fn canParseAccessNotWhere(tokens: []const Token, pos: usize) bool {
         }
     }
     return false;
+}
+
+fn accessNotInListHasPlainFieldLhs(tokens: []const Token, start: usize, in_index: usize) bool {
+    if (start >= in_index or in_index > tokens.len) return false;
+    return start + 1 == in_index and tokens[start].kind == .identifier;
 }
 
 pub fn canParseExpressionWhereCondition(
@@ -3338,7 +3354,6 @@ pub fn parseWhereAtomAlloc(
     collation_transferred = true;
 }
 
-
 fn parseAccessPredicateAtomGroupAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -3444,7 +3459,6 @@ fn parseAccessPredicateAtomGroupAlloc(
     }
     return group;
 }
-
 
 pub fn parseAccessPredicateGroupsAlloc(
     alloc: std.mem.Allocator,
@@ -3682,6 +3696,33 @@ test "sql expr predicate classifies bare boolean and access negation starts" {
         .{ .kind = .rparen, .text = ")" },
     };
     try std.testing.expect(canParseAccessNotWhere(&access_not_tokens, 0));
+
+    const access_not_in_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "not", .keyword = .not },
+        .{ .kind = .lparen, .text = "(" },
+        .{ .kind = .identifier, .text = "status" },
+        .{ .kind = .identifier, .text = "in", .keyword = .in },
+        .{ .kind = .lparen, .text = "(" },
+        .{ .kind = .string, .text = "archived" },
+        .{ .kind = .rparen, .text = ")" },
+        .{ .kind = .rparen, .text = ")" },
+    };
+    try std.testing.expect(canParseAccessNotWhere(&access_not_in_tokens, 0));
+
+    const expression_not_in_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "not", .keyword = .not },
+        .{ .kind = .lparen, .text = "(" },
+        .{ .kind = .identifier, .text = "lower", .keyword = .lower },
+        .{ .kind = .lparen, .text = "(" },
+        .{ .kind = .identifier, .text = "status" },
+        .{ .kind = .rparen, .text = ")" },
+        .{ .kind = .identifier, .text = "in", .keyword = .in },
+        .{ .kind = .lparen, .text = "(" },
+        .{ .kind = .string, .text = "archived" },
+        .{ .kind = .rparen, .text = ")" },
+        .{ .kind = .rparen, .text = ")" },
+    };
+    try std.testing.expect(!canParseAccessNotWhere(&expression_not_in_tokens, 0));
 }
 
 test "sql expr predicate classifies expression where condition starts" {

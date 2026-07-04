@@ -1336,6 +1336,12 @@ pub fn freeRelationalRowsCollectedRows(alloc: Allocator, rows: []const Relationa
 }
 
 pub const RelationalRowsQueryRequest = struct {
+    pub const TotalMode = enum {
+        exact,
+        bounded,
+        none,
+    };
+
     source_cte: []const u8 = "",
     predicates: []const schema_mod.RelationalCheck = &.{},
     array_any: []const RelationalRowsArrayAnyPredicate = &.{},
@@ -1370,6 +1376,8 @@ pub const RelationalRowsQueryRequest = struct {
     doc_key_range: ?RelationalRowsDocKeyRange = null,
     limit: ?u32 = null,
     offset: u32 = 0,
+    total_mode: TotalMode = .exact,
+    profile: bool = false,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         if (self.source_cte.len > 0) alloc.free(self.source_cte);
@@ -1857,8 +1865,63 @@ pub const RelationalRowsQueryPlan = struct {
 };
 
 pub const RelationalRowsQueryResult = struct {
+    pub const AccessMethod = enum {
+        unknown,
+        base_scan,
+        resolved_doc_set,
+        ordered_tuple_doc_set,
+        ordered_tuple_stream,
+    };
+
+    pub const FallbackReason = enum {
+        none,
+        ordered_tuple_skipped_for_exact_paged_total,
+        ordered_tuple_candidate_gate,
+        ordered_tuple_materialization_cap,
+        ordered_tuple_ordering_not_covered,
+        ordered_tuple_index_not_ready,
+        ordered_tuple_stale_generation,
+        ordered_tuple_access_method_mismatch,
+        ordered_tuple_predicate_not_proven,
+        ordered_tuple_no_usable_bounds,
+        ordered_tuple_order_field_not_covered,
+        ordered_tuple_order_direction_not_covered,
+        ordered_tuple_order_nulls_not_covered,
+        ordered_tuple_order_collation_not_covered,
+        ordered_tuple_collation_not_supported,
+    };
+
+    pub const Profile = struct {
+        access_method: AccessMethod = .unknown,
+        fallback_reason: FallbackReason = .none,
+        ordered_tuple_plan_selected: bool = false,
+        ordered_tuple_catalog_ordinal: u32 = 0,
+        ordered_tuple_index_generation: u64 = 0,
+        ordered_tuple_key_count: u32 = 0,
+        ordered_tuple_equality_prefix_len: u32 = 0,
+        ordered_tuple_range_key_index: u32 = std.math.maxInt(u32),
+        ordered_tuple_filter_predicates: u32 = 0,
+        ordered_tuple_proven_predicates: u32 = 0,
+        ordered_tuple_residual_predicates: u32 = 0,
+        ordered_tuple_lower_tuple_bytes: u64 = 0,
+        ordered_tuple_upper_tuple_bytes: u64 = 0,
+        ordered_tuple_prefix_scan: bool = false,
+        index_entries_scanned: u64 = 0,
+        candidate_rows: u64 = 0,
+        candidate_gate_limit: u64 = 0,
+        candidate_gate_observed: u64 = 0,
+        iterator_seeks: u64 = 0,
+        hydrated_rows: u64 = 0,
+        residual_rechecks: u64 = 0,
+        covering_payload_rows: u64 = 0,
+        projected_rows: u64 = 0,
+    };
+
     rows: [][]const u8 = &.{},
     total: u32 = 0,
+    total_exact: bool = true,
+    include_profile: bool = false,
+    profile: Profile = .{},
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.rows) |row| alloc.free(@constCast(row));

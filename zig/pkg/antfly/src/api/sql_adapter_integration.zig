@@ -62,6 +62,7 @@ const AppParityDdlSummaryPlan = union(enum) {
     savepoint_transaction: ddl_plan.SavepointTransactionPlan,
     comment_metadata: ddl_plan.CommentMetadataPlan,
     security_label: ddl_plan.SecurityLabelPlan,
+    transaction_boundary: ddl_plan.TransactionBoundaryPlan,
     transaction_control: ddl_plan.TransactionControlPlan,
     create_index: ddl_plan.CreateIndexPlan,
     drop_index: ddl_plan.DropIndexPlan,
@@ -320,6 +321,7 @@ fn expectCatalogDdlSummary(summary: AppParityPlanSummary, plan: sql_adapter.Cata
 
 fn expectTransactionDdlSummary(summary: AppParityPlanSummary, plan: sql_adapter.TransactionLogicalPlan) !void {
     switch (plan) {
+        .boundary => |payload| return try expectDdlSummaryPayload(summary, .{ .transaction_boundary = payload }),
         .control => |payload| return try expectDdlSummaryPayload(summary, .{ .transaction_control = payload }),
         .prepared => |payload| return try expectDdlSummaryPayload(summary, .{ .prepared_transaction = payload }),
         .savepoint => |payload| return try expectDdlSummaryPayload(summary, .{ .savepoint_transaction = payload }),
@@ -823,6 +825,13 @@ fn expectDdlSummaryPayload(summary: AppParityPlanSummary, payload: AppParityDdlS
                 try std.testing.expectEqual(AppParityDdlTag.rollback_to_savepoint, expected);
                 try expectOptionalTableName(summary.table_name, rollback.savepoint_name);
             },
+        },
+        .transaction_boundary => |plan| {
+            try std.testing.expectEqual(switch (plan.action) {
+                .begin => AppParityDdlTag.begin_transaction,
+                .commit => AppParityDdlTag.commit_transaction,
+                .rollback => AppParityDdlTag.rollback_transaction,
+            }, expected);
         },
         .comment_metadata => |plan| {
             try std.testing.expectEqual(AppParityDdlTag.comment_metadata, expected);
@@ -1401,6 +1410,39 @@ fn expectAppParityGeneratedParseFailureEntry(
     return true;
 }
 
+const AppParitySchemaCache = struct {
+    alloc: std.mem.Allocator,
+    schemas: std.StringHashMapUnmanaged(runtime_schema.TableSchema) = .{},
+
+    fn init(alloc: std.mem.Allocator) @This() {
+        return .{ .alloc = alloc };
+    }
+
+    fn deinit(self: *@This()) void {
+        var value_it = self.schemas.valueIterator();
+        while (value_it.next()) |schema| runtime_schema.freeSchema(self.alloc, schema.*);
+
+        var key_it = self.schemas.keyIterator();
+        while (key_it.next()) |schema_json| self.alloc.free(schema_json.*);
+
+        self.schemas.deinit(self.alloc);
+    }
+
+    fn getOrDerive(self: *@This(), schema_json: []const u8) !runtime_schema.TableSchema {
+        if (self.schemas.get(schema_json)) |schema| return schema;
+
+        var parsed = try schema_api.parseValidatedTableSchema(self.alloc, schema_json);
+        defer parsed.deinit(self.alloc);
+        const schema = try schema_api.deriveRuntimeTableSchema(self.alloc, parsed);
+        errdefer runtime_schema.freeSchema(self.alloc, schema);
+
+        const owned_schema_json = try self.alloc.dupe(u8, schema_json);
+        errdefer self.alloc.free(owned_schema_json);
+        try self.schemas.put(self.alloc, owned_schema_json, schema);
+        return schema;
+    }
+};
+
 fn expectAppParityCorpusEntry(
     alloc: std.mem.Allocator,
     base_schema_json: []const u8,
@@ -1408,6 +1450,7 @@ fn expectAppParityCorpusEntry(
     entry: AppParityCorpusEntry,
     unique_resolver: relational_rows.UniqueSelectorResolver,
     row_claim: db_mod.types.RowClaimRequest,
+    schema_cache: ?*AppParitySchemaCache,
 ) !void {
     var parsed_sql = sql_adapter.ParsedSql.initAlloc(alloc, entry.sql) catch |err| {
         if (try expectAppParityGeneratedParseFailureEntry(alloc, entry, err)) return;
@@ -1423,10 +1466,14 @@ fn expectAppParityCorpusEntry(
             defer alloc.free(@constCast(source_table_name));
             if (entry.summary.table_name) |table_name| {
                 if (std.mem.eql(u8, table_name, source_table_name)) {
-                    var parsed_source_schema = try schema_api.parseValidatedTableSchema(alloc, entry.source_schema_json);
-                    defer parsed_source_schema.deinit(alloc);
-                    owned_setup_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_source_schema);
-                    effective_schema = owned_setup_schema.?;
+                    if (schema_cache) |cache| {
+                        effective_schema = try cache.getOrDerive(entry.source_schema_json);
+                    } else {
+                        var parsed_source_schema = try schema_api.parseValidatedTableSchema(alloc, entry.source_schema_json);
+                        defer parsed_source_schema.deinit(alloc);
+                        owned_setup_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_source_schema);
+                        effective_schema = owned_setup_schema.?;
+                    }
                 }
             }
         }
@@ -1435,10 +1482,14 @@ fn expectAppParityCorpusEntry(
         if (entry.summary.table_name) |table_name| {
             for (entry.catalog_tables) |table| {
                 if (!std.mem.eql(u8, table.name, table_name)) continue;
-                var parsed_catalog_schema = try schema_api.parseValidatedTableSchema(alloc, table.schema_json);
-                defer parsed_catalog_schema.deinit(alloc);
-                owned_setup_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_catalog_schema);
-                effective_schema = owned_setup_schema.?;
+                if (schema_cache) |cache| {
+                    effective_schema = try cache.getOrDerive(table.schema_json);
+                } else {
+                    var parsed_catalog_schema = try schema_api.parseValidatedTableSchema(alloc, table.schema_json);
+                    defer parsed_catalog_schema.deinit(alloc);
+                    owned_setup_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_catalog_schema);
+                    effective_schema = owned_setup_schema.?;
+                }
                 break;
             }
         }
@@ -1446,10 +1497,14 @@ fn expectAppParityCorpusEntry(
     if (owned_setup_schema == null and entry.family != .ddl and entry.apply_setup_sql.len > 0) {
         const setup_schema_json = try schemaJsonFromSetupSqlAlloc(alloc, entry.apply_setup_sql);
         defer alloc.free(setup_schema_json);
-        var parsed_setup_schema = try schema_api.parseValidatedTableSchema(alloc, setup_schema_json);
-        defer parsed_setup_schema.deinit(alloc);
-        owned_setup_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_setup_schema);
-        effective_schema = owned_setup_schema.?;
+        if (schema_cache) |cache| {
+            effective_schema = try cache.getOrDerive(setup_schema_json);
+        } else {
+            var parsed_setup_schema = try schema_api.parseValidatedTableSchema(alloc, setup_schema_json);
+            defer parsed_setup_schema.deinit(alloc);
+            owned_setup_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_setup_schema);
+            effective_schema = owned_setup_schema.?;
+        }
     }
     var override_resolver_ctx = TestPrimaryResolver{
         .row_json = entry.resolver_row_json,
@@ -3181,10 +3236,9 @@ const preparedTransactionRecoveryFingerprintAlloc = sql_adapter.preparedTransact
 test "postgres sql adapter classifies application parity corpus" {
     const alloc = std.testing.allocator;
     const schema_json = app_parity_default_schema_json;
-    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed.deinit(alloc);
-    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
-    defer runtime_schema.freeSchema(alloc, schema);
+    var schema_cache = AppParitySchemaCache.init(alloc);
+    defer schema_cache.deinit();
+    const schema = try schema_cache.getOrDerive(schema_json);
 
     var resolver_ctx = TestPrimaryResolver{
         .row_json = "{\"id\":\"u1\",\"tenant_id\":\"t1\",\"status\":\"queued\",\"quantity\":1,\"amount\":5,\"priority\":1,\"updated_at_ns\":1,\"metadata\":{}}",
@@ -3197,7 +3251,7 @@ test "postgres sql adapter classifies application parity corpus" {
         .txn_id = txn_id,
     };
 
-    var external_source = try sql_adapter.parseAppParityExternalSourceCorpusAlloc(alloc);
+    var external_source = try sql_adapter.parseAppParityExternalSourceCorpusStructureAlloc(alloc);
     defer external_source.deinit(alloc);
     const corpus = external_source.root.entries;
     var required_coverage = try sql_adapter.parseAppParityCoverageRequirementsAlloc(alloc);
@@ -3213,7 +3267,7 @@ test "postgres sql adapter classifies application parity corpus" {
         const entry_alloc = entry_arena.allocator();
         errdefer std.debug.print("application parity corpus entry failed: {s}\n", .{entry.name});
         try coverage.observe(entry_alloc, entry);
-        try expectAppParityCorpusEntry(entry_alloc, schema_json, schema, entry, resolver_ctx.resolver(), row_claim);
+        try expectAppParityCorpusEntry(entry_alloc, schema_json, schema, entry, resolver_ctx.resolver(), row_claim, &schema_cache);
     }
     try sql_adapter.expectAppParityCoverageRequirementsWithReportAlloc(
         alloc,
@@ -3246,10 +3300,9 @@ test "postgres sql adapter classifies fixture-backed application parity corpus" 
     const skipped_entries = fixture_root.skipped_entries;
     const schema_json = fixture_root.schema_json;
 
-    var parsed_schema = try schema_api.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed_schema.deinit(alloc);
-    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
-    defer runtime_schema.freeSchema(alloc, schema);
+    var schema_cache = AppParitySchemaCache.init(alloc);
+    defer schema_cache.deinit();
+    const schema = try schema_cache.getOrDerive(schema_json);
 
     var resolver_ctx = TestPrimaryResolver{
         .row_json = "{\"id\":\"u1\",\"tenant_id\":\"t1\",\"status\":\"queued\",\"quantity\":1,\"amount\":5,\"priority\":1,\"updated_at_ns\":1,\"metadata\":{}}",
@@ -3285,7 +3338,7 @@ test "postgres sql adapter classifies fixture-backed application parity corpus" 
         if (seen_skipped_names.contains(entry.name)) return error.TestUnexpectedResult;
         try validateAppParityFixtureMetadataWithBaseSchema(entry, schema_json, &seen_names, alloc);
         try coverage.observe(entry_alloc, entry);
-        try expectAppParityCorpusEntry(entry_alloc, schema_json, schema, entry, resolver_ctx.resolver(), row_claim);
+        try expectAppParityCorpusEntry(entry_alloc, schema_json, schema, entry, resolver_ctx.resolver(), row_claim, &schema_cache);
     }
     try sql_adapter.expectAppParityCoverageRequirementsWithReportAlloc(
         alloc,
@@ -5693,16 +5746,14 @@ test "postgres sql adapter typed write plans execute through relational storage"
             try std.testing.expectEqual(@as(usize, 1), conflict.patch_expressions.len);
             try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, conflict.patch_expressions[0].expression.field_source);
             try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.scalar_subqueries.len);
-            var source_result = try db.queryRelationalRows(alloc, schema, insert_source.insert_source.req.source);
-            defer source_result.deinit(alloc);
-            try std.testing.expectEqual(@as(u32, 1), source_result.total);
 
-            var batch = try relational_rows.buildRowsInsertSourceBatchAlloc(
+            var batch = try relational_rows.buildRowsInsertSourceBatchFromDbAlloc(
                 alloc,
+                &db,
                 insert_source.table_name,
                 schema,
+                schema,
                 insert_source.insert_source.req,
-                source_result.rows,
                 insert_source_scalar_conflict_resolver.resolver(),
             );
             defer batch.deinit(alloc);
@@ -5963,7 +6014,7 @@ test "postgres sql adapter typed write plans execute through relational storage"
     try std.testing.expectEqualStrings("{\"id\":\"t1\",\"status\":\"joined\"}", joined_rows.rows[5]);
     try std.testing.expectEqualStrings("{\"id\":\"t3\",\"status\":\"stale\"}", joined_rows.rows[6]);
     try std.testing.expectEqualStrings("{\"id\":\"u3\",\"status\":\"queued\"}", joined_rows.rows[7]);
-    try std.testing.expectEqualStrings("{\"id\":\"u3_copy\",\"status\":\"QUEUED\"}", joined_rows.rows[8]);
+    try std.testing.expectEqualStrings("{\"id\":\"u3_copy\",\"status\":\"queued\"}", joined_rows.rows[8]);
     try std.testing.expectEqualStrings("{\"id\":\"u3_copy_cte_copy\",\"status\":\"QUEUED\"}", joined_rows.rows[9]);
 }
 
@@ -7290,6 +7341,97 @@ test "postgres sql adapter mutation source expression transforms execute through
     try std.testing.expectEqualStrings("{\"id\":\"u3\",\"status\":\"SKIP\",\"amount\":8}", text_rows.rows[2]);
 }
 
+test "postgres sql adapter mutation source row assignment scalar subquery executes through relational storage" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"quantity":{"type":"numeric"},"organization_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-row-assignment-scalar-subquery-update", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+
+    const source_row_json = "{\"id\":\"u1\",\"status\":\"source\",\"quantity\":7,\"organization_id\":\"o1\"}";
+    const target_row_json = "{\"id\":\"u2\",\"status\":\"old\",\"quantity\":1,\"organization_id\":\"o1\"}";
+    const source_key = try relational_rows.physicalPrimaryKeyFromRowJsonAlloc(alloc, schema, source_row_json);
+    defer alloc.free(source_key);
+    const target_key = try relational_rows.physicalPrimaryKeyFromRowJsonAlloc(alloc, schema, target_row_json);
+    defer alloc.free(target_key);
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = source_key, .value = source_row_json },
+            .{ .key = target_key, .value = target_row_json },
+        },
+        .sync_level = .write,
+    });
+
+    const txn_id = try db.beginTransaction(4_301);
+    var committed = false;
+    defer if (!committed) db.abortTransaction(txn_id, 4_302) catch {};
+    const claim: db_mod.types.RowClaimRequest = .{
+        .mode = .for_update,
+        .owner_id = "sql-row-assignment-scalar-subquery-update",
+        .txn_id = txn_id,
+    };
+
+    var plan = try lowerWritePlanAlloc(
+        alloc,
+        "UPDATE usage_records SET (quantity, status) = ROW((SELECT quantity FROM usage_records WHERE id = 'u1'), 'copied') WHERE id = 'u2' FOR UPDATE RETURNING id, quantity, status",
+        schema,
+        &.{},
+        .{ .row_claim = claim },
+    );
+    defer plan.deinit(alloc);
+
+    switch (plan) {
+        .update_source => |update_source| {
+            try std.testing.expectEqual(@as(usize, 1), update_source.mutation.req.source.scalar_subqueries.len);
+            try std.testing.expect(update_source.mutation.req.source.scalar_subqueries[0].hidden);
+            try std.testing.expectEqual(@as(usize, 1), update_source.mutation.req.operations.len);
+            try std.testing.expectEqualStrings("status", update_source.mutation.req.operations[0].path);
+            try std.testing.expectEqual(@as(usize, 1), update_source.mutation.req.patch_expressions.len);
+            try std.testing.expectEqualStrings("quantity", update_source.mutation.req.patch_expressions[0].field);
+
+            var result = try db.mutateRelationalRowsFromSource(alloc, schema, update_source.mutation.req);
+            defer result.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 1), result.matched);
+            try std.testing.expectEqual(@as(u32, 1), result.staged);
+            try std.testing.expectEqual(@as(usize, 1), result.returning_rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"u2\",\"quantity\":7,\"status\":\"copied\"}", result.returning_rows[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try db.commitTransaction(txn_id, 4_310);
+    committed = true;
+
+    const select = [_][]const u8{ "id", "quantity", "status" };
+    const predicates = [_]runtime_schema.RelationalCheck{.{
+        .name = "",
+        .field = "id",
+        .op = .eq,
+        .value_json = "\"u2\"",
+    }};
+    var rows = try db.queryRelationalRows(alloc, schema, .{
+        .select = select[0..],
+        .predicates = predicates[0..],
+    });
+    defer rows.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), rows.total);
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"u2\",\"quantity\":7,\"status\":\"copied\"}", rows.rows[0]);
+}
+
 test "postgres sql adapter insert source unique conflict executes through relational storage" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -7515,6 +7657,397 @@ test "postgres sql adapter insert source unique conflict executes through relati
     try std.testing.expectEqual(@as(u32, 1), rows.total);
     try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
     try std.testing.expectEqualStrings("{\"id\":\"existing\",\"source_id\":\"source:1\",\"status\":\"active\"}", rows.rows[0]);
+}
+
+test "postgres sql adapter insert values scalar subqueries execute through literal insert source rows" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"organization_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-insert-values-scalar-subquery", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+
+    const u1_seed_json = "{\"id\":\"u1\",\"status\":\"queued\",\"organization_id\":\"o1\"}";
+    const u2_seed_json = "{\"id\":\"u2\",\"status\":\"ready\",\"organization_id\":\"o1\"}";
+    const u1_seed_key = try relational_rows.physicalPrimaryKeyFromRowJsonAlloc(alloc, schema, u1_seed_json);
+    defer alloc.free(u1_seed_key);
+    const u2_seed_key = try relational_rows.physicalPrimaryKeyFromRowJsonAlloc(alloc, schema, u2_seed_json);
+    defer alloc.free(u2_seed_key);
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = u1_seed_key, .value = u1_seed_json },
+            .{ .key = u2_seed_key, .value = u2_seed_json },
+        },
+        .sync_level = .write,
+    });
+
+    var no_existing_primary = TestPrimaryResolver{ .row_json = "", .version = 0, .exists = false };
+    var plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, organization_id) VALUES ('u3', (SELECT status FROM usage_records WHERE id = 'u1'), 'o2') RETURNING id, status, organization_id",
+        schema,
+        &.{},
+        .{ .unique_resolver = no_existing_primary.resolver() },
+    );
+    defer plan.deinit(alloc);
+
+    switch (plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqual(@as(usize, 1), insert_source.literal_source_rows.len);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.scalar_subqueries.len);
+            try std.testing.expect(insert_source.insert_source.req.source.scalar_subqueries[0].hidden);
+
+            var batch = try relational_rows.buildRowsInsertSourceBatchFromLiteralRowsDbAcrossRangesAndRowScalarSubqueriesAlloc(
+                alloc,
+                &db,
+                insert_source.table_name,
+                schema,
+                schema,
+                insert_source.insert_source.req,
+                insert_source.literal_source_rows,
+                insert_source.literal_source_row_scalar_subqueries,
+                &.{},
+                null,
+            );
+            defer batch.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 1), batch.inserted);
+            try std.testing.expectEqual(@as(usize, 1), batch.returning_rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"u3\",\"status\":\"queued\",\"organization_id\":\"o2\"}", batch.returning_rows[0]);
+            try db.batch(batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var multi_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, organization_id) VALUES ('u5', (SELECT status FROM usage_records WHERE id = 'u1'), 'o2'), ('u6', (SELECT status FROM usage_records WHERE id = 'u2'), 'o2') RETURNING id, status, organization_id",
+        schema,
+        &.{},
+        .{ .unique_resolver = no_existing_primary.resolver() },
+    );
+    defer multi_plan.deinit(alloc);
+    switch (multi_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqual(@as(usize, 2), insert_source.literal_source_rows.len);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.literal_source_row_scalar_subqueries.len);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.literal_source_row_scalar_subqueries[1].len);
+            var batch = try relational_rows.buildRowsInsertSourceBatchFromLiteralRowsDbAcrossRangesAndRowScalarSubqueriesAlloc(
+                alloc,
+                &db,
+                insert_source.table_name,
+                schema,
+                schema,
+                insert_source.insert_source.req,
+                insert_source.literal_source_rows,
+                insert_source.literal_source_row_scalar_subqueries,
+                &.{},
+                no_existing_primary.resolver(),
+            );
+            defer batch.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 2), batch.inserted);
+            try std.testing.expectEqual(@as(usize, 2), batch.returning_rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"u5\",\"status\":\"queued\",\"organization_id\":\"o2\"}", batch.returning_rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"u6\",\"status\":\"ready\",\"organization_id\":\"o2\"}", batch.returning_rows[1]);
+            try db.batch(batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_correlated_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, organization_id) VALUES ('u7', (SELECT status FROM usage_records AS child WHERE child.id = organization_id), 'u1'), ('u8', (SELECT status FROM usage_records AS child WHERE child.id = organization_id), 'u2') RETURNING id, status, organization_id",
+        schema,
+        &.{},
+        .{ .unique_resolver = no_existing_primary.resolver() },
+    );
+    defer generated_correlated_plan.deinit(alloc);
+    switch (generated_correlated_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqual(@as(usize, 2), insert_source.literal_source_rows.len);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.scalar_subqueries.len);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.scalar_subqueries[0].correlations.len);
+            try std.testing.expectEqualStrings("organization_id", insert_source.insert_source.req.source.scalar_subqueries[0].correlations[0].left_field);
+            try std.testing.expectEqualStrings("id", insert_source.insert_source.req.source.scalar_subqueries[0].correlations[0].right_field);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.literal_source_row_scalar_subqueries.len);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.literal_source_row_scalar_subqueries[1].len);
+            var batch = try relational_rows.buildRowsInsertSourceBatchFromLiteralRowsDbAcrossRangesAndRowScalarSubqueriesAlloc(
+                alloc,
+                &db,
+                insert_source.table_name,
+                schema,
+                schema,
+                insert_source.insert_source.req,
+                insert_source.literal_source_rows,
+                insert_source.literal_source_row_scalar_subqueries,
+                &.{},
+                no_existing_primary.resolver(),
+            );
+            defer batch.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 2), batch.inserted);
+            try std.testing.expectEqual(@as(usize, 2), batch.returning_rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"u7\",\"status\":\"queued\",\"organization_id\":\"u1\"}", batch.returning_rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"u8\",\"status\":\"ready\",\"organization_id\":\"u2\"}", batch.returning_rows[1]);
+            try db.batch(batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const correlated_rows = [_][]const u8{
+        "{\"id\":\"u3-correlated\",\"organization_id\":\"u1\"}",
+        "{\"id\":\"u4-correlated\",\"organization_id\":\"u2\"}",
+    };
+    const status_correlation = [_]db_mod.types.RelationalRowsLateralCorrelation{.{
+        .left_field = "organization_id",
+        .right_field = "id",
+        .op = .eq,
+    }};
+    const correlated_scalar_subqueries = [_]db_mod.types.RelationalRowsScalarSubqueryProjection{.{
+        .output = "__scalar_status",
+        .query = .{ .select = &.{"status"} },
+        .output_field = "status",
+        .correlations = status_correlation[0..],
+        .hidden = true,
+    }};
+    const correlated_assignments = [_]db_mod.types.RelationalRowsExpressionAssignment{
+        .{ .field = "id", .expression = .{ .kind = .field, .field = "id", .field_source = .source } },
+        .{ .field = "status", .expression = .{ .kind = .field, .field = "__scalar_status", .field_source = .source } },
+        .{ .field = "organization_id", .expression = .{ .kind = .field, .field = "organization_id", .field_source = .source } },
+    };
+    var correlated_batch = try relational_rows.buildRowsInsertSourceBatchFromLiteralRowsDbAcrossRangesAlloc(
+        alloc,
+        &db,
+        "usage_records",
+        schema,
+        schema,
+        .{
+            .source_table = "usage_records",
+            .source = .{
+                .scalar_subqueries = correlated_scalar_subqueries[0..],
+                .select_all = true,
+            },
+            .assignments = correlated_assignments[0..],
+            .returning = &.{ "id", "status", "organization_id" },
+        },
+        correlated_rows[0..],
+        &.{},
+        no_existing_primary.resolver(),
+    );
+    defer correlated_batch.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), correlated_batch.inserted);
+    try std.testing.expectEqual(@as(usize, 2), correlated_batch.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"u3-correlated\",\"status\":\"queued\",\"organization_id\":\"u1\"}", correlated_batch.returning_rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"u4-correlated\",\"status\":\"ready\",\"organization_id\":\"u2\"}", correlated_batch.returning_rows[1]);
+
+    var existing_primary = TestPrimaryResolver{
+        .row_json = "{\"id\":\"u1\",\"status\":\"queued\",\"organization_id\":\"o1\"}",
+        .version = 10,
+        .exists = true,
+        .resolved_key = u1_seed_key,
+    };
+    var conflict_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, organization_id) VALUES ('u1', (SELECT status FROM usage_records WHERE id = 'u2'), 'o1') ON CONFLICT (id) DO UPDATE SET status = excluded.status RETURNING id, status, organization_id",
+        schema,
+        &.{},
+        .{ .unique_resolver = existing_primary.resolver() },
+    );
+    defer conflict_plan.deinit(alloc);
+    switch (conflict_plan) {
+        .insert_source => |insert_source| {
+            const conflict = insert_source.insert_source.req.on_conflict orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 1), conflict.patch_expressions.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.proposed, conflict.patch_expressions[0].expression.field_source);
+            var batch = try relational_rows.buildRowsInsertSourceBatchFromLiteralRowsDbAcrossRangesAlloc(
+                alloc,
+                &db,
+                insert_source.table_name,
+                schema,
+                schema,
+                insert_source.insert_source.req,
+                insert_source.literal_source_rows,
+                &.{},
+                existing_primary.resolver(),
+            );
+            defer batch.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 0), batch.inserted);
+            try std.testing.expectEqual(@as(u32, 1), batch.transformed);
+            try std.testing.expectEqual(@as(usize, 1), batch.returning_rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"ready\",\"organization_id\":\"o1\"}", batch.returning_rows[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const DbPrimaryResolver = struct {
+        db: *db_mod.DB,
+
+        fn resolver(self: *@This()) relational_rows.UniqueSelectorResolver {
+            return .{
+                .ptr = self,
+                .resolve = resolve,
+                .resolve_primary = primaryExists,
+                .lookup_primary = lookupPrimary,
+            };
+        }
+
+        fn resolve(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+        ) !?[]u8 {
+            return null;
+        }
+
+        fn primaryExists(
+            ptr: *anyopaque,
+            exists_alloc: std.mem.Allocator,
+            _: []const u8,
+            physical_key: []const u8,
+        ) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const row = try self.db.get(exists_alloc, physical_key);
+            if (row) |value| {
+                exists_alloc.free(value);
+                return true;
+            }
+            return false;
+        }
+
+        fn lookupPrimary(
+            ptr: *anyopaque,
+            lookup_alloc: std.mem.Allocator,
+            _: []const u8,
+            physical_key: []const u8,
+        ) !?relational_rows.ResolvedPrimaryRow {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const row = (try self.db.get(lookup_alloc, physical_key)) orelse return null;
+            errdefer lookup_alloc.free(row);
+            return .{
+                .json = row,
+                .version = try self.db.getTimestamp(lookup_alloc, physical_key),
+            };
+        }
+    };
+    var db_primary_resolver = DbPrimaryResolver{ .db = &db };
+    var multi_conflict_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, organization_id) VALUES ('u1', (SELECT status FROM usage_records WHERE id = 'u2'), 'o1'), ('u2', (SELECT status FROM usage_records WHERE id = 'u1'), 'o1') ON CONFLICT (id) DO UPDATE SET status = excluded.status RETURNING id, status, organization_id",
+        schema,
+        &.{},
+        .{ .unique_resolver = db_primary_resolver.resolver() },
+    );
+    defer multi_conflict_plan.deinit(alloc);
+    switch (multi_conflict_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqual(@as(usize, 2), insert_source.literal_source_rows.len);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.literal_source_row_scalar_subqueries.len);
+            const conflict = insert_source.insert_source.req.on_conflict orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(db_mod.types.RelationalRowsConflictAction.update, conflict.action);
+            try std.testing.expectEqual(@as(usize, 1), conflict.patch_expressions.len);
+            try std.testing.expectEqualStrings("status", conflict.patch_expressions[0].field);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.proposed, conflict.patch_expressions[0].expression.field_source);
+            var batch = try relational_rows.buildRowsInsertSourceBatchFromLiteralRowsDbAcrossRangesAndRowScalarSubqueriesAlloc(
+                alloc,
+                &db,
+                insert_source.table_name,
+                schema,
+                schema,
+                insert_source.insert_source.req,
+                insert_source.literal_source_rows,
+                insert_source.literal_source_row_scalar_subqueries,
+                &.{},
+                db_primary_resolver.resolver(),
+            );
+            defer batch.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 0), batch.inserted);
+            try std.testing.expectEqual(@as(u32, 2), batch.transformed);
+            try std.testing.expectEqual(@as(usize, 2), batch.returning_rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"ready\",\"organization_id\":\"o1\"}", batch.returning_rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"u2\",\"status\":\"queued\",\"organization_id\":\"o1\"}", batch.returning_rows[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var multi_scalar_assignment_conflict_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, organization_id) VALUES ('u1', 'ignored', 'u2'), ('u2', 'ignored', 'u1') ON CONFLICT (id) DO UPDATE SET status = (SELECT status FROM usage_records AS child WHERE child.id = organization_id) RETURNING id, status, organization_id",
+        schema,
+        &.{},
+        .{ .unique_resolver = db_primary_resolver.resolver() },
+    );
+    defer multi_scalar_assignment_conflict_plan.deinit(alloc);
+    switch (multi_scalar_assignment_conflict_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqual(@as(usize, 2), insert_source.literal_source_rows.len);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.scalar_subqueries.len);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.scalar_subqueries[0].correlations.len);
+            const conflict = insert_source.insert_source.req.on_conflict orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(db_mod.types.RelationalRowsConflictAction.update, conflict.action);
+            try std.testing.expectEqual(@as(usize, 1), conflict.patch_expressions.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, conflict.patch_expressions[0].expression.field_source);
+            var batch = try relational_rows.buildRowsInsertSourceBatchFromLiteralRowsDbAcrossRangesAndRowScalarSubqueriesAlloc(
+                alloc,
+                &db,
+                insert_source.table_name,
+                schema,
+                schema,
+                insert_source.insert_source.req,
+                insert_source.literal_source_rows,
+                insert_source.literal_source_row_scalar_subqueries,
+                &.{},
+                db_primary_resolver.resolver(),
+            );
+            defer batch.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 0), batch.inserted);
+            try std.testing.expectEqual(@as(u32, 2), batch.transformed);
+            try std.testing.expectEqual(@as(usize, 2), batch.returning_rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"ready\",\"organization_id\":\"o1\"}", batch.returning_rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"u2\",\"status\":\"queued\",\"organization_id\":\"o1\"}", batch.returning_rows[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var cardinality_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, organization_id) VALUES ('u4', (SELECT status FROM usage_records WHERE organization_id = 'o1'), 'o2') RETURNING id",
+        schema,
+        &.{},
+        .{ .unique_resolver = no_existing_primary.resolver() },
+    );
+    defer cardinality_plan.deinit(alloc);
+
+    switch (cardinality_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectError(
+                error.InvalidRowsRequest,
+                relational_rows.buildRowsInsertSourceBatchFromLiteralRowsDbAcrossRangesAlloc(
+                    alloc,
+                    &db,
+                    insert_source.table_name,
+                    schema,
+                    schema,
+                    insert_source.insert_source.req,
+                    insert_source.literal_source_rows,
+                    &.{},
+                    null,
+                ),
+            );
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "postgres sql adapter insert source temporal unique conflict executes through relational storage" {

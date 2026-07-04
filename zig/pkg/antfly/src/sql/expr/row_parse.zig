@@ -2224,7 +2224,7 @@ pub fn validateExtensionFunctionArity(
     if (operand_count != @as(usize, declared_arity)) return error.UnsupportedSqlShape;
     switch (kind) {
         .uuid_v4 => if (operand_count != 0) return error.UnsupportedSqlShape,
-        .lower, .upper, .md5 => if (operand_count != 1) return error.UnsupportedSqlShape,
+        .lower, .upper, .md5, .soundex => if (operand_count != 1) return error.UnsupportedSqlShape,
         .concat => if (operand_count == 0) return error.UnsupportedSqlShape,
         .concat_ws => if (operand_count < 2) return error.UnsupportedSqlShape,
         else => return error.UnsupportedSqlShape,
@@ -2470,6 +2470,7 @@ pub fn parseRowExpressionOperandAlloc(
             .repeat => return try parseRepeatRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_binary),
             .reverse => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .reverse, type_context, .text, hooks.fixed_unary),
             .md5 => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .md5, type_context, .text, hooks.fixed_unary),
+            .soundex => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .soundex, type_context, .text, hooks.fixed_unary),
             .starts_with => return try parseTextBinaryRowExpressionAlloc(alloc, tokens, pos, .starts_with, type_context, hooks.fixed_binary),
             .ends_with => return try parseTextBinaryRowExpressionAlloc(alloc, tokens, pos, .ends_with, type_context, hooks.fixed_binary),
             .date_trunc => return try parseDateTruncRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_binary),

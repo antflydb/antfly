@@ -150,6 +150,7 @@ pub const TransitionCommand = union(enum) {
     remove_secondary_index_rebuild_range: metadata_table_manager.SecondaryIndexRebuildRangeSelector,
     begin_secondary_index_rebuild_range: metadata_table_manager.SecondaryIndexRebuildRangeBeginRequest,
     finish_secondary_index_rebuild_range: metadata_table_manager.SecondaryIndexRebuildRangeFinishRequest,
+    save_secondary_index_rebuild_range_progress: metadata_table_manager.SecondaryIndexRebuildRangeProgressRequest,
     invalidate_secondary_index_rebuild_range: metadata_table_manager.SecondaryIndexRebuildRangeInvalidateRequest,
     upsert_schema_rewrite_job: metadata.SchemaRewriteJobRecord,
     apply_table_catalog_update_with_schema_rewrite_jobs: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
@@ -310,6 +311,9 @@ pub const TransitionCommand = union(enum) {
             },
             .finish_secondary_index_rebuild_range => |*request| {
                 freeSecondaryIndexRebuildRangeFinishRequest(alloc, request.*);
+            },
+            .save_secondary_index_rebuild_range_progress => |*request| {
+                freeSecondaryIndexRebuildRangeProgressRequest(alloc, request.*);
             },
             .invalidate_secondary_index_rebuild_range => |*request| {
                 freeSecondaryIndexRebuildRangeInvalidateRequest(alloc, request.*);
@@ -2002,6 +2006,9 @@ pub const RaftApplyStore = struct {
             .finish_secondary_index_rebuild_range => |request| {
                 try self.applySecondaryIndexRebuildRangeFinishTxn(txn, group_id, request);
             },
+            .save_secondary_index_rebuild_range_progress => |request| {
+                try self.applySecondaryIndexRebuildRangeProgressTxn(txn, group_id, request);
+            },
             .invalidate_secondary_index_rebuild_range => |request| {
                 try self.applySecondaryIndexRebuildRangeInvalidateTxn(txn, group_id, request);
             },
@@ -3274,7 +3281,7 @@ pub const RaftApplyStore = struct {
         var record = (try self.loadSecondaryIndexRebuildRangeTxn(txn, group_id, request.selector)) orelse return error.UnknownSecondaryIndexRebuildRange;
         defer metadata_table_manager.freeSecondaryIndexRebuildRange(self.alloc, record);
         const claimable = std.mem.eql(u8, record.state, metadata_table_manager.secondary_index_rebuild_declared) or
-            (std.mem.eql(u8, record.state, metadata_table_manager.secondary_index_rebuild_building) and record.lease_expires_at_ms != 0 and record.lease_expires_at_ms <= request.now_ms);
+            (std.mem.eql(u8, record.state, metadata_table_manager.secondary_index_rebuild_building) and (record.lease_expires_at_ms == 0 or record.lease_expires_at_ms <= request.now_ms));
         if (!claimable) {
             if (std.mem.eql(u8, record.state, metadata_table_manager.secondary_index_rebuild_building)) return error.SecondaryIndexRebuildRangeClaimBusy;
             return error.SecondaryIndexRebuildRangeNotDeclared;
@@ -3297,6 +3304,25 @@ pub const RaftApplyStore = struct {
         defer metadata_table_manager.freeSecondaryIndexRebuildRange(self.alloc, record);
         if (!std.mem.eql(u8, record.state, metadata_table_manager.secondary_index_rebuild_building)) return error.SecondaryIndexRebuildRangeNotBuilding;
         try replaceOwnedString(self.alloc, &record.state, metadata_table_manager.secondary_index_rebuild_ready);
+        try replaceOwnedString(self.alloc, &record.lease_owner, "");
+        record.lease_expires_at_ms = 0;
+        record.completed_row_count = request.completed_row_count;
+        try replaceOwnedString(self.alloc, &record.progress_row_key, request.progress_row_key);
+        try replaceOwnedString(self.alloc, &record.last_error, "");
+        record.topology_epoch +%= 1;
+        try self.putSecondaryIndexRebuildRangeTxn(txn, group_id, record);
+    }
+
+    fn applySecondaryIndexRebuildRangeProgressTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.SecondaryIndexRebuildRangeProgressRequest,
+    ) !void {
+        var record = (try self.loadSecondaryIndexRebuildRangeTxn(txn, group_id, request.selector)) orelse return error.UnknownSecondaryIndexRebuildRange;
+        defer metadata_table_manager.freeSecondaryIndexRebuildRange(self.alloc, record);
+        if (!std.mem.eql(u8, record.state, metadata_table_manager.secondary_index_rebuild_building)) return error.SecondaryIndexRebuildRangeNotBuilding;
+        try replaceOwnedString(self.alloc, &record.state, metadata_table_manager.secondary_index_rebuild_building);
         try replaceOwnedString(self.alloc, &record.lease_owner, "");
         record.lease_expires_at_ms = 0;
         record.completed_row_count = request.completed_row_count;
@@ -4071,6 +4097,13 @@ pub const RaftApplyStore = struct {
 
         if (!std.mem.eql(u8, current.name, request.promoted_table.name)) return error.InvalidSecondaryIndexPromotionRequest;
         if (!std.mem.eql(u8, current.schema_json, request.expected_schema_json)) return;
+        if (!(try self.secondaryIndexRebuildRangesReadyForPromotionTxn(
+            txn,
+            group_id,
+            request.table_id,
+            request.index_name,
+            request.expected_index_generation,
+        ))) return error.SecondaryIndexRebuildRangesIncomplete;
 
         const value = try encodeTableRecord(self.alloc, request.promoted_table);
         defer self.alloc.free(value);
@@ -4082,6 +4115,44 @@ pub const RaftApplyStore = struct {
             .table_name = request.promoted_table.name,
             .table_id = request.table_id,
         });
+    }
+
+    fn secondaryIndexRebuildRangesReadyForPromotionTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        table_id: u64,
+        index_name: []const u8,
+        index_generation: u64,
+    ) !bool {
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try rangePrefixForGroup(&prefix_buf, group_id);
+        var cur = try txn.openCursor();
+        defer cur.close();
+
+        var ranges_seen: usize = 0;
+        var entry = try cur.seekAtOrAfter(prefix);
+        while (entry) |kv| : (entry = try cur.next()) {
+            if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+            const range = try decodeRangeRecord(self.alloc, kv.value);
+            defer metadata_table_manager.freeRange(self.alloc, range);
+            if (range.table_id != table_id) continue;
+            ranges_seen += 1;
+
+            const selector: metadata_table_manager.SecondaryIndexRebuildRangeSelector = .{
+                .table_id = table_id,
+                .index_name = index_name,
+                .index_generation = index_generation,
+                .start_row_key = range.start_key,
+            };
+            const record = (try self.loadSecondaryIndexRebuildRangeTxn(txn, group_id, selector)) orelse return false;
+            defer metadata_table_manager.freeSecondaryIndexRebuildRange(self.alloc, record);
+            if (record.range_id != 0 and record.range_id != range.range_id) return false;
+            if (record.group_id != range.group_id) return false;
+            if (!optionalBytesEqual(record.end_row_key, range.end_key)) return false;
+            if (!std.mem.eql(u8, record.state, metadata_table_manager.secondary_index_rebuild_ready)) return false;
+        }
+        return ranges_seen > 0;
     }
 
     fn applyTableSchemaCompareAndSwapTxn(
@@ -4267,6 +4338,11 @@ fn freeSecondaryIndexRebuildRangeBeginRequest(alloc: std.mem.Allocator, request:
 }
 
 fn freeSecondaryIndexRebuildRangeFinishRequest(alloc: std.mem.Allocator, request: metadata_table_manager.SecondaryIndexRebuildRangeFinishRequest) void {
+    freeSecondaryIndexRebuildRangeSelector(alloc, request.selector);
+    alloc.free(request.progress_row_key);
+}
+
+fn freeSecondaryIndexRebuildRangeProgressRequest(alloc: std.mem.Allocator, request: metadata_table_manager.SecondaryIndexRebuildRangeProgressRequest) void {
     freeSecondaryIndexRebuildRangeSelector(alloc, request.selector);
     alloc.free(request.progress_row_key);
 }
@@ -4478,6 +4554,7 @@ const TransitionTag = enum(u8) {
     resume_table_emptying_job = 92,
     retry_table_emptying_job = 93,
     cancel_table_emptying_job = 94,
+    save_secondary_index_rebuild_range_progress = 95,
 };
 
 pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionCommand) ![]u8 {
@@ -4702,6 +4779,10 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .finish_secondary_index_rebuild_range => |request| {
             try out.append(alloc, @intFromEnum(TransitionTag.finish_secondary_index_rebuild_range));
             try appendSecondaryIndexRebuildRangeFinishRequest(alloc, &out, request);
+        },
+        .save_secondary_index_rebuild_range_progress => |request| {
+            try out.append(alloc, @intFromEnum(TransitionTag.save_secondary_index_rebuild_range_progress));
+            try appendSecondaryIndexRebuildRangeProgressRequest(alloc, &out, request);
         },
         .invalidate_secondary_index_rebuild_range => |request| {
             try out.append(alloc, @intFromEnum(TransitionTag.invalidate_secondary_index_rebuild_range));
@@ -5071,6 +5152,9 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         },
         .finish_secondary_index_rebuild_range => .{
             .finish_secondary_index_rebuild_range = try readSecondaryIndexRebuildRangeFinishRequest(alloc, encoded, &pos),
+        },
+        .save_secondary_index_rebuild_range_progress => .{
+            .save_secondary_index_rebuild_range_progress = try readSecondaryIndexRebuildRangeProgressRequest(alloc, encoded, &pos),
         },
         .invalidate_secondary_index_rebuild_range => .{
             .invalidate_secondary_index_rebuild_range = try readSecondaryIndexRebuildRangeInvalidateRequest(alloc, encoded, &pos),
@@ -6610,6 +6694,16 @@ fn appendSecondaryIndexRebuildRangeFinishRequest(
     try appendRequiredString(alloc, out, request.progress_row_key);
 }
 
+fn appendSecondaryIndexRebuildRangeProgressRequest(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    request: metadata_table_manager.SecondaryIndexRebuildRangeProgressRequest,
+) !void {
+    try appendSecondaryIndexRebuildRangeSelector(alloc, out, request.selector);
+    try appendInt(alloc, out, u64, request.completed_row_count);
+    try appendRequiredString(alloc, out, request.progress_row_key);
+}
+
 fn appendSecondaryIndexRebuildRangeInvalidateRequest(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -7678,6 +7772,23 @@ fn readSecondaryIndexRebuildRangeFinishRequest(
     };
 }
 
+fn readSecondaryIndexRebuildRangeProgressRequest(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+) !metadata_table_manager.SecondaryIndexRebuildRangeProgressRequest {
+    const selector = try readSecondaryIndexRebuildRangeSelector(alloc, encoded, pos);
+    errdefer freeSecondaryIndexRebuildRangeSelector(alloc, selector);
+    const completed_row_count = try readInt(encoded, pos, u64);
+    const progress_row_key = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(progress_row_key);
+    return .{
+        .selector = selector,
+        .completed_row_count = completed_row_count,
+        .progress_row_key = progress_row_key,
+    };
+}
+
 fn readSecondaryIndexRebuildRangeInvalidateRequest(
     alloc: std.mem.Allocator,
     encoded: []const u8,
@@ -8701,6 +8812,12 @@ fn secondaryIndexRebuildRangeKeyForGroup(
     );
 }
 
+fn optionalBytesEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
 fn schemaRewriteJobKeyForGroup(buf: []u8, group_id: u64, job_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_schema_rewrite_job:{d}:{d}", .{ group_id, job_id });
 }
@@ -9344,6 +9461,17 @@ test "metadata raft apply store persists secondary index rebuild work ranges acr
         },
     });
     defer std.testing.allocator.free(declared_right_cmd);
+    const declared_progress_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_secondary_index_rebuild_range = .{
+            .table_id = 41,
+            .index_name = "orders_amount_idx",
+            .index_generation = 7,
+            .start_row_key = "",
+            .end_row_key = null,
+            .group_id = 4103,
+        },
+    });
+    defer std.testing.allocator.free(declared_progress_cmd);
     const begin_left_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .begin_secondary_index_rebuild_range = .{
             .selector = .{
@@ -9383,6 +9511,45 @@ test "metadata raft apply store persists secondary index rebuild work ranges acr
         },
     });
     defer std.testing.allocator.free(begin_right_cmd);
+    const begin_progress_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .begin_secondary_index_rebuild_range = .{
+            .selector = .{
+                .table_id = 41,
+                .index_name = "orders_amount_idx",
+                .index_generation = 7,
+                .start_row_key = "",
+            },
+            .lease_owner = "worker-c",
+            .lease_expires_at_ms = 6789,
+        },
+    });
+    defer std.testing.allocator.free(begin_progress_cmd);
+    const save_progress_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .save_secondary_index_rebuild_range_progress = .{
+            .selector = .{
+                .table_id = 41,
+                .index_name = "orders_amount_idx",
+                .index_generation = 7,
+                .start_row_key = "",
+            },
+            .completed_row_count = 9,
+            .progress_row_key = "order:h",
+        },
+    });
+    defer std.testing.allocator.free(save_progress_cmd);
+    const resume_progress_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .begin_secondary_index_rebuild_range = .{
+            .selector = .{
+                .table_id = 41,
+                .index_name = "orders_amount_idx",
+                .index_generation = 7,
+                .start_row_key = "",
+            },
+            .lease_owner = "worker-d",
+            .lease_expires_at_ms = 7890,
+        },
+    });
+    defer std.testing.allocator.free(resume_progress_cmd);
     const invalidate_right_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .invalidate_secondary_index_rebuild_range = .{
             .selector = .{
@@ -9400,10 +9567,14 @@ test "metadata raft apply store persists secondary index rebuild work ranges acr
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_cmd },
         .{ .term = 1, .index = 2, .entry_type = .normal, .data = declared_left_cmd },
         .{ .term = 1, .index = 3, .entry_type = .normal, .data = declared_right_cmd },
-        .{ .term = 1, .index = 4, .entry_type = .normal, .data = begin_left_cmd },
-        .{ .term = 1, .index = 5, .entry_type = .normal, .data = finish_left_cmd },
-        .{ .term = 1, .index = 6, .entry_type = .normal, .data = begin_right_cmd },
-        .{ .term = 1, .index = 7, .entry_type = .normal, .data = invalidate_right_cmd },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = declared_progress_cmd },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = begin_left_cmd },
+        .{ .term = 1, .index = 6, .entry_type = .normal, .data = finish_left_cmd },
+        .{ .term = 1, .index = 7, .entry_type = .normal, .data = begin_right_cmd },
+        .{ .term = 1, .index = 8, .entry_type = .normal, .data = begin_progress_cmd },
+        .{ .term = 1, .index = 9, .entry_type = .normal, .data = save_progress_cmd },
+        .{ .term = 1, .index = 10, .entry_type = .normal, .data = resume_progress_cmd },
+        .{ .term = 1, .index = 11, .entry_type = .normal, .data = invalidate_right_cmd },
     });
     defer std.testing.allocator.free(encoded_entries);
 
@@ -9412,7 +9583,7 @@ test "metadata raft apply store persists secondary index rebuild work ranges acr
         defer store.deinit();
         try store.snapshotBuilder().applyBatch(.{
             .group_id = 41,
-            .commit_index = 7,
+            .commit_index = 11,
             .entries_bytes = encoded_entries,
         });
     }
@@ -9421,29 +9592,39 @@ test "metadata raft apply store persists secondary index rebuild work ranges acr
     defer reopened.deinit();
     const ranges = try reopened.listSecondaryIndexRebuildRanges(std.testing.allocator, 41);
     defer reopened.freeSecondaryIndexRebuildRanges(std.testing.allocator, ranges);
-    try std.testing.expectEqual(@as(usize, 2), ranges.len);
+    try std.testing.expectEqual(@as(usize, 3), ranges.len);
 
     var saw_ready = false;
     var saw_invalid = false;
+    var saw_saved_progress = false;
     for (ranges) |record| {
         try std.testing.expectEqual(@as(u64, 41), record.table_id);
-        try std.testing.expectEqualStrings("orders_status_idx", record.index_name);
-        try std.testing.expectEqual(@as(u64, 42), record.index_generation);
-        if (std.mem.eql(u8, record.start_row_key, "")) {
+        if (std.mem.eql(u8, record.index_name, "orders_status_idx") and std.mem.eql(u8, record.start_row_key, "")) {
+            try std.testing.expectEqual(@as(u64, 42), record.index_generation);
             try std.testing.expectEqualStrings(metadata_table_manager.secondary_index_rebuild_ready, record.state);
             try std.testing.expectEqual(@as(u64, 17), record.completed_row_count);
             try std.testing.expectEqualStrings("order:m", record.progress_row_key);
             try std.testing.expectEqualStrings("", record.lease_owner);
             saw_ready = true;
-        } else if (std.mem.eql(u8, record.start_row_key, "order:m")) {
+        } else if (std.mem.eql(u8, record.index_name, "orders_status_idx") and std.mem.eql(u8, record.start_row_key, "order:m")) {
+            try std.testing.expectEqual(@as(u64, 42), record.index_generation);
             try std.testing.expectEqualStrings(metadata_table_manager.secondary_index_rebuild_invalid, record.state);
             try std.testing.expectEqualStrings("schema generation moved", record.last_error);
             try std.testing.expectEqual(@as(u32, 1), record.attempts);
             try std.testing.expectEqualStrings("", record.lease_owner);
             saw_invalid = true;
+        } else if (std.mem.eql(u8, record.index_name, "orders_amount_idx")) {
+            try std.testing.expectEqual(@as(u64, 7), record.index_generation);
+            try std.testing.expectEqualStrings(metadata_table_manager.secondary_index_rebuild_building, record.state);
+            try std.testing.expectEqual(@as(u64, 9), record.completed_row_count);
+            try std.testing.expectEqualStrings("order:h", record.progress_row_key);
+            try std.testing.expectEqual(@as(u32, 2), record.attempts);
+            try std.testing.expectEqualStrings("worker-d", record.lease_owner);
+            try std.testing.expectEqual(@as(u64, 7890), record.lease_expires_at_ms);
+            saw_saved_progress = true;
         }
     }
-    try std.testing.expect(saw_ready and saw_invalid);
+    try std.testing.expect(saw_ready and saw_invalid and saw_saved_progress);
 }
 
 test "metadata raft apply store persists schema rewrite jobs across reopen" {
@@ -11095,6 +11276,96 @@ test "metadata raft apply store rejects stale schema rewrite lease owners" {
     }));
 }
 
+test "metadata raft apply store rejects secondary index promotion until every range is ready" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-secondary-index-promotion-incomplete-ranges", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const building_schema =
+        \\{"version":0,"document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"string","x-antfly-index":true,"x-antfly-index-lifecycle":"building","x-antfly-index-generation":42}}}}}}
+    ;
+    const ready_schema =
+        \\{"version":0,"document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"string","x-antfly-index":true,"x-antfly-index-lifecycle":"ready","x-antfly-index-generation":42}}}}}}
+    ;
+
+    const table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = .{
+            .table_id = 41,
+            .name = "orders",
+            .schema_json = building_schema,
+        },
+    });
+    defer std.testing.allocator.free(table_cmd);
+    const left_range_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = .{ .group_id = 9001, .range_id = 9101, .table_id = 41, .start_key = "", .end_key = "order:m" },
+    });
+    defer std.testing.allocator.free(left_range_cmd);
+    const right_range_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = .{ .group_id = 9002, .range_id = 9102, .table_id = 41, .start_key = "order:m", .end_key = null },
+    });
+    defer std.testing.allocator.free(right_range_cmd);
+    const left_rebuild_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_secondary_index_rebuild_range = .{
+            .table_id = 41,
+            .index_name = "status",
+            .index_generation = 42,
+            .start_row_key = "",
+            .end_row_key = "order:m",
+            .group_id = 9001,
+            .range_id = 9101,
+            .state = metadata_table_manager.secondary_index_rebuild_ready,
+        },
+    });
+    defer std.testing.allocator.free(left_rebuild_cmd);
+    const right_rebuild_building_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_secondary_index_rebuild_range = .{
+            .table_id = 41,
+            .index_name = "status",
+            .index_generation = 42,
+            .start_row_key = "order:m",
+            .end_row_key = null,
+            .group_id = 9002,
+            .range_id = 9102,
+            .state = metadata_table_manager.secondary_index_rebuild_building,
+        },
+    });
+    defer std.testing.allocator.free(right_rebuild_building_cmd);
+    const promote_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .promote_secondary_index_ready = .{
+            .table_id = 41,
+            .index_name = "status",
+            .expected_index_generation = 42,
+            .expected_schema_json = building_schema,
+            .promoted_table = .{
+                .table_id = 41,
+                .name = "orders",
+                .schema_json = ready_schema,
+            },
+        },
+    });
+    defer std.testing.allocator.free(promote_cmd);
+
+    const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = left_range_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = right_range_cmd },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = left_rebuild_cmd },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = right_rebuild_building_cmd },
+        .{ .term = 1, .index = 6, .entry_type = .normal, .data = promote_cmd },
+    });
+    defer std.testing.allocator.free(encoded_entries);
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    try std.testing.expectError(error.SecondaryIndexRebuildRangesIncomplete, store.snapshotBuilder().applyBatch(.{
+        .group_id = 41,
+        .commit_index = 6,
+        .entries_bytes = encoded_entries,
+    }));
+}
+
 test "metadata raft apply store promotes secondary index schema with compare and swap" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -11120,6 +11391,40 @@ test "metadata raft apply store promotes secondary index schema with compare and
         },
     });
     defer std.testing.allocator.free(table_cmd);
+    const left_range_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = .{ .group_id = 9001, .range_id = 9101, .table_id = 41, .start_key = "", .end_key = "order:m" },
+    });
+    defer std.testing.allocator.free(left_range_cmd);
+    const right_range_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = .{ .group_id = 9002, .range_id = 9102, .table_id = 41, .start_key = "order:m", .end_key = null },
+    });
+    defer std.testing.allocator.free(right_range_cmd);
+    const left_rebuild_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_secondary_index_rebuild_range = .{
+            .table_id = 41,
+            .index_name = "status",
+            .index_generation = 42,
+            .start_row_key = "",
+            .end_row_key = "order:m",
+            .group_id = 9001,
+            .range_id = 9101,
+            .state = metadata_table_manager.secondary_index_rebuild_ready,
+        },
+    });
+    defer std.testing.allocator.free(left_rebuild_cmd);
+    const right_rebuild_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_secondary_index_rebuild_range = .{
+            .table_id = 41,
+            .index_name = "status",
+            .index_generation = 42,
+            .start_row_key = "order:m",
+            .end_row_key = null,
+            .group_id = 9002,
+            .range_id = 9102,
+            .state = metadata_table_manager.secondary_index_rebuild_ready,
+        },
+    });
+    defer std.testing.allocator.free(right_rebuild_cmd);
     const stale_promote_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .promote_secondary_index_ready = .{
             .table_id = 41,
@@ -11151,8 +11456,12 @@ test "metadata raft apply store promotes secondary index schema with compare and
 
     const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_cmd },
-        .{ .term = 1, .index = 2, .entry_type = .normal, .data = stale_promote_cmd },
-        .{ .term = 1, .index = 3, .entry_type = .normal, .data = ready_promote_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = left_range_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = right_range_cmd },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = left_rebuild_cmd },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = right_rebuild_cmd },
+        .{ .term = 1, .index = 6, .entry_type = .normal, .data = stale_promote_cmd },
+        .{ .term = 1, .index = 7, .entry_type = .normal, .data = ready_promote_cmd },
     });
     defer std.testing.allocator.free(encoded_entries);
 
@@ -11160,7 +11469,7 @@ test "metadata raft apply store promotes secondary index schema with compare and
     defer store.deinit();
     try store.snapshotBuilder().applyBatch(.{
         .group_id = 41,
-        .commit_index = 3,
+        .commit_index = 7,
         .entries_bytes = encoded_entries,
     });
     const tables = try store.listTables(std.testing.allocator, 41);

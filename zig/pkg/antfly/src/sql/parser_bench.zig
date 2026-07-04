@@ -16,8 +16,13 @@ const std = @import("std");
 
 const generated = @import("grammar/generated/root.zig");
 const generated_parser = @import("generated_parser.zig");
+const document_plan = @import("document_plan.zig");
 const lexer = @import("lexer.zig");
+const lower_select = @import("lower_select.zig");
+const schema_api = @import("../schema/mod.zig");
+const storage_schema = @import("../storage/schema.zig");
 const token_mod = @import("token.zig");
+const tokenized = @import("tokenized.zig");
 
 const default_iterations = 100;
 
@@ -32,6 +37,55 @@ const corpus = generated_parser.first_family_corpus ++
 const TokenizedCase = struct {
     sql: []const u8,
     tokens: []token_mod.Token,
+};
+
+const BenchMode = enum {
+    lex,
+    parse,
+    lex_parse,
+    lower,
+    all,
+};
+
+const Config = struct {
+    iterations: usize = default_iterations,
+    mode: BenchMode = .parse,
+};
+
+const LowerKind = enum {
+    relational,
+    document,
+};
+
+const LowerCase = struct {
+    sql: []const u8,
+    kind: LowerKind,
+    parsed: tokenized.ParsedSql,
+};
+
+const LowerSchemas = struct {
+    relational: storage_schema.TableSchema,
+    document: storage_schema.TableSchema,
+
+    fn deinit(self: *LowerSchemas, alloc: std.mem.Allocator) void {
+        storage_schema.freeSchema(alloc, self.relational);
+        storage_schema.freeSchema(alloc, self.document);
+        self.* = undefined;
+    }
+};
+
+const TimingSummary = struct {
+    label: []const u8,
+    statements: usize,
+    iterations: usize,
+    operations: usize,
+    tokens: usize,
+    elapsed_ns: u64,
+    avg_ns_per_statement: f64,
+    operations_per_second: f64,
+    tokens_per_second: f64,
+    allocated_bytes_per_statement: f64,
+    peak_live_bytes: usize,
 };
 
 const CountingAllocator = struct {
@@ -112,7 +166,74 @@ pub fn main(init: std.process.Init) !void {
     defer _ = debug_allocator.deinit();
     const base_alloc = debug_allocator.allocator();
 
-    const iterations = try parseIterations(base_alloc, init.minimal.args);
+    const cfg = try parseArgs(base_alloc, init.minimal.args);
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    const stdout = &stdout_writer.interface;
+
+    switch (cfg.mode) {
+        .lex => try runLexBenchmark(base_alloc, stdout, cfg.iterations),
+        .parse => try runParseBenchmark(base_alloc, stdout, cfg.iterations),
+        .lex_parse => try runLexParseBenchmark(base_alloc, stdout, cfg.iterations),
+        .lower => try runLowerBenchmark(base_alloc, stdout, cfg.iterations),
+        .all => {
+            try runLexBenchmark(base_alloc, stdout, cfg.iterations);
+            try runParseBenchmark(base_alloc, stdout, cfg.iterations);
+            try runLexParseBenchmark(base_alloc, stdout, cfg.iterations);
+            try runLowerBenchmark(base_alloc, stdout, cfg.iterations);
+        },
+    }
+    try stdout.flush();
+}
+
+fn runLexBenchmark(base_alloc: std.mem.Allocator, stdout: anytype, iterations: usize) !void {
+    const total_ops = iterations * corpus.len;
+    var durations = try base_alloc.alloc(u64, total_ops);
+    defer base_alloc.free(durations);
+
+    var counting = CountingAllocator.init(base_alloc);
+    const op_alloc = counting.allocator();
+
+    var duration_index: usize = 0;
+    var total_tokens: usize = 0;
+    var total_allocated_bytes: usize = 0;
+    var peak_live_bytes: usize = 0;
+
+    const started = monotonicNanos();
+    for (0..iterations) |_| {
+        for (corpus) |entry| {
+            counting.reset();
+            const op_started = monotonicNanos();
+            var tokens = try lexer.tokenizeAlloc(op_alloc, entry.sql);
+            const op_elapsed = monotonicNanos() - op_started;
+
+            durations[duration_index] = @intCast(op_elapsed);
+            duration_index += 1;
+            total_tokens += tokens.items.len;
+            total_allocated_bytes += counting.allocated_total;
+            peak_live_bytes = @max(peak_live_bytes, counting.peak_live_bytes);
+            lexer.freeTokens(op_alloc, &tokens);
+        }
+    }
+    const elapsed_ns = monotonicNanos() - started;
+
+    try printBenchmarkSummary(stdout, .{
+        .label = "lex",
+        .statements = corpus.len,
+        .iterations = iterations,
+        .operations = total_ops,
+        .tokens = total_tokens,
+        .elapsed_ns = elapsed_ns,
+        .avg_ns_per_statement = avgNs(elapsed_ns, total_ops),
+        .operations_per_second = opsPerSecond(total_ops, elapsed_ns),
+        .tokens_per_second = tokensPerSecond(total_tokens, elapsed_ns),
+        .allocated_bytes_per_statement = avgBytes(total_allocated_bytes, total_ops),
+        .peak_live_bytes = peak_live_bytes,
+    }, durations);
+}
+
+fn runParseBenchmark(base_alloc: std.mem.Allocator, stdout: anytype, iterations: usize) !void {
     const cases = try tokenizeCorpus(base_alloc);
     defer freeTokenizedCorpus(base_alloc, cases);
 
@@ -149,73 +270,178 @@ pub fn main(init: std.process.Init) !void {
     }
     const elapsed_ns = monotonicNanos() - started;
 
-    std.mem.sort(u64, durations, {}, std.sort.asc(u64));
-    const total_parses_f: f64 = @floatFromInt(total_parses);
-    const elapsed_seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
-    const avg_ns_per_statement = @as(f64, @floatFromInt(elapsed_ns)) / total_parses_f;
-    const tokens_per_second = @as(f64, @floatFromInt(total_tokens)) / elapsed_seconds;
-    const allocated_bytes_per_statement = @as(f64, @floatFromInt(total_allocated_bytes)) / total_parses_f;
-    const action_range_avg = if (generated.state_count == 0) 0 else @as(f64, @floatFromInt(generated.action_count)) / @as(f64, @floatFromInt(generated.state_count));
-    const goto_range_avg = if (generated.state_count == 0) 0 else @as(f64, @floatFromInt(generated.goto_count)) / @as(f64, @floatFromInt(generated.state_count));
-
-    var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
-    const stdout = &stdout_writer.interface;
-    try stdout.print(
-        \\sql_parser_bench statements={} iterations={} parses={} tokens={} elapsed_ns={}
-        \\latency_ns avg={d:.2} p50={} p95={} p99={} max={}
-        \\throughput tokens_per_second={d:.2} statements_per_second={d:.2}
-        \\allocation bytes_per_statement={d:.2} peak_live_bytes={}
-        \\generated_table states={} actions={} gotos={} rules={} productions={} rhs={} state_items={} static_bytes={} symbol_name_bytes={} estimated_bytes={}
-        \\generated_table_entry_bytes action={} goto={} range={}
-        \\generated_table_rows action_max={} action_avg={d:.2} goto_max={} goto_avg={d:.2}
-        \\
-    , .{
-        cases.len,
-        iterations,
-        total_parses,
-        total_tokens,
-        elapsed_ns,
-        avg_ns_per_statement,
-        percentile(durations, 50),
-        percentile(durations, 95),
-        percentile(durations, 99),
-        durations[durations.len - 1],
-        tokens_per_second,
-        total_parses_f / elapsed_seconds,
-        allocated_bytes_per_statement,
-        peak_live_bytes,
-        generated.state_count,
-        generated.action_count,
-        generated.goto_count,
-        generated.rule_count,
-        generated.production_count,
-        generated.production_rhs_count,
-        generated.state_item_count,
-        generated.parse_table_static_bytes,
-        generated.symbol_name_bytes,
-        generated.parse_table_estimated_bytes,
-        generated.action_entry_bytes,
-        generated.goto_entry_bytes,
-        generated.table_range_entry_bytes,
-        generated.action_range_max,
-        action_range_avg,
-        generated.goto_range_max,
-        goto_range_avg,
-    });
-    try stdout.flush();
+    try printBenchmarkSummary(stdout, .{
+        .label = "parse",
+        .statements = cases.len,
+        .iterations = iterations,
+        .operations = total_parses,
+        .tokens = total_tokens,
+        .elapsed_ns = elapsed_ns,
+        .avg_ns_per_statement = avgNs(elapsed_ns, total_parses),
+        .operations_per_second = opsPerSecond(total_parses, elapsed_ns),
+        .tokens_per_second = tokensPerSecond(total_tokens, elapsed_ns),
+        .allocated_bytes_per_statement = avgBytes(total_allocated_bytes, total_parses),
+        .peak_live_bytes = peak_live_bytes,
+    }, durations);
 }
 
-fn parseIterations(alloc: std.mem.Allocator, args: std.process.Args) !usize {
+fn runLexParseBenchmark(base_alloc: std.mem.Allocator, stdout: anytype, iterations: usize) !void {
+    const total_ops = iterations * corpus.len;
+    var durations = try base_alloc.alloc(u64, total_ops);
+    defer base_alloc.free(durations);
+
+    var counting = CountingAllocator.init(base_alloc);
+    const op_alloc = counting.allocator();
+
+    var duration_index: usize = 0;
+    var total_tokens: usize = 0;
+    var total_allocated_bytes: usize = 0;
+    var peak_live_bytes: usize = 0;
+
+    const started = monotonicNanos();
+    for (0..iterations) |_| {
+        for (corpus) |entry| {
+            counting.reset();
+            const op_started = monotonicNanos();
+            var tokens = try lexer.tokenizeAlloc(op_alloc, entry.sql);
+            var parsed = generated_parser.parseTokensAlloc(op_alloc, tokens.items) catch |err| {
+                lexer.freeTokens(op_alloc, &tokens);
+                std.debug.print("sql_parser_bench lex_parse error={s} sql=\"{s}\"\n", .{ @errorName(err), entry.sql });
+                return err;
+            };
+            const op_elapsed = monotonicNanos() - op_started;
+
+            durations[duration_index] = @intCast(op_elapsed);
+            duration_index += 1;
+            total_tokens += tokens.items.len;
+            total_allocated_bytes += counting.allocated_total;
+            peak_live_bytes = @max(peak_live_bytes, counting.peak_live_bytes);
+            parsed.deinit(op_alloc);
+            lexer.freeTokens(op_alloc, &tokens);
+        }
+    }
+    const elapsed_ns = monotonicNanos() - started;
+
+    try printBenchmarkSummary(stdout, .{
+        .label = "lex_parse",
+        .statements = corpus.len,
+        .iterations = iterations,
+        .operations = total_ops,
+        .tokens = total_tokens,
+        .elapsed_ns = elapsed_ns,
+        .avg_ns_per_statement = avgNs(elapsed_ns, total_ops),
+        .operations_per_second = opsPerSecond(total_ops, elapsed_ns),
+        .tokens_per_second = tokensPerSecond(total_tokens, elapsed_ns),
+        .allocated_bytes_per_statement = avgBytes(total_allocated_bytes, total_ops),
+        .peak_live_bytes = peak_live_bytes,
+    }, durations);
+}
+
+fn runLowerBenchmark(base_alloc: std.mem.Allocator, stdout: anytype, iterations: usize) !void {
+    var schemas = try initLowerSchemas(base_alloc);
+    defer schemas.deinit(base_alloc);
+
+    const cases = try initLowerCases(base_alloc);
+    defer freeLowerCases(base_alloc, cases);
+
+    const total_ops = iterations * cases.len;
+    var durations = try base_alloc.alloc(u64, total_ops);
+    defer base_alloc.free(durations);
+
+    var counting = CountingAllocator.init(base_alloc);
+    const lower_alloc = counting.allocator();
+
+    var duration_index: usize = 0;
+    var total_tokens: usize = 0;
+    var total_allocated_bytes: usize = 0;
+    var peak_live_bytes: usize = 0;
+
+    const started = monotonicNanos();
+    for (0..iterations) |_| {
+        for (cases) |*entry| {
+            counting.reset();
+            const op_started = monotonicNanos();
+            switch (entry.kind) {
+                .relational => {
+                    var lowered = lower_select.lowerReadPlanWithOptionalSourceSchemaParsedSqlAlloc(
+                        lower_alloc,
+                        &entry.parsed,
+                        schemas.relational,
+                        null,
+                        &.{},
+                        .{},
+                    ) catch |err| {
+                        std.debug.print("sql_parser_bench lower error={s} sql=\"{s}\"\n", .{ @errorName(err), entry.sql });
+                        return err;
+                    };
+                    lowered.deinit(lower_alloc);
+                },
+                .document => {
+                    var lowered = document_plan.lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(
+                        lower_alloc,
+                        &entry.parsed,
+                        schemas.document,
+                        .{ .max_rows = 10_000 },
+                    ) catch |err| {
+                        std.debug.print("sql_parser_bench lower error={s} sql=\"{s}\"\n", .{ @errorName(err), entry.sql });
+                        return err;
+                    };
+                    lowered.deinit(lower_alloc);
+                },
+            }
+            const op_elapsed = monotonicNanos() - op_started;
+
+            durations[duration_index] = @intCast(op_elapsed);
+            duration_index += 1;
+            total_tokens += entry.parsed.items().len;
+            total_allocated_bytes += counting.allocated_total;
+            peak_live_bytes = @max(peak_live_bytes, counting.peak_live_bytes);
+        }
+    }
+    const elapsed_ns = monotonicNanos() - started;
+
+    try printBenchmarkSummary(stdout, .{
+        .label = "lower",
+        .statements = cases.len,
+        .iterations = iterations,
+        .operations = total_ops,
+        .tokens = total_tokens,
+        .elapsed_ns = elapsed_ns,
+        .avg_ns_per_statement = avgNs(elapsed_ns, total_ops),
+        .operations_per_second = opsPerSecond(total_ops, elapsed_ns),
+        .tokens_per_second = tokensPerSecond(total_tokens, elapsed_ns),
+        .allocated_bytes_per_statement = avgBytes(total_allocated_bytes, total_ops),
+        .peak_live_bytes = peak_live_bytes,
+    }, durations);
+}
+
+fn parseArgs(alloc: std.mem.Allocator, args: std.process.Args) !Config {
+    var cfg = Config{};
     var iterator = try std.process.Args.Iterator.initAllocator(args, alloc);
     defer iterator.deinit();
     _ = iterator.skip();
-    const first = iterator.next() orelse return default_iterations;
-    if (std.mem.eql(u8, first, "--iterations")) {
-        const value = iterator.next() orelse return error.MissingIterations;
-        return try std.fmt.parseUnsigned(usize, value, 10);
+    while (iterator.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--iterations")) {
+            const value = iterator.next() orelse return error.MissingIterations;
+            cfg.iterations = try std.fmt.parseUnsigned(usize, value, 10);
+        } else if (std.mem.eql(u8, arg, "--mode")) {
+            const value = iterator.next() orelse return error.MissingMode;
+            cfg.mode = parseMode(value) orelse return error.InvalidMode;
+        } else {
+            cfg.iterations = try std.fmt.parseUnsigned(usize, arg, 10);
+        }
     }
-    return try std.fmt.parseUnsigned(usize, first, 10);
+    if (cfg.iterations == 0) return error.InvalidIterations;
+    return cfg;
+}
+
+fn parseMode(raw: []const u8) ?BenchMode {
+    if (std.mem.eql(u8, raw, "lex")) return .lex;
+    if (std.mem.eql(u8, raw, "parse")) return .parse;
+    if (std.mem.eql(u8, raw, "lex-parse") or std.mem.eql(u8, raw, "lex_parse")) return .lex_parse;
+    if (std.mem.eql(u8, raw, "lower")) return .lower;
+    if (std.mem.eql(u8, raw, "all")) return .all;
+    return null;
 }
 
 fn monotonicNanos() u64 {
@@ -253,6 +479,141 @@ fn freeTokenizedCorpus(alloc: std.mem.Allocator, cases: []TokenizedCase) void {
         lexer.freeTokens(alloc, &tokens);
     }
     alloc.free(cases);
+}
+
+fn initLowerSchemas(alloc: std.mem.Allocator) !LowerSchemas {
+    var relational_parsed = schema_api.parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"items","enforce_types":true,"document_schemas":{"items":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"body":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ) catch |err| {
+        std.debug.print("sql_parser_bench lower schema=relational error={s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer relational_parsed.deinit(alloc);
+    const relational = try schema_api.deriveRuntimeTableSchema(alloc, relational_parsed);
+    errdefer storage_schema.freeSchema(alloc, relational);
+
+    var document_parsed = schema_api.parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"document","default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"title":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}},"metadata":{"type":"object","properties":{"tier":{"type":"keyword"}}}},"additionalProperties":true}}}}
+    ) catch |err| {
+        std.debug.print("sql_parser_bench lower schema=document error={s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer document_parsed.deinit(alloc);
+    const document = try schema_api.deriveRuntimeTableSchema(alloc, document_parsed);
+
+    return .{
+        .relational = relational,
+        .document = document,
+    };
+}
+
+fn initLowerCases(alloc: std.mem.Allocator) ![]LowerCase {
+    const definitions = [_]struct {
+        sql: []const u8,
+        kind: LowerKind,
+    }{
+        .{ .kind = .relational, .sql = "SELECT id, status FROM items WHERE status = 'open' LIMIT 10" },
+        .{ .kind = .relational, .sql = "SELECT id, amount FROM items WHERE amount > 100 ORDER BY amount DESC LIMIT 20" },
+        .{ .kind = .relational, .sql = "SELECT status, count(*) FROM items GROUP BY status" },
+        .{ .kind = .document, .sql = "SELECT id, status FROM doc WHERE status = 'open' LIMIT 10" },
+        .{ .kind = .document, .sql = "SELECT title, amount FROM doc WHERE amount >= 5 ORDER BY amount DESC LIMIT 20" },
+        .{ .kind = .document, .sql = "SELECT status FROM doc WHERE status != 'closed' LIMIT 10" },
+    };
+
+    var cases = try alloc.alloc(LowerCase, definitions.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cases[0..initialized]) |*entry| entry.parsed.deinit(alloc);
+        alloc.free(cases);
+    }
+
+    for (definitions, 0..) |definition, index| {
+        cases[index] = .{
+            .sql = definition.sql,
+            .kind = definition.kind,
+            .parsed = tokenized.ParsedSql.initAlloc(alloc, definition.sql) catch |err| {
+                std.debug.print("sql_parser_bench lower setup error={s} sql=\"{s}\"\n", .{ @errorName(err), definition.sql });
+                return err;
+            },
+        };
+        initialized += 1;
+    }
+    return cases;
+}
+
+fn freeLowerCases(alloc: std.mem.Allocator, cases: []LowerCase) void {
+    for (cases) |*entry| entry.parsed.deinit(alloc);
+    alloc.free(cases);
+}
+
+fn printBenchmarkSummary(stdout: anytype, summary: TimingSummary, durations: []u64) !void {
+    std.mem.sort(u64, durations, {}, std.sort.asc(u64));
+    const action_range_avg = if (generated.state_count == 0) 0 else @as(f64, @floatFromInt(generated.action_count)) / @as(f64, @floatFromInt(generated.state_count));
+    const goto_range_avg = if (generated.state_count == 0) 0 else @as(f64, @floatFromInt(generated.goto_count)) / @as(f64, @floatFromInt(generated.state_count));
+
+    try stdout.print(
+        \\sql_parser_bench mode={s} statements={} iterations={} operations={} tokens={} elapsed_ns={}
+        \\latency_ns avg={d:.2} p50={} p95={} p99={} max={}
+        \\throughput tokens_per_second={d:.2} statements_per_second={d:.2}
+        \\allocation bytes_per_statement={d:.2} peak_live_bytes={}
+        \\generated_table states={} actions={} gotos={} rules={} productions={} rhs={} state_items={} static_bytes={} symbol_name_bytes={} estimated_bytes={}
+        \\generated_table_entry_bytes action={} goto={} range={}
+        \\generated_table_rows action_max={} action_avg={d:.2} goto_max={} goto_avg={d:.2}
+        \\
+    , .{
+        summary.label,
+        summary.statements,
+        summary.iterations,
+        summary.operations,
+        summary.tokens,
+        summary.elapsed_ns,
+        summary.avg_ns_per_statement,
+        percentile(durations, 50),
+        percentile(durations, 95),
+        percentile(durations, 99),
+        durations[durations.len - 1],
+        summary.tokens_per_second,
+        summary.operations_per_second,
+        summary.allocated_bytes_per_statement,
+        summary.peak_live_bytes,
+        generated.state_count,
+        generated.action_count,
+        generated.goto_count,
+        generated.rule_count,
+        generated.production_count,
+        generated.production_rhs_count,
+        generated.state_item_count,
+        generated.parse_table_static_bytes,
+        generated.symbol_name_bytes,
+        generated.parse_table_estimated_bytes,
+        generated.action_entry_bytes,
+        generated.goto_entry_bytes,
+        generated.table_range_entry_bytes,
+        generated.action_range_max,
+        action_range_avg,
+        generated.goto_range_max,
+        goto_range_avg,
+    });
+}
+
+fn avgNs(elapsed_ns: u64, operations: usize) f64 {
+    return @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(operations));
+}
+
+fn avgBytes(bytes: usize, operations: usize) f64 {
+    return @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(operations));
+}
+
+fn opsPerSecond(operations: usize, elapsed_ns: u64) f64 {
+    return @as(f64, @floatFromInt(operations)) / elapsedSeconds(elapsed_ns);
+}
+
+fn tokensPerSecond(tokens: usize, elapsed_ns: u64) f64 {
+    return @as(f64, @floatFromInt(tokens)) / elapsedSeconds(elapsed_ns);
+}
+
+fn elapsedSeconds(elapsed_ns: u64) f64 {
+    return @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
 }
 
 fn percentile(sorted: []const u64, pct: usize) u64 {

@@ -31,6 +31,10 @@ pub const CatalogSource = struct {
             ptr: *anyopaque,
             request: metadata_table_manager.SecondaryIndexRebuildRangeFinishRequest,
         ) anyerror!void = null,
+        save_secondary_index_rebuild_range_progress: ?*const fn (
+            ptr: *anyopaque,
+            request: metadata_table_manager.SecondaryIndexRebuildRangeProgressRequest,
+        ) anyerror!void = null,
         invalidate_secondary_index_rebuild_range: ?*const fn (
             ptr: *anyopaque,
             request: metadata_table_manager.SecondaryIndexRebuildRangeInvalidateRequest,
@@ -158,6 +162,14 @@ pub const CatalogSource = struct {
         request: metadata_table_manager.SecondaryIndexRebuildRangeFinishRequest,
     ) !void {
         const fn_ptr = self.vtable.finish_secondary_index_rebuild_range orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn saveSecondaryIndexRebuildRangeProgress(
+        self: CatalogSource,
+        request: metadata_table_manager.SecondaryIndexRebuildRangeProgressRequest,
+    ) !void {
+        const fn_ptr = self.vtable.save_secondary_index_rebuild_range_progress orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, request);
     }
 

@@ -477,22 +477,19 @@ pub fn classificationReasonIsExpressionStructural(reason: SqlAdapterClassificati
 }
 
 pub fn classificationReasonIsAdapterNoop(reason: SqlAdapterClassificationReason) bool {
-    return switch (reason) {
-        .extension,
-        .schema_namespace,
-        .session_setting,
-        .transaction_control,
-        => true,
-        else => false,
-    };
+    _ = reason;
+    return false;
 }
 
 pub fn classificationReasonIsUnsupportedRequirement(reason: SqlAdapterClassificationReason) bool {
     return switch (reason) {
         .aggregate_duplicate_output_name,
         .duplicate_output_name,
+        .extension,
+        .schema_namespace,
+        .transaction_control,
         => false,
-        else => !classificationReasonIsAdapterNoop(reason),
+        else => true,
     };
 }
 
@@ -709,10 +706,13 @@ test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expectEqual(SqlAdapterClassificationReason.trigger_catalog_plan, classificationReasonFromToken("trigger_catalog_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.transform_catalog_plan, classificationReasonFromToken("transform_catalog_plan").?);
     try std.testing.expectEqualStrings("multi_table_generation_barrier", classificationReasonToken(.multi_table_generation_barrier));
-    try std.testing.expect(classificationReasonIsAdapterNoop(.session_setting));
+    try std.testing.expect(!classificationReasonIsAdapterNoop(.session_setting));
     try std.testing.expect(!classificationReasonIsAdapterNoop(.set_operation_plan));
     try std.testing.expect(classificationReasonIsUnsupportedRequirement(.set_operation_plan));
-    try std.testing.expect(!classificationReasonIsUnsupportedRequirement(.session_setting));
+    try std.testing.expect(classificationReasonIsUnsupportedRequirement(.session_setting));
+    try std.testing.expect(!classificationReasonIsUnsupportedRequirement(.extension));
+    try std.testing.expect(!classificationReasonIsUnsupportedRequirement(.schema_namespace));
+    try std.testing.expect(!classificationReasonIsUnsupportedRequirement(.transaction_control));
     try std.testing.expect(!classificationReasonIsUnsupportedRequirement(.aggregate_duplicate_output_name));
     try std.testing.expect(!classificationReasonIsUnsupportedRequirement(.duplicate_output_name));
     try std.testing.expect(!classificationReasonTokenIsKnown("set operation plan"));

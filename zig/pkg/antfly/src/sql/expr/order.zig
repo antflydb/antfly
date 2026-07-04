@@ -682,6 +682,8 @@ pub fn parseSelectOutputByAlloc(
             try validateGeneratedSimpleOrderExpression(tokens, generated_expression);
             order_candidate_transferred = true;
             break :blk order_candidate;
+        } else if (try parseGeneratedScalarSubqueryExpressionOutputOrderAlloc(alloc, tokens, pos, select, generated_expression)) |named_order| blk: {
+            break :blk named_order;
         } else try parseExpressionAlloc(
             alloc,
             tokens,
@@ -706,6 +708,28 @@ pub fn parseSelectOutputByAlloc(
         order_transferred = true;
         if (parser.matchToken(tokens, pos, .comma) == null) break;
     }
+}
+
+fn parseGeneratedScalarSubqueryExpressionOutputOrderAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    select: plan_mod.SelectList,
+    generated_expression: ?*const generated_parser.GeneratedSqlExpressionAst,
+) !?db_mod.types.RelationalRowsQueryOrder {
+    if (generated_expression == null or select.scalar_subqueries.len == 0) return null;
+    if (!parser.peekKind(tokens, pos.*, .identifier)) return null;
+    const name = tokens[pos.*].text;
+    var found = false;
+    for (select.expressions) |projection| {
+        if (!std.ascii.eqlIgnoreCase(projection.output, name)) continue;
+        if (found) return error.UnsupportedSqlShape;
+        found = true;
+    }
+    if (!found) return null;
+    try validateGeneratedSimpleOrderExpression(tokens, generated_expression);
+    pos.* += 1;
+    return .{ .field = try alloc.dupe(u8, name) };
 }
 
 pub fn parseTargetByAlloc(

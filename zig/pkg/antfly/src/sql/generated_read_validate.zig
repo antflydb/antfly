@@ -506,7 +506,12 @@ pub fn validateGeneratedExpressionFamilyPayloads(
         return error.UnsupportedSqlShape;
     }
     if (expression.kind != .function_call) {
-        try validateGeneratedEmptyList(expression.argument_items);
+        if (expression.kind == .grouped and expression.argument_items.count != 0) {
+            const inner_tokens = expression.inner_tokens orelse return error.UnsupportedSqlShape;
+            try validateGeneratedExpressionListForClause(tokens, inner_tokens, expression.argument_items);
+        } else {
+            try validateGeneratedEmptyList(expression.argument_items);
+        }
         try validateGeneratedEmptyList(expression.argument_order_items);
         try validateGeneratedEmptyList(expression.within_group_order_items);
         try validateGeneratedEmptyList(expression.over_partition_items);
@@ -3183,6 +3188,7 @@ fn validateGeneratedSelectItemStartFunctionName(
         .repeat => expr_token.sqlTokenIsRepeatFunction(token),
         .reverse => expr_token.sqlTokenIsReverseFunction(token),
         .md5 => expr_token.sqlTokenIsMd5Function(token),
+        .soundex => std.ascii.eqlIgnoreCase(token.text, "soundex"),
         .starts_with => expr_token.sqlTokenIsStartsWithFunction(token),
         .ends_with => expr_token.sqlTokenIsEndsWithFunction(token),
         .date_trunc => expr_token.sqlTokenIsDateTruncFunction(token),

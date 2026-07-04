@@ -48,12 +48,6 @@
       ]
     },
     {
-      "reason": "document_sql_bounded_scan_unsupported_residual",
-      "coverage": [
-        "document_query_view_mapping_rejected_unsupported_residual"
-      ]
-    },
-    {
       "reason": "document_sql_unnest_unsupported",
       "coverage": [
         "document_query_array_unnest_rejected_cartesian"
@@ -70,15 +64,7 @@
     {
       "reason": "document_sql_view_mapping_unsupported",
       "coverage": [
-        "unsupported_read_document_view_mapping_function_predicate",
-        "unsupported_read_document_view_mapping_ilike_predicate",
-        "unsupported_read_document_view_mapping_not_in_predicate",
-        "unsupported_read_document_view_mapping_not_predicate",
-        "unsupported_read_document_view_mapping_or_predicate",
-        "unsupported_read_document_view_mapping_projection_expression",
-        "unsupported_read_document_view_mapping_projection_path",
-        "unsupported_read_document_view_mapping_regex_not_imatch_predicate",
-        "unsupported_read_document_view_mapping_regex_predicate"
+        "unsupported_read_document_view_mapping_projection_path"
       ]
     },
     {

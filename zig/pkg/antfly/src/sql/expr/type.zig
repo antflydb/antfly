@@ -338,6 +338,7 @@ pub fn rowExpressionOpName(kind: db_mod.types.RelationalRowsExpressionKind) []co
         .repeat => "repeat",
         .reverse => "reverse",
         .md5 => "md5",
+        .soundex => "soundex",
         .starts_with => "starts_with",
         .ends_with => "ends_with",
         .chr => "chr",
@@ -642,7 +643,7 @@ pub fn checkExpressionTypeForColumns(
             }
             return .{ .type = .text };
         },
-        .lower, .upper, .initcap, .trim, .ltrim, .rtrim, .replace, .translate, .substring, .overlay, .split_part, .left, .right, .lpad, .rpad, .repeat, .reverse, .chr, .md5, .concat, .concat_ws => {
+        .lower, .upper, .initcap, .trim, .ltrim, .rtrim, .replace, .translate, .substring, .overlay, .split_part, .left, .right, .lpad, .rpad, .repeat, .reverse, .chr, .md5, .soundex, .concat, .concat_ws => {
             for (expression.operands) |operand| {
                 if (!checkExpressionTypeTextLike(try checkExpressionTypeForColumns(columns, operand))) return error.InvalidSqlCatalog;
             }
@@ -1259,7 +1260,8 @@ pub const RowExpressionTypeContext = struct {
             },
             .now, .date_trunc => return .datetime,
             .date_bin => return .datetime,
-            .uuid_v4, .lower, .upper, .initcap, .trim, .ltrim, .rtrim, .replace, .regexp_replace, .regexp_substr, .translate, .substring, .overlay, .split_part, .left, .right, .lpad, .rpad, .repeat, .reverse, .chr, .md5, .concat, .concat_ws, .json_typeof, .array_to_string => return .keyword,
+            .uuid_v4, .lower, .upper, .initcap, .trim, .ltrim, .rtrim, .replace, .regexp_replace, .regexp_substr, .translate, .substring, .overlay, .split_part, .left, .right, .lpad, .rpad, .repeat, .reverse, .chr, .md5, .soundex, .json_typeof, .array_to_string => return .keyword,
+            .concat, .concat_ws => return .text,
             .starts_with, .ends_with, .like, .ilike, .regexp_match, .bool_and, .bool_or, .bool_not, .json_path_exists => return .boolean,
             .nullif => {
                 if (expression.operands.len != 2) return error.UnsupportedSqlShape;
@@ -1280,7 +1282,7 @@ pub const RowExpressionTypeContext = struct {
                 return try self.caseExpressionOutputType(expression.case_branches, expression.case_else);
             },
             .cast => return switch (expression.cast_type orelse return error.UnsupportedSqlShape) {
-                .text => .keyword,
+                .text => .text,
                 .numeric => .numeric,
                 .bool => .boolean,
                 .datetime => .datetime,
@@ -1447,7 +1449,7 @@ pub const RowExpressionTypeContext = struct {
                 if (expression.operands.len == 0) return error.UnsupportedSqlShape;
                 for (expression.operands) |operand| try self.validateTextRowExpression(operand);
             },
-            .lower, .upper, .initcap, .md5 => {
+            .lower, .upper, .initcap, .md5, .soundex => {
                 if (expression.operands.len != 1) return error.UnsupportedSqlShape;
                 try self.validateTextRowExpression(expression.operands[0]);
             },

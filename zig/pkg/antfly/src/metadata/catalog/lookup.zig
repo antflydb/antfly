@@ -149,6 +149,11 @@ test "catalog lookup resolves default and qualified table identities" {
     const snapshot = metadata_api.AdminSnapshot{
         .status = .{ .metadata_group_id = 1, .metrics = .{} },
         .tables = &tables,
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
     };
 
     try std.testing.expect(findTableByName(&snapshot, "docs") == null);

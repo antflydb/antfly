@@ -369,6 +369,7 @@ const FingerprintDdlPayload = union(enum) {
     savepoint_transaction: ddl_plan.SavepointTransactionPlan,
     comment_metadata: ddl_plan.CommentMetadataPlan,
     security_label: ddl_plan.SecurityLabelPlan,
+    transaction_boundary: ddl_plan.TransactionBoundaryPlan,
     transaction_control: ddl_plan.TransactionControlPlan,
     create_index: ddl_plan.CreateIndexPlan,
     drop_index: ddl_plan.DropIndexPlan,
@@ -439,6 +440,7 @@ fn otherDdlFingerprintAlloc(alloc: std.mem.Allocator, plan: binder.OtherDdlLogic
 
 fn transactionDdlFingerprintAlloc(alloc: std.mem.Allocator, plan: binder.TransactionLogicalPlan) ![]u8 {
     return switch (plan) {
+        .boundary => |payload| try ddlPayloadFingerprintAlloc(alloc, .{ .transaction_boundary = payload }),
         .control => |payload| try ddlPayloadFingerprintAlloc(alloc, .{ .transaction_control = payload }),
         .prepared => |payload| try ddlPayloadFingerprintAlloc(alloc, .{ .prepared_transaction = payload }),
         .savepoint => |payload| try ddlPayloadFingerprintAlloc(alloc, .{ .savepoint_transaction = payload }),
@@ -1331,6 +1333,11 @@ fn ddlPayloadFingerprintAlloc(alloc: std.mem.Allocator, payload: FingerprintDdlP
                 "ddl:security_label:kind={s}:object={s}:provider={}:label={}",
                 .{ @tagName(plan.target), plan.object_name, plan.provider_name != null, plan.label_json != null },
             ),
+        .transaction_boundary => |plan| try std.fmt.allocPrint(
+            alloc,
+            "ddl:transaction_boundary:action={s}",
+            .{@tagName(plan.action)},
+        ),
         .transaction_control => |plan| switch (plan) {
             .table_lock => |lock| try std.fmt.allocPrint(
                 alloc,
@@ -1376,7 +1383,7 @@ fn ddlPayloadFingerprintAlloc(alloc: std.mem.Allocator, payload: FingerprintDdlP
             else
                 base;
             const with_include = try appendNonZeroUsizeFingerprintAlloc(alloc, with_generated_op, "include", plan.include_columns.len);
-            const with_index_keys = try appendNonZeroUsizeFingerprintAlloc(alloc, with_include, "index_keys", plan.index_keys.len);
+            const with_index_keys = if (plan.unique) try appendNonZeroUsizeFingerprintAlloc(alloc, with_include, "index_keys", plan.index_keys.len) else with_include;
             const with_where_expr = try appendNonZeroUsizeFingerprintAlloc(alloc, with_index_keys, "where_expr", plan.where_expressions.len);
             const with_temporal = try appendTrueBoolFingerprintAlloc(alloc, with_where_expr, "temporal_unique", plan.without_overlaps_period != null);
             break :blk try appendTrueBoolFingerprintAlloc(alloc, with_temporal, "nulls_not_distinct", plan.nulls_not_distinct);
@@ -2965,8 +2972,6 @@ test "sql adapter ddl fingerprint owns session catalog ddl surfaces" {
         sql: []const u8,
         fingerprint: []const u8,
     }{
-        .{ .sql = "SET LOCAL client_min_messages = warning;", .fingerprint = "adapter_noop:ddl:reason=session_setting" },
-        .{ .sql = "SET client_encoding = 'UTF8';", .fingerprint = "adapter_noop:ddl:reason=session_setting" },
         .{ .sql = "SET search_path TO public;", .fingerprint = "ddl:session:set_search_path:namespaces=1:local=false" },
         .{ .sql = "SET search_path TO tenant_schema, public;", .fingerprint = "ddl:session:set_search_path:namespaces=2:local=false" },
         .{ .sql = "SET LOCAL search_path TO public;", .fingerprint = "ddl:session:set_search_path:namespaces=1:local=true" },
@@ -2979,7 +2984,6 @@ test "sql adapter ddl fingerprint owns session catalog ddl surfaces" {
         .{ .sql = "RESET app.tenant_id;", .fingerprint = "ddl:session:reset_setting:setting=app.tenant_id:setting_kind=app" },
         .{ .sql = "RESET ALL;", .fingerprint = "ddl:session:discard_all" },
         .{ .sql = "RESET search_path;", .fingerprint = "ddl:session:reset_search_path" },
-        .{ .sql = "RESET client_min_messages;", .fingerprint = "adapter_noop:ddl:reason=session_setting" },
         .{ .sql = "SHOW search_path;", .fingerprint = "ddl:session:show_search_path" },
         .{ .sql = "DISCARD ALL;", .fingerprint = "ddl:session:discard_all" },
     };
@@ -2990,6 +2994,15 @@ test "sql adapter ddl fingerprint owns session catalog ddl surfaces" {
         const fingerprint = try ddlFingerprintAlloc(alloc, logical);
         defer alloc.free(fingerprint);
         try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
+    }
+
+    const unsupported = [_][]const u8{
+        "SET LOCAL client_min_messages = warning;",
+        "SET client_encoding = 'UTF8';",
+        "RESET client_min_messages;",
+    };
+    for (unsupported) |sql| {
+        try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanForFingerprintTestAlloc(alloc, sql));
     }
 }
 
@@ -3021,31 +3034,31 @@ test "sql adapter ddl fingerprint owns transaction protocol ddl surfaces" {
         },
         .{
             .sql = "BEGIN;",
-            .fingerprint = "adapter_noop:ddl:reason=transaction_control",
+            .fingerprint = "ddl:transaction_boundary:action=begin",
         },
         .{
             .sql = "BEGIN WORK;",
-            .fingerprint = "adapter_noop:ddl:reason=transaction_control",
+            .fingerprint = "ddl:transaction_boundary:action=begin",
         },
         .{
             .sql = "START TRANSACTION;",
-            .fingerprint = "adapter_noop:ddl:reason=transaction_control",
+            .fingerprint = "ddl:transaction_boundary:action=begin",
         },
         .{
             .sql = "COMMIT;",
-            .fingerprint = "adapter_noop:ddl:reason=transaction_control",
+            .fingerprint = "ddl:transaction_boundary:action=commit",
         },
         .{
             .sql = "COMMIT TRANSACTION;",
-            .fingerprint = "adapter_noop:ddl:reason=transaction_control",
+            .fingerprint = "ddl:transaction_boundary:action=commit",
         },
         .{
             .sql = "ROLLBACK;",
-            .fingerprint = "adapter_noop:ddl:reason=transaction_control",
+            .fingerprint = "ddl:transaction_boundary:action=rollback",
         },
         .{
             .sql = "ROLLBACK WORK;",
-            .fingerprint = "adapter_noop:ddl:reason=transaction_control",
+            .fingerprint = "ddl:transaction_boundary:action=rollback",
         },
         .{
             .sql = "SELECT pg_advisory_lock(42);",

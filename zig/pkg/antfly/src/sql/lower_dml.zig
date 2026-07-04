@@ -297,6 +297,7 @@ pub const ConflictExpressionStart = enum {
     repeat,
     reverse,
     md5,
+    soundex,
     starts_with,
     ends_with,
     date_trunc,
@@ -362,6 +363,7 @@ pub fn conflictExpressionStartAt(tokens: []const Token, pos: usize) ?ConflictExp
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsRepeatFunction)) return .repeat;
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsReverseFunction)) return .reverse;
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsMd5Function)) return .md5;
+    if (expr_token.peekFixedUnaryFunctionCall(tokens, pos, .soundex)) return .soundex;
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsStartsWithFunction)) return .starts_with;
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsEndsWithFunction)) return .ends_with;
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsDateTruncFunction)) return .date_trunc;
@@ -6660,6 +6662,7 @@ pub fn parseConflictExpressionWithExpectedAndGeneratedAlloc(
             .repeat => return try parseConflictTextNumericBinaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .repeat, type_context, options),
             .reverse => return try parseConflictTextUnaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .reverse, type_context, options),
             .md5 => return try parseConflictTextUnaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .md5, type_context, options),
+            .soundex => return try parseConflictTextUnaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .soundex, type_context, options),
             .starts_with => return try parseConflictTextBinaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .starts_with, type_context, options),
             .ends_with => return try parseConflictTextBinaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .ends_with, type_context, options),
             .date_trunc => return try parseConflictDateExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .date_trunc, type_context, options),
@@ -7883,7 +7886,7 @@ pub fn parseConflictTextUnaryExpressionAlloc(
 ) !db_mod.types.RelationalRowsExpression {
     if (expected_type) |field_type| if (!expr_type.sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
     switch (kind) {
-        .reverse, .md5 => try expr_token.parseFixedUnaryFunctionCallStart(tokens, pos, kind),
+        .reverse, .md5, .soundex => try expr_token.parseFixedUnaryFunctionCallStart(tokens, pos, kind),
         else => return error.UnsupportedSqlShape,
     }
     const operand = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, null, options);
@@ -15031,6 +15034,7 @@ fn assignmentExpressionKeywordCanStartAt(tokens: []const Token, pos: usize, incl
         expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsRepeatFunction) or
         expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsReverseFunction) or
         (include_md5 and expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsMd5Function)) or
+        expr_token.peekFixedUnaryFunctionCall(tokens, pos, .soundex) or
         expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsStartsWithFunction) or
         expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsEndsWithFunction) or
         expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsDateTruncFunction) or
@@ -17627,6 +17631,11 @@ pub fn lowerWritePlanFromGeneratedDmlAstDirectWithFunctionBindingsAlloc(
         return try lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast, schema, params, options, write_kind);
     }
     if (dml_ast.kind == .insert_values) {
+        if ((try generatedDmlListExpressionsContainSubquery(&dml_ast.insert_value_rows)) or
+            (try generatedDmlListExpressionsContainSubquery(&dml_ast.conflict_assignment_items)))
+        {
+            return .{ .insert_source = try insertValuesScalarSubquerySourceFromGeneratedDmlAstWithFunctionBindingsAlloc(alloc, parsed_sql.items(), dml_ast, schema, params, options, function_bindings) };
+        }
         return .{ .insert = try insertValuesFromGeneratedDmlAstWithFunctionBindingsAlloc(alloc, parsed_sql.items(), dml_ast, schema, params, options, function_bindings) };
     }
     if (dml_ast.kind == .insert_select) {
@@ -18988,6 +18997,565 @@ fn insertValuesFromGeneratedDmlAstAlloc(
     options: plan_mod.LowerWritePlanOptions,
 ) !plan_mod.LoweredInsert {
     return try insertValuesFromGeneratedDmlAstWithFunctionBindingsAlloc(alloc, tokens, ast, schema, params, options, .{});
+}
+
+fn insertSourceLiteralRowJsonAlloc(
+    alloc: std.mem.Allocator,
+    columns: []const []const u8,
+    values: []const []const u8,
+) ![]const u8 {
+    if (columns.len != values.len) return error.UnsupportedSqlShape;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('{');
+    for (columns, values, 0..) |column, value_json, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writer.print("{f}:", .{std.json.fmt(column, .{})});
+        try writer.writeAll(value_json);
+    }
+    try writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
+fn appendGeneratedInsertValuesSourceAssignmentAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    column_name: []const u8,
+    column: runtime_schema.RelationalColumn,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+    expression_range: generated_parser.GeneratedSqlTokenRange,
+    assignments: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionAssignment),
+    scalar_subqueries: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection),
+    type_context: expr_type.RowExpressionTypeContext,
+    realtime_ns: u64,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
+) !void {
+    const target_field = try alloc.dupe(u8, column_name);
+    var target_transferred = false;
+    errdefer if (!target_transferred) alloc.free(target_field);
+    const lowered = try parseGeneratedInsertValuesSourceAssignmentExpressionAlloc(
+        alloc,
+        tokens,
+        schema,
+        params,
+        column_name,
+        column,
+        expression,
+        expression_range,
+        scalar_subqueries,
+        type_context,
+        realtime_ns,
+        fixed_binary_hooks,
+        bare_boolean_hooks,
+        expression_alternatives_hooks,
+        expression_condition_hooks,
+    );
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, lowered);
+
+    try assignments.append(alloc, .{
+        .field = target_field,
+        .expression = lowered,
+    });
+    target_transferred = true;
+    expression_transferred = true;
+}
+
+fn parseGeneratedInsertValuesSourceAssignmentExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    _: []const u8,
+    column: runtime_schema.RelationalColumn,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+    expression_range: generated_parser.GeneratedSqlTokenRange,
+    scalar_subqueries: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection),
+    type_context: expr_type.RowExpressionTypeContext,
+    realtime_ns: u64,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
+) !db_mod.types.RelationalRowsExpression {
+    const original_scalar_subquery_len = scalar_subqueries.items.len;
+    var lowered = try lower_expr.parseGeneratedScalarSubqueryExpressionAlloc(
+        alloc,
+        tokens,
+        params,
+        schema,
+        type_context,
+        &.{},
+        expression,
+        expression_range,
+        scalar_subqueries,
+        realtime_ns,
+        fixed_binary_hooks,
+        bare_boolean_hooks,
+        expression_alternatives_hooks,
+        expression_condition_hooks,
+    );
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, lowered);
+    plan_mod.rewriteExpressionFieldsToSource(&lowered);
+    var synthetic_type_context = try lower_expr.generatedScalarSubqueryTypeContextAlloc(alloc, .{
+        .alloc = type_context.alloc,
+        .schema = schema,
+        .joined_source_schema = null,
+        .defer_row_expression_field_validation = type_context.defer_row_expression_field_validation,
+    }, scalar_subqueries.items[original_scalar_subquery_len..]);
+    defer synthetic_type_context.deinit(alloc);
+    var validation_type_context = type_context;
+    validation_type_context.joined_source_schema = synthetic_type_context.context.schema;
+    try validateGeneratedScalarSubqueryAssignmentTargetExpression(validation_type_context, column, lowered);
+
+    expression_transferred = true;
+    return lowered;
+}
+
+fn generatedInsertValuesSourceAssignmentIsSourceField(
+    assignment: db_mod.types.RelationalRowsExpressionAssignment,
+    field: []const u8,
+) bool {
+    return assignment.expression.kind == .field and
+        assignment.expression.field_source == .source and
+        std.mem.eql(u8, assignment.expression.field, field);
+}
+
+fn insertValuesScalarSubquerySourceFromGeneratedDmlAstWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
+) !plan_mod.LoweredInsertSource {
+    if (ast.kind != .insert_values) return error.UnsupportedSqlShape;
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (ast.source_tokens != null or ast.default_values) return error.UnsupportedSqlShape;
+    const unique_resolver = options.unique_resolver orelse return error.UnsupportedRowsSelector;
+    const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    const start = try generatedDmlCommandStart(tokens, ast, end);
+    if (start + 4 >= end or !tokens[start].matchesKeywordTag(.insert) or !tokens[start + 1].matchesKeywordTag(.into)) return error.UnsupportedSqlShape;
+    const target_start = try generatedInsertTargetTableStart(tokens, start, end);
+    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
+    const target_alias_end = try generatedDmlTargetAliasEnd(tokens, target_range, ast.target_alias_tokens, ast.target_alias_name_tokens, end);
+    const target_table = try tableAliasFromGeneratedDmlTargetAlloc(alloc, tokens, target_range, target_alias_end, ast.target_alias_name_tokens);
+    var table_transferred = false;
+    errdefer if (!table_transferred) plan_mod.freeTableAlias(alloc, target_table);
+
+    const returning_start = if (ast.returning_tokens) |returning_range| blk: {
+        if (returning_range.start == 0 or returning_range.start > returning_range.end or returning_range.end > end) return error.UnsupportedSqlShape;
+        if (!tokens[returning_range.start - 1].matchesKeywordTag(.returning)) return error.UnsupportedSqlShape;
+        break :blk returning_range.start - 1;
+    } else null;
+    const conflict_start = try generatedDmlConflictKeywordFromAst(tokens, ast, target_alias_end, end);
+    const body_end = conflict_start orelse returning_start orelse end;
+    const actual_returning_keyword = parser.findTopLevelKeywordTagFromIndex(tokens[0..end], target_alias_end, .returning);
+    if (actual_returning_keyword) |actual_returning| {
+        if (returning_start == null or returning_start.? != actual_returning) return error.UnsupportedSqlShape;
+    } else if (returning_start != null) return error.UnsupportedSqlShape;
+    try validateGeneratedDmlReturningItemsRange(tokens, ast.returning_tokens, &ast.returning_items);
+    if (returning_start) |returning| {
+        if (conflict_start) |conflict| {
+            if (conflict >= returning) return error.UnsupportedSqlShape;
+        }
+    }
+    if (ast.conflict_tokens) |conflict_range| {
+        if (conflict_range.start == 0 or conflict_range.start > conflict_range.end or conflict_range.end > end) return error.UnsupportedSqlShape;
+        if (!tokens[conflict_range.start - 1].matchesKeywordTag(.on) or !tokens[conflict_range.start].matchesKeywordTag(.conflict)) return error.UnsupportedSqlShape;
+        if (ast.returning_tokens) |returning_range| {
+            if (conflict_range.end != returning_range.start - 1) return error.UnsupportedSqlShape;
+        } else if (conflict_range.end != end) return error.UnsupportedSqlShape;
+        try validateGeneratedInsertConflictMetadata(tokens, ast, conflict_range, end);
+    } else {
+        try validateGeneratedDmlNoConflictMetadata(ast);
+    }
+
+    const column_range = ast.insert_columns_tokens orelse return error.UnsupportedSqlShape;
+    if (column_range.start != target_alias_end) return error.UnsupportedSqlShape;
+    var column_specs = std.ArrayListUnmanaged(InsertColumnSpec).empty;
+    defer column_specs.deinit(alloc);
+    const columns = try generatedInsertColumnsAlloc(alloc, tokens, column_range, &ast.insert_column_items, schema, &column_specs);
+    var columns_transferred = false;
+    defer if (!columns_transferred) {
+        for (columns) |column| alloc.free(column);
+        alloc.free(columns);
+    };
+    try validateSqlInsertColumnsUnique(schema, columns);
+
+    const values_range = ast.values_tokens orelse return error.UnsupportedSqlShape;
+    if (values_range.start == 0 or values_range.start >= values_range.end or values_range.end > end) return error.UnsupportedSqlShape;
+    if (values_range.start != column_range.end + 1) return error.UnsupportedSqlShape;
+    if (!tokens[values_range.start - 1].matchesKeywordTag(.values)) return error.UnsupportedSqlShape;
+    if (values_range.end != body_end) return error.UnsupportedSqlShape;
+    try validateGeneratedDmlListItemsRange(tokens, values_range, &ast.insert_value_rows);
+    if (ast.insert_value_rows.count == 0 or
+        ast.insert_value_rows.items.len != ast.insert_value_rows.count or
+        ast.insert_value_rows.expressions.len != ast.insert_value_rows.count or
+        ast.insert_value_rows.expression_items.len != ast.insert_value_rows.count)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    const row_item = ast.insert_value_rows.items[0];
+    if (row_item.start != values_range.start or row_item.end > values_range.end) return error.UnsupportedSqlShape;
+    if (ast.insert_value_rows.count == 1 and row_item.end != values_range.end) return error.UnsupportedSqlShape;
+    if (tokens[row_item.start].kind != .lparen or tokens[row_item.end - 1].kind != .rparen) return error.UnsupportedSqlShape;
+    const row_expression = ast.insert_value_rows.expressions[0];
+    if (row_expression.argument_items.count != column_specs.items.len or
+        row_expression.argument_items.items.len != row_expression.argument_items.count or
+        row_expression.argument_items.expression_items.len != row_expression.argument_items.count or
+        row_expression.argument_items.expressions.len != row_expression.argument_items.count)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    var scalar_subqueries = std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection).empty;
+    var scalar_subqueries_transferred = false;
+    errdefer {
+        if (!scalar_subqueries_transferred) {
+            for (scalar_subqueries.items) |projection| plan_mod.freeScalarSubqueryProjection(alloc, projection);
+        }
+        scalar_subqueries.deinit(alloc);
+    }
+    var assignments = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionAssignment).empty;
+    var assignments_transferred = false;
+    errdefer {
+        if (!assignments_transferred) {
+            for (assignments.items) |assignment| {
+                alloc.free(@constCast(assignment.field));
+                freeExpression(alloc, assignment.expression);
+            }
+        }
+        assignments.deinit(alloc);
+    }
+    var literal_columns = std.ArrayListUnmanaged([]const u8).empty;
+    defer literal_columns.deinit(alloc);
+    var literal_values = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (literal_values.items) |value| alloc.free(value);
+        literal_values.deinit(alloc);
+    }
+
+    const parser_context = @import("parser_context.zig");
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens,
+        .schema = schema,
+        .joined_source_schema = schema,
+        .params = params,
+        .unique_resolver = unique_resolver,
+        .default_context = options.default_context,
+        .function_bindings = function_bindings,
+        .generated_assignment_items = &ast.conflict_assignment_items,
+        .generated_conflict_assignments_tokens = ast.conflict_assignments_tokens,
+        .generated_conflict_target_tokens = ast.conflict_target_tokens,
+        .generated_conflict_target_kind = ast.conflict_target_kind,
+        .generated_conflict_target_items = &ast.conflict_target_items,
+        .generated_conflict_target_where_tokens = ast.conflict_target_where_tokens,
+        .generated_conflict_target_where_expression = if (ast.conflict_target_where_tokens != null) &ast.conflict_target_where_expression else null,
+        .generated_conflict_action_tokens = ast.conflict_action_tokens,
+        .generated_conflict_action_kind = ast.conflict_action_kind,
+        .generated_conflict_action_where_tokens = ast.conflict_action_where_tokens,
+        .generated_conflict_action_where_expression = if (ast.conflict_action_where_tokens != null) &ast.conflict_action_where_expression else null,
+    };
+    const type_context = parser_context.ParserState.ContextAccessors.rowExpressionTypeContext(&parser_state);
+    for (column_specs.items, 0..) |spec, index| {
+        const argument_item = row_expression.argument_items.items[index];
+        const argument_expression_item = row_expression.argument_items.expression_items[index];
+        const argument_expression = &row_expression.argument_items.expressions[index];
+        if (argument_item.start < row_item.start + 1 or argument_item.end > row_item.end - 1) return error.UnsupportedSqlShape;
+        if (argument_expression_item.start < argument_item.start or argument_expression_item.end > argument_item.end) return error.UnsupportedSqlShape;
+        switch (spec) {
+            .column => |column_name| {
+                const column = binder.relationalColumnForField(schema, column_name, null) orelse return error.InvalidSqlCatalog;
+                if (generatedDmlExpressionContainsSubquery(argument_expression.*)) {
+                    try appendGeneratedInsertValuesSourceAssignmentAlloc(
+                        alloc,
+                        tokens,
+                        schema,
+                        params,
+                        column_name,
+                        column,
+                        argument_expression,
+                        argument_expression_item,
+                        &assignments,
+                        &scalar_subqueries,
+                        type_context,
+                        sql_value.currentRealtimeNs(),
+                        parser_context.ParserState.ContextAccessors.fixedBinaryRowExpressionParserOptions(&parser_state),
+                        parser_context.ParserState.ContextAccessors.bareBooleanWhereExpressionParserOptions(&parser_state),
+                        parser_context.ParserState.ContextAccessors.expressionWhereConditionAlternativesParserHooks(&parser_state),
+                        parser_context.ParserState.ContextAccessors.expressionWhereConditionsParserHooks(&parser_state),
+                    );
+                } else {
+                    var value_pos = argument_item.start;
+                    const value_json = try sql_value.parseSqlColumnValueAlloc(alloc, tokens[0..argument_item.end], &value_pos, params, column, sql_value.currentRealtimeNs());
+                    var value_transferred = false;
+                    errdefer if (!value_transferred) alloc.free(value_json);
+                    if (value_pos != argument_item.end) return error.UnsupportedSqlShape;
+                    try literal_columns.append(alloc, column_name);
+                    try literal_values.append(alloc, value_json);
+                    value_transferred = true;
+                    const target_field = try alloc.dupe(u8, column_name);
+                    var target_transferred = false;
+                    errdefer if (!target_transferred) alloc.free(target_field);
+                    const source_field = try alloc.dupe(u8, column_name);
+                    var source_transferred = false;
+                    errdefer if (!source_transferred) alloc.free(source_field);
+                    try assignments.append(alloc, .{
+                        .field = target_field,
+                        .expression = .{
+                            .kind = .field,
+                            .field = source_field,
+                            .field_source = .source,
+                        },
+                    });
+                    target_transferred = true;
+                    source_transferred = true;
+                }
+            },
+            .period => return error.UnsupportedSqlShape,
+        }
+    }
+    if (assignments.items.len != columns.len) return error.UnsupportedSqlShape;
+
+    const literal_row = try insertSourceLiteralRowJsonAlloc(alloc, literal_columns.items, literal_values.items);
+    var literal_row_transferred = false;
+    errdefer if (!literal_row_transferred) alloc.free(literal_row);
+    var literal_source_rows = try alloc.alloc([]const u8, ast.insert_value_rows.count);
+    var literal_source_rows_transferred = false;
+    var literal_source_rows_initialized: usize = 0;
+    errdefer if (!literal_source_rows_transferred) {
+        for (literal_source_rows[0..literal_source_rows_initialized]) |row| alloc.free(row);
+        alloc.free(literal_source_rows);
+    };
+    literal_source_rows[0] = literal_row;
+    literal_source_rows_initialized = 1;
+    literal_row_transferred = true;
+
+    var literal_source_row_scalar_subqueries: []const []const db_mod.types.RelationalRowsScalarSubqueryProjection = &.{};
+    var literal_source_row_scalar_subqueries_transferred = false;
+    var literal_source_row_scalar_subqueries_initialized: usize = 0;
+    errdefer if (!literal_source_row_scalar_subqueries_transferred and literal_source_row_scalar_subqueries.len > 0) {
+        for (literal_source_row_scalar_subqueries[0..literal_source_row_scalar_subqueries_initialized]) |row_scalar_subqueries| {
+            plan_mod.freeScalarSubqueryProjections(alloc, row_scalar_subqueries);
+        }
+        alloc.free(literal_source_row_scalar_subqueries);
+    };
+    if (ast.insert_value_rows.count > 1) {
+        const mutable_row_scalar_subqueries = try alloc.alloc([]const db_mod.types.RelationalRowsScalarSubqueryProjection, ast.insert_value_rows.count);
+        literal_source_row_scalar_subqueries = mutable_row_scalar_subqueries;
+        mutable_row_scalar_subqueries[0] = &.{};
+        literal_source_row_scalar_subqueries_initialized = 1;
+        for (ast.insert_value_rows.items[1..], 1..) |next_row_item, row_index| {
+            if (next_row_item.start < values_range.start or next_row_item.end > values_range.end) return error.UnsupportedSqlShape;
+            if (tokens[next_row_item.start].kind != .lparen or tokens[next_row_item.end - 1].kind != .rparen) return error.UnsupportedSqlShape;
+            const next_row_expression = ast.insert_value_rows.expressions[row_index];
+            if (next_row_expression.argument_items.count != column_specs.items.len or
+                next_row_expression.argument_items.items.len != next_row_expression.argument_items.count or
+                next_row_expression.argument_items.expression_items.len != next_row_expression.argument_items.count or
+                next_row_expression.argument_items.expressions.len != next_row_expression.argument_items.count)
+            {
+                return error.UnsupportedSqlShape;
+            }
+
+            var row_scalar_subqueries = std.ArrayListUnmanaged(db_mod.types.RelationalRowsScalarSubqueryProjection).empty;
+            var row_scalar_subqueries_transferred = false;
+            errdefer {
+                if (!row_scalar_subqueries_transferred) {
+                    for (row_scalar_subqueries.items) |projection| plan_mod.freeScalarSubqueryProjection(alloc, projection);
+                }
+                row_scalar_subqueries.deinit(alloc);
+            }
+            var row_literal_columns = std.ArrayListUnmanaged([]const u8).empty;
+            defer row_literal_columns.deinit(alloc);
+            var row_literal_values = std.ArrayListUnmanaged([]const u8).empty;
+            var row_literal_values_transferred = false;
+            defer {
+                if (!row_literal_values_transferred) {
+                    for (row_literal_values.items) |value| alloc.free(value);
+                }
+                row_literal_values.deinit(alloc);
+            }
+
+            for (column_specs.items, 0..) |spec, index| {
+                const argument_item = next_row_expression.argument_items.items[index];
+                const argument_expression_item = next_row_expression.argument_items.expression_items[index];
+                const argument_expression = &next_row_expression.argument_items.expressions[index];
+                if (argument_item.start < next_row_item.start + 1 or argument_item.end > next_row_item.end - 1) return error.UnsupportedSqlShape;
+                if (argument_expression_item.start < argument_item.start or argument_expression_item.end > argument_item.end) return error.UnsupportedSqlShape;
+                switch (spec) {
+                    .column => |column_name| {
+                        const column = binder.relationalColumnForField(schema, column_name, null) orelse return error.InvalidSqlCatalog;
+                        if (generatedDmlExpressionContainsSubquery(argument_expression.*)) {
+                            const lowered = try parseGeneratedInsertValuesSourceAssignmentExpressionAlloc(
+                                alloc,
+                                tokens,
+                                schema,
+                                params,
+                                column_name,
+                                column,
+                                argument_expression,
+                                argument_expression_item,
+                                &row_scalar_subqueries,
+                                type_context,
+                                sql_value.currentRealtimeNs(),
+                                parser_context.ParserState.ContextAccessors.fixedBinaryRowExpressionParserOptions(&parser_state),
+                                parser_context.ParserState.ContextAccessors.bareBooleanWhereExpressionParserOptions(&parser_state),
+                                parser_context.ParserState.ContextAccessors.expressionWhereConditionAlternativesParserHooks(&parser_state),
+                                parser_context.ParserState.ContextAccessors.expressionWhereConditionsParserHooks(&parser_state),
+                            );
+                            defer freeExpression(alloc, lowered);
+                            if (!expr_equal.relationalRowsExpressionEqual(assignments.items[index].expression, lowered)) return error.UnsupportedSqlShape;
+                        } else {
+                            if (!generatedInsertValuesSourceAssignmentIsSourceField(assignments.items[index], column_name)) return error.UnsupportedSqlShape;
+                            var value_pos = argument_item.start;
+                            const value_json = try sql_value.parseSqlColumnValueAlloc(alloc, tokens[0..argument_item.end], &value_pos, params, column, sql_value.currentRealtimeNs());
+                            var value_transferred = false;
+                            errdefer if (!value_transferred) alloc.free(value_json);
+                            if (value_pos != argument_item.end) return error.UnsupportedSqlShape;
+                            try row_literal_columns.append(alloc, column_name);
+                            try row_literal_values.append(alloc, value_json);
+                            value_transferred = true;
+                        }
+                    },
+                    .period => return error.UnsupportedSqlShape,
+                }
+            }
+
+            const next_literal_row = try insertSourceLiteralRowJsonAlloc(alloc, row_literal_columns.items, row_literal_values.items);
+            var next_literal_row_transferred = false;
+            errdefer if (!next_literal_row_transferred) alloc.free(next_literal_row);
+            literal_source_rows[row_index] = next_literal_row;
+            literal_source_rows_initialized += 1;
+            next_literal_row_transferred = true;
+            row_literal_values_transferred = false;
+
+            if (row_scalar_subqueries.items.len == 0) {
+                mutable_row_scalar_subqueries[row_index] = &.{};
+            } else {
+                mutable_row_scalar_subqueries[row_index] = try row_scalar_subqueries.toOwnedSlice(alloc);
+                row_scalar_subqueries_transferred = true;
+            }
+            literal_source_row_scalar_subqueries_initialized += 1;
+        }
+    }
+
+    var conflict: ?db_mod.types.RelationalRowsOnConflict = null;
+    errdefer if (conflict) |value| freeRowsOnConflictValue(alloc, value);
+    var conflict_where = false;
+    if (ast.conflict_tokens) |conflict_range| {
+        const conflict_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
+        const insert_options = parser_context.ParserState.ContextAccessors.insertParserOptions(&parser_state);
+        parser_state.pos = conflict_range.start;
+        const parsed_conflict = try parseConflictClauseWithContextAlloc(alloc, tokens[0..conflict_range.end], &parser_state.pos, .{
+            .params = params,
+            .schema = schema,
+            .joined_source_schema = schema,
+            .table_name = target_table.name,
+            .existing_qualifiers = &conflict_qualifiers,
+            .insert_columns = columns,
+            .insert_values = literal_values.items,
+            .defer_row_expression_field_validation = false,
+            .context_hooks = parser_context.ParserState.ContextAccessors.conflictClauseParserContextHooks(&parser_state),
+            .target_options = insert_options.target_options,
+            .assignment_hooks = insertConflictUpdateSetAssignmentOptions(insert_options.assignment_value_hooks),
+            .generated_assignment_items = &ast.conflict_assignment_items,
+            .generated_assignments_tokens = ast.conflict_assignments_tokens,
+            .generated_action_tokens = ast.conflict_action_tokens,
+            .generated_action_kind = ast.conflict_action_kind,
+            .scalar_subqueries = &scalar_subqueries,
+            .fixed_binary_hooks = parser_context.ParserState.ContextAccessors.fixedBinaryRowExpressionParserOptions(&parser_state),
+            .bare_boolean_hooks = parser_context.ParserState.ContextAccessors.bareBooleanWhereExpressionParserOptions(&parser_state),
+            .expression_alternatives_hooks = parser_context.ParserState.ContextAccessors.expressionWhereConditionAlternativesParserHooks(&parser_state),
+            .expression_condition_hooks = parser_context.ParserState.ContextAccessors.expressionWhereConditionsParserHooks(&parser_state),
+            .condition_options = insert_options.condition_options,
+            .dispatch_options = insert_options.dispatch_options,
+        });
+        defer freeConflictClause(alloc, parsed_conflict);
+        if (parser_state.pos != conflict_range.end) return error.UnsupportedSqlShape;
+        if (parsed_conflict.where_expression != null or parsed_conflict.where_expressions.len != 0 or parsed_conflict.where_any.len != 0 or parsed_conflict.where_not.len != 0) conflict_where = true;
+        conflict = try insertSourceOnConflictFromClauseAlloc(alloc, schema, parsed_conflict);
+    }
+    for (literal_values.items) |value| alloc.free(value);
+    literal_values.deinit(alloc);
+    literal_values = .empty;
+
+    var returning: plan_mod.ReturningProjection = .{};
+    errdefer returning.deinit(alloc);
+    if (ast.returning_tokens) |returning_range| {
+        parser_state.pos = returning_range.start;
+        const returning_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
+        returning = generatedReturningProjectionAlloc(
+            alloc,
+            tokens,
+            returning_range,
+            schema,
+            &returning_qualifiers,
+            &parser_state.pos,
+            &ast.returning_items,
+            parser_context.ParserState.ContextAccessors.returningProjectionParserOptions(&parser_state),
+        ) catch |err| {
+            std.log.err("generated insert values scalar-subquery returning parse failed table={s} err={}", .{ target_table.name, err });
+            return err;
+        };
+        if (parser_state.pos != returning_range.end) return error.UnsupportedSqlShape;
+    }
+    const returning_expression_count = returning.expressions.len;
+    const returning_all = returning.returnsAll();
+    if (returning_all) {
+        strings.freeStringSlice(alloc, returning.fields);
+        returning.fields = &.{};
+    }
+
+    const source_table = try alloc.dupe(u8, target_table.name);
+    var source_table_transferred = false;
+    errdefer if (!source_table_transferred) alloc.free(source_table);
+    const owned_scalar_subqueries = try scalar_subqueries.toOwnedSlice(alloc);
+    scalar_subqueries_transferred = true;
+    const owned_assignments = try assignments.toOwnedSlice(alloc);
+    assignments_transferred = true;
+    const req: db_mod.types.RelationalRowsInsertSourceRequest = .{
+        .source_table = source_table,
+        .source = .{
+            .scalar_subqueries = owned_scalar_subqueries,
+            .select_all = true,
+        },
+        .assignments = owned_assignments,
+        .on_conflict = conflict,
+        .returning = returning.fields,
+        .returning_expressions = returning.expressions,
+        .returning_all = returning_all,
+    };
+    db_mod.DB.validateRelationalRowsInsertSourceRequestWithSchemas(schema, schema, req) catch return error.UnsupportedSqlShape;
+
+    conflict = null;
+    returning = .{};
+    source_table_transferred = true;
+    literal_source_rows_transferred = true;
+    literal_source_row_scalar_subqueries_transferred = true;
+    const table_name = target_table.name;
+    alloc.free(target_table.alias);
+    table_transferred = true;
+    columns_transferred = false;
+    return .{
+        .table_name = table_name,
+        .insert_source = .{ .req = req },
+        .literal_source_rows = literal_source_rows,
+        .literal_source_row_scalar_subqueries = literal_source_row_scalar_subqueries,
+        .sync_level = options.sync_level,
+        .returning_expression_count = returning_expression_count,
+        .returning_all = returning_all,
+        .conflict_where = conflict_where,
+    };
 }
 
 fn insertValuesFromGeneratedDmlAstWithFunctionBindingsAlloc(
@@ -23503,6 +24071,7 @@ fn documentJoinedGeneratedExpressionKindForSqlFunction(name: []const u8) ?runtim
     if (std.ascii.eqlIgnoreCase(name, "ltrim")) return .ltrim;
     if (std.ascii.eqlIgnoreCase(name, "rtrim")) return .rtrim;
     if (std.ascii.eqlIgnoreCase(name, "md5")) return .md5;
+    if (std.ascii.eqlIgnoreCase(name, "soundex")) return .soundex;
     if (std.ascii.eqlIgnoreCase(name, "reverse")) return .reverse;
     if (std.ascii.eqlIgnoreCase(name, "replace")) return .replace;
     if (std.ascii.eqlIgnoreCase(name, "concat")) return .concat;
@@ -23537,7 +24106,7 @@ fn validateDocumentJoinedGeneratedExpressionArity(
     count: usize,
 ) !void {
     switch (kind) {
-        .lower, .upper, .initcap, .trim, .ltrim, .rtrim, .md5, .reverse, .length, .octet_length, .bit_length, .ascii, .abs, .round, .trunc, .floor, .ceil, .sqrt, .sign, .json_typeof, .json_array_length => if (count != 1) return error.DocumentSqlWriteUnsupported,
+        .lower, .upper, .initcap, .trim, .ltrim, .rtrim, .md5, .soundex, .reverse, .length, .octet_length, .bit_length, .ascii, .abs, .round, .trunc, .floor, .ceil, .sqrt, .sign, .json_typeof, .json_array_length => if (count != 1) return error.DocumentSqlWriteUnsupported,
         .replace => if (count != 3) return error.DocumentSqlWriteUnsupported,
         .mod, .power, .strpos, .left, .right, .repeat, .starts_with, .ends_with => if (count != 2) return error.DocumentSqlWriteUnsupported,
         .concat, .coalesce => if (count == 0) return error.DocumentSqlWriteUnsupported,
@@ -26683,20 +27252,39 @@ test "sql adapter lower dml rejects stale generated DML typed write-plan metadat
         },
         else => return error.TestUnexpectedResult,
     }
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerGeneratedDmlWritePlanForDmlTestAlloc(
+    var generated_values_conflict_scalar_assignment_plan = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
         alloc,
         "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', 'ready', 1) ON CONFLICT (id) DO UPDATE SET quantity = (SELECT quantity FROM usage_records WHERE id = 'u1') RETURNING id",
         schema,
         &.{},
         options,
-    ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerGeneratedDmlWritePlanForDmlTestAlloc(
+    );
+    defer generated_values_conflict_scalar_assignment_plan.deinit(alloc);
+    switch (generated_values_conflict_scalar_assignment_plan) {
+        .insert_source => |source| {
+            try std.testing.expectEqual(@as(usize, 1), source.literal_source_rows.len);
+            try std.testing.expectEqual(@as(usize, 1), source.insert_source.req.source.scalar_subqueries.len);
+            const conflict = source.insert_source.req.on_conflict orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 1), conflict.patch_expressions.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    var generated_values_scalar_payload_plan = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
         alloc,
         "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', (SELECT status FROM usage_records WHERE id = 'u2'), 1) RETURNING id",
         schema,
         &.{},
         options,
-    ));
+    );
+    defer generated_values_scalar_payload_plan.deinit(alloc);
+    switch (generated_values_scalar_payload_plan) {
+        .insert_source => |source| {
+            try std.testing.expectEqual(@as(usize, 1), source.literal_source_rows.len);
+            try std.testing.expectEqual(@as(usize, 1), source.insert_source.req.source.scalar_subqueries.len);
+            try std.testing.expectEqual(@as(usize, 1), source.insert_source.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 
     var parsed_stale_no_conflict_expression = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -32430,6 +33018,151 @@ test "sql adapter lower dml rejects stale generated insert value row list adornm
             options,
         ),
     );
+}
+
+test "sql adapter lower dml routes generated insert values scalar subqueries to insert source plans" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"status\":\"active\",\"quantity\":1}", .version = 9 };
+    const options = plan_mod.LowerWritePlanOptions{
+        .unique_resolver = resolver_ctx.resolver(),
+        .sync_level = .full_text,
+    };
+
+    const cases = [_][]const u8{
+        "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', (SELECT status FROM usage_records WHERE id = 'u2'), 1) RETURNING id",
+        "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', 'ready', 1) ON CONFLICT (id) DO UPDATE SET quantity = (SELECT quantity FROM usage_records WHERE id = 'u1') RETURNING id",
+    };
+    for (cases) |sql| {
+        var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+        defer parsed.deinit(alloc);
+        const ast = switch ((parsed.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+            .dml => |generated_ast| generated_ast,
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqual(generated_parser.GeneratedSqlDmlKind.insert_values, ast.kind);
+        try std.testing.expectError(
+            error.UnsupportedSqlShape,
+            insertValuesFromGeneratedDmlAstAlloc(
+                alloc,
+                parsed.items(),
+                ast,
+                schema,
+                &.{},
+                options,
+            ),
+        );
+        var lowered = try lowerWritePlanFromGeneratedDmlAstDirectAlloc(alloc, &parsed, ast, schema, &.{}, options);
+        defer lowered.deinit(alloc);
+        switch (lowered) {
+            .insert_source => |insert_source| {
+                try std.testing.expectEqual(@as(usize, 1), insert_source.literal_source_rows.len);
+                try std.testing.expect(insert_source.insert_source.req.source.scalar_subqueries.len >= 1);
+                try std.testing.expectEqual(options.sync_level, insert_source.sync_level);
+                try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.returning.len);
+                try std.testing.expectEqualStrings("id", insert_source.insert_source.req.returning[0]);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    var multi_parsed = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', (SELECT status FROM usage_records WHERE id = 'u2'), 1), ('u3', (SELECT status FROM usage_records WHERE id = 'u4'), 2) RETURNING id, status",
+    );
+    defer multi_parsed.deinit(alloc);
+    const multi_ast = switch ((multi_parsed.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |generated_ast| generated_ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var multi_lowered = try lowerWritePlanFromGeneratedDmlAstDirectAlloc(alloc, &multi_parsed, multi_ast, schema, &.{}, options);
+    defer multi_lowered.deinit(alloc);
+    switch (multi_lowered) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqual(@as(usize, 2), insert_source.literal_source_rows.len);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.literal_source_row_scalar_subqueries.len);
+            try std.testing.expectEqual(@as(usize, 0), insert_source.literal_source_row_scalar_subqueries[0].len);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.literal_source_row_scalar_subqueries[1].len);
+            try std.testing.expectEqualStrings(insert_source.insert_source.req.source.scalar_subqueries[0].output, insert_source.literal_source_row_scalar_subqueries[1][0].output);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var correlated_values_parsed = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', (SELECT status FROM usage_records AS child WHERE child.id = id), 1), ('u2', (SELECT status FROM usage_records AS child WHERE child.id = id), 2) RETURNING id, status",
+    );
+    defer correlated_values_parsed.deinit(alloc);
+    const correlated_values_ast = switch ((correlated_values_parsed.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |generated_ast| generated_ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var correlated_values_lowered = try lowerWritePlanFromGeneratedDmlAstDirectAlloc(alloc, &correlated_values_parsed, correlated_values_ast, schema, &.{}, options);
+    defer correlated_values_lowered.deinit(alloc);
+    switch (correlated_values_lowered) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.scalar_subqueries.len);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.scalar_subqueries[0].correlations.len);
+            try std.testing.expectEqualStrings("id", insert_source.insert_source.req.source.scalar_subqueries[0].correlations[0].left_field);
+            try std.testing.expectEqualStrings("id", insert_source.insert_source.req.source.scalar_subqueries[0].correlations[0].right_field);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.literal_source_row_scalar_subqueries.len);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.literal_source_row_scalar_subqueries[1].len);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.literal_source_row_scalar_subqueries[1][0].correlations.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    var malformed_correlated_values_parsed = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', (SELECT status FROM usage_records AS child WHERE child.id = id), 1) RETURNING id, status",
+    );
+    defer malformed_correlated_values_parsed.deinit(alloc);
+    var malformed_correlated_values_ast = switch ((malformed_correlated_values_parsed.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |generated_ast| generated_ast,
+        else => return error.TestUnexpectedResult,
+    };
+    if (malformed_correlated_values_ast.insert_value_rows.expressions.len != 1) return error.TestUnexpectedResult;
+    if (malformed_correlated_values_ast.insert_value_rows.expressions[0].argument_items.expressions.len < 2) return error.TestUnexpectedResult;
+    const malformed_scalar_subquery = &malformed_correlated_values_ast.insert_value_rows.expressions[0].argument_items.expressions[1];
+    const malformed_where = malformed_scalar_subquery.subquery_where_expression orelse return error.TestUnexpectedResult;
+    malformed_where.right_tokens = malformed_scalar_subquery.subquery_source_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanFromGeneratedDmlAstDirectAlloc(
+            alloc,
+            &malformed_correlated_values_parsed,
+            malformed_correlated_values_ast,
+            schema,
+            &.{},
+            options,
+        ),
+    );
+
+    var excluded_parsed = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', (SELECT status FROM usage_records WHERE id = 'u2'), 1) ON CONFLICT (id) DO UPDATE SET status = excluded.status RETURNING id, status",
+    );
+    defer excluded_parsed.deinit(alloc);
+    const excluded_ast = switch ((excluded_parsed.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |generated_ast| generated_ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var excluded_lowered = try lowerWritePlanFromGeneratedDmlAstDirectAlloc(alloc, &excluded_parsed, excluded_ast, schema, &.{}, options);
+    defer excluded_lowered.deinit(alloc);
+    switch (excluded_lowered) {
+        .insert_source => |insert_source| {
+            const conflict = insert_source.insert_source.req.on_conflict orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 1), conflict.patch_expressions.len);
+            try std.testing.expectEqualStrings("status", conflict.patch_expressions[0].field);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, conflict.patch_expressions[0].expression.kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.proposed, conflict.patch_expressions[0].expression.field_source);
+            try std.testing.expectEqualStrings("status", conflict.patch_expressions[0].expression.field);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "sql adapter lower dml rejects stale generated truncate target list adornment metadata" {

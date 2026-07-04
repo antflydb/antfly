@@ -1251,7 +1251,7 @@ pub fn applyLogicalDdlPlanToSchemaJsonAlloc(
             .security_label => |label| try applySecurityLabelPlanToSchemaJsonAlloc(alloc, current_schema_json, label),
             else => error.UnsupportedSqlShape,
         },
-        .other_ddl, .session => .{ .schema_json = try alloc.dupe(u8, current_schema_json) },
+        .other_ddl, .session, .transaction => .{ .schema_json = try alloc.dupe(u8, current_schema_json) },
         else => error.UnsupportedSqlShape,
     };
 }
@@ -1417,7 +1417,8 @@ pub fn applyTableDdlPlanToSchemaJsonAlloc(
         },
     }
     const updated_schema_json = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
-    errdefer alloc.free(updated_schema_json);
+    var updated_schema_json_transferred = false;
+    errdefer if (!updated_schema_json_transferred) alloc.free(updated_schema_json);
     const rewrite_source = switch (plan) {
         .alter_table => |alter_table| try alterTableRewriteExpressionSourceAlloc(alloc, alter_table),
         else => null,
@@ -1444,6 +1445,7 @@ pub fn applyTableDdlPlanToSchemaJsonAlloc(
         rewrite_source,
         row_rewrite_source,
     );
+    updated_schema_json_transferred = true;
     errdefer result.deinit(alloc);
     try schema_json.validateDdlAppliedSchemaJsonAlloc(alloc, result.schema_json);
     return result;
@@ -1684,6 +1686,11 @@ fn applyCreateIndexPlanAlloc(
         try expr_type.validateCreateIndexIncludeColumns(schema.relational_columns, plan.columns, plan.include_columns);
     }
 
+    const index_generation = ddl_plan.stableSecondaryIndexGeneration(plan);
+    const index_access_method = try ddl_plan.relationalAccessMethodForCreateIndex(plan);
+    const index_schema_fingerprint = try ddl_plan.stableSecondaryIndexSchemaFingerprintAlloc(alloc, plan);
+    defer alloc.free(index_schema_fingerprint);
+
     if (plan.unique) {
         try expr_type.validateCreateIndexIncludeColumns(schema.relational_columns, plan.columns, plan.include_columns);
         const constraint: runtime_schema.UniqueConstraint = .{
@@ -1692,6 +1699,10 @@ fn applyCreateIndexPlanAlloc(
             .expressions = plan.expressions,
             .include_columns = plan.include_columns,
             .index_keys = plan.index_keys,
+            .index_lifecycle = .building,
+            .index_generation = index_generation,
+            .index_access_method = index_access_method,
+            .index_schema_fingerprint = index_schema_fingerprint,
             .without_overlaps_period = plan.without_overlaps_period,
             .nulls_not_distinct = plan.nulls_not_distinct,
             .where = plan.where,
@@ -1703,7 +1714,6 @@ fn applyCreateIndexPlanAlloc(
         return schema;
     }
 
-    const index_generation = ddl_plan.stableSecondaryIndexGeneration(plan);
     if (plan.generated_expression) |generated_expression| {
         if (plan.columns.len != 0 or plan.expressions.len != 0) return error.UnsupportedSqlShape;
         if (binder.relationalColumnIndex(schema.relational_columns, plan.index_name) != null) return error.InvalidSqlCatalog;
@@ -1717,6 +1727,8 @@ fn applyCreateIndexPlanAlloc(
             .index_lifecycle = .building,
             .index_generation = index_generation,
             .index_name = plan.index_name,
+            .index_access_method = index_access_method,
+            .index_schema_fingerprint = index_schema_fingerprint,
             .index_include_columns = plan.include_columns,
             .generated = generated_expression,
             .index_where = plan.where,
@@ -1733,7 +1745,7 @@ fn applyCreateIndexPlanAlloc(
     try expr_type.validateCreateIndexIncludeColumns(schema.relational_columns, plan.columns, plan.include_columns);
     try expr_type.validateUniquePredicatesForColumns(schema.relational_columns, plan.where);
     try expr_type.validateUniquePredicateExpressionsForColumns(schema.relational_columns, plan.where_expressions);
-    try ddl_plan.markColumnsIndexedAlloc(alloc, &schema, plan.index_name, plan.columns, plan.include_columns, plan.index_keys, plan.where, plan.where_expressions, index_generation);
+    try ddl_plan.markColumnsIndexedAlloc(alloc, &schema, plan.index_name, index_access_method, index_schema_fingerprint, plan.columns, plan.include_columns, plan.index_keys, plan.where, plan.where_expressions, index_generation);
     return schema;
 }
 
@@ -1931,33 +1943,7 @@ fn logicalDdlPlanForCatalogApplyTestAlloc(
 }
 
 fn ddlLogicalFingerprintForCatalogApplyTestAlloc(alloc: std.mem.Allocator, plan: binder.LogicalSqlPlan) ![]u8 {
-    return switch (plan) {
-        .other_ddl => |other| switch (other) {
-            .adapter_noop => |noop| try std.fmt.allocPrint(alloc, "adapter_noop:ddl:reason={s}", .{@tagName(noop.reason)}),
-            .moved => error.TestUnexpectedResult,
-        },
-        .catalog_ddl => |catalog| switch (catalog) {
-            .comment_metadata => |comment| if (comment.parent_table_name) |parent_table|
-                try std.fmt.allocPrint(
-                    alloc,
-                    "ddl:comment:kind={s}:object={s}:table={s}:comment={}",
-                    .{ @tagName(comment.target), comment.object_name, parent_table, comment.comment_json != null },
-                )
-            else
-                try std.fmt.allocPrint(
-                    alloc,
-                    "ddl:comment:kind={s}:object={s}:comment={}",
-                    .{ @tagName(comment.target), comment.object_name, comment.comment_json != null },
-                ),
-            .security_label => |label| try std.fmt.allocPrint(
-                alloc,
-                "ddl:security_label:kind={s}:object={s}:provider={}:label={}",
-                .{ @tagName(label.target), label.object_name, label.provider_name != null, label.label_json != null },
-            ),
-            else => error.TestUnexpectedResult,
-        },
-        else => error.TestUnexpectedResult,
-    };
+    return try fingerprint.ddlFingerprintAlloc(alloc, plan);
 }
 
 fn expectAppliedDdlWorkActions(applied: ddl_plan.AppliedDdlSchemaJson, expected: []const ddl_plan.AppliedDdlWorkAction) !void {
@@ -2138,51 +2124,56 @@ test "catalog apply applies adapter noops and comment ddl to public schema json"
 
     var create_public_schema = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE SCHEMA IF NOT EXISTS public;");
     defer create_public_schema.deinit(alloc);
-    const create_public_schema_noop = switch (create_public_schema) {
-        .other_ddl => |other| switch (other) {
-            .adapter_noop => |plan| plan,
+    switch (create_public_schema) {
+        .catalog_ddl => |catalog| switch (catalog) {
+            .schema_namespace_catalog => |plan| switch (plan) {
+                .create => |create_schema| {
+                    try std.testing.expectEqualStrings("public", create_schema.schema_name);
+                    try std.testing.expect(create_schema.if_not_exists);
+                },
+                else => return error.TestUnexpectedResult,
+            },
             else => return error.TestUnexpectedResult,
         },
         else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expectEqual(ddl_plan.AdapterNoopDdlReason.schema_namespace, create_public_schema_noop.reason);
+    }
     const create_public_schema_fingerprint = try ddlLogicalFingerprintForCatalogApplyTestAlloc(alloc, create_public_schema);
     defer alloc.free(create_public_schema_fingerprint);
-    try std.testing.expectEqualStrings("adapter_noop:ddl:reason=schema_namespace", create_public_schema_fingerprint);
-    var public_schema_applied = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_public_schema);
-    defer public_schema_applied.deinit(alloc);
-    try std.testing.expectEqualStrings(applied.schema_json, public_schema_applied.schema_json);
+    try std.testing.expectEqualStrings("ddl:create_schema_namespace:schema=public:if_not_exists=true", create_public_schema_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyLogicalDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_public_schema));
 
     var create_extension = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE EXTENSION IF NOT EXISTS pgcrypto;");
     defer create_extension.deinit(alloc);
-    const create_extension_noop = switch (create_extension) {
-        .other_ddl => |other| switch (other) {
-            .adapter_noop => |plan| plan,
+    switch (create_extension) {
+        .extension => |extension| switch (extension) {
+            .create => |create_extension_plan| {
+                try std.testing.expectEqualStrings("pgcrypto", create_extension_plan.extension_name);
+                try std.testing.expect(create_extension_plan.if_not_exists);
+            },
             else => return error.TestUnexpectedResult,
         },
         else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expectEqual(ddl_plan.AdapterNoopDdlReason.extension, create_extension_noop.reason);
+    }
     const create_extension_fingerprint = try ddlLogicalFingerprintForCatalogApplyTestAlloc(alloc, create_extension);
     defer alloc.free(create_extension_fingerprint);
-    try std.testing.expectEqualStrings("adapter_noop:ddl:reason=extension", create_extension_fingerprint);
-    var extension_applied = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_extension);
-    defer extension_applied.deinit(alloc);
-    try std.testing.expectEqualStrings(applied.schema_json, extension_applied.schema_json);
+    try std.testing.expectEqualStrings("ddl:create_extension:extension=pgcrypto:if_not_exists=true", create_extension_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyLogicalDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_extension));
 
     var create_public_extension = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;");
     defer create_public_extension.deinit(alloc);
-    const create_public_extension_noop = switch (create_public_extension) {
-        .other_ddl => |other| switch (other) {
-            .adapter_noop => |plan| plan,
+    switch (create_public_extension) {
+        .extension => |extension| switch (extension) {
+            .create => |create_public_extension_plan| {
+                try std.testing.expectEqualStrings("pgcrypto", create_public_extension_plan.extension_name);
+                try std.testing.expect(create_public_extension_plan.if_not_exists);
+            },
             else => return error.TestUnexpectedResult,
         },
         else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expectEqual(ddl_plan.AdapterNoopDdlReason.extension, create_public_extension_noop.reason);
+    }
     const create_public_extension_fingerprint = try ddlLogicalFingerprintForCatalogApplyTestAlloc(alloc, create_public_extension);
     defer alloc.free(create_public_extension_fingerprint);
-    try std.testing.expectEqualStrings("adapter_noop:ddl:reason=extension", create_public_extension_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_extension:extension=pgcrypto:if_not_exists=true", create_public_extension_fingerprint);
 
     var table_comment = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON TABLE users IS 'metered usage rows';");
     defer table_comment.deinit(alloc);
@@ -2540,6 +2531,11 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expectEqualStrings("users_account_email_idx", multi_account.index_name.?);
     try std.testing.expectEqualStrings("users_account_email_idx", multi_email.index_name.?);
     try std.testing.expectEqual(multi_account.index_generation, multi_email.index_generation);
+    try std.testing.expectEqual(@as(usize, 2), multi_account.index_keys.len);
+    try std.testing.expectEqualStrings("account_id", multi_account.index_keys[0].column);
+    try std.testing.expectEqualStrings("email", multi_account.index_keys[1].column);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexKeyDirection.asc, multi_account.index_keys[0].direction);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexKeyNulls.default, multi_account.index_keys[0].nulls);
 
     var drop_multi_column_index = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_account_email_idx;");
     defer drop_multi_column_index.deinit(alloc);
@@ -3882,9 +3878,29 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqual(@as(usize, 2), covered_email.index_include_columns.len);
     try std.testing.expectEqualStrings("tenant_id", covered_email.index_include_columns[0]);
     try std.testing.expectEqualStrings("amount", covered_email.index_include_columns[1]);
-    try std.testing.expectEqual(@as(usize, 0), covered_email.index_keys.len);
+    try std.testing.expectEqual(@as(usize, 1), covered_email.index_keys.len);
+    try std.testing.expectEqualStrings("email", covered_email.index_keys[0].column);
     const covered_tenant = binder.relationalColumnForField(covering_schema, "tenant_id", null) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 0), covered_tenant.index_include_columns.len);
+
+    var explicit_btree_index = try logicalDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_tenant_status_btree_idx ON users USING btree (tenant_id ASC, status DESC NULLS LAST);",
+    );
+    defer explicit_btree_index.deinit(alloc);
+    const explicit_btree_schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, schema, explicit_btree_index);
+    defer runtime_schema.freeSchema(alloc, explicit_btree_schema);
+    const explicit_btree_tenant = binder.relationalColumnForField(explicit_btree_schema, "tenant_id", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(explicit_btree_tenant.indexed);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexAccessMethod.ordered_tuple, explicit_btree_tenant.index_access_method.?);
+    try std.testing.expectEqualStrings("users_tenant_status_btree_idx", explicit_btree_tenant.index_name.?);
+    try std.testing.expectEqual(@as(usize, 2), explicit_btree_tenant.index_keys.len);
+    try std.testing.expectEqualStrings("tenant_id", explicit_btree_tenant.index_keys[0].column);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexKeyDirection.asc, explicit_btree_tenant.index_keys[0].direction);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexKeyNulls.default, explicit_btree_tenant.index_keys[0].nulls);
+    try std.testing.expectEqualStrings("status", explicit_btree_tenant.index_keys[1].column);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexKeyDirection.desc, explicit_btree_tenant.index_keys[1].direction);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexKeyNulls.last, explicit_btree_tenant.index_keys[1].nulls);
 
     var drop_covering_index = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_email_cover_idx;");
     defer drop_covering_index.deinit(alloc);
@@ -4050,6 +4066,10 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqualStrings("users_tenant_lower_email_key", unique_schema.unique_constraints[0].name);
     try std.testing.expectEqual(@as(usize, 1), unique_schema.unique_constraints[0].expressions.len);
     try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, unique_schema.unique_constraints[0].validation_state);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.building, unique_schema.unique_constraints[0].index_lifecycle);
+    try std.testing.expect(unique_schema.unique_constraints[0].index_generation != 0);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexAccessMethod.ordered_tuple, unique_schema.unique_constraints[0].index_access_method.?);
+    try std.testing.expect(unique_schema.unique_constraints[0].index_schema_fingerprint != null);
 
     var unique_covering_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
@@ -4065,6 +4085,8 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqual(@as(usize, 2), unique_covering_schema.unique_constraints[1].include_columns.len);
     try std.testing.expectEqualStrings("tenant_id", unique_covering_schema.unique_constraints[1].include_columns[0]);
     try std.testing.expectEqualStrings("status", unique_covering_schema.unique_constraints[1].include_columns[1]);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.building, unique_covering_schema.unique_constraints[1].index_lifecycle);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexAccessMethod.ordered_tuple, unique_covering_schema.unique_constraints[1].index_access_method.?);
 
     var upper_unique_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,

@@ -4029,6 +4029,62 @@ test "api public SQL endpoint executes SQL point writes through typed row batch 
     try std.testing.expectEqualStrings("closed", insert_source_row.get("status").?.string);
     try std.testing.expectEqual(@as(i64, 16), insert_source_row.get("amount").?.integer);
 
+    var values_scalar_subquery_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('u1-scalar', (SELECT status FROM usage_records WHERE id = 'u1'), (SELECT amount FROM usage_records WHERE id = 'u1')) RETURNING id, status, amount;\"}",
+    });
+    defer values_scalar_subquery_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), values_scalar_subquery_resp.status);
+    var parsed_values_scalar_subquery = try std.json.parseFromSlice(std.json.Value, alloc, values_scalar_subquery_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_values_scalar_subquery.deinit();
+    try std.testing.expectEqualStrings("write", parsed_values_scalar_subquery.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("insert_source", parsed_values_scalar_subquery.value.object.get("statement_kind").?.string);
+    const values_scalar_subquery_result = parsed_values_scalar_subquery.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), values_scalar_subquery_result.get("matched").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), values_scalar_subquery_result.get("staged").?.integer);
+    const values_scalar_subquery_row = values_scalar_subquery_result.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("u1-scalar", values_scalar_subquery_row.get("id").?.string);
+    try std.testing.expectEqualStrings("closed", values_scalar_subquery_row.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 15), values_scalar_subquery_row.get("amount").?.integer);
+
+    var scalar_conflict_source_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('u1-conflict-source', 'reopened', 8);\"}",
+    });
+    defer scalar_conflict_source_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), scalar_conflict_source_resp.status);
+
+    var values_scalar_conflict_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('u1', (SELECT status FROM usage_records WHERE id = 'u1-conflict-source'), 99) ON CONFLICT (id) DO UPDATE SET status = excluded.status RETURNING id, status, amount;\"}",
+    });
+    defer values_scalar_conflict_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), values_scalar_conflict_resp.status);
+    var parsed_values_scalar_conflict = try std.json.parseFromSlice(std.json.Value, alloc, values_scalar_conflict_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_values_scalar_conflict.deinit();
+    try std.testing.expectEqualStrings("write", parsed_values_scalar_conflict.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("insert_source", parsed_values_scalar_conflict.value.object.get("statement_kind").?.string);
+    const values_scalar_conflict_result = parsed_values_scalar_conflict.value.object.get("result").?.object;
+    const values_scalar_conflict_row = values_scalar_conflict_result.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("u1", values_scalar_conflict_row.get("id").?.string);
+    try std.testing.expectEqualStrings("reopened", values_scalar_conflict_row.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 15), values_scalar_conflict_row.get("amount").?.integer);
+
+    var values_scalar_cardinality_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('u1-cardinality', (SELECT status FROM usage_records), 1) RETURNING id;\"}",
+    });
+    defer values_scalar_cardinality_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), values_scalar_cardinality_resp.status);
+
     var delete_resp = try server.handle(.{
         .method = .POST,
         .uri = "/db/v1/sql",

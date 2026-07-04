@@ -165,6 +165,7 @@ pub const DocumentProjectionKind = enum {
     text_rtrim,
     text_reverse,
     text_split_part,
+    text_soundex,
     text_starts_with,
     text_strpos,
     text_string_to_array,
@@ -1747,6 +1748,7 @@ fn parseProjectionItemAlloc(
     if (try parseTextLengthProjectionItemAlloc(alloc, expression, aliased.output, schema, virtual_schema, source_ref)) |projection| return projection;
     if (try parseTextInitcapProjectionItemAlloc(alloc, expression, aliased.output, schema, virtual_schema, source_ref)) |projection| return projection;
     if (try parseTextMd5ProjectionItemAlloc(alloc, expression, aliased.output, schema, virtual_schema, source_ref)) |projection| return projection;
+    if (try parseTextSoundexProjectionItemAlloc(alloc, expression, aliased.output, schema, virtual_schema, source_ref)) |projection| return projection;
     if (try parseTextCaseProjectionItemAlloc(alloc, expression, aliased.output, schema, virtual_schema, source_ref)) |projection| return projection;
 
     var output: ?[]const u8 = null;
@@ -2831,6 +2833,29 @@ fn parseTextMd5ProjectionItemAlloc(
     }
     return .{
         .kind = .text_md5,
+        .field = try alloc.dupe(u8, column.path),
+        .output = try alloc.dupe(u8, output orelse expression[0].text),
+    };
+}
+
+fn parseTextSoundexProjectionItemAlloc(
+    alloc: std.mem.Allocator,
+    expression: []const Token,
+    output: ?[]const u8,
+    schema: runtime_schema.TableSchema,
+    virtual_schema: source_binding.DocumentSqlSchema,
+    source_ref: DocumentSourceRef,
+) !?DocumentProjection {
+    if (expression.len < 4 or expression[0].kind != .identifier or !std.ascii.eqlIgnoreCase(expression[0].text, "soundex")) return null;
+    if (expression.len != 4 or expression[1].kind != .lparen or expression[2].kind != .identifier or expression[3].kind != .rparen) return error.UnsupportedSqlShape;
+    const field_name = try documentIdentifierName(expression[2], source_ref);
+    const column = documentVirtualField(schema, virtual_schema, field_name) orelse return error.InvalidSqlCatalog;
+    switch (column.field_type orelse return error.UnsupportedSqlShape) {
+        .keyword, .text, .search_as_you_type => {},
+        else => return error.UnsupportedSqlShape,
+    }
+    return .{
+        .kind = .text_soundex,
         .field = try alloc.dupe(u8, column.path),
         .output = try alloc.dupe(u8, output orelse expression[0].text),
     };
@@ -5685,10 +5710,6 @@ fn parseTextStrposRangeFilterClauseAlloc(
 ) !?[]const u8 {
     if (tokens.len != op_index + 2) return null;
     if (op_index != 6 or tokens[0].kind != .identifier) return null;
-    if (require_index) return error.DocumentSqlIndexUnavailable;
-    if (tokenIsNullLiteral(tokens[op_index + 1])) return try buildMatchNoneFilterClauseAlloc(alloc);
-    if (tokens[op_index + 1].kind != .number) return error.UnsupportedSqlShape;
-    try validateDocumentTextLengthLiteral(tokens[op_index + 1]);
 
     const TextPositionCall = struct {
         field_tokens: []const Token,
@@ -5701,6 +5722,11 @@ fn parseTextStrposRangeFilterClauseAlloc(
         if (tokens[1].kind != .lparen or tokens[2].kind != .string or !tokens[3].matchesKeywordTag(.in) or tokens[4].kind != .identifier or tokens[5].kind != .rparen) return null;
         break :blk .{ .field_tokens = tokens[4..5], .needle = tokens[2].text };
     } else return null;
+
+    if (require_index) return error.DocumentSqlIndexUnavailable;
+    if (tokenIsNullLiteral(tokens[op_index + 1])) return try buildMatchNoneFilterClauseAlloc(alloc);
+    if (tokens[op_index + 1].kind != .number) return error.UnsupportedSqlShape;
+    try validateDocumentTextLengthLiteral(tokens[op_index + 1]);
 
     var field = (try documentFilterFieldForExpressionAlloc(alloc, parsed.field_tokens, schema, virtual_schema, source_ref, false)) orelse return error.UnsupportedSqlShape;
     defer field.deinit(alloc);
@@ -5994,6 +6020,8 @@ fn parseTextUnaryTermFilterClauseAlloc(
         "initcap"
     else if (std.ascii.eqlIgnoreCase(tokens[0].text, "md5"))
         "md5"
+    else if (std.ascii.eqlIgnoreCase(tokens[0].text, "soundex"))
+        "soundex"
     else if (std.ascii.eqlIgnoreCase(tokens[0].text, "reverse"))
         "reverse"
     else if (std.ascii.eqlIgnoreCase(tokens[0].text, "trim") or std.ascii.eqlIgnoreCase(tokens[0].text, "btrim"))
@@ -6208,26 +6236,23 @@ fn parseArrayLengthRangeFilterClauseAlloc(
     if (tokens[op_index + 1].kind != .number) return error.UnsupportedSqlShape;
     try validateDocumentTextLengthLiteral(tokens[op_index + 1]);
 
-    const field_token: Token = if (is_cardinality) blk: {
-        if (op_index != 3 or tokens[2].kind != .identifier) return error.UnsupportedSqlShape;
-        break :blk tokens[2];
-    } else blk: {
-        if (op_index != 5 or tokens[2].kind != .identifier or tokens[3].kind != .comma or tokens[4].kind != .number) return error.UnsupportedSqlShape;
-        if (!std.mem.eql(u8, tokens[4].text, "1")) return error.UnsupportedSqlShape;
-        break :blk tokens[2];
+    const field_tokens: []const Token = if (is_cardinality)
+        tokens[2 .. op_index - 1]
+    else blk: {
+        if (op_index < 6 or tokens[op_index - 3].kind != .comma or tokens[op_index - 2].kind != .number) return error.UnsupportedSqlShape;
+        if (!std.mem.eql(u8, tokens[op_index - 2].text, "1")) return error.UnsupportedSqlShape;
+        break :blk tokens[2 .. op_index - 3];
     };
 
-    const field_name = try documentIdentifierName(field_token, source_ref);
-    const column = documentVirtualField(schema, virtual_schema, field_name) orelse return error.InvalidSqlCatalog;
-    if ((column.field_type orelse return error.UnsupportedSqlShape) != .array) return error.UnsupportedSqlShape;
-    const path = try documentFilterPathAlloc(alloc, column.path);
-    defer alloc.free(path);
+    var field = (try documentFilterFieldForExpressionAlloc(alloc, field_tokens, schema, virtual_schema, source_ref, false)) orelse return error.UnsupportedSqlShape;
+    defer field.deinit(alloc);
+    if (field.field_type != .array) return error.UnsupportedSqlShape;
 
     if (tokens[op_index].kind == .eq) {
-        return try buildArrayLengthEqualFilterClauseAlloc(alloc, path, tokens[op_index + 1]);
+        return try buildArrayLengthEqualFilterClauseAlloc(alloc, field.path, tokens[op_index + 1]);
     }
     if (tokens[op_index].kind == .neq) {
-        const term = try buildArrayLengthEqualFilterClauseAlloc(alloc, path, tokens[op_index + 1]);
+        const term = try buildArrayLengthEqualFilterClauseAlloc(alloc, field.path, tokens[op_index + 1]);
         defer alloc.free(term);
         return try std.fmt.allocPrint(
             alloc,
@@ -6236,7 +6261,7 @@ fn parseArrayLengthRangeFilterClauseAlloc(
         );
     }
     const bound = documentRangeBound(tokens[op_index].kind, tokens[op_index + 1].text) orelse return null;
-    return try buildArrayLengthRangeFilterClauseAlloc(alloc, path, bound, tokens[op_index + 1]);
+    return try buildArrayLengthRangeFilterClauseAlloc(alloc, field.path, bound, tokens[op_index + 1]);
 }
 
 fn buildArrayLengthEqualFilterClauseAlloc(alloc: std.mem.Allocator, path: []const u8, value: Token) ![]const u8 {
@@ -6403,6 +6428,7 @@ fn parseNumericArithmeticRangeFilterClauseAlloc(
 ) !?[]const u8 {
     if (tokens.len != op_index + 2) return null;
     if (op_index != 3) return null;
+    const arithmetic_operator = documentNumericArithmeticOperatorName(tokens[1].kind) orelse return null;
     if (require_index) return error.DocumentSqlIndexUnavailable;
     if (tokenIsNullLiteral(tokens[op_index + 1])) return try buildMatchNoneFilterClauseAlloc(alloc);
     if (tokens[2].kind != .number or tokens[op_index + 1].kind != .number) return error.UnsupportedSqlShape;
@@ -6415,7 +6441,6 @@ fn parseNumericArithmeticRangeFilterClauseAlloc(
     try validateDocumentScalarPredicateField(field);
     if (field.field_type != .numeric) return error.UnsupportedSqlShape;
 
-    const arithmetic_operator = documentNumericArithmeticOperatorName(tokens[1].kind) orelse return null;
     if (tokens[op_index].kind == .eq) {
         return try buildNumericArithmeticEqualFilterClauseAlloc(alloc, field.path, arithmetic_operator, tokens[2], tokens[op_index + 1]);
     }
@@ -9430,6 +9455,30 @@ test "document SQL lowers direct table md5 projection" {
     );
 }
 
+test "document SQL lowers direct table soundex projection" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "status", .path = "status", .field_type = .keyword },
+            .{ .name = "amount", .path = "amount", .field_type = .numeric },
+        },
+    };
+
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT soundex(status) AS status_soundex FROM docs WHERE _id = 'doc:a'");
+    defer parsed.deinit(alloc);
+    var lowered = try lowerDocumentReadPlanParsedSqlAlloc(alloc, &parsed, schema);
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), lowered.projection.len);
+    try std.testing.expectEqual(DocumentProjectionKind.text_soundex, lowered.projection[0].kind);
+    try std.testing.expectEqualStrings("status", lowered.projection[0].field);
+    try std.testing.expectEqualStrings("status_soundex", lowered.projection[0].output);
+
+    var wrong_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT soundex(amount) AS amount_soundex FROM docs WHERE _id = 'doc:a'");
+    defer wrong_type.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_type, schema));
+}
+
 test "document SQL lowers direct table text length projections" {
     const alloc = std.testing.allocator;
     const schema = runtime_schema.TableSchema{
@@ -10314,7 +10363,8 @@ test "document SQL lowers direct table array position predicate" {
             .{ .name = "scores", .path = "scores", .field_type = .array, .array_item_type = .numeric },
         },
     };
-    const capabilities = DocumentProducerCapabilities{
+    const capabilities = source_binding.DocumentSqlCapabilities{
+        .indexed_scalar_filters = true,
         .indexed_array_element_paths = &.{"/tags"},
     };
 
@@ -10412,7 +10462,8 @@ test "document SQL lowers direct table array overlap predicate" {
             .{ .name = "scores", .path = "scores", .field_type = .array, .array_item_type = .numeric },
         },
     };
-    const capabilities = DocumentProducerCapabilities{
+    const capabilities = source_binding.DocumentSqlCapabilities{
+        .indexed_scalar_filters = true,
         .indexed_array_element_paths = &.{"/tags"},
     };
 
@@ -10474,7 +10525,8 @@ test "document SQL lowers direct table array contains predicate" {
             .{ .name = "scores", .path = "scores", .field_type = .array, .array_item_type = .numeric },
         },
     };
-    const capabilities = DocumentProducerCapabilities{
+    const capabilities = source_binding.DocumentSqlCapabilities{
+        .indexed_scalar_filters = true,
         .indexed_array_element_paths = &.{"/tags"},
     };
 
@@ -10539,7 +10591,8 @@ test "document SQL lowers direct table JSON key exists predicates" {
             .{ .name = "status", .path = "status", .field_type = .keyword },
         },
     };
-    const capabilities = DocumentProducerCapabilities{
+    const capabilities = source_binding.DocumentSqlCapabilities{
+        .indexed_scalar_filters = true,
         .indexed_scalar_filter_paths = &.{ "/metadata/flags", "/metadata/source", "/metadata/billing/plan", "/metadata" },
     };
 
@@ -11858,7 +11911,7 @@ test "document SQL capability-aware aggregate requires full text producer" {
     var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs WHERE full_text_search('body:alpha')");
     defer parsed.deinit(alloc);
 
-    try std.testing.expectError(error.DocumentSqlIndexUnavailable, lowerDocumentAggregatePlanWithOptionalIndexesAndCapabilitiesParsedSqlAlloc(alloc, &parsed, schema, null, .{
+    try std.testing.expectError(error.DocumentSqlBoundedScanMissingExactProducer, lowerDocumentAggregatePlanWithOptionalIndexesAndCapabilitiesParsedSqlAlloc(alloc, &parsed, schema, null, .{
         .full_text_filters = false,
         .bounded_scan = .{ .max_rows = 25 },
     }));
@@ -12617,7 +12670,12 @@ test "document SQL rejects unsupported ilike predicates" {
     };
     var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, title FROM docs WHERE title ILIKE 'alp%' LIMIT 10");
     defer parsed.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &parsed, schema));
+    var lowered = try lowerDocumentReadPlanParsedSqlAlloc(alloc, &parsed, schema);
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "{\"disjuncts\":[{\"prefix\":{\"path\":\"/title\",\"value\":\"alp\"}},{\"prefix\":{\"path\":\"/title\",\"value\":\"alP\"}},{\"prefix\":{\"path\":\"/title\",\"value\":\"aLp\"}},{\"prefix\":{\"path\":\"/title\",\"value\":\"aLP\"}},{\"prefix\":{\"path\":\"/title\",\"value\":\"Alp\"}},{\"prefix\":{\"path\":\"/title\",\"value\":\"AlP\"}},{\"prefix\":{\"path\":\"/title\",\"value\":\"ALp\"}},{\"prefix\":{\"path\":\"/title\",\"value\":\"ALP\"}}]}",
+        lowered.producer.indexed_query.filter_query_json.?,
+    );
 }
 
 test "document SQL lowers json path equality to indexed filter producer" {
@@ -13785,7 +13843,8 @@ test "document SQL combines typed virtual scalar fields with independent index r
     defer cast_path_lowered.deinit(alloc);
     try std.testing.expectEqualStrings("/metrics/score", cast_path_lowered.projection[1].field);
     try std.testing.expectEqualStrings("score", cast_path_lowered.projection[1].output);
-    try std.testing.expectEqualStrings("{\"numeric_range\":{\"path\":\"/metrics/score\",\"min\":7,\"inclusive_min\":true}}", cast_path_lowered.producer.indexed_query.filter_query_json.?);
+    try std.testing.expectEqual(@as(u32, 25), cast_path_lowered.producer.bounded_scan.max_rows);
+    try std.testing.expectEqualStrings("{\"scalar_numeric_cast_range\":{\"path\":\"/metrics/score\",\"min\":7,\"inclusive_min\":true}}", cast_path_lowered.producer.bounded_scan.residual_filter_json.?);
     try std.testing.expect(cast_path_lowered.order_by != null);
     try std.testing.expectEqualStrings("/metrics/score", cast_path_lowered.order_by.?.field);
     try std.testing.expectEqual(runtime_schema.AntflyType.numeric, cast_path_lowered.order_by.?.field_type);
@@ -13793,7 +13852,7 @@ test "document SQL combines typed virtual scalar fields with independent index r
 
     var wrong_cast = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE CAST(metrics->>'score' AS text) = '7' LIMIT 10;");
     defer wrong_cast.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &wrong_cast, schema, virtual_schema, .{
+    try std.testing.expectError(error.DocumentSqlBoundedScanPolicyRequired, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &wrong_cast, schema, virtual_schema, .{
         .indexed_scalar_filter_paths = &.{"/metrics/score"},
     }));
 }
@@ -15116,6 +15175,15 @@ test "document SQL lowers unary text function predicates as residual filters" {
     try std.testing.expectEqualStrings(
         "{\"text_unary_term\":{\"path\":\"/category\",\"operator\":\"md5\",\"value\":\"5d41402abc4b2a76b9719d911017c592\"}}",
         scan_lowered.producer.bounded_scan.residual_filter_json.?,
+    );
+
+    var soundex_scan = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE soundex(status) = 'A231' LIMIT 10");
+    defer soundex_scan.deinit(alloc);
+    var soundex_scan_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &soundex_scan, schema, .{ .max_rows = 25 });
+    defer soundex_scan_lowered.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"soundex\",\"value\":\"A231\"}}",
+        soundex_scan_lowered.producer.bounded_scan.residual_filter_json.?,
     );
 
     var reverse_scan = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE reverse(category) = 'ydaer' LIMIT 10");
@@ -16751,7 +16819,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
     try std.testing.expectEqualStrings("[\"urgent\",\"vip\"]", in_not_in_filter_lowered.unnest.?.filter_values_json.?);
     try std.testing.expectEqualStrings("[\"vip\"]", in_not_in_filter_lowered.unnest.?.filter_not_values_json.?);
     try std.testing.expectEqualStrings(
-        "{\"array_any\":{\"path\":\"/tags\",\"value\":\"urgent\"}}",
+        "{\"disjuncts\":[{\"array_any\":{\"path\":\"/tags\",\"value\":\"urgent\"}}]}",
         in_not_in_filter_lowered.producer.indexed_query.filter_query_json.?,
     );
 
@@ -17072,7 +17140,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
     });
     defer view_mapping_numeric_function_residual_lowered.deinit(alloc);
     try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/plan\",\"value\":\"pro\"}}", view_mapping_numeric_function_residual_lowered.producer.indexed_query.filter_query_json.?);
-    try std.testing.expectEqualStrings("{\"numeric_unary_range\":{\"path\":\"/score\",\"function\":\"sqrt\",\"min\":2,\"inclusive_min\":true}}", view_mapping_numeric_function_residual_lowered.producer.indexed_query.residual_filter_json.?);
+    try std.testing.expectEqualStrings("{\"numeric_unary_range\":{\"path\":\"/score\",\"operator\":\"sqrt\",\"min\":2,\"inclusive_min\":true}}", view_mapping_numeric_function_residual_lowered.producer.indexed_query.residual_filter_json.?);
 
     var view_mapping_regexp_function_residual = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id FROM support_view AS d WHERE d.plan = 'pro' AND regexp_count(d.plan, '[a-z]+') >= 1 LIMIT 10");
     defer view_mapping_regexp_function_residual.deinit(alloc);
@@ -17092,7 +17160,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
     });
     defer view_mapping_ilike_residual_lowered.deinit(alloc);
     try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/plan\",\"value\":\"pro\"}}", view_mapping_ilike_residual_lowered.producer.indexed_query.filter_query_json.?);
-    try std.testing.expectEqualStrings("{\"disjuncts\":[{\"prefix\":{\"path\":\"/region\",\"value\":\"west\"}},{\"prefix\":{\"path\":\"/region\",\"value\":\"West\"}}]}", view_mapping_ilike_residual_lowered.producer.indexed_query.residual_filter_json.?);
+    try std.testing.expectEqualStrings("{\"disjuncts\":[{\"prefix\":{\"path\":\"/region\",\"value\":\"west\"}},{\"prefix\":{\"path\":\"/region\",\"value\":\"wesT\"}},{\"prefix\":{\"path\":\"/region\",\"value\":\"weSt\"}},{\"prefix\":{\"path\":\"/region\",\"value\":\"weST\"}},{\"prefix\":{\"path\":\"/region\",\"value\":\"wEst\"}},{\"prefix\":{\"path\":\"/region\",\"value\":\"wEsT\"}},{\"prefix\":{\"path\":\"/region\",\"value\":\"wESt\"}},{\"prefix\":{\"path\":\"/region\",\"value\":\"wEST\"}},{\"prefix\":{\"path\":\"/region\",\"value\":\"West\"}},{\"prefix\":{\"path\":\"/region\",\"value\":\"WesT\"}},{\"prefix\":{\"path\":\"/region\",\"value\":\"WeSt\"}},{\"prefix\":{\"path\":\"/region\",\"value\":\"WeST\"}},{\"prefix\":{\"path\":\"/region\",\"value\":\"WEst\"}},{\"prefix\":{\"path\":\"/region\",\"value\":\"WEsT\"}},{\"prefix\":{\"path\":\"/region\",\"value\":\"WESt\"}},{\"prefix\":{\"path\":\"/region\",\"value\":\"WEST\"}}]}", view_mapping_ilike_residual_lowered.producer.indexed_query.residual_filter_json.?);
 
     var view_mapping_regex_residual = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id FROM support_view AS d WHERE d.plan = 'pro' AND d.plan ~ '^pro' LIMIT 10");
     defer view_mapping_regex_residual.deinit(alloc);
@@ -17151,19 +17219,9 @@ test "document SQL lowers explicit array unnest over bounded scan" {
         .bounded_scan = .{ .max_rows = 25 },
     }));
 
-    var view_mapping_malformed_not_in = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id FROM support_view AS d WHERE d.plan = 'pro' AND d.region NOT IN ('internal',) LIMIT 10");
-    defer view_mapping_malformed_not_in.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_malformed_not_in, schema, view_mapping_virtual_schema, .{
-        .indexed_scalar_filter_paths = &.{"/plan"},
-        .bounded_scan = .{ .max_rows = 25 },
-    }));
+    try std.testing.expectError(error.UnexpectedToken, tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id FROM support_view AS d WHERE d.plan = 'pro' AND d.region NOT IN ('internal',) LIMIT 10"));
 
-    var view_mapping_malformed_or = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id FROM support_view AS d WHERE d.plan = 'seed' AND (d.plan = 'pro' OR) LIMIT 10");
-    defer view_mapping_malformed_or.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_malformed_or, schema, view_mapping_virtual_schema, .{
-        .indexed_scalar_filter_paths = &.{"/plan"},
-        .bounded_scan = .{ .max_rows = 25 },
-    }));
+    try std.testing.expectError(error.UnexpectedToken, tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id FROM support_view AS d WHERE d.plan = 'seed' AND (d.plan = 'pro' OR) LIMIT 10"));
 
     var view_mapping_json_projection = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, json_typeof(d.metadata->'flags') AS flags_type, json_array_length(json_extract_path(d.metadata, 'events')) AS event_count FROM support_view AS d WHERE d.plan = 'pro' LIMIT 10");
     defer view_mapping_json_projection.deinit(alloc);
@@ -17486,7 +17544,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
     });
     defer view_mapping_correlated_lateral_residual_without_unique_lowered.deinit(alloc);
     try std.testing.expect(view_mapping_correlated_lateral_residual_without_unique_lowered.lateral_subquery != null);
-    try std.testing.expect(view_mapping_correlated_lateral_residual_without_unique_lowered.lateral_subquery.?.branch_lookup_required);
+    try std.testing.expect(!view_mapping_correlated_lateral_residual_without_unique_lowered.lateral_subquery.?.branch_lookup_required);
     try std.testing.expect(view_mapping_correlated_lateral_residual_without_unique_lowered.lateral_subquery.?.residual_filter_json != null);
 
     var view_mapping_correlated_lateral_source_residual_without_unique = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan AND s.score > d.score LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10");
@@ -17497,7 +17555,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
     });
     defer view_mapping_correlated_lateral_source_residual_without_unique_lowered.deinit(alloc);
     try std.testing.expect(view_mapping_correlated_lateral_source_residual_without_unique_lowered.lateral_subquery != null);
-    try std.testing.expect(view_mapping_correlated_lateral_source_residual_without_unique_lowered.lateral_subquery.?.branch_lookup_required);
+    try std.testing.expect(!view_mapping_correlated_lateral_source_residual_without_unique_lowered.lateral_subquery.?.branch_lookup_required);
     try std.testing.expectEqual(@as(usize, 1), view_mapping_correlated_lateral_source_residual_without_unique_lowered.lateral_subquery.?.field_residuals.len);
 
     var view_mapping_nonunique_alternate_projection_pinned = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan AND s.score = 60 ORDER BY s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10");
@@ -17508,7 +17566,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
     });
     defer view_mapping_nonunique_alternate_projection_pinned_lowered.deinit(alloc);
     try std.testing.expect(view_mapping_nonunique_alternate_projection_pinned_lowered.lateral_subquery != null);
-    try std.testing.expect(view_mapping_nonunique_alternate_projection_pinned_lowered.lateral_subquery.?.branch_lookup_required);
+    try std.testing.expect(!view_mapping_nonunique_alternate_projection_pinned_lowered.lateral_subquery.?.branch_lookup_required);
     try std.testing.expect(view_mapping_nonunique_alternate_projection_pinned_lowered.lateral_subquery.?.branch_ordered);
     try std.testing.expectEqualStrings("score", view_mapping_nonunique_alternate_projection_pinned_lowered.lateral_subquery.?.field);
     try std.testing.expectEqualStrings("/score", view_mapping_nonunique_alternate_projection_pinned_lowered.lateral_subquery.?.path);
@@ -17528,7 +17586,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
     });
     defer view_mapping_nonunique_alternate_projection_ordered_lowered.deinit(alloc);
     try std.testing.expect(view_mapping_nonunique_alternate_projection_ordered_lowered.lateral_subquery != null);
-    try std.testing.expect(view_mapping_nonunique_alternate_projection_ordered_lowered.lateral_subquery.?.branch_lookup_required);
+    try std.testing.expect(!view_mapping_nonunique_alternate_projection_ordered_lowered.lateral_subquery.?.branch_lookup_required);
     try std.testing.expectEqual(@as(usize, 1), view_mapping_nonunique_alternate_projection_ordered_lowered.lateral_subquery.?.branch_order_by.len);
     try std.testing.expectEqualStrings("/score", view_mapping_nonunique_alternate_projection_ordered_lowered.lateral_subquery.?.branch_order_by[0].field);
     try std.testing.expectEqual(DocumentOrderDirection.desc, view_mapping_nonunique_alternate_projection_ordered_lowered.lateral_subquery.?.branch_order_by[0].direction);
@@ -17541,7 +17599,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
     });
     defer view_mapping_nonunique_alternate_projection_compound_ordered_lowered.deinit(alloc);
     try std.testing.expect(view_mapping_nonunique_alternate_projection_compound_ordered_lowered.lateral_subquery != null);
-    try std.testing.expect(view_mapping_nonunique_alternate_projection_compound_ordered_lowered.lateral_subquery.?.branch_lookup_required);
+    try std.testing.expect(!view_mapping_nonunique_alternate_projection_compound_ordered_lowered.lateral_subquery.?.branch_lookup_required);
     try std.testing.expectEqual(@as(usize, 2), view_mapping_nonunique_alternate_projection_compound_ordered_lowered.lateral_subquery.?.branch_order_by.len);
     try std.testing.expectEqualStrings("/score", view_mapping_nonunique_alternate_projection_compound_ordered_lowered.lateral_subquery.?.branch_order_by[0].field);
     try std.testing.expectEqual(DocumentOrderDirection.desc, view_mapping_nonunique_alternate_projection_compound_ordered_lowered.lateral_subquery.?.branch_order_by[0].direction);
@@ -17556,7 +17614,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
     });
     defer view_mapping_nonunique_alternate_projection_later_unique_compound_ordered_lowered.deinit(alloc);
     try std.testing.expect(view_mapping_nonunique_alternate_projection_later_unique_compound_ordered_lowered.lateral_subquery != null);
-    try std.testing.expect(view_mapping_nonunique_alternate_projection_later_unique_compound_ordered_lowered.lateral_subquery.?.branch_lookup_required);
+    try std.testing.expect(!view_mapping_nonunique_alternate_projection_later_unique_compound_ordered_lowered.lateral_subquery.?.branch_lookup_required);
     try std.testing.expectEqual(@as(usize, 2), view_mapping_nonunique_alternate_projection_later_unique_compound_ordered_lowered.lateral_subquery.?.branch_order_by.len);
     try std.testing.expectEqualStrings("/plan", view_mapping_nonunique_alternate_projection_later_unique_compound_ordered_lowered.lateral_subquery.?.branch_order_by[0].field);
     try std.testing.expectEqual(DocumentOrderDirection.asc, view_mapping_nonunique_alternate_projection_later_unique_compound_ordered_lowered.lateral_subquery.?.branch_order_by[0].direction);
@@ -17714,10 +17772,10 @@ test "document SQL lowers explicit array unnest over bounded scan" {
 
     try std.testing.expect(residual_lowered.unnest != null);
     try std.testing.expectEqualStrings("\"urgent\"", residual_lowered.unnest.?.filter_value_json.?);
-    try std.testing.expectEqual(@as(u32, 25), residual_lowered.producer.bounded_scan.max_rows);
+    try std.testing.expect(residual_lowered.producer.indexed_query.max_candidate_rows == null);
     try std.testing.expectEqualStrings(
         "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
-        residual_lowered.producer.bounded_scan.residual_filter_json.?,
+        residual_lowered.producer.indexed_query.residual_filter_json.?,
     );
 
     var lookup = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE d._id = 'doc:a' AND tag = 'urgent' LIMIT 10");

@@ -764,11 +764,18 @@ fn isGeneratedTableOrIndexDdlHead(tokens: []const Token, raw_statement: RawSqlSt
     const second = tokens[start + 1];
     if (tokenMatchesKeyword(first, .create)) {
         var object_index = start + 1;
+        if (object_index + 2 < end and
+            tokenMatchesKeyword(tokens[object_index], .@"or") and
+            tokenMatchesKeyword(tokens[object_index + 1], .replace))
+        {
+            object_index += 2;
+        }
         consumeRelationLifetime(tokens, &object_index, end);
         if (object_index >= end) return false;
         const object = tokens[object_index];
         return tokenMatchesKeyword(object, .table) or
             tokenMatchesKeyword(object, .index) or
+            (tokenMatchesKeyword(object, .materialized) and object_index + 1 < end and tokenMatchesKeyword(tokens[object_index + 1], .view)) or
             (tokenMatchesKeyword(object, .unique) and object_index + 1 < end and tokenMatchesKeyword(tokens[object_index + 1], .index));
     }
     if (tokenMatchesKeyword(first, .alter)) {
@@ -789,15 +796,18 @@ fn isGeneratedUnsupportedHead(tokens: []const Token, raw_statement: RawSqlStatem
         tokenMatchesKeyword(first, .call) or
         tokenMatchesKeyword(first, .checkpoint) or
         tokenMatchesKeyword(first, .cluster) or
+        tokenMatchesKeyword(first, .comment) or
         tokenMatchesKeyword(first, .copy) or
         tokenMatchesText(first, "do") or
         tokenMatchesKeyword(first, .explain) or
+        tokenMatchesKeyword(first, .grant) or
         tokenMatchesKeyword(first, .listen) or
         tokenMatchesText(first, "load") or
         tokenMatchesText(first, "lock") or
         tokenMatchesKeyword(first, .match) or
         tokenMatchesKeyword(first, .notify) or
         tokenMatchesKeyword(first, .reindex) or
+        tokenMatchesKeyword(first, .revoke) or
         tokenMatchesKeyword(first, .security) or
         tokenMatchesKeyword(first, .unlisten) or
         tokenMatchesKeyword(first, .vacuum))
@@ -1934,7 +1944,6 @@ fn generatedDdlAstHasValidClassificationPayload(
     if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.version_tokens)) return false;
     if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.index_table_tokens)) return false;
     if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.index_method_tokens)) return false;
-    if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.index_elements_tokens)) return false;
     if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.index_include_tokens)) return false;
     if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.index_options_tokens)) return false;
     if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.index_where_tokens)) return false;
@@ -2235,7 +2244,7 @@ fn generatedDdlCreateIndexPayloadIsValid(
 
     const elements = ddl_ast.index_elements_tokens orelse return false;
     if (cursor >= end or tokens[cursor].kind != .lparen) return false;
-    if (elements.start != cursor + 1 or elements.end <= elements.start or elements.end >= end) return false;
+    if (elements.start != cursor + 1 or elements.end < elements.start or elements.end >= end) return false;
     if (tokens[elements.end].kind != .rparen) return false;
     cursor = elements.end + 1;
 
@@ -6523,10 +6532,22 @@ fn generatedReadSubqueryBodyCursorIsValid(
 fn generatedReadSubqueryTailStart(maybe_tail: ?*generated_parser.GeneratedSqlSubqueryTailAst) ?usize {
     const tail = maybe_tail orelse return null;
     var start: ?usize = null;
-    if (tail.order_tokens) |range| generatedReadSetMinIndex(&start, range.start);
-    if (tail.limit_tokens) |range| generatedReadSetMinIndex(&start, range.start);
-    if (tail.offset_tokens) |range| generatedReadSetMinIndex(&start, range.start);
-    if (tail.fetch_tokens) |range| generatedReadSetMinIndex(&start, range.start);
+    if (tail.order_tokens) |range| {
+        if (range.start < 2) return null;
+        generatedReadSetMinIndex(&start, range.start - 2);
+    }
+    if (tail.limit_tokens) |range| {
+        if (range.start == 0) return null;
+        generatedReadSetMinIndex(&start, range.start - 1);
+    }
+    if (tail.offset_tokens) |range| {
+        if (range.start == 0) return null;
+        generatedReadSetMinIndex(&start, range.start - 1);
+    }
+    if (tail.fetch_tokens) |range| {
+        if (range.start == 0) return null;
+        generatedReadSetMinIndex(&start, range.start - 1);
+    }
     return start;
 }
 
@@ -8659,11 +8680,6 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .alter_table_set_schema_not_planned_by_generated_parser,
         },
         .{
-            .sql = "ALTER TABLE usage_records REPLICA IDENTITY FULL",
-            .kind = .alter_table_replica_identity,
-            .reason = .alter_table_replica_identity_not_planned_by_generated_parser,
-        },
-        .{
             .sql = "ALTER TABLE usage_records ENABLE TRIGGER usage_audit",
             .kind = .alter_table_trigger_state,
             .reason = .alter_table_trigger_state_not_planned_by_generated_parser,
@@ -8717,11 +8733,6 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "CLUSTER usage_records USING usage_status_idx",
             .kind = .cluster,
             .reason = .cluster_not_planned_by_generated_parser,
-        },
-        .{
-            .sql = "COMMENT ON TABLE usage_records IS 'billing rows'",
-            .kind = .comment,
-            .reason = .comment_not_planned_by_generated_parser,
         },
         .{
             .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)",
@@ -9024,11 +9035,6 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .drop_view_multi_not_planned_by_generated_parser,
         },
         .{
-            .sql = "GRANT SELECT ON TABLE usage_records TO readonly",
-            .kind = .grant,
-            .reason = .grant_not_planned_by_generated_parser,
-        },
-        .{
             .sql = "LISTEN usage_events",
             .kind = .listen,
             .reason = .listen_not_planned_by_generated_parser,
@@ -9092,11 +9098,6 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "REASSIGN OWNED BY old_role TO new_role",
             .kind = .reassign_owned,
             .reason = .reassign_owned_not_planned_by_generated_parser,
-        },
-        .{
-            .sql = "REVOKE SELECT ON TABLE usage_records FROM readonly",
-            .kind = .revoke,
-            .reason = .revoke_not_planned_by_generated_parser,
         },
         .{
             .sql = "SET ROLE app_user",
@@ -9481,6 +9482,38 @@ test "sql adapter parsed sql owns typed statement variants" {
         else => return error.TestUnexpectedResult,
     }
 
+    var create_replace_table = try ParsedSql.initAlloc(alloc, "CREATE OR REPLACE TABLE usage_records (id text)");
+    defer create_replace_table.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, create_replace_table.generatedStatementKind().?);
+    switch (create_replace_table.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl_ast.kind);
+            try std.testing.expect(ddl_ast.replace_existing);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl_ast.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (create_replace_table.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var comment_extension = try ParsedSql.initAlloc(alloc, "COMMENT ON EXTENSION vector IS 'vector search extension'");
+    defer comment_extension.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, comment_extension.generatedStatementKind().?);
+    switch (comment_extension.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.comment, ddl_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlCommentTarget.extension, ddl_ast.comment_target.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 4 }, ddl_ast.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (comment_extension.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
     var create_function = try ParsedSql.initAlloc(alloc, "CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger LANGUAGE plpgsql");
     defer create_function.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, create_function.generatedStatementKind().?);
@@ -9695,6 +9728,23 @@ test "sql adapter parsed sql owns typed statement variants" {
         else => return error.TestUnexpectedResult,
     }
     switch (create_materialized_view.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_replace_materialized_view = try ParsedSql.initAlloc(alloc, "CREATE OR REPLACE MATERIALIZED VIEW usage_summary AS SELECT status FROM usage_records WITH NO DATA");
+    defer create_replace_materialized_view.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, create_replace_materialized_view.generatedStatementKind().?);
+    switch (create_replace_materialized_view.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_materialized_view, ddl_ast.kind);
+            try std.testing.expect(ddl_ast.replace_existing);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 14 }, ddl_ast.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (create_replace_materialized_view.statement) {
         .ddl => {},
         else => return error.TestUnexpectedResult,
     }
@@ -13349,6 +13399,16 @@ test "sql adapter parsed sql read statement kind can come from generated AST" {
     try std.testing.expect(generatedReadAstHasValidClassificationPayload(scalar_subquery_tokens, scalar_subquery_read_ast));
     try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, generated_scalar_subquery_projection.generatedReadStatementKind().?);
     try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, generated_scalar_subquery_projection.readStatementKindIncludingGeneratedAst().?);
+
+    var generated_tailed_scalar_subquery_projection = try ParsedSql.initAlloc(alloc, "SELECT (SELECT status FROM usage_records WHERE active IS TRUE ORDER BY status DESC LIMIT 1) AS first_status FROM usage_records");
+    defer generated_tailed_scalar_subquery_projection.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, generated_tailed_scalar_subquery_projection.generatedReadStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, generated_tailed_scalar_subquery_projection.readStatementKindIncludingGeneratedAst().?);
+
+    var generated_tailed_subquery_predicate = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE status IN (SELECT status FROM usage_records ORDER BY status DESC NULLS LAST LIMIT +2 OFFSET +1 ROW)");
+    defer generated_tailed_subquery_predicate.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, generated_tailed_subquery_predicate.generatedReadStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, generated_tailed_subquery_predicate.readStatementKindIncludingGeneratedAst().?);
 }
 
 test "sql adapter parsed sql read statement kind is generated-owned for covered reads" {

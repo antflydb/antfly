@@ -87,6 +87,7 @@ pub const SelectItemStart = enum {
     repeat,
     reverse,
     md5,
+    soundex,
     starts_with,
     ends_with,
     date_trunc,
@@ -149,6 +150,7 @@ pub fn selectItemStartAt(tokens: []const Token, pos: usize) ?SelectItemStart {
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsRepeatFunction)) return .repeat;
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsReverseFunction)) return .reverse;
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsMd5Function)) return .md5;
+    if (expr_token.peekFixedUnaryFunctionCall(tokens, pos, .soundex)) return .soundex;
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsStartsWithFunction)) return .starts_with;
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsEndsWithFunction)) return .ends_with;
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsDateTruncFunction)) return .date_trunc;
@@ -1634,6 +1636,7 @@ pub fn selectOutputOrderByRefAlloc(
         .coalesce => .{ .expression = try expressionFromCoalesceProjectionAlloc(alloc, select.coalesce[output.index]) },
         .field_alias => try orderForOwnedOutputFieldAlloc(alloc, schema, try alloc.dupe(u8, select.field_aliases[output.index].field)),
         .expression => blk: {
+            if (select.scalar_subqueries.len != 0) break :blk try orderForOwnedOutputFieldAlloc(alloc, schema, try alloc.dupe(u8, select.expressions[output.index].output));
             const expression = select.expressions[output.index].expression;
             if (expression.kind == .field) break :blk try orderForOwnedOutputFieldAlloc(alloc, schema, try alloc.dupe(u8, expression.field));
             break :blk .{ .expression = try cloneExpressionAlloc(alloc, expression) };
@@ -2062,6 +2065,7 @@ fn generatedSelectItemStartAllowsExpressionKind(
         .repeat,
         .reverse,
         .md5,
+        .soundex,
         .starts_with,
         .ends_with,
         .date_trunc,
@@ -2119,6 +2123,7 @@ fn validateGeneratedSelectItemStartFunctionName(
         .repeat,
         .reverse,
         .md5,
+        .soundex,
         .starts_with,
         .ends_with,
         .date_trunc,
@@ -2159,6 +2164,7 @@ fn validateGeneratedSelectItemStartFunctionName(
         .repeat => expr_token.sqlTokenIsRepeatFunction(token),
         .reverse => expr_token.sqlTokenIsReverseFunction(token),
         .md5 => expr_token.sqlTokenIsMd5Function(token),
+        .soundex => std.ascii.eqlIgnoreCase(token.text, "soundex"),
         .starts_with => expr_token.sqlTokenIsStartsWithFunction(token),
         .ends_with => expr_token.sqlTokenIsEndsWithFunction(token),
         .date_trunc => expr_token.sqlTokenIsDateTruncFunction(token),
@@ -3119,6 +3125,7 @@ pub fn parseSelectItemAlloc(
             .repeat => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
             .reverse => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
             .md5 => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .soundex => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
             .starts_with => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
             .ends_with => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
             .date_trunc => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },

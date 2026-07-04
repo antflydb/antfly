@@ -22,6 +22,7 @@ pub const backups = @import("backups.zig");
 pub const linear_merge = @import("linear_merge.zig");
 pub const relational_rows = @import("relational_rows.zig");
 pub const catalog_resources = @import("catalog_resources.zig");
+pub const table_catalog = @import("../metadata/catalog/routing.zig");
 pub const sql_adapter = @import("../sql/mod.zig");
 const sql_adapter_integration = @import("sql_adapter_integration.zig");
 const public_sql_endpoint_parity = @import("public_sql_endpoint_parity.zig");

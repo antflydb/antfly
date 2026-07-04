@@ -172,6 +172,24 @@ pub fn schemaWithSecondaryIndexReadyAlloc(
     index_name: []const u8,
     expected_generation: u64,
 ) ![]u8 {
+    return try schemaWithSecondaryIndexReadyCheckedAlloc(alloc, schema_json, index_name, .{
+        .generation = expected_generation,
+    });
+}
+
+pub const SecondaryIndexReadyExpectation = struct {
+    generation: u64,
+    access_method: ?runtime_schema.RelationalIndexAccessMethod = null,
+    schema_fingerprint: ?[]const u8 = null,
+};
+
+pub fn schemaWithSecondaryIndexReadyCheckedAlloc(
+    alloc: std.mem.Allocator,
+    schema_json: []const u8,
+    index_name: []const u8,
+    expected: SecondaryIndexReadyExpectation,
+) ![]u8 {
+    const expected_generation = expected.generation;
     if (expected_generation == 0) return error.InvalidSchemaUpdateRequest;
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
     defer parsed.deinit();
@@ -198,9 +216,23 @@ pub fn schemaWithSecondaryIndexReadyAlloc(
     const generation: u64 = @intCast(generation_value.integer);
     if (generation != expected_generation) return error.SecondaryIndexGenerationMismatch;
 
+    if (expected.access_method) |expected_method| {
+        const access_method_value = property.object.get("x-antfly-index-access-method") orelse return error.SecondaryIndexAccessMethodMismatch;
+        if (access_method_value != .string) return error.InvalidSchemaUpdateRequest;
+        const actual_method = runtime_schema.RelationalIndexAccessMethod.fromString(access_method_value.string) orelse return error.InvalidSchemaUpdateRequest;
+        if (actual_method != expected_method) return error.SecondaryIndexAccessMethodMismatch;
+    }
+
+    if (expected.schema_fingerprint) |expected_fingerprint| {
+        if (expected_fingerprint.len == 0) return error.InvalidSchemaUpdateRequest;
+        const fingerprint_value = property.object.get("x-antfly-index-schema-fingerprint") orelse return error.SecondaryIndexSchemaFingerprintMismatch;
+        if (fingerprint_value != .string or fingerprint_value.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        if (!std.mem.eql(u8, fingerprint_value.string, expected_fingerprint)) return error.SecondaryIndexSchemaFingerprintMismatch;
+    }
+
     const lifecycle_value = property.object.getPtr("x-antfly-index-lifecycle") orelse return error.SecondaryIndexNotBuilding;
     if (lifecycle_value.* != .string) return error.InvalidSchemaUpdateRequest;
-    if (!std.mem.eql(u8, lifecycle_value.string, "building")) return error.SecondaryIndexNotBuilding;
+    if (!std.mem.eql(u8, lifecycle_value.string, "building") and !std.mem.eql(u8, lifecycle_value.string, "catching_up")) return error.SecondaryIndexNotBuilding;
     lifecycle_value.* = .{ .string = "ready" };
 
     const updated = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});

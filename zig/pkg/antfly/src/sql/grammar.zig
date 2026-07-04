@@ -5024,6 +5024,7 @@ fn ddlGeneratedFunctionExpressionKind(name: []const u8) ?runtime_schema.Relation
     if (std.ascii.eqlIgnoreCase(name, "ascii")) return .ascii;
     if (std.ascii.eqlIgnoreCase(name, "chr")) return .chr;
     if (std.ascii.eqlIgnoreCase(name, "md5")) return .md5;
+    if (std.ascii.eqlIgnoreCase(name, "soundex")) return .soundex;
     if (std.ascii.eqlIgnoreCase(name, "concat")) return .concat;
     if (std.ascii.eqlIgnoreCase(name, "concat_ws")) return .concat_ws;
     if (std.ascii.eqlIgnoreCase(name, "length") or std.ascii.eqlIgnoreCase(name, "char_length") or std.ascii.eqlIgnoreCase(name, "character_length")) return .length;
@@ -5234,7 +5235,48 @@ pub fn parseDdlDefaultValueUntypedAlloc(
     if (try parseOptionalDdlKnownDefault(tokens, pos)) |known| {
         return try ddlDefaultValueFromKnownSyntaxAlloc(alloc, known, null);
     }
+    if (try parseOptionalDdlScalarSubqueryDefaultAlloc(alloc, tokens, pos)) |value| return value;
     return .{ .kind = .literal, .value_json = try sql_value.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos) };
+}
+
+pub fn parseOptionalDdlScalarSubqueryDefaultAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !?runtime_schema.RelationalDefaultValue {
+    if (pos.* + 2 >= tokens.len or tokens[pos.*].kind != .lparen or !tokens[pos.* + 1].matchesKeywordTag(.select)) return null;
+    const close_index = findMatchingParen(tokens, pos.*, tokens.len) orelse return error.UnsupportedSqlShape;
+    if (close_index <= pos.* + 1) return error.UnsupportedSqlShape;
+
+    const value_json = try ddlScalarSubqueryDefaultPayloadJsonAlloc(alloc, tokens[pos.* + 1 .. close_index]);
+    pos.* = close_index + 1;
+    return .{
+        .kind = .scalar_subquery,
+        .value_json = value_json,
+    };
+}
+
+fn ddlScalarSubqueryDefaultPayloadJsonAlloc(
+    alloc: std.mem.Allocator,
+    query_tokens: []const Token,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"query\":{\"kind\":\"tokenized_sql\",\"tokens\":[");
+    for (query_tokens, 0..) |token, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writer.print("{{\"kind\":{f},\"text\":{f}", .{
+            std.json.fmt(@tagName(token.kind), .{}),
+            std.json.fmt(token.text, .{}),
+        });
+        if (token.keyword) |keyword| {
+            try writer.print(",\"keyword\":{f}", .{std.json.fmt(@tagName(keyword), .{})});
+        }
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("]}}");
+    return try out.toOwnedSlice();
 }
 
 pub fn ddlDefaultValueFromKnownSyntaxAlloc(
@@ -8456,9 +8498,22 @@ pub fn tokenRangeSqlTextAlloc(
     errdefer out.deinit(alloc);
     for (tokens[start..end], 0..) |token, index| {
         if (index != 0) try out.append(alloc, ' ');
-        try out.appendSlice(alloc, token.text);
+        try appendSqlTokenText(alloc, &out, token);
     }
     return try out.toOwnedSlice(alloc);
+}
+
+fn appendSqlTokenText(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), token: Token) !void {
+    if (token.kind != .string) {
+        try out.appendSlice(alloc, token.text);
+        return;
+    }
+    try out.append(alloc, '\'');
+    for (token.text) |ch| {
+        if (ch == '\'') try out.append(alloc, '\'');
+        try out.append(alloc, ch);
+    }
+    try out.append(alloc, '\'');
 }
 
 fn freeRoutineSettingList(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged(ddl_plan.RoutineSetting)) void {

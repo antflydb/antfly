@@ -14,6 +14,8 @@
 
 pub const platform_time = @import("platform/time.zig");
 pub const resource_manager = @import("storage/resource_manager.zig");
+pub const schema = @import("storage/schema.zig");
+pub const table_schema = @import("schema/mod.zig");
 pub const db = struct {
     pub const types = @import("storage/db/types.zig");
     pub const freeDBStats = @import("storage/db/types.zig").freeDBStats;

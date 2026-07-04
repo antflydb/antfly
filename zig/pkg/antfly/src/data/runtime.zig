@@ -6224,12 +6224,15 @@ pub const DataServer = struct {
                     {
                         lockAtomic(refresh_write_source.localDbMutex());
                         defer refresh_write_source.localDbMutex().unlock();
+                        const range_ptrs = try self.alloc.alloc(*const antfly.metadata.table_manager.RangeRecord, snapshot.ranges.len);
+                        defer self.alloc.free(range_ptrs);
+                        for (snapshot.ranges, 0..) |*range_record, index| range_ptrs[index] = range_record;
                         _ = try refresh_write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
                             self.alloc,
                             head.metadata_group_id,
                             group_ids_one[0..],
                             snapshot.tables,
-                            snapshot.ranges,
+                            range_ptrs,
                             backend_runtime,
                         );
                     }

@@ -37,6 +37,13 @@ const value_mod = @import("value.zig");
 
 const Token = token_mod.Token;
 
+fn generatedReadProjectionContainsSubquery(read: *const generated_parser.GeneratedSqlReadAst) bool {
+    for (read.projection_items.expressions) |expression| {
+        if (lower_expr.generatedExpressionContainsSubquery(expression)) return true;
+    }
+    return false;
+}
+
 pub const ParserState = struct {
     pub const ContextAccessors = ParserContextAccessors(@This());
 
@@ -1273,6 +1280,20 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             schema: runtime_schema.TableSchema,
         ) anyerror!plan.LoweredSelect {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
+            var generated_source_ast: ?*const generated_parser.GeneratedSqlReadAst = null;
+            if (self.generated_dml_ast) |dml_ast| {
+                const source_range = dml_ast.source_tokens orelse return error.UnsupportedSqlShape;
+                const source_read_body = dml_ast.source_read orelse return error.UnsupportedSqlShape;
+                const source_read = source_read_body.read_ast orelse return error.UnsupportedSqlShape;
+                if (generatedReadProjectionContainsSubquery(source_read)) {
+                    if (tokens.len == 0 or source_range.end <= source_range.start or source_range.end - source_range.start != tokens.len) return error.UnsupportedSqlShape;
+                    if (source_range.end > self.tokens.len) return error.UnsupportedSqlShape;
+                    if (self.tokens[source_range.start].source_start != tokens[0].source_start) return error.UnsupportedSqlShape;
+                    if (self.tokens[source_range.end - 1].source_end != tokens[tokens.len - 1].source_end) return error.UnsupportedSqlShape;
+                    try generated_read_validate.validateGeneratedReadAstPayloads(tokens, source_read.*);
+                    generated_source_ast = source_read;
+                }
+            }
             var sub = ParserType{
                 .alloc = self.alloc,
                 .tokens = tokens,
@@ -1280,6 +1301,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .params = self.params,
                 .function_bindings = self.function_bindings,
                 .unique_resolver = self.unique_resolver,
+                .generated_read_ast = generated_source_ast,
             };
             return try Accessors.parseSelect(&sub);
         }

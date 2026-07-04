@@ -783,7 +783,7 @@ pub fn graphTableFunctionSyntheticRowJsonAlloc(
     errdefer out.deinit();
     const writer = &out.writer;
     try writer.writeAll("{\"id\":\"\",\"score\":null,\"graph_name\":");
-    try std.json.Stringify.value(.{ .string = graph_name }, .{}, writer);
+    try writer.print("{f}", .{std.json.fmt(graph_name, .{})});
     try writer.writeAll(",\"node_key\":null,\"depth\":null,\"distance\":null,\"path_json\":null,\"match_json\":");
     try writer.writeAll(match_json);
     try writer.writeAll(",\"stored_json\":null");
@@ -804,7 +804,7 @@ pub fn graphTableFunctionHitRowJsonAlloc(
     errdefer out.deinit();
     const writer = &out.writer;
     try writer.writeAll("{\"id\":");
-    try std.json.Stringify.value(.{ .string = hit.id }, .{}, writer);
+    try writer.print("{f}", .{std.json.fmt(hit.id, .{})});
     try writer.writeAll(",\"score\":");
     if (hit.score) |score| {
         try writer.print("{d}", .{score});
@@ -826,7 +826,7 @@ pub fn graphTableFunctionNodeRowJsonAlloc(
     errdefer out.deinit();
     const writer = &out.writer;
     try writer.writeAll("{\"id\":");
-    try std.json.Stringify.value(.{ .string = node.key }, .{}, writer);
+    try writer.print("{f}", .{std.json.fmt(node.key, .{})});
     try writer.writeAll(",\"score\":null");
     try appendGraphTableFunctionTailJson(writer, graph_name, node, match_json, null, alias_projections, null);
     return try out.toOwnedSlice();
@@ -845,9 +845,9 @@ pub fn graphTableFunctionPatternMatchRowJsonAlloc(
     const node = if (match.bindings.len > 0) match.bindings[0].node else null;
     try writer.writeAll("{\"id\":");
     if (node) |value| {
-        try std.json.Stringify.value(.{ .string = value.key }, .{}, writer);
+        try writer.print("{f}", .{std.json.fmt(value.key, .{})});
     } else {
-        try std.json.Stringify.value(.{ .string = "" }, .{}, writer);
+        try writer.print("{f}", .{std.json.fmt("", .{})});
     }
     try writer.writeAll(",\"score\":null");
     try appendGraphTableFunctionTailJson(writer, graph_name, node, match_json, null, alias_projections, match);
@@ -863,13 +863,13 @@ pub fn graphMetricTableFunctionScoreRowJsonAlloc(
     errdefer out.deinit();
     const writer = &out.writer;
     try writer.writeAll("{\"id\":");
-    try std.json.Stringify.value(.{ .string = score.node }, .{}, writer);
+    try writer.print("{f}", .{std.json.fmt(score.node, .{})});
     try writer.writeAll(",\"score\":");
     try writer.print("{d}", .{score.score});
     try writer.writeAll(",\"graph_name\":");
-    try std.json.Stringify.value(.{ .string = graph_name }, .{}, writer);
+    try writer.print("{f}", .{std.json.fmt(graph_name, .{})});
     try writer.writeAll(",\"node_key\":");
-    try std.json.Stringify.value(.{ .string = score.node }, .{}, writer);
+    try writer.print("{f}", .{std.json.fmt(score.node, .{})});
     try writer.writeAll(",\"depth\":null,\"distance\":null,\"path_json\":null,\"match_json\":null,\"stored_json\":null}");
     return try out.toOwnedSlice();
 }
@@ -884,10 +884,10 @@ fn appendGraphTableFunctionTailJson(
     match: ?types.GraphPatternMatch,
 ) !void {
     try writer.writeAll(",\"graph_name\":");
-    try std.json.Stringify.value(.{ .string = graph_name }, .{}, writer);
+    try writer.print("{f}", .{std.json.fmt(graph_name, .{})});
     try writer.writeAll(",\"node_key\":");
     if (node) |value| {
-        try std.json.Stringify.value(.{ .string = value.key }, .{}, writer);
+        try writer.print("{f}", .{std.json.fmt(value.key, .{})});
     } else {
         try writer.writeAll("null");
     }
@@ -924,7 +924,7 @@ fn appendGraphAliasProjectionFieldsJson(
 ) !void {
     for (alias_projections) |projection| {
         try writer.writeAll(",");
-        try std.json.Stringify.value(.{ .string = projection.output }, .{}, writer);
+        try writer.print("{f}", .{std.json.fmt(projection.output, .{})});
         try writer.writeAll(":");
         const binding = if (match) |value| graphPatternBindingForAlias(value, projection.alias) else null;
         if (binding) |value| {
@@ -951,7 +951,7 @@ fn writeGraphAliasProjectionValueJson(
     node: graph_query_mod.GraphResultNode,
 ) !void {
     if (std.mem.eql(u8, field, "key")) {
-        try std.json.Stringify.value(.{ .string = node.key }, .{}, writer);
+        try writer.print("{f}", .{std.json.fmt(node.key, .{})});
     } else if (std.mem.eql(u8, field, "depth")) {
         try writer.print("{d}", .{node.depth});
     } else if (std.mem.eql(u8, field, "distance")) {
@@ -971,7 +971,7 @@ fn graphPathJson(
         try writer.writeAll("[");
         for (nodes, 0..) |node, i| {
             if (i > 0) try writer.writeAll(",");
-            try std.json.Stringify.value(.{ .string = node }, .{}, writer);
+            try writer.print("{f}", .{std.json.fmt(node, .{})});
         }
         try writer.writeAll("]");
     } else {
@@ -983,11 +983,11 @@ fn graphPathJson(
         for (edges, 0..) |edge, i| {
             if (i > 0) try writer.writeAll(",");
             try writer.writeAll("{\"source\":");
-            try std.json.Stringify.value(.{ .string = edge.source }, .{}, writer);
+            try writer.print("{f}", .{std.json.fmt(edge.source, .{})});
             try writer.writeAll(",\"target\":");
-            try std.json.Stringify.value(.{ .string = edge.target }, .{}, writer);
+            try writer.print("{f}", .{std.json.fmt(edge.target, .{})});
             try writer.writeAll(",\"type\":");
-            try std.json.Stringify.value(.{ .string = edge.edge_type }, .{}, writer);
+            try writer.print("{f}", .{std.json.fmt(edge.edge_type, .{})});
             try writer.print(",\"weight\":{d}", .{edge.weight});
             if (edge.metadata.len > 0) {
                 try writer.writeAll(",\"metadata\":");
@@ -1010,7 +1010,7 @@ pub fn graphPatternMatchJsonAlloc(alloc: Allocator, match: types.GraphPatternMat
     for (match.bindings, 0..) |binding, i| {
         if (i > 0) try writer.writeAll(",");
         try writer.writeAll("{\"alias\":");
-        try std.json.Stringify.value(.{ .string = binding.alias }, .{}, writer);
+        try writer.print("{f}", .{std.json.fmt(binding.alias, .{})});
         try writer.writeAll(",\"node\":");
         try graphNodeJson(binding.node, writer);
         try writer.writeAll("}");
@@ -1019,11 +1019,11 @@ pub fn graphPatternMatchJsonAlloc(alloc: Allocator, match: types.GraphPatternMat
     for (match.path, 0..) |edge, i| {
         if (i > 0) try writer.writeAll(",");
         try writer.writeAll("{\"source\":");
-        try std.json.Stringify.value(.{ .string = edge.source }, .{}, writer);
+        try writer.print("{f}", .{std.json.fmt(edge.source, .{})});
         try writer.writeAll(",\"target\":");
-        try std.json.Stringify.value(.{ .string = edge.target }, .{}, writer);
+        try writer.print("{f}", .{std.json.fmt(edge.target, .{})});
         try writer.writeAll(",\"type\":");
-        try std.json.Stringify.value(.{ .string = edge.edge_type }, .{}, writer);
+        try writer.print("{f}", .{std.json.fmt(edge.edge_type, .{})});
         try writer.print(",\"weight\":{d}}}", .{edge.weight});
     }
     try writer.writeAll("]}");
@@ -1032,7 +1032,7 @@ pub fn graphPatternMatchJsonAlloc(alloc: Allocator, match: types.GraphPatternMat
 
 fn graphNodeJson(node: graph_query_mod.GraphResultNode, writer: *std.Io.Writer) !void {
     try writer.writeAll("{\"key\":");
-    try std.json.Stringify.value(.{ .string = node.key }, .{}, writer);
+    try writer.print("{f}", .{std.json.fmt(node.key, .{})});
     try writer.print(",\"depth\":{d},\"distance\":{d}", .{ node.depth, node.distance });
     try writer.writeAll(",\"path\":");
     try graphPathJson(node.path, node.path_edges, writer);
@@ -1611,6 +1611,19 @@ pub fn appendPlannedCandidateSetAlloc(
     });
 }
 
+fn appendPlannedCandidateSetIfPresentAlloc(
+    alloc: Allocator,
+    planned_sets: *std.ArrayListUnmanaged(PlannedCandidateSet),
+    maybe_child: ?doc_set.ResolvedDocSet,
+    ordinal: *usize,
+) !void {
+    var child = maybe_child orelse return;
+    errdefer child.deinit(alloc);
+    try appendPlannedCandidateSetAlloc(alloc, planned_sets, &child, ordinal.*);
+    child = .none;
+    ordinal.* += 1;
+}
+
 pub fn plannedCandidateSetLessThan(
     _: void,
     left: PlannedCandidateSet,
@@ -2143,6 +2156,54 @@ pub fn md5HexTextAlloc(alloc: Allocator, text: []const u8) ![]u8 {
     return try hexBytesAlloc(alloc, digest[0..]);
 }
 
+pub fn soundexTextAlloc(alloc: Allocator, text: []const u8) ![]u8 {
+    var out = try alloc.dupe(u8, "?000");
+    errdefer alloc.free(out);
+
+    var previous_code: u8 = 0;
+    var output_index: usize = 1;
+    var found_first = false;
+    for (text) |byte| {
+        if (!std.ascii.isAlphabetic(byte)) {
+            previous_code = 0;
+            continue;
+        }
+        const upper = std.ascii.toUpper(byte);
+        const code = soundexCode(upper);
+        if (!found_first) {
+            out[0] = upper;
+            previous_code = code;
+            found_first = true;
+            continue;
+        }
+        if (code == 0) {
+            if (upper != 'H' and upper != 'W') previous_code = 0;
+            continue;
+        }
+        if (code == previous_code) continue;
+        if (output_index < out.len) {
+            out[output_index] = '0' + code;
+            output_index += 1;
+        }
+        previous_code = code;
+        if (output_index == out.len) break;
+    }
+
+    return out;
+}
+
+fn soundexCode(upper: u8) u8 {
+    return switch (upper) {
+        'B', 'F', 'P', 'V' => 1,
+        'C', 'G', 'J', 'K', 'Q', 'S', 'X', 'Z' => 2,
+        'D', 'T' => 3,
+        'L' => 4,
+        'M', 'N' => 5,
+        'R' => 6,
+        else => 0,
+    };
+}
+
 fn hexBytesAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
     const hex = "0123456789abcdef";
     const out = try alloc.alloc(u8, bytes.len * 2);
@@ -2612,7 +2673,7 @@ fn expressionValueJsonWithSourcesAndColumnSetsAlloc(
             }
             break :blk try alloc.dupe(u8, "null");
         },
-        .lower, .upper, .initcap, .md5 => blk: {
+        .lower, .upper, .initcap, .md5, .soundex => blk: {
             if (expression.operands.len != 1) return error.InvalidQueryRequest;
             const value_json = try expressionValueJsonWithSourcesAndColumnSetsAlloc(alloc, row, proposed_row, source_row, expression.operands[0], row_columns, source_columns, now_ns);
             defer alloc.free(value_json);
@@ -2626,6 +2687,7 @@ fn expressionValueJsonWithSourcesAndColumnSetsAlloc(
                         .upper => try std.ascii.allocUpperString(alloc, text),
                         .initcap => try initcapTextAlloc(alloc, text),
                         .md5 => try md5HexTextAlloc(alloc, text),
+                        .soundex => try soundexTextAlloc(alloc, text),
                         else => unreachable,
                     };
                     defer alloc.free(transformed);
@@ -5029,6 +5091,679 @@ pub fn equalityPredicateObjectJsonAlloc(
     return try out.toOwnedSlice();
 }
 
+fn equalityPredicateForColumn(
+    runtime_schema: schema_mod.TableSchema,
+    predicates: []const schema_mod.RelationalCheck,
+    column_name: []const u8,
+) ?schema_mod.RelationalCheck {
+    const column = columnForField(runtime_schema, column_name) orelse return null;
+    for (predicates) |predicate| {
+        if (predicate.op != .eq or predicate.value_json == null) continue;
+        const predicate_column = columnForField(runtime_schema, predicate.field) orelse continue;
+        if (std.mem.eql(u8, predicate_column.name, column.name) or std.mem.eql(u8, predicate_column.path, column.path)) return predicate;
+    }
+    return null;
+}
+
+fn orderedTupleIndexColumnId(column: schema_mod.RelationalColumn) []const u8 {
+    return column.index_name orelse column.name;
+}
+
+fn orderedTupleIndexEqualityKeyPlannerUsable(
+    runtime_schema: schema_mod.TableSchema,
+    predicates: []const schema_mod.RelationalCheck,
+    key: schema_mod.RelationalIndexKey,
+) bool {
+    _ = runtime_schema;
+    _ = predicates;
+    _ = key;
+    return true;
+}
+
+fn orderedTupleIndexRangeKeyPlannerUsable(key: schema_mod.RelationalIndexKey) bool {
+    return orderedTupleIndexKeyNullsFirst(key) == (key.direction == .desc);
+}
+
+fn orderedTupleIndexKeyCollationsSupported(
+    runtime_schema: schema_mod.TableSchema,
+    index_keys: []const schema_mod.RelationalIndexKey,
+) bool {
+    for (index_keys) |key| {
+        const column = columnForField(runtime_schema, key.column) orelse return false;
+        if (column.collation) |collation| {
+            if (!relational_collation.isSupported(collation)) return false;
+        }
+    }
+    return true;
+}
+
+fn orderedTupleIndexPrefixLen(
+    runtime_schema: schema_mod.TableSchema,
+    predicates: []const schema_mod.RelationalCheck,
+    index_keys: []const schema_mod.RelationalIndexKey,
+) usize {
+    var prefix_len: usize = 0;
+    for (index_keys) |key| {
+        if (!orderedTupleIndexEqualityKeyPlannerUsable(runtime_schema, predicates, key)) break;
+        if (equalityPredicateForColumn(runtime_schema, predicates, key.column) == null) break;
+        prefix_len += 1;
+    }
+    return prefix_len;
+}
+
+fn orderedTupleEqualityKeyNeedsFoldedPrefix(
+    runtime_schema: schema_mod.TableSchema,
+    predicates: []const schema_mod.RelationalCheck,
+    key: schema_mod.RelationalIndexKey,
+) bool {
+    const column = columnForField(runtime_schema, key.column) orelse return false;
+    const predicate = equalityPredicateForColumn(runtime_schema, predicates, key.column) orelse return false;
+    const effective_collation = predicate.collation orelse column.collation;
+    if (effective_collation) |collation| return relational_collation.isCaseInsensitive(collation);
+    return false;
+}
+
+fn orderedTupleFoldedEqualityPrefixIndex(
+    runtime_schema: schema_mod.TableSchema,
+    predicates: []const schema_mod.RelationalCheck,
+    index_keys: []const schema_mod.RelationalIndexKey,
+) ?usize {
+    for (index_keys, 0..) |key, i| {
+        if (orderedTupleEqualityKeyNeedsFoldedPrefix(runtime_schema, predicates, key)) return i;
+    }
+    return null;
+}
+
+const OrderedTupleRangePredicates = struct {
+    lower: ?schema_mod.RelationalCheck = null,
+    upper: ?schema_mod.RelationalCheck = null,
+
+    fn hasAny(self: @This()) bool {
+        return self.lower != null or self.upper != null;
+    }
+};
+
+const OrderedTupleIndexCandidate = struct {
+    column: schema_mod.RelationalColumn,
+    catalog_ordinal: usize,
+    equality_prefix_len: usize,
+    range_key_index: ?usize = null,
+    range: OrderedTupleRangePredicates = .{},
+
+    fn score(self: @This()) usize {
+        return self.equality_prefix_len * 2 + @as(usize, if (self.range_key_index != null) 1 else 0);
+    }
+};
+
+const OrderedTupleIndexCapabilityRejection = enum {
+    generation_not_current,
+    not_indexed,
+    not_ready,
+    access_method_mismatch,
+    no_ordered_keys,
+    unsupported_collation,
+    partial_predicate_not_proven,
+    expression_predicate_not_proven,
+    no_usable_bounds,
+};
+
+const OrderedTupleIndexCapability = union(enum) {
+    usable: OrderedTupleIndexCandidate,
+    rejected: OrderedTupleIndexCapabilityRejection,
+};
+
+const OrderedTupleScanPlan = struct {
+    column: schema_mod.RelationalColumn,
+    catalog_ordinal: usize,
+    equality_prefix_len: usize,
+    range_key_index: ?usize = null,
+    predicate_count: usize = 0,
+    proven_predicate_count: usize = 0,
+    residual_predicate_count: usize = 0,
+    lower_tuple: []u8,
+    upper_tuple: ?[]u8 = null,
+    prefix_scan: bool = false,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.lower_tuple);
+        if (self.upper_tuple) |buf| alloc.free(buf);
+        self.* = undefined;
+    }
+};
+
+const OrderedTuplePredicateProofCounts = struct {
+    predicate_count: usize,
+    proven_predicate_count: usize,
+    residual_predicate_count: usize,
+};
+
+fn orderedTuplePredicateProofCounts(candidate: OrderedTupleIndexCandidate, predicate_count: usize) OrderedTuplePredicateProofCounts {
+    const range_proofs: usize = @as(usize, @intFromBool(candidate.range.lower != null)) + @as(usize, @intFromBool(candidate.range.upper != null));
+    const proven = @min(predicate_count, candidate.equality_prefix_len + range_proofs);
+    return .{
+        .predicate_count = predicate_count,
+        .proven_predicate_count = proven,
+        .residual_predicate_count = predicate_count - proven,
+    };
+}
+
+const OrderedTuplePredicateSetProbe = union(enum) {
+    set: doc_set.ResolvedDocSet,
+    exceeded_gate: usize,
+};
+
+const ordered_tuple_exact_unordered_unpaged_candidate_gate: usize = 32;
+const ordered_tuple_exact_unordered_candidate_page_multiplier: usize = 4;
+const ordered_tuple_bounded_unordered_candidate_gate: usize = 4096;
+
+fn setRelationalRowsProfileAccessMethod(
+    profile: ?*types.RelationalRowsQueryResult.Profile,
+    method: types.RelationalRowsQueryResult.AccessMethod,
+) void {
+    if (profile) |out| {
+        switch (method) {
+            .unknown => {},
+            .base_scan => {
+                if (out.access_method == .unknown) out.access_method = .base_scan;
+            },
+            .resolved_doc_set => {
+                if (out.access_method == .unknown) out.access_method = .resolved_doc_set;
+            },
+            .ordered_tuple_doc_set => {
+                if (out.access_method != .ordered_tuple_stream) out.access_method = .ordered_tuple_doc_set;
+                clearRelationalRowsProfileOrderedTupleFallbackOnSelection(out);
+            },
+            .ordered_tuple_stream => {
+                out.access_method = .ordered_tuple_stream;
+                clearRelationalRowsProfileOrderedTupleFallbackOnSelection(out);
+            },
+        }
+    }
+}
+
+fn clearRelationalRowsProfileOrderedTupleFallbackOnSelection(
+    profile: *types.RelationalRowsQueryResult.Profile,
+) void {
+    switch (profile.fallback_reason) {
+        .ordered_tuple_ordering_not_covered,
+        .ordered_tuple_order_field_not_covered,
+        .ordered_tuple_order_direction_not_covered,
+        .ordered_tuple_order_nulls_not_covered,
+        .ordered_tuple_order_collation_not_covered,
+        .ordered_tuple_collation_not_supported,
+        => {},
+        else => profile.fallback_reason = .none,
+    }
+}
+
+fn addRelationalRowsOrderedTupleScanStats(
+    profile: ?*types.RelationalRowsQueryResult.Profile,
+    stats: relational_store_mod.OrderedTupleDocKeyScanStats,
+) void {
+    if (profile) |out| {
+        out.index_entries_scanned += stats.index_entries_scanned;
+        out.candidate_rows += stats.candidate_rows;
+        out.iterator_seeks += stats.iterator_seeks;
+    }
+}
+
+fn setRelationalRowsProfileOrderedTuplePlan(
+    profile: ?*types.RelationalRowsQueryResult.Profile,
+    plan: OrderedTupleScanPlan,
+) void {
+    if (profile) |out| {
+        out.ordered_tuple_plan_selected = true;
+        out.ordered_tuple_catalog_ordinal = std.math.cast(u32, plan.catalog_ordinal) orelse std.math.maxInt(u32);
+        out.ordered_tuple_index_generation = plan.column.index_generation;
+        out.ordered_tuple_key_count = std.math.cast(u32, plan.column.index_keys.len) orelse std.math.maxInt(u32);
+        out.ordered_tuple_equality_prefix_len = std.math.cast(u32, plan.equality_prefix_len) orelse std.math.maxInt(u32);
+        out.ordered_tuple_range_key_index = if (plan.range_key_index) |index|
+            std.math.cast(u32, index) orelse std.math.maxInt(u32)
+        else
+            std.math.maxInt(u32);
+        out.ordered_tuple_filter_predicates = std.math.cast(u32, plan.predicate_count) orelse std.math.maxInt(u32);
+        out.ordered_tuple_proven_predicates = std.math.cast(u32, plan.proven_predicate_count) orelse std.math.maxInt(u32);
+        out.ordered_tuple_residual_predicates = std.math.cast(u32, plan.residual_predicate_count) orelse std.math.maxInt(u32);
+        out.ordered_tuple_lower_tuple_bytes = plan.lower_tuple.len;
+        out.ordered_tuple_upper_tuple_bytes = if (plan.upper_tuple) |upper| upper.len else 0;
+        out.ordered_tuple_prefix_scan = plan.prefix_scan;
+    }
+}
+
+fn relationalRowsSaturatingUsize(value: u64) usize {
+    return std.math.cast(usize, value) orelse std.math.maxInt(usize);
+}
+
+fn setRelationalRowsProfileFallback(
+    profile: ?*types.RelationalRowsQueryResult.Profile,
+    reason: types.RelationalRowsQueryResult.FallbackReason,
+) void {
+    if (profile) |out| {
+        if (out.fallback_reason == .none) out.fallback_reason = reason;
+    }
+}
+
+fn orderedTupleCapabilityRejectionPriority(rejection: OrderedTupleIndexCapabilityRejection) u8 {
+    return switch (rejection) {
+        .generation_not_current => 90,
+        .not_ready => 80,
+        .access_method_mismatch => 78,
+        .unsupported_collation => 75,
+        .partial_predicate_not_proven, .expression_predicate_not_proven => 70,
+        .no_usable_bounds => 60,
+        .no_ordered_keys => 20,
+        .not_indexed => 10,
+    };
+}
+
+fn recordOrderedTupleCapabilityRejection(
+    rejection_out: ?*?OrderedTupleIndexCapabilityRejection,
+    rejection: OrderedTupleIndexCapabilityRejection,
+) void {
+    const out = rejection_out orelse return;
+    if (out.*) |current| {
+        if (orderedTupleCapabilityRejectionPriority(current) >= orderedTupleCapabilityRejectionPriority(rejection)) return;
+    }
+    out.* = rejection;
+}
+
+fn orderedTupleCapabilityFallbackReason(
+    rejection: OrderedTupleIndexCapabilityRejection,
+) types.RelationalRowsQueryResult.FallbackReason {
+    return switch (rejection) {
+        .generation_not_current => .ordered_tuple_stale_generation,
+        .not_ready => .ordered_tuple_index_not_ready,
+        .access_method_mismatch => .ordered_tuple_access_method_mismatch,
+        .unsupported_collation => .ordered_tuple_collation_not_supported,
+        .partial_predicate_not_proven, .expression_predicate_not_proven => .ordered_tuple_predicate_not_proven,
+        .no_usable_bounds => .ordered_tuple_no_usable_bounds,
+        .not_indexed, .no_ordered_keys => .none,
+    };
+}
+
+fn setRelationalRowsProfileOrderedTupleRejection(
+    profile: ?*types.RelationalRowsQueryResult.Profile,
+    rejection: ?OrderedTupleIndexCapabilityRejection,
+) void {
+    const reason = orderedTupleCapabilityFallbackReason(rejection orelse return);
+    if (reason == .none) return;
+    setRelationalRowsProfileFallback(profile, reason);
+}
+
+fn setRelationalRowsProfileCandidateGate(
+    profile: ?*types.RelationalRowsQueryResult.Profile,
+    limit: usize,
+    observed: usize,
+) void {
+    if (profile) |out| {
+        out.candidate_gate_limit = @intCast(limit);
+        out.candidate_gate_observed = @intCast(observed);
+    }
+}
+
+fn setRelationalRowsProfileOrderedTupleProbeGate(
+    profile: ?*types.RelationalRowsQueryResult.Profile,
+    req: types.RelationalRowsQueryRequest,
+    observed: usize,
+) void {
+    const limit = orderedTupleCandidateSetProbeLimit(req) orelse return;
+    setRelationalRowsProfileCandidateGate(profile, limit, observed);
+}
+
+fn orderedTupleSchemaHasActiveIndex(runtime_schema: schema_mod.TableSchema) bool {
+    for (runtime_schema.relational_columns) |column| {
+        if (column.indexed and
+            column.index_access_method != null and
+            column.index_access_method.? == .ordered_tuple and
+            column.index_lifecycle == .ready and
+            column.index_keys.len >= 2) return true;
+    }
+    return false;
+}
+
+fn orderedTupleCanPlanForQueryShape(req: types.RelationalRowsQueryRequest) bool {
+    if (req.order_by.len != 0 or queryHasDistinctOn(req) or req.row_claim != null) return true;
+    if (req.total_mode != .exact) return true;
+    return req.limit != null or req.offset == 0;
+}
+
+fn orderedTupleRequestedPageWidth(req: types.RelationalRowsQueryRequest) ?usize {
+    const limit = req.limit orelse return null;
+    return @as(usize, req.offset) +| @as(usize, limit);
+}
+
+fn orderedTupleCandidateSetGate(req: types.RelationalRowsQueryRequest) usize {
+    if (req.order_by.len != 0 or queryHasDistinctOn(req) or req.row_claim != null) return std.math.maxInt(usize);
+    const materialization_cap = ordered_tuple_bounded_unordered_candidate_gate;
+    if (req.total_mode == .exact) {
+        const page_gate = if (orderedTupleRequestedPageWidth(req)) |page_width|
+            @max(@as(usize, 1), page_width *| ordered_tuple_exact_unordered_candidate_page_multiplier)
+        else
+            ordered_tuple_exact_unordered_unpaged_candidate_gate;
+        return @max(page_gate, materialization_cap);
+    }
+    const page_gate = if (orderedTupleRequestedPageWidth(req)) |page_width|
+        @max(ordered_tuple_exact_unordered_unpaged_candidate_gate, page_width *| ordered_tuple_exact_unordered_candidate_page_multiplier)
+    else
+        materialization_cap;
+    return @min(page_gate, materialization_cap);
+}
+
+fn orderedTupleCandidateSetUsableForQuery(req: types.RelationalRowsQueryRequest, set: *const doc_set.ResolvedDocSet) bool {
+    if (req.order_by.len != 0 or queryHasDistinctOn(req) or req.row_claim != null) return true;
+    const cardinality = set.estimatedCardinality() orelse return false;
+    return cardinality <= orderedTupleCandidateSetGate(req);
+}
+
+fn orderedTupleCandidateSetProbeLimit(req: types.RelationalRowsQueryRequest) ?usize {
+    if (req.order_by.len != 0 or queryHasDistinctOn(req) or req.row_claim != null) return null;
+    return orderedTupleCandidateSetGate(req);
+}
+
+fn orderedTupleIndexKeyNullsFirst(index_key: schema_mod.RelationalIndexKey) bool {
+    return switch (index_key.nulls) {
+        .first => true,
+        .last => false,
+        .default => index_key.direction == .desc,
+    };
+}
+
+fn orderedTupleQueryOrderNullsFirst(order: types.RelationalRowsQueryOrder) bool {
+    return order.direction == .desc;
+}
+
+fn orderedTupleIndexKeyDirectionMatchesOrder(index_key: schema_mod.RelationalIndexKey, order: types.RelationalRowsQueryOrder) bool {
+    return switch (index_key.direction) {
+        .asc => order.direction == .asc,
+        .desc => order.direction == .desc,
+    };
+}
+
+fn orderedTuplePlanOrderFallbackReason(
+    runtime_schema: schema_mod.TableSchema,
+    req: types.RelationalRowsQueryRequest,
+    plan: OrderedTupleScanPlan,
+) ?types.RelationalRowsQueryResult.FallbackReason {
+    if (req.order_by.len == 0) return .ordered_tuple_ordering_not_covered;
+    if (queryHasDistinctOn(req) or req.row_claim != null or req.scalar_subqueries.len != 0) return .ordered_tuple_ordering_not_covered;
+
+    var prefix_len = orderedTupleIndexPrefixLen(runtime_schema, req.predicates, plan.column.index_keys);
+    if (orderedTupleFoldedEqualityPrefixIndex(runtime_schema, req.predicates, plan.column.index_keys[0..prefix_len])) |index| {
+        prefix_len = index + 1;
+    }
+    if (prefix_len + req.order_by.len > plan.column.index_keys.len) return .ordered_tuple_order_field_not_covered;
+
+    for (req.order_by, 0..) |order, i| {
+        if (order.expression != null or order.null_test != null or order.field.len == 0) return .ordered_tuple_order_field_not_covered;
+        const index_key = plan.column.index_keys[prefix_len + i];
+        if (!orderedTupleIndexKeyDirectionMatchesOrder(index_key, order)) return .ordered_tuple_order_direction_not_covered;
+        if (orderedTupleIndexKeyNullsFirst(index_key) != orderedTupleQueryOrderNullsFirst(order)) return .ordered_tuple_order_nulls_not_covered;
+
+        const order_column = columnForField(runtime_schema, order.field) orelse return .ordered_tuple_order_field_not_covered;
+        const index_column = columnForField(runtime_schema, index_key.column) orelse return .ordered_tuple_order_field_not_covered;
+        if (!std.mem.eql(u8, order_column.name, index_column.name) and !std.mem.eql(u8, order_column.path, index_column.path)) return .ordered_tuple_order_field_not_covered;
+        if (!optionalBytesEqual(order.collation, index_column.collation)) return .ordered_tuple_order_collation_not_covered;
+    }
+    return null;
+}
+
+fn optionalBytesEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null and right == null) return true;
+    if (left == null or right == null) return false;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+fn orderedTupleRangePredicateValueOrder(
+    alloc: Allocator,
+    column: schema_mod.RelationalColumn,
+    candidate: schema_mod.RelationalCheck,
+    current: schema_mod.RelationalCheck,
+) ?ScalarComparison {
+    const candidate_json = candidate.value_json orelse return null;
+    const current_json = current.value_json orelse return null;
+    const candidate_collation = candidate.collation orelse column.collation;
+    const current_collation = current.collation orelse column.collation;
+    if (!optionalBytesEqual(candidate_collation, current_collation)) return null;
+    var parsed_candidate = std.json.parseFromSlice(std.json.Value, alloc, candidate_json, .{}) catch return null;
+    defer parsed_candidate.deinit();
+    var parsed_current = std.json.parseFromSlice(std.json.Value, alloc, current_json, .{}) catch return null;
+    defer parsed_current.deinit();
+    return compareJsonScalarsWithCollation(parsed_candidate.value, parsed_current.value, candidate_collation);
+}
+
+fn orderedTupleLowerPredicateTighter(
+    alloc: Allocator,
+    column: schema_mod.RelationalColumn,
+    candidate: schema_mod.RelationalCheck,
+    current: schema_mod.RelationalCheck,
+) bool {
+    const order = orderedTupleRangePredicateValueOrder(alloc, column, candidate, current) orelse return false;
+    return switch (order) {
+        .gt => true,
+        .lt => false,
+        .eq => candidate.op == .gt and current.op == .gte,
+    };
+}
+
+fn orderedTupleUpperPredicateTighter(
+    alloc: Allocator,
+    column: schema_mod.RelationalColumn,
+    candidate: schema_mod.RelationalCheck,
+    current: schema_mod.RelationalCheck,
+) bool {
+    const order = orderedTupleRangePredicateValueOrder(alloc, column, candidate, current) orelse return false;
+    return switch (order) {
+        .lt => true,
+        .gt => false,
+        .eq => candidate.op == .lt and current.op == .lte,
+    };
+}
+
+fn orderedTupleRangePredicatesForColumn(
+    alloc: Allocator,
+    runtime_schema: schema_mod.TableSchema,
+    predicates: []const schema_mod.RelationalCheck,
+    column_name: []const u8,
+) OrderedTupleRangePredicates {
+    const column = columnForField(runtime_schema, column_name) orelse return .{};
+    var out: OrderedTupleRangePredicates = .{};
+    for (predicates) |predicate| {
+        if (predicate.value_json == null) continue;
+        const predicate_column = columnForField(runtime_schema, predicate.field) orelse continue;
+        if (!std.mem.eql(u8, predicate_column.name, column.name) and !std.mem.eql(u8, predicate_column.path, column.path)) continue;
+        switch (predicate.op) {
+            .gt, .gte => {
+                if (out.lower == null or orderedTupleLowerPredicateTighter(alloc, column, predicate, out.lower.?)) out.lower = predicate;
+            },
+            .lt, .lte => {
+                if (out.upper == null or orderedTupleUpperPredicateTighter(alloc, column, predicate, out.upper.?)) out.upper = predicate;
+            },
+            else => {},
+        }
+    }
+    return out;
+}
+
+fn orderedTupleIndexCapabilityForQueryAlloc(
+    alloc: Allocator,
+    runtime_schema: schema_mod.TableSchema,
+    column: schema_mod.RelationalColumn,
+    catalog_ordinal: usize,
+    predicates: []const schema_mod.RelationalCheck,
+    implications: PredicateImplications,
+    generation_usable: bool,
+) !OrderedTupleIndexCapability {
+    if (!generation_usable) return .{ .rejected = .generation_not_current };
+    if (!column.indexed) return .{ .rejected = .not_indexed };
+    if (column.index_lifecycle != .ready) return .{ .rejected = .not_ready };
+    if (column.index_keys.len < 2) return .{ .rejected = .no_ordered_keys };
+    if (column.index_access_method == null or column.index_access_method.? != .ordered_tuple) return .{ .rejected = .access_method_mismatch };
+    if (!orderedTupleIndexKeyCollationsSupported(runtime_schema, column.index_keys)) return .{ .rejected = .unsupported_collation };
+    if (!(try relational_store_mod.predicatesImplyUniqueWhereWithColumns(alloc, implications.predicates, column.index_where, runtime_schema.relational_columns))) {
+        return .{ .rejected = .partial_predicate_not_proven };
+    }
+    if (!(try expressionPredicatesImplyWithColumns(alloc, implications, column.index_where_expressions, runtime_schema.relational_columns, currentTimeNs()))) {
+        return .{ .rejected = .expression_predicate_not_proven };
+    }
+
+    const prefix_len = orderedTupleIndexPrefixLen(runtime_schema, predicates, column.index_keys);
+    var candidate: OrderedTupleIndexCandidate = .{
+        .column = column,
+        .catalog_ordinal = catalog_ordinal,
+        .equality_prefix_len = prefix_len,
+    };
+    const folded_prefix_index = orderedTupleFoldedEqualityPrefixIndex(runtime_schema, predicates, column.index_keys[0..prefix_len]);
+    if (folded_prefix_index) |index| {
+        candidate.equality_prefix_len = index + 1;
+    } else if (prefix_len < column.index_keys.len and orderedTupleIndexRangeKeyPlannerUsable(column.index_keys[prefix_len])) {
+        const range = orderedTupleRangePredicatesForColumn(alloc, runtime_schema, predicates, column.index_keys[prefix_len].column);
+        if (range.hasAny()) {
+            candidate.range_key_index = prefix_len;
+            candidate.range = range;
+        }
+    }
+    if (candidate.equality_prefix_len == 0 and candidate.range_key_index == null) return .{ .rejected = .no_usable_bounds };
+    return .{ .usable = candidate };
+}
+
+fn relationalColumnsForOrderedTuplePrefixAlloc(
+    alloc: Allocator,
+    runtime_schema: schema_mod.TableSchema,
+    index_keys: []const schema_mod.RelationalIndexKey,
+) ![]schema_mod.RelationalColumn {
+    if (index_keys.len == 0) return &.{};
+    const columns = try alloc.alloc(schema_mod.RelationalColumn, index_keys.len);
+    errdefer alloc.free(columns);
+    for (index_keys, 0..) |key, i| {
+        columns[i] = columnForField(runtime_schema, key.column) orelse return error.InvalidQueryRequest;
+    }
+    return columns;
+}
+
+fn orderedTuplePrefixEqualityObjectJsonAlloc(
+    alloc: Allocator,
+    runtime_schema: schema_mod.TableSchema,
+    predicates: []const schema_mod.RelationalCheck,
+    index_keys: []const schema_mod.RelationalIndexKey,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('{');
+    for (index_keys, 0..) |key, i| {
+        const predicate = equalityPredicateForColumn(runtime_schema, predicates, key.column) orelse return error.InvalidQueryRequest;
+        if (i != 0) try writer.writeByte(',');
+        try writer.print("{f}:", .{std.json.fmt(key.column, .{})});
+        try writer.writeAll(predicate.value_json.?);
+    }
+    try writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
+fn orderedTupleExactEqualityPrefixAlloc(
+    alloc: Allocator,
+    runtime_schema: schema_mod.TableSchema,
+    predicates: []const schema_mod.RelationalCheck,
+    index_keys: []const schema_mod.RelationalIndexKey,
+) ![]u8 {
+    if (index_keys.len == 0) return try alloc.dupe(u8, "");
+    const equality_json = try orderedTuplePrefixEqualityObjectJsonAlloc(alloc, runtime_schema, predicates, index_keys);
+    defer alloc.free(equality_json);
+    const prefix_columns = try relationalColumnsForOrderedTuplePrefixAlloc(alloc, runtime_schema, index_keys);
+    defer if (prefix_columns.len > 0) alloc.free(prefix_columns);
+    const row_value = mapper.buildRelationalRowValueAlloc(alloc, equality_json, prefix_columns) catch return error.InvalidQueryRequest;
+    defer alloc.free(row_value);
+    return relational_store_mod.orderedTupleValueForIndexKeysAlloc(alloc, row_value, index_keys, runtime_schema.relational_columns);
+}
+
+fn appendOrderedTupleFoldedEqualityComponentPrefix(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    runtime_schema: schema_mod.TableSchema,
+    predicates: []const schema_mod.RelationalCheck,
+    index_key: schema_mod.RelationalIndexKey,
+) !void {
+    const column = columnForField(runtime_schema, index_key.column) orelse return error.InvalidQueryRequest;
+    const predicate = equalityPredicateForColumn(runtime_schema, predicates, index_key.column) orelse return error.InvalidQueryRequest;
+    const value_json = predicate.value_json orelse return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .string) return error.InvalidQueryRequest;
+    const effective_collation = predicate.collation orelse column.collation;
+    if (effective_collation == null or !relational_collation.isCaseInsensitive(effective_collation.?)) return error.InvalidQueryRequest;
+
+    var scalar_prefix = std.ArrayListUnmanaged(u8).empty;
+    defer scalar_prefix.deinit(alloc);
+    for (parsed.value.string) |byte| try scalar_prefix.append(alloc, std.ascii.toLower(byte));
+    try scalar_prefix.append(alloc, 0);
+
+    var scalar_encoded_prefix = std.ArrayListUnmanaged(u8).empty;
+    defer scalar_encoded_prefix.deinit(alloc);
+    const scalar_start = scalar_encoded_prefix.items.len;
+    try scalar_encoded_prefix.resize(alloc, scalar_start + internal_keys.encodedBodyLen(scalar_prefix.items));
+    _ = internal_keys.encodeBody(scalar_encoded_prefix.items[scalar_start..], scalar_prefix.items);
+
+    var component_prefix = std.ArrayListUnmanaged(u8).empty;
+    defer component_prefix.deinit(alloc);
+    try component_prefix.append(alloc, 0x10);
+    if (index_key.direction == .desc) {
+        for (scalar_encoded_prefix.items) |byte| try component_prefix.append(alloc, ~byte);
+    } else {
+        try component_prefix.appendSlice(alloc, scalar_prefix.items);
+    }
+
+    const start = out.items.len;
+    try out.resize(alloc, start + internal_keys.encodedBodyLen(component_prefix.items));
+    _ = internal_keys.encodeBody(out.items[start..], component_prefix.items);
+}
+
+fn orderedTupleEqualityScanPrefixAlloc(
+    alloc: Allocator,
+    runtime_schema: schema_mod.TableSchema,
+    predicates: []const schema_mod.RelationalCheck,
+    index_keys: []const schema_mod.RelationalIndexKey,
+) ![]u8 {
+    if (orderedTupleFoldedEqualityPrefixIndex(runtime_schema, predicates, index_keys)) |folded_index| {
+        var out = std.ArrayListUnmanaged(u8).empty;
+        errdefer out.deinit(alloc);
+        if (folded_index > 0) {
+            const exact_prefix = try orderedTupleExactEqualityPrefixAlloc(alloc, runtime_schema, predicates, index_keys[0..folded_index]);
+            defer alloc.free(exact_prefix);
+            try out.appendSlice(alloc, exact_prefix);
+        }
+        try appendOrderedTupleFoldedEqualityComponentPrefix(alloc, &out, runtime_schema, predicates, index_keys[folded_index]);
+        return try out.toOwnedSlice(alloc);
+    }
+    return orderedTupleExactEqualityPrefixAlloc(alloc, runtime_schema, predicates, index_keys);
+}
+
+fn orderedTupleRangeBoundObjectJsonAlloc(
+    alloc: Allocator,
+    runtime_schema: schema_mod.TableSchema,
+    predicates: []const schema_mod.RelationalCheck,
+    prefix_keys: []const schema_mod.RelationalIndexKey,
+    range_key: schema_mod.RelationalIndexKey,
+    range_predicate: schema_mod.RelationalCheck,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('{');
+    var first = true;
+    for (prefix_keys) |key| {
+        const predicate = equalityPredicateForColumn(runtime_schema, predicates, key.column) orelse return error.InvalidQueryRequest;
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try writer.print("{f}:", .{std.json.fmt(key.column, .{})});
+        try writer.writeAll(predicate.value_json.?);
+    }
+    if (!first) try writer.writeByte(',');
+    try writer.print("{f}:", .{std.json.fmt(range_key.column, .{})});
+    try writer.writeAll(range_predicate.value_json.?);
+    try writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
 pub fn uniqueConstraintColumnsAlloc(
     alloc: Allocator,
     runtime_schema: schema_mod.TableSchema,
@@ -5418,6 +6153,91 @@ pub fn predicateSearchQuery(
 pub const arrayColumnValueContains = relational_store_mod.arrayColumnValueContains;
 pub const arrayColumnValueContainsAll = relational_store_mod.arrayColumnValueContainsAll;
 pub const arrayColumnValueEquals = relational_store_mod.arrayColumnValueEquals;
+
+fn relationalColumnValueMatchesPredicate(
+    value: relational_store_mod.OwnedColumnValue,
+    column: schema_mod.RelationalColumn,
+    predicate: schema_mod.RelationalCheck,
+    expected: std.json.Value,
+) bool {
+    return switch (column.field_type) {
+        .keyword => relationalTextColumnValueMatchesPredicate(value, predicate, expected),
+        .boolean => predicate.op == .eq and value.value_type == .bool_val and expected == .bool and value.value.bool_val == expected.bool,
+        .numeric => relationalNumericColumnValueMatchesPredicate(value, predicate, expected),
+        .datetime => relationalDateColumnValueMatchesPredicate(value, predicate, expected),
+        else => false,
+    };
+}
+
+fn relationalTextColumnValueMatchesPredicate(
+    value: relational_store_mod.OwnedColumnValue,
+    predicate: schema_mod.RelationalCheck,
+    expected: std.json.Value,
+) bool {
+    if (value.value_type != .bytes_val or value.is_json or expected != .string) return false;
+    const comparison = relational_collation.compareTextForScalar(value.value.bytes_val, expected.string, predicate.collation);
+    return comparisonMatchesPredicateOp(comparison, predicate.op);
+}
+
+fn relationalNumericColumnValueMatchesPredicate(
+    value: relational_store_mod.OwnedColumnValue,
+    predicate: schema_mod.RelationalCheck,
+    expected: std.json.Value,
+) bool {
+    const rhs = jsonNumberAsF64(expected) orelse return false;
+    const lhs = switch (value.value_type) {
+        .f64_val => value.value.f64_val,
+        .u64_val => @as(f64, @floatFromInt(value.value.u64_val)),
+        else => return false,
+    };
+    return numericComparisonMatchesPredicateOp(lhs, rhs, predicate.op);
+}
+
+fn relationalDateColumnValueMatchesPredicate(
+    value: relational_store_mod.OwnedColumnValue,
+    predicate: schema_mod.RelationalCheck,
+    expected: std.json.Value,
+) bool {
+    const rhs = jsonNumberAsU64(expected) orelse return false;
+    const lhs = switch (value.value_type) {
+        .u64_val => value.value.u64_val,
+        else => return false,
+    };
+    return integerComparisonMatchesPredicateOp(lhs, rhs, predicate.op);
+}
+
+fn comparisonMatchesPredicateOp(comparison: relational_collation.TextComparison, op: schema_mod.RelationalCheckOp) bool {
+    return switch (op) {
+        .eq => comparison == .eq,
+        .gt => comparison == .gt,
+        .gte => comparison == .gt or comparison == .eq,
+        .lt => comparison == .lt,
+        .lte => comparison == .lt or comparison == .eq,
+        else => false,
+    };
+}
+
+fn numericComparisonMatchesPredicateOp(lhs: f64, rhs: f64, op: schema_mod.RelationalCheckOp) bool {
+    return switch (op) {
+        .eq => lhs == rhs,
+        .gt => lhs > rhs,
+        .gte => lhs >= rhs,
+        .lt => lhs < rhs,
+        .lte => lhs <= rhs,
+        else => false,
+    };
+}
+
+fn integerComparisonMatchesPredicateOp(lhs: u64, rhs: u64, op: schema_mod.RelationalCheckOp) bool {
+    return switch (op) {
+        .eq => lhs == rhs,
+        .gt => lhs > rhs,
+        .gte => lhs >= rhs,
+        .lt => lhs < rhs,
+        .lte => lhs <= rhs,
+        else => false,
+    };
+}
 
 pub fn queryHasDistinctOn(req: types.RelationalRowsQueryRequest) bool {
     return req.distinct_on.len > 0 or req.distinct_on_expressions.len > 0;
@@ -9350,7 +10170,7 @@ pub fn validateQueryAgainstSchema(
     for (req.distinct_on_expressions) |expression| try validateExpressionAgainstSchema(runtime_schema, expression);
     for (req.order_by) |order| {
         if (order.field.len > 0) try validateSchemaField(runtime_schema, order.field);
-        if (order.expression) |expression| try validateExpressionAgainstSchema(runtime_schema, expression);
+        if (order.expression) |expression| try validateExpressionAgainstSchemaWithScalarOutputs(runtime_schema, expression, req.scalar_subqueries);
     }
     for (req.json_extract) |projection| try validateSchemaField(runtime_schema, projection.field);
     for (req.array_length) |projection| try validateSchemaField(runtime_schema, projection.field);
@@ -12492,6 +13312,7 @@ const relationalRowsSetOperationRowsAllocFn = relationalRowsSetOperationRowsAllo
 
 pub fn Impl(comptime DB: type) type {
     return struct {
+        const RelationalRowsImpl = @This();
         const RelationalRowsQueryCandidate = QueryCandidate;
         const RelationalRowsMutationSourceCandidate = MutationSourceCandidate;
         const RelationalRowsMutationSourcePlan = MutationSourcePlan;
@@ -13139,6 +13960,19 @@ pub fn Impl(comptime DB: type) type {
             }
             for (expression.case_else) |fallback| {
                 if (expressionReferencesHiddenScalarOutput(fallback, scalar_subqueries)) return true;
+            }
+            return false;
+        }
+
+        fn queryOrdersReferenceHiddenScalarOutput(
+            order_by: []const types.RelationalRowsQueryOrder,
+            scalar_subqueries: []const types.RelationalRowsScalarSubqueryProjection,
+        ) bool {
+            if (scalar_subqueries.len == 0) return false;
+            for (order_by) |order| {
+                if (order.expression) |expression| {
+                    if (expressionReferencesHiddenScalarOutput(expression, scalar_subqueries)) return true;
+                }
             }
             return false;
         }
@@ -14051,18 +14885,469 @@ pub fn Impl(comptime DB: type) type {
             defer if (apply_shared_held) self.core.unlockApplyShared();
 
             const generation = self.core.nextDerivedSequence();
+            if (relationalRowsCanUseDirectUnorderedResult(local_req)) {
+                var result = try @This().buildDirectUnorderedRelationalRowsQueryResultAlloc(self, alloc, runtime_schema, local_req, generation);
+                result.include_profile = local_req.profile;
+                self.core.unlockApplyShared();
+                apply_shared_held = false;
+                return result;
+            }
+
+            var profile = types.RelationalRowsQueryResult.Profile{};
+            if (try @This().buildDirectOrderSatisfyingOrderedTupleRelationalRowsQueryResultAlloc(self, alloc, runtime_schema, local_req, generation, &profile)) |result| {
+                var owned_result = result;
+                owned_result.include_profile = local_req.profile;
+                self.core.unlockApplyShared();
+                apply_shared_held = false;
+                return owned_result;
+            }
+
             var rows = std.ArrayListUnmanaged(QueryCandidate).empty;
             defer {
                 for (rows.items) |*row| row.deinit(alloc);
                 rows.deinit(alloc);
             }
 
-            try @This().appendRelationalRowsQueryCandidatesForRequestAlloc(self, alloc, runtime_schema, local_req, generation, &rows);
+            try @This().appendRelationalRowsQueryCandidatesForRequestWithMaterializedCtesAndProfileAlloc(self, alloc, runtime_schema, &.{}, local_req, generation, &rows, &profile);
 
             self.core.unlockApplyShared();
             apply_shared_held = false;
 
-            return try @This().buildRelationalRowsQueryResultFromCandidatesAlloc(self, alloc, runtime_schema, local_req, rows.items);
+            var result = try @This().buildRelationalRowsQueryResultFromCandidatesAlloc(self, alloc, runtime_schema, local_req, rows.items);
+            profile.projected_rows += result.rows.len;
+            result.profile = profile;
+            result.include_profile = local_req.profile;
+            return result;
+        }
+
+        fn relationalRowsCanUseDirectUnorderedResult(req: types.RelationalRowsQueryRequest) bool {
+            return req.order_by.len == 0 and
+                !queryHasDistinctOn(req) and
+                req.row_claim == null and
+                req.scalar_subqueries.len == 0;
+        }
+
+        fn buildDirectUnorderedRelationalRowsQueryResultAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            generation: ?u64,
+        ) !types.RelationalRowsQueryResult {
+            var acc = DirectUnorderedRelationalRowsAccumulator{};
+            errdefer {
+                for (acc.rows.items) |row| alloc.free(@constCast(row));
+                acc.rows.deinit(alloc);
+            }
+
+            if (try @This().buildDirectUnorderedOrderedTupleRelationalRowsQueryResultAlloc(self, alloc, runtime_schema, req, generation)) |result| {
+                return result;
+            }
+
+            var candidate_set = try @This().resolveRelationalRowsQueryCandidateSetWithProfileAlloc(self, alloc, runtime_schema, req, generation, &acc.profile);
+            defer if (candidate_set) |*set| set.deinit(alloc);
+            if (candidate_set) |*set| {
+                const maybe_doc_ids = try self.searchRuntimeResolveDocSetDocIds(alloc, set, generation);
+                if (maybe_doc_ids) |doc_ids| {
+                    setRelationalRowsProfileAccessMethod(&acc.profile, .resolved_doc_set);
+                    if (acc.profile.access_method != .ordered_tuple_doc_set) {
+                        acc.profile.candidate_rows += doc_ids.len;
+                        acc.profile.index_entries_scanned += doc_ids.len;
+                    }
+                    defer {
+                        for (doc_ids) |doc_id| alloc.free(@constCast(doc_id));
+                        alloc.free(doc_ids);
+                    }
+                    for (doc_ids) |doc_id| {
+                        try @This().appendDirectUnorderedRelationalRowsResultForDocKeyAlloc(self, alloc, runtime_schema, req, &acc, doc_id);
+                        if (acc.done(req)) break;
+                    }
+                    return try acc.toResult(alloc);
+                }
+            }
+
+            const scanned = if (req.doc_key_range) |range|
+                try relational_store_mod.scanRowsSpanAlloc(alloc, self.core.store, range.start, range.end)
+            else
+                try relational_store_mod.scanRowsAlloc(alloc, self.core.store, "", "");
+            defer relational_store_mod.freeRows(alloc, scanned);
+            setRelationalRowsProfileAccessMethod(&acc.profile, .base_scan);
+            acc.profile.iterator_seeks += 1;
+            acc.profile.candidate_rows += scanned.len;
+            for (scanned) |row| {
+                try @This().appendDirectUnorderedRelationalRowsResultFromRawAlloc(self, alloc, runtime_schema, req, &acc, row.doc_key, row.row_value);
+                if (acc.done(req)) break;
+            }
+            return try acc.toResult(alloc);
+        }
+
+        fn orderedTuplePayloadCanCoverQuery(
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            plan: OrderedTupleScanPlan,
+        ) bool {
+            if (plan.column.index_include_columns.len == 0) return false;
+            if (req.select_all) return false;
+            if (req.subquery_predicates.len != 0 or req.scalar_subqueries.len != 0) return false;
+            if (req.json_extract.len != 0 or req.array_length.len != 0 or req.coalesce.len != 0 or req.field_aliases.len != 0 or req.expressions.len != 0) return false;
+            if (req.array_any.len != 0 or req.array_contains.len != 0 or req.array_eq.len != 0 or req.in_predicates.len != 0) return false;
+            if (req.json_contains.len != 0 or req.json_path_eq.len != 0 or req.json_path_exists.len != 0 or req.text_patterns.len != 0) return false;
+            if (req.or_predicates.len != 0 or req.not_predicates.len != 0 or req.access_or_predicates.len != 0 or req.access_not_predicates.len != 0) return false;
+            if (req.expression_predicates.len != 0 or req.expression_or_predicates.len != 0 or req.expression_not_predicates.len != 0 or req.expression_array_contains.len != 0) return false;
+            for (req.predicates) |predicate| {
+                if (!orderedTupleIndexKeysCoverField(runtime_schema, plan.column, predicate.field)) return false;
+            }
+            for (req.select) |field| {
+                if (!orderedTupleIncludeColumnsCoverField(runtime_schema, plan.column, field)) return false;
+            }
+            return true;
+        }
+
+        fn orderedTupleIndexKeysCoverField(runtime_schema: schema_mod.TableSchema, index_column: schema_mod.RelationalColumn, field: []const u8) bool {
+            const column = columnForField(runtime_schema, field) orelse return false;
+            for (index_column.index_keys) |key| {
+                const key_column = columnForField(runtime_schema, key.column) orelse continue;
+                if (std.mem.eql(u8, key_column.name, column.name) or std.mem.eql(u8, key_column.path, column.path)) return true;
+            }
+            return false;
+        }
+
+        fn orderedTupleIncludeColumnsCoverField(runtime_schema: schema_mod.TableSchema, index_column: schema_mod.RelationalColumn, field: []const u8) bool {
+            const column = columnForField(runtime_schema, field) orelse return false;
+            for (index_column.index_include_columns) |include| {
+                const include_column = columnForField(runtime_schema, include) orelse continue;
+                if (std.mem.eql(u8, include_column.name, column.name) or std.mem.eql(u8, include_column.path, column.path)) return true;
+            }
+            return false;
+        }
+
+        fn projectOrderedTuplePayloadStaticAlloc(
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            payload: []const u8,
+            req: types.RelationalRowsQueryRequest,
+        ) ![]u8 {
+            if (req.select.len == 0) {
+                try relational_row_codec.validate(payload);
+                return try alloc.dupe(u8, "{}");
+            }
+
+            var stack_lookups: [32]relational_row_codec.CellLookup = undefined;
+            const lookups = if (req.select.len <= stack_lookups.len)
+                stack_lookups[0..req.select.len]
+            else
+                try alloc.alloc(relational_row_codec.CellLookup, req.select.len);
+            defer if (req.select.len > stack_lookups.len) alloc.free(lookups);
+
+            var stack_cells: [32]?relational_row_codec.Cell = undefined;
+            const cells = if (req.select.len <= stack_cells.len)
+                stack_cells[0..req.select.len]
+            else
+                try alloc.alloc(?relational_row_codec.Cell, req.select.len);
+            defer if (req.select.len > stack_cells.len) alloc.free(cells);
+
+            for (req.select, 0..) |field, i| {
+                const selected_column = columnForField(runtime_schema, field);
+                lookups[i] = .{
+                    .path = field,
+                    .alternate_path = if (selected_column) |column|
+                        if (std.mem.eql(u8, field, column.path)) "" else column.path
+                    else
+                        "",
+                };
+            }
+            try relational_row_codec.collectCellsByLookup(payload, lookups, cells);
+
+            var out = std.ArrayListUnmanaged(u8).empty;
+            errdefer out.deinit(alloc);
+            try out.append(alloc, '{');
+            for (req.select, 0..) |field, i| {
+                if (cells[i]) |found| {
+                    try relational_row_codec.appendCellValue(alloc, &out, field, found.value_type, found.is_json, found.value, i > 0);
+                } else {
+                    if (i > 0) try out.append(alloc, ',');
+                    try relational_row_codec.appendJsonString(alloc, &out, field);
+                    try out.appendSlice(alloc, ":null");
+                }
+            }
+            try out.append(alloc, '}');
+            return try out.toOwnedSlice(alloc);
+        }
+
+        fn appendDirectUnorderedRelationalRowsResultFromOrderedTuplePayloadAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            acc: *DirectUnorderedRelationalRowsAccumulator,
+            plan: OrderedTupleScanPlan,
+            entry_key: []const u8,
+            doc_key: []const u8,
+            payload: []const u8,
+        ) !bool {
+            if (!orderedTuplePayloadCanCoverQuery(runtime_schema, req, plan)) return false;
+            if (payload.len == 0) return false;
+            if (!docKeyInQueryRange(req, doc_key)) return true;
+            if (try @This().isExpiredDocumentKey(self, alloc, doc_key)) return true;
+            const raw_row = try relational_store_mod.getRawAlloc(alloc, self.core.store, doc_key) orelse return true;
+            defer alloc.free(raw_row);
+            acc.profile.hydrated_rows += 1;
+            switch (try relational_store_mod.orderedTupleEntryRowMatchAlloc(alloc, entry_key, payload, raw_row, plan.column, runtime_schema.relational_columns)) {
+                .none => return true,
+                .tuple => {
+                    try @This().appendDirectUnorderedRelationalRowsResultFromRawWithHydrationProfileAlloc(self, alloc, runtime_schema, req, acc, doc_key, raw_row, false);
+                    return true;
+                },
+                .tuple_and_payload => {},
+            }
+
+            const matched_index: usize = @intCast(acc.total);
+            acc.total = std.math.cast(u32, @as(usize, acc.total) + 1) orelse return error.UnsupportedQueryRequest;
+            if (matched_index < @as(usize, req.offset)) return true;
+            if (req.limit) |limit| {
+                if (acc.rows.items.len >= @as(usize, limit)) return true;
+            }
+
+            const projected = try projectOrderedTuplePayloadStaticAlloc(alloc, runtime_schema, payload, req);
+            var projected_transferred = false;
+            errdefer if (!projected_transferred) alloc.free(projected);
+            try acc.rows.append(alloc, projected);
+            acc.profile.covering_payload_rows += 1;
+            acc.profile.projected_rows += 1;
+            projected_transferred = true;
+            return true;
+        }
+
+        const DirectUnorderedOrderedTupleScanContext = struct {
+            db: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            acc: *DirectUnorderedRelationalRowsAccumulator,
+            append_doc_key: *const fn (
+                self: *DB,
+                alloc: Allocator,
+                runtime_schema: schema_mod.TableSchema,
+                req: types.RelationalRowsQueryRequest,
+                acc: *DirectUnorderedRelationalRowsAccumulator,
+                doc_key: []const u8,
+            ) anyerror!void,
+            append_payload: *const fn (
+                self: *DB,
+                alloc: Allocator,
+                runtime_schema: schema_mod.TableSchema,
+                req: types.RelationalRowsQueryRequest,
+                acc: *DirectUnorderedRelationalRowsAccumulator,
+                plan: OrderedTupleScanPlan,
+                entry_key: []const u8,
+                doc_key: []const u8,
+                payload: []const u8,
+            ) anyerror!bool,
+            plan: OrderedTupleScanPlan,
+
+            fn append(ctx: ?*anyopaque, entry_key: []const u8, doc_key: []const u8, payload: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                try @This().appendRow(self, entry_key, doc_key, payload);
+                return if (self.acc.done(self.req)) .stop else .@"continue";
+            }
+
+            fn appendRow(self: *@This(), entry_key: []const u8, doc_key: []const u8, payload: []const u8) !void {
+                if (try self.append_payload(
+                    self.db,
+                    self.alloc,
+                    self.runtime_schema,
+                    self.req,
+                    self.acc,
+                    self.plan,
+                    entry_key,
+                    doc_key,
+                    payload,
+                )) return;
+                try self.append_doc_key(self.db, self.alloc, self.runtime_schema, self.req, self.acc, doc_key);
+            }
+        };
+
+        fn buildDirectUnorderedOrderedTupleRelationalRowsQueryResultAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            generation: ?u64,
+        ) !?types.RelationalRowsQueryResult {
+            const implications = PredicateImplications{
+                .predicates = req.predicates,
+                .expressions = req.expression_predicates,
+            };
+            var plan = (try @This().orderedTupleScanPlanForPredicatesAlloc(self, alloc, runtime_schema, req.predicates, implications, generation, null)) orelse return null;
+            defer plan.deinit(alloc);
+            return try @This().buildDirectOrderedTupleRelationalRowsQueryResultFromPlanAlloc(self, alloc, runtime_schema, req, plan);
+        }
+
+        fn buildDirectOrderSatisfyingOrderedTupleRelationalRowsQueryResultAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            generation: ?u64,
+            profile: ?*types.RelationalRowsQueryResult.Profile,
+        ) !?types.RelationalRowsQueryResult {
+            if (req.order_by.len == 0) return null;
+            const implications = PredicateImplications{
+                .predicates = req.predicates,
+                .expressions = req.expression_predicates,
+            };
+            var rejection: ?OrderedTupleIndexCapabilityRejection = null;
+            var plan = (try @This().orderedTupleScanPlanForPredicatesAlloc(self, alloc, runtime_schema, req.predicates, implications, generation, &rejection)) orelse {
+                setRelationalRowsProfileOrderedTupleRejection(profile, rejection);
+                return null;
+            };
+            defer plan.deinit(alloc);
+            if (orderedTuplePlanOrderFallbackReason(runtime_schema, req, plan)) |reason| {
+                setRelationalRowsProfileFallback(profile, reason);
+                return null;
+            }
+            return try @This().buildDirectOrderedTupleRelationalRowsQueryResultFromPlanAlloc(self, alloc, runtime_schema, req, plan);
+        }
+
+        fn buildDirectOrderedTupleRelationalRowsQueryResultFromPlanAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            plan: OrderedTupleScanPlan,
+        ) !types.RelationalRowsQueryResult {
+            var acc = DirectUnorderedRelationalRowsAccumulator{};
+            errdefer {
+                for (acc.rows.items) |row| alloc.free(@constCast(row));
+                acc.rows.deinit(alloc);
+            }
+            setRelationalRowsProfileAccessMethod(&acc.profile, .ordered_tuple_stream);
+            setRelationalRowsProfileOrderedTuplePlan(&acc.profile, plan);
+            var stats = relational_store_mod.OrderedTupleDocKeyScanStats{};
+            var scan_ctx = DirectUnorderedOrderedTupleScanContext{
+                .db = self,
+                .alloc = alloc,
+                .runtime_schema = runtime_schema,
+                .req = req,
+                .acc = &acc,
+                .append_doc_key = @This().appendDirectUnorderedRelationalRowsResultForDocKeyAlloc,
+                .append_payload = @This().appendDirectUnorderedRelationalRowsResultFromOrderedTuplePayloadAlloc,
+                .plan = plan,
+            };
+            try @This().scanOrderedTuplePlanWithContext(
+                self,
+                alloc,
+                plan,
+                req.doc_key_range,
+                &stats,
+                &scan_ctx,
+                DirectUnorderedOrderedTupleScanContext.append,
+            );
+            acc.profile.index_entries_scanned += stats.index_entries_scanned;
+            acc.profile.candidate_rows += stats.candidate_rows;
+            acc.profile.iterator_seeks += stats.iterator_seeks;
+            return try acc.toResult(alloc);
+        }
+
+        const DirectUnorderedRelationalRowsAccumulator = struct {
+            rows: std.ArrayListUnmanaged([]const u8) = .empty,
+            total: u32 = 0,
+            total_exact: bool = true,
+            profile: types.RelationalRowsQueryResult.Profile = .{},
+
+            fn selectedFull(self: @This(), req: types.RelationalRowsQueryRequest) bool {
+                const limit = req.limit orelse return false;
+                return self.rows.items.len >= @as(usize, limit);
+            }
+
+            fn done(self: *@This(), req: types.RelationalRowsQueryRequest) bool {
+                if (!self.selectedFull(req)) return false;
+                switch (req.total_mode) {
+                    .exact => return false,
+                    .none => {
+                        self.total = @intCast(self.rows.items.len);
+                        self.total_exact = false;
+                        return true;
+                    },
+                    .bounded => {
+                        self.total_exact = false;
+                        return true;
+                    },
+                }
+            }
+
+            fn toResult(self: *@This(), alloc: Allocator) !types.RelationalRowsQueryResult {
+                const rows = try self.rows.toOwnedSlice(alloc);
+                self.rows = .empty;
+                return .{
+                    .rows = rows,
+                    .total = self.total,
+                    .total_exact = self.total_exact,
+                    .profile = self.profile,
+                };
+            }
+        };
+
+        fn appendDirectUnorderedRelationalRowsResultForDocKeyAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            acc: *DirectUnorderedRelationalRowsAccumulator,
+            doc_key: []const u8,
+        ) !void {
+            if (!docKeyInQueryRange(req, doc_key)) return;
+            const raw_row = try relational_store_mod.getRawAlloc(alloc, self.core.store, doc_key) orelse return;
+            defer alloc.free(raw_row);
+            try @This().appendDirectUnorderedRelationalRowsResultFromRawAlloc(self, alloc, runtime_schema, req, acc, doc_key, raw_row);
+        }
+
+        fn appendDirectUnorderedRelationalRowsResultFromRawAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            acc: *DirectUnorderedRelationalRowsAccumulator,
+            doc_key: []const u8,
+            raw_row: []const u8,
+        ) !void {
+            try @This().appendDirectUnorderedRelationalRowsResultFromRawWithHydrationProfileAlloc(self, alloc, runtime_schema, req, acc, doc_key, raw_row, true);
+        }
+
+        fn appendDirectUnorderedRelationalRowsResultFromRawWithHydrationProfileAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            acc: *DirectUnorderedRelationalRowsAccumulator,
+            doc_key: []const u8,
+            raw_row: []const u8,
+            count_hydration: bool,
+        ) !void {
+            if (!docKeyInQueryRange(req, doc_key)) return;
+            if (try @This().isExpiredDocumentKey(self, alloc, doc_key)) return;
+            if (count_hydration) acc.profile.hydrated_rows += 1;
+            const materialized = try mapper.materializeRelationalRowValueAlloc(alloc, raw_row);
+            defer alloc.free(materialized);
+            acc.profile.residual_rechecks += 1;
+            if (!(try @This().relationalRowsSubqueryPredicatesPassAlloc(self, alloc, runtime_schema, &.{}, materialized, req.subquery_predicates, currentTimeNs()))) return;
+            var local_req = req;
+            local_req.subquery_predicates = &.{};
+            if (!(try queryJsonMatchesRequestWithColumns(alloc, materialized, local_req, runtime_schema.relational_columns, currentTimeNs()))) return;
+
+            const matched_index: usize = @intCast(acc.total);
+            acc.total = std.math.cast(u32, @as(usize, acc.total) + 1) orelse return error.UnsupportedQueryRequest;
+            if (matched_index < @as(usize, req.offset)) return;
+            if (req.limit) |limit| {
+                if (acc.rows.items.len >= @as(usize, limit)) return;
+            }
+
+            const projected = try @This().projectRelationalRowsQueryCandidateWithMaterializedCtesAlloc(self, alloc, runtime_schema, &.{}, doc_key, materialized, req);
+            var projected_transferred = false;
+            errdefer if (!projected_transferred) alloc.free(projected);
+            try acc.rows.append(alloc, projected);
+            acc.profile.projected_rows += 1;
+            projected_transferred = true;
         }
 
         pub fn collectRelationalRowsPreimagesAlloc(
@@ -14195,7 +15480,7 @@ pub fn Impl(comptime DB: type) type {
             generation: ?u64,
             rows: *std.ArrayListUnmanaged(QueryCandidate),
         ) !void {
-            return try @This().appendRelationalRowsQueryCandidatesForRequestWithMaterializedCtesAlloc(self, alloc, runtime_schema, &.{}, req, generation, rows);
+            return try @This().appendRelationalRowsQueryCandidatesForRequestWithMaterializedCtesAndProfileAlloc(self, alloc, runtime_schema, &.{}, req, generation, rows, null);
         }
 
         fn appendRelationalRowsQueryCandidatesForRequestWithMaterializedCtesAlloc(
@@ -14207,24 +15492,135 @@ pub fn Impl(comptime DB: type) type {
             generation: ?u64,
             rows: *std.ArrayListUnmanaged(QueryCandidate),
         ) !void {
-            var candidate_set = try @This().resolveRelationalRowsQueryCandidateSetAlloc(self, alloc, runtime_schema, req, generation);
+            return try @This().appendRelationalRowsQueryCandidatesForRequestWithMaterializedCtesAndProfileAlloc(self, alloc, runtime_schema, materialized_ctes, req, generation, rows, null);
+        }
+
+        fn appendRelationalRowsQueryCandidatesForRequestWithMaterializedCtesAndProfileAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
+            req: types.RelationalRowsQueryRequest,
+            generation: ?u64,
+            rows: *std.ArrayListUnmanaged(QueryCandidate),
+            profile: ?*types.RelationalRowsQueryResult.Profile,
+        ) !void {
+            if (try @This().appendRelationalRowsQueryCandidatesFromOrderedTupleStreamAlloc(self, alloc, runtime_schema, materialized_ctes, req, generation, rows, profile)) {
+                return;
+            }
+
+            var candidate_set = try @This().resolveRelationalRowsQueryCandidateSetWithProfileAlloc(self, alloc, runtime_schema, req, generation, profile);
             defer if (candidate_set) |*set| set.deinit(alloc);
 
             if (candidate_set) |*set| {
                 const maybe_doc_ids = try self.searchRuntimeResolveDocSetDocIds(alloc, set, generation);
                 if (maybe_doc_ids) |doc_ids| {
+                    if (profile) |out| {
+                        setRelationalRowsProfileAccessMethod(profile, .resolved_doc_set);
+                        if (out.access_method != .ordered_tuple_doc_set) {
+                            out.index_entries_scanned += doc_ids.len;
+                            out.candidate_rows += doc_ids.len;
+                        }
+                    }
                     defer {
                         for (doc_ids) |doc_id| alloc.free(@constCast(doc_id));
                         alloc.free(doc_ids);
                     }
                     for (doc_ids) |doc_id| {
-                        try @This().appendRelationalRowsQueryCandidateWithMaterializedCtesAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows, doc_id);
+                        try @This().appendRelationalRowsQueryCandidateWithMaterializedCtesAndProfileAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows, doc_id, profile);
                     }
                     return;
                 }
             }
 
-            try @This().appendAllRelationalRowsQueryCandidatesWithMaterializedCtesAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows);
+            try @This().appendAllRelationalRowsQueryCandidatesWithMaterializedCtesAndProfileAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows, profile);
+        }
+
+        fn relationalRowsCanStreamOrderedTupleCandidates(req: types.RelationalRowsQueryRequest) bool {
+            return req.order_by.len == 0 and
+                !queryHasDistinctOn(req) and
+                req.row_claim == null;
+        }
+
+        const OrderedTupleCandidateAppendContext = struct {
+            db: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
+            req: types.RelationalRowsQueryRequest,
+            rows: *std.ArrayListUnmanaged(QueryCandidate),
+            profile: ?*types.RelationalRowsQueryResult.Profile,
+
+            fn done(self: *@This()) bool {
+                if (self.req.total_mode == .exact) return false;
+                const limit = self.req.limit orelse return false;
+                const page_width = @as(usize, self.req.offset) +| @as(usize, limit);
+                return self.rows.items.len >= page_width;
+            }
+
+            fn append(ctx: ?*anyopaque, _: []const u8, doc_key: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                try RelationalRowsImpl.appendRelationalRowsQueryCandidateWithMaterializedCtesAndProfileAlloc(
+                    self.db,
+                    self.alloc,
+                    self.runtime_schema,
+                    self.materialized_ctes,
+                    self.req,
+                    self.rows,
+                    doc_key,
+                    self.profile,
+                );
+                return if (self.done()) .stop else .@"continue";
+            }
+        };
+
+        fn appendRelationalRowsQueryCandidatesFromOrderedTupleStreamAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
+            req: types.RelationalRowsQueryRequest,
+            generation: ?u64,
+            rows: *std.ArrayListUnmanaged(QueryCandidate),
+            profile: ?*types.RelationalRowsQueryResult.Profile,
+        ) !bool {
+            if (!relationalRowsCanStreamOrderedTupleCandidates(req)) return false;
+            const implications = PredicateImplications{
+                .predicates = req.predicates,
+                .expressions = req.expression_predicates,
+            };
+            var rejection: ?OrderedTupleIndexCapabilityRejection = null;
+            var plan = (try @This().orderedTupleScanPlanForPredicatesAlloc(self, alloc, runtime_schema, req.predicates, implications, generation, &rejection)) orelse {
+                setRelationalRowsProfileOrderedTupleRejection(profile, rejection);
+                return false;
+            };
+            defer plan.deinit(alloc);
+
+            if (plan.column.index_where.len != 0 or plan.column.index_where_expressions.len != 0) return false;
+
+            setRelationalRowsProfileAccessMethod(profile, .ordered_tuple_stream);
+            setRelationalRowsProfileOrderedTuplePlan(profile, plan);
+            var stats = relational_store_mod.OrderedTupleDocKeyScanStats{};
+            var scan_ctx = OrderedTupleCandidateAppendContext{
+                .db = self,
+                .alloc = alloc,
+                .runtime_schema = runtime_schema,
+                .materialized_ctes = materialized_ctes,
+                .req = req,
+                .rows = rows,
+                .profile = profile,
+            };
+            try @This().scanOrderedTuplePlanWithContext(
+                self,
+                alloc,
+                plan,
+                req.doc_key_range,
+                &stats,
+                &scan_ctx,
+                OrderedTupleCandidateAppendContext.append,
+            );
+            addRelationalRowsOrderedTupleScanStats(profile, stats);
+            return true;
         }
 
         pub fn buildRelationalRowsQueryResultFromCandidatesAlloc(
@@ -14297,10 +15693,40 @@ pub fn Impl(comptime DB: type) type {
                 projected_transferred = true;
             }
 
+            const total_shape = relationalRowsQueryTotalShape(total, out_rows.items.len, req.offset, req.limit, req.total_mode);
             return .{
                 .rows = try out_rows.toOwnedSlice(alloc),
-                .total = total,
+                .total = total_shape.total,
+                .total_exact = total_shape.total_exact,
             };
+        }
+
+        const RelationalRowsQueryTotalShape = struct {
+            total: u32,
+            total_exact: bool,
+        };
+
+        fn relationalRowsQueryTotalShape(
+            exact_total: u32,
+            returned_len: usize,
+            offset: u32,
+            limit: ?u32,
+            total_mode: types.RelationalRowsQueryRequest.TotalMode,
+        ) RelationalRowsQueryTotalShape {
+            switch (total_mode) {
+                .exact => return .{ .total = exact_total, .total_exact = true },
+                .bounded => {
+                    const page_limit = limit orelse return .{ .total = exact_total, .total_exact = true };
+                    if (returned_len < @as(usize, page_limit)) return .{ .total = exact_total, .total_exact = true };
+                    const bound = @min(@as(u64, exact_total), @as(u64, offset) + @as(u64, page_limit));
+                    return .{ .total = @intCast(bound), .total_exact = false };
+                },
+                .none => {
+                    const page_limit = limit orelse return .{ .total = exact_total, .total_exact = true };
+                    if (returned_len < @as(usize, page_limit)) return .{ .total = exact_total, .total_exact = true };
+                    return .{ .total = @intCast(returned_len), .total_exact = false };
+                },
+            }
         }
 
         pub fn collectRelationalRowsPreimagesFromCandidatesAlloc(
@@ -14518,6 +15944,17 @@ pub fn Impl(comptime DB: type) type {
             req: types.RelationalRowsQueryRequest,
             generation: ?u64,
         ) !?doc_set.ResolvedDocSet {
+            return try @This().resolveRelationalRowsQueryCandidateSetWithProfileAlloc(self, alloc, runtime_schema, req, generation, null);
+        }
+
+        fn resolveRelationalRowsQueryCandidateSetWithProfileAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            generation: ?u64,
+            profile: ?*types.RelationalRowsQueryResult.Profile,
+        ) !?doc_set.ResolvedDocSet {
             if (try @This().resolveRelationalRowsUniqueOwnerCandidateSetAlloc(self, alloc, runtime_schema, req, generation)) |owner_set| {
                 return owner_set;
             }
@@ -14533,8 +15970,40 @@ pub fn Impl(comptime DB: type) type {
             }
             var plan_ordinal: usize = 0;
 
+            if (orderedTupleCanPlanForQueryShape(req)) {
+                var ordered_stats = relational_store_mod.OrderedTupleDocKeyScanStats{};
+                if (try @This().resolveRelationalRowsOrderedTuplePredicateSetProbeAlloc(self, alloc, runtime_schema, req.predicates, implications, generation, req.doc_key_range, orderedTupleCandidateSetProbeLimit(req), &ordered_stats, profile)) |probe| {
+                    switch (probe) {
+                        .set => |ordered_set| {
+                            var ordered = ordered_set;
+                            errdefer ordered.deinit(alloc);
+                            if (orderedTupleCandidateSetUsableForQuery(req, &ordered)) {
+                                setRelationalRowsProfileAccessMethod(profile, .ordered_tuple_doc_set);
+                                addRelationalRowsOrderedTupleScanStats(profile, ordered_stats);
+                                setRelationalRowsProfileOrderedTupleProbeGate(profile, req, relationalRowsSaturatingUsize(ordered_stats.candidate_rows));
+                                try appendPlannedCandidateSetAlloc(alloc, &planned_sets, &ordered, plan_ordinal);
+                                ordered = .none;
+                                plan_ordinal += 1;
+                            } else {
+                                addRelationalRowsOrderedTupleScanStats(profile, ordered_stats);
+                                setRelationalRowsProfileOrderedTupleProbeGate(profile, req, relationalRowsSaturatingUsize(ordered_stats.candidate_rows));
+                                setRelationalRowsProfileFallback(profile, .ordered_tuple_candidate_gate);
+                                ordered.deinit(alloc);
+                            }
+                        },
+                        .exceeded_gate => |observed_count| {
+                            addRelationalRowsOrderedTupleScanStats(profile, ordered_stats);
+                            setRelationalRowsProfileOrderedTupleProbeGate(profile, req, observed_count);
+                            setRelationalRowsProfileFallback(profile, .ordered_tuple_materialization_cap);
+                        },
+                    }
+                }
+            } else if (orderedTupleSchemaHasActiveIndex(runtime_schema)) {
+                setRelationalRowsProfileFallback(profile, .ordered_tuple_skipped_for_exact_paged_total);
+            }
+
             for (req.predicates) |predicate| {
-                var child = (try @This().resolveRelationalRowsPredicateDocSetWithPredicatesAlloc(self, alloc, runtime_schema, predicate, implications, generation)) orelse continue;
+                var child = (try @This().resolveRelationalRowsPredicateDocSetWithPredicatesAndRangeAlloc(self, alloc, runtime_schema, predicate, implications, generation, req.doc_key_range)) orelse continue;
                 errdefer child.deinit(alloc);
                 try appendPlannedCandidateSetAlloc(alloc, &planned_sets, &child, plan_ordinal);
                 child = .none;
@@ -14590,7 +16059,14 @@ pub fn Impl(comptime DB: type) type {
                 plan_ordinal += 1;
             }
             if (req.or_predicates.len > 0) {
-                var disjunction = (try @This().resolveRelationalRowsOrPredicateGroupsCandidateSetAlloc(self, alloc, runtime_schema, req.or_predicates, generation)) orelse return null;
+                var disjunction = (try @This().resolveRelationalRowsOrPredicateGroupsCandidateSetWithProfileAlloc(self, alloc, runtime_schema, req.or_predicates, generation, req.doc_key_range, profile)) orelse return null;
+                errdefer disjunction.deinit(alloc);
+                try appendPlannedCandidateSetAlloc(alloc, &planned_sets, &disjunction, plan_ordinal);
+                disjunction = .none;
+                plan_ordinal += 1;
+            }
+            if (req.access_or_predicates.len > 0) {
+                var disjunction = (try @This().resolveRelationalRowsAccessOrPredicateGroupsCandidateSetWithProfileAlloc(self, alloc, runtime_schema, req.access_or_predicates, generation, req.doc_key_range, profile)) orelse return null;
                 errdefer disjunction.deinit(alloc);
                 try appendPlannedCandidateSetAlloc(alloc, &planned_sets, &disjunction, plan_ordinal);
                 disjunction = .none;
@@ -14616,15 +16092,137 @@ pub fn Impl(comptime DB: type) type {
             groups: []const types.RelationalRowsPredicateGroup,
             generation: ?u64,
         ) !?doc_set.ResolvedDocSet {
+            return try @This().resolveRelationalRowsOrPredicateGroupsCandidateSetWithProfileAlloc(self, alloc, runtime_schema, groups, generation, null, null);
+        }
+
+        fn resolveRelationalRowsOrPredicateGroupsCandidateSetWithProfileAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            groups: []const types.RelationalRowsPredicateGroup,
+            generation: ?u64,
+            doc_key_range: ?types.RelationalRowsDocKeyRange,
+            profile: ?*types.RelationalRowsQueryResult.Profile,
+        ) !?doc_set.ResolvedDocSet {
             if (groups.len == 0) return null;
 
             var current: ?doc_set.ResolvedDocSet = null;
             errdefer if (current) |*set| set.deinit(alloc);
             for (groups) |group| {
-                var branch = (try @This().resolveRelationalRowsPredicateGroupCandidateSetAlloc(self, alloc, runtime_schema, group.predicates, generation)) orelse return null;
+                var branch = (try @This().resolveRelationalRowsPredicateGroupCandidateSetWithProfileAlloc(self, alloc, runtime_schema, group.predicates, generation, doc_key_range, profile)) orelse return null;
                 defer branch.deinit(alloc);
                 try self.searchRuntimeCombineRelationalFilterSetAlloc(alloc, &current, &branch, generation, .union_set);
             }
+            return current;
+        }
+
+        pub fn resolveRelationalRowsAccessOrPredicateGroupsCandidateSetAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            groups: []const types.RelationalRowsAccessPredicateGroup,
+            generation: ?u64,
+        ) !?doc_set.ResolvedDocSet {
+            return try @This().resolveRelationalRowsAccessOrPredicateGroupsCandidateSetWithProfileAlloc(self, alloc, runtime_schema, groups, generation, null, null);
+        }
+
+        fn resolveRelationalRowsAccessOrPredicateGroupsCandidateSetWithProfileAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            groups: []const types.RelationalRowsAccessPredicateGroup,
+            generation: ?u64,
+            doc_key_range: ?types.RelationalRowsDocKeyRange,
+            profile: ?*types.RelationalRowsQueryResult.Profile,
+        ) !?doc_set.ResolvedDocSet {
+            if (groups.len == 0) return null;
+
+            var current: ?doc_set.ResolvedDocSet = null;
+            errdefer if (current) |*set| set.deinit(alloc);
+            for (groups) |group| {
+                var branch = (try @This().resolveRelationalRowsAccessPredicateGroupCandidateSetWithProfileAlloc(self, alloc, runtime_schema, group, generation, doc_key_range, profile)) orelse return null;
+                defer branch.deinit(alloc);
+                try self.searchRuntimeCombineRelationalFilterSetAlloc(alloc, &current, &branch, generation, .union_set);
+            }
+            return current;
+        }
+
+        fn resolveRelationalRowsAccessPredicateGroupCandidateSetWithProfileAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            group: types.RelationalRowsAccessPredicateGroup,
+            generation: ?u64,
+            doc_key_range: ?types.RelationalRowsDocKeyRange,
+            profile: ?*types.RelationalRowsQueryResult.Profile,
+        ) !?doc_set.ResolvedDocSet {
+            if (accessPredicateGroupIsEmpty(group)) return null;
+            const implications = PredicateImplications{ .predicates = group.predicates };
+
+            var current: ?doc_set.ResolvedDocSet = null;
+            errdefer if (current) |*set| set.deinit(alloc);
+            var matched_index = false;
+            var ordered_stats = relational_store_mod.OrderedTupleDocKeyScanStats{};
+            if (try @This().resolveRelationalRowsOrderedTuplePredicateSetProbeAlloc(self, alloc, runtime_schema, group.predicates, implications, generation, doc_key_range, null, &ordered_stats, profile)) |probe| {
+                switch (probe) {
+                    .set => |ordered_set| {
+                        setRelationalRowsProfileAccessMethod(profile, .ordered_tuple_doc_set);
+                        addRelationalRowsOrderedTupleScanStats(profile, ordered_stats);
+                        current = ordered_set;
+                        matched_index = true;
+                    },
+                    .exceeded_gate => unreachable,
+                }
+            }
+            for (group.predicates) |predicate| {
+                var child = (try @This().resolveRelationalRowsPredicateDocSetWithPredicatesAndRangeAlloc(self, alloc, runtime_schema, predicate, implications, generation, doc_key_range)) orelse continue;
+                defer child.deinit(alloc);
+                matched_index = true;
+                try self.searchRuntimeCombineRelationalFilterSetAlloc(alloc, &current, &child, generation, .intersect);
+            }
+            for (group.array_any) |predicate| {
+                var child = (try @This().resolveRelationalRowsArrayAnyDocSetWithPredicatesAlloc(self, alloc, runtime_schema, predicate, implications, generation)) orelse continue;
+                defer child.deinit(alloc);
+                matched_index = true;
+                try self.searchRuntimeCombineRelationalFilterSetAlloc(alloc, &current, &child, generation, .intersect);
+            }
+            for (group.array_contains) |predicate| {
+                var child = (try @This().resolveRelationalRowsArrayContainsDocSetWithPredicatesAlloc(self, alloc, runtime_schema, predicate, implications, generation)) orelse continue;
+                defer child.deinit(alloc);
+                matched_index = true;
+                try self.searchRuntimeCombineRelationalFilterSetAlloc(alloc, &current, &child, generation, .intersect);
+            }
+            for (group.array_eq) |predicate| {
+                var child = (try @This().resolveRelationalRowsArrayEqDocSetWithPredicatesAlloc(self, alloc, runtime_schema, predicate, implications, generation, doc_key_range)) orelse continue;
+                defer child.deinit(alloc);
+                matched_index = true;
+                try self.searchRuntimeCombineRelationalFilterSetAlloc(alloc, &current, &child, generation, .intersect);
+            }
+            for (group.in_predicates) |predicate| {
+                var child = (try @This().resolveRelationalRowsInDocSetWithPredicatesAlloc(self, alloc, runtime_schema, predicate, implications, generation)) orelse continue;
+                defer child.deinit(alloc);
+                matched_index = true;
+                try self.searchRuntimeCombineRelationalFilterSetAlloc(alloc, &current, &child, generation, .intersect);
+            }
+            for (group.json_contains) |predicate| {
+                var child = (try @This().resolveRelationalRowsJsonContainsDocSetWithPredicatesAlloc(self, alloc, runtime_schema, predicate, implications, generation)) orelse continue;
+                defer child.deinit(alloc);
+                matched_index = true;
+                try self.searchRuntimeCombineRelationalFilterSetAlloc(alloc, &current, &child, generation, .intersect);
+            }
+            for (group.json_path_eq) |predicate| {
+                var child = (try @This().resolveRelationalRowsJsonPathEqDocSetWithPredicatesAlloc(self, alloc, runtime_schema, predicate, implications, generation, doc_key_range)) orelse continue;
+                defer child.deinit(alloc);
+                matched_index = true;
+                try self.searchRuntimeCombineRelationalFilterSetAlloc(alloc, &current, &child, generation, .intersect);
+            }
+            for (group.json_path_exists) |predicate| {
+                var child = (try @This().resolveRelationalRowsJsonPathExistsDocSetWithPredicatesAlloc(self, alloc, runtime_schema, predicate, implications, generation, doc_key_range)) orelse continue;
+                defer child.deinit(alloc);
+                matched_index = true;
+                try self.searchRuntimeCombineRelationalFilterSetAlloc(alloc, &current, &child, generation, .intersect);
+            }
+            if (!matched_index) return null;
             return current;
         }
 
@@ -14635,14 +16233,38 @@ pub fn Impl(comptime DB: type) type {
             predicates: []const schema_mod.RelationalCheck,
             generation: ?u64,
         ) !?doc_set.ResolvedDocSet {
+            return try @This().resolveRelationalRowsPredicateGroupCandidateSetWithProfileAlloc(self, alloc, runtime_schema, predicates, generation, null, null);
+        }
+
+        fn resolveRelationalRowsPredicateGroupCandidateSetWithProfileAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            predicates: []const schema_mod.RelationalCheck,
+            generation: ?u64,
+            doc_key_range: ?types.RelationalRowsDocKeyRange,
+            profile: ?*types.RelationalRowsQueryResult.Profile,
+        ) !?doc_set.ResolvedDocSet {
             if (predicates.len == 0) return null;
             const implications = PredicateImplications{ .predicates = predicates };
 
             var current: ?doc_set.ResolvedDocSet = null;
             errdefer if (current) |*set| set.deinit(alloc);
             var matched_index = false;
+            var ordered_stats = relational_store_mod.OrderedTupleDocKeyScanStats{};
+            if (try @This().resolveRelationalRowsOrderedTuplePredicateSetProbeAlloc(self, alloc, runtime_schema, predicates, implications, generation, doc_key_range, null, &ordered_stats, profile)) |probe| {
+                switch (probe) {
+                    .set => |ordered_set| {
+                        setRelationalRowsProfileAccessMethod(profile, .ordered_tuple_doc_set);
+                        addRelationalRowsOrderedTupleScanStats(profile, ordered_stats);
+                        current = ordered_set;
+                        matched_index = true;
+                    },
+                    .exceeded_gate => unreachable,
+                }
+            }
             for (predicates) |predicate| {
-                var child = (try @This().resolveRelationalRowsPredicateDocSetWithPredicatesAlloc(self, alloc, runtime_schema, predicate, implications, generation)) orelse continue;
+                var child = (try @This().resolveRelationalRowsPredicateDocSetWithPredicatesAndRangeAlloc(self, alloc, runtime_schema, predicate, implications, generation, doc_key_range)) orelse continue;
                 defer child.deinit(alloc);
                 matched_index = true;
                 try self.searchRuntimeCombineRelationalFilterSetAlloc(alloc, &current, &child, generation, .intersect);
@@ -14708,6 +16330,335 @@ pub fn Impl(comptime DB: type) type {
             return try self.searchRuntimeResolveDocIdsToDocSet(alloc, &.{owner}, generation);
         }
 
+        fn orderedTupleScanPlanForPredicatesAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            predicates: []const schema_mod.RelationalCheck,
+            implications: PredicateImplications,
+            generation: ?u64,
+            rejection_out: ?*?OrderedTupleIndexCapabilityRejection,
+        ) !?OrderedTupleScanPlan {
+            const generation_usable = self.searchRuntimeRelationalFilterGenerationCanUseCurrentRows(generation);
+            var best_candidate: ?OrderedTupleIndexCandidate = null;
+            for (runtime_schema.relational_columns, 0..) |column, catalog_ordinal| {
+                const capability = try orderedTupleIndexCapabilityForQueryAlloc(alloc, runtime_schema, column, catalog_ordinal, predicates, implications, generation_usable);
+                const candidate = switch (capability) {
+                    .usable => |candidate| candidate,
+                    .rejected => |rejection| {
+                        recordOrderedTupleCapabilityRejection(rejection_out, rejection);
+                        continue;
+                    },
+                };
+                if (best_candidate == null or candidate.score() > best_candidate.?.score()) {
+                    best_candidate = candidate;
+                }
+            }
+
+            const candidate = best_candidate orelse return null;
+            const proof_counts = orderedTuplePredicateProofCounts(candidate, predicates.len);
+            const column = candidate.column;
+            const prefix_keys = column.index_keys[0..candidate.equality_prefix_len];
+            const tuple_prefix = orderedTupleEqualityScanPrefixAlloc(alloc, runtime_schema, predicates, prefix_keys) catch return null;
+            errdefer alloc.free(tuple_prefix);
+
+            if (candidate.range_key_index) |range_key_index| {
+                var lower_tuple = tuple_prefix;
+                var upper_tuple = try internal_keys.nextPrefixAlloc(alloc, tuple_prefix);
+                errdefer if (upper_tuple) |buf| alloc.free(buf);
+
+                const range_key = column.index_keys[range_key_index];
+                const range_keys = column.index_keys[0 .. range_key_index + 1];
+                const descending_range = range_key.direction == .desc;
+                const range_columns = try relationalColumnsForOrderedTuplePrefixAlloc(alloc, runtime_schema, range_keys);
+                defer if (range_columns.len > 0) alloc.free(range_columns);
+
+                if (candidate.range.lower) |lower_predicate| {
+                    const lower_json = try orderedTupleRangeBoundObjectJsonAlloc(alloc, runtime_schema, predicates, prefix_keys, range_key, lower_predicate);
+                    defer alloc.free(lower_json);
+                    const lower_row_value = mapper.buildRelationalRowValueAlloc(alloc, lower_json, range_columns) catch {
+                        if (upper_tuple) |buf| alloc.free(buf);
+                        return null;
+                    };
+                    defer alloc.free(lower_row_value);
+                    const bound_tuple = relational_store_mod.orderedTupleValueForIndexKeysAlloc(alloc, lower_row_value, range_keys, runtime_schema.relational_columns) catch {
+                        if (upper_tuple) |buf| alloc.free(buf);
+                        return null;
+                    };
+                    var bound_owned = true;
+                    errdefer if (bound_owned) alloc.free(bound_tuple);
+                    if (descending_range) {
+                        const previous_upper = upper_tuple;
+                        if (lower_predicate.op == .gte) {
+                            const next = try internal_keys.nextPrefixAlloc(alloc, bound_tuple);
+                            alloc.free(bound_tuple);
+                            bound_owned = false;
+                            if (next) |next_upper| {
+                                upper_tuple = next_upper;
+                                if (previous_upper) |buf| alloc.free(buf);
+                            } else {
+                                upper_tuple = previous_upper;
+                            }
+                        } else {
+                            upper_tuple = bound_tuple;
+                            bound_owned = false;
+                            if (previous_upper) |buf| alloc.free(buf);
+                        }
+                    } else {
+                        const previous_lower = lower_tuple;
+                        if (lower_predicate.op == .gt) {
+                            const next = try internal_keys.nextPrefixAlloc(alloc, bound_tuple);
+                            alloc.free(bound_tuple);
+                            bound_owned = false;
+                            lower_tuple = next orelse {
+                                alloc.free(previous_lower);
+                                if (upper_tuple) |buf| alloc.free(buf);
+                                return OrderedTupleScanPlan{
+                                    .column = column,
+                                    .catalog_ordinal = candidate.catalog_ordinal,
+                                    .equality_prefix_len = candidate.equality_prefix_len,
+                                    .range_key_index = candidate.range_key_index,
+                                    .predicate_count = proof_counts.predicate_count,
+                                    .proven_predicate_count = proof_counts.proven_predicate_count,
+                                    .residual_predicate_count = proof_counts.residual_predicate_count,
+                                    .lower_tuple = try alloc.dupe(u8, "\xff"),
+                                    .upper_tuple = try alloc.dupe(u8, "\xff"),
+                                };
+                            };
+                            alloc.free(previous_lower);
+                        } else {
+                            lower_tuple = bound_tuple;
+                            bound_owned = false;
+                            alloc.free(previous_lower);
+                        }
+                    }
+                }
+
+                if (candidate.range.upper) |upper_predicate| {
+                    const upper_json = try orderedTupleRangeBoundObjectJsonAlloc(alloc, runtime_schema, predicates, prefix_keys, range_key, upper_predicate);
+                    defer alloc.free(upper_json);
+                    const upper_row_value = mapper.buildRelationalRowValueAlloc(alloc, upper_json, range_columns) catch {
+                        if (upper_tuple) |buf| alloc.free(buf);
+                        return null;
+                    };
+                    defer alloc.free(upper_row_value);
+                    const bound_tuple = relational_store_mod.orderedTupleValueForIndexKeysAlloc(alloc, upper_row_value, range_keys, runtime_schema.relational_columns) catch {
+                        if (upper_tuple) |buf| alloc.free(buf);
+                        return null;
+                    };
+                    var bound_owned = true;
+                    errdefer if (bound_owned) alloc.free(bound_tuple);
+                    if (descending_range) {
+                        const previous_lower = lower_tuple;
+                        if (upper_predicate.op == .lt) {
+                            const next = try internal_keys.nextPrefixAlloc(alloc, bound_tuple);
+                            alloc.free(bound_tuple);
+                            bound_owned = false;
+                            lower_tuple = next orelse {
+                                alloc.free(previous_lower);
+                                if (upper_tuple) |buf| alloc.free(buf);
+                                return OrderedTupleScanPlan{
+                                    .column = column,
+                                    .catalog_ordinal = candidate.catalog_ordinal,
+                                    .equality_prefix_len = candidate.equality_prefix_len,
+                                    .range_key_index = candidate.range_key_index,
+                                    .predicate_count = proof_counts.predicate_count,
+                                    .proven_predicate_count = proof_counts.proven_predicate_count,
+                                    .residual_predicate_count = proof_counts.residual_predicate_count,
+                                    .lower_tuple = try alloc.dupe(u8, "\xff"),
+                                    .upper_tuple = try alloc.dupe(u8, "\xff"),
+                                };
+                            };
+                            alloc.free(previous_lower);
+                        } else {
+                            lower_tuple = bound_tuple;
+                            bound_owned = false;
+                            alloc.free(previous_lower);
+                        }
+                    } else {
+                        const previous_upper = upper_tuple;
+                        if (upper_predicate.op == .lte) {
+                            const next = try internal_keys.nextPrefixAlloc(alloc, bound_tuple);
+                            alloc.free(bound_tuple);
+                            bound_owned = false;
+                            upper_tuple = next;
+                        } else {
+                            upper_tuple = bound_tuple;
+                            bound_owned = false;
+                        }
+                        if (previous_upper) |buf| alloc.free(buf);
+                    }
+                }
+
+                return .{
+                    .column = column,
+                    .catalog_ordinal = candidate.catalog_ordinal,
+                    .equality_prefix_len = candidate.equality_prefix_len,
+                    .range_key_index = candidate.range_key_index,
+                    .predicate_count = proof_counts.predicate_count,
+                    .proven_predicate_count = proof_counts.proven_predicate_count,
+                    .residual_predicate_count = proof_counts.residual_predicate_count,
+                    .lower_tuple = lower_tuple,
+                    .upper_tuple = upper_tuple,
+                };
+            }
+
+            return .{
+                .column = column,
+                .catalog_ordinal = candidate.catalog_ordinal,
+                .equality_prefix_len = candidate.equality_prefix_len,
+                .range_key_index = candidate.range_key_index,
+                .predicate_count = proof_counts.predicate_count,
+                .proven_predicate_count = proof_counts.proven_predicate_count,
+                .residual_predicate_count = proof_counts.residual_predicate_count,
+                .lower_tuple = tuple_prefix,
+                .prefix_scan = true,
+            };
+        }
+
+        fn scanOrderedTuplePlanWithContext(
+            self: *DB,
+            alloc: Allocator,
+            plan: OrderedTupleScanPlan,
+            doc_key_range: ?types.RelationalRowsDocKeyRange,
+            stats: ?*relational_store_mod.OrderedTupleDocKeyScanStats,
+            ctx: ?*anyopaque,
+            callback: relational_store_mod.OrderedTupleDocKeyScanCallback,
+        ) !void {
+            const lower_doc_key = if (doc_key_range) |range| range.start else "";
+            const upper_doc_key = if (doc_key_range) |range| range.end else "";
+            if (plan.prefix_scan) {
+                return try relational_store_mod.scanOrderedTupleDocKeysWithContext(
+                    alloc,
+                    self.core.store,
+                    orderedTupleIndexColumnId(plan.column),
+                    plan.lower_tuple,
+                    lower_doc_key,
+                    upper_doc_key,
+                    stats,
+                    ctx,
+                    callback,
+                );
+            }
+            return try relational_store_mod.scanOrderedTupleDocKeysInTupleRangeWithContext(
+                alloc,
+                self.core.store,
+                orderedTupleIndexColumnId(plan.column),
+                plan.lower_tuple,
+                plan.upper_tuple,
+                lower_doc_key,
+                upper_doc_key,
+                stats,
+                ctx,
+                callback,
+            );
+        }
+
+        const OrderedTupleDocKeyProbeCollector = struct {
+            alloc: Allocator,
+            max_doc_keys: ?usize,
+            out: std.ArrayListUnmanaged([]const u8) = .empty,
+            observed_count: usize = 0,
+            exceeded: bool = false,
+
+            fn deinit(self: *@This()) void {
+                for (self.out.items) |doc_key| self.alloc.free(@constCast(doc_key));
+                self.out.deinit(self.alloc);
+                self.* = undefined;
+            }
+
+            fn toDocSet(self: *@This(), alloc: Allocator) !doc_set.ResolvedDocSet {
+                if (self.out.items.len == 0) return .none;
+                const doc_keys = try self.out.toOwnedSlice(alloc);
+                self.out = .empty;
+                return .{ .doc_keys = doc_keys };
+            }
+
+            fn append(ctx: ?*anyopaque, _: []const u8, doc_key: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                if (self.max_doc_keys) |max_doc_keys| {
+                    if (self.out.items.len >= max_doc_keys) {
+                        self.observed_count = self.out.items.len +| 1;
+                        self.exceeded = true;
+                        return .stop;
+                    }
+                }
+                const owned_doc_key = try self.alloc.dupe(u8, doc_key);
+                errdefer self.alloc.free(owned_doc_key);
+                try self.out.append(self.alloc, owned_doc_key);
+                self.observed_count = self.out.items.len;
+                return .@"continue";
+            }
+        };
+
+        fn resolveRelationalRowsOrderedTuplePredicateSetProbeAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            predicates: []const schema_mod.RelationalCheck,
+            implications: PredicateImplications,
+            generation: ?u64,
+            doc_key_range: ?types.RelationalRowsDocKeyRange,
+            max_doc_keys: ?usize,
+            stats: ?*relational_store_mod.OrderedTupleDocKeyScanStats,
+            profile: ?*types.RelationalRowsQueryResult.Profile,
+        ) !?OrderedTuplePredicateSetProbe {
+            var rejection: ?OrderedTupleIndexCapabilityRejection = null;
+            var plan = (try @This().orderedTupleScanPlanForPredicatesAlloc(self, alloc, runtime_schema, predicates, implications, generation, &rejection)) orelse {
+                setRelationalRowsProfileOrderedTupleRejection(profile, rejection);
+                return null;
+            };
+            defer plan.deinit(alloc);
+            setRelationalRowsProfileOrderedTuplePlan(profile, plan);
+
+            var collector = OrderedTupleDocKeyProbeCollector{
+                .alloc = alloc,
+                .max_doc_keys = max_doc_keys,
+            };
+            defer collector.deinit();
+            try @This().scanOrderedTuplePlanWithContext(
+                self,
+                alloc,
+                plan,
+                doc_key_range,
+                stats,
+                &collector,
+                OrderedTupleDocKeyProbeCollector.append,
+            );
+
+            if (collector.exceeded) return .{ .exceeded_gate = collector.observed_count };
+            if (collector.out.items.len == 0 and (plan.column.index_where.len != 0 or plan.column.index_where_expressions.len != 0)) return null;
+            const set = try collector.toDocSet(alloc);
+            return .{ .set = set };
+        }
+
+        fn resolveRelationalRowsOrderedTuplePredicateSetAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            predicates: []const schema_mod.RelationalCheck,
+            implications: PredicateImplications,
+            generation: ?u64,
+            doc_key_range: ?types.RelationalRowsDocKeyRange,
+        ) !?doc_set.ResolvedDocSet {
+            const probe = (try @This().resolveRelationalRowsOrderedTuplePredicateSetProbeAlloc(
+                self,
+                alloc,
+                runtime_schema,
+                predicates,
+                implications,
+                generation,
+                doc_key_range,
+                null,
+                null,
+                null,
+            )) orelse return null;
+            return switch (probe) {
+                .set => |set| set,
+                .exceeded_gate => unreachable,
+            };
+        }
+
         pub fn resolveRelationalRowsPredicateDocSetAlloc(
             self: *DB,
             alloc: Allocator,
@@ -14726,14 +16677,65 @@ pub fn Impl(comptime DB: type) type {
             implications: PredicateImplications,
             generation: ?u64,
         ) !?doc_set.ResolvedDocSet {
+            return try @This().resolveRelationalRowsPredicateDocSetWithPredicatesAndRangeAlloc(self, alloc, runtime_schema, predicate, implications, generation, null);
+        }
+
+        fn resolveRelationalRowsPredicateDocSetWithPredicatesAndRangeAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            predicate: schema_mod.RelationalCheck,
+            implications: PredicateImplications,
+            generation: ?u64,
+            doc_key_range: ?types.RelationalRowsDocKeyRange,
+        ) !?doc_set.ResolvedDocSet {
             const column = columnForField(runtime_schema, predicate.field) orelse return null;
             if (predicate.op == .is_null or predicate.op == .is_not_null or predicate.op == .is_distinct or predicate.op == .is_not_distinct or predicate.op == .ne) return null;
             const value_json = predicate.value_json orelse return null;
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return null;
             defer parsed.deinit();
 
+            if (doc_key_range) |range| {
+                if (try @This().resolveRelationalRowsScalarPredicateRangeDocSetAlloc(self, alloc, column, predicate, parsed.value, implications, generation, range)) |set| {
+                    return set;
+                }
+            }
+
             const query = (try predicateSearchQuery(column, predicate, parsed.value)) orelse return null;
             return try self.searchRuntimeResolveRelationalFilterQueryDocSetWithImplicationsAlloc(alloc, runtime_schema, query, implications, generation);
+        }
+
+        fn resolveRelationalRowsScalarPredicateRangeDocSetAlloc(
+            self: *DB,
+            alloc: Allocator,
+            column: schema_mod.RelationalColumn,
+            predicate: schema_mod.RelationalCheck,
+            expected: std.json.Value,
+            implications: PredicateImplications,
+            generation: ?u64,
+            range: types.RelationalRowsDocKeyRange,
+        ) !?doc_set.ResolvedDocSet {
+            if (!self.searchRuntimeRelationalFilterGenerationCanUseCurrentRows(generation)) return null;
+            if (!(try self.searchRuntimeRelationalColumnIndexUsableForQuery(alloc, column, implications))) return null;
+            if ((try predicateSearchQuery(column, predicate, expected)) == null) return null;
+
+            const values = try relational_store_mod.scanColumnAlloc(alloc, self.core.store, column.path, range.start, range.end);
+            defer relational_store_mod.freeColumnValues(alloc, values);
+
+            var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
+            errdefer {
+                for (doc_ids.items) |doc_id| alloc.free(@constCast(doc_id));
+                doc_ids.deinit(alloc);
+            }
+            for (values) |value| {
+                if (!relationalColumnValueMatchesPredicate(value, column, predicate, expected)) continue;
+                const owned_doc_id = try alloc.dupe(u8, value.doc_key);
+                errdefer alloc.free(owned_doc_id);
+                try doc_ids.append(alloc, owned_doc_id);
+            }
+            if (doc_ids.items.len == 0 and (column.index_where.len != 0 or column.index_where_expressions.len != 0)) return null;
+            if (doc_ids.items.len == 0) return .none;
+            return .{ .doc_keys = try doc_ids.toOwnedSlice(alloc) };
         }
 
         pub fn resolveRelationalRowsArrayAnyDocSetAlloc(
@@ -15053,13 +17055,30 @@ pub fn Impl(comptime DB: type) type {
             req: types.RelationalRowsQueryRequest,
             rows: *std.ArrayListUnmanaged(QueryCandidate),
         ) !void {
+            return try @This().appendAllRelationalRowsQueryCandidatesWithMaterializedCtesAndProfileAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows, null);
+        }
+
+        fn appendAllRelationalRowsQueryCandidatesWithMaterializedCtesAndProfileAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
+            req: types.RelationalRowsQueryRequest,
+            rows: *std.ArrayListUnmanaged(QueryCandidate),
+            profile: ?*types.RelationalRowsQueryResult.Profile,
+        ) !void {
             const scanned = if (req.doc_key_range) |range|
                 try relational_store_mod.scanRowsSpanAlloc(alloc, self.core.store, range.start, range.end)
             else
                 try relational_store_mod.scanRowsAlloc(alloc, self.core.store, "", "");
             defer relational_store_mod.freeRows(alloc, scanned);
+            if (profile) |out| {
+                setRelationalRowsProfileAccessMethod(profile, .base_scan);
+                out.iterator_seeks += 1;
+                out.candidate_rows += scanned.len;
+            }
             for (scanned) |row| {
-                try @This().appendRelationalRowsQueryCandidateFromRawWithMaterializedCtesAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows, row.doc_key, row.row_value);
+                try @This().appendRelationalRowsQueryCandidateFromRawWithMaterializedCtesAndProfileAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows, row.doc_key, row.row_value, profile);
             }
         }
 
@@ -15398,10 +17417,23 @@ pub fn Impl(comptime DB: type) type {
             rows: *std.ArrayListUnmanaged(QueryCandidate),
             doc_key: []const u8,
         ) !void {
+            return try @This().appendRelationalRowsQueryCandidateWithMaterializedCtesAndProfileAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows, doc_key, null);
+        }
+
+        fn appendRelationalRowsQueryCandidateWithMaterializedCtesAndProfileAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
+            req: types.RelationalRowsQueryRequest,
+            rows: *std.ArrayListUnmanaged(QueryCandidate),
+            doc_key: []const u8,
+            profile: ?*types.RelationalRowsQueryResult.Profile,
+        ) !void {
             if (!docKeyInQueryRange(req, doc_key)) return;
             const raw_row = try relational_store_mod.getRawAlloc(alloc, self.core.store, doc_key) orelse return;
             defer alloc.free(raw_row);
-            try @This().appendRelationalRowsQueryCandidateFromRawWithMaterializedCtesAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows, doc_key, raw_row);
+            try @This().appendRelationalRowsQueryCandidateFromRawWithMaterializedCtesAndProfileAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows, doc_key, raw_row, profile);
         }
 
         pub fn appendRelationalRowsQueryCandidateFromRawAlloc(
@@ -15426,15 +17458,65 @@ pub fn Impl(comptime DB: type) type {
             doc_key: []const u8,
             raw_row: []const u8,
         ) !void {
+            return try @This().appendRelationalRowsQueryCandidateFromRawWithMaterializedCtesAndProfileAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows, doc_key, raw_row, null);
+        }
+
+        fn appendRelationalRowsQueryCandidateFromRawWithMaterializedCtesAndProfileAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
+            req: types.RelationalRowsQueryRequest,
+            rows: *std.ArrayListUnmanaged(QueryCandidate),
+            doc_key: []const u8,
+            raw_row: []const u8,
+            profile: ?*types.RelationalRowsQueryResult.Profile,
+        ) !void {
             if (!docKeyInQueryRange(req, doc_key)) return;
             if (try @This().isExpiredDocumentKey(self, alloc, doc_key)) return;
             const materialized = try mapper.materializeRelationalRowValueAlloc(alloc, raw_row);
             defer alloc.free(materialized);
+            if (profile) |out| {
+                out.hydrated_rows += 1;
+                out.residual_rechecks += 1;
+            }
             if (!(try @This().relationalRowsSubqueryPredicatesPassAlloc(self, alloc, runtime_schema, materialized_ctes, materialized, req.subquery_predicates, currentTimeNs()))) return;
             const version = try self.getTimestamp(alloc, doc_key);
             var local_req = req;
             local_req.subquery_predicates = &.{};
-            try @This().appendRelationalRowsQueryCandidateFromJsonWithColumnsAlloc(alloc, local_req, rows, doc_key, materialized, version, runtime_schema.relational_columns);
+            if (!(try queryJsonMatchesRequestWithColumns(alloc, materialized, local_req, runtime_schema.relational_columns, currentTimeNs()))) return;
+
+            const needs_hidden_order_fields = queryOrdersReferenceHiddenScalarOutput(local_req.order_by, local_req.scalar_subqueries);
+            const order_row_json = if (needs_hidden_order_fields)
+                try @This().rowJsonWithHiddenScalarSubqueriesAlloc(self, alloc, runtime_schema, materialized_ctes, materialized, local_req.scalar_subqueries)
+            else
+                materialized;
+            defer if (needs_hidden_order_fields) alloc.free(order_row_json);
+
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, order_row_json, .{}) catch return error.InvalidQueryRequest;
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidQueryRequest;
+            const order_keys = try queryOrderKeysAlloc(alloc, parsed.value, local_req.order_by, currentTimeNs());
+            var order_keys_transferred = false;
+            errdefer if (!order_keys_transferred) freeQueryOrderKeySlice(alloc, order_keys);
+
+            const owned_doc_key = try alloc.dupe(u8, doc_key);
+            var doc_key_transferred = false;
+            errdefer if (!doc_key_transferred) alloc.free(owned_doc_key);
+            const materialized_owned = try alloc.dupe(u8, materialized);
+            var materialized_transferred = false;
+            errdefer if (!materialized_transferred) alloc.free(materialized_owned);
+
+            try rows.append(alloc, .{
+                .doc_key = owned_doc_key,
+                .json = materialized_owned,
+                .version = version,
+                .order_keys = order_keys,
+                .ordinal = rows.items.len,
+            });
+            doc_key_transferred = true;
+            materialized_transferred = true;
+            order_keys_transferred = true;
         }
 
         pub fn appendRelationalRowsQueryCandidateFromJsonAlloc(
@@ -22827,6 +24909,107 @@ test "relational rows cte spill reloads across reopen and cleans up" {
     }
 }
 
+test "relational rows cte materialization uses ordered tuple prefilters" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const relational_rows_impl = Impl(DB);
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_cte_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_cte_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false},"status":{"type":"keyword","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"rank\":1,\"status\":\"open\"}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"tenant\":\"t1\",\"rank\":2,\"status\":\"open\"}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"tenant\":\"t1\",\"rank\":3,\"status\":\"closed\"}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"tenant\":\"t2\",\"rank\":2,\"status\":\"open\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    for ([_][]const u8{ "row:a", "row:b", "row:c", "row:d" }) |doc_key| {
+        const tenant_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "tenant", doc_key);
+        defer alloc.free(tenant_index_key);
+        try db.core.store.delete(tenant_index_key);
+        const rank_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "rank", doc_key);
+        defer alloc.free(rank_index_key);
+        db.core.store.delete(rank_index_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    const predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+        .{ .name = "", .field = "rank", .op = .gt, .value_json = "1" },
+        .{ .name = "", .field = "rank", .op = .lt, .value_json = "4" },
+    };
+    const ctes = [_]types.RelationalRowsCte{.{
+        .name = "ranked_tenant",
+        .query = .{
+            .predicates = predicates[0..],
+            .select_all = true,
+        },
+    }};
+
+    var materialized_ctes = std.ArrayListUnmanaged(MaterializedCte).empty;
+    defer {
+        relational_rows_impl.deinitRelationalRowsMaterializedCtes(&db, alloc, materialized_ctes.items);
+        materialized_ctes.deinit(alloc);
+    }
+    try relational_rows_impl.appendRelationalRowsMaterializedCtesAlloc(&db, alloc, runtime_schema, &.{}, ctes[0..], &materialized_ctes);
+    try std.testing.expectEqual(@as(usize, 1), materialized_ctes.items.len);
+    const materialized = materialized_ctes.items[0];
+    try std.testing.expectEqualStrings("ranked_tenant", materialized.name);
+    switch (materialized.rows) {
+        .memory => |memory| {
+            try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, memory.profile.access_method);
+            try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.none, memory.profile.fallback_reason);
+            try std.testing.expect(memory.profile.ordered_tuple_plan_selected);
+            try std.testing.expectEqual(@as(u64, 2), memory.profile.index_entries_scanned);
+            try std.testing.expectEqual(@as(u64, 2), memory.profile.candidate_rows);
+            try std.testing.expectEqual(@as(u32, 2), memory.total);
+            try std.testing.expectEqual(@as(usize, 2), memory.rows.len);
+        },
+        .spilled => return error.TestUnexpectedResult,
+    }
+
+    const select = [_][]const u8{ "id", "rank" };
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "rank",
+        .direction = .asc,
+    }};
+    var result = try db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = ctes[0..],
+        .query = .{
+            .source_cte = "ranked_tenant",
+            .select = select[0..],
+            .select_all = false,
+            .order_by = order_by[0..],
+        },
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"rank\":2}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\",\"rank\":3}", result.rows[1]);
+}
+
 test "relational rows query doc key range scopes indexed and scanned candidates" {
     const DB = @import("mod.zig").DB;
     const table_schema_api = @import("../../schema/mod.zig");
@@ -23453,7 +25636,7 @@ test "relational rows query ignores building secondary indexes and scans base ro
     try std.testing.expectEqualStrings("{\"id\":\"b\"}", result.rows[1]);
 }
 
-test "relational rows query ignores ordered secondary indexes and scans base rows" {
+test "relational rows query ignores building ordered tuple indexes and scans base rows" {
     const DB = @import("mod.zig").DB;
     const table_schema_api = @import("../../schema/mod.zig");
 
@@ -23466,7 +25649,72 @@ test "relational rows query ignores ordered secondary indexes and scans base row
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","x-antfly-index-name":"email_rank_idx","x-antfly-index-keys":[{"column":"email","direction":"desc","nulls":"last"},{"column":"rank","direction":"asc","nulls":"first"}]},"username":{"type":"keyword","x-antfly-index-name":"username_ordered_idx","x-antfly-index-keys":[{"column":"username","direction":"desc","nulls":"last"}]},"rank":{"type":"numeric"}},"required":["id","email","username","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","x-antfly-index-lifecycle":"building","x-antfly-index-generation":7,"x-antfly-index-name":"email_rank_building_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:email_rank_building_idx","x-antfly-index-keys":[{"column":"email"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","email","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"email\":\"same@example.test\",\"rank\":1}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"email\":\"same@example.test\",\"rank\":2}" },
+        },
+        .sync_level = .write,
+    });
+
+    const email_column = columnForField(runtime_schema, "email") orelse return error.TestExpectedEqual;
+    const raw_b = try relational_store_mod.getRawAlloc(alloc, db.core.store, "row:b") orelse return error.TestExpectedEqual;
+    defer alloc.free(raw_b);
+    const tuple_b = try relational_store_mod.orderedTupleValueForIndexKeysAlloc(alloc, raw_b, email_column.index_keys, runtime_schema.relational_columns);
+    defer alloc.free(tuple_b);
+    const b_ordered_index_key = try internal_keys.relationalOrderedTupleIndexKeyAlloc(alloc, "email_rank_building_idx", tuple_b, "row:b");
+    defer alloc.free(b_ordered_index_key);
+    const b_ordered_index = try db.core.store.get(alloc, b_ordered_index_key);
+    defer alloc.free(b_ordered_index);
+    try db.core.store.delete(b_ordered_index_key);
+
+    const predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "email", .op = .eq, .value_json = "\"same@example.test\"" },
+        .{ .name = "", .field = "rank", .op = .gt, .value_json = "0" },
+    };
+    const select = [_][]const u8{"id"};
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "rank",
+        .direction = .asc,
+    }};
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expect(result.profile.access_method != .ordered_tuple_stream);
+    try std.testing.expect(result.profile.access_method != .ordered_tuple_doc_set);
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", result.rows[1]);
+}
+
+test "relational rows query does not maintain scalar entries for ordered secondary indexes" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","x-antfly-index-name":"email_rank_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:email_rank_idx","x-antfly-index-keys":[{"column":"email","direction":"desc","nulls":"last"},{"column":"rank","direction":"asc","nulls":"first"}]},"username":{"type":"keyword","x-antfly-index-name":"username_ordered_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:username_ordered_idx","x-antfly-index-keys":[{"column":"username","direction":"desc","nulls":"last"}]},"rank":{"type":"numeric"}},"required":["id","email","username","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -23484,12 +25732,11 @@ test "relational rows query ignores ordered secondary indexes and scans base row
 
     const a_email_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "email", "row:a");
     defer alloc.free(a_email_index_key);
-    const a_email_index = try db.core.store.get(alloc, a_email_index_key);
-    defer alloc.free(a_email_index);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, a_email_index_key));
 
     const b_email_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "email", "row:b");
     defer alloc.free(b_email_index_key);
-    try db.core.store.delete(b_email_index_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, b_email_index_key));
 
     const predicates = [_]schema_mod.RelationalCheck{.{
         .name = "",
@@ -23517,12 +25764,11 @@ test "relational rows query ignores ordered secondary indexes and scans base row
 
     const a_username_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "username", "row:a");
     defer alloc.free(a_username_index_key);
-    const a_username_index = try db.core.store.get(alloc, a_username_index_key);
-    defer alloc.free(a_username_index);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, a_username_index_key));
 
     const b_username_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "username", "row:b");
     defer alloc.free(b_username_index_key);
-    try db.core.store.delete(b_username_index_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, b_username_index_key));
 
     const username_predicates = [_]schema_mod.RelationalCheck{.{
         .name = "",
@@ -23542,6 +25788,1944 @@ test "relational rows query ignores ordered secondary indexes and scans base row
     try std.testing.expectEqual(@as(usize, 2), username_result.rows.len);
     try std.testing.expectEqualStrings("{\"id\":\"a\"}", username_result.rows[0]);
     try std.testing.expectEqualStrings("{\"id\":\"b\"}", username_result.rows[1]);
+}
+
+test "relational rows query resolves compound ordered tuple equality prefixes" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_status_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_status_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"status"}]},"status":{"type":"keyword","x-antfly-index":false},"rank":{"type":"numeric"}},"required":["id","tenant","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"status\":\"open\",\"rank\":2}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"tenant\":\"t1\",\"status\":\"open\",\"rank\":1}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"tenant\":\"t1\",\"status\":\"closed\",\"rank\":3}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"tenant\":\"t2\",\"status\":\"open\",\"rank\":4}" },
+        },
+        .sync_level = .write,
+    });
+
+    const predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+        .{ .name = "", .field = "status", .op = .eq, .value_json = "\"open\"" },
+    };
+    var candidate_set = (try db.resolveRelationalRowsQueryCandidateSetAlloc(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+    }, null)) orelse return error.TestExpectedEqual;
+    defer candidate_set.deinit(alloc);
+    const candidate_ids = (try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &candidate_set, null)) orelse return error.TestExpectedEqual;
+    defer {
+        for (candidate_ids) |id| alloc.free(@constCast(id));
+        alloc.free(candidate_ids);
+    }
+    try std.testing.expectEqual(@as(usize, 2), candidate_ids.len);
+    try std.testing.expectEqualStrings("row:a", candidate_ids[0]);
+    try std.testing.expectEqualStrings("row:b", candidate_ids[1]);
+
+    const select = [_][]const u8{"id"};
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "rank",
+        .direction = .asc,
+    }};
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_doc_set, result.profile.access_method);
+    try std.testing.expect(result.profile.ordered_tuple_plan_selected);
+    try std.testing.expectEqual(@as(u32, 2), result.profile.ordered_tuple_key_count);
+    try std.testing.expectEqual(@as(u32, 2), result.profile.ordered_tuple_equality_prefix_len);
+    try std.testing.expectEqual(std.math.maxInt(u32), result.profile.ordered_tuple_range_key_index);
+    try std.testing.expect(result.profile.ordered_tuple_prefix_scan);
+    try std.testing.expect(result.profile.ordered_tuple_lower_tuple_bytes > 0);
+    try std.testing.expectEqual(@as(u64, 0), result.profile.ordered_tuple_upper_tuple_bytes);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.index_entries_scanned);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.iterator_seeks);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.residual_rechecks);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.projected_rows);
+    try std.testing.expectEqual(@as(u64, 0), result.profile.candidate_gate_limit);
+    try std.testing.expectEqual(@as(u64, 0), result.profile.candidate_gate_observed);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", result.rows[1]);
+}
+
+test "relational ordered tuple capability matcher gates readiness and bounds" {
+    const alloc = std.testing.allocator;
+    const columns = [_]schema_mod.RelationalColumn{
+        .{
+            .name = "tenant",
+            .path = "tenant",
+            .field_type = .keyword,
+            .indexed = true,
+            .index_name = "tenant_rank_idx",
+            .index_access_method = .ordered_tuple,
+            .index_keys = &.{
+                .{ .column = "tenant" },
+                .{ .column = "rank" },
+            },
+        },
+        .{ .name = "rank", .path = "rank", .field_type = .numeric, .indexed = false },
+    };
+    const runtime_schema = schema_mod.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+    };
+    const predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+        .{ .name = "", .field = "rank", .op = .gt, .value_json = "1" },
+    };
+    const implications = PredicateImplications{ .predicates = predicates[0..] };
+
+    const usable = try orderedTupleIndexCapabilityForQueryAlloc(alloc, runtime_schema, columns[0], 0, predicates[0..], implications, true);
+    switch (usable) {
+        .usable => |candidate| {
+            try std.testing.expectEqual(@as(usize, 1), candidate.equality_prefix_len);
+            try std.testing.expectEqual(@as(?usize, 1), candidate.range_key_index);
+            try std.testing.expect(candidate.range.lower != null);
+        },
+        .rejected => return error.TestExpectedEqual,
+    }
+
+    const stale = try orderedTupleIndexCapabilityForQueryAlloc(alloc, runtime_schema, columns[0], 0, predicates[0..], implications, false);
+    try std.testing.expectEqual(OrderedTupleIndexCapability{ .rejected = .generation_not_current }, stale);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_stale_generation, orderedTupleCapabilityFallbackReason(.generation_not_current));
+
+    var scalar_method_column = columns[0];
+    scalar_method_column.index_access_method = .scalar_column;
+    const scalar_method = try orderedTupleIndexCapabilityForQueryAlloc(alloc, runtime_schema, scalar_method_column, 0, predicates[0..], implications, true);
+    try std.testing.expectEqual(OrderedTupleIndexCapability{ .rejected = .access_method_mismatch }, scalar_method);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_access_method_mismatch, orderedTupleCapabilityFallbackReason(.access_method_mismatch));
+
+    var building_column = columns[0];
+    building_column.index_lifecycle = .building;
+    const building = try orderedTupleIndexCapabilityForQueryAlloc(alloc, runtime_schema, building_column, 0, predicates[0..], implications, true);
+    try std.testing.expectEqual(OrderedTupleIndexCapability{ .rejected = .not_ready }, building);
+
+    const no_bounds_predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "rank",
+        .op = .eq,
+        .value_json = "2",
+    }};
+    const no_bounds_implications = PredicateImplications{ .predicates = no_bounds_predicates[0..] };
+    const no_bounds = try orderedTupleIndexCapabilityForQueryAlloc(alloc, runtime_schema, columns[0], 0, no_bounds_predicates[0..], no_bounds_implications, true);
+    try std.testing.expectEqual(OrderedTupleIndexCapability{ .rejected = .no_usable_bounds }, no_bounds);
+
+    const ci_columns = [_]schema_mod.RelationalColumn{
+        .{
+            .name = "email",
+            .path = "email",
+            .field_type = .keyword,
+            .indexed = true,
+            .collation = "antfly.case_insensitive",
+            .index_access_method = .ordered_tuple,
+            .index_keys = &.{
+                .{ .column = "email" },
+                .{ .column = "rank" },
+            },
+        },
+        .{ .name = "rank", .path = "rank", .field_type = .numeric, .indexed = false },
+    };
+    const ci_schema = schema_mod.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = ci_columns[0..],
+    };
+    const ci_predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "email", .op = .eq, .value_json = "\"ada@example.test\"", .collation = "antfly.case_insensitive" },
+        .{ .name = "", .field = "rank", .op = .eq, .value_json = "1" },
+    };
+    const ci_implications = PredicateImplications{ .predicates = ci_predicates[0..] };
+    const ci_capability = try orderedTupleIndexCapabilityForQueryAlloc(alloc, ci_schema, ci_columns[0], 0, ci_predicates[0..], ci_implications, true);
+    switch (ci_capability) {
+        .usable => |candidate| {
+            try std.testing.expectEqual(@as(usize, 1), candidate.equality_prefix_len);
+            try std.testing.expect(candidate.range_key_index == null);
+        },
+        .rejected => return error.TestExpectedEqual,
+    }
+
+    const unsupported_collation_columns = [_]schema_mod.RelationalColumn{
+        .{
+            .name = "email",
+            .path = "email",
+            .field_type = .keyword,
+            .indexed = true,
+            .collation = "und-x-icu",
+            .index_access_method = .ordered_tuple,
+            .index_keys = &.{
+                .{ .column = "email" },
+                .{ .column = "rank" },
+            },
+        },
+        .{ .name = "rank", .path = "rank", .field_type = .numeric, .indexed = false },
+    };
+    const unsupported_collation_schema = schema_mod.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = unsupported_collation_columns[0..],
+    };
+    const unsupported_collation_capability = try orderedTupleIndexCapabilityForQueryAlloc(alloc, unsupported_collation_schema, unsupported_collation_columns[0], 0, ci_predicates[0..], ci_implications, true);
+    try std.testing.expectEqual(OrderedTupleIndexCapability{ .rejected = .unsupported_collation }, unsupported_collation_capability);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_collation_not_supported, orderedTupleCapabilityFallbackReason(.unsupported_collation));
+}
+
+test "relational ordered tuple fallback profile names capability rejections" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const relational_rows_impl = Impl(DB);
+    const alloc = std.testing.allocator;
+    const select = [_][]const u8{"id"};
+
+    {
+        var path_buf: [256]u8 = undefined;
+        const path = TestHelpers.tempPath(&path_buf);
+        defer TestHelpers.cleanupTempDir(path);
+
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_active_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_active_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}],"x-antfly-index-where":{"all":[{"field":"status","op":"eq","value":"active"}]}},"rank":{"type":"numeric","x-antfly-index":false},"status":{"type":"keyword","x-antfly-index":false}},"required":["id","tenant","rank","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ;
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"rank\":1,\"status\":\"active\"}" },
+                .{ .key = "row:b", .value = "{\"id\":\"b\",\"tenant\":\"t1\",\"rank\":2,\"status\":\"inactive\"}" },
+            },
+            .sync_level = .write,
+        });
+
+        const predicates = [_]schema_mod.RelationalCheck{
+            .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+            .{ .name = "", .field = "rank", .op = .gt, .value_json = "0" },
+        };
+        var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+            .predicates = predicates[0..],
+            .select = select[0..],
+            .select_all = false,
+            .profile = true,
+        });
+        defer result.deinit(alloc);
+        try std.testing.expect(result.include_profile);
+        try std.testing.expect(result.profile.access_method != .ordered_tuple_doc_set);
+        try std.testing.expect(result.profile.access_method != .ordered_tuple_stream);
+        try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_predicate_not_proven, result.profile.fallback_reason);
+        try std.testing.expect(!result.profile.ordered_tuple_plan_selected);
+        try std.testing.expectEqual(@as(u32, 2), result.total);
+    }
+
+    {
+        var path_buf: [256]u8 = undefined;
+        const path = TestHelpers.tempPath(&path_buf);
+        defer TestHelpers.cleanupTempDir(path);
+
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_stale_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_stale_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ;
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"rank\":1}" },
+                .{ .key = "row:b", .value = "{\"id\":\"b\",\"tenant\":\"t1\",\"rank\":2}" },
+            },
+            .sync_level = .write,
+        });
+
+        const predicates = [_]schema_mod.RelationalCheck{
+            .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+            .{ .name = "", .field = "rank", .op = .gt, .value_json = "0" },
+        };
+        var profile = types.RelationalRowsQueryResult.Profile{};
+        var candidate_set = try relational_rows_impl.resolveRelationalRowsQueryCandidateSetWithProfileAlloc(&db, alloc, runtime_schema, .{
+            .predicates = predicates[0..],
+        }, 0, &profile);
+        defer if (candidate_set) |*set| set.deinit(alloc);
+
+        try std.testing.expect(candidate_set == null);
+        try std.testing.expect(profile.access_method != .ordered_tuple_doc_set);
+        try std.testing.expect(profile.access_method != .ordered_tuple_stream);
+        try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_stale_generation, profile.fallback_reason);
+        try std.testing.expect(!profile.ordered_tuple_plan_selected);
+    }
+
+    {
+        var path_buf: [256]u8 = undefined;
+        const path = TestHelpers.tempPath(&path_buf);
+        defer TestHelpers.cleanupTempDir(path);
+
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","collation":"und-x-icu","x-antfly-index-name":"email_rank_unsupported_collation_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:email_rank_unsupported_collation_idx","x-antfly-index-keys":[{"column":"email"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","email","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ;
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "row:a", .value = "{\"id\":\"a\",\"email\":\"ada@example.test\",\"rank\":1}" },
+                .{ .key = "row:b", .value = "{\"id\":\"b\",\"email\":\"ada@example.test\",\"rank\":2}" },
+            },
+            .sync_level = .write,
+        });
+
+        const predicates = [_]schema_mod.RelationalCheck{
+            .{ .name = "", .field = "email", .op = .eq, .value_json = "\"ada@example.test\"" },
+            .{ .name = "", .field = "rank", .op = .gt, .value_json = "0" },
+        };
+        var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+            .predicates = predicates[0..],
+            .select = select[0..],
+            .select_all = false,
+            .profile = true,
+        });
+        defer result.deinit(alloc);
+        try std.testing.expect(result.include_profile);
+        try std.testing.expect(result.profile.access_method != .ordered_tuple_doc_set);
+        try std.testing.expect(result.profile.access_method != .ordered_tuple_stream);
+        try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_collation_not_supported, result.profile.fallback_reason);
+        try std.testing.expect(!result.profile.ordered_tuple_plan_selected);
+        try std.testing.expectEqual(@as(u32, 2), result.total);
+    }
+
+    {
+        var path_buf: [256]u8 = undefined;
+        const path = TestHelpers.tempPath(&path_buf);
+        defer TestHelpers.cleanupTempDir(path);
+
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ;
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"rank\":1}" },
+                .{ .key = "row:b", .value = "{\"id\":\"b\",\"tenant\":\"t2\",\"rank\":2}" },
+            },
+            .sync_level = .write,
+        });
+
+        const predicates = [_]schema_mod.RelationalCheck{.{
+            .name = "",
+            .field = "rank",
+            .op = .gt,
+            .value_json = "0",
+        }};
+        var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+            .predicates = predicates[0..],
+            .select = select[0..],
+            .select_all = false,
+            .profile = true,
+        });
+        defer result.deinit(alloc);
+        try std.testing.expect(result.include_profile);
+        try std.testing.expect(result.profile.access_method != .ordered_tuple_doc_set);
+        try std.testing.expect(result.profile.access_method != .ordered_tuple_stream);
+        try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_no_usable_bounds, result.profile.fallback_reason);
+        try std.testing.expect(!result.profile.ordered_tuple_plan_selected);
+        try std.testing.expectEqual(@as(u32, 2), result.total);
+    }
+
+    {
+        var path_buf: [256]u8 = undefined;
+        const path = TestHelpers.tempPath(&path_buf);
+        defer TestHelpers.cleanupTempDir(path);
+
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_building_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_building_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}],"x-antfly-index-lifecycle":"building"},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ;
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"rank\":1}" },
+                .{ .key = "row:b", .value = "{\"id\":\"b\",\"tenant\":\"t1\",\"rank\":2}" },
+            },
+            .sync_level = .write,
+        });
+
+        const predicates = [_]schema_mod.RelationalCheck{
+            .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+            .{ .name = "", .field = "rank", .op = .gt, .value_json = "0" },
+        };
+        var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+            .predicates = predicates[0..],
+            .select = select[0..],
+            .select_all = false,
+            .profile = true,
+        });
+        defer result.deinit(alloc);
+        try std.testing.expect(result.include_profile);
+        try std.testing.expect(result.profile.access_method != .ordered_tuple_doc_set);
+        try std.testing.expect(result.profile.access_method != .ordered_tuple_stream);
+        try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_index_not_ready, result.profile.fallback_reason);
+        try std.testing.expect(!result.profile.ordered_tuple_plan_selected);
+        try std.testing.expectEqual(@as(u32, 2), result.total);
+    }
+}
+
+test "relational ordered tuple candidate gate is total-mode aware" {
+    const exact_page_gate = orderedTupleCandidateSetGate(.{ .limit = 1, .total_mode = .exact });
+    try std.testing.expectEqual(@as(usize, ordered_tuple_bounded_unordered_candidate_gate), exact_page_gate);
+    try std.testing.expectEqual(@as(usize, ordered_tuple_bounded_unordered_candidate_gate), orderedTupleCandidateSetGate(.{ .total_mode = .exact }));
+
+    var small_ordinals: [4]doc_set.DocOrdinal = undefined;
+    for (&small_ordinals, 0..) |*ordinal, i| ordinal.* = @intCast(i);
+    const small_set = doc_set.ResolvedDocSet{ .ordinals = small_ordinals[0..] };
+
+    var too_many_exact_ordinals: [5]doc_set.DocOrdinal = undefined;
+    for (&too_many_exact_ordinals, 0..) |*ordinal, i| ordinal.* = @intCast(i);
+    const too_many_exact = doc_set.ResolvedDocSet{ .ordinals = too_many_exact_ordinals[0..] };
+
+    var bounded_ordinals: [33]doc_set.DocOrdinal = undefined;
+    for (&bounded_ordinals, 0..) |*ordinal, i| ordinal.* = @intCast(i);
+    const bounded_set = doc_set.ResolvedDocSet{ .ordinals = bounded_ordinals[0..] };
+
+    try std.testing.expect(orderedTupleCandidateSetUsableForQuery(.{ .limit = 1, .total_mode = .exact }, &small_set));
+    try std.testing.expect(orderedTupleCandidateSetUsableForQuery(.{ .limit = 1, .total_mode = .exact }, &too_many_exact));
+    try std.testing.expect(orderedTupleCandidateSetUsableForQuery(.{ .limit = 100, .total_mode = .exact }, &too_many_exact));
+    try std.testing.expectEqual(@as(usize, ordered_tuple_bounded_unordered_candidate_gate), orderedTupleCandidateSetGate(.{ .limit = 100, .total_mode = .exact }));
+    try std.testing.expect(orderedTupleCandidateSetUsableForQuery(.{ .limit = 100, .total_mode = .none }, &bounded_set));
+
+    const over_cap_ordinals = try std.testing.allocator.alloc(doc_set.DocOrdinal, ordered_tuple_bounded_unordered_candidate_gate + 1);
+    defer std.testing.allocator.free(over_cap_ordinals);
+    for (over_cap_ordinals, 0..) |*ordinal, i| ordinal.* = @intCast(i);
+    const over_cap_set = doc_set.ResolvedDocSet{ .ordinals = over_cap_ordinals };
+    try std.testing.expect(!orderedTupleCandidateSetUsableForQuery(.{ .limit = 1, .total_mode = .exact }, &over_cap_set));
+
+    var finite_profile = types.RelationalRowsQueryResult.Profile{};
+    setRelationalRowsProfileOrderedTupleProbeGate(&finite_profile, .{ .limit = 1, .total_mode = .exact }, 5);
+    try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate), finite_profile.candidate_gate_limit);
+    try std.testing.expectEqual(@as(u64, 5), finite_profile.candidate_gate_observed);
+
+    var wider_profile = types.RelationalRowsQueryResult.Profile{};
+    setRelationalRowsProfileOrderedTupleProbeGate(&wider_profile, .{ .limit = 100, .total_mode = .exact }, 33);
+    try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate), wider_profile.candidate_gate_limit);
+    try std.testing.expectEqual(@as(u64, 33), wider_profile.candidate_gate_observed);
+
+    var unpaged_profile = types.RelationalRowsQueryResult.Profile{};
+    setRelationalRowsProfileOrderedTupleProbeGate(&unpaged_profile, .{ .total_mode = .exact }, 33);
+    try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate), unpaged_profile.candidate_gate_limit);
+    try std.testing.expectEqual(@as(u64, 33), unpaged_profile.candidate_gate_observed);
+
+    const order_by = [_]types.RelationalRowsQueryOrder{.{ .field = "rank", .direction = .asc }};
+    var ungated_profile = types.RelationalRowsQueryResult.Profile{};
+    setRelationalRowsProfileOrderedTupleProbeGate(&ungated_profile, .{ .order_by = order_by[0..], .limit = 100, .total_mode = .exact }, 33);
+    try std.testing.expectEqual(@as(u64, 0), ungated_profile.candidate_gate_limit);
+    try std.testing.expectEqual(@as(u64, 0), ungated_profile.candidate_gate_observed);
+}
+
+test "relational ordered tuple candidate probe uses measured candidates past old page gate" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_gate_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_gate_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"rank\":1}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"tenant\":\"t1\",\"rank\":2}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"tenant\":\"t1\",\"rank\":3}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"tenant\":\"t1\",\"rank\":4}" },
+            .{ .key = "row:e", .value = "{\"id\":\"e\",\"tenant\":\"t1\",\"rank\":5}" },
+        },
+        .sync_level = .write,
+    });
+
+    const predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+        .{ .name = "", .field = "rank", .op = .gt, .value_json = "0" },
+    };
+    const missing_rank = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "rank",
+        .op = .eq,
+        .value_json = "99",
+    }};
+    const select_id = [_][]const u8{"id"};
+    const scalar_subqueries = [_]types.RelationalRowsScalarSubqueryProjection{.{
+        .output = "missing_id",
+        .query = .{
+            .predicates = missing_rank[0..],
+            .select = select_id[0..],
+            .select_all = false,
+        },
+        .output_field = "id",
+    }};
+
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .scalar_subqueries = scalar_subqueries[0..],
+        .limit = 1,
+        .total_mode = .exact,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, result.profile.access_method);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.none, result.profile.fallback_reason);
+    try std.testing.expectEqual(@as(u64, 0), result.profile.candidate_gate_limit);
+    try std.testing.expectEqual(@as(u64, 0), result.profile.candidate_gate_observed);
+    try std.testing.expectEqual(@as(u64, 5), result.profile.index_entries_scanned);
+    try std.testing.expectEqual(@as(u64, 5), result.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u64, 5), result.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 5), result.profile.residual_rechecks);
+    try std.testing.expectEqual(@as(u32, 5), result.total);
+    try std.testing.expect(result.total_exact);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"missing_id\":null}", result.rows[0]);
+
+    var bounded = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .scalar_subqueries = scalar_subqueries[0..],
+        .limit = 1,
+        .total_mode = .bounded,
+    });
+    defer bounded.deinit(alloc);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, bounded.profile.access_method);
+    try std.testing.expectEqual(@as(u32, 1), bounded.total);
+    try std.testing.expect(!bounded.total_exact);
+    try std.testing.expectEqual(@as(usize, 1), bounded.rows.len);
+    try std.testing.expectEqual(@as(u64, 1), bounded.profile.index_entries_scanned);
+    try std.testing.expectEqual(@as(u64, 1), bounded.profile.hydrated_rows);
+
+    var no_total = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .scalar_subqueries = scalar_subqueries[0..],
+        .limit = 1,
+        .total_mode = .none,
+    });
+    defer no_total.deinit(alloc);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, no_total.profile.access_method);
+    try std.testing.expectEqual(@as(u32, 1), no_total.total);
+    try std.testing.expect(!no_total.total_exact);
+    try std.testing.expectEqual(@as(usize, 1), no_total.rows.len);
+    try std.testing.expectEqual(@as(u64, 1), no_total.profile.index_entries_scanned);
+    try std.testing.expectEqual(@as(u64, 1), no_total.profile.hydrated_rows);
+}
+
+test "relational ordered tuple candidate probe reports materialization cap fallback" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_cap_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_cap_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}],"x-antfly-index-where":{"all":[{"field":"tenant","op":"is_not_null"}]}},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const row_count = ordered_tuple_bounded_unordered_candidate_gate + 1;
+    const writes = try alloc.alloc(types.BatchWrite, row_count);
+    defer {
+        for (writes) |write| {
+            alloc.free(write.key);
+            alloc.free(write.value);
+        }
+        alloc.free(writes);
+    }
+    for (writes, 0..) |*write, i| {
+        write.* = .{
+            .key = try std.fmt.allocPrint(alloc, "row:{d:0>5}", .{i}),
+            .value = try std.fmt.allocPrint(alloc, "{{\"id\":\"{d:0>5}\",\"tenant\":\"t1\",\"rank\":{d}}}", .{ i, i }),
+        };
+    }
+    try db.batch(.{
+        .writes = writes,
+        .sync_level = .write,
+    });
+
+    const predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+        .{ .name = "", .field = "rank", .op = .gt, .value_json = "-1" },
+    };
+    const missing_rank = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "rank",
+        .op = .eq,
+        .value_json = "-2",
+    }};
+    const select_id = [_][]const u8{"id"};
+    const scalar_subqueries = [_]types.RelationalRowsScalarSubqueryProjection{.{
+        .output = "missing_id",
+        .query = .{
+            .predicates = missing_rank[0..],
+            .select = select_id[0..],
+            .select_all = false,
+        },
+        .output_field = "id",
+    }};
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select_id[0..],
+        .select_all = false,
+        .scalar_subqueries = scalar_subqueries[0..],
+        .limit = 1,
+        .total_mode = .exact,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_materialization_cap, result.profile.fallback_reason);
+    try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate), result.profile.candidate_gate_limit);
+    try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate + 1), result.profile.candidate_gate_observed);
+    try std.testing.expect(result.profile.index_entries_scanned >= result.profile.candidate_gate_observed);
+    try std.testing.expectEqual(@as(u32, @intCast(row_count)), result.total);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+}
+
+test "relational rows query resolves ordered tuple equality prefixes with desc and null ordering" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","x-antfly-index-name":"email_status_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:email_status_idx","x-antfly-index-keys":[{"column":"email","direction":"desc","nulls":"last"},{"column":"status","direction":"asc","nulls":"first"}]},"status":{"type":"keyword","x-antfly-index":false},"rank":{"type":"numeric"}},"required":["id","email","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"email\":\"ada@example.test\",\"status\":\"active\",\"rank\":2}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"email\":\"ada@example.test\",\"status\":\"active\",\"rank\":1}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"email\":\"ada@example.test\",\"status\":\"inactive\",\"rank\":3}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"email\":\"grace@example.test\",\"status\":\"active\",\"rank\":4}" },
+        },
+        .sync_level = .write,
+    });
+
+    for ([_][]const u8{ "row:a", "row:b", "row:c", "row:d" }) |doc_key| {
+        const email_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "email", doc_key);
+        defer alloc.free(email_index_key);
+        try db.core.store.delete(email_index_key);
+        const status_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "status", doc_key);
+        defer alloc.free(status_index_key);
+        db.core.store.delete(status_index_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    const predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "email", .op = .eq, .value_json = "\"ada@example.test\"" },
+        .{ .name = "", .field = "status", .op = .eq, .value_json = "\"active\"" },
+    };
+    var candidate_set = (try db.resolveRelationalRowsQueryCandidateSetAlloc(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+    }, null)) orelse return error.TestExpectedEqual;
+    defer candidate_set.deinit(alloc);
+    const candidate_ids = (try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &candidate_set, null)) orelse return error.TestExpectedEqual;
+    defer {
+        for (candidate_ids) |id| alloc.free(@constCast(id));
+        alloc.free(candidate_ids);
+    }
+    try std.testing.expectEqual(@as(usize, 2), candidate_ids.len);
+    try std.testing.expectEqualStrings("row:a", candidate_ids[0]);
+    try std.testing.expectEqualStrings("row:b", candidate_ids[1]);
+
+    const select = [_][]const u8{"id"};
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "rank",
+        .direction = .asc,
+    }};
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+    });
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", result.rows[1]);
+}
+
+test "relational rows query resolves ordered tuple folded collation equality prefixes" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","collation":"antfly.case_insensitive","x-antfly-index-name":"email_status_ci_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:email_status_ci_idx","x-antfly-index-keys":[{"column":"email"},{"column":"status"}]},"status":{"type":"keyword","x-antfly-index":false},"rank":{"type":"numeric"}},"required":["id","email","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"email\":\"ADA@example.test\",\"status\":\"active\",\"rank\":2}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"email\":\"ada@example.test\",\"status\":\"active\",\"rank\":1}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"email\":\"ada@example.test\",\"status\":\"inactive\",\"rank\":3}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"email\":\"grace@example.test\",\"status\":\"active\",\"rank\":4}" },
+        },
+        .sync_level = .write,
+    });
+
+    for ([_][]const u8{ "row:a", "row:b", "row:c", "row:d" }) |doc_key| {
+        const email_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "email", doc_key);
+        defer alloc.free(email_index_key);
+        try db.core.store.delete(email_index_key);
+        const status_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "status", doc_key);
+        defer alloc.free(status_index_key);
+        db.core.store.delete(status_index_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    const predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "email", .op = .eq, .value_json = "\"ada@example.test\"", .collation = "antfly.case_insensitive" },
+        .{ .name = "", .field = "status", .op = .eq, .value_json = "\"active\"" },
+    };
+    var candidate_set = (try db.resolveRelationalRowsQueryCandidateSetAlloc(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+    }, null)) orelse return error.TestExpectedEqual;
+    defer candidate_set.deinit(alloc);
+    const candidate_ids = (try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &candidate_set, null)) orelse return error.TestExpectedEqual;
+    defer {
+        for (candidate_ids) |id| alloc.free(@constCast(id));
+        alloc.free(candidate_ids);
+    }
+    try std.testing.expectEqual(@as(usize, 2), candidate_ids.len);
+
+    const select = [_][]const u8{"id"};
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "rank",
+        .direction = .asc,
+    }};
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+    });
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", result.rows[1]);
+}
+
+test "relational rows query resolves compound ordered tuple equality prefix ranges" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false},"status":{"type":"keyword"}},"required":["id","tenant","rank","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"rank\":1,\"status\":\"open\"}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"tenant\":\"t1\",\"rank\":2,\"status\":\"open\"}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"tenant\":\"t1\",\"rank\":3,\"status\":\"closed\"}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"tenant\":\"t2\",\"rank\":2,\"status\":\"open\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+        .{ .name = "", .field = "rank", .op = .gt, .value_json = "1" },
+        .{ .name = "", .field = "rank", .op = .lte, .value_json = "3" },
+    };
+    var candidate_set = (try db.resolveRelationalRowsQueryCandidateSetAlloc(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+    }, null)) orelse return error.TestExpectedEqual;
+    defer candidate_set.deinit(alloc);
+    const candidate_ids = (try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &candidate_set, null)) orelse return error.TestExpectedEqual;
+    defer {
+        for (candidate_ids) |id| alloc.free(@constCast(id));
+        alloc.free(candidate_ids);
+    }
+    try std.testing.expectEqual(@as(usize, 2), candidate_ids.len);
+    try std.testing.expectEqualStrings("row:b", candidate_ids[0]);
+    try std.testing.expectEqualStrings("row:c", candidate_ids[1]);
+
+    const select = [_][]const u8{"id"};
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "rank",
+        .direction = .asc,
+    }};
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", result.rows[1]);
+}
+
+test "relational rows direct ordered tuple scan honors total modes" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_page_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_page_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}],"x-antfly-index-include":["id"]},"rank":{"type":"numeric","x-antfly-index":false},"status":{"type":"keyword","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"rank\":1,\"status\":\"inactive\"}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"tenant\":\"t1\",\"rank\":2,\"status\":\"active\"}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"tenant\":\"t1\",\"rank\":3,\"status\":\"inactive\"}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"tenant\":\"t1\",\"rank\":4,\"status\":\"active\"}" },
+            .{ .key = "row:e", .value = "{\"id\":\"e\",\"tenant\":\"t2\",\"rank\":1,\"status\":\"active\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+        .{ .name = "", .field = "rank", .op = .gt, .value_json = "0" },
+    };
+    const select = [_][]const u8{"id"};
+    var bounded = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .limit = 2,
+        .total_mode = .none,
+        .profile = true,
+    });
+    defer bounded.deinit(alloc);
+    try std.testing.expect(bounded.include_profile);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, bounded.profile.access_method);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.none, bounded.profile.fallback_reason);
+    try std.testing.expect(bounded.profile.ordered_tuple_plan_selected);
+    try std.testing.expectEqual(@as(u32, 2), bounded.profile.ordered_tuple_key_count);
+    try std.testing.expectEqual(@as(u32, 1), bounded.profile.ordered_tuple_equality_prefix_len);
+    try std.testing.expectEqual(@as(u32, 1), bounded.profile.ordered_tuple_range_key_index);
+    try std.testing.expectEqual(@as(u32, 2), bounded.profile.ordered_tuple_filter_predicates);
+    try std.testing.expectEqual(@as(u32, 2), bounded.profile.ordered_tuple_proven_predicates);
+    try std.testing.expectEqual(@as(u32, 0), bounded.profile.ordered_tuple_residual_predicates);
+    try std.testing.expect(!bounded.profile.ordered_tuple_prefix_scan);
+    try std.testing.expect(bounded.profile.ordered_tuple_lower_tuple_bytes > 0);
+    try std.testing.expect(bounded.profile.ordered_tuple_upper_tuple_bytes > 0);
+    try std.testing.expectEqual(@as(usize, 2), bounded.rows.len);
+    try std.testing.expect(!bounded.total_exact);
+    try std.testing.expectEqual(@as(u32, 2), bounded.total);
+    try std.testing.expectEqual(@as(u64, 2), bounded.profile.index_entries_scanned);
+    try std.testing.expectEqual(@as(u64, 2), bounded.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 0), bounded.profile.residual_rechecks);
+    try std.testing.expectEqual(@as(u64, 2), bounded.profile.covering_payload_rows);
+    try std.testing.expectEqual(@as(u64, 2), bounded.profile.projected_rows);
+
+    var exact = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .limit = 2,
+        .total_mode = .exact,
+    });
+    defer exact.deinit(alloc);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, exact.profile.access_method);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.none, exact.profile.fallback_reason);
+    try std.testing.expect(exact.profile.ordered_tuple_plan_selected);
+    try std.testing.expectEqual(@as(u32, 2), exact.profile.ordered_tuple_key_count);
+    try std.testing.expectEqual(@as(u32, 1), exact.profile.ordered_tuple_equality_prefix_len);
+    try std.testing.expectEqual(@as(u32, 1), exact.profile.ordered_tuple_range_key_index);
+    try std.testing.expectEqual(@as(u32, 2), exact.profile.ordered_tuple_filter_predicates);
+    try std.testing.expectEqual(@as(u32, 2), exact.profile.ordered_tuple_proven_predicates);
+    try std.testing.expectEqual(@as(u32, 0), exact.profile.ordered_tuple_residual_predicates);
+    try std.testing.expect(!exact.profile.ordered_tuple_prefix_scan);
+    try std.testing.expectEqual(@as(usize, 2), exact.rows.len);
+    try std.testing.expect(exact.total_exact);
+    try std.testing.expectEqual(@as(u32, 4), exact.total);
+    try std.testing.expectEqual(@as(u64, 4), exact.profile.index_entries_scanned);
+    try std.testing.expectEqual(@as(u64, 4), exact.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 0), exact.profile.residual_rechecks);
+    try std.testing.expectEqual(@as(u64, 2), exact.profile.covering_payload_rows);
+    try std.testing.expectEqual(@as(u64, 2), exact.profile.projected_rows);
+
+    const residual_predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+        .{ .name = "", .field = "rank", .op = .gt, .value_json = "0" },
+        .{ .name = "", .field = "status", .op = .eq, .value_json = "\"active\"" },
+    };
+    var residual = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = residual_predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .limit = 1,
+        .total_mode = .none,
+        .profile = true,
+    });
+    defer residual.deinit(alloc);
+    try std.testing.expect(residual.include_profile);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, residual.profile.access_method);
+    try std.testing.expect(residual.profile.ordered_tuple_plan_selected);
+    try std.testing.expectEqual(@as(u32, 3), residual.profile.ordered_tuple_filter_predicates);
+    try std.testing.expectEqual(@as(u32, 2), residual.profile.ordered_tuple_proven_predicates);
+    try std.testing.expectEqual(@as(u32, 1), residual.profile.ordered_tuple_residual_predicates);
+    try std.testing.expectEqual(@as(usize, 1), residual.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", residual.rows[0]);
+    try std.testing.expect(!residual.total_exact);
+    try std.testing.expectEqual(@as(u32, 1), residual.total);
+    try std.testing.expectEqual(@as(u64, 2), residual.profile.index_entries_scanned);
+    try std.testing.expectEqual(@as(u64, 2), residual.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 2), residual.profile.residual_rechecks);
+    try std.testing.expectEqual(@as(u64, 0), residual.profile.covering_payload_rows);
+    try std.testing.expectEqual(@as(u64, 1), residual.profile.projected_rows);
+}
+
+test "relational rows ordered tuple scan streams order-satisfying pagination" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_amount_cover_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:status_amount_cover_idx","x-antfly-index-keys":[{"column":"status"},{"column":"amount"}],"x-antfly-index-include":["id","amount"]},"amount":{"type":"numeric","x-antfly-index":false}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"open\",\"amount\":3}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"status\":\"open\",\"amount\":1}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"status\":\"open\",\"amount\":2}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"status\":\"closed\",\"amount\":0}" },
+        },
+        .sync_level = .write,
+    });
+
+    const predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "status",
+        .op = .eq,
+        .value_json = "\"open\"",
+    }};
+    const select = [_][]const u8{ "id", "amount" };
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "amount",
+        .direction = .asc,
+    }};
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+        .limit = 2,
+        .total_mode = .none,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, result.profile.access_method);
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expect(!result.total_exact);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"amount\":1}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\",\"amount\":2}", result.rows[1]);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.index_entries_scanned);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.iterator_seeks);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 0), result.profile.residual_rechecks);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.covering_payload_rows);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.projected_rows);
+}
+
+test "relational rows ordered tuple scan does not stream non-default null order" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_amount_nulls_first_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:status_amount_nulls_first_idx","x-antfly-index-keys":[{"column":"status"},{"column":"amount","direction":"asc","nulls":"first"}],"x-antfly-index-include":["id","amount"]},"amount":{"type":"numeric","x-antfly-index":false}},"required":["id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"open\",\"amount\":null}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"status\":\"open\",\"amount\":1}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"status\":\"open\",\"amount\":2}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"status\":\"closed\",\"amount\":0}" },
+        },
+        .sync_level = .write,
+    });
+
+    const predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "status",
+        .op = .eq,
+        .value_json = "\"open\"",
+    }};
+    const select = [_][]const u8{ "id", "amount" };
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "amount",
+        .direction = .asc,
+    }};
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+        .limit = 2,
+        .total_mode = .none,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expect(result.profile.access_method != .ordered_tuple_stream);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_order_nulls_not_covered, result.profile.fallback_reason);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"amount\":1}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\",\"amount\":2}", result.rows[1]);
+}
+
+test "relational rows ordered tuple scan reports order collation mismatch" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_status_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_status_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"status"}]},"status":{"type":"keyword","x-antfly-index":false}},"required":["id","tenant","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"status\":\"Beta\"}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"tenant\":\"t1\",\"status\":\"alpha\"}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"tenant\":\"t1\",\"status\":\"gamma\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "tenant",
+        .op = .eq,
+        .value_json = "\"t1\"",
+    }};
+    const select = [_][]const u8{ "id", "status" };
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "status",
+        .direction = .asc,
+        .collation = "antfly.case_insensitive",
+    }};
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+        .limit = 2,
+        .total_mode = .none,
+        .profile = true,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expect(result.include_profile);
+    try std.testing.expect(result.profile.access_method != .ordered_tuple_stream);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_order_collation_not_covered, result.profile.fallback_reason);
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expect(!result.total_exact);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"status\":\"alpha\"}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"Beta\"}", result.rows[1]);
+}
+
+test "relational rows ordered tuple covering payload rechecks packed row before projecting" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_cover_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_cover_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}],"x-antfly-index-include":["id"]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"rank\":1}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"tenant\":\"t1\",\"rank\":2}" },
+        },
+        .sync_level = .write,
+    });
+
+    const raw_a = (try relational_store_mod.getRawAlloc(alloc, db.core.store, "row:a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw_a);
+    const tenant_column = columnForField(runtime_schema, "tenant") orelse return error.TestExpectedEqual;
+    const tuple_a = try relational_store_mod.orderedTupleValueForIndexKeysAlloc(alloc, raw_a, tenant_column.index_keys, runtime_schema.relational_columns);
+    defer alloc.free(tuple_a);
+    const forward_key = try internal_keys.relationalOrderedTupleIndexKeyAlloc(alloc, "tenant_rank_cover_idx", tuple_a, "row:a");
+    defer alloc.free(forward_key);
+    const stale_payload = try relational_row_codec.serialize(alloc, &.{
+        .{ .path = "id", .value_type = .bytes_val, .value = .{ .bytes_val = "stale-payload" } },
+    });
+    defer alloc.free(stale_payload);
+    try db.core.store.putBatch(&.{.{ .key = forward_key, .value = stale_payload }}, &.{});
+
+    const predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+        .{ .name = "", .field = "rank", .op = .gt, .value_json = "0" },
+    };
+    const select = [_][]const u8{"id"};
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .total_mode = .exact,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, result.profile.access_method);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.none, result.profile.fallback_reason);
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", result.rows[1]);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.residual_rechecks);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.covering_payload_rows);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.projected_rows);
+}
+
+test "relational rows ordered tuple stream skips stale tuple entries for moved rows" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_cover_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_cover_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}],"x-antfly-index-include":["id"]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"rank\":1}" }},
+        .sync_level = .write,
+    });
+
+    const raw_old = (try relational_store_mod.getRawAlloc(alloc, db.core.store, "row:a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw_old);
+    const tenant_column = columnForField(runtime_schema, "tenant") orelse return error.TestExpectedEqual;
+    const old_tuple = try relational_store_mod.orderedTupleValueForIndexKeysAlloc(alloc, raw_old, tenant_column.index_keys, runtime_schema.relational_columns);
+    defer alloc.free(old_tuple);
+    const old_forward_key = try internal_keys.relationalOrderedTupleIndexKeyAlloc(alloc, "tenant_rank_cover_idx", old_tuple, "row:a");
+    defer alloc.free(old_forward_key);
+    const old_forward_value = try db.core.store.get(alloc, old_forward_key);
+    defer alloc.free(old_forward_value);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"rank\":2}" }},
+        .sync_level = .write,
+    });
+    try db.core.store.putBatch(&.{.{ .key = old_forward_key, .value = old_forward_value }}, &.{});
+
+    const predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+        .{ .name = "", .field = "rank", .op = .gt, .value_json = "0" },
+    };
+    const select = [_][]const u8{"id"};
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .total_mode = .exact,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, result.profile.access_method);
+    try std.testing.expectEqual(@as(u32, 1), result.total);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", result.rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.index_entries_scanned);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 0), result.profile.residual_rechecks);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.covering_payload_rows);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.projected_rows);
+}
+
+test "relational rows query tightens compound ordered tuple range bounds" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_tight_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_tight_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"rank\":1}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"tenant\":\"t1\",\"rank\":2}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"tenant\":\"t1\",\"rank\":3}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"tenant\":\"t1\",\"rank\":4}" },
+            .{ .key = "row:e", .value = "{\"id\":\"e\",\"tenant\":\"t1\",\"rank\":5}" },
+            .{ .key = "row:f", .value = "{\"id\":\"f\",\"tenant\":\"t2\",\"rank\":3}" },
+        },
+        .sync_level = .write,
+    });
+
+    const predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+        .{ .name = "", .field = "rank", .op = .gte, .value_json = "1" },
+        .{ .name = "", .field = "rank", .op = .gt, .value_json = "2" },
+        .{ .name = "", .field = "rank", .op = .lte, .value_json = "5" },
+        .{ .name = "", .field = "rank", .op = .lt, .value_json = "5" },
+    };
+    var candidate_set = (try db.resolveRelationalRowsQueryCandidateSetAlloc(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+    }, null)) orelse return error.TestExpectedEqual;
+    defer candidate_set.deinit(alloc);
+    const candidate_ids = (try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &candidate_set, null)) orelse return error.TestExpectedEqual;
+    defer {
+        for (candidate_ids) |id| alloc.free(@constCast(id));
+        alloc.free(candidate_ids);
+    }
+    try std.testing.expectEqual(@as(usize, 2), candidate_ids.len);
+    try std.testing.expectEqualStrings("row:c", candidate_ids[0]);
+    try std.testing.expectEqualStrings("row:d", candidate_ids[1]);
+}
+
+test "relational rows query resolves ordered tuple first-key ranges" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index":false},"rank":{"type":"numeric","x-antfly-index-name":"rank_tenant_range_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:rank_tenant_range_idx","x-antfly-index-keys":[{"column":"rank"},{"column":"tenant"}]}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"rank\":1}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"tenant\":\"t2\",\"rank\":2}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"tenant\":\"t1\",\"rank\":3}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"tenant\":\"t2\",\"rank\":4}" },
+            .{ .key = "row:e", .value = "{\"id\":\"e\",\"tenant\":\"t1\",\"rank\":5}" },
+        },
+        .sync_level = .write,
+    });
+
+    const predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "rank", .op = .gt, .value_json = "1" },
+        .{ .name = "", .field = "rank", .op = .lt, .value_json = "5" },
+    };
+    var candidate_set = (try db.resolveRelationalRowsQueryCandidateSetAlloc(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+    }, null)) orelse return error.TestExpectedEqual;
+    defer candidate_set.deinit(alloc);
+    const candidate_ids = (try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &candidate_set, null)) orelse return error.TestExpectedEqual;
+    defer {
+        for (candidate_ids) |id| alloc.free(@constCast(id));
+        alloc.free(candidate_ids);
+    }
+    try std.testing.expectEqual(@as(usize, 3), candidate_ids.len);
+    try std.testing.expectEqualStrings("row:b", candidate_ids[0]);
+    try std.testing.expectEqualStrings("row:c", candidate_ids[1]);
+    try std.testing.expectEqualStrings("row:d", candidate_ids[2]);
+}
+
+test "relational rows query resolves explicit default-null ordered tuple ranges" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index":false},"rank":{"type":"numeric","x-antfly-index-name":"rank_nulls_last_range_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:rank_nulls_last_range_idx","x-antfly-index-keys":[{"column":"rank","direction":"asc","nulls":"last"},{"column":"tenant"}]}},"required":["id","tenant"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"rank\":1}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"tenant\":\"t2\",\"rank\":2}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"tenant\":\"t1\",\"rank\":3}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"tenant\":\"t2\",\"rank\":4}" },
+            .{ .key = "row:e", .value = "{\"id\":\"e\",\"tenant\":\"t1\",\"rank\":null}" },
+        },
+        .sync_level = .write,
+    });
+
+    for ([_][]const u8{ "row:a", "row:b", "row:c", "row:d", "row:e" }) |doc_key| {
+        const rank_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "rank", doc_key);
+        defer alloc.free(rank_index_key);
+        db.core.store.delete(rank_index_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    const predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "rank", .op = .gt, .value_json = "1" },
+        .{ .name = "", .field = "rank", .op = .lt, .value_json = "5" },
+    };
+    const select = [_][]const u8{"id"};
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "id",
+        .direction = .asc,
+    }};
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_doc_set, result.profile.access_method);
+    try std.testing.expectEqual(@as(u64, 3), result.profile.index_entries_scanned);
+    try std.testing.expectEqual(@as(u64, 3), result.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u32, 3), result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", result.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"d\"}", result.rows[2]);
+}
+
+test "relational rows query resolves descending ordered tuple first-key ranges" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index":false},"rank":{"type":"numeric","x-antfly-index-name":"rank_desc_tenant_range_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:rank_desc_tenant_range_idx","x-antfly-index-keys":[{"column":"rank","direction":"desc"},{"column":"tenant"}]}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"rank\":1}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"tenant\":\"t2\",\"rank\":2}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"tenant\":\"t1\",\"rank\":3}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"tenant\":\"t2\",\"rank\":4}" },
+            .{ .key = "row:e", .value = "{\"id\":\"e\",\"tenant\":\"t1\",\"rank\":5}" },
+        },
+        .sync_level = .write,
+    });
+
+    for ([_][]const u8{ "row:a", "row:b", "row:c", "row:d", "row:e" }) |doc_key| {
+        const rank_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "rank", doc_key);
+        defer alloc.free(rank_index_key);
+        db.core.store.delete(rank_index_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    const predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "rank", .op = .gt, .value_json = "1" },
+        .{ .name = "", .field = "rank", .op = .lt, .value_json = "5" },
+    };
+    const select = [_][]const u8{"id"};
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "id",
+        .direction = .asc,
+    }};
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_doc_set, result.profile.access_method);
+    try std.testing.expectEqual(@as(u64, 3), result.profile.index_entries_scanned);
+    try std.testing.expectEqual(@as(u64, 3), result.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u32, 3), result.total);
+    try std.testing.expectEqual(@as(usize, 3), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", result.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"d\"}", result.rows[2]);
+}
+
+test "relational rows across ranges uses ordered tuple candidate scans" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_routed_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_routed_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"rank\":1}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"tenant\":\"t1\",\"rank\":2}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"tenant\":\"t1\",\"rank\":3}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"tenant\":\"t1\",\"rank\":4}" },
+            .{ .key = "row:e", .value = "{\"id\":\"e\",\"tenant\":\"t1\",\"rank\":5}" },
+            .{ .key = "row:f", .value = "{\"id\":\"f\",\"tenant\":\"t2\",\"rank\":3}" },
+        },
+        .sync_level = .write,
+    });
+
+    for ([_][]const u8{ "row:a", "row:b", "row:c", "row:d", "row:e", "row:f" }) |doc_key| {
+        const tenant_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "tenant", doc_key);
+        defer alloc.free(tenant_index_key);
+        try db.core.store.delete(tenant_index_key);
+        const rank_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "rank", doc_key);
+        defer alloc.free(rank_index_key);
+        db.core.store.delete(rank_index_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    const predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+        .{ .name = "", .field = "rank", .op = .gt, .value_json = "1" },
+        .{ .name = "", .field = "rank", .op = .lt, .value_json = "5" },
+    };
+    const ranges = [_]types.RelationalRowsDocKeyRange{
+        .{ .start = "row:b", .end = "row:d" },
+        .{ .start = "row:e", .end = "row:g" },
+    };
+    const select = [_][]const u8{"id"};
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "id",
+        .direction = .asc,
+    }};
+    var result = try db.queryRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+    }, ranges[0..]);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", result.rows[1]);
+}
+
+test "relational rows OR branches use compound ordered tuple candidate scans" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_rank_or_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:status_rank_or_idx","x-antfly-index-keys":[{"column":"status"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"open\",\"rank\":1}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"status\":\"open\",\"rank\":3}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"status\":\"pending\",\"rank\":2}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"status\":\"pending\",\"rank\":5}" },
+            .{ .key = "row:e", .value = "{\"id\":\"e\",\"status\":\"closed\",\"rank\":3}" },
+        },
+        .sync_level = .write,
+    });
+
+    for ([_][]const u8{ "row:a", "row:b", "row:c", "row:d", "row:e" }) |doc_key| {
+        const status_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "status", doc_key);
+        defer alloc.free(status_index_key);
+        db.core.store.delete(status_index_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        const rank_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "rank", doc_key);
+        defer alloc.free(rank_index_key);
+        db.core.store.delete(rank_index_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    const open_rank_gt_two = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "status", .op = .eq, .value_json = "\"open\"" },
+        .{ .name = "", .field = "rank", .op = .gt, .value_json = "2" },
+    };
+    const pending_rank_lt_four = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "status", .op = .eq, .value_json = "\"pending\"" },
+        .{ .name = "", .field = "rank", .op = .lt, .value_json = "4" },
+    };
+    const or_predicates = [_]types.RelationalRowsPredicateGroup{
+        .{ .predicates = open_rank_gt_two[0..] },
+        .{ .predicates = pending_rank_lt_four[0..] },
+    };
+    const select = [_][]const u8{"id"};
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .or_predicates = or_predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .profile = true,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expect(result.include_profile);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_doc_set, result.profile.access_method);
+    try std.testing.expect(result.profile.ordered_tuple_plan_selected);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.none, result.profile.fallback_reason);
+    try std.testing.expectEqual(@as(u32, 0), result.profile.ordered_tuple_residual_predicates);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.residual_rechecks);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.projected_rows);
+    try std.testing.expect(result.profile.index_entries_scanned >= 2);
+    try std.testing.expect(result.profile.candidate_rows >= 2);
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+
+    var saw_b = false;
+    var saw_c = false;
+    for (result.rows) |row| {
+        if (std.mem.eql(u8, row, "{\"id\":\"b\"}")) saw_b = true;
+        if (std.mem.eql(u8, row, "{\"id\":\"c\"}")) saw_c = true;
+    }
+    try std.testing.expect(saw_b);
+    try std.testing.expect(saw_c);
+}
+
+test "relational rows access OR branches use ranged compound ordered tuple candidates" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_rank_access_or_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:status_rank_access_or_idx","x-antfly-index-keys":[{"column":"status"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"open\",\"rank\":1}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"status\":\"open\",\"rank\":3}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"status\":\"pending\",\"rank\":2}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"status\":\"pending\",\"rank\":5}" },
+            .{ .key = "row:e", .value = "{\"id\":\"e\",\"status\":\"closed\",\"rank\":3}" },
+        },
+        .sync_level = .write,
+    });
+
+    for ([_][]const u8{ "row:a", "row:b", "row:c", "row:d", "row:e" }) |doc_key| {
+        const status_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "status", doc_key);
+        defer alloc.free(status_index_key);
+        db.core.store.delete(status_index_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        const rank_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "rank", doc_key);
+        defer alloc.free(rank_index_key);
+        db.core.store.delete(rank_index_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    const open_rank_gt_two = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "status", .op = .eq, .value_json = "\"open\"" },
+        .{ .name = "", .field = "rank", .op = .gt, .value_json = "2" },
+    };
+    const pending_rank_lt_four = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "status", .op = .eq, .value_json = "\"pending\"" },
+        .{ .name = "", .field = "rank", .op = .lt, .value_json = "4" },
+    };
+    const access_or_predicates = [_]types.RelationalRowsAccessPredicateGroup{
+        .{ .predicates = open_rank_gt_two[0..] },
+        .{ .predicates = pending_rank_lt_four[0..] },
+    };
+    const select = [_][]const u8{"id"};
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .access_or_predicates = access_or_predicates[0..],
+        .doc_key_range = .{ .start = "row:b", .end = "row:d" },
+        .select = select[0..],
+        .select_all = false,
+        .profile = true,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expect(result.include_profile);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_doc_set, result.profile.access_method);
+    try std.testing.expect(result.profile.ordered_tuple_plan_selected);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.none, result.profile.fallback_reason);
+    try std.testing.expectEqual(@as(u32, 0), result.profile.ordered_tuple_residual_predicates);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.projected_rows);
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+
+    var saw_b = false;
+    var saw_c = false;
+    for (result.rows) |row| {
+        if (std.mem.eql(u8, row, "{\"id\":\"b\"}")) saw_b = true;
+        if (std.mem.eql(u8, row, "{\"id\":\"c\"}")) saw_c = true;
+    }
+    try std.testing.expect(saw_b);
+    try std.testing.expect(saw_c);
+}
+
+test "relational aggregate and join sources use ordered tuple prefilters" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"kind":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_prefilter_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_prefilter_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false},"customer_id":{"type":"keyword"},"name":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","kind","tenant"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:c1", .value = "{\"id\":\"c1\",\"kind\":\"customer\",\"tenant\":\"t1\",\"name\":\"Alice\"}" },
+            .{ .key = "row:c2", .value = "{\"id\":\"c2\",\"kind\":\"customer\",\"tenant\":\"t1\",\"name\":\"Bob\"}" },
+            .{ .key = "row:o1", .value = "{\"id\":\"o1\",\"kind\":\"order\",\"tenant\":\"t1\",\"rank\":1,\"customer_id\":\"c1\",\"amount\":5}" },
+            .{ .key = "row:o2", .value = "{\"id\":\"o2\",\"kind\":\"order\",\"tenant\":\"t1\",\"rank\":2,\"customer_id\":\"c2\",\"amount\":7}" },
+            .{ .key = "row:o3", .value = "{\"id\":\"o3\",\"kind\":\"order\",\"tenant\":\"t1\",\"rank\":3,\"customer_id\":\"c1\",\"amount\":11}" },
+            .{ .key = "row:o4", .value = "{\"id\":\"o4\",\"kind\":\"order\",\"tenant\":\"t1\",\"rank\":4,\"customer_id\":\"c2\",\"amount\":13}" },
+            .{ .key = "row:o5", .value = "{\"id\":\"o5\",\"kind\":\"order\",\"tenant\":\"t2\",\"rank\":3,\"customer_id\":\"c1\",\"amount\":17}" },
+        },
+        .sync_level = .write,
+    });
+
+    for ([_][]const u8{ "row:c1", "row:c2", "row:o1", "row:o2", "row:o3", "row:o4", "row:o5" }) |doc_key| {
+        const tenant_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "tenant", doc_key);
+        defer alloc.free(tenant_index_key);
+        try db.core.store.delete(tenant_index_key);
+        const rank_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "rank", doc_key);
+        defer alloc.free(rank_index_key);
+        db.core.store.delete(rank_index_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    const source_predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+        .{ .name = "", .field = "rank", .op = .gt, .value_json = "1" },
+        .{ .name = "", .field = "rank", .op = .lt, .value_json = "4" },
+        .{ .name = "", .field = "kind", .op = .eq, .value_json = "\"order\"" },
+    };
+    var candidate_set = (try db.resolveRelationalRowsQueryCandidateSetAlloc(alloc, runtime_schema, .{
+        .predicates = source_predicates[0..],
+    }, null)) orelse return error.TestExpectedEqual;
+    defer candidate_set.deinit(alloc);
+    const candidate_ids = (try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &candidate_set, null)) orelse return error.TestExpectedEqual;
+    defer {
+        for (candidate_ids) |id| alloc.free(@constCast(id));
+        alloc.free(candidate_ids);
+    }
+    try std.testing.expectEqual(@as(usize, 2), candidate_ids.len);
+    try std.testing.expectEqualStrings("row:o2", candidate_ids[0]);
+    try std.testing.expectEqualStrings("row:o3", candidate_ids[1]);
+
+    const group_by = [_][]const u8{"tenant"};
+    const aggregations = [_]types.RelationalRowsAggregateSpec{
+        .{ .name = "row_count", .op = .count },
+        .{ .name = "amount_sum", .op = .sum, .field = "amount" },
+    };
+    var aggregate = try db.aggregateRelationalRows(alloc, runtime_schema, .{
+        .source = .{ .predicates = source_predicates[0..] },
+        .group_by = group_by[0..],
+        .aggregations = aggregations[0..],
+    });
+    defer aggregate.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), aggregate.total_groups);
+    try std.testing.expectEqual(@as(usize, 1), aggregate.rows.len);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"row_count\":2,\"amount_sum\":18}", aggregate.rows[0]);
+
+    const customer_predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "kind",
+        .op = .eq,
+        .value_json = "\"customer\"",
+    }};
+    const on = [_]types.RelationalRowsJoinOn{
+        .{ .left_field = "tenant", .right_field = "tenant" },
+        .{ .left_field = "customer_id", .right_field = "id" },
+    };
+    const select = [_]types.RelationalRowsJoinProjection{
+        .{ .output = "order_id", .side = .left, .field = "id" },
+        .{ .output = "customer_name", .side = .right, .field = "name" },
+    };
+    var joined = try db.joinRelationalRows(alloc, runtime_schema, .{
+        .left = .{ .predicates = source_predicates[0..] },
+        .right = .{ .predicates = customer_predicates[0..] },
+        .on = on[0..],
+        .join_type = .inner,
+        .select = select[0..],
+        .order_by = &.{.{ .field = "order_id", .direction = .asc }},
+    });
+    defer joined.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), joined.total_rows);
+    try std.testing.expectEqual(@as(usize, 2), joined.rows.len);
+    try std.testing.expectEqualStrings("{\"order_id\":\"o2\",\"customer_name\":\"Bob\"}", joined.rows[0]);
+    try std.testing.expectEqualStrings("{\"order_id\":\"o3\",\"customer_name\":\"Alice\"}", joined.rows[1]);
 }
 
 test "relational rows query falls back to base scans for non-indexable predicates" {

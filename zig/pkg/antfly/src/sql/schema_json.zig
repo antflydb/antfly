@@ -19,6 +19,7 @@ const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const expr_type = @import("expr/type.zig");
 const json_helpers = @import("../common/json_helpers.zig");
+const relational_rows = @import("relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
 
@@ -128,6 +129,8 @@ pub fn schemaJsonPropertyFromColumnAlloc(alloc: std.mem.Allocator, column: runti
     if (column.index_lifecycle != .ready) try putJsonString(alloc, &object, "x-antfly-index-lifecycle", ddl_plan.relationalIndexLifecycleName(column.index_lifecycle));
     if (column.index_generation != 0) try object.put(alloc, try alloc.dupe(u8, "x-antfly-index-generation"), .{ .integer = @intCast(column.index_generation) });
     if (column.index_name) |index_name| try putJsonString(alloc, &object, "x-antfly-index-name", index_name);
+    if (column.index_access_method) |method| try putJsonString(alloc, &object, "x-antfly-index-access-method", method.name());
+    if (column.index_schema_fingerprint) |fingerprint| try putJsonString(alloc, &object, "x-antfly-index-schema-fingerprint", fingerprint);
     if (column.index_include_columns.len > 0) try object.put(alloc, try alloc.dupe(u8, "x-antfly-index-include"), try schemaJsonStringArrayAlloc(alloc, column.index_include_columns));
     if (column.index_keys.len > 0) try object.put(alloc, try alloc.dupe(u8, "x-antfly-index-keys"), try schemaJsonRelationalIndexKeysAlloc(alloc, column.index_keys));
     if (column.cardinality_proof == .unique) try putJsonString(alloc, &object, "x-antfly-cardinality-proof", "unique");
@@ -156,22 +159,36 @@ pub fn schemaJsonDefaultValueAlloc(alloc: std.mem.Allocator, value: runtime_sche
         .current_date_ns => "current_date_ns",
         .uuid_v4 => "uuid_v4",
         .sequence_next => "sequence_next",
+        .scalar_subquery => "scalar_subquery",
     });
-    if (value.kind == .sequence_next) {
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value.value_json, .{});
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidSqlCatalog;
-        const sequence = parsed.value.object.get("sequence") orelse return error.InvalidSqlCatalog;
-        if (sequence != .string) return error.InvalidSqlCatalog;
-        try putJsonString(alloc, &object, "sequence", sequence.string);
-        if (parsed.value.object.get("database")) |database| {
-            if (database != .string) return error.InvalidSqlCatalog;
-            try putJsonString(alloc, &object, "database", database.string);
-        }
-        if (parsed.value.object.get("schema")) |schema_name| {
-            if (schema_name != .string) return error.InvalidSqlCatalog;
-            try putJsonString(alloc, &object, "schema", schema_name.string);
-        }
+    switch (value.kind) {
+        .sequence_next => {
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value.value_json, .{});
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidSqlCatalog;
+            const sequence = parsed.value.object.get("sequence") orelse return error.InvalidSqlCatalog;
+            if (sequence != .string) return error.InvalidSqlCatalog;
+            try putJsonString(alloc, &object, "sequence", sequence.string);
+            if (parsed.value.object.get("database")) |database| {
+                if (database != .string) return error.InvalidSqlCatalog;
+                try putJsonString(alloc, &object, "database", database.string);
+            }
+            if (parsed.value.object.get("schema")) |schema_name| {
+                if (schema_name != .string) return error.InvalidSqlCatalog;
+                try putJsonString(alloc, &object, "schema", schema_name.string);
+            }
+        },
+        .scalar_subquery => {
+            const normalized_value_json = relational_rows.normalizeScalarSubqueryDefaultValueJsonAlloc(alloc, value.value_json) catch return error.InvalidSqlCatalog;
+            defer alloc.free(normalized_value_json);
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, normalized_value_json, .{}) catch return error.InvalidSqlCatalog;
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidSqlCatalog;
+            const query = parsed.value.object.get("query") orelse return error.InvalidSqlCatalog;
+            if (query != .object) return error.InvalidSqlCatalog;
+            try object.put(alloc, try alloc.dupe(u8, "query"), try json_helpers.cloneJsonValue(alloc, query));
+        },
+        .literal, .now_ns, .current_date_ns, .uuid_v4 => {},
     }
     return .{ .object = object };
 }
@@ -238,6 +255,10 @@ pub fn schemaJsonUniqueConstraintAlloc(alloc: std.mem.Allocator, constraint: run
     if (constraint.expressions.len > 0) try object.put(alloc, try alloc.dupe(u8, "expressions"), try schemaJsonUniqueExpressionsAlloc(alloc, constraint.expressions));
     if (constraint.include_columns.len > 0) try object.put(alloc, try alloc.dupe(u8, "include_columns"), try schemaJsonStringArrayAlloc(alloc, constraint.include_columns));
     if (constraint.index_keys.len > 0) try object.put(alloc, try alloc.dupe(u8, "index_keys"), try schemaJsonRelationalIndexKeysAlloc(alloc, constraint.index_keys));
+    if (constraint.index_lifecycle != .ready) try putJsonString(alloc, &object, "index_lifecycle", ddl_plan.relationalIndexLifecycleName(constraint.index_lifecycle));
+    if (constraint.index_generation != 0) try object.put(alloc, try alloc.dupe(u8, "index_generation"), .{ .integer = @intCast(constraint.index_generation) });
+    if (constraint.index_access_method) |method| try putJsonString(alloc, &object, "index_access_method", method.name());
+    if (constraint.index_schema_fingerprint) |fingerprint| try putJsonString(alloc, &object, "index_schema_fingerprint", fingerprint);
     if (constraint.without_overlaps_period) |period| try putJsonString(alloc, &object, "without_overlaps_period", period);
     if (constraint.nulls_not_distinct) try object.put(alloc, try alloc.dupe(u8, "nulls_not_distinct"), .{ .bool = true });
     if (constraint.where.len > 0) try object.put(alloc, try alloc.dupe(u8, "where"), try schemaJsonUniquePredicateDefinitionAlloc(alloc, constraint.where));
@@ -429,6 +450,10 @@ pub fn applyCreateIndexPlanToSchemaJsonValue(
         } else return error.InvalidSqlCatalog;
         try validateCreateIndexIncludeColumnsForSchemaJsonProperties(schema_parts.properties, plan.columns, plan.include_columns);
     }
+    const index_generation = ddl_plan.stableSecondaryIndexGeneration(plan);
+    const index_access_method = try ddl_plan.relationalAccessMethodForCreateIndex(plan);
+    const index_schema_fingerprint = try ddl_plan.stableSecondaryIndexSchemaFingerprintAlloc(alloc, plan);
+    defer alloc.free(index_schema_fingerprint);
     if (plan.unique) {
         try validateCreateIndexIncludeColumnsForSchemaJsonProperties(schema_parts.properties, plan.columns, plan.include_columns);
         const constraint: runtime_schema.UniqueConstraint = .{
@@ -437,6 +462,10 @@ pub fn applyCreateIndexPlanToSchemaJsonValue(
             .expressions = plan.expressions,
             .include_columns = plan.include_columns,
             .index_keys = plan.index_keys,
+            .index_lifecycle = .building,
+            .index_generation = index_generation,
+            .index_access_method = index_access_method,
+            .index_schema_fingerprint = index_schema_fingerprint,
             .without_overlaps_period = plan.without_overlaps_period,
             .nulls_not_distinct = plan.nulls_not_distinct,
             .where = plan.where,
@@ -448,7 +477,6 @@ pub fn applyCreateIndexPlanToSchemaJsonValue(
         return true;
     }
 
-    const index_generation = ddl_plan.stableSecondaryIndexGeneration(plan);
     if (plan.generated_expression) |generated_expression| {
         if (plan.columns.len != 0 or plan.expressions.len != 0) return error.UnsupportedSqlShape;
         try validateCreateIndexIncludeColumnsForSchemaJsonProperties(schema_parts.properties, &.{}, plan.include_columns);
@@ -462,6 +490,8 @@ pub fn applyCreateIndexPlanToSchemaJsonValue(
             .index_lifecycle = .building,
             .index_generation = index_generation,
             .index_name = plan.index_name,
+            .index_access_method = index_access_method,
+            .index_schema_fingerprint = index_schema_fingerprint,
             .index_include_columns = plan.include_columns,
             .index_keys = plan.index_keys,
             .generated = generated_expression,
@@ -488,6 +518,8 @@ pub fn applyCreateIndexPlanToSchemaJsonValue(
         try putJsonString(alloc, &property.object, "x-antfly-index-lifecycle", "building");
         try property.object.put(alloc, try alloc.dupe(u8, "x-antfly-index-generation"), .{ .integer = @intCast(index_generation) });
         try putJsonString(alloc, &property.object, "x-antfly-index-name", plan.index_name);
+        try putJsonString(alloc, &property.object, "x-antfly-index-access-method", index_access_method.name());
+        try putJsonString(alloc, &property.object, "x-antfly-index-schema-fingerprint", index_schema_fingerprint);
         if (plan.include_columns.len > 0) try property.object.put(alloc, try alloc.dupe(u8, "x-antfly-index-include"), try schemaJsonStringArrayAlloc(alloc, plan.include_columns));
         if (plan.index_keys.len > 0) try property.object.put(alloc, try alloc.dupe(u8, "x-antfly-index-keys"), try schemaJsonRelationalIndexKeysAlloc(alloc, plan.index_keys));
         if (plan.where.len > 0) try property.object.put(alloc, try alloc.dupe(u8, "x-antfly-index-where"), try schemaJsonUniquePredicateDefinitionAlloc(alloc, plan.where));
@@ -525,6 +557,8 @@ pub fn applyDropIndexPlanToSchemaJsonValue(
         _ = entry.value_ptr.object.orderedRemove("x-antfly-index-lifecycle");
         _ = entry.value_ptr.object.orderedRemove("x-antfly-index-generation");
         _ = entry.value_ptr.object.orderedRemove("x-antfly-index-name");
+        _ = entry.value_ptr.object.orderedRemove("x-antfly-index-access-method");
+        _ = entry.value_ptr.object.orderedRemove("x-antfly-index-schema-fingerprint");
         _ = entry.value_ptr.object.orderedRemove("x-antfly-index-include");
         _ = entry.value_ptr.object.orderedRemove("x-antfly-index-keys");
         _ = entry.value_ptr.object.orderedRemove("x-antfly-index-where");
@@ -1737,6 +1771,25 @@ test "schema json emits sequence-backed relational defaults" {
     const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
     defer alloc.free(encoded);
     try std.testing.expectEqualStrings("{\"op\":\"sequence_next\",\"sequence\":\"usage_id_seq\",\"database\":\"tenant\",\"schema\":\"billing\"}", encoded);
+}
+
+test "schema json normalizes legacy tokenized scalar subquery defaults" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-default":{"op":"scalar_subquery","query":{"kind":"tokenized_sql","tokens":[{"kind":"identifier","text":"SELECT","keyword":"select"},{"kind":"identifier","text":"status"},{"kind":"identifier","text":"FROM","keyword":"from"},{"kind":"identifier","text":"usage_records"},{"kind":"identifier","text":"LIMIT","keyword":"limit"},{"kind":"number","text":"1"}]}}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, runtime);
+    const default_value = runtime.relational_columns[1].default_value orelse return error.TestUnexpectedResult;
+
+    var value = try schemaJsonDefaultValueAlloc(alloc, default_value, true);
+    defer json_helpers.deinitJsonValue(alloc, &value);
+
+    const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(encoded);
+    try std.testing.expectEqualStrings("{\"op\":\"scalar_subquery\",\"query\":{\"table\":\"usage_records\",\"select\":[\"status\"],\"limit\":1}}", encoded);
 }
 
 test "schema json emits relational check collation" {

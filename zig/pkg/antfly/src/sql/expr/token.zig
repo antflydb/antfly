@@ -929,6 +929,7 @@ fn fixedUnaryFunctionKeyword(kind: db_mod.types.RelationalRowsExpressionKind) ?[
         .sign => "sign",
         .reverse => "reverse",
         .md5 => "md5",
+        .soundex => "soundex",
         .to_jsonb => "to_jsonb",
         else => null,
     };

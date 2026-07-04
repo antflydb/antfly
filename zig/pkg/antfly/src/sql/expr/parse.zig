@@ -59,6 +59,7 @@ pub const RowExpressionOperandStart = enum {
     repeat,
     reverse,
     md5,
+    soundex,
     starts_with,
     ends_with,
     date_trunc,
@@ -324,6 +325,7 @@ pub fn rowExpressionOperandStartAt(tokens: []const Token, pos: usize) ?RowExpres
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsRepeatFunction)) return .repeat;
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsReverseFunction)) return .reverse;
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsMd5Function)) return .md5;
+    if (expr_token.peekFixedUnaryFunctionCall(tokens, pos, .soundex)) return .soundex;
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsStartsWithFunction)) return .starts_with;
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsEndsWithFunction)) return .ends_with;
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsDateTruncFunction)) return .date_trunc;

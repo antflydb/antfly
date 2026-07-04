@@ -35,7 +35,7 @@ pub fn expressionValueJsonAlloc(
             break :blk try alloc.dupe(u8, value_json);
         },
         .value => try alloc.dupe(u8, expression.value_json),
-        .lower, .upper, .initcap, .md5 => blk: {
+        .lower, .upper, .initcap, .md5, .soundex => blk: {
             if (expression.operands.len != 1) return error.UnsupportedSqlShape;
             const value_json = try expressionValueJsonAlloc(alloc, expression.operands[0], values);
             defer alloc.free(value_json);
@@ -49,6 +49,7 @@ pub fn expressionValueJsonAlloc(
                         .upper => try std.ascii.allocUpperString(alloc, text),
                         .initcap => try expr_text.initcapTextAlloc(alloc, text),
                         .md5 => try expr_text.md5HexTextAlloc(alloc, text),
+                        .soundex => try expr_text.soundexTextAlloc(alloc, text),
                         else => unreachable,
                     };
                     defer alloc.free(transformed);

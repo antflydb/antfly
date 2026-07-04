@@ -346,8 +346,8 @@ Supported document read expansion should remain deliberate:
   ASCII case folding, `substring`/`substr`, `overlay`, `left`, `right`,
   `repeat`, `reverse`, default `btrim`/`ltrim`/`rtrim`/`trim`, `lpad`,
   `rpad`, `split_part`, `starts_with`, `ends_with`, `strpos`, `position`,
-  `octet_length`, `bit_length`, `ascii`, `chr`, `initcap`, `md5`, `replace`,
-  `nullif`,
+  `octet_length`, `bit_length`, `ascii`, `chr`, `initcap`, `md5`, `soundex`,
+  `replace`, `nullif`,
   scalar `CAST(field AS text)` over direct-table and simple mapped-view scalar
   fields, scalar `CAST(field AS numeric)` over direct-table and simple
   mapped-view numeric/text-like scalar fields, scalar
@@ -412,8 +412,9 @@ Supported document read expansion should remain deliberate:
   comparison predicates
 - residual/bounded-scan direct-table and simple mapped-view
   `ascii(text_field)` comparison predicates
-- residual/bounded-scan direct-table and simple mapped-view `initcap(text_field)` and
-  `md5(text_field)` equality predicates
+- residual/bounded-scan direct-table and simple mapped-view
+  `initcap(text_field)`, `md5(text_field)`, and `soundex(text_field)`
+  equality predicates
 - residual/bounded-scan direct-table and simple mapped-view
   `reverse(text_field)` and default `trim`/`btrim`/`ltrim`/`rtrim` equality
   predicates
@@ -626,8 +627,28 @@ fail before catalog application or row execution.
 
 ## Derived Index SQL
 
-SQL can expose PostgreSQL-shaped DDL for Antfly-derived artifacts while keeping
-the durable model native:
+SQL can expose PostgreSQL-shaped DDL for Antfly scalar and derived artifacts
+while keeping the durable model native. SQL index syntax lowers to catalog
+index definitions with explicit access methods and planner capabilities, not to
+backend SQL strings or user-visible physical data-structure names.
+
+Ordinary relational `CREATE INDEX` and `CREATE UNIQUE INDEX` lower to the
+`ordered_tuple` access method by default. This is the SQL scalar/compound index
+contract: equality prefixes, range scans, `ORDER BY` satisfaction, uniqueness,
+foreign-key owner lookup, partial predicates, expression keys, collation/null
+ordering, descending key parts, lifecycle generations, and reverse cleanup all
+belong to the ordered tuple capability. The implementation may use sorted KV,
+BT-tree-like storage, or a future trie-backed physical layout, but SQL should
+not expose that choice unless a method proves the same semantics.
+
+SQL-visible index lifecycle is still native catalog state, not backend DDL text.
+Only `ready` indexes are eligible for query plans; `building` and `catching_up`
+can be maintained during writes; `stale`, `rebuild_required`, `failed`,
+`dropping`, and legacy `invalid` fail closed until catalog-owned rebuild,
+repair, retry, or cleanup promotes a matching generation.
+Rebuild work records durable owner-range progress with leases, completed-row
+counts, resume row keys, and error state; SQL DDL never owns a separate backend
+cursor or hidden physical index job.
 
 - `USING antfly_full_text` for full-text indexes.
 - `USING hnsw` or `USING antfly_aknn` for external vector or managed embedding
@@ -641,6 +662,24 @@ Embedded `json` / `jsonb` fields on relational rows participate through the
 same field-path resolver as document-derived indexes. Full-text, AKNN, graph,
 algebraic, embedding, and hybrid configs validate paths against table schema
 before writing catalog metadata.
+
+`CREATE TEXT SEARCH` should lower into the same native index catalog as an
+explicit `text_search` access method. It is a sibling of ordered relational
+indexes, not a replacement for them: text search owns analyzed terms, ranking,
+highlight/snippet state, and segment lifecycle; relational hydration and scalar
+rechecks still read the committed base row. Queries combine methods by
+intersecting compatible doc sets, for example a `text_search` result with an
+`ordered_tuple` tenant/status filter or an `algebraic_filter` JSON path fact.
+
+`USING antfly_algebraic` lowers to an `algebraic_filter` access method or to
+native algebraic materialization metadata, depending on the requested shape.
+Algebraic dictionaries, FSTs, tries, postings, and path facts are planner
+accelerators for fact/path/filter/aggregate workloads. They should not be used
+as the SQL compound scalar index backend unless the implementation advertises
+and tests the full `ordered_tuple` contract: left-prefix equality, range
+traversal, deterministic SQL ordering, null/collation semantics, partial
+predicate proof, row-generation safety, uniqueness/FK enforcement where
+applicable, and reverse delete/update cleanup.
 
 See [RELATIONAL.md](RELATIONAL.md) for the relational field and derived-index
 model.

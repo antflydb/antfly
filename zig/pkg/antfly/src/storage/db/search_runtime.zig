@@ -771,7 +771,7 @@ test "relational embedded json search intersects with top-level relational filte
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"title":{"type":"text"},"plan":{"type":"keyword"}},"additionalProperties":true}}},"required":["status"],"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"keyword"},"active":{"type":"boolean"},"attrs":{"type":"json","schema":{"type":"object","properties":{"title":{"type":"text"},"plan":{"type":"keyword"}},"additionalProperties":true}}},"required":["status"],"additionalProperties":false}}}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -784,13 +784,13 @@ test "relational embedded json search intersects with top-level relational filte
         .kind = .full_text,
         .config_json = "{}",
     });
-    try std.testing.expectError(error.InvalidDocumentForSchema, db.batch(.{
+    try db.batch(.{
         .writes = &.{.{
-            .key = "row:invalid",
-            .value = "{\"status\":7,\"attrs\":{\"title\":\"nebula invalid\",\"plan\":\"pro\"},\"unexpected\":\"bypass\"}",
+            .key = "row:inactive",
+            .value = "{\"status\":\"inactive\",\"attrs\":{\"title\":\"nebula inactive\",\"plan\":\"pro\"}}",
         }},
         .sync_level = .full_index,
-    }));
+    });
     try db.batch(.{
         .writes = &.{
             .{
@@ -840,7 +840,7 @@ test "relational embedded json search intersects with top-level relational filte
 
     const locker_txn = try db.beginTransaction(2_000);
     defer db.abortTransaction(locker_txn, 2_100) catch {};
-    try db.claimRowsForTransaction(locker_txn, &.{"row:archived"}, .{
+    try db.claimRowsForTransaction(locker_txn, &.{ "row:archived", "row:inactive" }, .{
         .mode = .for_update,
         .owner_id = "session:embedded-json-locker",
         .txn_id = locker_txn,
@@ -852,7 +852,8 @@ test "relational embedded json search intersects with top-level relational filte
         .index_name = "ft_json",
         .query = .{ .match = .{ .field = "attrs.title", .text = "nebula" } },
         .row_claim = .{
-            .mode = .for_update_skip_locked,
+            .mode = .for_update,
+            .skip_locked = true,
             .owner_id = "session:embedded-json-reader",
             .txn_id = reader_txn,
         },

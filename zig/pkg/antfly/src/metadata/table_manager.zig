@@ -526,6 +526,12 @@ pub const SecondaryIndexRebuildRangeFinishRequest = struct {
     progress_row_key: []const u8,
 };
 
+pub const SecondaryIndexRebuildRangeProgressRequest = struct {
+    selector: SecondaryIndexRebuildRangeSelector,
+    completed_row_count: u64,
+    progress_row_key: []const u8,
+};
+
 pub const SecondaryIndexRebuildRangeInvalidateRequest = struct {
     selector: SecondaryIndexRebuildRangeSelector,
     last_error: []const u8,
@@ -2497,7 +2503,7 @@ pub const TableManager = struct {
         const selector = request.selector;
         const record = self.findSecondaryIndexRebuildRange(selector) orelse return error.UnknownSecondaryIndexRebuildRange;
         const claimable = std.mem.eql(u8, record.state, secondary_index_rebuild_declared) or
-            (std.mem.eql(u8, record.state, secondary_index_rebuild_building) and record.lease_expires_at_ms != 0 and record.lease_expires_at_ms <= request.now_ms);
+            (std.mem.eql(u8, record.state, secondary_index_rebuild_building) and (record.lease_expires_at_ms == 0 or record.lease_expires_at_ms <= request.now_ms));
         if (!claimable) {
             if (std.mem.eql(u8, record.state, secondary_index_rebuild_building)) return error.SecondaryIndexRebuildRangeClaimBusy;
             return error.SecondaryIndexRebuildRangeNotDeclared;
@@ -2517,6 +2523,21 @@ pub const TableManager = struct {
         if (!std.mem.eql(u8, record.state, secondary_index_rebuild_building)) return error.SecondaryIndexRebuildRangeNotBuilding;
         var updated = record.*;
         updated.state = secondary_index_rebuild_ready;
+        updated.lease_owner = "";
+        updated.lease_expires_at_ms = 0;
+        updated.completed_row_count = request.completed_row_count;
+        updated.progress_row_key = request.progress_row_key;
+        updated.last_error = "";
+        updated.topology_epoch +%= 1;
+        try self.upsertSecondaryIndexRebuildRange(updated);
+    }
+
+    pub fn saveSecondaryIndexRebuildRangeProgress(self: *TableManager, request: SecondaryIndexRebuildRangeProgressRequest) !void {
+        const selector = request.selector;
+        const record = self.findSecondaryIndexRebuildRange(selector) orelse return error.UnknownSecondaryIndexRebuildRange;
+        if (!std.mem.eql(u8, record.state, secondary_index_rebuild_building)) return error.SecondaryIndexRebuildRangeNotBuilding;
+        var updated = record.*;
+        updated.state = secondary_index_rebuild_building;
         updated.lease_owner = "";
         updated.lease_expires_at_ms = 0;
         updated.completed_row_count = request.completed_row_count;
@@ -5723,6 +5744,28 @@ test "table manager applies secondary index rebuild lifecycle operations" {
         try std.testing.expectEqualStrings("worker-b", ranges[0].lease_owner);
         try std.testing.expectEqual(@as(u64, 2000), ranges[0].lease_expires_at_ms);
         try std.testing.expectEqual(@as(u32, 2), ranges[0].attempts);
+    }
+
+    try manager.saveSecondaryIndexRebuildRangeProgress(.{ .selector = selector, .completed_row_count = 5, .progress_row_key = "order:m" });
+    {
+        const ranges = try manager.listSecondaryIndexRebuildRanges(std.testing.allocator);
+        defer manager.freeSecondaryIndexRebuildRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqualStrings(secondary_index_rebuild_building, ranges[0].state);
+        try std.testing.expectEqualStrings("", ranges[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 0), ranges[0].lease_expires_at_ms);
+        try std.testing.expectEqual(@as(u64, 5), ranges[0].completed_row_count);
+        try std.testing.expectEqualStrings("order:m", ranges[0].progress_row_key);
+    }
+    try manager.beginSecondaryIndexRebuildRange(.{ .selector = selector, .lease_owner = "worker-c", .now_ms = 2001, .lease_expires_at_ms = 3000 });
+    {
+        const ranges = try manager.listSecondaryIndexRebuildRanges(std.testing.allocator);
+        defer manager.freeSecondaryIndexRebuildRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqualStrings(secondary_index_rebuild_building, ranges[0].state);
+        try std.testing.expectEqualStrings("worker-c", ranges[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 3000), ranges[0].lease_expires_at_ms);
+        try std.testing.expectEqual(@as(u32, 3), ranges[0].attempts);
+        try std.testing.expectEqual(@as(u64, 5), ranges[0].completed_row_count);
+        try std.testing.expectEqualStrings("order:m", ranges[0].progress_row_key);
     }
 
     try manager.finishSecondaryIndexRebuildRange(.{ .selector = selector, .completed_row_count = 17, .progress_row_key = "order:z" });

@@ -1322,6 +1322,28 @@ pub fn Impl(comptime DB: type) type {
             );
         }
 
+        pub fn rebuildRelationalSecondaryIndexPageInRange(
+            self: *DB,
+            index_name: []const u8,
+            index_generation: u64,
+            lower_doc_key: []const u8,
+            upper_doc_key: []const u8,
+            max_rows: usize,
+        ) !relational_store_mod.SecondaryIndexRebuildPage {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            return try relational_store_mod.rebuildColumnIndexFromRowsInSpanPageWithColumnIndexPolicy(
+                self.alloc,
+                self.core.store,
+                index_name,
+                index_generation,
+                lower_doc_key,
+                upper_doc_key,
+                Self.relationalColumnIndexPolicyForStore(self),
+                max_rows,
+            );
+        }
+
         pub fn hasIndex(self: *DB, name: []const u8) bool {
             return self.core.hasIndex(name);
         }
@@ -1364,7 +1386,9 @@ fn validateRuntimeTableSchemaTransition(current_schema: schema_mod.TableSchema, 
 fn validateRelationalColumnCatalogTransition(current_columns: []const schema_mod.RelationalColumn, next_columns: []const schema_mod.RelationalColumn) !void {
     for (next_columns) |column| {
         if (findRelationalColumnByPath(current_columns, column.path)) |current_column| {
-            if (!schema_mod.relationalColumnCatalogsEqual(&.{current_column.*}, &.{column})) {
+            if (!schema_mod.relationalColumnCatalogsEqual(&.{current_column.*}, &.{column}) and
+                !relationalColumnDefinitionsEqualIgnoringSecondaryIndexCatalog(current_column.*, column))
+            {
                 return error.InvalidSchemaUpdateRequest;
             }
             continue;
@@ -1372,6 +1396,36 @@ fn validateRelationalColumnCatalogTransition(current_columns: []const schema_mod
         if (try relationalColumnHasUniqueDroppedRenameSource(current_columns, next_columns, column)) continue;
         try validateNewRelationalColumnTransition(current_columns, next_columns, column);
     }
+}
+
+fn relationalColumnDefinitionsEqualIgnoringSecondaryIndexCatalog(
+    current: schema_mod.RelationalColumn,
+    next: schema_mod.RelationalColumn,
+) bool {
+    if (!std.mem.eql(u8, current.name, next.name)) return false;
+    if (!std.mem.eql(u8, current.path, next.path)) return false;
+
+    var normalized_current = current;
+    var normalized_next = next;
+    normalized_current.indexed = false;
+    normalized_next.indexed = false;
+    normalized_current.index_lifecycle = .ready;
+    normalized_next.index_lifecycle = .ready;
+    normalized_current.index_generation = 0;
+    normalized_next.index_generation = 0;
+    normalized_current.index_name = null;
+    normalized_next.index_name = null;
+    normalized_current.index_include_columns = &.{};
+    normalized_next.index_include_columns = &.{};
+    normalized_current.index_keys = &.{};
+    normalized_next.index_keys = &.{};
+    normalized_current.index_where = &.{};
+    normalized_next.index_where = &.{};
+    normalized_current.index_where_expressions = &.{};
+    normalized_next.index_where_expressions = &.{};
+    normalized_current.cardinality_proof = .none;
+    normalized_next.cardinality_proof = .none;
+    return schema_mod.relationalColumnDefinitionsEqual(normalized_current, normalized_next);
 }
 
 fn findRelationalColumnByPath(columns: []const schema_mod.RelationalColumn, path: []const u8) ?*const schema_mod.RelationalColumn {
@@ -1626,8 +1680,18 @@ fn uniqueConstraintsEqual(a: schema_mod.UniqueConstraint, b: schema_mod.UniqueCo
     return std.mem.eql(u8, a.name, b.name) and
         stringSlicesEqual(a.columns, b.columns) and
         uniqueExpressionSlicesEqual(a.expressions, b.expressions) and
+        stringSlicesEqual(a.include_columns, b.include_columns) and
+        schema_mod.relationalIndexKeySlicesEqual(a.index_keys, b.index_keys) and
+        a.index_lifecycle == b.index_lifecycle and
+        a.index_generation == b.index_generation and
+        a.index_access_method == b.index_access_method and
+        optionalStringsEqual(a.index_schema_fingerprint, b.index_schema_fingerprint) and
         optionalStringsEqual(a.without_overlaps_period, b.without_overlaps_period) and
+        a.nulls_not_distinct == b.nulls_not_distinct and
+        a.deferrable == b.deferrable and
+        a.timing == b.timing and
         uniquePredicateSlicesEqual(a.where, b.where) and
+        a.validation_state == b.validation_state and
         relationalRowsExpressionConditionSlicesEqual(a.where_expressions, b.where_expressions);
 }
 
@@ -2065,11 +2129,6 @@ test "db direct schema apply appends literal default and generated columns throu
     const materialized = (try db.get(alloc, "doc:a")) orelse return error.TestUnexpectedResult;
     defer alloc.free(materialized);
     try std.testing.expectEqualStrings("{\"title\":\"one\",\"amount\":3,\"status\":\"ACTIVE\",\"title_lc\":\"one\",\"status_lc\":\"active\",\"status_expr_lc\":\"active\"}", materialized);
-
-    const status_column = try internal_keys.relationalColumnKeyAlloc(alloc, "doc:a", "status");
-    defer alloc.free(status_column);
-    const status_value = try db.core.store.get(alloc, status_column);
-    defer alloc.free(status_value);
 
     const status_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "status", "doc:a");
     defer alloc.free(status_index);

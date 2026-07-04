@@ -20751,6 +20751,7 @@ test "api.table_writes.docid provisioned secondary index rebuild worker pass rep
                     .free_admin_snapshot = freeAdminSnapshot,
                     .begin_secondary_index_rebuild_range = beginSecondaryIndexRebuildRange,
                     .finish_secondary_index_rebuild_range = finishSecondaryIndexRebuildRange,
+                    .save_secondary_index_rebuild_range_progress = saveSecondaryIndexRebuildRangeProgress,
                     .invalidate_secondary_index_rebuild_range = invalidateSecondaryIndexRebuildRange,
                     .promote_secondary_index_ready = promoteSecondaryIndexReady,
                 },
@@ -20793,6 +20794,16 @@ test "api.table_writes.docid provisioned secondary index rebuild worker pass rep
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!self.selectorMatches(request.selector)) return error.SecondaryIndexRebuildRangeNotFound;
             self.rebuild.state = metadata_table_manager.secondary_index_rebuild_ready;
+            self.rebuild.completed_row_count = request.completed_row_count;
+            self.rebuild.progress_row_key = request.progress_row_key;
+        }
+
+        fn saveSecondaryIndexRebuildRangeProgress(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeProgressRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.selectorMatches(request.selector)) return error.SecondaryIndexRebuildRangeNotFound;
+            self.rebuild.state = metadata_table_manager.secondary_index_rebuild_building;
+            self.rebuild.lease_owner = "";
+            self.rebuild.lease_expires_at_ms = 0;
             self.rebuild.completed_row_count = request.completed_row_count;
             self.rebuild.progress_row_key = request.progress_row_key;
         }

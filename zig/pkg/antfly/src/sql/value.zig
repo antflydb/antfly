@@ -1008,8 +1008,20 @@ pub fn validateDefaultValueForColumnAlloc(
         .sequence_next => {
             if (column.field_type != .numeric) return error.UnsupportedSqlShape;
         },
+        .scalar_subquery => try validateScalarSubqueryDefaultForColumnAlloc(alloc, default_value.value_json),
         .literal => try validateLiteralDefaultForColumnAlloc(alloc, column, default_value.value_json),
     }
+}
+
+fn validateScalarSubqueryDefaultForColumnAlloc(
+    alloc: std.mem.Allocator,
+    value_json: []const u8,
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.UnsupportedSqlShape;
+    const query_value = parsed.value.object.get("query") orelse return error.UnsupportedSqlShape;
+    if (query_value != .object) return error.UnsupportedSqlShape;
 }
 
 fn validateLiteralDefaultForColumnAlloc(

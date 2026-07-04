@@ -17,6 +17,7 @@ const std = @import("std");
 const metadata_api = @import("../../metadata/api.zig");
 const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const db_mod = @import("../../storage/db/mod.zig");
+const relational_row_codec = @import("../../storage/db/algebraic/relational_row_codec.zig");
 const schema_mod = @import("../../schema/mod.zig");
 const relational_rows_api = @import("../../sql/relational_rows.zig");
 const storage_schema = @import("../../storage/schema.zig");
@@ -26,6 +27,8 @@ const tables_api = @import("../../metadata/catalog/table_ddl.zig");
 const table_write_relational_mutation = @import("relational_mutation.zig");
 
 const mutateRowsFromSourceAutocommitOnDb = table_write_relational_mutation.mutateRowsFromSourceAutocommitOnDb;
+
+const default_secondary_index_rebuild_rows_per_range: usize = 1024;
 
 pub const SecondaryIndexRebuildWorkerResult = struct {
     group_id: u64,
@@ -156,7 +159,28 @@ pub fn runSecondaryIndexRebuildRangeGroupLocal(
     now_ms: u64,
     lease_ms: u64,
 ) !SecondaryIndexRebuildWorkerResult {
+    return try runSecondaryIndexRebuildRangeGroupLocalBounded(
+        db,
+        metadata,
+        record,
+        worker_id,
+        now_ms,
+        lease_ms,
+        default_secondary_index_rebuild_rows_per_range,
+    );
+}
+
+fn runSecondaryIndexRebuildRangeGroupLocalBounded(
+    db: *db_mod.DB,
+    metadata: anytype,
+    record: metadata_table_manager.SecondaryIndexRebuildRangeRecord,
+    worker_id: []const u8,
+    now_ms: u64,
+    lease_ms: u64,
+    max_rows: usize,
+) !SecondaryIndexRebuildWorkerResult {
     if (worker_id.len == 0 or lease_ms == 0) return error.InvalidSecondaryIndexRebuildRequest;
+    if (max_rows == 0) return error.InvalidSecondaryIndexRebuildRequest;
     const selector: metadata_table_manager.SecondaryIndexRebuildRangeSelector = .{
         .table_id = record.table_id,
         .index_name = record.index_name,
@@ -190,12 +214,14 @@ pub fn runSecondaryIndexRebuildRangeGroupLocal(
         return error.TopologyChanged;
     }
 
+    const lower = if (record.progress_row_key.len > 0) record.progress_row_key else record.start_row_key;
     const upper = record.end_row_key orelse "";
-    result.report = db.rebuildRelationalSecondaryIndexInRange(
+    var page = db.rebuildRelationalSecondaryIndexPageInRange(
         record.index_name,
         record.index_generation,
-        record.start_row_key,
+        lower,
         upper,
+        max_rows,
     ) catch |err| {
         metadata.invalidateSecondaryIndexRebuildRange(.{
             .selector = selector,
@@ -204,9 +230,20 @@ pub fn runSecondaryIndexRebuildRangeGroupLocal(
         result.invalidated = true;
         return err;
     };
+    defer page.deinit(db.alloc);
+    result.report = page.report;
+    const completed_row_count = record.completed_row_count + page.report.scanned_rows;
+    if (!page.complete) {
+        try metadata.saveSecondaryIndexRebuildRangeProgress(.{
+            .selector = selector,
+            .completed_row_count = completed_row_count,
+            .progress_row_key = page.next_start_doc_key,
+        });
+        return result;
+    }
     try metadata.finishSecondaryIndexRebuildRange(.{
         .selector = selector,
-        .completed_row_count = result.report.scanned_rows,
+        .completed_row_count = completed_row_count,
         .progress_row_key = upper,
     });
     result.completed = true;
@@ -324,11 +361,12 @@ pub fn promoteReadySecondaryIndexesForCatalog(
         if (!column.indexed) continue;
         if (column.index_lifecycle != .building) continue;
         if (column.index_generation == 0) continue;
-        if (!secondaryIndexReadyForPromotion(&snapshot, table.table_id, column.name, column.index_generation)) continue;
+        const index_name = column.index_name orelse column.name;
+        if (!secondaryIndexReadyForPromotion(&snapshot, table.table_id, index_name, column.index_generation)) continue;
         const did_promote = catalog.promoteSecondaryIndexReady(
             alloc,
             table_name,
-            column.name,
+            index_name,
             column.index_generation,
         ) catch |err| switch (err) {
             error.UnsupportedOperation => false,
@@ -1121,6 +1159,265 @@ test "secondary index rebuild worker helper claims repairs and finishes range" {
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, inactive_amount_key));
 }
 
+test "secondary index rebuild worker saves bounded progress and resumes range" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/secondary-index-rebuild-worker-resume", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+
+    const building_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index-lifecycle":"building","x-antfly-index-generation":9},"status":{"type":"keyword"}},"required":["id","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    try db.applyTableSchemaJson(alloc, building_schema_json, .{});
+    try db.batch(.{ .writes = &.{
+        .{ .key = "row:a", .value = "{\"id\":\"a\",\"amount\":1,\"status\":\"open\"}" },
+        .{ .key = "row:b", .value = "{\"id\":\"b\",\"amount\":2,\"status\":\"open\"}" },
+    } });
+
+    const row_a_amount_key = try db_mod.internal_keys.relationalColumnIndexKeyAlloc(alloc, "amount", "row:a");
+    defer alloc.free(row_a_amount_key);
+    const row_b_amount_key = try db_mod.internal_keys.relationalColumnIndexKeyAlloc(alloc, "amount", "row:b");
+    defer alloc.free(row_b_amount_key);
+    try db.core.store.putBatch(&.{}, &.{ row_a_amount_key, row_b_amount_key });
+
+    var manager = metadata_table_manager.TableManager.init(alloc);
+    defer manager.deinit();
+    try manager.upsertTable(.{ .table_id = 77, .name = "orders", .schema_json = building_schema_json });
+    try manager.upsertSecondaryIndexRebuildRange(.{
+        .table_id = 77,
+        .index_name = "amount",
+        .index_generation = 9,
+        .start_row_key = "",
+        .end_row_key = null,
+        .group_id = 9001,
+    });
+
+    const initial_records = try manager.listSecondaryIndexRebuildRanges(alloc);
+    defer manager.freeSecondaryIndexRebuildRanges(alloc, initial_records);
+    try std.testing.expectEqual(@as(usize, 1), initial_records.len);
+
+    const first = try runSecondaryIndexRebuildRangeGroupLocalBounded(&db, &manager, initial_records[0], "worker-a", 1000, 500, 1);
+    try std.testing.expect(first.claimed);
+    try std.testing.expect(!first.completed);
+    try std.testing.expect(!first.invalidated);
+    try std.testing.expectEqual(@as(u64, 1), first.report.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 1), first.report.indexed_rows);
+
+    const progress_records = try manager.listSecondaryIndexRebuildRanges(alloc);
+    defer manager.freeSecondaryIndexRebuildRanges(alloc, progress_records);
+    try std.testing.expectEqualStrings(metadata_table_manager.secondary_index_rebuild_building, progress_records[0].state);
+    try std.testing.expectEqual(@as(u64, 1), progress_records[0].completed_row_count);
+    try std.testing.expectEqualStrings("row:b", progress_records[0].progress_row_key);
+    try std.testing.expectEqualStrings("", progress_records[0].lease_owner);
+    const row_a_index_value = try db.core.store.get(alloc, row_a_amount_key);
+    defer alloc.free(row_a_index_value);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, row_b_amount_key));
+
+    const second = try runSecondaryIndexRebuildRangeGroupLocalBounded(&db, &manager, progress_records[0], "worker-b", 2000, 500, 1);
+    try std.testing.expect(second.claimed);
+    try std.testing.expect(second.completed);
+    try std.testing.expect(!second.invalidated);
+    try std.testing.expectEqual(@as(u64, 1), second.report.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 1), second.report.indexed_rows);
+
+    const final_records = try manager.listSecondaryIndexRebuildRanges(alloc);
+    defer manager.freeSecondaryIndexRebuildRanges(alloc, final_records);
+    try std.testing.expectEqualStrings(metadata_table_manager.secondary_index_rebuild_ready, final_records[0].state);
+    try std.testing.expectEqual(@as(u64, 2), final_records[0].completed_row_count);
+    try std.testing.expectEqualStrings("", final_records[0].progress_row_key);
+    const row_b_index_value = try db.core.store.get(alloc, row_b_amount_key);
+    defer alloc.free(row_b_index_value);
+}
+
+test "secondary index rebuild worker rebuilds ordered tuple index in bounded pages" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/secondary-index-ordered-tuple-rebuild-worker", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+
+    const building_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"orders_status_amount_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-lifecycle":"building","x-antfly-index-generation":9,"x-antfly-index-schema-fingerprint":"secondary-index-v1:status_amount","x-antfly-index-keys":[{"column":"status"},{"column":"amount"}],"x-antfly-index-include":["note"],"x-antfly-index-where":{"all":[{"field":"status","op":"eq","value":"active"}]}},"amount":{"type":"numeric"},"note":{"type":"keyword"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    try db.applyTableSchemaJson(alloc, building_schema_json, .{});
+    var parsed_schema = try schema_mod.parseValidatedTableSchema(alloc, building_schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+
+    const active_json = "{\"id\":\"a\",\"status\":\"active\",\"amount\":1,\"note\":\"keep\"}";
+    const inactive_json = "{\"id\":\"b\",\"status\":\"inactive\",\"amount\":2,\"note\":\"drop\"}";
+    try db.batch(.{ .writes = &.{
+        .{ .key = "row:a", .value = active_json },
+        .{ .key = "row:b", .value = inactive_json },
+    } });
+
+    const active_row = try db_mod.relational_store.getRawAlloc(alloc, db.core.store, "row:a") orelse return error.TestUnexpectedResult;
+    defer alloc.free(active_row);
+    const inactive_row = try db_mod.relational_store.getRawAlloc(alloc, db.core.store, "row:b") orelse return error.TestUnexpectedResult;
+    defer alloc.free(inactive_row);
+    const index_column = blk: {
+        for (runtime_schema.relational_columns) |column| {
+            if (std.mem.eql(u8, column.name, "status")) break :blk column;
+        }
+        return error.TestUnexpectedResult;
+    };
+    const active_tuple = try db_mod.relational_store.orderedTupleValueForIndexKeysAlloc(alloc, active_row, index_column.index_keys, runtime_schema.relational_columns);
+    defer alloc.free(active_tuple);
+    const inactive_tuple = try db_mod.relational_store.orderedTupleValueForIndexKeysAlloc(alloc, inactive_row, index_column.index_keys, runtime_schema.relational_columns);
+    defer alloc.free(inactive_tuple);
+    const active_forward_key = try db_mod.internal_keys.relationalOrderedTupleIndexKeyAlloc(alloc, "orders_status_amount_idx", active_tuple, "row:a");
+    defer alloc.free(active_forward_key);
+    const inactive_forward_key = try db_mod.internal_keys.relationalOrderedTupleIndexKeyAlloc(alloc, "orders_status_amount_idx", inactive_tuple, "row:b");
+    defer alloc.free(inactive_forward_key);
+    const inactive_reverse_key = try db_mod.internal_keys.relationalOrderedTupleIndexByDocKeyAlloc(alloc, "row:b", "orders_status_amount_idx", inactive_tuple);
+    defer alloc.free(inactive_reverse_key);
+    try db.core.store.put(inactive_forward_key, "");
+    try db.core.store.put(inactive_reverse_key, "");
+    const inactive_stale_before = try db.core.store.get(alloc, inactive_forward_key);
+    defer alloc.free(inactive_stale_before);
+
+    var manager = metadata_table_manager.TableManager.init(alloc);
+    defer manager.deinit();
+    const table = metadata_table_manager.TableRecord{
+        .table_id = 77,
+        .name = "orders",
+        .schema_json = building_schema_json,
+    };
+    const range = metadata_table_manager.RangeRecord{
+        .group_id = 9001,
+        .range_id = 9101,
+        .table_id = table.table_id,
+        .start_key = "",
+        .end_key = null,
+    };
+    try manager.upsertTable(table);
+    try manager.upsertSecondaryIndexRebuildRange(.{
+        .table_id = table.table_id,
+        .index_name = "orders_status_amount_idx",
+        .index_generation = 9,
+        .start_row_key = range.start_key,
+        .end_row_key = range.end_key,
+        .group_id = range.group_id,
+        .range_id = 0,
+    });
+
+    const initial_records = try manager.listSecondaryIndexRebuildRanges(alloc);
+    defer manager.freeSecondaryIndexRebuildRanges(alloc, initial_records);
+    try std.testing.expectEqual(@as(usize, 1), initial_records.len);
+
+    const first = try runSecondaryIndexRebuildRangeGroupLocalBounded(&db, &manager, initial_records[0], "worker-a", 1000, 500, 1);
+    try std.testing.expect(first.claimed);
+    try std.testing.expect(!first.completed);
+    try std.testing.expect(!first.invalidated);
+    try std.testing.expectEqual(@as(u64, 1), first.report.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 1), first.report.indexed_rows);
+    try std.testing.expectEqual(@as(u64, 2), first.report.written_entries);
+    const inactive_stale_after_first = try db.core.store.get(alloc, inactive_forward_key);
+    defer alloc.free(inactive_stale_after_first);
+
+    const progress_records = try manager.listSecondaryIndexRebuildRanges(alloc);
+    defer manager.freeSecondaryIndexRebuildRanges(alloc, progress_records);
+    try std.testing.expectEqualStrings(metadata_table_manager.secondary_index_rebuild_building, progress_records[0].state);
+    try std.testing.expectEqualStrings("row:b", progress_records[0].progress_row_key);
+
+    const second = try runSecondaryIndexRebuildRangeGroupLocalBounded(&db, &manager, progress_records[0], "worker-b", 2000, 500, 1);
+    try std.testing.expect(second.claimed);
+    try std.testing.expect(second.completed);
+    try std.testing.expect(!second.invalidated);
+    try std.testing.expectEqual(@as(u64, 1), second.report.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 0), second.report.indexed_rows);
+    try std.testing.expect(second.report.deleted_entries >= 2);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, inactive_forward_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, inactive_reverse_key));
+
+    const active_payload = try db.core.store.get(alloc, active_forward_key);
+    defer alloc.free(active_payload);
+    try std.testing.expect(active_payload.len > 0);
+    var active_payload_row = try relational_row_codec.deserialize(alloc, active_payload);
+    defer active_payload_row.deinit(alloc);
+    var saw_note = false;
+    for (active_payload_row.cells) |cell| {
+        if (!std.mem.eql(u8, cell.path, "note")) continue;
+        try std.testing.expectEqualStrings("keep", cell.value.bytes_val);
+        saw_note = true;
+    }
+    try std.testing.expect(saw_note);
+
+    const final_records = try manager.listSecondaryIndexRebuildRanges(alloc);
+    defer manager.freeSecondaryIndexRebuildRanges(alloc, final_records);
+    try std.testing.expectEqualStrings(metadata_table_manager.secondary_index_rebuild_ready, final_records[0].state);
+    try std.testing.expectEqual(@as(u64, 2), final_records[0].completed_row_count);
+
+    const Catalog = struct {
+        table: metadata_table_manager.TableRecord,
+        range: metadata_table_manager.RangeRecord,
+        rebuild: metadata_table_manager.SecondaryIndexRebuildRangeRecord,
+        promoted: bool = false,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .promote_secondary_index_ready = promoteSecondaryIndexReady,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = @as([*]metadata_table_manager.RangeRecord, @ptrCast(&self.range))[0..1],
+                .secondary_index_rebuild_ranges = @as([*]metadata_table_manager.SecondaryIndexRebuildRangeRecord, @ptrCast(&self.rebuild))[0..1],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn promoteSecondaryIndexReady(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            expected_generation: u64,
+        ) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("orders", table_name);
+            try std.testing.expectEqualStrings("orders_status_amount_idx", index_name);
+            try std.testing.expectEqual(@as(u64, 9), expected_generation);
+            self.promoted = true;
+            return true;
+        }
+    };
+
+    var catalog = Catalog{
+        .table = table,
+        .range = range,
+        .rebuild = final_records[0],
+    };
+    try std.testing.expectEqual(@as(u64, 1), try promoteReadySecondaryIndexesForCatalog(alloc, catalog.iface(), "orders"));
+    try std.testing.expect(catalog.promoted);
+}
+
 test "secondary index rebuild worker rebuilds and promotes expression generated index" {
     const alloc = std.testing.allocator;
 
@@ -1331,6 +1628,7 @@ test "secondary index rebuild worker invalidates stale range before rebuilding i
                     .free_admin_snapshot = freeAdminSnapshot,
                     .begin_secondary_index_rebuild_range = beginSecondaryIndexRebuildRange,
                     .finish_secondary_index_rebuild_range = finishSecondaryIndexRebuildRange,
+                    .save_secondary_index_rebuild_range_progress = saveSecondaryIndexRebuildRangeProgress,
                     .invalidate_secondary_index_rebuild_range = invalidateSecondaryIndexRebuildRange,
                 },
             };
@@ -1359,6 +1657,11 @@ test "secondary index rebuild worker invalidates stale range before rebuilding i
         fn finishSecondaryIndexRebuildRange(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeFinishRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return try self.manager.finishSecondaryIndexRebuildRange(request);
+        }
+
+        fn saveSecondaryIndexRebuildRangeProgress(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeProgressRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.saveSecondaryIndexRebuildRangeProgress(request);
         }
 
         fn invalidateSecondaryIndexRebuildRange(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeInvalidateRequest) !void {
@@ -2603,6 +2906,7 @@ test "table emptying and secondary index rebuild converge across chaos and reope
                     .invalidate_table_emptying_job = invalidateTableEmptyingJob,
                     .begin_secondary_index_rebuild_range = beginSecondaryIndexRebuildRange,
                     .finish_secondary_index_rebuild_range = finishSecondaryIndexRebuildRange,
+                    .save_secondary_index_rebuild_range_progress = saveSecondaryIndexRebuildRangeProgress,
                     .invalidate_secondary_index_rebuild_range = invalidateSecondaryIndexRebuildRange,
                 },
             };
@@ -2646,6 +2950,11 @@ test "table emptying and secondary index rebuild converge across chaos and reope
         fn finishSecondaryIndexRebuildRange(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeFinishRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return try self.manager.finishSecondaryIndexRebuildRange(request);
+        }
+
+        fn saveSecondaryIndexRebuildRangeProgress(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeProgressRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.saveSecondaryIndexRebuildRangeProgress(request);
         }
 
         fn invalidateSecondaryIndexRebuildRange(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeInvalidateRequest) !void {

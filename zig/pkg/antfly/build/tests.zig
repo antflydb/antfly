@@ -737,6 +737,11 @@ pub const DBTestFilters = struct {
 
     pub const write_path = [_][]const u8{
         "storage.db.write_path.test.",
+        "storage.db.relational_store.test.relational index reserve counts catalog indexes instead of all cells",
+        "storage.db.relational_store.test.relational ordered tuple staging transfers owned buffers without allocation",
+        "storage.db.relational_store.test.relational ordered tuple index maintenance skips unchanged overwrites",
+        "storage.db.relational_store.test.relational ordered tuple index maintenance tracks partial predicate membership",
+        "storage.db.relational_store.test.relational ordered tuple index maintenance respects lifecycle states",
     };
 
     pub const ha_replication = [_][]const u8{

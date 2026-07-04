@@ -88,6 +88,10 @@ pub const DocumentSqlSchema = struct {
     owns_typed_paths: bool = false,
     view_mappings: []const DocumentSqlViewMappingSummary = &.{},
     owns_view_mappings: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        deinitDocumentSqlSchema(alloc, self);
+    }
 };
 
 pub const DocumentSqlFullTextIndex = struct {
@@ -121,6 +125,10 @@ pub const DocumentSqlCapabilities = struct {
     owns_graph_metric_index_names: bool = false,
     algebraic_aggregates: bool = false,
     bounded_scan: ?BoundedScanPolicy = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        deinitDocumentSqlCapabilities(alloc, self);
+    }
 };
 
 pub fn documentSqlSourceSchemaFingerprintAlloc(alloc: std.mem.Allocator, schema_json: []const u8) ![]u8 {
@@ -1195,6 +1203,7 @@ fn documentSqlFieldTypeFromTypedPathTypeName(type_name: []const u8) ?runtime_sch
     if (std.mem.eql(u8, type_name, "numeric")) return .numeric;
     if (std.mem.eql(u8, type_name, "boolean")) return .boolean;
     if (std.mem.eql(u8, type_name, "datetime")) return .datetime;
+    if (std.mem.eql(u8, type_name, "json")) return .json;
     if (std.mem.eql(u8, type_name, "array")) return .array;
     return null;
 }

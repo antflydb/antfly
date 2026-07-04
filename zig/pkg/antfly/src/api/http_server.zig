@@ -554,6 +554,77 @@ const RowsSequenceDefaultResolverContext = struct {
     }
 };
 
+const RowsScalarSubqueryDefaultResolverContext = struct {
+    source: StatusSource,
+    table_reads: table_reads.TableReadSource,
+
+    fn resolver(self: *@This()) relational_rows_api.ScalarSubqueryDefaultResolver {
+        return .{
+            .ptr = self,
+            .value_json_alloc = valueJsonAlloc,
+        };
+    }
+
+    fn valueJsonAlloc(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        request: relational_rows_api.ScalarSubqueryDefaultRequest,
+    ) ![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var plan = try relational_rows_api.scalarSubqueryDefaultPlanFromQueryJsonAlloc(alloc, request.query_json);
+        defer plan.deinit(alloc);
+
+        const schema = try runtimeSchemaForScalarSubqueryDefaultAlloc(alloc, self.source, plan.table_name);
+        defer runtime_schema_mod.freeSchema(alloc, schema);
+
+        var result = (try self.table_reads.rowsQueryPlan(
+            alloc,
+            plan.table_name,
+            schema,
+            .{ .query = plan.query },
+            .read_index,
+        )) orelse return error.TableNotFound;
+        defer result.deinit(alloc);
+
+        if (result.rows.len > 1) return error.InvalidRowsRequest;
+        if (result.rows.len == 0) return try alloc.dupe(u8, "null");
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, result.rows[0], .{}) catch return error.InvalidRowsRequest;
+        defer parsed.deinit();
+        const value = scalarDefaultJsonValueAtPath(parsed.value, plan.output_field) orelse return try alloc.dupe(u8, "null");
+        return try std.json.Stringify.valueAlloc(alloc, value.*, .{});
+    }
+};
+
+fn runtimeSchemaForScalarSubqueryDefaultAlloc(
+    alloc: std.mem.Allocator,
+    source: StatusSource,
+    table_name: []const u8,
+) !runtime_schema_mod.TableSchema {
+    var snapshot = (try source.adminSnapshot()) orelse return error.TableNotFound;
+    defer source.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    if (table.schema_json.len == 0) return error.InvalidRowsRequest;
+    var parsed_schema = schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch return error.InvalidRowsRequest;
+    defer parsed_schema.deinit(alloc);
+    const derived_schema = schema_mod.deriveRuntimeTableSchema(alloc, parsed_schema) catch return error.InvalidRowsRequest;
+    if (derived_schema.storage_mode != .relational or derived_schema.primary_key == null) {
+        runtime_schema_mod.freeSchema(alloc, derived_schema);
+        return error.InvalidRowsRequest;
+    }
+    return derived_schema;
+}
+
+fn scalarDefaultJsonValueAtPath(root: std.json.Value, path: []const u8) ?*const std.json.Value {
+    if (root != .object) return null;
+    var current: *const std.json.Value = &root;
+    var parts = std.mem.splitScalar(u8, path, '.');
+    while (parts.next()) |part| {
+        if (part.len == 0 or current.* != .object) return null;
+        current = current.object.getPtr(part) orelse return null;
+    }
+    return current;
+}
+
 pub const RequestForwarder = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -4949,6 +5020,26 @@ pub const ApiHttpServer = struct {
         return try sql_transactions.applyTransactionModePlanToSession(self.alloc, session, plan);
     }
 
+    fn applyTransactionBoundaryPlanToSession(
+        self: *ApiHttpServer,
+        session: *sql_adapter.OwnedSqlCatalogSession,
+        plan: sql_adapter.TransactionBoundaryPlan,
+    ) !void {
+        switch (plan.action) {
+            .begin => {
+                session.in_sql_transaction = true;
+                session.sql_transaction_failed = false;
+            },
+            .commit, .rollback => {
+                if (session.notification_session_id != 0) {
+                    try self.sql_cursor_runtime.closeTransactionPortals(session.notification_session_id);
+                    self.sql_savepoint_runtime.clear(session.notification_session_id);
+                }
+                try session.clearTransactionLocalState(self.alloc);
+            },
+        }
+    }
+
     pub fn applyRelationalSqlDdlWithSession(self: *ApiHttpServer, sql: []const u8, session: *sql_adapter.OwnedSqlCatalogSession) !tables_api.AppliedRelationalSqlDdlRecord {
         var parsed_sql = try sql_adapter.ParsedSql.initAlloc(self.alloc, sql);
         defer parsed_sql.deinit(self.alloc);
@@ -5151,6 +5242,12 @@ pub const ApiHttpServer = struct {
         try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
 
         switch (plan) {
+            .boundary => |boundary| {
+                try self.applyTransactionBoundaryPlanToSession(session, boundary);
+                var applied = try self.emptyAppliedSqlDdlRecordWithTiming(timing);
+                applied.noop = true;
+                return applied;
+            },
             .control => |control| {
                 if (try self.publicSqlReadOnlyActive(session)) {
                     if (!try self.transactionControlPlanAllowedInReadOnly(control)) return error.SqlReadOnlyTransaction;
@@ -5943,6 +6040,7 @@ pub const ApiHttpServer = struct {
             .catalog_write => |*write| {
                 write.options.unique_resolver = null;
                 write.options.default_context.sequence_resolver = null;
+                write.options.default_context.scalar_subquery_resolver = null;
             },
             else => {},
         }
@@ -6353,31 +6451,14 @@ pub const ApiHttpServer = struct {
         defer if (filter) |*value| value.deinit(self.alloc);
         if (filter) |active| {
             for (@constCast(lowered.ctes)) |*cte| try self.applyRowsAuthFilterToQuery(source_schema, active, &cte.query);
-            if (lowered.insert_source.req.source.source_cte.len == 0) try self.applyRowsAuthFilterToQuery(source_schema, active, &lowered.insert_source.req.source);
+            if (lowered.literal_source_rows.len == 0) {
+                if (lowered.insert_source.req.source.source_cte.len == 0) try self.applyRowsAuthFilterToQuery(source_schema, active, &lowered.insert_source.req.source);
+            } else {
+                for (@constCast(lowered.insert_source.req.source.scalar_subqueries)) |*projection| {
+                    try self.applyRowsAuthFilterToQuery(source_schema, active, &projection.query);
+                }
+            }
         }
-
-        var source_result = (read_source.rowsQueryPlan(
-            self.alloc,
-            source_table_name,
-            source_schema,
-            .{
-                .ctes = lowered.ctes,
-                .query = lowered.insert_source.req.source,
-            },
-            .read_index,
-        ) catch |err| switch (err) {
-            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
-            error.RelationalRowsCteSpillRequired => return .{ .failure = try textResponse(self.alloc, 429, "sql write backpressured") },
-            error.UnsupportedOperation, error.UnsupportedRowsQuery => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
-            error.TableNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
-            error.TopologyChanged => return .{ .failure = try textResponse(self.alloc, 503, "topology changed") },
-            error.LeaderUnavailable, error.ReadUnavailable => return .{ .failure = try textResponse(self.alloc, 503, "read unavailable") },
-            else => {
-                std.log.err("public sql insert source read failed table={s} source={s} err={}", .{ target_table_name, source_table_name, err });
-                return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
-            },
-        }) orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
-        defer source_result.deinit(self.alloc);
 
         const planned_ctes = relational_rows_api.planRowsCteOutputsAlloc(self.alloc, source_schema, lowered.ctes) catch |err| switch (err) {
             error.InvalidRowsRequest => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
@@ -6388,30 +6469,353 @@ pub const ApiHttpServer = struct {
 
         var unique_resolver_ctx = RowsUniqueSelectorResolverContext{ .source = self.table_reads };
         var sequence_resolver_ctx = RowsSequenceDefaultResolverContext{ .source = self.source };
-        var rows_batch = relational_rows_api.buildRowsInsertSourceBatchWithSchemasAndDefaultContextAlloc(
-            self.alloc,
-            target_table_name,
-            target_schema,
-            effective_source_schema,
-            lowered.insert_source.req,
-            source_result.rows,
-            unique_resolver_ctx.resolver(),
-            .{ .sequence_resolver = sequence_resolver_ctx.resolver() },
-        ) catch |err| switch (err) {
-            error.UnsupportedRowsSelector => return .{ .failure = try textResponse(self.alloc, 400, "unsupported rows selector") },
-            error.RowSelectorNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
-            error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return .{ .failure = try textResponse(self.alloc, 503, "unique owner unavailable") },
-            error.InvalidRowsRequest, error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation, error.SequenceNotFound => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
-            else => {
-                std.log.err("public sql insert source plan failed table={s} source={s} err={}", .{ target_table_name, source_table_name, err });
-                return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
-            },
+        var scalar_default_resolver_ctx = RowsScalarSubqueryDefaultResolverContext{ .source = self.source, .table_reads = read_source };
+        const default_context = relational_rows_api.DefaultValueContext{
+            .sequence_resolver = sequence_resolver_ctx.resolver(),
+            .scalar_subquery_resolver = scalar_default_resolver_ctx.resolver(),
+        };
+        var matched_len: usize = 0;
+        var rows_batch: relational_rows_api.OwnedRowsBatchRequest = if (lowered.literal_source_rows.len != 0) literal_blk: {
+            if (lowered.ctes.len != 0) return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") };
+            matched_len = lowered.literal_source_rows.len;
+            break :literal_blk self.buildPublicSqlLiteralInsertSourceRowsBatchAlloc(
+                read_source,
+                target_table_name,
+                target_schema,
+                source_table_name,
+                effective_source_schema,
+                lowered.insert_source.req,
+                lowered.literal_source_rows,
+                lowered.literal_source_row_scalar_subqueries,
+                unique_resolver_ctx.resolver(),
+                default_context,
+            ) catch |err| switch (err) {
+                error.UnsupportedRowsSelector => return .{ .failure = try textResponse(self.alloc, 400, "unsupported rows selector") },
+                error.RowSelectorNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
+                error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return .{ .failure = try textResponse(self.alloc, 503, "unique owner unavailable") },
+                error.InvalidRowsRequest, error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation, error.SequenceNotFound, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
+                error.RelationalRowsCteSpillRequired => return .{ .failure = try textResponse(self.alloc, 429, "sql write backpressured") },
+                error.UnsupportedOperation, error.UnsupportedRowsQuery, error.UnsupportedSqlShape => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
+                error.TableNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
+                error.LeaderUnavailable, error.ReadUnavailable => return .{ .failure = try textResponse(self.alloc, 503, "read unavailable") },
+                else => {
+                    std.log.err("public sql literal insert source plan failed table={s} source={s} err={}", .{ target_table_name, source_table_name, err });
+                    return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
+                },
+            };
+        } else table_blk: {
+            var source_result = (read_source.rowsQueryPlan(
+                self.alloc,
+                source_table_name,
+                source_schema,
+                .{
+                    .ctes = lowered.ctes,
+                    .query = lowered.insert_source.req.source,
+                },
+                .read_index,
+            ) catch |err| switch (err) {
+                error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
+                error.RelationalRowsCteSpillRequired => return .{ .failure = try textResponse(self.alloc, 429, "sql write backpressured") },
+                error.UnsupportedOperation, error.UnsupportedRowsQuery => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
+                error.TableNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
+                error.TopologyChanged => return .{ .failure = try textResponse(self.alloc, 503, "topology changed") },
+                error.LeaderUnavailable, error.ReadUnavailable => return .{ .failure = try textResponse(self.alloc, 503, "read unavailable") },
+                else => {
+                    std.log.err("public sql insert source read failed table={s} source={s} err={}", .{ target_table_name, source_table_name, err });
+                    return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
+                },
+            }) orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+            defer source_result.deinit(self.alloc);
+            matched_len = source_result.rows.len;
+            break :table_blk relational_rows_api.buildRowsInsertSourceBatchWithSchemasAndDefaultContextAlloc(
+                self.alloc,
+                target_table_name,
+                target_schema,
+                effective_source_schema,
+                lowered.insert_source.req,
+                source_result.rows,
+                unique_resolver_ctx.resolver(),
+                default_context,
+            ) catch |err| switch (err) {
+                error.UnsupportedRowsSelector => return .{ .failure = try textResponse(self.alloc, 400, "unsupported rows selector") },
+                error.RowSelectorNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
+                error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return .{ .failure = try textResponse(self.alloc, 503, "unique owner unavailable") },
+                error.InvalidRowsRequest, error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation, error.SequenceNotFound => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
+                else => {
+                    std.log.err("public sql insert source plan failed table={s} source={s} err={}", .{ target_table_name, source_table_name, err });
+                    return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
+                },
+            };
         };
         defer rows_batch.deinit(self.alloc);
         rows_batch.req.sync_level = lowered.sync_level;
 
         if (try self.applyLoweredPublicSqlRowsBatch(target_table_name, target_schema, &rows_batch, authenticated_identity)) |failure| return .{ .failure = failure };
-        return .{ .result = try rowsInsertSourceMutationResultAlloc(self.alloc, source_result.rows.len, rows_batch) };
+        return .{ .result = try rowsInsertSourceMutationResultAlloc(self.alloc, matched_len, rows_batch) };
+    }
+
+    fn buildPublicSqlLiteralInsertSourceRowsBatchAlloc(
+        self: *ApiHttpServer,
+        read_source: table_reads.TableReadSource,
+        target_table_name: []const u8,
+        target_schema: runtime_schema_mod.TableSchema,
+        source_table_name: []const u8,
+        source_schema: runtime_schema_mod.TableSchema,
+        req: db_mod.types.RelationalRowsInsertSourceRequest,
+        literal_source_rows: []const []const u8,
+        literal_source_row_scalar_subqueries: []const []const db_mod.types.RelationalRowsScalarSubqueryProjection,
+        unique_resolver: ?relational_rows_api.UniqueSelectorResolver,
+        default_context: relational_rows_api.DefaultValueContext,
+    ) !relational_rows_api.OwnedRowsBatchRequest {
+        if (literal_source_rows.len == 0) return error.InvalidRowsRequest;
+        if (req.source.source_cte.len != 0) return error.InvalidRowsRequest;
+        if (literal_source_row_scalar_subqueries.len != 0 and literal_source_row_scalar_subqueries.len != literal_source_rows.len) return error.InvalidRowsRequest;
+
+        const materialized_rows = try self.literalInsertSourceRowsWithScalarSubqueriesAlloc(
+            read_source,
+            source_table_name,
+            source_schema,
+            req.source.scalar_subqueries,
+            literal_source_row_scalar_subqueries,
+            literal_source_rows,
+        );
+        defer freeStringSlice(self.alloc, materialized_rows);
+
+        return try relational_rows_api.buildRowsInsertSourceBatchWithSchemasAndDefaultContextAlloc(
+            self.alloc,
+            target_table_name,
+            target_schema,
+            source_schema,
+            req,
+            materialized_rows,
+            unique_resolver,
+            default_context,
+        );
+    }
+
+    fn literalInsertSourceRowsWithScalarSubqueriesAlloc(
+        self: *ApiHttpServer,
+        read_source: table_reads.TableReadSource,
+        source_table_name: []const u8,
+        source_schema: runtime_schema_mod.TableSchema,
+        scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
+        row_scalar_subqueries: []const []const db_mod.types.RelationalRowsScalarSubqueryProjection,
+        literal_source_rows: []const []const u8,
+    ) ![]const []const u8 {
+        const rows = try self.alloc.alloc([]const u8, literal_source_rows.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (rows[0..initialized]) |row| self.alloc.free(row);
+            self.alloc.free(rows);
+        }
+
+        for (literal_source_rows, 0..) |row_json, i| {
+            const effective_scalar_subqueries = if (row_scalar_subqueries.len != 0 and row_scalar_subqueries[i].len != 0) row_scalar_subqueries[i] else scalar_subqueries;
+            rows[i] = if (!httpHiddenScalarSubqueriesPresent(effective_scalar_subqueries))
+                try self.alloc.dupe(u8, row_json)
+            else
+                try self.publicSqlRowJsonWithHiddenScalarSubqueriesAlloc(read_source, source_table_name, source_schema, row_json, effective_scalar_subqueries);
+            initialized += 1;
+        }
+        return rows;
+    }
+
+    const HttpLiteralScalarSubqueryValue = struct {
+        output: []const u8,
+        value_json: []const u8,
+    };
+
+    fn httpHiddenScalarSubqueriesPresent(scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection) bool {
+        for (scalar_subqueries) |projection| {
+            if (projection.hidden) return true;
+        }
+        return false;
+    }
+
+    fn publicSqlRowJsonWithHiddenScalarSubqueriesAlloc(
+        self: *ApiHttpServer,
+        read_source: table_reads.TableReadSource,
+        source_table_name: []const u8,
+        source_schema: runtime_schema_mod.TableSchema,
+        row_json: []const u8,
+        scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
+    ) ![]const u8 {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, row_json, .{}) catch return error.InvalidRowsRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidRowsRequest;
+
+        var scalar_values = std.ArrayListUnmanaged(HttpLiteralScalarSubqueryValue).empty;
+        defer {
+            for (scalar_values.items) |value| self.alloc.free(value.value_json);
+            scalar_values.deinit(self.alloc);
+        }
+
+        for (scalar_subqueries) |projection| {
+            if (!projection.hidden) continue;
+            const value_json = try self.publicSqlScalarSubqueryProjectionValueJsonAlloc(read_source, source_table_name, source_schema, parsed.value, projection);
+            errdefer self.alloc.free(value_json);
+            try scalar_values.append(self.alloc, .{
+                .output = projection.output,
+                .value_json = value_json,
+            });
+        }
+        return try httpRowJsonWithHiddenScalarValuesFromParsedAlloc(self.alloc, parsed.value, scalar_values.items);
+    }
+
+    fn publicSqlScalarSubqueryProjectionValueJsonAlloc(
+        self: *ApiHttpServer,
+        read_source: table_reads.TableReadSource,
+        source_table_name: []const u8,
+        source_schema: runtime_schema_mod.TableSchema,
+        outer_row: std.json.Value,
+        projection: db_mod.types.RelationalRowsScalarSubqueryProjection,
+    ) ![]const u8 {
+        var query = projection.query;
+        var correlated_predicates: []runtime_schema_mod.RelationalCheck = &.{};
+        defer httpFreeOwnedRelationalChecks(self.alloc, correlated_predicates);
+        var combined_predicates: []runtime_schema_mod.RelationalCheck = &.{};
+        defer if (combined_predicates.len > 0) self.alloc.free(combined_predicates);
+        if (projection.correlations.len != 0) {
+            correlated_predicates = try httpLateralCorrelationPredicatesAlloc(self.alloc, outer_row, projection.correlations);
+            if (correlated_predicates.len != projection.correlations.len) return try self.alloc.dupe(u8, "null");
+            combined_predicates = try httpCombinedBorrowedAndOwnedRelationalChecksAlloc(self.alloc, projection.query.predicates, correlated_predicates);
+            query.predicates = combined_predicates;
+        }
+        var result = (try read_source.rowsQueryPlan(
+            self.alloc,
+            source_table_name,
+            source_schema,
+            .{ .query = query },
+            .read_index,
+        )) orelse return error.TableNotFound;
+        defer result.deinit(self.alloc);
+        if (result.rows.len > 1) return error.InvalidRowsRequest;
+        if (result.rows.len == 0) return try self.alloc.dupe(u8, "null");
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, result.rows[0], .{}) catch return error.InvalidRowsRequest;
+        defer parsed.deinit();
+        const value = httpJsonValueAtPath(parsed.value, projection.output_field) orelse return try self.alloc.dupe(u8, "null");
+        return try std.json.Stringify.valueAlloc(self.alloc, value.*, .{});
+    }
+
+    fn httpLateralCorrelationPredicatesAlloc(
+        alloc: std.mem.Allocator,
+        left_row: std.json.Value,
+        correlations: []const db_mod.types.RelationalRowsLateralCorrelation,
+    ) ![]runtime_schema_mod.RelationalCheck {
+        const predicates = try alloc.alloc(runtime_schema_mod.RelationalCheck, correlations.len);
+        var initialized: usize = 0;
+        errdefer {
+            httpFreeOwnedRelationalCheckContents(alloc, predicates[0..initialized]);
+            alloc.free(predicates);
+        }
+        for (correlations) |correlation| {
+            const selected = httpJsonValueAtPath(left_row, correlation.left_field) orelse break;
+            if (selected.* == .null) break;
+            const value_json = switch (selected.*) {
+                .bool, .integer, .float, .string => try std.json.Stringify.valueAlloc(alloc, selected.*, .{}),
+                else => return error.InvalidRowsRequest,
+            };
+            var value_transferred = false;
+            errdefer if (!value_transferred) alloc.free(value_json);
+            const name = try alloc.dupe(u8, "");
+            var name_transferred = false;
+            errdefer if (!name_transferred) alloc.free(name);
+            const field = try alloc.dupe(u8, correlation.right_field);
+            var field_transferred = false;
+            errdefer if (!field_transferred) alloc.free(field);
+            predicates[initialized] = .{
+                .name = name,
+                .field = field,
+                .op = correlation.op,
+                .value_json = value_json,
+            };
+            initialized += 1;
+            name_transferred = true;
+            field_transferred = true;
+            value_transferred = true;
+        }
+        if (initialized != correlations.len) {
+            httpFreeOwnedRelationalCheckContents(alloc, predicates[0..initialized]);
+            alloc.free(predicates);
+            return &.{};
+        }
+        return predicates;
+    }
+
+    fn httpCombinedBorrowedAndOwnedRelationalChecksAlloc(
+        alloc: std.mem.Allocator,
+        borrowed: []const runtime_schema_mod.RelationalCheck,
+        owned: []const runtime_schema_mod.RelationalCheck,
+    ) ![]runtime_schema_mod.RelationalCheck {
+        const combined = try alloc.alloc(runtime_schema_mod.RelationalCheck, borrowed.len + owned.len);
+        @memcpy(combined[0..borrowed.len], borrowed);
+        @memcpy(combined[borrowed.len..], owned);
+        return combined;
+    }
+
+    fn httpFreeOwnedRelationalChecks(alloc: std.mem.Allocator, checks: []const runtime_schema_mod.RelationalCheck) void {
+        httpFreeOwnedRelationalCheckContents(alloc, checks);
+        if (checks.len > 0) alloc.free(checks);
+    }
+
+    fn httpFreeOwnedRelationalCheckContents(alloc: std.mem.Allocator, checks: []const runtime_schema_mod.RelationalCheck) void {
+        for (checks) |check| {
+            if (check.name.len > 0) alloc.free(@constCast(check.name));
+            if (check.field.len > 0) alloc.free(@constCast(check.field));
+            if (check.value_json) |value_json| if (value_json.len > 0) alloc.free(@constCast(value_json));
+        }
+    }
+
+    fn httpRowJsonWithHiddenScalarValuesAlloc(
+        alloc: std.mem.Allocator,
+        row_json: []const u8,
+        scalar_values: []const HttpLiteralScalarSubqueryValue,
+    ) ![]const u8 {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidRowsRequest;
+        return try httpRowJsonWithHiddenScalarValuesFromParsedAlloc(alloc, parsed.value, scalar_values);
+    }
+
+    fn httpRowJsonWithHiddenScalarValuesFromParsedAlloc(
+        alloc: std.mem.Allocator,
+        row_value: std.json.Value,
+        scalar_values: []const HttpLiteralScalarSubqueryValue,
+    ) ![]const u8 {
+        if (row_value != .object) return error.InvalidRowsRequest;
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        try writer.writeByte('{');
+        var first = true;
+        for (row_value.object.keys(), row_value.object.values()) |field, value| {
+            for (scalar_values) |scalar_value| {
+                if (std.mem.eql(u8, field, scalar_value.output)) return error.InvalidRowsRequest;
+            }
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writer.print("{f}:", .{std.json.fmt(field, .{})});
+            try std.json.Stringify.value(value, .{}, writer);
+        }
+        for (scalar_values) |scalar_value| {
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writer.print("{f}:{s}", .{ std.json.fmt(scalar_value.output, .{}), scalar_value.value_json });
+        }
+        try writer.writeByte('}');
+        return try out.toOwnedSlice();
+    }
+
+    fn httpJsonValueAtPath(root: std.json.Value, path: []const u8) ?*const std.json.Value {
+        if (root != .object) return null;
+        var current: *const std.json.Value = &root;
+        var parts = std.mem.splitScalar(u8, path, '.');
+        while (parts.next()) |part| {
+            if (part.len == 0 or current.* != .object) return null;
+            current = current.object.getPtr(part) orelse return null;
+        }
+        return current;
     }
 
     fn nextSqlMutationTxnId() db_mod.types.TxnId {
@@ -7556,6 +7960,7 @@ pub const ApiHttpServer = struct {
         }
 
         var sequence_resolver_ctx = RowsSequenceDefaultResolverContext{ .source = self.source };
+        var scalar_default_resolver_ctx = RowsScalarSubqueryDefaultResolverContext{ .source = self.source, .table_reads = read_source };
         var batch = (table_reads.rowsMergeMutationBatchFromRoutedScansWithSchemasAndDefaultContextAlloc(
             self.alloc,
             read_source,
@@ -7569,7 +7974,10 @@ pub const ApiHttpServer = struct {
             lowered.source,
             &.{},
             .read_index,
-            .{ .sequence_resolver = sequence_resolver_ctx.resolver() },
+            .{
+                .sequence_resolver = sequence_resolver_ctx.resolver(),
+                .scalar_subquery_resolver = scalar_default_resolver_ctx.resolver(),
+            },
         ) catch |err| switch (err) {
             error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation, error.SequenceNotFound => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
             error.RelationalRowsCteMaterializationRejected => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
@@ -7610,6 +8018,7 @@ pub const ApiHttpServer = struct {
         if (target_filter != null) return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") };
 
         var sequence_resolver_ctx = RowsSequenceDefaultResolverContext{ .source = self.source };
+        var scalar_default_resolver_ctx = RowsScalarSubqueryDefaultResolverContext{ .source = self.source, .table_reads = read_source };
         var batch = (table_reads.rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAndSessionAndDefaultContextAlloc(
             self.alloc,
             read_source,
@@ -7623,7 +8032,10 @@ pub const ApiHttpServer = struct {
             .{ .select_all = true },
             &.{},
             .read_index,
-            .{ .sequence_resolver = sequence_resolver_ctx.resolver() },
+            .{
+                .sequence_resolver = sequence_resolver_ctx.resolver(),
+                .scalar_subquery_resolver = scalar_default_resolver_ctx.resolver(),
+            },
         ) catch |err| switch (err) {
             error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation, error.SequenceNotFound, error.RelationalRowsCteMaterializationRejected => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
             error.RelationalRowsCteSpillRequired => return .{ .failure = try textResponse(self.alloc, 429, "sql write backpressured") },
@@ -7678,8 +8090,11 @@ pub const ApiHttpServer = struct {
         defer runtime_schema_mod.freeSchema(self.alloc, schema);
         var unique_resolver_ctx = RowsUniqueSelectorResolverContext{ .source = self.table_reads };
         var sequence_resolver_ctx = RowsSequenceDefaultResolverContext{ .source = self.source };
+        const default_read_source = self.effectivePublicTableReads() orelse return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.bind, .table_not_found)) };
+        var scalar_default_resolver_ctx = RowsScalarSubqueryDefaultResolverContext{ .source = self.source, .table_reads = default_read_source };
         write_catalog.options.unique_resolver = unique_resolver_ctx.resolver();
         write_catalog.options.default_context.sequence_resolver = sequence_resolver_ctx.resolver();
+        write_catalog.options.default_context.scalar_subquery_resolver = scalar_default_resolver_ctx.resolver();
 
         const routine_bindings = try self.sql_routine_runtime.listExpressionRoutineBindingsAlloc(self.alloc);
         defer sql_routines.freeExpressionRoutineBindings(self.alloc, routine_bindings);
@@ -10806,6 +11221,8 @@ pub const ApiHttpServer = struct {
         }
         var unique_resolver_ctx = RowsUniqueSelectorResolverContext{ .source = self.table_reads };
         var sequence_resolver_ctx = RowsSequenceDefaultResolverContext{ .source = self.source };
+        const default_read_source = self.effectivePublicTableReads() orelse return .{ .response = try self.publicSqlParsedDiagnosticResponse(404, parsed_sql, .init(.bind, .table_not_found)) };
+        var scalar_default_resolver_ctx = RowsScalarSubqueryDefaultResolverContext{ .source = self.source, .table_reads = default_read_source };
         var write_options: sql_adapter.LowerWritePlanOptions = .{};
         var row_claim_owner_id: ?[]const u8 = null;
         defer if (row_claim_owner_id) |owner_id| self.alloc.free(@constCast(owner_id));
@@ -10827,7 +11244,10 @@ pub const ApiHttpServer = struct {
             row_claim_owner_id = if (row_claim) |claim| claim.owner_id else null;
             write_options = .{
                 .unique_resolver = unique_resolver_ctx.resolver(),
-                .default_context = .{ .sequence_resolver = sequence_resolver_ctx.resolver() },
+                .default_context = .{
+                    .sequence_resolver = sequence_resolver_ctx.resolver(),
+                    .scalar_subquery_resolver = scalar_default_resolver_ctx.resolver(),
+                },
                 .row_claim = row_claim,
                 .sync_level = sync_level,
             };
@@ -11818,8 +12238,11 @@ pub const ApiHttpServer = struct {
         defer runtime_schema_mod.freeSchema(self.alloc, schema);
 
         var sequence_resolver_ctx = RowsSequenceDefaultResolverContext{ .source = self.source };
+        const default_read_source = self.effectivePublicTableReads() orelse return error.UnsupportedOperation;
+        var scalar_default_resolver_ctx = RowsScalarSubqueryDefaultResolverContext{ .source = self.source, .table_reads = default_read_source };
         var rows_req = try sql_adapter.bulkSqlIoImportRowsBatchFromStdinWithDefaultContextAlloc(self.alloc, schema, execution_plan, payload, .{
             .sequence_resolver = sequence_resolver_ctx.resolver(),
+            .scalar_subquery_resolver = scalar_default_resolver_ctx.resolver(),
         });
         errdefer rows_req.deinit(self.alloc);
         try self.applyRowsBatchBeforeInsertTriggersForBulkImport(target.table_name, schema, &rows_req);
@@ -18985,8 +19408,11 @@ pub const ApiHttpServer = struct {
         defer if (triggered_body.ptr != body.ptr) self.alloc.free(triggered_body);
 
         var sequence_resolver_ctx = RowsSequenceDefaultResolverContext{ .source = self.source };
+        const default_read_source = self.effectivePublicTableReads() orelse return try textResponse(self.alloc, 404, "not found");
+        var scalar_default_resolver_ctx = RowsScalarSubqueryDefaultResolverContext{ .source = self.source, .table_reads = default_read_source };
         var rows_req = relational_rows_api.parseRowsBatchRequestWithResolverAndDefaultContext(self.alloc, table_name, triggered_body, schema, unique_resolver, .{
             .sequence_resolver = sequence_resolver_ctx.resolver(),
+            .scalar_subquery_resolver = scalar_default_resolver_ctx.resolver(),
         }) catch |err| switch (err) {
             error.UnsupportedRowsSelector => return try textResponse(self.alloc, 400, "unsupported rows selector"),
             error.RowSelectorNotFound => return try textResponse(self.alloc, 404, "not found"),
@@ -19082,8 +19508,11 @@ pub const ApiHttpServer = struct {
         defer if (triggered_body.ptr != body.ptr) self.alloc.free(triggered_body);
 
         var sequence_resolver_ctx = RowsSequenceDefaultResolverContext{ .source = self.source };
+        const default_read_source = self.effectivePublicTableReads() orelse return try textResponse(self.alloc, 404, "not found");
+        var scalar_default_resolver_ctx = RowsScalarSubqueryDefaultResolverContext{ .source = self.source, .table_reads = default_read_source };
         var rows_req = relational_rows_api.parseRowsBatchRequestWithResolverAndDefaultContext(self.alloc, target.table_name, triggered_body, schema, unique_resolver, .{
             .sequence_resolver = sequence_resolver_ctx.resolver(),
+            .scalar_subquery_resolver = scalar_default_resolver_ctx.resolver(),
         }) catch |err| switch (err) {
             error.UnsupportedRowsSelector => return try textResponse(self.alloc, 400, "unsupported rows selector"),
             error.RowSelectorNotFound => return try textResponse(self.alloc, 404, "not found"),
@@ -19434,6 +19863,7 @@ pub const ApiHttpServer = struct {
 
         var unique_resolver_ctx = RowsUniqueSelectorResolverContext{ .source = self.table_reads };
         var sequence_resolver_ctx = RowsSequenceDefaultResolverContext{ .source = self.source };
+        var scalar_default_resolver_ctx = RowsScalarSubqueryDefaultResolverContext{ .source = self.source, .table_reads = read_source };
         var rows_batch = relational_rows_api.buildRowsInsertSourceBatchWithSchemasAndDefaultContextAlloc(
             self.alloc,
             table_name,
@@ -19442,7 +19872,10 @@ pub const ApiHttpServer = struct {
             rows_req.req,
             source_result.rows,
             unique_resolver_ctx.resolver(),
-            .{ .sequence_resolver = sequence_resolver_ctx.resolver() },
+            .{
+                .sequence_resolver = sequence_resolver_ctx.resolver(),
+                .scalar_subquery_resolver = scalar_default_resolver_ctx.resolver(),
+            },
         ) catch |err| switch (err) {
             error.UnsupportedRowsSelector => return try textResponse(self.alloc, 400, "unsupported rows selector"),
             error.RowSelectorNotFound => return try textResponse(self.alloc, 404, "not found"),
@@ -33212,6 +33645,102 @@ test "api http server applies safe before insert SQL triggers to rows batch" {
     try std.testing.expectEqualStrings("open", row.get("status").?.string);
 }
 
+test "api http server resolves scalar subquery defaults in public rows batch" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-default":{"op":"scalar_subquery","query":{"kind":"tokenized_sql","tokens":[{"kind":"identifier","text":"SELECT","keyword":"select"},{"kind":"identifier","text":"status"},{"kind":"identifier","text":"FROM","keyword":"from"},{"kind":"identifier","text":"events"},{"kind":"identifier","text":"ORDER","keyword":"order"},{"kind":"identifier","text":"BY","keyword":"by"},{"kind":"identifier","text":"id"}]}}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/rows-scalar-subquery-default", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+
+    var read_source = table_reads.BoundTableReadSource.init("events", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var write_source = table_writes.BoundTableWriteSource.init("events", &db);
+
+    const FakeSource = struct {
+        tables: [1]metadata_table_manager.TableRecord,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = self.tables[0..],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = FakeSource{ .tables = .{.{
+        .table_id = 1,
+        .name = "events",
+        .schema_json = schema_json,
+        .desired_replica_count = 1,
+    }} };
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), write_source.source());
+    defer server.deinit();
+
+    var seed = try server.handlePublicTableRowsBatch(
+        "events",
+        "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"evt-1\",\"status\":\"queued\"}}]}",
+        null,
+    );
+    defer seed.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), seed.status);
+
+    var defaulted = try server.handlePublicTableRowsBatch(
+        "events",
+        "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"evt-2\"},\"returning\":[\"id\",\"status\"]}]}",
+        null,
+    );
+    defer defaulted.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), defaulted.status);
+
+    var query_resp = try server.handlePublicTableRowsQuery("events", "{\"query\":{\"select\":[\"id\",\"status\"],\"order_by\":[{\"field\":\"id\",\"direction\":\"asc\"}]}}", null);
+    defer query_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), query_resp.status);
+    var parsed_query = try std.json.parseFromSlice(std.json.Value, alloc, query_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_query.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_query.value.object.get("total").?.integer);
+    const defaulted_row = parsed_query.value.object.get("rows").?.array.items[1].object;
+    try std.testing.expectEqualStrings("evt-2", defaulted_row.get("id").?.string);
+    try std.testing.expectEqualStrings("queued", defaulted_row.get("status").?.string);
+
+    var cardinality = try server.handlePublicTableRowsBatch(
+        "events",
+        "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"evt-3\"}}]}",
+        null,
+    );
+    defer cardinality.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), cardinality.status);
+}
+
 test "api http server maps relational CTE spill admission to rows backpressure" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -38350,69 +38879,6 @@ test "api http server executes public relational row plan endpoints" {
     defer public_range_query_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), public_range_query_resp.status);
 
-    var aggregate_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/tables/records/rows/aggregate",
-        .content_type = "application/json",
-        .body = "{\"ctes\":[{\"name\":\"open_orders\",\"query\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]}}}],\"aggregate\":{\"source\":{\"source_cte\":\"open_orders\"},\"group_by\":[\"customer_id\"],\"aggregations\":[{\"name\":\"amount_sum\",\"op\":\"sum\",\"field\":\"amount\"}]}}",
-    });
-    defer aggregate_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), aggregate_resp.status);
-    var parsed_aggregate = try std.json.parseFromSlice(std.json.Value, alloc, aggregate_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_aggregate.deinit();
-    try std.testing.expectEqual(@as(i64, 1), parsed_aggregate.value.object.get("total_groups").?.integer);
-    try std.testing.expectEqual(@as(i64, 30), parsed_aggregate.value.object.get("rows").?.array.items[0].object.get("amount_sum").?.integer);
-    try expectRowsResultSchemaColumn(parsed_aggregate.value, "customer_id", "keyword", true, null);
-    try expectRowsResultSchemaColumn(parsed_aggregate.value, "amount_sum", "numeric", false, null);
-
-    var window_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/tables/records/rows/window",
-        .content_type = "application/json",
-        .body = "{\"window\":{\"source\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]}},\"windows\":[{\"as\":\"row_num\",\"function\":\"row_number\",\"partition_by\":[\"customer_id\"],\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}]}],\"select\":[\"id\",\"amount\"]}}",
-    });
-    defer window_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), window_resp.status);
-    var parsed_window = try std.json.parseFromSlice(std.json.Value, alloc, window_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_window.deinit();
-    try std.testing.expectEqual(@as(i64, 2), parsed_window.value.object.get("total_rows").?.integer);
-    try std.testing.expectEqual(@as(i64, 1), parsed_window.value.object.get("rows").?.array.items[0].object.get("row_num").?.integer);
-    try expectRowsResultSchemaColumn(parsed_window.value, "id", "keyword", false, null);
-    try expectRowsResultSchemaColumn(parsed_window.value, "row_num", "numeric", false, null);
-
-    var join_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/tables/records/rows/join",
-        .content_type = "application/json",
-        .body = "{\"join\":{\"left\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]}},\"right\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"customer\"}},\"on\":[{\"left_field\":\"customer_id\",\"right_field\":\"id\"}],\"select\":[{\"as\":\"order_id\",\"side\":\"left\",\"field\":\"id\"},{\"as\":\"customer_name\",\"side\":\"right\",\"field\":\"name\"},{\"as\":\"amount\",\"side\":\"left\",\"field\":\"amount\"}],\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}]}}",
-    });
-    defer join_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), join_resp.status);
-    var parsed_join = try std.json.parseFromSlice(std.json.Value, alloc, join_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_join.deinit();
-    try std.testing.expectEqual(@as(i64, 2), parsed_join.value.object.get("total_rows").?.integer);
-    try std.testing.expectEqualStrings("Alice", parsed_join.value.object.get("rows").?.array.items[0].object.get("customer_name").?.string);
-    try expectRowsResultSchemaColumn(parsed_join.value, "order_id", "keyword", false, null);
-    try expectRowsResultSchemaColumn(parsed_join.value, "customer_name", "keyword", true, null);
-    try expectRowsResultSchemaColumnCollation(parsed_join.value, "customer_name", "name_collation");
-    try expectRowsResultSchemaColumn(parsed_join.value, "amount", "numeric", true, null);
-
-    var lateral_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/tables/records/rows/lateral",
-        .content_type = "application/json",
-        .body = "{\"lateral\":{\"left\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"customer\"},\"order_by\":[{\"field\":\"id\"}]},\"right\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}],\"limit\":1},\"correlations\":[{\"left_field\":\"id\",\"right_field\":\"customer_id\"}],\"select\":[{\"as\":\"customer_id\",\"side\":\"left\",\"field\":\"id\"},{\"as\":\"latest_order_id\",\"side\":\"right\",\"field\":\"id\"},{\"as\":\"latest_amount\",\"side\":\"right\",\"field\":\"amount\"}]}}",
-    });
-    defer lateral_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), lateral_resp.status);
-    var parsed_lateral = try std.json.parseFromSlice(std.json.Value, alloc, lateral_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_lateral.deinit();
-    try std.testing.expectEqual(@as(i64, 2), parsed_lateral.value.object.get("total_rows").?.integer);
-    try std.testing.expectEqualStrings("o2", parsed_lateral.value.object.get("rows").?.array.items[0].object.get("latest_order_id").?.string);
-    try expectRowsResultSchemaColumn(parsed_lateral.value, "customer_id", "keyword", false, null);
-    try expectRowsResultSchemaColumn(parsed_lateral.value, "latest_order_id", "keyword", true, null);
-    try expectRowsResultSchemaColumn(parsed_lateral.value, "latest_amount", "numeric", true, null);
-
     const mutation_txn_hex = "00112233445566778899aabbccddeeff";
     const mutation_txn_id = try distributed_txn.parseTxnIdHex(mutation_txn_hex);
     _ = try db.beginTransactionWithId(mutation_txn_id, 1_000);
@@ -38526,22 +38992,6 @@ test "api http server executes public relational row plan endpoints" {
     defer parsed_filtered_query.deinit();
     try std.testing.expectEqual(@as(i64, 2), parsed_filtered_query.value.object.get("total").?.integer);
     try std.testing.expectEqualStrings("t1", parsed_filtered_query.value.object.get("rows").?.array.items[0].object.get("tenant").?.string);
-
-    var filtered_aggregate_resp = try server.handlePublicTableRowsAggregate("records", "{\"ctes\":[{\"name\":\"open_orders\",\"query\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]}}}],\"aggregate\":{\"source\":{\"source_cte\":\"open_orders\"},\"group_by\":[\"customer_id\"],\"aggregations\":[{\"name\":\"amount_sum\",\"op\":\"sum\",\"field\":\"amount\"}]}}", identity);
-    defer filtered_aggregate_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), filtered_aggregate_resp.status);
-    var parsed_filtered_aggregate = try std.json.parseFromSlice(std.json.Value, alloc, filtered_aggregate_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_filtered_aggregate.deinit();
-    try std.testing.expectEqual(@as(i64, 1), parsed_filtered_aggregate.value.object.get("total_groups").?.integer);
-    try std.testing.expectEqual(@as(i64, 30), parsed_filtered_aggregate.value.object.get("rows").?.array.items[0].object.get("amount_sum").?.integer);
-
-    var filtered_join_resp = try server.handlePublicTableRowsJoin("records", "{\"join\":{\"left\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]}},\"right\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"customer\"}},\"on\":[{\"left_field\":\"customer_id\",\"right_field\":\"id\"}],\"select\":[{\"as\":\"tenant\",\"side\":\"left\",\"field\":\"tenant\"},{\"as\":\"order_id\",\"side\":\"left\",\"field\":\"id\"},{\"as\":\"customer_name\",\"side\":\"right\",\"field\":\"name\"}]}}", identity);
-    defer filtered_join_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), filtered_join_resp.status);
-    var parsed_filtered_join = try std.json.parseFromSlice(std.json.Value, alloc, filtered_join_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_filtered_join.deinit();
-    try std.testing.expectEqual(@as(i64, 2), parsed_filtered_join.value.object.get("total_rows").?.integer);
-    try std.testing.expectEqualStrings("t1", parsed_filtered_join.value.object.get("rows").?.array.items[0].object.get("tenant").?.string);
 
     var disjunctive_row_filters = try alloc.alloc(usermgr.RowFilterEntry, 1);
     disjunctive_row_filters[0] = try usermgr.RowFilterEntry.initOwned(alloc, "records", "{\"disjuncts\":[{\"term\":{\"tenant\":\"t1\"}},{\"term\":{\"tenant\":\"t2\"}}]}");

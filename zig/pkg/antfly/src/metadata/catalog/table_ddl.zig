@@ -2438,6 +2438,15 @@ pub fn schemaWithSecondaryIndexReadyAlloc(
     return try sql_schema_mutation.schemaWithSecondaryIndexReadyAlloc(alloc, schema_json, index_name, expected_generation);
 }
 
+pub fn schemaWithSecondaryIndexReadyCheckedAlloc(
+    alloc: std.mem.Allocator,
+    schema_json: []const u8,
+    index_name: []const u8,
+    expected: sql_schema_mutation.SecondaryIndexReadyExpectation,
+) ![]u8 {
+    return try sql_schema_mutation.schemaWithSecondaryIndexReadyCheckedAlloc(alloc, schema_json, index_name, expected);
+}
+
 pub fn schemaWithSecondaryIndexBuildingAlloc(
     alloc: std.mem.Allocator,
     schema_json: []const u8,
@@ -6456,6 +6465,29 @@ test "metadata.schema update sql ddl applies relational catalog changes through 
     );
     defer created.deinit(std.testing.allocator);
 
+    const default_table: metadata_table_manager.TableRecord = .{
+        .table_id = 14,
+        .name = "usage_records",
+        .schema_json = "",
+        .indexes_json = "{}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+    var scalar_default_created = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &default_table,
+        "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text DEFAULT (SELECT status FROM usage_records ORDER BY id LIMIT 1));",
+    );
+    defer scalar_default_created.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, scalar_default_created.table.schema_json, "\"op\":\"scalar_subquery\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scalar_default_created.table.schema_json, "\"query\":{\"table\":\"usage_records\"") != null);
+    var scalar_default_created_parsed = try schema_mod.parseValidatedTableSchema(std.testing.allocator, scalar_default_created.table.schema_json);
+    defer scalar_default_created_parsed.deinit(std.testing.allocator);
+    const scalar_default_created_runtime = try schema_mod.deriveRuntimeTableSchema(std.testing.allocator, scalar_default_created_parsed);
+    defer runtime_schema_mod.freeSchema(std.testing.allocator, scalar_default_created_runtime);
+    const scalar_default_created_status = findRuntimeRelationalColumn(scalar_default_created_runtime, "status") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema_mod.RelationalDefaultKind.scalar_subquery, scalar_default_created_status.default_value.?.kind);
+
     const qualified_table: metadata_table_manager.TableRecord = .{
         .table_id = deriveQualifiedTableId(default_database_name, "analytics", "users"),
         .name = "users",
@@ -6512,6 +6544,20 @@ test "metadata.schema update sql ddl applies relational catalog changes through 
     try std.testing.expect(std.mem.indexOf(u8, altered.table.schema_json, "\"version\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, altered.table.schema_json, "\"status\":{\"type\":\"keyword\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, altered.table.read_schema_json, "\"version\":0") != null);
+
+    var literal_default_altered = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &altered.table,
+        "ALTER TABLE users ALTER COLUMN status SET DEFAULT 'queued';",
+    );
+    defer literal_default_altered.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, literal_default_altered.table.schema_json, "\"queued\"") != null);
+    var literal_default_altered_parsed = try schema_mod.parseValidatedTableSchema(std.testing.allocator, literal_default_altered.table.schema_json);
+    defer literal_default_altered_parsed.deinit(std.testing.allocator);
+    const literal_default_altered_runtime = try schema_mod.deriveRuntimeTableSchema(std.testing.allocator, literal_default_altered_parsed);
+    defer runtime_schema_mod.freeSchema(std.testing.allocator, literal_default_altered_runtime);
+    const literal_default_altered_status = findRuntimeRelationalColumn(literal_default_altered_runtime, "status") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema_mod.RelationalDefaultKind.literal, literal_default_altered_status.default_value.?.kind);
 
     var generated = try applyRelationalSqlDdlToTableRecordAlloc(
         std.testing.allocator,
@@ -6850,6 +6896,59 @@ test "metadata.schema update promotes secondary index only for matching building
     try std.testing.expectError(
         error.SecondaryIndexNotBuilding,
         schemaWithSecondaryIndexReadyAlloc(alloc, updated, "amount", 9),
+    );
+
+    const catching_up_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index-lifecycle":"catching_up","x-antfly-index-generation":11},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const caught_up = try schemaWithSecondaryIndexReadyAlloc(alloc, catching_up_json, "amount", 11);
+    defer alloc.free(caught_up);
+    var caught_up_parsed = try parseValidatedTableSchema(alloc, caught_up);
+    defer caught_up_parsed.deinit(alloc);
+    const caught_up_runtime = try deriveRuntimeTableSchema(alloc, caught_up_parsed);
+    defer runtime_schema_mod.freeSchema(alloc, caught_up_runtime);
+    const caught_up_column = secondaryIndexColumnByIdentity(caught_up_runtime.relational_columns, "amount") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema_mod.RelationalIndexLifecycle.ready, caught_up_column.index_lifecycle);
+
+    const stale_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index-lifecycle":"stale","x-antfly-index-generation":12},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    try std.testing.expectError(
+        error.SecondaryIndexNotBuilding,
+        schemaWithSecondaryIndexReadyAlloc(alloc, stale_json, "amount", 12),
+    );
+
+    const checked_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index-lifecycle":"building","x-antfly-index-generation":13,"x-antfly-index-name":"amount_idx","x-antfly-index-access-method":"scalar_column","x-antfly-index-schema-fingerprint":"secondary-index-v1:amount"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const checked_ready = try schemaWithSecondaryIndexReadyCheckedAlloc(alloc, checked_json, "amount_idx", .{
+        .generation = 13,
+        .access_method = .scalar_column,
+        .schema_fingerprint = "secondary-index-v1:amount",
+    });
+    defer alloc.free(checked_ready);
+    var checked_parsed = try parseValidatedTableSchema(alloc, checked_ready);
+    defer checked_parsed.deinit(alloc);
+    const checked_runtime = try deriveRuntimeTableSchema(alloc, checked_parsed);
+    defer runtime_schema_mod.freeSchema(alloc, checked_runtime);
+    const checked_column = secondaryIndexColumnByIdentity(checked_runtime.relational_columns, "amount_idx") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema_mod.RelationalIndexLifecycle.ready, checked_column.index_lifecycle);
+
+    try std.testing.expectError(
+        error.SecondaryIndexAccessMethodMismatch,
+        schemaWithSecondaryIndexReadyCheckedAlloc(alloc, checked_json, "amount_idx", .{
+            .generation = 13,
+            .access_method = .ordered_tuple,
+            .schema_fingerprint = "secondary-index-v1:amount",
+        }),
+    );
+    try std.testing.expectError(
+        error.SecondaryIndexSchemaFingerprintMismatch,
+        schemaWithSecondaryIndexReadyCheckedAlloc(alloc, checked_json, "amount_idx", .{
+            .generation = 13,
+            .access_method = .scalar_column,
+            .schema_fingerprint = "secondary-index-v1:other",
+        }),
     );
 }
 

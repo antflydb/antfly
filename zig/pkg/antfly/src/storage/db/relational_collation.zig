@@ -22,6 +22,16 @@ pub fn isCaseInsensitive(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "ci");
 }
 
+pub fn isBinary(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "C") or
+        std.ascii.eqlIgnoreCase(name, "POSIX") or
+        std.ascii.eqlIgnoreCase(name, "binary");
+}
+
+pub fn isSupported(name: []const u8) bool {
+    return isBinary(name) or isCaseInsensitive(name);
+}
+
 pub fn textEqual(lhs: []const u8, rhs: []const u8, collation: ?[]const u8) bool {
     if (collation) |name| {
         if (isCaseInsensitive(name)) return std.ascii.eqlIgnoreCase(lhs, rhs);
@@ -59,8 +69,11 @@ fn textComparisonFromOrder(order: std.math.Order) TextComparison {
 }
 
 test "relational collation centralizes scalar equality and stable ordering" {
+    try std.testing.expect(isSupported("C"));
+    try std.testing.expect(isSupported("binary"));
     try std.testing.expect(isCaseInsensitive("antfly.case_insensitive"));
     try std.testing.expect(isCaseInsensitive("CI"));
+    try std.testing.expect(!isSupported("und-x-icu"));
     try std.testing.expect(textEqual("Alpha", "alpha", "ci"));
     try std.testing.expect(!textEqual("Alpha", "alpha", "C"));
     try std.testing.expectEqual(TextComparison.eq, compareTextForScalar("Alpha", "alpha", "ci"));

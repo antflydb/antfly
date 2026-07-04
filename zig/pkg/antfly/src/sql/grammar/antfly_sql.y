@@ -24,7 +24,7 @@
 %reference postgres_scan_l https://github.com/postgres/postgres/blob/4cc02b80774ecdc4cf2a2d5df09c07df36d68ca5/src/backend/parser/scan.l
 %reference cockroach_sql_y https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/parser/sql.y
 
-%expect 10436
+%expect 10719
 
 %start statement
 
@@ -226,6 +226,7 @@ create_schema_statement:
 
 create_table_statement:
     CREATE relation_lifetime_opt TABLE index_target_relation_prefix_opt if_not_exists_opt qualified_name create_table_body create_table_partition_opt create_table_option_list_opt
+  | CREATE OR REPLACE relation_lifetime_opt TABLE index_target_relation_prefix_opt if_not_exists_opt qualified_name create_table_body create_table_partition_opt create_table_option_list_opt
   ;
 
 create_table_body:
@@ -282,7 +283,7 @@ create_view_statement:
   ;
 
 create_materialized_view_statement:
-    CREATE MATERIALIZED VIEW if_not_exists_opt qualified_name diagnostic_tail
+    CREATE create_view_replace_opt MATERIALIZED VIEW if_not_exists_opt qualified_name diagnostic_tail
   ;
 
 create_view_replace_opt:
@@ -984,6 +985,7 @@ graph_match_token:
   | ALL
   | ALTER
   | ANALYZE
+  | AND
   | AS
   | ASC
   | BY
@@ -1010,6 +1012,7 @@ graph_match_token:
   | EXECUTE
   | EXISTS
   | FALSE
+  | EXTENSION
   | FETCH
   | FIRST
   | FOR
@@ -2180,11 +2183,13 @@ diagnostic_token:
   | DECLARE
   | DEFAULT
   | DELETE
+  | DISTINCT
   | DO
   | DOMAIN
   | DROP
   | EXECUTE
   | EXISTS
+  | EXTENSION
   | FALSE
   | FETCH
   | FIRST
@@ -2207,6 +2212,7 @@ diagnostic_token:
   | LAST
   | KEY
   | LISTEN
+  | LIMIT
   | LOAD
   | LOCK
   | LOCKED
@@ -2223,6 +2229,7 @@ diagnostic_token:
   | OF
   | ON
   | ONLY
+  | OR
   | OPERATOR
   | OVERRIDING
   | OVERLAPS
@@ -2279,6 +2286,7 @@ diagnostic_token:
   | VIEW
   | VIRTUAL
   | WEIGHT
+  | WHERE
   | WITH
   | WITHOUT
   | ALWAYS

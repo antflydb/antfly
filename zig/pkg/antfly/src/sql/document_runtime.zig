@@ -5239,6 +5239,20 @@ fn documentSqlProjectedParsedRowJsonWithUnnestAndLateralAlloc(
                 defer alloc.free(digest);
                 try writer.print("{f}", .{std.json.fmt(digest, .{})});
             },
+            .text_soundex => {
+                const value = documentSqlProjectedValue(row, item.field) orelse {
+                    try writer.writeAll("null");
+                    continue;
+                };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
+                const text = try documentSqlFilterStringValue(value);
+                const code = try expr_text.soundexTextAlloc(alloc, text);
+                defer alloc.free(code);
+                try writer.print("{f}", .{std.json.fmt(code, .{})});
+            },
             .text_chr => {
                 const codepoint = if (item.field.len > 0) blk: {
                     const value = documentSqlProjectedValue(row, item.field) orelse {
@@ -6158,6 +6172,11 @@ fn documentSqlFilterValueMatches(
             const digest = try expr_text.md5HexTextAlloc(alloc, text);
             defer alloc.free(digest);
             return std.mem.eql(u8, digest, field_value.value.string);
+        }
+        if (std.mem.eql(u8, operator.string, "soundex")) {
+            const code = try expr_text.soundexTextAlloc(alloc, text);
+            defer alloc.free(code);
+            return std.mem.eql(u8, code, field_value.value.string);
         }
         if (std.mem.eql(u8, operator.string, "reverse")) {
             const reversed = try documentSqlReverseTextAlloc(alloc, text);
@@ -8420,6 +8439,11 @@ test "document SQL residual text unary term filters match rows" {
     ));
     try std.testing.expect(try residualFilterMatchesAlloc(
         alloc,
+        "{\"status\":\"active\"}",
+        "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"soundex\",\"value\":\"A231\"}}",
+    ));
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
         "{\"status\":\"héllo\"}",
         "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"reverse\",\"value\":\"olléh\"}}",
     ));
@@ -10213,6 +10237,25 @@ test "document SQL materializes md5 projections" {
     const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
     defer alloc.free(row);
     try std.testing.expectEqualStrings("{\"status_md5\":\"5d41402abc4b2a76b9719d911017c592\",\"accent_md5\":\"9f6ec78061f7655b2782d3e5b8cd77a2\",\"missing_md5\":null,\"absent_md5\":null}", row);
+
+    var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":42}", .{ .allocate = .alloc_always });
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.InvalidRowsRequest, documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", wrong_type.value, null, projection[0..1]));
+}
+
+test "document SQL materializes soundex projections" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"active\",\"missing\":null}", .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .text_soundex, .field = "status", .output = "status_soundex" },
+        .{ .kind = .text_soundex, .field = "missing", .output = "missing_soundex" },
+        .{ .kind = .text_soundex, .field = "absent", .output = "absent_soundex" },
+    };
+    const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"status_soundex\":\"A231\",\"missing_soundex\":null,\"absent_soundex\":null}", row);
 
     var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":42}", .{ .allocate = .alloc_always });
     defer wrong_type.deinit();

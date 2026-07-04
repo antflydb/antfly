@@ -27,6 +27,7 @@ const raft_reconciler = antfly.raft.reconciler;
 const relational_rows = antfly.public_api.relational_rows;
 const sql_adapter = antfly.public_api.sql_adapter;
 const storage_schema = antfly.schema;
+const table_schema = antfly.table_schema;
 const table_catalog = antfly.metadata.catalog_source;
 const table_reads = antfly.public_api.table_reads;
 const table_writes = antfly.public_api.table_writes;
@@ -260,6 +261,7 @@ fn executeTableDdlLogicalPlanAlloc(
     defer applied.deinit(allocator);
 
     try db.applyLiteSqlTableRecord(allocator, applied.table);
+    try executeLiteLocalSecondaryIndexWorkAlloc(allocator, db, &applied);
 
     const response = NonRowResponse{
         .kind = "ddl",
@@ -269,6 +271,100 @@ fn executeTableDdlLogicalPlanAlloc(
         .applied = applied,
     };
     return try std.json.Stringify.valueAlloc(allocator, response, .{ .whitespace = .indent_2 });
+}
+
+const LiteLocalSecondaryIndex = struct {
+    name: []u8,
+    generation: u64,
+    access_method: storage_schema.RelationalIndexAccessMethod,
+    schema_fingerprint: []u8,
+
+    fn deinit(self: *@This(), allocator: Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.schema_fingerprint);
+        self.* = undefined;
+    }
+};
+
+fn executeLiteLocalSecondaryIndexWorkAlloc(
+    allocator: Allocator,
+    db: *antfly.db.DB,
+    applied: *tables_api.AppliedRelationalSqlDdlRecord,
+) !void {
+    if (applied.dropped_table or applied.table.schema_json.len == 0) return;
+
+    const indexes = try liteLocalBuildingSecondaryIndexesAlloc(allocator, applied.table.schema_json);
+    defer {
+        for (indexes) |*index| index.deinit(allocator);
+        if (indexes.len > 0) allocator.free(indexes);
+    }
+    if (indexes.len == 0) return;
+
+    for (indexes) |index| {
+        _ = try db.rebuildRelationalSecondaryIndexInRange(index.name, index.generation, "", "");
+    }
+
+    var ready_schema_json = try allocator.dupe(u8, applied.table.schema_json);
+    var ready_schema_transferred = false;
+    errdefer if (!ready_schema_transferred) allocator.free(ready_schema_json);
+    for (indexes) |index| {
+        const next_schema_json = try tables_api.schemaWithSecondaryIndexReadyCheckedAlloc(
+            allocator,
+            ready_schema_json,
+            index.name,
+            .{
+                .generation = index.generation,
+                .access_method = index.access_method,
+                .schema_fingerprint = index.schema_fingerprint,
+            },
+        );
+        allocator.free(ready_schema_json);
+        ready_schema_json = next_schema_json;
+    }
+
+    allocator.free(applied.table.schema_json);
+    applied.table.schema_json = ready_schema_json;
+    ready_schema_transferred = true;
+    try db.applyLiteSqlTableRecord(allocator, applied.table);
+}
+
+fn liteLocalBuildingSecondaryIndexesAlloc(
+    allocator: Allocator,
+    schema_json: []const u8,
+) ![]LiteLocalSecondaryIndex {
+    var parsed_schema = try table_schema.parseValidatedTableSchema(allocator, schema_json);
+    defer parsed_schema.deinit(allocator);
+    const runtime_schema = try table_schema.deriveRuntimeTableSchema(allocator, parsed_schema);
+    defer storage_schema.freeSchema(allocator, runtime_schema);
+
+    var indexes = std.ArrayListUnmanaged(LiteLocalSecondaryIndex).empty;
+    errdefer {
+        for (indexes.items) |*index| index.deinit(allocator);
+        indexes.deinit(allocator);
+    }
+
+    for (runtime_schema.relational_columns) |column| {
+        if (!column.indexed or column.index_lifecycle != .building or column.index_generation == 0) continue;
+        const identity = column.index_name orelse column.name;
+        const access_method = column.index_access_method orelse return error.InvalidSchemaUpdateRequest;
+        const schema_fingerprint = column.index_schema_fingerprint orelse return error.InvalidSchemaUpdateRequest;
+        var seen = false;
+        for (indexes.items) |existing| {
+            if (std.mem.eql(u8, existing.name, identity)) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+        try indexes.append(allocator, .{
+            .name = try allocator.dupe(u8, identity),
+            .generation = column.index_generation,
+            .access_method = access_method,
+            .schema_fingerprint = try allocator.dupe(u8, schema_fingerprint),
+        });
+    }
+
+    return try indexes.toOwnedSlice(allocator);
 }
 
 fn executeSessionLogicalPlanAlloc(
@@ -330,12 +426,24 @@ fn executeWriteAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session,
     var catalog = LiteSingleTableCatalog.initBorrowed(table_record);
     const catalog_source = catalog.iface();
 
+    const schema = try sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(allocator, catalog_source, target_table, session.catalog.session());
+    defer storage_schema.freeSchema(allocator, schema);
+
     var unique_resolver_ctx = DbUniqueSelectorResolverContext{ .db = db };
+    var scalar_default_resolver_ctx = DbScalarSubqueryDefaultResolverContext{
+        .db = db,
+        .table_name = target_table,
+        .schema = schema,
+    };
+    const default_context = relational_rows.DefaultValueContext{
+        .scalar_subquery_resolver = scalar_default_resolver_ctx.resolver(),
+    };
     var logical_plan = try sql_adapter.planParsedSqlWithSessionAlloc(allocator, parsed_sql, .{
         .catalog = catalog_source,
         .session = session.catalog.session(),
         .write_options = .{
             .unique_resolver = unique_resolver_ctx.resolver(),
+            .default_context = default_context,
             .sync_level = try sql_adapter.sqlSyncLevelFromSession(session.catalog.session()),
         },
     });
@@ -344,9 +452,6 @@ fn executeWriteAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session,
         .catalog_write => {},
         else => return error.UnsupportedSqlShape,
     }
-
-    const schema = try sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(allocator, catalog_source, target_table, session.catalog.session());
-    defer storage_schema.freeSchema(allocator, schema);
 
     var write_source = table_writes.BoundTableWriteSource.init(target_table, db);
     var lowered = try sql_adapter.lower_dml.lowerWritePlanWithLogicalPlanAndFunctionBindingsAlloc(
@@ -359,17 +464,50 @@ fn executeWriteAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session,
     );
     defer lowered.deinit(allocator);
 
+    var owned_insert_source_batch: ?relational_rows.OwnedRowsBatchRequest = null;
+    defer if (owned_insert_source_batch) |*batch| batch.deinit(allocator);
+    var lowered_statement_kind: ?[]const u8 = null;
     const rows_batch = switch (lowered) {
         .insert => |*insert| &insert.batch,
         .update => |*update| &update.batch,
         .delete => |*delete| &delete.batch,
+        .insert_source => |insert_source| blk: {
+            if (insert_source.ctes.len != 0) return error.UnsupportedSqlShape;
+            if (insert_source.literal_source_rows.len == 0) return error.UnsupportedSqlShape;
+            if (insert_source.insert_source.req.source_table.len != 0 and
+                !std.mem.eql(u8, insert_source.insert_source.req.source_table, target_table))
+            {
+                return error.UnsupportedSqlShape;
+            }
+            owned_insert_source_batch = try relational_rows.buildRowsInsertSourceBatchFromLiteralRowsDbAcrossRangesAndDefaultContextAndRowScalarSubqueriesAlloc(
+                allocator,
+                db,
+                insert_source.table_name,
+                schema,
+                schema,
+                insert_source.insert_source.req,
+                insert_source.literal_source_rows,
+                insert_source.literal_source_row_scalar_subqueries,
+                &.{},
+                unique_resolver_ctx.resolver(),
+                default_context,
+            );
+            owned_insert_source_batch.?.req.sync_level = insert_source.sync_level;
+            lowered_statement_kind = "insert_source";
+            break :blk &owned_insert_source_batch.?;
+        },
         else => return error.UnsupportedSqlShape,
     };
     if (rows_batch.writes.len != 0 or rows_batch.deletes.len != 0 or rows_batch.transforms.len != 0 or rows_batch.predicates.len != 0) {
         _ = (try write_source.source().batch(allocator, target_table, rows_batch.req)) orelse return error.TableNotFound;
     }
 
-    return try encodeRowsBatchResultAlloc(allocator, session.sessionId(), try liteStatementKindForParsedLogicalPlan(logical_plan, parsed_sql), rows_batch.*);
+    return try encodeRowsBatchResultAlloc(
+        allocator,
+        session.sessionId(),
+        lowered_statement_kind orelse try liteStatementKindForParsedLogicalPlan(logical_plan, parsed_sql),
+        rows_batch.*,
+    );
 }
 
 fn executeReadAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, parsed_sql: *const sql_adapter.ParsedSql) ![]u8 {
@@ -721,6 +859,51 @@ const DbUniqueSelectorResolverContext = struct {
         };
     }
 };
+
+const DbScalarSubqueryDefaultResolverContext = struct {
+    db: *antfly.db.DB,
+    table_name: []const u8,
+    schema: storage_schema.TableSchema,
+
+    fn resolver(self: *@This()) relational_rows.ScalarSubqueryDefaultResolver {
+        return .{
+            .ptr = self,
+            .value_json_alloc = valueJsonAlloc,
+        };
+    }
+
+    fn valueJsonAlloc(
+        ptr: *anyopaque,
+        allocator: Allocator,
+        request: relational_rows.ScalarSubqueryDefaultRequest,
+    ) ![]u8 {
+        const self: *DbScalarSubqueryDefaultResolverContext = @ptrCast(@alignCast(ptr));
+        var plan = try relational_rows.scalarSubqueryDefaultPlanFromQueryJsonAlloc(allocator, request.query_json);
+        defer plan.deinit(allocator);
+        if (!std.mem.eql(u8, plan.table_name, self.table_name)) return error.UnsupportedSqlShape;
+
+        var result = try relational_rows.executeRowsQueryPlanFromDbAlloc(allocator, self.db, self.schema, .{ .query = plan.query });
+        defer result.deinit(allocator);
+        if (result.rows.len > 1) return error.InvalidRowsRequest;
+        if (result.rows.len == 0) return try allocator.dupe(u8, "null");
+
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, result.rows[0], .{}) catch return error.InvalidRowsRequest;
+        defer parsed.deinit();
+        const value = liteJsonValueAtPath(parsed.value, plan.output_field) orelse return try allocator.dupe(u8, "null");
+        return try std.json.Stringify.valueAlloc(allocator, value.*, .{});
+    }
+};
+
+fn liteJsonValueAtPath(root: std.json.Value, path: []const u8) ?*const std.json.Value {
+    if (root != .object) return null;
+    var current: *const std.json.Value = &root;
+    var parts = std.mem.splitScalar(u8, path, '.');
+    while (parts.next()) |part| {
+        if (part.len == 0 or current.* != .object) return null;
+        current = current.object.getPtr(part) orelse return null;
+    }
+    return current;
+}
 
 fn ddlTargetTableNameAlloc(allocator: Allocator, plan: sql_adapter.TableDdlLogicalPlan, session: catalog_resources.SqlCatalogSession) ![]u8 {
     var target = try tables_api.relationalSqlDdlTargetForTablePlanWithSessionAlloc(allocator, plan, session);

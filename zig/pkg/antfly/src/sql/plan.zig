@@ -929,6 +929,8 @@ pub const LoweredInsertSource = struct {
     table_name: []const u8,
     ctes: []const db_mod.types.RelationalRowsCte = &.{},
     insert_source: relational_rows.OwnedRowsInsertSourceRequest,
+    literal_source_rows: []const []const u8 = &.{},
+    literal_source_row_scalar_subqueries: []const []const db_mod.types.RelationalRowsScalarSubqueryProjection = &.{},
     sync_level: db_mod.types.SyncLevel = .write,
     returning_expression_count: usize = 0,
     returning_all: bool = false,
@@ -942,6 +944,12 @@ pub const LoweredInsertSource = struct {
         }
         if (self.ctes.len > 0) alloc.free(self.ctes);
         self.insert_source.deinit(alloc);
+        for (self.literal_source_rows) |row| alloc.free(row);
+        if (self.literal_source_rows.len > 0) alloc.free(self.literal_source_rows);
+        for (self.literal_source_row_scalar_subqueries) |row_scalar_subqueries| {
+            freeScalarSubqueryProjections(alloc, row_scalar_subqueries);
+        }
+        if (self.literal_source_row_scalar_subqueries.len > 0) alloc.free(self.literal_source_row_scalar_subqueries);
         self.* = undefined;
     }
 };

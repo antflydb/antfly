@@ -2465,6 +2465,10 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .finish_secondary_index_rebuild_range = request });
     }
 
+    pub fn saveSecondaryIndexRebuildRangeProgress(self: *MetadataService, request: metadata_table_manager.SecondaryIndexRebuildRangeProgressRequest) !void {
+        try self.proposeTransitionCommand(.{ .save_secondary_index_rebuild_range_progress = request });
+    }
+
     pub fn invalidateSecondaryIndexRebuildRange(self: *MetadataService, request: metadata_table_manager.SecondaryIndexRebuildRangeInvalidateRequest) !void {
         try self.proposeTransitionCommand(.{ .invalidate_secondary_index_rebuild_range = request });
     }
@@ -4210,6 +4214,10 @@ pub const MetadataHttpService = struct {
 
     pub fn finishSecondaryIndexRebuildRange(self: *MetadataHttpService, request: metadata_table_manager.SecondaryIndexRebuildRangeFinishRequest) !void {
         try self.proposeTransitionCommand(.{ .finish_secondary_index_rebuild_range = request });
+    }
+
+    pub fn saveSecondaryIndexRebuildRangeProgress(self: *MetadataHttpService, request: metadata_table_manager.SecondaryIndexRebuildRangeProgressRequest) !void {
+        try self.proposeTransitionCommand(.{ .save_secondary_index_rebuild_range_progress = request });
     }
 
     pub fn invalidateSecondaryIndexRebuildRange(self: *MetadataHttpService, request: metadata_table_manager.SecondaryIndexRebuildRangeInvalidateRequest) !void {
@@ -6049,6 +6057,10 @@ fn catalogSourceVTable(comptime Service: type) catalog_source.CatalogSource.VTab
             return try service(ptr).finishSecondaryIndexRebuildRange(request);
         }
 
+        fn saveSecondaryIndexRebuildRangeProgress(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeProgressRequest) !void {
+            return try service(ptr).saveSecondaryIndexRebuildRangeProgress(request);
+        }
+
         fn invalidateSecondaryIndexRebuildRange(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeInvalidateRequest) !void {
             return try service(ptr).invalidateSecondaryIndexRebuildRange(request);
         }
@@ -6174,6 +6186,7 @@ fn catalogSourceVTable(comptime Service: type) catalog_source.CatalogSource.VTab
         .free_admin_snapshot = Gen.freeAdminSnapshot,
         .begin_secondary_index_rebuild_range = Gen.beginSecondaryIndexRebuildRange,
         .finish_secondary_index_rebuild_range = Gen.finishSecondaryIndexRebuildRange,
+        .save_secondary_index_rebuild_range_progress = Gen.saveSecondaryIndexRebuildRangeProgress,
         .invalidate_secondary_index_rebuild_range = Gen.invalidateSecondaryIndexRebuildRange,
         .begin_schema_rewrite_job = Gen.beginSchemaRewriteJob,
         .finish_schema_rewrite_job = Gen.finishSchemaRewriteJob,
@@ -12948,6 +12961,40 @@ test "metadata service secondary index promotion command uses schema compare and
         },
     });
     defer std.testing.allocator.free(table_cmd);
+    const left_range_cmd = try metadata_storage.encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = .{ .group_id = 9001, .range_id = 9101, .table_id = 41, .start_key = "", .end_key = "order:m" },
+    });
+    defer std.testing.allocator.free(left_range_cmd);
+    const right_range_cmd = try metadata_storage.encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = .{ .group_id = 9002, .range_id = 9102, .table_id = 41, .start_key = "order:m", .end_key = null },
+    });
+    defer std.testing.allocator.free(right_range_cmd);
+    const left_rebuild_cmd = try metadata_storage.encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_secondary_index_rebuild_range = .{
+            .table_id = 41,
+            .index_name = "status",
+            .index_generation = 42,
+            .start_row_key = "",
+            .end_row_key = "order:m",
+            .group_id = 9001,
+            .range_id = 9101,
+            .state = metadata_table_manager.secondary_index_rebuild_ready,
+        },
+    });
+    defer std.testing.allocator.free(left_rebuild_cmd);
+    const right_rebuild_cmd = try metadata_storage.encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_secondary_index_rebuild_range = .{
+            .table_id = 41,
+            .index_name = "status",
+            .index_generation = 42,
+            .start_row_key = "order:m",
+            .end_row_key = null,
+            .group_id = 9002,
+            .range_id = 9102,
+            .state = metadata_table_manager.secondary_index_rebuild_ready,
+        },
+    });
+    defer std.testing.allocator.free(right_rebuild_cmd);
     const stale_promote_cmd = try metadata_storage.encodeTransitionCommand(std.testing.allocator, .{
         .promote_secondary_index_ready = .{
             .table_id = 41,
@@ -12979,8 +13026,12 @@ test "metadata service secondary index promotion command uses schema compare and
 
     const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_cmd },
-        .{ .term = 1, .index = 2, .entry_type = .normal, .data = stale_promote_cmd },
-        .{ .term = 1, .index = 3, .entry_type = .normal, .data = ready_promote_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = left_range_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = right_range_cmd },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = left_rebuild_cmd },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = right_rebuild_cmd },
+        .{ .term = 1, .index = 6, .entry_type = .normal, .data = stale_promote_cmd },
+        .{ .term = 1, .index = 7, .entry_type = .normal, .data = ready_promote_cmd },
     });
     defer std.testing.allocator.free(encoded_entries);
 
@@ -12988,7 +13039,7 @@ test "metadata service secondary index promotion command uses schema compare and
     defer store.deinit();
     try store.snapshotBuilder().applyBatch(.{
         .group_id = 41,
-        .commit_index = 3,
+        .commit_index = 7,
         .entries_bytes = encoded_entries,
     });
     const tables = try store.listTables(std.testing.allocator, 41);

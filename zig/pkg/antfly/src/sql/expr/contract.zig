@@ -139,6 +139,7 @@ pub fn expressionFamily(kind: runtime_schema.RelationalRowsExpressionKind) Typed
         .ascii,
         .chr,
         .md5,
+        .soundex,
         .like,
         .ilike,
         .concat,

@@ -95,8 +95,60 @@ pub const SequenceDefaultResolver = struct {
     }
 };
 
+pub const ScalarSubqueryDefaultRequest = struct {
+    query_json: []const u8,
+};
+
+pub const ScalarSubqueryDefaultPlan = struct {
+    table_name: []const u8,
+    output_field: []const u8,
+    query: db_mod.types.RelationalRowsQueryRequest,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.table_name.len > 0) alloc.free(@constCast(self.table_name));
+        if (self.output_field.len > 0) alloc.free(@constCast(self.output_field));
+        self.query.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+const ScalarDefaultWherePlan = struct {
+    predicates: []const runtime_schema.RelationalCheck = &.{},
+    in_predicates: []const db_mod.types.RelationalRowsInPredicate = &.{},
+    or_predicates: []const db_mod.types.RelationalRowsPredicateGroup = &.{},
+    not_predicates: []const db_mod.types.RelationalRowsPredicateGroup = &.{},
+};
+
+const ScalarDefaultSourceBinding = struct {
+    table_name: []const u8,
+    alias: []const u8 = "",
+};
+
+const ScalarDefaultTokenizedProjection = union(enum) {
+    field: struct {
+        raw_field: []const u8,
+        alias: []const u8 = "",
+    },
+    simple_expression: struct {
+        kind: db_mod.types.RelationalRowsExpressionKind,
+        raw_field: []const u8,
+        output: []const u8,
+        value_json: ?[]const u8 = null,
+    },
+};
+
+pub const ScalarSubqueryDefaultResolver = struct {
+    ptr: *anyopaque,
+    value_json_alloc: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: ScalarSubqueryDefaultRequest) anyerror![]u8,
+
+    pub fn valueJsonAlloc(self: @This(), alloc: std.mem.Allocator, request: ScalarSubqueryDefaultRequest) ![]u8 {
+        return try self.value_json_alloc(self.ptr, alloc, request);
+    }
+};
+
 pub const DefaultValueContext = struct {
     sequence_resolver: ?SequenceDefaultResolver = null,
+    scalar_subquery_resolver: ?ScalarSubqueryDefaultResolver = null,
 };
 
 pub const OwnedRowsGetRequest = struct {
@@ -504,6 +556,28 @@ pub fn buildRowsInsertSourceBatchFromDbAcrossRangesAlloc(
     conflict_resolver: ?UniqueSelectorResolver,
 ) !OwnedRowsBatchRequest {
     if (req.source.source_cte.len != 0) return error.InvalidRowsRequest;
+    if (req.source.scalar_subqueries.len != 0) {
+        var scalar_subqueries = try alloc.alloc(db_mod.types.RelationalRowsScalarSubqueryProjection, req.source.scalar_subqueries.len);
+        defer alloc.free(scalar_subqueries);
+        for (req.source.scalar_subqueries, 0..) |projection, i| {
+            scalar_subqueries[i] = projection;
+            scalar_subqueries[i].hidden = false;
+        }
+        var source_query = req.source;
+        source_query.scalar_subqueries = scalar_subqueries;
+        var source_result = try db.queryRelationalRowsAcrossRanges(alloc, source_schema, source_query, source_ranges);
+        defer source_result.deinit(alloc);
+        return try buildRowsInsertSourceBatchFromSelectedRowsWithSchemasAndDefaultContextAlloc(
+            alloc,
+            table_name,
+            target_schema,
+            source_schema,
+            req,
+            source_result.rows,
+            conflict_resolver,
+            .{},
+        );
+    }
     const source_preimages = try db.collectRelationalRowsPreimagesAcrossRangesAlloc(alloc, source_schema, req.source, source_ranges);
     defer db_mod.types.freeRelationalRowsCollectedRows(alloc, source_preimages);
 
@@ -521,6 +595,334 @@ pub fn buildRowsInsertSourceBatchFromDbAcrossRangesAlloc(
         conflict_resolver,
         .{},
     );
+}
+
+pub fn buildRowsInsertSourceBatchFromLiteralRowsDbAcrossRangesAlloc(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    req: db_mod.types.RelationalRowsInsertSourceRequest,
+    literal_source_rows: []const []const u8,
+    source_ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    conflict_resolver: ?UniqueSelectorResolver,
+) !OwnedRowsBatchRequest {
+    return try buildRowsInsertSourceBatchFromLiteralRowsDbAcrossRangesAndDefaultContextAlloc(
+        alloc,
+        db,
+        table_name,
+        target_schema,
+        source_schema,
+        req,
+        literal_source_rows,
+        source_ranges,
+        conflict_resolver,
+        .{},
+    );
+}
+
+pub fn buildRowsInsertSourceBatchFromLiteralRowsDbAcrossRangesAndRowScalarSubqueriesAlloc(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    req: db_mod.types.RelationalRowsInsertSourceRequest,
+    literal_source_rows: []const []const u8,
+    literal_source_row_scalar_subqueries: []const []const db_mod.types.RelationalRowsScalarSubqueryProjection,
+    source_ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    conflict_resolver: ?UniqueSelectorResolver,
+) !OwnedRowsBatchRequest {
+    return try buildRowsInsertSourceBatchFromLiteralRowsDbAcrossRangesAndDefaultContextAndRowScalarSubqueriesAlloc(
+        alloc,
+        db,
+        table_name,
+        target_schema,
+        source_schema,
+        req,
+        literal_source_rows,
+        literal_source_row_scalar_subqueries,
+        source_ranges,
+        conflict_resolver,
+        .{},
+    );
+}
+
+pub fn buildRowsInsertSourceBatchFromLiteralRowsDbAcrossRangesAndDefaultContextAlloc(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    req: db_mod.types.RelationalRowsInsertSourceRequest,
+    literal_source_rows: []const []const u8,
+    source_ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    conflict_resolver: ?UniqueSelectorResolver,
+    default_context: DefaultValueContext,
+) !OwnedRowsBatchRequest {
+    return try buildRowsInsertSourceBatchFromLiteralRowsDbAcrossRangesAndDefaultContextAndRowScalarSubqueriesAlloc(
+        alloc,
+        db,
+        table_name,
+        target_schema,
+        source_schema,
+        req,
+        literal_source_rows,
+        &.{},
+        source_ranges,
+        conflict_resolver,
+        default_context,
+    );
+}
+
+pub fn buildRowsInsertSourceBatchFromLiteralRowsDbAcrossRangesAndDefaultContextAndRowScalarSubqueriesAlloc(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    req: db_mod.types.RelationalRowsInsertSourceRequest,
+    literal_source_rows: []const []const u8,
+    literal_source_row_scalar_subqueries: []const []const db_mod.types.RelationalRowsScalarSubqueryProjection,
+    source_ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    conflict_resolver: ?UniqueSelectorResolver,
+    default_context: DefaultValueContext,
+) !OwnedRowsBatchRequest {
+    if (literal_source_rows.len == 0) return error.InvalidRowsRequest;
+    if (req.source.source_cte.len != 0) return error.InvalidRowsRequest;
+    if (literal_source_row_scalar_subqueries.len != 0 and literal_source_row_scalar_subqueries.len != literal_source_rows.len) return error.InvalidRowsRequest;
+
+    const materialized_rows = try literalRowsWithHiddenScalarSubqueriesFromDbAlloc(
+        alloc,
+        db,
+        source_schema,
+        req.source.scalar_subqueries,
+        literal_source_row_scalar_subqueries,
+        literal_source_rows,
+        source_ranges,
+    );
+    defer freeStringSlice(alloc, materialized_rows);
+
+    return try buildRowsInsertSourceBatchWithSchemasAndDefaultContextAlloc(
+        alloc,
+        table_name,
+        target_schema,
+        source_schema,
+        req,
+        materialized_rows,
+        conflict_resolver,
+        default_context,
+    );
+}
+
+fn literalRowsWithHiddenScalarSubqueriesFromDbAlloc(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    source_schema: runtime_schema.TableSchema,
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
+    row_scalar_subqueries: []const []const db_mod.types.RelationalRowsScalarSubqueryProjection,
+    literal_source_rows: []const []const u8,
+    source_ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+) ![]const []const u8 {
+    const rows = try alloc.alloc([]const u8, literal_source_rows.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (rows[0..initialized]) |row| alloc.free(row);
+        alloc.free(rows);
+    }
+
+    for (literal_source_rows, 0..) |row_json, i| {
+        const effective_scalar_subqueries = if (row_scalar_subqueries.len != 0 and row_scalar_subqueries[i].len != 0) row_scalar_subqueries[i] else scalar_subqueries;
+        rows[i] = if (!hiddenScalarSubqueriesPresent(effective_scalar_subqueries))
+            try alloc.dupe(u8, row_json)
+        else
+            try rowJsonWithHiddenScalarSubqueriesFromDbAlloc(alloc, db, source_schema, row_json, effective_scalar_subqueries, source_ranges);
+        initialized += 1;
+    }
+    return rows;
+}
+
+const LiteralScalarSubqueryValue = struct {
+    output: []const u8,
+    value_json: []const u8,
+};
+
+fn hiddenScalarSubqueriesPresent(scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection) bool {
+    for (scalar_subqueries) |projection| {
+        if (projection.hidden) return true;
+    }
+    return false;
+}
+
+fn rowJsonWithHiddenScalarSubqueriesFromDbAlloc(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    source_schema: runtime_schema.TableSchema,
+    row_json: []const u8,
+    scalar_subqueries: []const db_mod.types.RelationalRowsScalarSubqueryProjection,
+    source_ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+) ![]const u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRowsRequest;
+
+    var scalar_values = std.ArrayListUnmanaged(LiteralScalarSubqueryValue).empty;
+    defer {
+        for (scalar_values.items) |value| alloc.free(value.value_json);
+        scalar_values.deinit(alloc);
+    }
+
+    for (scalar_subqueries) |projection| {
+        if (!projection.hidden) continue;
+        const value_json = try scalarSubqueryProjectionValueJsonFromDbAlloc(alloc, db, source_schema, parsed.value, projection, source_ranges);
+        errdefer alloc.free(value_json);
+        try scalar_values.append(alloc, .{
+            .output = projection.output,
+            .value_json = value_json,
+        });
+    }
+    return try rowJsonWithHiddenScalarValuesFromParsedAlloc(alloc, parsed.value, scalar_values.items);
+}
+
+fn scalarSubqueryProjectionValueJsonFromDbAlloc(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    source_schema: runtime_schema.TableSchema,
+    outer_row: std.json.Value,
+    projection: db_mod.types.RelationalRowsScalarSubqueryProjection,
+    source_ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+) ![]const u8 {
+    var query = projection.query;
+    var correlated_predicates: []runtime_schema.RelationalCheck = &.{};
+    defer freeOwnedRelationalChecks(alloc, correlated_predicates);
+    var combined_predicates: []runtime_schema.RelationalCheck = &.{};
+    defer if (combined_predicates.len > 0) alloc.free(combined_predicates);
+    if (projection.correlations.len != 0) {
+        correlated_predicates = try lateralCorrelationPredicatesAlloc(alloc, outer_row, projection.correlations);
+        if (correlated_predicates.len != projection.correlations.len) return try alloc.dupe(u8, "null");
+        combined_predicates = try combinedBorrowedAndOwnedRelationalChecksAlloc(alloc, projection.query.predicates, correlated_predicates);
+        query.predicates = combined_predicates;
+    }
+
+    var result = try db.queryRelationalRowsAcrossRanges(alloc, source_schema, query, source_ranges);
+    defer result.deinit(alloc);
+    if (result.rows.len > 1) return error.InvalidRowsRequest;
+    if (result.rows.len == 0) return try alloc.dupe(u8, "null");
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, result.rows[0], .{}) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    const value = jsonValueAtPath(parsed.value, projection.output_field) orelse return try alloc.dupe(u8, "null");
+    return try jsonValueStringifyAlloc(alloc, value.*);
+}
+
+fn lateralCorrelationPredicatesAlloc(
+    alloc: std.mem.Allocator,
+    left_row: std.json.Value,
+    correlations: []const db_mod.types.RelationalRowsLateralCorrelation,
+) ![]runtime_schema.RelationalCheck {
+    const predicates = try alloc.alloc(runtime_schema.RelationalCheck, correlations.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeOwnedRelationalCheckContents(alloc, predicates[0..initialized]);
+        alloc.free(predicates);
+    }
+    for (correlations) |correlation| {
+        const selected = jsonValueAtPath(left_row, correlation.left_field) orelse break;
+        if (selected.* == .null) break;
+        const value_json = switch (selected.*) {
+            .bool, .integer, .float, .string => try jsonValueStringifyAlloc(alloc, selected.*),
+            else => return error.InvalidRowsRequest,
+        };
+        var value_transferred = false;
+        errdefer if (!value_transferred) alloc.free(value_json);
+        const name = try alloc.dupe(u8, "");
+        var name_transferred = false;
+        errdefer if (!name_transferred) alloc.free(name);
+        const field = try alloc.dupe(u8, correlation.right_field);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        predicates[initialized] = .{
+            .name = name,
+            .field = field,
+            .op = correlation.op,
+            .value_json = value_json,
+        };
+        initialized += 1;
+        name_transferred = true;
+        field_transferred = true;
+        value_transferred = true;
+    }
+    if (initialized != correlations.len) {
+        freeOwnedRelationalCheckContents(alloc, predicates[0..initialized]);
+        alloc.free(predicates);
+        return &.{};
+    }
+    return predicates;
+}
+
+fn combinedBorrowedAndOwnedRelationalChecksAlloc(
+    alloc: std.mem.Allocator,
+    borrowed: []const runtime_schema.RelationalCheck,
+    owned: []const runtime_schema.RelationalCheck,
+) ![]runtime_schema.RelationalCheck {
+    const combined = try alloc.alloc(runtime_schema.RelationalCheck, borrowed.len + owned.len);
+    @memcpy(combined[0..borrowed.len], borrowed);
+    @memcpy(combined[borrowed.len..], owned);
+    return combined;
+}
+
+fn freeOwnedRelationalChecks(alloc: std.mem.Allocator, checks: []const runtime_schema.RelationalCheck) void {
+    freeOwnedRelationalCheckContents(alloc, checks);
+    if (checks.len > 0) alloc.free(checks);
+}
+
+fn freeOwnedRelationalCheckContents(alloc: std.mem.Allocator, checks: []const runtime_schema.RelationalCheck) void {
+    for (checks) |check| {
+        if (check.name.len > 0) alloc.free(@constCast(check.name));
+        if (check.field.len > 0) alloc.free(@constCast(check.field));
+        if (check.value_json) |value_json| if (value_json.len > 0) alloc.free(@constCast(value_json));
+    }
+}
+
+fn rowJsonWithHiddenScalarValuesAlloc(
+    alloc: std.mem.Allocator,
+    row_json: []const u8,
+    scalar_values: []const LiteralScalarSubqueryValue,
+) ![]const u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRowsRequest;
+    return try rowJsonWithHiddenScalarValuesFromParsedAlloc(alloc, parsed.value, scalar_values);
+}
+
+fn rowJsonWithHiddenScalarValuesFromParsedAlloc(
+    alloc: std.mem.Allocator,
+    row_value: std.json.Value,
+    scalar_values: []const LiteralScalarSubqueryValue,
+) ![]const u8 {
+    if (row_value != .object) return error.InvalidRowsRequest;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('{');
+    var first = true;
+    for (row_value.object.keys(), row_value.object.values()) |field, value| {
+        for (scalar_values) |scalar_value| {
+            if (std.mem.eql(u8, field, scalar_value.output)) return error.InvalidRowsRequest;
+        }
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try writer.print("{f}:", .{std.json.fmt(field, .{})});
+        try std.json.Stringify.value(value, .{}, writer);
+    }
+    for (scalar_values) |scalar_value| {
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try writer.print("{f}:{s}", .{ std.json.fmt(scalar_value.output, .{}), scalar_value.value_json });
+    }
+    try writer.writeByte('}');
+    return try out.toOwnedSlice();
 }
 
 pub fn buildRowsInsertSourcePlanBatchOnJsonRowsAlloc(
@@ -2093,7 +2495,7 @@ fn parseRowsQueryStreamRequest(
     }) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidRowsRequest;
-    try requireJsonObjectOnlyKeys(parsed.value.object, &.{ "source_cte", "where", "expression_where", "expression_any", "expression_not", "expression_array_contains", "select", "json_extract", "array_length", "coalesce", "field_aliases", "expressions", "scalar_subqueries", "distinct_on", "distinct_on_expressions", "order_by", "limit", "offset", "row_claim", "doc_key_range" });
+    try requireJsonObjectOnlyKeys(parsed.value.object, &.{ "source_cte", "where", "expression_where", "expression_any", "expression_not", "expression_array_contains", "select", "json_extract", "array_length", "coalesce", "field_aliases", "expressions", "scalar_subqueries", "distinct_on", "distinct_on_expressions", "order_by", "limit", "offset", "total_mode", "profile", "row_claim", "doc_key_range" });
 
     const source_cte = try parseRowsQuerySourceCteAlloc(alloc, parsed.value.object.get("source_cte"));
     errdefer if (source_cte.len > 0) alloc.free(source_cte);
@@ -2237,7 +2639,18 @@ fn parseRowsQueryStreamRequest(
         .doc_key_range = doc_key_range,
         .limit = try parseOptionalU32(parsed.value.object.get("limit")),
         .offset = (try parseOptionalU32(parsed.value.object.get("offset"))) orelse 0,
+        .total_mode = try parseRowsQueryTotalMode(parsed.value.object.get("total_mode")),
+        .profile = (try parseOptionalBool(parsed.value.object.get("profile"))) orelse false,
     };
+}
+
+fn parseRowsQueryTotalMode(maybe_value: ?std.json.Value) !db_mod.types.RelationalRowsQueryRequest.TotalMode {
+    const value = maybe_value orelse return .exact;
+    if (value != .string) return error.InvalidRowsRequest;
+    if (std.mem.eql(u8, value.string, "exact")) return .exact;
+    if (std.mem.eql(u8, value.string, "bounded")) return .bounded;
+    if (std.mem.eql(u8, value.string, "none")) return .none;
+    return error.InvalidRowsRequest;
 }
 
 fn rowsQueryExpressionsEqual(lhs: db_mod.types.RelationalRowsExpression, rhs: db_mod.types.RelationalRowsExpression) bool {
@@ -2707,16 +3120,25 @@ fn encodeRowsMutationSourceQueryRequest(writer: *std.Io.Writer, req: db_mod.type
 }
 
 fn encodeRowsMutationSourceWhere(writer: *std.Io.Writer, req: db_mod.types.RelationalRowsQueryRequest) !void {
-    const grouped = req.predicates.len != 1 or req.or_predicates.len != 0 or req.not_predicates.len != 0;
-    if (!grouped) return try encodeRowsMutationSourcePredicate(writer, req.predicates[0]);
+    const scalar_atoms = req.predicates.len + req.in_predicates.len;
+    const grouped = scalar_atoms != 1 or req.or_predicates.len != 0 or req.not_predicates.len != 0;
+    if (!grouped and req.predicates.len == 1) return try encodeRowsMutationSourcePredicate(writer, req.predicates[0]);
+    if (!grouped and req.in_predicates.len == 1) return try encodeRowsMutationSourceInPredicate(writer, req.in_predicates[0]);
 
     try writer.writeByte('{');
     var wrote = false;
-    if (req.predicates.len != 0) {
+    if (req.predicates.len != 0 or req.in_predicates.len != 0) {
         try writer.writeAll("\"all\":[");
-        for (req.predicates, 0..) |predicate, i| {
+        var i: usize = 0;
+        for (req.predicates) |predicate| {
             if (i > 0) try writer.writeByte(',');
             try encodeRowsMutationSourcePredicate(writer, predicate);
+            i += 1;
+        }
+        for (req.in_predicates) |predicate| {
+            if (i > 0) try writer.writeByte(',');
+            try encodeRowsMutationSourceInPredicate(writer, predicate);
+            i += 1;
         }
         try writer.writeByte(']');
         wrote = true;
@@ -2769,6 +3191,17 @@ fn encodeRowsMutationSourcePredicate(writer: *std.Io.Writer, predicate: runtime_
     } else if (predicate.value_json != null) {
         return error.UnsupportedOperation;
     }
+    try writer.writeByte('}');
+}
+
+fn encodeRowsMutationSourceInPredicate(writer: *std.Io.Writer, predicate: db_mod.types.RelationalRowsInPredicate) !void {
+    if (predicate.field.len == 0 or predicate.values_json.len == 0) return error.UnsupportedOperation;
+    try writer.writeByte('{');
+    try writer.print("\"field\":{f},\"op\":{f},\"value\":", .{
+        std.json.fmt(predicate.field, .{}),
+        std.json.fmt(if (predicate.negated) "not_in" else "in", .{}),
+    });
+    try writer.writeAll(predicate.values_json);
     try writer.writeByte('}');
 }
 
@@ -4411,10 +4844,41 @@ pub fn executeRowsQueryOnJsonRowsAlloc(
         projected_transferred = true;
     }
 
+    const total_shape = rowsQueryTotalShape(total, out_rows.items.len, request.offset, request.limit, request.total_mode);
     return .{
         .rows = try out_rows.toOwnedSlice(alloc),
-        .total = total,
+        .total = total_shape.total,
+        .total_exact = total_shape.total_exact,
+        .include_profile = request.profile,
     };
+}
+
+const RowsQueryTotalShape = struct {
+    total: u32,
+    total_exact: bool,
+};
+
+fn rowsQueryTotalShape(
+    exact_total: u32,
+    returned_len: usize,
+    offset: u32,
+    limit: ?u32,
+    total_mode: db_mod.types.RelationalRowsQueryRequest.TotalMode,
+) RowsQueryTotalShape {
+    switch (total_mode) {
+        .exact => return .{ .total = exact_total, .total_exact = true },
+        .bounded => {
+            const page_limit = limit orelse return .{ .total = exact_total, .total_exact = true };
+            if (returned_len < @as(usize, page_limit)) return .{ .total = exact_total, .total_exact = true };
+            const bound = @min(@as(u64, exact_total), @as(u64, offset) + @as(u64, page_limit));
+            return .{ .total = @intCast(bound), .total_exact = false };
+        },
+        .none => {
+            const page_limit = limit orelse return .{ .total = exact_total, .total_exact = true };
+            if (returned_len < @as(usize, page_limit)) return .{ .total = exact_total, .total_exact = true };
+            return .{ .total = @intCast(returned_len), .total_exact = false };
+        },
+    }
 }
 
 pub fn buildLakeRowsScanRequestForRowsQueryAlloc(
@@ -4633,11 +5097,15 @@ pub fn buildRowsQueryResultFromLakeRowsWithSchemaAlloc(
         rows.appendAssumeCapacity(encoded);
     }
 
+    const exact_total: u32 = if (request.distinct_on.len > 0 or request.distinct_on_expressions.len > 0)
+        @intCast(candidate_indexes.items.len)
+    else if (!has_residual_predicates and !has_doc_key_range) result.total else @intCast(filtered_rows.len);
+    const total_shape = rowsQueryTotalShape(exact_total, rows.items.len, request.offset, request.limit, request.total_mode);
     return .{
         .rows = try rows.toOwnedSlice(alloc),
-        .total = if (request.distinct_on.len > 0 or request.distinct_on_expressions.len > 0)
-            @intCast(candidate_indexes.items.len)
-        else if (!has_residual_predicates and !has_doc_key_range) result.total else @intCast(filtered_rows.len),
+        .total = total_shape.total,
+        .total_exact = total_shape.total_exact,
+        .include_profile = request.profile,
     };
 }
 
@@ -7436,7 +7904,9 @@ pub fn encodeRowsQueryResponseWithResultSchemaAlloc(
     errdefer out.deinit();
     const writer = &out.writer;
     try writer.print("{{\"total\":{d}", .{result.total});
+    if (!result.total_exact) try writer.writeAll(",\"total_exact\":false");
     try appendRowsResultColumnsJson(writer, result_schema);
+    if (result.include_profile) try appendRowsQueryProfileJson(writer, result.profile);
     try writer.writeAll(",\"rows\":[");
     for (result.rows, 0..) |row, i| {
         if (i != 0) try writer.writeByte(',');
@@ -7444,6 +7914,86 @@ pub fn encodeRowsQueryResponseWithResultSchemaAlloc(
     }
     try writer.writeAll("]}");
     return try out.toOwnedSlice();
+}
+
+fn appendRowsQueryProfileJson(
+    writer: *std.Io.Writer,
+    profile: db_mod.types.RelationalRowsQueryResult.Profile,
+) !void {
+    try writer.print(
+        ",\"profile\":{{\"access_method\":\"{s}\",\"fallback_reason\":\"{s}\",\"index_entries_scanned\":{d},\"candidate_rows\":{d},\"candidate_gate_limit\":{d},\"candidate_gate_observed\":{d},\"iterator_seeks\":{d},\"hydrated_rows\":{d},\"residual_rechecks\":{d},\"covering_payload_rows\":{d},\"projected_rows\":{d}",
+        .{
+            rowsQueryAccessMethodName(profile.access_method),
+            rowsQueryFallbackReasonName(profile.fallback_reason),
+            profile.index_entries_scanned,
+            profile.candidate_rows,
+            profile.candidate_gate_limit,
+            profile.candidate_gate_observed,
+            profile.iterator_seeks,
+            profile.hydrated_rows,
+            profile.residual_rechecks,
+            profile.covering_payload_rows,
+            profile.projected_rows,
+        },
+    );
+    if (profile.ordered_tuple_plan_selected) {
+        try writer.print(
+            ",\"ordered_tuple\":{{\"catalog_ordinal\":{d},\"index_generation\":{d},\"key_count\":{d},\"equality_prefix_len\":{d},\"filter_predicates\":{d},\"proven_predicates\":{d},\"residual_predicates\":{d}",
+            .{
+                profile.ordered_tuple_catalog_ordinal,
+                profile.ordered_tuple_index_generation,
+                profile.ordered_tuple_key_count,
+                profile.ordered_tuple_equality_prefix_len,
+                profile.ordered_tuple_filter_predicates,
+                profile.ordered_tuple_proven_predicates,
+                profile.ordered_tuple_residual_predicates,
+            },
+        );
+        if (profile.ordered_tuple_range_key_index == std.math.maxInt(u32)) {
+            try writer.writeAll(",\"range_key_index\":null");
+        } else {
+            try writer.print(",\"range_key_index\":{d}", .{profile.ordered_tuple_range_key_index});
+        }
+        try writer.print(
+            ",\"lower_tuple_bytes\":{d},\"upper_tuple_bytes\":{d},\"prefix_scan\":{any}}}",
+            .{
+                profile.ordered_tuple_lower_tuple_bytes,
+                profile.ordered_tuple_upper_tuple_bytes,
+                profile.ordered_tuple_prefix_scan,
+            },
+        );
+    }
+    try writer.writeByte('}');
+}
+
+fn rowsQueryAccessMethodName(method: db_mod.types.RelationalRowsQueryResult.AccessMethod) []const u8 {
+    return switch (method) {
+        .unknown => "unknown",
+        .base_scan => "base_scan",
+        .resolved_doc_set => "resolved_doc_set",
+        .ordered_tuple_doc_set => "ordered_tuple_doc_set",
+        .ordered_tuple_stream => "ordered_tuple_stream",
+    };
+}
+
+fn rowsQueryFallbackReasonName(reason: db_mod.types.RelationalRowsQueryResult.FallbackReason) []const u8 {
+    return switch (reason) {
+        .none => "none",
+        .ordered_tuple_skipped_for_exact_paged_total => "ordered_tuple_skipped_for_exact_paged_total",
+        .ordered_tuple_candidate_gate => "ordered_tuple_candidate_gate",
+        .ordered_tuple_materialization_cap => "ordered_tuple_materialization_cap",
+        .ordered_tuple_ordering_not_covered => "ordered_tuple_ordering_not_covered",
+        .ordered_tuple_index_not_ready => "ordered_tuple_index_not_ready",
+        .ordered_tuple_stale_generation => "ordered_tuple_stale_generation",
+        .ordered_tuple_access_method_mismatch => "ordered_tuple_access_method_mismatch",
+        .ordered_tuple_predicate_not_proven => "ordered_tuple_predicate_not_proven",
+        .ordered_tuple_no_usable_bounds => "ordered_tuple_no_usable_bounds",
+        .ordered_tuple_order_field_not_covered => "ordered_tuple_order_field_not_covered",
+        .ordered_tuple_order_direction_not_covered => "ordered_tuple_order_direction_not_covered",
+        .ordered_tuple_order_nulls_not_covered => "ordered_tuple_order_nulls_not_covered",
+        .ordered_tuple_order_collation_not_covered => "ordered_tuple_order_collation_not_covered",
+        .ordered_tuple_collation_not_supported => "ordered_tuple_collation_not_supported",
+    };
 }
 
 pub fn encodeRowsJoinedMutationSourceCollectResponseAlloc(
@@ -8677,7 +9227,7 @@ fn rowsExpressionOutputNullableWithSources(
             if (expression.operands.len < 2) return error.InvalidRowsRequest;
             return try rowsExpressionOutputNullableWithSources(alloc, schema, source_schema, expression.operands[0]);
         },
-        .lower, .upper, .initcap, .trim, .ltrim, .rtrim, .replace, .translate, .substring, .overlay, .split_part, .left, .right, .lpad, .rpad, .repeat, .reverse, .chr, .md5, .json_typeof, .array_to_string, .regexp_replace, .starts_with, .ends_with, .like, .ilike, .regexp_match, .bool_and, .bool_or, .bool_not, .json_path_exists, .length, .octet_length, .bit_length, .strpos, .ascii, .regexp_count, .regexp_instr, .abs, .round, .trunc, .floor, .ceil, .sqrt, .sign, .power, .mul, .div, .mod, .json_array_length, .array_length, .array_position, .interval_ns, .interval_months, .date_part, .add, .sub, .date_trunc, .date_bin, .to_jsonb, .array_positions, .array_append, .array_prepend, .array_cat, .array_remove, .array_replace, .string_to_array => {
+        .lower, .upper, .initcap, .trim, .ltrim, .rtrim, .replace, .translate, .substring, .overlay, .split_part, .left, .right, .lpad, .rpad, .repeat, .reverse, .chr, .md5, .soundex, .json_typeof, .array_to_string, .regexp_replace, .starts_with, .ends_with, .like, .ilike, .regexp_match, .bool_and, .bool_or, .bool_not, .json_path_exists, .length, .octet_length, .bit_length, .strpos, .ascii, .regexp_count, .regexp_instr, .abs, .round, .trunc, .floor, .ceil, .sqrt, .sign, .power, .mul, .div, .mod, .json_array_length, .array_length, .array_position, .interval_ns, .interval_months, .date_part, .add, .sub, .date_trunc, .date_bin, .to_jsonb, .array_positions, .array_append, .array_prepend, .array_cat, .array_remove, .array_replace, .string_to_array => {
             return try rowsExpressionAnyOperandNullableWithSources(alloc, schema, source_schema, expression.operands);
         },
     }
@@ -8720,7 +9270,7 @@ fn rowsExpressionOutputTypeWithSources(
             };
         },
         .now, .date_trunc, .date_bin => return .datetime,
-        .uuid_v4, .lower, .upper, .initcap, .trim, .ltrim, .rtrim, .replace, .translate, .substring, .overlay, .split_part, .left, .right, .lpad, .rpad, .repeat, .reverse, .chr, .md5, .concat, .concat_ws, .json_typeof, .array_to_string, .regexp_replace, .regexp_substr => return .keyword,
+        .uuid_v4, .lower, .upper, .initcap, .trim, .ltrim, .rtrim, .replace, .translate, .substring, .overlay, .split_part, .left, .right, .lpad, .rpad, .repeat, .reverse, .chr, .md5, .soundex, .concat, .concat_ws, .json_typeof, .array_to_string, .regexp_replace, .regexp_substr => return .keyword,
         .starts_with, .ends_with, .like, .ilike, .regexp_match, .bool_and, .bool_or, .bool_not, .json_path_exists => return .boolean,
         .nullif => {
             if (expression.operands.len != 2) return error.InvalidRowsRequest;
@@ -13400,6 +13950,8 @@ fn parseRowsExpressionWithScalarOutputsAlloc(
         .chr
     else if (std.mem.eql(u8, op.string, "md5"))
         .md5
+    else if (std.mem.eql(u8, op.string, "soundex"))
+        .soundex
     else if (std.mem.eql(u8, op.string, "like"))
         .like
     else if (std.mem.eql(u8, op.string, "ilike"))
@@ -13512,7 +14064,7 @@ fn parseRowsExpressionWithScalarOutputsAlloc(
         .json_path_exists => try requireJsonObjectOnlyKeys(value.object, &.{ "op", "args", "path" }),
         else => try requireJsonObjectOnlyKeys(value.object, &.{ "op", "args" }),
     }
-    if ((expression_kind == .lower or expression_kind == .upper or expression_kind == .initcap or expression_kind == .length or expression_kind == .octet_length or expression_kind == .bit_length or expression_kind == .ascii or expression_kind == .chr or expression_kind == .md5) and args_value.array.items.len != 1) return error.InvalidRowsRequest;
+    if ((expression_kind == .lower or expression_kind == .upper or expression_kind == .initcap or expression_kind == .length or expression_kind == .octet_length or expression_kind == .bit_length or expression_kind == .ascii or expression_kind == .chr or expression_kind == .md5 or expression_kind == .soundex) and args_value.array.items.len != 1) return error.InvalidRowsRequest;
     if ((expression_kind == .trim or expression_kind == .ltrim or expression_kind == .rtrim) and (args_value.array.items.len != 1 and args_value.array.items.len != 2)) return error.InvalidRowsRequest;
     if ((expression_kind == .replace or expression_kind == .translate) and args_value.array.items.len != 3) return error.InvalidRowsRequest;
     if (expression_kind == .regexp_replace and (args_value.array.items.len != 3 and args_value.array.items.len != 4)) return error.InvalidRowsRequest;
@@ -13620,7 +14172,7 @@ fn parseRowsExpressionWithScalarOutputsAlloc(
     if (!rowsExpressionReferencesScalarOutput(expression, scalar_subqueries)) {
         if (expression_kind == .length or expression_kind == .octet_length or expression_kind == .bit_length or expression_kind == .ascii or expression_kind == .regexp_count or expression_kind == .regexp_instr or expression_kind == .json_array_length or expression_kind == .abs or expression_kind == .round or expression_kind == .trunc or expression_kind == .floor or expression_kind == .ceil or expression_kind == .sqrt or expression_kind == .sign or expression_kind == .power or expression_kind == .add or expression_kind == .sub or expression_kind == .mul or expression_kind == .div or expression_kind == .mod or expression_kind == .interval_ns or expression_kind == .interval_months) try validateRowsQueryNumericExpressionWithSources(alloc, schema, source_schema, expression);
         if (expression_kind == .array_position or expression_kind == .array_positions) try validateRowsArrayPositionExpressionWithSources(alloc, schema, source_schema, expression);
-        if (expression_kind == .chr or expression_kind == .md5 or expression_kind == .json_typeof or expression_kind == .array_to_string or expression_kind == .regexp_replace or expression_kind == .regexp_substr or expression_kind == .concat_ws) try validateRowsQueryTextExpressionWithSources(alloc, schema, source_schema, expression);
+        if (expression_kind == .chr or expression_kind == .md5 or expression_kind == .soundex or expression_kind == .json_typeof or expression_kind == .array_to_string or expression_kind == .regexp_replace or expression_kind == .regexp_substr or expression_kind == .concat_ws) try validateRowsQueryTextExpressionWithSources(alloc, schema, source_schema, expression);
         if (expression_kind == .date_trunc) try validateRowsDateTruncExpressionWithSources(alloc, schema, source_schema, expression);
         if (expression_kind == .date_bin) try validateRowsDateBinExpressionWithSources(alloc, schema, source_schema, expression);
         if (expression_kind == .date_part) try validateRowsDatePartExpressionWithSources(alloc, schema, source_schema, expression);
@@ -14182,7 +14734,7 @@ fn validateRowsQueryTextExpressionWithSources(
             if (expression.operands.len == 0) return error.InvalidRowsRequest;
             for (expression.operands) |operand| try validateRowsQueryTextExpressionWithSources(alloc, schema, source_schema, operand);
         },
-        .lower, .upper, .initcap, .md5 => {
+        .lower, .upper, .initcap, .md5, .soundex => {
             if (expression.operands.len != 1) return error.InvalidRowsRequest;
             try validateRowsQueryTextExpressionWithSources(alloc, schema, source_schema, expression.operands[0]);
         },
@@ -15464,7 +16016,7 @@ fn expressionValueJsonWithExplicitSourceAlloc(
             }
             break :blk try alloc.dupe(u8, "null");
         },
-        .lower, .upper, .initcap, .md5 => blk: {
+        .lower, .upper, .initcap, .md5, .soundex => blk: {
             if (expression.operands.len != 1) return error.InvalidRowsRequest;
             const value_json = try expressionValueJsonWithExplicitSourceAlloc(alloc, row, proposed_row, source_row, expression.operands[0]);
             defer alloc.free(value_json);
@@ -15478,6 +16030,7 @@ fn expressionValueJsonWithExplicitSourceAlloc(
                         .upper => try std.ascii.allocUpperString(alloc, text),
                         .initcap => try expr_text.initcapTextAlloc(alloc, text),
                         .md5 => try expr_text.md5HexTextAlloc(alloc, text),
+                        .soundex => try expr_text.soundexTextAlloc(alloc, text),
                         else => unreachable,
                     };
                     defer alloc.free(transformed);
@@ -17719,11 +18272,1640 @@ pub fn relationalDefaultValueJsonWithContextAlloc(
         .now_ns => try std.fmt.allocPrint(alloc, "{d}", .{platform_time.realtimeNs()}),
         .current_date_ns => try std.fmt.allocPrint(alloc, "{d}", .{currentUtcDateStartNs()}),
         .sequence_next => try sequenceDefaultValueJsonAlloc(alloc, default_value.value_json, default_context.sequence_resolver orelse return error.UnsupportedSqlShape),
+        .scalar_subquery => try scalarSubqueryDefaultValueJsonAlloc(alloc, default_value.value_json, default_context.scalar_subquery_resolver orelse return error.UnsupportedSqlShape),
         .uuid_v4 => blk: {
             const uuid = try randomUuidV4String();
             break :blk try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(uuid[0..], .{})});
         },
     };
+}
+
+fn scalarSubqueryDefaultValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    value_json: []const u8,
+    resolver: ScalarSubqueryDefaultResolver,
+) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRowsRequest;
+    const query_value = parsed.value.object.get("query") orelse return error.InvalidRowsRequest;
+    if (query_value != .object) return error.InvalidRowsRequest;
+    if (query_value.object.get("kind") != null) return error.UnsupportedSqlShape;
+    const query_json = try jsonValueStringifyAlloc(alloc, query_value);
+    defer alloc.free(query_json);
+    const value = try resolver.valueJsonAlloc(alloc, .{ .query_json = query_json });
+    errdefer alloc.free(value);
+    try validateScalarSubqueryDefaultJsonValue(alloc, value);
+    return value;
+}
+
+pub fn normalizeScalarSubqueryDefaultValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    value_json: []const u8,
+) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRowsRequest;
+    try requireJsonObjectOnlyKeys(parsed.value.object, &.{"query"});
+    const query_value = parsed.value.object.get("query") orelse return error.InvalidRowsRequest;
+    if (query_value != .object) return error.InvalidRowsRequest;
+    var plan = if (query_value.object.get("kind")) |kind| blk: {
+        if (kind != .string) return error.InvalidRowsRequest;
+        if (!std.mem.eql(u8, kind.string, "tokenized_sql")) return error.UnsupportedSqlShape;
+        break :blk try legacyTokenizedScalarDefaultPlanAlloc(alloc, query_value);
+    } else try scalarSubqueryDefaultPlanFromStructuredPayloadAlloc(alloc, query_value);
+    defer plan.deinit(alloc);
+    const query_json = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, plan);
+    defer alloc.free(query_json);
+    return try std.fmt.allocPrint(alloc, "{{\"query\":{s}}}", .{query_json});
+}
+
+fn validateScalarSubqueryDefaultJsonValue(alloc: std.mem.Allocator, value_json: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+}
+
+pub fn scalarSubqueryDefaultPlanFromQueryJsonAlloc(
+    alloc: std.mem.Allocator,
+    query_json: []const u8,
+) !ScalarSubqueryDefaultPlan {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, query_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRowsRequest;
+    if (parsed.value.object.get("kind") != null) return error.UnsupportedSqlShape;
+    return try scalarSubqueryDefaultPlanFromStructuredPayloadAlloc(alloc, parsed.value);
+}
+
+fn legacyScalarDefaultPlanFromQueryJsonAlloc(
+    alloc: std.mem.Allocator,
+    query_json: []const u8,
+) !ScalarSubqueryDefaultPlan {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, query_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRowsRequest;
+    return try legacyTokenizedScalarDefaultPlanAlloc(alloc, parsed.value);
+}
+
+fn scalarSubqueryDefaultPlanFromStructuredPayloadAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !ScalarSubqueryDefaultPlan {
+    if (value != .object) return error.InvalidRowsRequest;
+    try requireJsonObjectOnlyKeys(value.object, &.{ "table", "alias", "select", "expressions", "where", "limit", "offset", "order_by", "distinct_on" });
+    const table_value = value.object.get("table") orelse return error.InvalidRowsRequest;
+    if (table_value != .string or table_value.string.len == 0) return error.InvalidRowsRequest;
+    const table_name = scalarDefaultNormalizeTableName(table_value.string);
+    const source_binding: ScalarDefaultSourceBinding = .{
+        .table_name = table_name,
+        .alias = try scalarDefaultStructuredAlias(value.object.get("alias")),
+    };
+    const select_value = value.object.get("select");
+    const expressions_value = value.object.get("expressions");
+    if ((select_value == null) == (expressions_value == null)) return error.UnsupportedSqlShape;
+
+    const where_plan = try scalarDefaultStructuredWhereAlloc(alloc, value.object.get("where"), source_binding);
+    var where_transferred = false;
+    errdefer if (!where_transferred) freeScalarDefaultWherePlan(alloc, where_plan);
+
+    const order_by = try scalarDefaultStructuredOrderByAlloc(alloc, value.object.get("order_by"), source_binding);
+    var order_transferred = false;
+    errdefer if (!order_transferred) freeScalarDefaultOrderBy(alloc, order_by);
+
+    const limit = try parseOptionalU32(value.object.get("limit"));
+    const offset = (try parseOptionalU32(value.object.get("offset"))) orelse 0;
+    const plan = if (select_value) |selected_value| blk: {
+        if (selected_value != .array or selected_value.array.items.len != 1) return error.UnsupportedSqlShape;
+        const selected = selected_value.array.items[0];
+        if (selected != .string or selected.string.len == 0) return error.InvalidRowsRequest;
+        const selected_field = scalarDefaultNormalizeFieldNameForBinding(selected.string, source_binding);
+        const distinct_on_value = value.object.get("distinct_on");
+        const distinct = try scalarDefaultStructuredDistinctOnMatchesSelected(distinct_on_value, selected_field);
+        break :blk try ownedScalarSubqueryDefaultPlanAlloc(
+            alloc,
+            table_name,
+            selected_field,
+            limit,
+            offset,
+            where_plan.predicates,
+            where_plan.in_predicates,
+            where_plan.or_predicates,
+            where_plan.not_predicates,
+            distinct,
+            order_by,
+        );
+    } else blk: {
+        if (value.object.get("distinct_on") != null) return error.UnsupportedSqlShape;
+        const projection = try scalarDefaultStructuredExpressionProjection(alloc, expressions_value orelse return error.UnsupportedSqlShape, source_binding);
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) freeRowsQueryExpression(alloc, projection.expression);
+        const expression_plan = try ownedScalarSubqueryDefaultExpressionTreePlanAlloc(
+            alloc,
+            table_name,
+            projection.output,
+            projection.expression,
+            limit,
+            offset,
+            where_plan.predicates,
+            where_plan.in_predicates,
+            where_plan.or_predicates,
+            where_plan.not_predicates,
+            order_by,
+        );
+        expression_transferred = true;
+        break :blk expression_plan;
+    };
+    where_transferred = true;
+    order_transferred = true;
+    return plan;
+}
+
+fn scalarDefaultStructuredDistinctOnMatchesSelected(
+    maybe_value: ?std.json.Value,
+    selected_field: []const u8,
+) !bool {
+    const value = maybe_value orelse return false;
+    if (value != .array or value.array.items.len != 1) return error.UnsupportedSqlShape;
+    const field = value.array.items[0];
+    if (field != .string or field.string.len == 0) return error.InvalidRowsRequest;
+    if (!std.mem.eql(u8, field.string, selected_field)) return error.UnsupportedSqlShape;
+    return true;
+}
+
+fn scalarDefaultStructuredExpressionProjection(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    source_binding: ScalarDefaultSourceBinding,
+) !struct { output: []const u8, expression: db_mod.types.RelationalRowsExpression } {
+    if (value != .array or value.array.items.len != 1) return error.UnsupportedSqlShape;
+    const item = value.array.items[0];
+    if (item != .object) return error.InvalidRowsRequest;
+    try requireJsonObjectOnlyKeys(item.object, &.{ "as", "expr" });
+    const output_value = item.object.get("as") orelse return error.InvalidRowsRequest;
+    const expression_value = item.object.get("expr") orelse return error.InvalidRowsRequest;
+    if (output_value != .string or output_value.string.len == 0) return error.InvalidRowsRequest;
+    const expression = try scalarDefaultStructuredExpressionAlloc(alloc, expression_value, source_binding);
+    return .{
+        .output = output_value.string,
+        .expression = expression,
+    };
+}
+
+fn scalarDefaultSimpleExpressionKind(op: []const u8) ?db_mod.types.RelationalRowsExpressionKind {
+    if (std.ascii.eqlIgnoreCase(op, "lower")) return .lower;
+    if (std.ascii.eqlIgnoreCase(op, "upper")) return .upper;
+    if (std.ascii.eqlIgnoreCase(op, "length")) return .length;
+    if (std.ascii.eqlIgnoreCase(op, "md5")) return .md5;
+    if (std.ascii.eqlIgnoreCase(op, "concat")) return .concat;
+    return null;
+}
+
+fn scalarDefaultStructuredSimpleExpressionKind(op: []const u8) ?db_mod.types.RelationalRowsExpressionKind {
+    if (std.ascii.eqlIgnoreCase(op, "reverse")) return .reverse;
+    return scalarDefaultSimpleExpressionKind(op);
+}
+
+fn scalarDefaultStructuredExpressionKind(op: []const u8) ?db_mod.types.RelationalRowsExpressionKind {
+    if (std.ascii.eqlIgnoreCase(op, "cast")) return .cast;
+    if (std.ascii.eqlIgnoreCase(op, "add")) return .add;
+    if (std.ascii.eqlIgnoreCase(op, "sub")) return .sub;
+    if (std.ascii.eqlIgnoreCase(op, "mul")) return .mul;
+    if (std.ascii.eqlIgnoreCase(op, "div")) return .div;
+    if (std.ascii.eqlIgnoreCase(op, "mod")) return .mod;
+    return scalarDefaultStructuredSimpleExpressionKind(op);
+}
+
+fn scalarDefaultStructuredExpressionArityValid(
+    kind: db_mod.types.RelationalRowsExpressionKind,
+    len: usize,
+) bool {
+    return switch (kind) {
+        .concat, .sub, .div, .mod => len == 2,
+        .add, .mul => len >= 2,
+        .cast => len == 1,
+        else => len == 1,
+    };
+}
+
+fn scalarDefaultStructuredExpressionAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    source_binding: ScalarDefaultSourceBinding,
+) !db_mod.types.RelationalRowsExpression {
+    if (value != .object) return error.InvalidRowsRequest;
+    if (value.object.get("field")) |field_value| {
+        try requireJsonObjectOnlyKeys(value.object, &.{"field"});
+        if (field_value != .string or field_value.string.len == 0) return error.InvalidRowsRequest;
+        return .{
+            .kind = .field,
+            .field = try alloc.dupe(u8, scalarDefaultNormalizeFieldNameForBinding(field_value.string, source_binding)),
+        };
+    }
+    if (value.object.get("value")) |literal_value| {
+        try requireJsonObjectOnlyKeys(value.object, &.{"value"});
+        return .{
+            .kind = .value,
+            .value_json = try jsonValueStringifyAlloc(alloc, literal_value),
+        };
+    }
+    const op_value = value.object.get("op") orelse return error.InvalidRowsRequest;
+    const args_value = value.object.get("args") orelse return error.InvalidRowsRequest;
+    if (op_value != .string) return error.InvalidRowsRequest;
+    if (args_value != .array) return error.InvalidRowsRequest;
+    const kind = scalarDefaultStructuredExpressionKind(op_value.string) orelse return error.UnsupportedSqlShape;
+    if (kind == .cast) {
+        try requireJsonObjectOnlyKeys(value.object, &.{ "op", "args", "to" });
+    } else {
+        try requireJsonObjectOnlyKeys(value.object, &.{ "op", "args" });
+    }
+    if (!scalarDefaultStructuredExpressionArityValid(kind, args_value.array.items.len)) return error.UnsupportedSqlShape;
+    const operands = try alloc.alloc(db_mod.types.RelationalRowsExpression, args_value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (operands[0..initialized]) |operand| freeRowsQueryExpression(alloc, operand);
+        alloc.free(operands);
+    }
+    for (args_value.array.items) |arg| {
+        operands[initialized] = try scalarDefaultStructuredExpressionAlloc(alloc, arg, source_binding);
+        initialized += 1;
+    }
+    const cast_type: ?db_mod.types.RelationalRowsExpressionCastType = if (kind == .cast) blk: {
+        const target_value = value.object.get("to") orelse return error.InvalidRowsRequest;
+        if (target_value != .string) return error.InvalidRowsRequest;
+        break :blk parseRowsQueryExpressionCastType(target_value.string) orelse return error.InvalidRowsRequest;
+    } else null;
+    return .{ .kind = kind, .operands = operands, .cast_type = cast_type };
+}
+
+fn scalarDefaultStructuredWhereAlloc(
+    alloc: std.mem.Allocator,
+    maybe_value: ?std.json.Value,
+    source_binding: ScalarDefaultSourceBinding,
+) !ScalarDefaultWherePlan {
+    const value = maybe_value orelse return .{};
+    if (value != .object) return error.InvalidRowsRequest;
+    if (value.object.get("any") != null or value.object.get("not") != null) {
+        try requireJsonObjectOnlyKeys(value.object, &.{ "all", "any", "not" });
+        const predicates = if (value.object.get("all")) |all_value|
+            try scalarDefaultStructuredPredicateArrayAlloc(alloc, all_value, source_binding)
+        else
+            &.{};
+        var predicates_transferred = false;
+        errdefer if (!predicates_transferred) freeScalarDefaultPredicates(alloc, predicates);
+        const or_predicates = if (value.object.get("any")) |any_value|
+            try scalarDefaultStructuredPredicateGroupsAlloc(alloc, any_value, source_binding)
+        else
+            &.{};
+        var or_transferred = false;
+        errdefer if (!or_transferred) freeScalarDefaultPredicateGroups(alloc, or_predicates);
+        const not_predicates = if (value.object.get("not")) |not_value|
+            try scalarDefaultStructuredPredicateGroupsAlloc(alloc, not_value, source_binding)
+        else
+            &.{};
+        var not_transferred = false;
+        errdefer if (!not_transferred) freeScalarDefaultPredicateGroups(alloc, not_predicates);
+        predicates_transferred = true;
+        or_transferred = true;
+        not_transferred = true;
+        return .{ .predicates = predicates, .or_predicates = or_predicates, .not_predicates = not_predicates };
+    }
+    if (value.object.get("all")) |all_value| {
+        try requireJsonObjectOnlyKeys(value.object, &.{"all"});
+        return try scalarDefaultStructuredPredicateAllPlanAlloc(alloc, all_value, source_binding);
+    }
+    if (try scalarDefaultStructuredPredicateIsIn(value)) {
+        const out = try alloc.alloc(db_mod.types.RelationalRowsInPredicate, 1);
+        errdefer alloc.free(out);
+        out[0] = try scalarDefaultStructuredInPredicateAlloc(alloc, value, source_binding);
+        return .{ .in_predicates = out };
+    }
+    const out = try alloc.alloc(runtime_schema.RelationalCheck, 1);
+    errdefer alloc.free(out);
+    out[0] = try scalarDefaultStructuredPredicateAlloc(alloc, value, source_binding);
+    return .{ .predicates = out };
+}
+
+fn scalarDefaultStructuredPredicateAllPlanAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    source_binding: ScalarDefaultSourceBinding,
+) !ScalarDefaultWherePlan {
+    if (value != .array) return error.InvalidRowsRequest;
+    var predicates = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
+    defer predicates.deinit(alloc);
+    var in_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsInPredicate).empty;
+    defer in_predicates.deinit(alloc);
+    var or_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup).empty;
+    defer or_predicates.deinit(alloc);
+    var not_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup).empty;
+    defer not_predicates.deinit(alloc);
+    errdefer {
+        freeScalarDefaultPredicateValues(alloc, predicates.items);
+        freeRowsQueryInPredicatesNoSlice(alloc, in_predicates.items);
+        freeScalarDefaultPredicateGroupValues(alloc, or_predicates.items);
+        freeScalarDefaultPredicateGroupValues(alloc, not_predicates.items);
+    }
+    for (value.array.items) |item| {
+        if (item == .object and item.object.get("any") != null) {
+            try requireJsonObjectOnlyKeys(item.object, &.{"any"});
+            try scalarDefaultStructuredAppendPredicateGroupsAlloc(alloc, &or_predicates, item.object.get("any").?, source_binding);
+        } else if (item == .object and item.object.get("not") != null) {
+            try requireJsonObjectOnlyKeys(item.object, &.{"not"});
+            try scalarDefaultStructuredAppendPredicateGroupsAlloc(alloc, &not_predicates, item.object.get("not").?, source_binding);
+        } else if (item == .object and item.object.get("all") != null) {
+            try requireJsonObjectOnlyKeys(item.object, &.{"all"});
+            var nested = try scalarDefaultStructuredPredicateAllPlanAlloc(alloc, item.object.get("all").?, source_binding);
+            try scalarDefaultStructuredAppendWherePlanAlloc(alloc, &predicates, &in_predicates, &or_predicates, &not_predicates, &nested);
+        } else if (try scalarDefaultStructuredPredicateIsIn(item)) {
+            try in_predicates.append(alloc, try scalarDefaultStructuredInPredicateAlloc(alloc, item, source_binding));
+        } else {
+            try predicates.append(alloc, try scalarDefaultStructuredPredicateAlloc(alloc, item, source_binding));
+        }
+    }
+    const owned_predicates = try predicates.toOwnedSlice(alloc);
+    predicates = .empty;
+    var predicates_transferred = false;
+    errdefer if (!predicates_transferred) freeScalarDefaultPredicates(alloc, owned_predicates);
+    const owned_in_predicates = try in_predicates.toOwnedSlice(alloc);
+    in_predicates = .empty;
+    var in_predicates_transferred = false;
+    errdefer if (!in_predicates_transferred) freeRowsQueryInPredicates(alloc, owned_in_predicates);
+    const owned_or_predicates = try or_predicates.toOwnedSlice(alloc);
+    or_predicates = .empty;
+    var or_predicates_transferred = false;
+    errdefer if (!or_predicates_transferred) freeScalarDefaultPredicateGroups(alloc, owned_or_predicates);
+    const owned_not_predicates = try not_predicates.toOwnedSlice(alloc);
+    not_predicates = .empty;
+    var not_predicates_transferred = false;
+    errdefer if (!not_predicates_transferred) freeScalarDefaultPredicateGroups(alloc, owned_not_predicates);
+    predicates_transferred = true;
+    in_predicates_transferred = true;
+    or_predicates_transferred = true;
+    not_predicates_transferred = true;
+    return .{ .predicates = owned_predicates, .in_predicates = owned_in_predicates, .or_predicates = owned_or_predicates, .not_predicates = owned_not_predicates };
+}
+
+fn scalarDefaultStructuredAppendWherePlanAlloc(
+    alloc: std.mem.Allocator,
+    predicates: *std.ArrayListUnmanaged(runtime_schema.RelationalCheck),
+    in_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsInPredicate),
+    or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup),
+    not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup),
+    nested: *ScalarDefaultWherePlan,
+) !void {
+    errdefer freeScalarDefaultWherePlan(alloc, nested.*);
+    try predicates.appendSlice(alloc, nested.predicates);
+    try in_predicates.appendSlice(alloc, nested.in_predicates);
+    try or_predicates.appendSlice(alloc, nested.or_predicates);
+    try not_predicates.appendSlice(alloc, nested.not_predicates);
+    if (nested.predicates.len > 0) alloc.free(@constCast(nested.predicates.ptr)[0..nested.predicates.len]);
+    if (nested.in_predicates.len > 0) alloc.free(@constCast(nested.in_predicates.ptr)[0..nested.in_predicates.len]);
+    if (nested.or_predicates.len > 0) alloc.free(@constCast(nested.or_predicates.ptr)[0..nested.or_predicates.len]);
+    if (nested.not_predicates.len > 0) alloc.free(@constCast(nested.not_predicates.ptr)[0..nested.not_predicates.len]);
+    nested.* = .{};
+}
+
+fn scalarDefaultStructuredPredicateIsIn(value: std.json.Value) !bool {
+    if (value != .object) return false;
+    const op_value = value.object.get("op") orelse return false;
+    if (op_value != .string) return error.InvalidRowsRequest;
+    return std.mem.eql(u8, op_value.string, "in") or std.mem.eql(u8, op_value.string, "not_in");
+}
+
+fn scalarDefaultStructuredInPredicateAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    source_binding: ScalarDefaultSourceBinding,
+) !db_mod.types.RelationalRowsInPredicate {
+    if (value != .object) return error.InvalidRowsRequest;
+    try requireJsonObjectOnlyKeys(value.object, &.{ "field", "op", "value" });
+    const field_value = value.object.get("field") orelse return error.InvalidRowsRequest;
+    const op_value = value.object.get("op") orelse return error.InvalidRowsRequest;
+    const list_value = value.object.get("value") orelse return error.InvalidRowsRequest;
+    if (field_value != .string or field_value.string.len == 0) return error.InvalidRowsRequest;
+    if (op_value != .string) return error.InvalidRowsRequest;
+    if (list_value != .array or list_value.array.items.len == 0) return error.InvalidRowsRequest;
+    const field = try alloc.dupe(u8, scalarDefaultNormalizeFieldNameForBinding(field_value.string, source_binding));
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    const values_json = try jsonValueStringifyAlloc(alloc, list_value);
+    var values_transferred = false;
+    errdefer if (!values_transferred) alloc.free(values_json);
+    field_transferred = true;
+    values_transferred = true;
+    return .{
+        .field = field,
+        .values_json = values_json,
+        .negated = std.mem.eql(u8, op_value.string, "not_in"),
+    };
+}
+
+fn scalarDefaultStructuredPredicateArrayAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    source_binding: ScalarDefaultSourceBinding,
+) ![]const runtime_schema.RelationalCheck {
+    if (value != .array) return error.InvalidRowsRequest;
+    const out = try alloc.alloc(runtime_schema.RelationalCheck, value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeScalarDefaultPredicateValues(alloc, out[0..initialized]);
+        alloc.free(out);
+    }
+    for (value.array.items) |item| {
+        out[initialized] = try scalarDefaultStructuredPredicateAlloc(alloc, item, source_binding);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn scalarDefaultStructuredPredicateGroupsAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    source_binding: ScalarDefaultSourceBinding,
+) ![]const db_mod.types.RelationalRowsPredicateGroup {
+    if (value != .array or value.array.items.len == 0) return error.InvalidRowsRequest;
+    const groups = try alloc.alloc(db_mod.types.RelationalRowsPredicateGroup, value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeScalarDefaultPredicateGroupValues(alloc, groups[0..initialized]);
+        alloc.free(groups);
+    }
+    for (value.array.items) |item| {
+        groups[initialized] = .{ .predicates = try scalarDefaultStructuredPredicateGroupAlloc(alloc, item, source_binding) };
+        initialized += 1;
+    }
+    return groups;
+}
+
+fn scalarDefaultStructuredAppendPredicateGroupsAlloc(
+    alloc: std.mem.Allocator,
+    groups: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup),
+    value: std.json.Value,
+    source_binding: ScalarDefaultSourceBinding,
+) !void {
+    const parsed_groups = try scalarDefaultStructuredPredicateGroupsAlloc(alloc, value, source_binding);
+    var groups_transferred = false;
+    errdefer if (!groups_transferred) freeScalarDefaultPredicateGroups(alloc, parsed_groups);
+    try groups.appendSlice(alloc, parsed_groups);
+    groups_transferred = true;
+    if (parsed_groups.len > 0) alloc.free(@constCast(parsed_groups.ptr)[0..parsed_groups.len]);
+}
+
+fn scalarDefaultStructuredPredicateGroupAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    source_binding: ScalarDefaultSourceBinding,
+) ![]const runtime_schema.RelationalCheck {
+    if (value != .object) return error.InvalidRowsRequest;
+    if (value.object.get("all")) |all_value| {
+        try requireJsonObjectOnlyKeys(value.object, &.{"all"});
+        const predicates = try scalarDefaultStructuredPredicateArrayAlloc(alloc, all_value, source_binding);
+        errdefer freeScalarDefaultPredicates(alloc, predicates);
+        if (predicates.len == 0) return error.InvalidRowsRequest;
+        return predicates;
+    }
+    const out = try alloc.alloc(runtime_schema.RelationalCheck, 1);
+    errdefer alloc.free(out);
+    out[0] = try scalarDefaultStructuredPredicateAlloc(alloc, value, source_binding);
+    return out;
+}
+
+fn scalarDefaultStructuredPredicateAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    source_binding: ScalarDefaultSourceBinding,
+) !runtime_schema.RelationalCheck {
+    if (value != .object) return error.InvalidRowsRequest;
+    try requireJsonObjectOnlyKeys(value.object, &.{ "field", "op", "value" });
+    const field_value = value.object.get("field") orelse return error.InvalidRowsRequest;
+    const op_value = value.object.get("op") orelse return error.InvalidRowsRequest;
+    if (field_value != .string or field_value.string.len == 0) return error.InvalidRowsRequest;
+    if (op_value != .string or op_value.string.len == 0) return error.InvalidRowsRequest;
+    const op = try parseRowsQueryPredicateOp(op_value.string);
+    if (!rowsQueryPredicateNeedsValue(op)) {
+        if (value.object.get("value") != null) return error.InvalidRowsRequest;
+    }
+    const value_json = if (rowsQueryPredicateNeedsValue(op)) blk: {
+        const predicate_value = value.object.get("value") orelse return error.InvalidRowsRequest;
+        break :blk try jsonValueStringifyAlloc(alloc, predicate_value);
+    } else null;
+    var value_transferred = false;
+    errdefer if (!value_transferred) if (value_json) |json| alloc.free(json);
+    const field = try alloc.dupe(u8, scalarDefaultNormalizeFieldNameForBinding(field_value.string, source_binding));
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    value_transferred = true;
+    field_transferred = true;
+    return .{
+        .name = "",
+        .field = field,
+        .op = op,
+        .value_json = value_json,
+    };
+}
+
+fn scalarDefaultStructuredOrderByAlloc(
+    alloc: std.mem.Allocator,
+    maybe_value: ?std.json.Value,
+    source_binding: ScalarDefaultSourceBinding,
+) ![]const db_mod.types.RelationalRowsQueryOrder {
+    const value = maybe_value orelse return &.{};
+    if (value != .array) return error.InvalidRowsRequest;
+    const orders = try alloc.alloc(db_mod.types.RelationalRowsQueryOrder, value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeScalarDefaultOrderBy(alloc, orders[0..initialized]);
+        alloc.free(orders);
+    }
+    for (value.array.items) |item| {
+        if (item != .object) return error.InvalidRowsRequest;
+        try requireJsonObjectOnlyKeys(item.object, &.{ "field", "direction", "null_test" });
+        const field_value = item.object.get("field") orelse return error.InvalidRowsRequest;
+        if (field_value != .string or field_value.string.len == 0) return error.InvalidRowsRequest;
+        const direction: db_mod.types.RelationalRowsQueryOrderDirection = if (item.object.get("direction")) |direction_value| blk: {
+            if (direction_value != .string) return error.InvalidRowsRequest;
+            if (std.ascii.eqlIgnoreCase(direction_value.string, "asc")) break :blk .asc;
+            if (std.ascii.eqlIgnoreCase(direction_value.string, "desc")) break :blk .desc;
+            return error.InvalidRowsRequest;
+        } else .asc;
+        const null_test: ?db_mod.types.RelationalRowsQueryOrderNullTest = if (item.object.get("null_test")) |null_test_value| blk: {
+            if (null_test_value != .string) return error.InvalidRowsRequest;
+            if (std.mem.eql(u8, null_test_value.string, "is_null")) break :blk .is_null;
+            if (std.mem.eql(u8, null_test_value.string, "is_not_null")) break :blk .is_not_null;
+            return error.InvalidRowsRequest;
+        } else null;
+        orders[initialized] = .{
+            .field = try alloc.dupe(u8, scalarDefaultNormalizeFieldNameForBinding(field_value.string, source_binding)),
+            .direction = direction,
+            .null_test = null_test,
+        };
+        initialized += 1;
+    }
+    return orders;
+}
+
+fn legacyTokenizedScalarDefaultPlanAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !ScalarSubqueryDefaultPlan {
+    if (value != .object) return error.InvalidRowsRequest;
+    try requireJsonObjectOnlyKeys(value.object, &.{ "kind", "tokens" });
+    const tokens_value = value.object.get("tokens") orelse return error.InvalidRowsRequest;
+    if (tokens_value != .array) return error.InvalidRowsRequest;
+    const tokens = tokens_value.array.items;
+    var pos: usize = 0;
+
+    try expectScalarDefaultKeyword(tokens, &pos, "select");
+    const distinct = if (pos < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos], "distinct")) distinct: {
+        pos += 1;
+        if (pos < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos], "on")) return error.UnsupportedSqlShape;
+        break :distinct true;
+    } else false;
+    const projection = try scalarDefaultTokenizedProjection(alloc, tokens, &pos);
+    defer scalarDefaultFreeTokenizedProjection(alloc, projection);
+    if (pos < tokens.len and scalarDefaultTokenKindEql(tokens[pos], "comma")) return error.UnsupportedSqlShape;
+    try expectScalarDefaultKeyword(tokens, &pos, "from");
+    const table_name = scalarDefaultNormalizeTableName(try scalarDefaultIdentifierTokenText(tokens, pos));
+    pos += 1;
+    const source_binding: ScalarDefaultSourceBinding = .{
+        .table_name = table_name,
+        .alias = try scalarDefaultConsumeOptionalSourceAlias(tokens, &pos),
+    };
+    const output_field = switch (projection) {
+        .field => |field| scalarDefaultNormalizeFieldNameForBinding(field.raw_field, source_binding),
+        .simple_expression => |projection_expression| projection_expression.output,
+    };
+    const projection_alias = switch (projection) {
+        .field => |field| field.alias,
+        .simple_expression => "",
+    };
+    if (distinct and projection != .field) return error.UnsupportedSqlShape;
+
+    var order_by = std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder).empty;
+    defer order_by.deinit(alloc);
+    var where_plan: ScalarDefaultWherePlan = .{};
+    var where_transferred = false;
+    errdefer if (!where_transferred) freeScalarDefaultWherePlan(alloc, where_plan);
+    var limit: ?u32 = null;
+    var offset: u32 = 0;
+    var consumed_where = false;
+
+    while (pos < tokens.len) {
+        if (scalarDefaultTokenKindEql(tokens[pos], "semicolon")) {
+            pos += 1;
+            break;
+        }
+        if (scalarDefaultTokenMatchesKeyword(tokens[pos], "where")) {
+            if (consumed_where) return error.UnsupportedSqlShape;
+            consumed_where = true;
+            pos += 1;
+            where_plan = try scalarDefaultTokenizedWhereAlloc(alloc, tokens, &pos, source_binding);
+            continue;
+        }
+        if (scalarDefaultTokenMatchesKeyword(tokens[pos], "order")) {
+            pos += 1;
+            try expectScalarDefaultKeyword(tokens, &pos, "by");
+            while (true) {
+                const field = try alloc.dupe(u8, try scalarDefaultOrderFieldName(tokens, pos, source_binding, output_field, projection_alias));
+                var field_transferred = false;
+                errdefer if (!field_transferred) alloc.free(field);
+                pos += 1;
+                const direction: db_mod.types.RelationalRowsQueryOrderDirection = if (pos < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos], "desc")) blk: {
+                    pos += 1;
+                    break :blk .desc;
+                } else if (pos < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos], "asc")) blk: {
+                    pos += 1;
+                    break :blk .asc;
+                } else .asc;
+                const explicit_nulls_first: ?bool = if (pos < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos], "nulls")) blk: {
+                    pos += 1;
+                    if (pos < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos], "first")) {
+                        pos += 1;
+                        break :blk true;
+                    }
+                    try expectScalarDefaultKeyword(tokens, &pos, "last");
+                    break :blk false;
+                } else null;
+                if (explicit_nulls_first) |nulls_first| {
+                    const null_field = try alloc.dupe(u8, field);
+                    var null_field_transferred = false;
+                    errdefer if (!null_field_transferred) alloc.free(null_field);
+                    try order_by.append(alloc, .{
+                        .field = null_field,
+                        .direction = if (nulls_first) .desc else .asc,
+                        .null_test = .is_null,
+                    });
+                    null_field_transferred = true;
+                }
+                try order_by.append(alloc, .{ .field = field, .direction = direction });
+                field_transferred = true;
+                if (pos < tokens.len and scalarDefaultTokenKindEql(tokens[pos], "comma")) {
+                    pos += 1;
+                    continue;
+                }
+                break;
+            }
+            continue;
+        }
+        if (scalarDefaultTokenMatchesKeyword(tokens[pos], "limit")) {
+            pos += 1;
+            if (pos < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos], "all")) {
+                pos += 1;
+                limit = null;
+            } else {
+                limit = try scalarDefaultUnsignedToken(tokens, &pos);
+            }
+            continue;
+        }
+        if (scalarDefaultTokenMatchesKeyword(tokens[pos], "offset")) {
+            pos += 1;
+            offset = try scalarDefaultUnsignedToken(tokens, &pos);
+            if (pos < tokens.len and (scalarDefaultTokenMatchesKeyword(tokens[pos], "row") or scalarDefaultTokenMatchesKeyword(tokens[pos], "rows"))) pos += 1;
+            continue;
+        }
+        if (scalarDefaultTokenMatchesKeyword(tokens[pos], "fetch")) {
+            pos += 1;
+            try expectScalarDefaultFetchDirection(tokens, &pos);
+            limit = if (pos < tokens.len and scalarDefaultTokenKindEql(tokens[pos], "number"))
+                try scalarDefaultUnsignedToken(tokens, &pos)
+            else
+                1;
+            if (pos < tokens.len and (scalarDefaultTokenMatchesKeyword(tokens[pos], "row") or scalarDefaultTokenMatchesKeyword(tokens[pos], "rows"))) {
+                pos += 1;
+            } else return error.UnsupportedSqlShape;
+            try expectScalarDefaultKeyword(tokens, &pos, "only");
+            continue;
+        }
+        return error.UnsupportedSqlShape;
+    }
+    if (pos != tokens.len) return error.UnsupportedSqlShape;
+
+    const owned_order_by = try order_by.toOwnedSlice(alloc);
+    var order_transferred = false;
+    errdefer if (!order_transferred) freeScalarDefaultOrderBy(alloc, owned_order_by);
+    if (distinct and (owned_order_by.len == 0 or !std.mem.eql(u8, owned_order_by[0].field, output_field))) return error.UnsupportedSqlShape;
+    const plan = switch (projection) {
+        .field => try ownedScalarSubqueryDefaultPlanAlloc(
+            alloc,
+            table_name,
+            output_field,
+            limit,
+            offset,
+            where_plan.predicates,
+            where_plan.in_predicates,
+            where_plan.or_predicates,
+            where_plan.not_predicates,
+            distinct,
+            owned_order_by,
+        ),
+        .simple_expression => |projection_expression| try ownedScalarSubqueryDefaultExpressionPlanAlloc(
+            alloc,
+            table_name,
+            projection_expression.kind,
+            projection_expression.output,
+            scalarDefaultNormalizeFieldNameForBinding(projection_expression.raw_field, source_binding),
+            projection_expression.value_json,
+            limit,
+            offset,
+            where_plan.predicates,
+            where_plan.in_predicates,
+            where_plan.or_predicates,
+            where_plan.not_predicates,
+            owned_order_by,
+        ),
+    };
+    where_transferred = true;
+    order_transferred = true;
+    return plan;
+}
+
+fn scalarSubqueryDefaultNormalizedQueryJsonAlloc(
+    alloc: std.mem.Allocator,
+    plan: ScalarSubqueryDefaultPlan,
+) ![]u8 {
+    if (plan.table_name.len == 0 or plan.query.select_all) return error.UnsupportedSqlShape;
+    if ((plan.query.select.len == 0) == (plan.query.expressions.len == 0)) return error.UnsupportedSqlShape;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('{');
+    try writer.print("\"table\":{f}", .{std.json.fmt(plan.table_name, .{})});
+    if (plan.query.select.len != 0) {
+        try writer.writeAll(",\"select\":[");
+        for (plan.query.select, 0..) |field, i| {
+            if (field.len == 0) return error.UnsupportedSqlShape;
+            if (i > 0) try writer.writeByte(',');
+            try writer.print("{f}", .{std.json.fmt(field, .{})});
+        }
+        try writer.writeByte(']');
+    }
+    if (plan.query.expressions.len != 0) {
+        try writer.writeAll(",\"expressions\":[");
+        for (plan.query.expressions, 0..) |projection, i| {
+            if (projection.output.len == 0) return error.UnsupportedSqlShape;
+            if (i > 0) try writer.writeByte(',');
+            try writer.print("{{\"as\":{f},\"expr\":", .{std.json.fmt(projection.output, .{})});
+            try expr_type.writeRowExpressionJson(writer, projection.expression);
+            try writer.writeByte('}');
+        }
+        try writer.writeByte(']');
+    }
+    if (plan.query.distinct_on.len != 0) {
+        try writer.writeAll(",\"distinct_on\":[");
+        for (plan.query.distinct_on, 0..) |field, i| {
+            if (field.len == 0) return error.UnsupportedSqlShape;
+            if (i > 0) try writer.writeByte(',');
+            try writer.print("{f}", .{std.json.fmt(field, .{})});
+        }
+        try writer.writeByte(']');
+    }
+    if (plan.query.predicates.len != 0 or plan.query.in_predicates.len != 0 or plan.query.or_predicates.len != 0 or plan.query.not_predicates.len != 0) {
+        try writer.writeAll(",\"where\":");
+        try encodeRowsMutationSourceWhere(writer, plan.query);
+    }
+    if (plan.query.order_by.len != 0) {
+        try writer.writeAll(",\"order_by\":[");
+        for (plan.query.order_by, 0..) |order, i| {
+            if (order.expression != null or order.field.len == 0) return error.UnsupportedSqlShape;
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeByte('{');
+            try writer.print("\"field\":{f}", .{std.json.fmt(order.field, .{})});
+            if (order.direction == .desc) try writer.writeAll(",\"direction\":\"desc\"");
+            if (order.null_test) |null_test| {
+                try writer.writeAll(",\"null_test\":");
+                try writer.print("{f}", .{std.json.fmt(rowsQueryOrderNullTestText(null_test), .{})});
+            }
+            try writer.writeByte('}');
+        }
+        try writer.writeByte(']');
+    }
+    if (plan.query.limit) |limit| try writer.print(",\"limit\":{d}", .{limit});
+    if (plan.query.offset != 0) try writer.print(",\"offset\":{d}", .{plan.query.offset});
+    try writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
+fn scalarDefaultTokenizedProjection(alloc: std.mem.Allocator, tokens: []const std.json.Value, pos: *usize) !ScalarDefaultTokenizedProjection {
+    const first = try scalarDefaultIdentifierTokenText(tokens, pos.*);
+    pos.* += 1;
+    if (pos.* < tokens.len and scalarDefaultTokenKindEql(tokens[pos.*], "lparen")) {
+        const kind = scalarDefaultSimpleExpressionKind(first) orelse return error.UnsupportedSqlShape;
+        pos.* += 1;
+        const raw_field = try scalarDefaultIdentifierTokenText(tokens, pos.*);
+        pos.* += 1;
+        const value_json: ?[]const u8 = if (kind == .concat) blk: {
+            if (pos.* >= tokens.len or !scalarDefaultTokenKindEql(tokens[pos.*], "comma")) return error.UnsupportedSqlShape;
+            pos.* += 1;
+            break :blk try scalarDefaultValueTokenJsonAlloc(alloc, tokens, pos);
+        } else null;
+        var value_transferred = false;
+        errdefer if (!value_transferred) if (value_json) |json| alloc.free(@constCast(json));
+        if (pos.* >= tokens.len or !scalarDefaultTokenKindEql(tokens[pos.*], "rparen")) return error.UnsupportedSqlShape;
+        pos.* += 1;
+        const alias = try scalarDefaultConsumeOptionalProjectionAlias(tokens, pos);
+        value_transferred = true;
+        return .{ .simple_expression = .{
+            .kind = kind,
+            .raw_field = raw_field,
+            .output = if (alias.len != 0) alias else expr_type.rowExpressionDefaultOutputName(kind),
+            .value_json = value_json,
+        } };
+    }
+    return .{ .field = .{
+        .raw_field = first,
+        .alias = try scalarDefaultConsumeOptionalProjectionAlias(tokens, pos),
+    } };
+}
+
+fn scalarDefaultFreeTokenizedProjection(alloc: std.mem.Allocator, projection: ScalarDefaultTokenizedProjection) void {
+    switch (projection) {
+        .field => {},
+        .simple_expression => |expression| if (expression.value_json) |value_json| alloc.free(@constCast(value_json)),
+    }
+}
+
+fn scalarDefaultAppendTokenizedPredicatesAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const std.json.Value,
+    pos: *usize,
+    source_binding: ScalarDefaultSourceBinding,
+    predicates: *std.ArrayListUnmanaged(runtime_schema.RelationalCheck),
+    in_predicates: ?*std.ArrayListUnmanaged(db_mod.types.RelationalRowsInPredicate),
+    not_groups: ?*std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup),
+) !void {
+    if (pos.* < tokens.len and scalarDefaultTokenKindEql(tokens[pos.*], "lparen")) {
+        pos.* += 1;
+        try scalarDefaultAppendTokenizedPredicatesAlloc(alloc, tokens, pos, source_binding, predicates, in_predicates, not_groups);
+        if (pos.* >= tokens.len or !scalarDefaultTokenKindEql(tokens[pos.*], "rparen")) return error.UnsupportedSqlShape;
+        pos.* += 1;
+        return;
+    }
+    const field = try alloc.dupe(u8, scalarDefaultNormalizeFieldNameForBinding(try scalarDefaultIdentifierTokenText(tokens, pos.*), source_binding));
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    pos.* += 1;
+    if (pos.* < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos.*], "not")) {
+        pos.* += 1;
+        if (pos.* < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos.*], "between")) {
+            pos.* += 1;
+            const target_not_groups = not_groups orelse return error.UnsupportedSqlShape;
+            field_transferred = true;
+            try scalarDefaultAppendTokenizedBetweenNotGroupAlloc(alloc, tokens, pos, field, target_not_groups);
+            return;
+        }
+        if (pos.* < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos.*], "in")) {
+            pos.* += 1;
+            const target_in_predicates = in_predicates orelse return error.UnsupportedSqlShape;
+            field_transferred = true;
+            try scalarDefaultAppendTokenizedInPredicateAlloc(alloc, tokens, pos, field, true, target_in_predicates);
+            return;
+        }
+        return error.UnsupportedSqlShape;
+    }
+    if (pos.* < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos.*], "in")) {
+        pos.* += 1;
+        const target_in_predicates = in_predicates orelse return error.UnsupportedSqlShape;
+        field_transferred = true;
+        try scalarDefaultAppendTokenizedInPredicateAlloc(alloc, tokens, pos, field, false, target_in_predicates);
+        return;
+    }
+    if (pos.* < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos.*], "between")) {
+        pos.* += 1;
+        field_transferred = true;
+        try scalarDefaultAppendTokenizedBetweenPredicatesAlloc(alloc, tokens, pos, field, predicates);
+        return;
+    }
+    field_transferred = true;
+    const predicate = try scalarDefaultTokenizedPredicateAfterFieldAlloc(alloc, tokens, pos, field);
+    var predicate_transferred = false;
+    errdefer if (!predicate_transferred) {
+        const predicate_slice = [_]runtime_schema.RelationalCheck{predicate};
+        freeScalarDefaultPredicateValues(alloc, predicate_slice[0..]);
+    };
+    try predicates.append(alloc, predicate);
+    predicate_transferred = true;
+}
+
+fn scalarDefaultAppendTokenizedInPredicateAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const std.json.Value,
+    pos: *usize,
+    field: []const u8,
+    negated: bool,
+    in_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsInPredicate),
+) !void {
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(@constCast(field));
+    const values_json = try scalarDefaultTokenizedValueListJsonAlloc(alloc, tokens, pos);
+    var values_transferred = false;
+    errdefer if (!values_transferred) alloc.free(values_json);
+    try in_predicates.append(alloc, .{ .field = field, .values_json = values_json, .negated = negated });
+    field_transferred = true;
+    values_transferred = true;
+}
+
+fn scalarDefaultAppendTokenizedBetweenNotGroupAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const std.json.Value,
+    pos: *usize,
+    field: []const u8,
+    groups: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup),
+) !void {
+    var current = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
+    defer current.deinit(alloc);
+    errdefer freeScalarDefaultPredicateValues(alloc, current.items);
+
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(@constCast(field));
+    field_transferred = true;
+    try scalarDefaultAppendTokenizedBetweenPredicatesAlloc(alloc, tokens, pos, field, &current);
+
+    const predicates = try current.toOwnedSlice(alloc);
+    current = .empty;
+    var predicates_transferred = false;
+    errdefer if (!predicates_transferred) freeScalarDefaultPredicates(alloc, predicates);
+    try groups.append(alloc, .{ .predicates = predicates });
+    predicates_transferred = true;
+}
+
+fn scalarDefaultAppendTokenizedBetweenPredicatesAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const std.json.Value,
+    pos: *usize,
+    field: []const u8,
+    predicates: *std.ArrayListUnmanaged(runtime_schema.RelationalCheck),
+) !void {
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(@constCast(field));
+
+    if (pos.* < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos.*], "symmetric")) return error.UnsupportedSqlShape;
+    if (pos.* < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos.*], "asymmetric")) pos.* += 1;
+
+    const lower_value_json = try scalarDefaultValueTokenJsonAlloc(alloc, tokens, pos);
+    var lower_value_transferred = false;
+    errdefer if (!lower_value_transferred) alloc.free(lower_value_json);
+    try expectScalarDefaultKeyword(tokens, pos, "and");
+    const upper_value_json = try scalarDefaultValueTokenJsonAlloc(alloc, tokens, pos);
+    var upper_value_transferred = false;
+    errdefer if (!upper_value_transferred) alloc.free(upper_value_json);
+    const upper_field = try alloc.dupe(u8, field);
+    var upper_field_transferred = false;
+    errdefer if (!upper_field_transferred) alloc.free(upper_field);
+
+    try predicates.append(alloc, .{
+        .name = "",
+        .field = field,
+        .op = .gte,
+        .value_json = lower_value_json,
+    });
+    field_transferred = true;
+    lower_value_transferred = true;
+    try predicates.append(alloc, .{
+        .name = "",
+        .field = upper_field,
+        .op = .lte,
+        .value_json = upper_value_json,
+    });
+    upper_field_transferred = true;
+    upper_value_transferred = true;
+}
+
+fn scalarDefaultTokenizedPredicateAfterFieldAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const std.json.Value,
+    pos: *usize,
+    field: []const u8,
+) !runtime_schema.RelationalCheck {
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(@constCast(field));
+    var precomputed_value_json: ?[]const u8 = null;
+    var precomputed_transferred = false;
+    errdefer if (!precomputed_transferred) if (precomputed_value_json) |json| alloc.free(@constCast(json));
+    const op: runtime_schema.RelationalCheckOp = if (pos.* < tokens.len and scalarDefaultTokenKindEql(tokens[pos.*], "eq")) blk: {
+        pos.* += 1;
+        break :blk .eq;
+    } else if (pos.* < tokens.len and scalarDefaultTokenKindEql(tokens[pos.*], "neq")) blk: {
+        pos.* += 1;
+        break :blk .ne;
+    } else if (pos.* < tokens.len and scalarDefaultTokenKindEql(tokens[pos.*], "gt")) blk: {
+        pos.* += 1;
+        break :blk .gt;
+    } else if (pos.* < tokens.len and scalarDefaultTokenKindEql(tokens[pos.*], "gte")) blk: {
+        pos.* += 1;
+        break :blk .gte;
+    } else if (pos.* < tokens.len and scalarDefaultTokenKindEql(tokens[pos.*], "lt")) blk: {
+        pos.* += 1;
+        break :blk .lt;
+    } else if (pos.* < tokens.len and scalarDefaultTokenKindEql(tokens[pos.*], "lte")) blk: {
+        pos.* += 1;
+        break :blk .lte;
+    } else if (pos.* < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos.*], "is")) blk: {
+        pos.* += 1;
+        const negated = if (pos.* < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos.*], "not")) negated: {
+            pos.* += 1;
+            break :negated true;
+        } else false;
+        if (pos.* < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos.*], "null")) {
+            pos.* += 1;
+            break :blk if (negated) .is_not_null else .is_null;
+        }
+        if (pos.* < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos.*], "unknown")) {
+            pos.* += 1;
+            break :blk if (negated) .is_not_null else .is_null;
+        }
+        if (pos.* < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos.*], "distinct")) {
+            pos.* += 1;
+            try expectScalarDefaultKeyword(tokens, pos, "from");
+            break :blk if (negated) .is_not_distinct else .is_distinct;
+        }
+        if (!negated and pos.* < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos.*], "true")) {
+            pos.* += 1;
+            precomputed_value_json = try alloc.dupe(u8, "true");
+            break :blk .eq;
+        }
+        if (!negated and pos.* < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos.*], "false")) {
+            pos.* += 1;
+            precomputed_value_json = try alloc.dupe(u8, "false");
+            break :blk .eq;
+        }
+        return error.UnsupportedSqlShape;
+    } else return error.UnsupportedSqlShape;
+    const value_json: ?[]const u8 = if (precomputed_value_json) |json| blk: {
+        precomputed_transferred = true;
+        break :blk json;
+    } else if (rowsQueryPredicateNeedsValue(op))
+        try scalarDefaultValueTokenJsonAlloc(alloc, tokens, pos)
+    else
+        null;
+    var value_transferred = false;
+    errdefer if (!value_transferred) if (value_json) |json| alloc.free(json);
+    field_transferred = true;
+    value_transferred = true;
+    return .{
+        .name = "",
+        .field = field,
+        .op = op,
+        .value_json = value_json,
+    };
+}
+
+fn scalarDefaultTokenizedWhereAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const std.json.Value,
+    pos: *usize,
+    source_binding: ScalarDefaultSourceBinding,
+) !ScalarDefaultWherePlan {
+    var current = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
+    defer current.deinit(alloc);
+    var current_in = std.ArrayListUnmanaged(db_mod.types.RelationalRowsInPredicate).empty;
+    defer current_in.deinit(alloc);
+    var groups = std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup).empty;
+    defer groups.deinit(alloc);
+    var not_groups = std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup).empty;
+    defer not_groups.deinit(alloc);
+    var saw_or = false;
+
+    errdefer {
+        freeScalarDefaultPredicateValues(alloc, current.items);
+        freeRowsQueryInPredicatesNoSlice(alloc, current_in.items);
+        freeScalarDefaultPredicateGroupValues(alloc, groups.items);
+        freeScalarDefaultPredicateGroupValues(alloc, not_groups.items);
+    }
+
+    while (true) {
+        if (pos.* < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos.*], "not")) {
+            if (saw_or) return error.UnsupportedSqlShape;
+            pos.* += 1;
+            try scalarDefaultAppendTokenizedNotGroup(alloc, tokens, pos, source_binding, &not_groups);
+        } else {
+            try scalarDefaultAppendTokenizedPredicatesAlloc(alloc, tokens, pos, source_binding, &current, &current_in, if (saw_or) null else &not_groups);
+        }
+        if (pos.* < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos.*], "and")) {
+            pos.* += 1;
+            continue;
+        }
+        if (pos.* < tokens.len and scalarDefaultTokenMatchesKeyword(tokens[pos.*], "or")) {
+            if (not_groups.items.len != 0) return error.UnsupportedSqlShape;
+            if (current_in.items.len != 0) return error.UnsupportedSqlShape;
+            saw_or = true;
+            pos.* += 1;
+            try scalarDefaultFlushTokenizedWhereGroup(alloc, &current, &groups);
+            continue;
+        }
+        break;
+    }
+
+    if (!saw_or) {
+        const owned_predicates = try current.toOwnedSlice(alloc);
+        current = .empty;
+        var predicates_transferred = false;
+        errdefer if (!predicates_transferred) freeScalarDefaultPredicates(alloc, owned_predicates);
+        const owned_in_predicates = try current_in.toOwnedSlice(alloc);
+        current_in = .empty;
+        var in_predicates_transferred = false;
+        errdefer if (!in_predicates_transferred) freeRowsQueryInPredicates(alloc, owned_in_predicates);
+        const owned_not_groups = try not_groups.toOwnedSlice(alloc);
+        not_groups = .empty;
+        predicates_transferred = true;
+        in_predicates_transferred = true;
+        return .{ .predicates = owned_predicates, .in_predicates = owned_in_predicates, .not_predicates = owned_not_groups };
+    }
+    try scalarDefaultFlushTokenizedWhereGroup(alloc, &current, &groups);
+    const owned_groups = try groups.toOwnedSlice(alloc);
+    groups = .empty;
+    return .{ .or_predicates = owned_groups };
+}
+
+fn scalarDefaultAppendTokenizedNotGroup(
+    alloc: std.mem.Allocator,
+    tokens: []const std.json.Value,
+    pos: *usize,
+    source_binding: ScalarDefaultSourceBinding,
+    groups: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup),
+) !void {
+    var current = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
+    defer current.deinit(alloc);
+    errdefer freeScalarDefaultPredicateValues(alloc, current.items);
+    try scalarDefaultAppendTokenizedPredicatesAlloc(alloc, tokens, pos, source_binding, &current, null, null);
+    const predicates = try current.toOwnedSlice(alloc);
+    current = .empty;
+    var predicates_transferred = false;
+    errdefer if (!predicates_transferred) freeScalarDefaultPredicates(alloc, predicates);
+    try groups.append(alloc, .{ .predicates = predicates });
+    predicates_transferred = true;
+}
+
+fn scalarDefaultFlushTokenizedWhereGroup(
+    alloc: std.mem.Allocator,
+    current: *std.ArrayListUnmanaged(runtime_schema.RelationalCheck),
+    groups: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup),
+) !void {
+    if (current.items.len == 0) return error.InvalidRowsRequest;
+    const predicates = try current.toOwnedSlice(alloc);
+    current.* = .empty;
+    var predicates_transferred = false;
+    errdefer if (!predicates_transferred) freeScalarDefaultPredicates(alloc, predicates);
+    try groups.append(alloc, .{ .predicates = predicates });
+    predicates_transferred = true;
+}
+
+fn ownedScalarSubqueryDefaultPlanAlloc(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    output_field: []const u8,
+    limit: ?u32,
+    offset: u32,
+    predicates: []const runtime_schema.RelationalCheck,
+    in_predicates: []const db_mod.types.RelationalRowsInPredicate,
+    or_predicates: []const db_mod.types.RelationalRowsPredicateGroup,
+    not_predicates: []const db_mod.types.RelationalRowsPredicateGroup,
+    distinct: bool,
+    order_by: []const db_mod.types.RelationalRowsQueryOrder,
+) !ScalarSubqueryDefaultPlan {
+    const owned_table = try alloc.dupe(u8, table_name);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(owned_table);
+    const owned_output = try alloc.dupe(u8, output_field);
+    var output_transferred = false;
+    errdefer if (!output_transferred) alloc.free(owned_output);
+    const select = try alloc.alloc([]const u8, 1);
+    var select_transferred = false;
+    errdefer if (!select_transferred) alloc.free(select);
+    select[0] = try alloc.dupe(u8, output_field);
+    var select_field_transferred = false;
+    errdefer if (!select_field_transferred) alloc.free(@constCast(select[0]));
+    const distinct_on = if (distinct) distinct_on: {
+        const fields = try alloc.alloc([]const u8, 1);
+        var fields_transferred = false;
+        errdefer if (!fields_transferred) alloc.free(fields);
+        fields[0] = try alloc.dupe(u8, output_field);
+        fields_transferred = true;
+        break :distinct_on fields;
+    } else &.{};
+    var distinct_slice_transferred = false;
+    errdefer if (!distinct_slice_transferred and distinct_on.len != 0) alloc.free(@constCast(distinct_on.ptr)[0..distinct_on.len]);
+    var distinct_field_transferred = false;
+    errdefer if (!distinct_field_transferred and distinct_on.len != 0) alloc.free(@constCast(distinct_on[0]));
+
+    table_transferred = true;
+    output_transferred = true;
+    select_transferred = true;
+    select_field_transferred = true;
+    distinct_slice_transferred = true;
+    distinct_field_transferred = true;
+    return .{
+        .table_name = owned_table,
+        .output_field = owned_output,
+        .query = .{
+            .select = select,
+            .select_all = false,
+            .predicates = predicates,
+            .in_predicates = in_predicates,
+            .or_predicates = or_predicates,
+            .not_predicates = not_predicates,
+            .distinct_on = distinct_on,
+            .order_by = order_by,
+            .limit = limit,
+            .offset = offset,
+        },
+    };
+}
+
+fn ownedScalarSubqueryDefaultExpressionPlanAlloc(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    expression_kind: db_mod.types.RelationalRowsExpressionKind,
+    output_field: []const u8,
+    source_field: []const u8,
+    value_json: ?[]const u8,
+    limit: ?u32,
+    offset: u32,
+    predicates: []const runtime_schema.RelationalCheck,
+    in_predicates: []const db_mod.types.RelationalRowsInPredicate,
+    or_predicates: []const db_mod.types.RelationalRowsPredicateGroup,
+    not_predicates: []const db_mod.types.RelationalRowsPredicateGroup,
+    order_by: []const db_mod.types.RelationalRowsQueryOrder,
+) !ScalarSubqueryDefaultPlan {
+    if (output_field.len == 0 or source_field.len == 0) return error.UnsupportedSqlShape;
+    const operands_len: usize = if (value_json != null) 2 else 1;
+    const operands = try alloc.alloc(db_mod.types.RelationalRowsExpression, operands_len);
+    var operands_transferred = false;
+    errdefer if (!operands_transferred) alloc.free(operands);
+    const operand_field = try alloc.dupe(u8, source_field);
+    var operand_field_transferred = false;
+    errdefer if (!operand_field_transferred) alloc.free(operand_field);
+    const operand_value_json = if (value_json) |json| try alloc.dupe(u8, json) else "";
+    var operand_value_transferred = false;
+    errdefer if (!operand_value_transferred and operand_value_json.len != 0) alloc.free(operand_value_json);
+
+    operands[0] = .{ .kind = .field, .field = operand_field };
+    operand_field_transferred = true;
+    if (value_json != null) {
+        operands[1] = .{ .kind = .value, .value_json = operand_value_json };
+        operand_value_transferred = true;
+    }
+    operands_transferred = true;
+    const expression: db_mod.types.RelationalRowsExpression = .{ .kind = expression_kind, .operands = operands };
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeRowsQueryExpression(alloc, expression);
+    const plan = try ownedScalarSubqueryDefaultExpressionTreePlanAlloc(
+        alloc,
+        table_name,
+        output_field,
+        expression,
+        limit,
+        offset,
+        predicates,
+        in_predicates,
+        or_predicates,
+        not_predicates,
+        order_by,
+    );
+    expression_transferred = true;
+    return plan;
+}
+
+fn ownedScalarSubqueryDefaultExpressionTreePlanAlloc(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    output_field: []const u8,
+    expression: db_mod.types.RelationalRowsExpression,
+    limit: ?u32,
+    offset: u32,
+    predicates: []const runtime_schema.RelationalCheck,
+    in_predicates: []const db_mod.types.RelationalRowsInPredicate,
+    or_predicates: []const db_mod.types.RelationalRowsPredicateGroup,
+    not_predicates: []const db_mod.types.RelationalRowsPredicateGroup,
+    order_by: []const db_mod.types.RelationalRowsQueryOrder,
+) !ScalarSubqueryDefaultPlan {
+    if (output_field.len == 0) return error.UnsupportedSqlShape;
+    const owned_table = try alloc.dupe(u8, table_name);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(owned_table);
+    const owned_output = try alloc.dupe(u8, output_field);
+    var output_transferred = false;
+    errdefer if (!output_transferred) alloc.free(owned_output);
+    const expressions = try alloc.alloc(db_mod.types.RelationalRowsExpressionProjection, 1);
+    var expressions_transferred = false;
+    errdefer if (!expressions_transferred) alloc.free(expressions);
+    const projection_output = try alloc.dupe(u8, output_field);
+    var projection_output_transferred = false;
+    errdefer if (!projection_output_transferred) alloc.free(projection_output);
+    expressions[0] = .{
+        .output = projection_output,
+        .expression = expression,
+    };
+    projection_output_transferred = true;
+    table_transferred = true;
+    output_transferred = true;
+    expressions_transferred = true;
+    return .{
+        .table_name = owned_table,
+        .output_field = owned_output,
+        .query = .{
+            .select = &.{},
+            .select_all = false,
+            .predicates = predicates,
+            .in_predicates = in_predicates,
+            .or_predicates = or_predicates,
+            .not_predicates = not_predicates,
+            .expressions = expressions,
+            .order_by = order_by,
+            .limit = limit,
+            .offset = offset,
+        },
+    };
+}
+
+fn freeScalarDefaultOrderBy(
+    alloc: std.mem.Allocator,
+    order_by: []const db_mod.types.RelationalRowsQueryOrder,
+) void {
+    for (order_by) |order| {
+        if (order.field.len > 0) alloc.free(@constCast(order.field));
+    }
+    if (order_by.len > 0) alloc.free(@constCast(order_by.ptr)[0..order_by.len]);
+}
+
+fn freeScalarDefaultPredicates(
+    alloc: std.mem.Allocator,
+    predicates: []const runtime_schema.RelationalCheck,
+) void {
+    freeScalarDefaultPredicateValues(alloc, predicates);
+    if (predicates.len > 0) alloc.free(@constCast(predicates.ptr)[0..predicates.len]);
+}
+
+fn freeScalarDefaultPredicateValues(
+    alloc: std.mem.Allocator,
+    predicates: []const runtime_schema.RelationalCheck,
+) void {
+    for (predicates) |predicate| {
+        if (predicate.field.len > 0) alloc.free(@constCast(predicate.field));
+        if (predicate.value_json) |value| alloc.free(@constCast(value));
+        if (predicate.collation) |collation| alloc.free(@constCast(collation));
+    }
+}
+
+fn freeScalarDefaultWherePlan(
+    alloc: std.mem.Allocator,
+    where_plan: ScalarDefaultWherePlan,
+) void {
+    freeScalarDefaultPredicates(alloc, where_plan.predicates);
+    freeRowsQueryInPredicates(alloc, where_plan.in_predicates);
+    freeScalarDefaultPredicateGroups(alloc, where_plan.or_predicates);
+    freeScalarDefaultPredicateGroups(alloc, where_plan.not_predicates);
+}
+
+fn freeScalarDefaultPredicateGroups(
+    alloc: std.mem.Allocator,
+    groups: []const db_mod.types.RelationalRowsPredicateGroup,
+) void {
+    freeScalarDefaultPredicateGroupValues(alloc, groups);
+    if (groups.len > 0) alloc.free(@constCast(groups.ptr)[0..groups.len]);
+}
+
+fn freeScalarDefaultPredicateGroupValues(
+    alloc: std.mem.Allocator,
+    groups: []const db_mod.types.RelationalRowsPredicateGroup,
+) void {
+    for (groups) |group| {
+        freeScalarDefaultPredicates(alloc, group.predicates);
+    }
+}
+
+fn expectScalarDefaultKeyword(tokens: []const std.json.Value, pos: *usize, keyword: []const u8) !void {
+    if (pos.* >= tokens.len or !scalarDefaultTokenMatchesKeyword(tokens[pos.*], keyword)) return error.UnsupportedSqlShape;
+    pos.* += 1;
+}
+
+fn expectScalarDefaultFetchDirection(tokens: []const std.json.Value, pos: *usize) !void {
+    if (pos.* >= tokens.len) return error.UnsupportedSqlShape;
+    if (scalarDefaultTokenMatchesKeyword(tokens[pos.*], "first") or scalarDefaultTokenMatchesKeyword(tokens[pos.*], "next")) {
+        pos.* += 1;
+        return;
+    }
+    return error.UnsupportedSqlShape;
+}
+
+fn scalarDefaultTokenMatchesKeyword(token: std.json.Value, keyword: []const u8) bool {
+    if (token != .object) return false;
+    if (!scalarDefaultTokenKindEql(token, "identifier")) return false;
+    const keyword_value = token.object.get("keyword") orelse return false;
+    if (keyword_value != .string or !std.mem.eql(u8, keyword_value.string, keyword)) return false;
+    return std.ascii.eqlIgnoreCase(scalarDefaultTokenText(token), keyword);
+}
+
+fn scalarDefaultTokenKindEql(token: std.json.Value, kind: []const u8) bool {
+    if (token != .object) return false;
+    const kind_value = token.object.get("kind") orelse return false;
+    if (kind_value != .string or !std.mem.eql(u8, kind_value.string, kind)) return false;
+    return scalarDefaultTokenTextMatchesKind(kind, scalarDefaultTokenText(token));
+}
+
+fn scalarDefaultTokenTextMatchesKind(kind: []const u8, text: []const u8) bool {
+    if (std.mem.eql(u8, kind, "identifier") or
+        std.mem.eql(u8, kind, "number") or
+        std.mem.eql(u8, kind, "string"))
+    {
+        return text.len != 0;
+    }
+    if (std.mem.eql(u8, kind, "lparen")) return std.mem.eql(u8, text, "(");
+    if (std.mem.eql(u8, kind, "rparen")) return std.mem.eql(u8, text, ")");
+    if (std.mem.eql(u8, kind, "comma")) return std.mem.eql(u8, text, ",");
+    if (std.mem.eql(u8, kind, "semicolon")) return std.mem.eql(u8, text, ";");
+    if (std.mem.eql(u8, kind, "eq")) return std.mem.eql(u8, text, "=");
+    if (std.mem.eql(u8, kind, "neq")) return std.mem.eql(u8, text, "!=") or std.mem.eql(u8, text, "<>");
+    if (std.mem.eql(u8, kind, "gt")) return std.mem.eql(u8, text, ">");
+    if (std.mem.eql(u8, kind, "gte")) return std.mem.eql(u8, text, ">=");
+    if (std.mem.eql(u8, kind, "lt")) return std.mem.eql(u8, text, "<");
+    if (std.mem.eql(u8, kind, "lte")) return std.mem.eql(u8, text, "<=");
+    if (std.mem.eql(u8, kind, "plus")) return std.mem.eql(u8, text, "+");
+    if (std.mem.eql(u8, kind, "minus")) return std.mem.eql(u8, text, "-");
+    return true;
+}
+
+fn scalarDefaultIdentifierTokenText(tokens: []const std.json.Value, pos: usize) ![]const u8 {
+    if (pos >= tokens.len) return error.UnsupportedSqlShape;
+    const token = tokens[pos];
+    if (!scalarDefaultTokenKindEql(token, "identifier")) return error.UnsupportedSqlShape;
+    const text = scalarDefaultTokenText(token);
+    if (text.len == 0) return error.UnsupportedSqlShape;
+    return text;
+}
+
+fn scalarDefaultOrderFieldName(
+    tokens: []const std.json.Value,
+    pos: usize,
+    source_binding: ScalarDefaultSourceBinding,
+    output_field: []const u8,
+    projection_alias: []const u8,
+) ![]const u8 {
+    if (pos >= tokens.len) return error.UnsupportedSqlShape;
+    if (scalarDefaultTokenKindEql(tokens[pos], "number")) {
+        const text = scalarDefaultTokenText(tokens[pos]);
+        if (!std.mem.eql(u8, text, "1")) return error.UnsupportedSqlShape;
+        return output_field;
+    }
+    const field = try scalarDefaultIdentifierTokenText(tokens, pos);
+    if (projection_alias.len != 0 and std.mem.eql(u8, field, projection_alias)) return output_field;
+    return scalarDefaultNormalizeFieldNameForBinding(field, source_binding);
+}
+
+fn scalarDefaultConsumeOptionalProjectionAlias(tokens: []const std.json.Value, pos: *usize) ![]const u8 {
+    if (pos.* >= tokens.len or !scalarDefaultTokenMatchesKeyword(tokens[pos.*], "as")) return "";
+    pos.* += 1;
+    const alias = try scalarDefaultIdentifierTokenText(tokens, pos.*);
+    pos.* += 1;
+    return alias;
+}
+
+fn scalarDefaultConsumeOptionalSourceAlias(tokens: []const std.json.Value, pos: *usize) ![]const u8 {
+    if (pos.* >= tokens.len) return "";
+    if (scalarDefaultTokenMatchesKeyword(tokens[pos.*], "as")) {
+        pos.* += 1;
+        const alias = try scalarDefaultIdentifierTokenText(tokens, pos.*);
+        if (!scalarDefaultAliasIsValid(alias) or scalarDefaultTokenKeyword(tokens[pos.*]) != null) return error.UnsupportedSqlShape;
+        pos.* += 1;
+        return alias;
+    }
+    if (!scalarDefaultTokenKindEql(tokens[pos.*], "identifier") or scalarDefaultTokenKeyword(tokens[pos.*]) != null) return "";
+    const alias = try scalarDefaultIdentifierTokenText(tokens, pos.*);
+    if (!scalarDefaultAliasIsValid(alias)) return error.UnsupportedSqlShape;
+    pos.* += 1;
+    return alias;
+}
+
+fn scalarDefaultStructuredAlias(maybe_value: ?std.json.Value) ![]const u8 {
+    const value = maybe_value orelse return "";
+    if (value != .string or !scalarDefaultAliasIsValid(value.string)) return error.InvalidRowsRequest;
+    return value.string;
+}
+
+fn scalarDefaultAliasIsValid(alias: []const u8) bool {
+    return alias.len != 0 and std.mem.indexOfScalar(u8, alias, '.') == null;
+}
+
+fn scalarDefaultTokenKeyword(token: std.json.Value) ?[]const u8 {
+    if (token != .object) return null;
+    const keyword_value = token.object.get("keyword") orelse return null;
+    if (keyword_value != .string) return null;
+    return keyword_value.string;
+}
+
+fn scalarDefaultNormalizeTableName(name: []const u8) []const u8 {
+    const public_member = scalarDefaultStripQualifier(name, "public") orelse return name;
+    if (std.mem.indexOfScalar(u8, public_member, '.') != null or public_member.len == 0) return name;
+    return public_member;
+}
+
+fn scalarDefaultNormalizeFieldNameForBinding(name: []const u8, source_binding: ScalarDefaultSourceBinding) []const u8 {
+    if (scalarDefaultStripQualifier(name, source_binding.alias)) |member| {
+        if (member.len != 0) return member;
+    }
+    return scalarDefaultNormalizeFieldName(name, source_binding.table_name);
+}
+
+fn scalarDefaultNormalizeFieldName(name: []const u8, table_name: []const u8) []const u8 {
+    if (scalarDefaultStripQualifier(name, table_name)) |member| {
+        if (member.len != 0) return member;
+    }
+    if (scalarDefaultStripQualifier(name, "public")) |public_member| {
+        if (scalarDefaultStripQualifier(public_member, table_name)) |member| {
+            if (member.len != 0) return member;
+        }
+    }
+    return name;
+}
+
+fn scalarDefaultStripQualifier(name: []const u8, qualifier: []const u8) ?[]const u8 {
+    if (qualifier.len == 0 or name.len <= qualifier.len + 1) return null;
+    if (name[qualifier.len] != '.') return null;
+    if (!std.ascii.eqlIgnoreCase(name[0..qualifier.len], qualifier)) return null;
+    return name[qualifier.len + 1 ..];
+}
+
+fn scalarDefaultValueTokenJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const std.json.Value,
+    pos: *usize,
+) ![]const u8 {
+    if (pos.* >= tokens.len) return error.UnsupportedSqlShape;
+    if (scalarDefaultTokenKindEql(tokens[pos.*], "string")) {
+        const text = scalarDefaultTokenText(tokens[pos.*]);
+        pos.* += 1;
+        return try std.json.Stringify.valueAlloc(alloc, text, .{});
+    }
+    if (scalarDefaultTokenKindEql(tokens[pos.*], "number")) {
+        const text = scalarDefaultTokenText(tokens[pos.*]);
+        pos.* += 1;
+        return try alloc.dupe(u8, text);
+    }
+    if (scalarDefaultTokenKindEql(tokens[pos.*], "minus") or scalarDefaultTokenKindEql(tokens[pos.*], "plus")) {
+        const negative = scalarDefaultTokenKindEql(tokens[pos.*], "minus");
+        pos.* += 1;
+        if (pos.* >= tokens.len or !scalarDefaultTokenKindEql(tokens[pos.*], "number")) return error.UnsupportedSqlShape;
+        const text = scalarDefaultTokenText(tokens[pos.*]);
+        pos.* += 1;
+        return if (negative) try std.fmt.allocPrint(alloc, "-{s}", .{text}) else try alloc.dupe(u8, text);
+    }
+    if (scalarDefaultTokenMatchesKeyword(tokens[pos.*], "true")) {
+        pos.* += 1;
+        return try alloc.dupe(u8, "true");
+    }
+    if (scalarDefaultTokenMatchesKeyword(tokens[pos.*], "false")) {
+        pos.* += 1;
+        return try alloc.dupe(u8, "false");
+    }
+    if (scalarDefaultTokenMatchesKeyword(tokens[pos.*], "null")) {
+        pos.* += 1;
+        return try alloc.dupe(u8, "null");
+    }
+    return error.UnsupportedSqlShape;
+}
+
+fn scalarDefaultTokenizedValueListJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const std.json.Value,
+    pos: *usize,
+) ![]const u8 {
+    if (pos.* >= tokens.len or !scalarDefaultTokenKindEql(tokens[pos.*], "lparen")) return error.UnsupportedSqlShape;
+    pos.* += 1;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('[');
+    var count: usize = 0;
+    while (true) {
+        if (pos.* >= tokens.len or scalarDefaultTokenKindEql(tokens[pos.*], "rparen")) return error.UnsupportedSqlShape;
+        const value_json = try scalarDefaultValueTokenJsonAlloc(alloc, tokens, pos);
+        defer alloc.free(value_json);
+        if (count > 0) try writer.writeByte(',');
+        try writer.writeAll(value_json);
+        count += 1;
+        if (pos.* < tokens.len and scalarDefaultTokenKindEql(tokens[pos.*], "comma")) {
+            pos.* += 1;
+            continue;
+        }
+        break;
+    }
+    if (pos.* >= tokens.len or !scalarDefaultTokenKindEql(tokens[pos.*], "rparen")) return error.UnsupportedSqlShape;
+    pos.* += 1;
+    try writer.writeByte(']');
+    return try out.toOwnedSlice();
+}
+
+fn scalarDefaultUnsignedToken(tokens: []const std.json.Value, pos: *usize) !u32 {
+    if (pos.* < tokens.len and scalarDefaultTokenKindEql(tokens[pos.*], "plus")) pos.* += 1;
+    if (pos.* >= tokens.len or !scalarDefaultTokenKindEql(tokens[pos.*], "number")) return error.UnsupportedSqlShape;
+    const text = scalarDefaultTokenText(tokens[pos.*]);
+    pos.* += 1;
+    return std.fmt.parseUnsigned(u32, text, 10) catch return error.UnsupportedSqlShape;
+}
+
+fn scalarDefaultTokenText(token: std.json.Value) []const u8 {
+    if (token != .object) return "";
+    const text_value = token.object.get("text") orelse return "";
+    return if (text_value == .string) text_value.string else "";
 }
 
 fn sequenceDefaultValueJsonAlloc(
@@ -23392,6 +25574,961 @@ test "relational rows materializes sequence defaults through explicit resolver" 
     try std.testing.expectEqualStrings("{\"id\":42,\"status\":\"pending\"}", batch.returning_rows[0]);
 }
 
+test "relational rows binds scalar subquery default query payloads" {
+    const alloc = std.testing.allocator;
+
+    var structured = try scalarSubqueryDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"field\":\"id\",\"op\":\"eq\",\"value\":\"u2\"},\"limit\":1}",
+    );
+    defer structured.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", structured.table_name);
+    try std.testing.expectEqualStrings("status", structured.output_field);
+    try std.testing.expectEqual(@as(usize, 1), structured.query.select.len);
+    try std.testing.expectEqualStrings("status", structured.query.select[0]);
+    try std.testing.expectEqual(@as(usize, 1), structured.query.predicates.len);
+    try std.testing.expectEqualStrings("id", structured.query.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, structured.query.predicates[0].op);
+    try std.testing.expectEqualStrings("\"u2\"", structured.query.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(?u32, 1), structured.query.limit);
+    try std.testing.expectEqual(@as(u32, 0), structured.query.offset);
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        scalarSubqueryDefaultPlanFromQueryJsonAlloc(
+            alloc,
+            "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+        ),
+    );
+
+    const normalized_legacy_value = try normalizeScalarSubqueryDefaultValueJsonAlloc(
+        alloc,
+        "{\"query\":{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}}",
+    );
+    defer alloc.free(normalized_legacy_value);
+    try std.testing.expectEqualStrings("{\"query\":{\"table\":\"usage_records\",\"select\":[\"status\"],\"limit\":1}}", normalized_legacy_value);
+
+    const RuntimeRejectResolver = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) ScalarSubqueryDefaultResolver {
+            return .{
+                .ptr = self,
+                .value_json_alloc = valueJsonAlloc,
+            };
+        }
+
+        fn valueJsonAlloc(ptr: *anyopaque, alloc_inner: std.mem.Allocator, _: ScalarSubqueryDefaultRequest) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return try alloc_inner.dupe(u8, "\"unexpected\"");
+        }
+    };
+
+    var runtime_reject_resolver = RuntimeRejectResolver{};
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        relationalDefaultValueJsonWithContextAlloc(
+            alloc,
+            .{
+                .kind = .scalar_subquery,
+                .value_json = "{\"query\":{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}}",
+            },
+            .{ .scalar_subquery_resolver = runtime_reject_resolver.iface() },
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), runtime_reject_resolver.calls);
+
+    var structured_in = try scalarSubqueryDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"field\":\"status\",\"op\":\"in\",\"value\":[\"open\",\"pending\"]},\"limit\":1}",
+    );
+    defer structured_in.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), structured_in.query.in_predicates.len);
+    try std.testing.expectEqualStrings("status", structured_in.query.in_predicates[0].field);
+    try std.testing.expect(!structured_in.query.in_predicates[0].negated);
+    try std.testing.expectEqualStrings("[\"open\",\"pending\"]", structured_in.query.in_predicates[0].values_json);
+    const normalized_structured_in = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, structured_in);
+    defer alloc.free(normalized_structured_in);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"field\":\"status\",\"op\":\"in\",\"value\":[\"open\",\"pending\"]},\"limit\":1}", normalized_structured_in);
+
+    var structured_not_in = try scalarSubqueryDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"field\":\"status\",\"op\":\"not_in\",\"value\":[\"closed\",\"archived\"]},\"limit\":1}",
+    );
+    defer structured_not_in.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), structured_not_in.query.in_predicates.len);
+    try std.testing.expectEqualStrings("status", structured_not_in.query.in_predicates[0].field);
+    try std.testing.expect(structured_not_in.query.in_predicates[0].negated);
+    try std.testing.expectEqualStrings("[\"closed\",\"archived\"]", structured_not_in.query.in_predicates[0].values_json);
+
+    var structured_all = try scalarSubqueryDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"all\":[{\"field\":\"id\",\"op\":\"eq\",\"value\":\"u2\"},{\"field\":\"status\",\"op\":\"is_not_null\"}]},\"limit\":1}",
+    );
+    defer structured_all.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), structured_all.query.predicates.len);
+    try std.testing.expectEqualStrings("id", structured_all.query.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, structured_all.query.predicates[0].op);
+    try std.testing.expectEqualStrings("\"u2\"", structured_all.query.predicates[0].value_json.?);
+    try std.testing.expectEqualStrings("status", structured_all.query.predicates[1].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_not_null, structured_all.query.predicates[1].op);
+    try std.testing.expect(structured_all.query.predicates[1].value_json == null);
+
+    var structured_all_in = try scalarSubqueryDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"all\":[{\"field\":\"id\",\"op\":\"eq\",\"value\":\"u2\"},{\"field\":\"status\",\"op\":\"in\",\"value\":[\"open\",\"pending\"]}]},\"limit\":1}",
+    );
+    defer structured_all_in.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), structured_all_in.query.predicates.len);
+    try std.testing.expectEqualStrings("id", structured_all_in.query.predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 1), structured_all_in.query.in_predicates.len);
+    try std.testing.expectEqualStrings("status", structured_all_in.query.in_predicates[0].field);
+    try std.testing.expectEqualStrings("[\"open\",\"pending\"]", structured_all_in.query.in_predicates[0].values_json);
+    const normalized_structured_all_in = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, structured_all_in);
+    defer alloc.free(normalized_structured_all_in);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"all\":[{\"field\":\"id\",\"op\":\"eq\",\"value\":\"u2\"},{\"field\":\"status\",\"op\":\"in\",\"value\":[\"open\",\"pending\"]}]},\"limit\":1}", normalized_structured_all_in);
+
+    var structured_all_not = try scalarSubqueryDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"all\":[{\"field\":\"status\",\"op\":\"is_not_null\"},{\"not\":[{\"field\":\"id\",\"op\":\"eq\",\"value\":\"u2\"}]}]},\"limit\":1}",
+    );
+    defer structured_all_not.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), structured_all_not.query.predicates.len);
+    try std.testing.expectEqualStrings("status", structured_all_not.query.predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 1), structured_all_not.query.not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), structured_all_not.query.not_predicates[0].predicates.len);
+    try std.testing.expectEqualStrings("id", structured_all_not.query.not_predicates[0].predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, structured_all_not.query.not_predicates[0].predicates[0].op);
+    try std.testing.expectEqualStrings("\"u2\"", structured_all_not.query.not_predicates[0].predicates[0].value_json.?);
+
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        scalarSubqueryDefaultPlanFromQueryJsonAlloc(
+            alloc,
+            "{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"field\":\"status\",\"op\":\"in\",\"value\":[]},\"limit\":1}",
+        ),
+    );
+
+    var structured_any = try scalarSubqueryDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"any\":[{\"field\":\"id\",\"op\":\"eq\",\"value\":\"u2\"},{\"all\":[{\"field\":\"status\",\"op\":\"is_not_null\"},{\"field\":\"amount\",\"op\":\"gte\",\"value\":5}]}]},\"limit\":1}",
+    );
+    defer structured_any.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), structured_any.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), structured_any.query.or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), structured_any.query.or_predicates[0].predicates.len);
+    try std.testing.expectEqualStrings("id", structured_any.query.or_predicates[0].predicates[0].field);
+    try std.testing.expectEqualStrings("\"u2\"", structured_any.query.or_predicates[0].predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 2), structured_any.query.or_predicates[1].predicates.len);
+    try std.testing.expectEqualStrings("status", structured_any.query.or_predicates[1].predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_not_null, structured_any.query.or_predicates[1].predicates[0].op);
+    try std.testing.expectEqualStrings("amount", structured_any.query.or_predicates[1].predicates[1].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, structured_any.query.or_predicates[1].predicates[1].op);
+    const normalized_structured_any = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, structured_any);
+    defer alloc.free(normalized_structured_any);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"any\":[{\"field\":\"id\",\"op\":\"eq\",\"value\":\"u2\"},{\"all\":[{\"field\":\"status\",\"op\":\"is_not_null\"},{\"field\":\"amount\",\"op\":\"gte\",\"value\":5}]}]},\"limit\":1}", normalized_structured_any);
+
+    var structured_not = try scalarSubqueryDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"all\":[{\"field\":\"status\",\"op\":\"is_not_null\"}],\"not\":[{\"field\":\"id\",\"op\":\"eq\",\"value\":\"u2\"},{\"all\":[{\"field\":\"amount\",\"op\":\"lt\",\"value\":5},{\"field\":\"deleted_at\",\"op\":\"is_not_null\"}]}]},\"limit\":1}",
+    );
+    defer structured_not.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), structured_not.query.predicates.len);
+    try std.testing.expectEqualStrings("status", structured_not.query.predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 2), structured_not.query.not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), structured_not.query.not_predicates[0].predicates.len);
+    try std.testing.expectEqualStrings("id", structured_not.query.not_predicates[0].predicates[0].field);
+    try std.testing.expectEqualStrings("\"u2\"", structured_not.query.not_predicates[0].predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 2), structured_not.query.not_predicates[1].predicates.len);
+    try std.testing.expectEqualStrings("amount", structured_not.query.not_predicates[1].predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lt, structured_not.query.not_predicates[1].predicates[0].op);
+    try std.testing.expectEqualStrings("deleted_at", structured_not.query.not_predicates[1].predicates[1].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_not_null, structured_not.query.not_predicates[1].predicates[1].op);
+    const normalized_structured_not = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, structured_not);
+    defer alloc.free(normalized_structured_not);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"all\":[{\"field\":\"status\",\"op\":\"is_not_null\"}],\"not\":[{\"field\":\"id\",\"op\":\"eq\",\"value\":\"u2\"},{\"all\":[{\"field\":\"amount\",\"op\":\"lt\",\"value\":5},{\"field\":\"deleted_at\",\"op\":\"is_not_null\"}]}]},\"limit\":1}", normalized_structured_not);
+
+    var structured_qualified = try scalarSubqueryDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"table\":\"public.usage_records\",\"select\":[\"usage_records.status\"],\"where\":{\"field\":\"usage_records.id\",\"op\":\"eq\",\"value\":\"u2\"},\"order_by\":[{\"field\":\"usage_records.id\"}],\"limit\":1}",
+    );
+    defer structured_qualified.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", structured_qualified.table_name);
+    try std.testing.expectEqualStrings("status", structured_qualified.output_field);
+    try std.testing.expectEqualStrings("status", structured_qualified.query.select[0]);
+    try std.testing.expectEqualStrings("id", structured_qualified.query.predicates[0].field);
+    try std.testing.expectEqualStrings("id", structured_qualified.query.order_by[0].field);
+
+    var structured_source_alias = try scalarSubqueryDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"table\":\"usage_records\",\"alias\":\"u\",\"select\":[\"u.status\"],\"where\":{\"field\":\"u.id\",\"op\":\"eq\",\"value\":\"u2\"},\"order_by\":[{\"field\":\"u.id\"}],\"limit\":1}",
+    );
+    defer structured_source_alias.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", structured_source_alias.table_name);
+    try std.testing.expectEqualStrings("status", structured_source_alias.output_field);
+    try std.testing.expectEqualStrings("status", structured_source_alias.query.select[0]);
+    try std.testing.expectEqualStrings("id", structured_source_alias.query.predicates[0].field);
+    try std.testing.expectEqualStrings("id", structured_source_alias.query.order_by[0].field);
+    const normalized_structured_source_alias = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, structured_source_alias);
+    defer alloc.free(normalized_structured_source_alias);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"field\":\"id\",\"op\":\"eq\",\"value\":\"u2\"},\"order_by\":[{\"field\":\"id\"}],\"limit\":1}", normalized_structured_source_alias);
+
+    var structured_null_order = try scalarSubqueryDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"table\":\"usage_records\",\"select\":[\"status\"],\"order_by\":[{\"field\":\"status\",\"direction\":\"desc\",\"null_test\":\"is_null\"}],\"limit\":1}",
+    );
+    defer structured_null_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), structured_null_order.query.order_by.len);
+    try std.testing.expectEqualStrings("status", structured_null_order.query.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, structured_null_order.query.order_by[0].direction);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderNullTest.is_null, structured_null_order.query.order_by[0].null_test.?);
+    const normalized_structured_null_order = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, structured_null_order);
+    defer alloc.free(normalized_structured_null_order);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"order_by\":[{\"field\":\"status\",\"direction\":\"desc\",\"null_test\":\"is_null\"}],\"limit\":1}", normalized_structured_null_order);
+
+    var structured_lower_projection = try scalarSubqueryDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"table\":\"usage_records\",\"expressions\":[{\"as\":\"status_key\",\"expr\":{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]}}],\"where\":{\"field\":\"id\",\"op\":\"eq\",\"value\":\"u2\"},\"limit\":1}",
+    );
+    defer structured_lower_projection.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", structured_lower_projection.table_name);
+    try std.testing.expectEqualStrings("status_key", structured_lower_projection.output_field);
+    try std.testing.expectEqual(@as(usize, 0), structured_lower_projection.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), structured_lower_projection.query.expressions.len);
+    try std.testing.expectEqualStrings("status_key", structured_lower_projection.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, structured_lower_projection.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), structured_lower_projection.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqualStrings("status", structured_lower_projection.query.expressions[0].expression.operands[0].field);
+    const normalized_structured_lower_projection = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, structured_lower_projection);
+    defer alloc.free(normalized_structured_lower_projection);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"expressions\":[{\"as\":\"status_key\",\"expr\":{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]}}],\"where\":{\"field\":\"id\",\"op\":\"eq\",\"value\":\"u2\"},\"limit\":1}", normalized_structured_lower_projection);
+
+    var structured_upper_projection = try scalarSubqueryDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"table\":\"usage_records\",\"expressions\":[{\"as\":\"status_label\",\"expr\":{\"op\":\"upper\",\"args\":[{\"field\":\"status\"}]}}],\"limit\":1}",
+    );
+    defer structured_upper_projection.deinit(alloc);
+    try std.testing.expectEqualStrings("status_label", structured_upper_projection.output_field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.upper, structured_upper_projection.query.expressions[0].expression.kind);
+    try std.testing.expectEqualStrings("status", structured_upper_projection.query.expressions[0].expression.operands[0].field);
+    const normalized_structured_upper_projection = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, structured_upper_projection);
+    defer alloc.free(normalized_structured_upper_projection);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"expressions\":[{\"as\":\"status_label\",\"expr\":{\"op\":\"upper\",\"args\":[{\"field\":\"status\"}]}}],\"limit\":1}", normalized_structured_upper_projection);
+
+    var structured_concat_projection = try scalarSubqueryDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"table\":\"usage_records\",\"expressions\":[{\"as\":\"status_label\",\"expr\":{\"op\":\"concat\",\"args\":[{\"field\":\"status\"},{\"value\":\"-seed\"}]}}],\"limit\":1}",
+    );
+    defer structured_concat_projection.deinit(alloc);
+    try std.testing.expectEqualStrings("status_label", structured_concat_projection.output_field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.concat, structured_concat_projection.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), structured_concat_projection.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqualStrings("status", structured_concat_projection.query.expressions[0].expression.operands[0].field);
+    try std.testing.expectEqualStrings("\"-seed\"", structured_concat_projection.query.expressions[0].expression.operands[1].value_json);
+    const normalized_structured_concat_projection = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, structured_concat_projection);
+    defer alloc.free(normalized_structured_concat_projection);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"expressions\":[{\"as\":\"status_label\",\"expr\":{\"op\":\"concat\",\"args\":[{\"field\":\"status\"},{\"value\":\"-seed\"}]}}],\"limit\":1}", normalized_structured_concat_projection);
+
+    var structured_md5_projection = try scalarSubqueryDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"table\":\"usage_records\",\"expressions\":[{\"as\":\"status_hash\",\"expr\":{\"op\":\"md5\",\"args\":[{\"field\":\"status\"}]}}],\"limit\":1}",
+    );
+    defer structured_md5_projection.deinit(alloc);
+    try std.testing.expectEqualStrings("status_hash", structured_md5_projection.output_field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.md5, structured_md5_projection.query.expressions[0].expression.kind);
+    try std.testing.expectEqualStrings("status", structured_md5_projection.query.expressions[0].expression.operands[0].field);
+    const normalized_structured_md5_projection = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, structured_md5_projection);
+    defer alloc.free(normalized_structured_md5_projection);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"expressions\":[{\"as\":\"status_hash\",\"expr\":{\"op\":\"md5\",\"args\":[{\"field\":\"status\"}]}}],\"limit\":1}", normalized_structured_md5_projection);
+
+    var structured_reverse_projection = try scalarSubqueryDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"table\":\"usage_records\",\"expressions\":[{\"as\":\"status_reversed\",\"expr\":{\"op\":\"reverse\",\"args\":[{\"field\":\"status\"}]}}],\"limit\":1}",
+    );
+    defer structured_reverse_projection.deinit(alloc);
+    try std.testing.expectEqualStrings("status_reversed", structured_reverse_projection.output_field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.reverse, structured_reverse_projection.query.expressions[0].expression.kind);
+    try std.testing.expectEqualStrings("status", structured_reverse_projection.query.expressions[0].expression.operands[0].field);
+    const normalized_structured_reverse_projection = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, structured_reverse_projection);
+    defer alloc.free(normalized_structured_reverse_projection);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"expressions\":[{\"as\":\"status_reversed\",\"expr\":{\"op\":\"reverse\",\"args\":[{\"field\":\"status\"}]}}],\"limit\":1}", normalized_structured_reverse_projection);
+
+    var structured_arithmetic_projection = try scalarSubqueryDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"table\":\"usage_records\",\"expressions\":[{\"as\":\"amount_plus\",\"expr\":{\"op\":\"add\",\"args\":[{\"field\":\"amount\"},{\"value\":5}]}}],\"limit\":1}",
+    );
+    defer structured_arithmetic_projection.deinit(alloc);
+    try std.testing.expectEqualStrings("amount_plus", structured_arithmetic_projection.output_field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, structured_arithmetic_projection.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), structured_arithmetic_projection.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqualStrings("amount", structured_arithmetic_projection.query.expressions[0].expression.operands[0].field);
+    try std.testing.expectEqualStrings("5", structured_arithmetic_projection.query.expressions[0].expression.operands[1].value_json);
+    const normalized_structured_arithmetic_projection = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, structured_arithmetic_projection);
+    defer alloc.free(normalized_structured_arithmetic_projection);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"expressions\":[{\"as\":\"amount_plus\",\"expr\":{\"op\":\"add\",\"args\":[{\"field\":\"amount\"},{\"value\":5}]}}],\"limit\":1}", normalized_structured_arithmetic_projection);
+
+    var structured_nested_arithmetic_projection = try scalarSubqueryDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"table\":\"usage_records\",\"expressions\":[{\"as\":\"net_amount\",\"expr\":{\"op\":\"sub\",\"args\":[{\"op\":\"add\",\"args\":[{\"field\":\"amount\"},{\"field\":\"fee\"}]},{\"value\":1}]}}],\"limit\":1}",
+    );
+    defer structured_nested_arithmetic_projection.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, structured_nested_arithmetic_projection.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, structured_nested_arithmetic_projection.query.expressions[0].expression.operands[0].kind);
+    const normalized_structured_nested_arithmetic_projection = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, structured_nested_arithmetic_projection);
+    defer alloc.free(normalized_structured_nested_arithmetic_projection);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"expressions\":[{\"as\":\"net_amount\",\"expr\":{\"op\":\"sub\",\"args\":[{\"op\":\"add\",\"args\":[{\"field\":\"amount\"},{\"field\":\"fee\"}]},{\"value\":1}]}}],\"limit\":1}", normalized_structured_nested_arithmetic_projection);
+
+    var structured_cast_projection = try scalarSubqueryDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"table\":\"usage_records\",\"expressions\":[{\"as\":\"amount_text\",\"expr\":{\"op\":\"cast\",\"to\":\"text\",\"args\":[{\"field\":\"amount\"}]}}],\"limit\":1}",
+    );
+    defer structured_cast_projection.deinit(alloc);
+    try std.testing.expectEqualStrings("amount_text", structured_cast_projection.output_field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.cast, structured_cast_projection.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionCastType.text, structured_cast_projection.query.expressions[0].expression.cast_type.?);
+    try std.testing.expectEqualStrings("amount", structured_cast_projection.query.expressions[0].expression.operands[0].field);
+    const normalized_structured_cast_projection = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, structured_cast_projection);
+    defer alloc.free(normalized_structured_cast_projection);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"expressions\":[{\"as\":\"amount_text\",\"expr\":{\"op\":\"cast\",\"to\":\"text\",\"args\":[{\"field\":\"amount\"}]}}],\"limit\":1}", normalized_structured_cast_projection);
+
+    var tokenized = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"id\"},{\"kind\":\"eq\",\"text\":\"=\"},{\"kind\":\"string\",\"text\":\"u2\"},{\"kind\":\"identifier\",\"text\":\"ORDER\",\"keyword\":\"order\"},{\"kind\":\"identifier\",\"text\":\"BY\",\"keyword\":\"by\"},{\"kind\":\"identifier\",\"text\":\"id\"},{\"kind\":\"identifier\",\"text\":\"DESC\",\"keyword\":\"desc\"},{\"kind\":\"identifier\",\"text\":\"OFFSET\",\"keyword\":\"offset\"},{\"kind\":\"plus\",\"text\":\"+\"},{\"kind\":\"number\",\"text\":\"1\"},{\"kind\":\"identifier\",\"text\":\"ROW\",\"keyword\":\"row\"},{\"kind\":\"identifier\",\"text\":\"FETCH\",\"keyword\":\"fetch\"},{\"kind\":\"identifier\",\"text\":\"FIRST\",\"keyword\":\"first\"},{\"kind\":\"identifier\",\"text\":\"ROW\",\"keyword\":\"row\"},{\"kind\":\"identifier\",\"text\":\"ONLY\",\"keyword\":\"only\"}]}",
+    );
+    defer tokenized.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", tokenized.table_name);
+    try std.testing.expectEqualStrings("status", tokenized.output_field);
+    try std.testing.expectEqual(@as(usize, 1), tokenized.query.predicates.len);
+    try std.testing.expectEqualStrings("id", tokenized.query.predicates[0].field);
+    try std.testing.expectEqualStrings("\"u2\"", tokenized.query.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(?u32, 1), tokenized.query.limit);
+    try std.testing.expectEqual(@as(u32, 1), tokenized.query.offset);
+    try std.testing.expectEqual(@as(usize, 1), tokenized.query.order_by.len);
+    try std.testing.expectEqualStrings("id", tokenized.query.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, tokenized.query.order_by[0].direction);
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        legacyScalarDefaultPlanFromQueryJsonAlloc(
+            alloc,
+            "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"UPDATE\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+        ),
+    );
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        legacyScalarDefaultPlanFromQueryJsonAlloc(
+            alloc,
+            "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"id\"},{\"kind\":\"eq\",\"text\":\"<\"},{\"kind\":\"string\",\"text\":\"u2\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+        ),
+    );
+
+    var tokenized_fetch_next = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"ORDER\",\"keyword\":\"order\"},{\"kind\":\"identifier\",\"text\":\"BY\",\"keyword\":\"by\"},{\"kind\":\"identifier\",\"text\":\"id\"},{\"kind\":\"identifier\",\"text\":\"FETCH\",\"keyword\":\"fetch\"},{\"kind\":\"identifier\",\"text\":\"NEXT\",\"keyword\":\"next\"},{\"kind\":\"number\",\"text\":\"2\"},{\"kind\":\"identifier\",\"text\":\"ROWS\",\"keyword\":\"rows\"},{\"kind\":\"identifier\",\"text\":\"ONLY\",\"keyword\":\"only\"}]}",
+    );
+    defer tokenized_fetch_next.deinit(alloc);
+    try std.testing.expectEqual(@as(?u32, 2), tokenized_fetch_next.query.limit);
+    try std.testing.expectEqualStrings("id", tokenized_fetch_next.query.order_by[0].field);
+    const normalized_tokenized_fetch_next = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_fetch_next);
+    defer alloc.free(normalized_tokenized_fetch_next);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"order_by\":[{\"field\":\"id\"}],\"limit\":2}", normalized_tokenized_fetch_next);
+
+    var tokenized_limit_all = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"ORDER\",\"keyword\":\"order\"},{\"kind\":\"identifier\",\"text\":\"BY\",\"keyword\":\"by\"},{\"kind\":\"identifier\",\"text\":\"id\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"identifier\",\"text\":\"ALL\",\"keyword\":\"all\"}]}",
+    );
+    defer tokenized_limit_all.deinit(alloc);
+    try std.testing.expect(tokenized_limit_all.query.limit == null);
+    try std.testing.expectEqualStrings("id", tokenized_limit_all.query.order_by[0].field);
+    const normalized_tokenized_limit_all = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_limit_all);
+    defer alloc.free(normalized_tokenized_limit_all);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"order_by\":[{\"field\":\"id\"}]}", normalized_tokenized_limit_all);
+
+    var tokenized_source_alias = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"u.status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"AS\",\"keyword\":\"as\"},{\"kind\":\"identifier\",\"text\":\"u\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"u.id\"},{\"kind\":\"eq\",\"text\":\"=\"},{\"kind\":\"string\",\"text\":\"u2\"},{\"kind\":\"identifier\",\"text\":\"ORDER\",\"keyword\":\"order\"},{\"kind\":\"identifier\",\"text\":\"BY\",\"keyword\":\"by\"},{\"kind\":\"identifier\",\"text\":\"u.id\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+    );
+    defer tokenized_source_alias.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", tokenized_source_alias.table_name);
+    try std.testing.expectEqualStrings("status", tokenized_source_alias.output_field);
+    try std.testing.expectEqualStrings("status", tokenized_source_alias.query.select[0]);
+    try std.testing.expectEqualStrings("id", tokenized_source_alias.query.predicates[0].field);
+    try std.testing.expectEqualStrings("id", tokenized_source_alias.query.order_by[0].field);
+    const normalized_tokenized_source_alias = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_source_alias);
+    defer alloc.free(normalized_tokenized_source_alias);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"field\":\"id\",\"op\":\"eq\",\"value\":\"u2\"},\"order_by\":[{\"field\":\"id\"}],\"limit\":1}", normalized_tokenized_source_alias);
+
+    var tokenized_ordinal_order = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"ORDER\",\"keyword\":\"order\"},{\"kind\":\"identifier\",\"text\":\"BY\",\"keyword\":\"by\"},{\"kind\":\"number\",\"text\":\"1\"},{\"kind\":\"identifier\",\"text\":\"DESC\",\"keyword\":\"desc\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+    );
+    defer tokenized_ordinal_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_ordinal_order.query.order_by.len);
+    try std.testing.expectEqualStrings("status", tokenized_ordinal_order.query.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, tokenized_ordinal_order.query.order_by[0].direction);
+    const normalized_tokenized_ordinal_order = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_ordinal_order);
+    defer alloc.free(normalized_tokenized_ordinal_order);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"order_by\":[{\"field\":\"status\",\"direction\":\"desc\"}],\"limit\":1}", normalized_tokenized_ordinal_order);
+
+    var tokenized_projection_alias_order = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"AS\",\"keyword\":\"as\"},{\"kind\":\"identifier\",\"text\":\"latest_status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"ORDER\",\"keyword\":\"order\"},{\"kind\":\"identifier\",\"text\":\"BY\",\"keyword\":\"by\"},{\"kind\":\"identifier\",\"text\":\"latest_status\"},{\"kind\":\"identifier\",\"text\":\"DESC\",\"keyword\":\"desc\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+    );
+    defer tokenized_projection_alias_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_projection_alias_order.query.order_by.len);
+    try std.testing.expectEqualStrings("status", tokenized_projection_alias_order.query.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, tokenized_projection_alias_order.query.order_by[0].direction);
+    const normalized_tokenized_projection_alias_order = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_projection_alias_order);
+    defer alloc.free(normalized_tokenized_projection_alias_order);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"order_by\":[{\"field\":\"status\",\"direction\":\"desc\"}],\"limit\":1}", normalized_tokenized_projection_alias_order);
+
+    var tokenized_distinct_projection_alias_order = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"DISTINCT\",\"keyword\":\"distinct\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"AS\",\"keyword\":\"as\"},{\"kind\":\"identifier\",\"text\":\"latest_status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"ORDER\",\"keyword\":\"order\"},{\"kind\":\"identifier\",\"text\":\"BY\",\"keyword\":\"by\"},{\"kind\":\"identifier\",\"text\":\"latest_status\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+    );
+    defer tokenized_distinct_projection_alias_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_distinct_projection_alias_order.query.distinct_on.len);
+    try std.testing.expectEqualStrings("status", tokenized_distinct_projection_alias_order.query.distinct_on[0]);
+    try std.testing.expectEqualStrings("status", tokenized_distinct_projection_alias_order.query.order_by[0].field);
+    const normalized_tokenized_distinct_projection_alias_order = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_distinct_projection_alias_order);
+    defer alloc.free(normalized_tokenized_distinct_projection_alias_order);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"distinct_on\":[\"status\"],\"order_by\":[{\"field\":\"status\"}],\"limit\":1}", normalized_tokenized_distinct_projection_alias_order);
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        legacyScalarDefaultPlanFromQueryJsonAlloc(
+            alloc,
+            "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"ORDER\",\"keyword\":\"order\"},{\"kind\":\"identifier\",\"text\":\"BY\",\"keyword\":\"by\"},{\"kind\":\"number\",\"text\":\"2\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+        ),
+    );
+
+    var tokenized_null_order = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"ORDER\",\"keyword\":\"order\"},{\"kind\":\"identifier\",\"text\":\"BY\",\"keyword\":\"by\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"DESC\",\"keyword\":\"desc\"},{\"kind\":\"identifier\",\"text\":\"NULLS\",\"keyword\":\"nulls\"},{\"kind\":\"identifier\",\"text\":\"LAST\",\"keyword\":\"last\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+    );
+    defer tokenized_null_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), tokenized_null_order.query.order_by.len);
+    try std.testing.expectEqualStrings("status", tokenized_null_order.query.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderNullTest.is_null, tokenized_null_order.query.order_by[0].null_test.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, tokenized_null_order.query.order_by[0].direction);
+    try std.testing.expectEqualStrings("status", tokenized_null_order.query.order_by[1].field);
+    try std.testing.expect(tokenized_null_order.query.order_by[1].null_test == null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, tokenized_null_order.query.order_by[1].direction);
+    const normalized_tokenized_null_order = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_null_order);
+    defer alloc.free(normalized_tokenized_null_order);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"order_by\":[{\"field\":\"status\",\"null_test\":\"is_null\"},{\"field\":\"status\",\"direction\":\"desc\"}],\"limit\":1}", normalized_tokenized_null_order);
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        legacyScalarDefaultPlanFromQueryJsonAlloc(
+            alloc,
+            "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"comma\",\"text\":\",\"},{\"kind\":\"identifier\",\"text\":\"id\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"}]}",
+        ),
+    );
+    var tokenized_comparison = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"amount\"},{\"kind\":\"gte\",\"text\":\">=\"},{\"kind\":\"number\",\"text\":\"5\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+    );
+    defer tokenized_comparison.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_comparison.query.predicates.len);
+    try std.testing.expectEqualStrings("amount", tokenized_comparison.query.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, tokenized_comparison.query.predicates[0].op);
+    try std.testing.expectEqualStrings("5", tokenized_comparison.query.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(?u32, 1), tokenized_comparison.query.limit);
+
+    var tokenized_in = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"IN\",\"keyword\":\"in\"},{\"kind\":\"lparen\",\"text\":\"(\"},{\"kind\":\"string\",\"text\":\"open\"},{\"kind\":\"comma\",\"text\":\",\"},{\"kind\":\"string\",\"text\":\"pending\"},{\"kind\":\"rparen\",\"text\":\")\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+    );
+    defer tokenized_in.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_in.query.in_predicates.len);
+    try std.testing.expectEqualStrings("status", tokenized_in.query.in_predicates[0].field);
+    try std.testing.expect(!tokenized_in.query.in_predicates[0].negated);
+    try std.testing.expectEqualStrings("[\"open\",\"pending\"]", tokenized_in.query.in_predicates[0].values_json);
+    const normalized_tokenized_in = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_in);
+    defer alloc.free(normalized_tokenized_in);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"field\":\"status\",\"op\":\"in\",\"value\":[\"open\",\"pending\"]},\"limit\":1}", normalized_tokenized_in);
+
+    var tokenized_not_in = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"NOT\",\"keyword\":\"not\"},{\"kind\":\"identifier\",\"text\":\"IN\",\"keyword\":\"in\"},{\"kind\":\"lparen\",\"text\":\"(\"},{\"kind\":\"string\",\"text\":\"closed\"},{\"kind\":\"comma\",\"text\":\",\"},{\"kind\":\"string\",\"text\":\"archived\"},{\"kind\":\"rparen\",\"text\":\")\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+    );
+    defer tokenized_not_in.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_not_in.query.in_predicates.len);
+    try std.testing.expectEqualStrings("status", tokenized_not_in.query.in_predicates[0].field);
+    try std.testing.expect(tokenized_not_in.query.in_predicates[0].negated);
+    try std.testing.expectEqualStrings("[\"closed\",\"archived\"]", tokenized_not_in.query.in_predicates[0].values_json);
+    const normalized_tokenized_not_in = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_not_in);
+    defer alloc.free(normalized_tokenized_not_in);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"field\":\"status\",\"op\":\"not_in\",\"value\":[\"closed\",\"archived\"]},\"limit\":1}", normalized_tokenized_not_in);
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        legacyScalarDefaultPlanFromQueryJsonAlloc(
+            alloc,
+            "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"IN\",\"keyword\":\"in\"},{\"kind\":\"lparen\",\"text\":\"(\"},{\"kind\":\"rparen\",\"text\":\")\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+        ),
+    );
+
+    var tokenized_between = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"amount\"},{\"kind\":\"identifier\",\"text\":\"BETWEEN\",\"keyword\":\"between\"},{\"kind\":\"number\",\"text\":\"5\"},{\"kind\":\"identifier\",\"text\":\"AND\",\"keyword\":\"and\"},{\"kind\":\"number\",\"text\":\"10\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+    );
+    defer tokenized_between.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), tokenized_between.query.predicates.len);
+    try std.testing.expectEqualStrings("amount", tokenized_between.query.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, tokenized_between.query.predicates[0].op);
+    try std.testing.expectEqualStrings("5", tokenized_between.query.predicates[0].value_json.?);
+    try std.testing.expectEqualStrings("amount", tokenized_between.query.predicates[1].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lte, tokenized_between.query.predicates[1].op);
+    try std.testing.expectEqualStrings("10", tokenized_between.query.predicates[1].value_json.?);
+    const normalized_tokenized_between = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_between);
+    defer alloc.free(normalized_tokenized_between);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"all\":[{\"field\":\"amount\",\"op\":\"gte\",\"value\":5},{\"field\":\"amount\",\"op\":\"lte\",\"value\":10}]},\"limit\":1}", normalized_tokenized_between);
+
+    var tokenized_not_between = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"amount\"},{\"kind\":\"identifier\",\"text\":\"NOT\",\"keyword\":\"not\"},{\"kind\":\"identifier\",\"text\":\"BETWEEN\",\"keyword\":\"between\"},{\"kind\":\"number\",\"text\":\"5\"},{\"kind\":\"identifier\",\"text\":\"AND\",\"keyword\":\"and\"},{\"kind\":\"number\",\"text\":\"10\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+    );
+    defer tokenized_not_between.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), tokenized_not_between.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_not_between.query.not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), tokenized_not_between.query.not_predicates[0].predicates.len);
+    try std.testing.expectEqualStrings("amount", tokenized_not_between.query.not_predicates[0].predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, tokenized_not_between.query.not_predicates[0].predicates[0].op);
+    try std.testing.expectEqualStrings("5", tokenized_not_between.query.not_predicates[0].predicates[0].value_json.?);
+    try std.testing.expectEqualStrings("amount", tokenized_not_between.query.not_predicates[0].predicates[1].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lte, tokenized_not_between.query.not_predicates[0].predicates[1].op);
+    try std.testing.expectEqualStrings("10", tokenized_not_between.query.not_predicates[0].predicates[1].value_json.?);
+    const normalized_tokenized_not_between = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_not_between);
+    defer alloc.free(normalized_tokenized_not_between);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"not\":[{\"all\":[{\"field\":\"amount\",\"op\":\"gte\",\"value\":5},{\"field\":\"amount\",\"op\":\"lte\",\"value\":10}]}]},\"limit\":1}", normalized_tokenized_not_between);
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        legacyScalarDefaultPlanFromQueryJsonAlloc(
+            alloc,
+            "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"amount\"},{\"kind\":\"identifier\",\"text\":\"BETWEEN\",\"keyword\":\"between\"},{\"kind\":\"identifier\",\"text\":\"SYMMETRIC\",\"keyword\":\"symmetric\"},{\"kind\":\"number\",\"text\":\"5\"},{\"kind\":\"identifier\",\"text\":\"AND\",\"keyword\":\"and\"},{\"kind\":\"number\",\"text\":\"10\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+        ),
+    );
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        legacyScalarDefaultPlanFromQueryJsonAlloc(
+            alloc,
+            "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"amount\"},{\"kind\":\"identifier\",\"text\":\"NOT\",\"keyword\":\"not\"},{\"kind\":\"identifier\",\"text\":\"BETWEEN\",\"keyword\":\"between\"},{\"kind\":\"number\",\"text\":\"5\"},{\"kind\":\"identifier\",\"text\":\"AND\",\"keyword\":\"and\"},{\"kind\":\"number\",\"text\":\"10\"},{\"kind\":\"identifier\",\"text\":\"OR\",\"keyword\":\"or\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"eq\",\"text\":\"=\"},{\"kind\":\"string\",\"text\":\"open\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+        ),
+    );
+
+    var tokenized_parenthesized = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"lparen\",\"text\":\"(\"},{\"kind\":\"identifier\",\"text\":\"id\"},{\"kind\":\"eq\",\"text\":\"=\"},{\"kind\":\"string\",\"text\":\"u2\"},{\"kind\":\"rparen\",\"text\":\")\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+    );
+    defer tokenized_parenthesized.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_parenthesized.query.predicates.len);
+    try std.testing.expectEqualStrings("id", tokenized_parenthesized.query.predicates[0].field);
+    try std.testing.expectEqualStrings("\"u2\"", tokenized_parenthesized.query.predicates[0].value_json.?);
+    const normalized_tokenized_parenthesized = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_parenthesized);
+    defer alloc.free(normalized_tokenized_parenthesized);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"field\":\"id\",\"op\":\"eq\",\"value\":\"u2\"},\"limit\":1}", normalized_tokenized_parenthesized);
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        legacyScalarDefaultPlanFromQueryJsonAlloc(
+            alloc,
+            "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"lparen\",\"text\":\"(\"},{\"kind\":\"identifier\",\"text\":\"id\"},{\"kind\":\"eq\",\"text\":\"=\"},{\"kind\":\"string\",\"text\":\"u2\"},{\"kind\":\"identifier\",\"text\":\"AND\",\"keyword\":\"and\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"eq\",\"text\":\"=\"},{\"kind\":\"string\",\"text\":\"queued\"},{\"kind\":\"rparen\",\"text\":\")\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+        ),
+    );
+
+    var tokenized_boolean_true = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"enabled\"},{\"kind\":\"identifier\",\"text\":\"IS\",\"keyword\":\"is\"},{\"kind\":\"identifier\",\"text\":\"TRUE\",\"keyword\":\"true\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+    );
+    defer tokenized_boolean_true.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_boolean_true.query.predicates.len);
+    try std.testing.expectEqualStrings("enabled", tokenized_boolean_true.query.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, tokenized_boolean_true.query.predicates[0].op);
+    try std.testing.expectEqualStrings("true", tokenized_boolean_true.query.predicates[0].value_json.?);
+    const normalized_tokenized_boolean_true = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_boolean_true);
+    defer alloc.free(normalized_tokenized_boolean_true);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"field\":\"enabled\",\"op\":\"eq\",\"value\":true},\"limit\":1}", normalized_tokenized_boolean_true);
+
+    var tokenized_boolean_false = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"enabled\"},{\"kind\":\"identifier\",\"text\":\"IS\",\"keyword\":\"is\"},{\"kind\":\"identifier\",\"text\":\"FALSE\",\"keyword\":\"false\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+    );
+    defer tokenized_boolean_false.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_boolean_false.query.predicates.len);
+    try std.testing.expectEqualStrings("enabled", tokenized_boolean_false.query.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, tokenized_boolean_false.query.predicates[0].op);
+    try std.testing.expectEqualStrings("false", tokenized_boolean_false.query.predicates[0].value_json.?);
+    const normalized_tokenized_boolean_false = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_boolean_false);
+    defer alloc.free(normalized_tokenized_boolean_false);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"field\":\"enabled\",\"op\":\"eq\",\"value\":false},\"limit\":1}", normalized_tokenized_boolean_false);
+
+    var tokenized_boolean_unknown = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"enabled\"},{\"kind\":\"identifier\",\"text\":\"IS\",\"keyword\":\"is\"},{\"kind\":\"identifier\",\"text\":\"UNKNOWN\",\"keyword\":\"unknown\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+    );
+    defer tokenized_boolean_unknown.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_boolean_unknown.query.predicates.len);
+    try std.testing.expectEqualStrings("enabled", tokenized_boolean_unknown.query.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, tokenized_boolean_unknown.query.predicates[0].op);
+    try std.testing.expect(tokenized_boolean_unknown.query.predicates[0].value_json == null);
+    const normalized_tokenized_boolean_unknown = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_boolean_unknown);
+    defer alloc.free(normalized_tokenized_boolean_unknown);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"field\":\"enabled\",\"op\":\"is_null\"},\"limit\":1}", normalized_tokenized_boolean_unknown);
+
+    var tokenized_boolean_not_unknown = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"enabled\"},{\"kind\":\"identifier\",\"text\":\"IS\",\"keyword\":\"is\"},{\"kind\":\"identifier\",\"text\":\"NOT\",\"keyword\":\"not\"},{\"kind\":\"identifier\",\"text\":\"UNKNOWN\",\"keyword\":\"unknown\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+    );
+    defer tokenized_boolean_not_unknown.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_boolean_not_unknown.query.predicates.len);
+    try std.testing.expectEqualStrings("enabled", tokenized_boolean_not_unknown.query.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_not_null, tokenized_boolean_not_unknown.query.predicates[0].op);
+    try std.testing.expect(tokenized_boolean_not_unknown.query.predicates[0].value_json == null);
+    const normalized_tokenized_boolean_not_unknown = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_boolean_not_unknown);
+    defer alloc.free(normalized_tokenized_boolean_not_unknown);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"field\":\"enabled\",\"op\":\"is_not_null\"},\"limit\":1}", normalized_tokenized_boolean_not_unknown);
+
+    var tokenized_null_safe_distinct = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"IS\",\"keyword\":\"is\"},{\"kind\":\"identifier\",\"text\":\"DISTINCT\",\"keyword\":\"distinct\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"string\",\"text\":\"archived\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+    );
+    defer tokenized_null_safe_distinct.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_null_safe_distinct.query.predicates.len);
+    try std.testing.expectEqualStrings("status", tokenized_null_safe_distinct.query.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_distinct, tokenized_null_safe_distinct.query.predicates[0].op);
+    try std.testing.expectEqualStrings("\"archived\"", tokenized_null_safe_distinct.query.predicates[0].value_json.?);
+    const normalized_tokenized_null_safe_distinct = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_null_safe_distinct);
+    defer alloc.free(normalized_tokenized_null_safe_distinct);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"field\":\"status\",\"op\":\"is_distinct\",\"value\":\"archived\"},\"limit\":1}", normalized_tokenized_null_safe_distinct);
+
+    var tokenized_null_safe_not_distinct = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"IS\",\"keyword\":\"is\"},{\"kind\":\"identifier\",\"text\":\"NOT\",\"keyword\":\"not\"},{\"kind\":\"identifier\",\"text\":\"DISTINCT\",\"keyword\":\"distinct\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"string\",\"text\":\"ready\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+    );
+    defer tokenized_null_safe_not_distinct.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_null_safe_not_distinct.query.predicates.len);
+    try std.testing.expectEqualStrings("status", tokenized_null_safe_not_distinct.query.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_not_distinct, tokenized_null_safe_not_distinct.query.predicates[0].op);
+    try std.testing.expectEqualStrings("\"ready\"", tokenized_null_safe_not_distinct.query.predicates[0].value_json.?);
+    const normalized_tokenized_null_safe_not_distinct = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_null_safe_not_distinct);
+    defer alloc.free(normalized_tokenized_null_safe_not_distinct);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"field\":\"status\",\"op\":\"is_not_distinct\",\"value\":\"ready\"},\"limit\":1}", normalized_tokenized_null_safe_not_distinct);
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        legacyScalarDefaultPlanFromQueryJsonAlloc(
+            alloc,
+            "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"enabled\"},{\"kind\":\"identifier\",\"text\":\"IS\",\"keyword\":\"is\"},{\"kind\":\"identifier\",\"text\":\"NOT\",\"keyword\":\"not\"},{\"kind\":\"identifier\",\"text\":\"TRUE\",\"keyword\":\"true\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+        ),
+    );
+
+    var tokenized_null_check = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"deleted_at\"},{\"kind\":\"identifier\",\"text\":\"IS\",\"keyword\":\"is\"},{\"kind\":\"identifier\",\"text\":\"NOT\",\"keyword\":\"not\"},{\"kind\":\"identifier\",\"text\":\"NULL\",\"keyword\":\"null\"}]}",
+    );
+    defer tokenized_null_check.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_null_check.query.predicates.len);
+    try std.testing.expectEqualStrings("deleted_at", tokenized_null_check.query.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_not_null, tokenized_null_check.query.predicates[0].op);
+    try std.testing.expect(tokenized_null_check.query.predicates[0].value_json == null);
+
+    var tokenized_conjunctive = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"IS\",\"keyword\":\"is\"},{\"kind\":\"identifier\",\"text\":\"NOT\",\"keyword\":\"not\"},{\"kind\":\"identifier\",\"text\":\"NULL\",\"keyword\":\"null\"},{\"kind\":\"identifier\",\"text\":\"AND\",\"keyword\":\"and\"},{\"kind\":\"identifier\",\"text\":\"amount\"},{\"kind\":\"lt\",\"text\":\"<\"},{\"kind\":\"number\",\"text\":\"10\"}]}",
+    );
+    defer tokenized_conjunctive.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), tokenized_conjunctive.query.predicates.len);
+    try std.testing.expectEqualStrings("status", tokenized_conjunctive.query.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_not_null, tokenized_conjunctive.query.predicates[0].op);
+    try std.testing.expect(tokenized_conjunctive.query.predicates[0].value_json == null);
+    try std.testing.expectEqualStrings("amount", tokenized_conjunctive.query.predicates[1].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lt, tokenized_conjunctive.query.predicates[1].op);
+    try std.testing.expectEqualStrings("10", tokenized_conjunctive.query.predicates[1].value_json.?);
+    const normalized_tokenized = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_conjunctive);
+    defer alloc.free(normalized_tokenized);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"all\":[{\"field\":\"status\",\"op\":\"is_not_null\"},{\"field\":\"amount\",\"op\":\"lt\",\"value\":10}]}}", normalized_tokenized);
+
+    var tokenized_disjunctive = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"IS\",\"keyword\":\"is\"},{\"kind\":\"identifier\",\"text\":\"NOT\",\"keyword\":\"not\"},{\"kind\":\"identifier\",\"text\":\"NULL\",\"keyword\":\"null\"},{\"kind\":\"identifier\",\"text\":\"AND\",\"keyword\":\"and\"},{\"kind\":\"identifier\",\"text\":\"amount\"},{\"kind\":\"lt\",\"text\":\"<\"},{\"kind\":\"number\",\"text\":\"10\"},{\"kind\":\"identifier\",\"text\":\"OR\",\"keyword\":\"or\"},{\"kind\":\"identifier\",\"text\":\"id\"},{\"kind\":\"eq\",\"text\":\"=\"},{\"kind\":\"string\",\"text\":\"u2\"}]}",
+    );
+    defer tokenized_disjunctive.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), tokenized_disjunctive.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), tokenized_disjunctive.query.or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), tokenized_disjunctive.query.or_predicates[0].predicates.len);
+    try std.testing.expectEqualStrings("status", tokenized_disjunctive.query.or_predicates[0].predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_not_null, tokenized_disjunctive.query.or_predicates[0].predicates[0].op);
+    try std.testing.expectEqualStrings("amount", tokenized_disjunctive.query.or_predicates[0].predicates[1].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lt, tokenized_disjunctive.query.or_predicates[0].predicates[1].op);
+    try std.testing.expectEqualStrings("10", tokenized_disjunctive.query.or_predicates[0].predicates[1].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_disjunctive.query.or_predicates[1].predicates.len);
+    try std.testing.expectEqualStrings("id", tokenized_disjunctive.query.or_predicates[1].predicates[0].field);
+    try std.testing.expectEqualStrings("\"u2\"", tokenized_disjunctive.query.or_predicates[1].predicates[0].value_json.?);
+    const normalized_disjunctive = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_disjunctive);
+    defer alloc.free(normalized_disjunctive);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"any\":[{\"all\":[{\"field\":\"status\",\"op\":\"is_not_null\"},{\"field\":\"amount\",\"op\":\"lt\",\"value\":10}]},{\"field\":\"id\",\"op\":\"eq\",\"value\":\"u2\"}]}}", normalized_disjunctive);
+
+    var tokenized_distinct = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"DISTINCT\",\"keyword\":\"distinct\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"ORDER\",\"keyword\":\"order\"},{\"kind\":\"identifier\",\"text\":\"BY\",\"keyword\":\"by\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+    );
+    defer tokenized_distinct.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_distinct.query.distinct_on.len);
+    try std.testing.expectEqualStrings("status", tokenized_distinct.query.distinct_on[0]);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_distinct.query.order_by.len);
+    try std.testing.expectEqualStrings("status", tokenized_distinct.query.order_by[0].field);
+    const normalized_distinct = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_distinct);
+    defer alloc.free(normalized_distinct);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"distinct_on\":[\"status\"],\"order_by\":[{\"field\":\"status\"}],\"limit\":1}", normalized_distinct);
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        legacyScalarDefaultPlanFromQueryJsonAlloc(
+            alloc,
+            "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"DISTINCT\",\"keyword\":\"distinct\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+        ),
+    );
+
+    var tokenized_negated = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"IS\",\"keyword\":\"is\"},{\"kind\":\"identifier\",\"text\":\"NOT\",\"keyword\":\"not\"},{\"kind\":\"identifier\",\"text\":\"NULL\",\"keyword\":\"null\"},{\"kind\":\"identifier\",\"text\":\"AND\",\"keyword\":\"and\"},{\"kind\":\"identifier\",\"text\":\"NOT\",\"keyword\":\"not\"},{\"kind\":\"identifier\",\"text\":\"id\"},{\"kind\":\"eq\",\"text\":\"=\"},{\"kind\":\"string\",\"text\":\"u2\"}]}",
+    );
+    defer tokenized_negated.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_negated.query.predicates.len);
+    try std.testing.expectEqualStrings("status", tokenized_negated.query.predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_negated.query.not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_negated.query.not_predicates[0].predicates.len);
+    try std.testing.expectEqualStrings("id", tokenized_negated.query.not_predicates[0].predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, tokenized_negated.query.not_predicates[0].predicates[0].op);
+    try std.testing.expectEqualStrings("\"u2\"", tokenized_negated.query.not_predicates[0].predicates[0].value_json.?);
+    const normalized_negated = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_negated);
+    defer alloc.free(normalized_negated);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"all\":[{\"field\":\"status\",\"op\":\"is_not_null\"}],\"not\":[{\"field\":\"id\",\"op\":\"eq\",\"value\":\"u2\"}]}}", normalized_negated);
+
+    var tokenized_qualified = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"usage_records.status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"public.usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"usage_records.id\"},{\"kind\":\"eq\",\"text\":\"=\"},{\"kind\":\"string\",\"text\":\"u2\"},{\"kind\":\"identifier\",\"text\":\"ORDER\",\"keyword\":\"order\"},{\"kind\":\"identifier\",\"text\":\"BY\",\"keyword\":\"by\"},{\"kind\":\"identifier\",\"text\":\"usage_records.id\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+    );
+    defer tokenized_qualified.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", tokenized_qualified.table_name);
+    try std.testing.expectEqualStrings("status", tokenized_qualified.output_field);
+    try std.testing.expectEqualStrings("id", tokenized_qualified.query.predicates[0].field);
+    try std.testing.expectEqualStrings("id", tokenized_qualified.query.order_by[0].field);
+    const normalized_qualified = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_qualified);
+    defer alloc.free(normalized_qualified);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"field\":\"id\",\"op\":\"eq\",\"value\":\"u2\"},\"order_by\":[{\"field\":\"id\"}],\"limit\":1}", normalized_qualified);
+
+    var tokenized_alias = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"identifier\",\"text\":\"AS\",\"keyword\":\"as\"},{\"kind\":\"identifier\",\"text\":\"latest_status\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+    );
+    defer tokenized_alias.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", tokenized_alias.table_name);
+    try std.testing.expectEqualStrings("status", tokenized_alias.output_field);
+    try std.testing.expectEqualStrings("status", tokenized_alias.query.select[0]);
+    const normalized_alias = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_alias);
+    defer alloc.free(normalized_alias);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"limit\":1}", normalized_alias);
+
+    var tokenized_lower_projection = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"lower\"},{\"kind\":\"lparen\",\"text\":\"(\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"rparen\",\"text\":\")\"},{\"kind\":\"identifier\",\"text\":\"AS\",\"keyword\":\"as\"},{\"kind\":\"identifier\",\"text\":\"status_key\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"WHERE\",\"keyword\":\"where\"},{\"kind\":\"identifier\",\"text\":\"id\"},{\"kind\":\"eq\",\"text\":\"=\"},{\"kind\":\"string\",\"text\":\"u2\"},{\"kind\":\"identifier\",\"text\":\"ORDER\",\"keyword\":\"order\"},{\"kind\":\"identifier\",\"text\":\"BY\",\"keyword\":\"by\"},{\"kind\":\"identifier\",\"text\":\"id\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+    );
+    defer tokenized_lower_projection.deinit(alloc);
+    try std.testing.expectEqualStrings("status_key", tokenized_lower_projection.output_field);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_lower_projection.query.expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, tokenized_lower_projection.query.expressions[0].expression.kind);
+    try std.testing.expectEqualStrings("status", tokenized_lower_projection.query.expressions[0].expression.operands[0].field);
+    try std.testing.expectEqualStrings("id", tokenized_lower_projection.query.predicates[0].field);
+    try std.testing.expectEqualStrings("id", tokenized_lower_projection.query.order_by[0].field);
+    const normalized_tokenized_lower_projection = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_lower_projection);
+    defer alloc.free(normalized_tokenized_lower_projection);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"expressions\":[{\"as\":\"status_key\",\"expr\":{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]}}],\"where\":{\"field\":\"id\",\"op\":\"eq\",\"value\":\"u2\"},\"order_by\":[{\"field\":\"id\"}],\"limit\":1}", normalized_tokenized_lower_projection);
+
+    var tokenized_length_projection = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"length\"},{\"kind\":\"lparen\",\"text\":\"(\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"rparen\",\"text\":\")\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+    );
+    defer tokenized_length_projection.deinit(alloc);
+    try std.testing.expectEqualStrings("length", tokenized_length_projection.output_field);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_length_projection.query.expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.length, tokenized_length_projection.query.expressions[0].expression.kind);
+    try std.testing.expectEqualStrings("status", tokenized_length_projection.query.expressions[0].expression.operands[0].field);
+    const normalized_tokenized_length_projection = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_length_projection);
+    defer alloc.free(normalized_tokenized_length_projection);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"expressions\":[{\"as\":\"length\",\"expr\":{\"op\":\"length\",\"args\":[{\"field\":\"status\"}]}}],\"limit\":1}", normalized_tokenized_length_projection);
+
+    var tokenized_concat_projection = try legacyScalarDefaultPlanFromQueryJsonAlloc(
+        alloc,
+        "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"concat\"},{\"kind\":\"lparen\",\"text\":\"(\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"comma\",\"text\":\",\"},{\"kind\":\"string\",\"text\":\"-seed\"},{\"kind\":\"rparen\",\"text\":\")\"},{\"kind\":\"identifier\",\"text\":\"AS\",\"keyword\":\"as\"},{\"kind\":\"identifier\",\"text\":\"status_label\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"},{\"kind\":\"identifier\",\"text\":\"LIMIT\",\"keyword\":\"limit\"},{\"kind\":\"number\",\"text\":\"1\"}]}",
+    );
+    defer tokenized_concat_projection.deinit(alloc);
+    try std.testing.expectEqualStrings("status_label", tokenized_concat_projection.output_field);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_concat_projection.query.expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.concat, tokenized_concat_projection.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), tokenized_concat_projection.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqualStrings("status", tokenized_concat_projection.query.expressions[0].expression.operands[0].field);
+    try std.testing.expectEqualStrings("\"-seed\"", tokenized_concat_projection.query.expressions[0].expression.operands[1].value_json);
+    const normalized_tokenized_concat_projection = try scalarSubqueryDefaultNormalizedQueryJsonAlloc(alloc, tokenized_concat_projection);
+    defer alloc.free(normalized_tokenized_concat_projection);
+    try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"expressions\":[{\"as\":\"status_label\",\"expr\":{\"op\":\"concat\",\"args\":[{\"field\":\"status\"},{\"value\":\"-seed\"}]}}],\"limit\":1}", normalized_tokenized_concat_projection);
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        legacyScalarDefaultPlanFromQueryJsonAlloc(
+            alloc,
+            "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"concat\"},{\"kind\":\"lparen\",\"text\":\"(\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"rparen\",\"text\":\")\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"}]}",
+        ),
+    );
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        legacyScalarDefaultPlanFromQueryJsonAlloc(
+            alloc,
+            "{\"kind\":\"tokenized_sql\",\"tokens\":[{\"kind\":\"identifier\",\"text\":\"SELECT\",\"keyword\":\"select\"},{\"kind\":\"identifier\",\"text\":\"reverse\"},{\"kind\":\"lparen\",\"text\":\"(\"},{\"kind\":\"identifier\",\"text\":\"status\"},{\"kind\":\"rparen\",\"text\":\")\"},{\"kind\":\"identifier\",\"text\":\"FROM\",\"keyword\":\"from\"},{\"kind\":\"identifier\",\"text\":\"usage_records\"}]}",
+        ),
+    );
+}
+
+test "relational rows materializes scalar subquery defaults through explicit resolver" {
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-default":{"op":"scalar_subquery","query":{"table":"usage_records","select":["status"],"where":{"field":"id","op":"eq","value":"u2"},"limit":1}}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(std.testing.allocator, schema_json);
+    defer parsed.deinit(std.testing.allocator);
+    const schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(std.testing.allocator, parsed);
+    defer runtime_schema.freeSchema(std.testing.allocator, schema);
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        parseRowsBatchRequest(
+            std.testing.allocator,
+            "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"u1\"},\"returning\":[\"id\",\"status\"]}]}",
+            schema,
+        ),
+    );
+
+    const Resolver = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) ScalarSubqueryDefaultResolver {
+            return .{
+                .ptr = self,
+                .value_json_alloc = valueJsonAlloc,
+            };
+        }
+
+        fn valueJsonAlloc(ptr: *anyopaque, alloc: std.mem.Allocator, request: ScalarSubqueryDefaultRequest) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"field\":\"id\",\"op\":\"eq\",\"value\":\"u2\"},\"limit\":1}", request.query_json);
+            self.calls += 1;
+            return try alloc.dupe(u8, "\"queued\"");
+        }
+    };
+
+    var resolver = Resolver{};
+    var batch = try parseRowsBatchRequestWithResolverAndDefaultContext(
+        std.testing.allocator,
+        "usage",
+        "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"u1\"},\"returning\":[\"id\",\"status\"]}]}",
+        schema,
+        null,
+        .{ .scalar_subquery_resolver = resolver.iface() },
+    );
+    defer batch.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), resolver.calls);
+    try std.testing.expectEqual(@as(usize, 1), batch.writes.len);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"queued\"}", batch.writes[0].value);
+    try std.testing.expectEqual(@as(usize, 1), batch.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"queued\"}", batch.returning_rows[0]);
+
+    const tokenized_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-default":{"op":"scalar_subquery","query":{"kind":"tokenized_sql","tokens":[{"kind":"identifier","text":"SELECT","keyword":"select"},{"kind":"identifier","text":"status"},{"kind":"identifier","text":"FROM","keyword":"from"},{"kind":"identifier","text":"usage_records"},{"kind":"identifier","text":"WHERE","keyword":"where"},{"kind":"identifier","text":"deleted_at"},{"kind":"identifier","text":"IS","keyword":"is"},{"kind":"identifier","text":"NOT","keyword":"not"},{"kind":"identifier","text":"NULL","keyword":"null"},{"kind":"identifier","text":"AND","keyword":"and"},{"kind":"identifier","text":"NOT","keyword":"not"},{"kind":"identifier","text":"id"},{"kind":"eq","text":"="},{"kind":"string","text":"u3"},{"kind":"identifier","text":"LIMIT","keyword":"limit"},{"kind":"number","text":"1"}]}}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var tokenized_parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(std.testing.allocator, tokenized_schema_json);
+    defer tokenized_parsed.deinit(std.testing.allocator);
+    const tokenized_schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(std.testing.allocator, tokenized_parsed);
+    defer runtime_schema.freeSchema(std.testing.allocator, tokenized_schema);
+    const tokenized_default_value = tokenized_schema.relational_columns[1].default_value orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("{\"query\":{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"all\":[{\"field\":\"deleted_at\",\"op\":\"is_not_null\"}],\"not\":[{\"field\":\"id\",\"op\":\"eq\",\"value\":\"u3\"}]},\"limit\":1}}", tokenized_default_value.value_json);
+
+    const TokenizedResolver = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) ScalarSubqueryDefaultResolver {
+            return .{
+                .ptr = self,
+                .value_json_alloc = valueJsonAlloc,
+            };
+        }
+
+        fn valueJsonAlloc(ptr: *anyopaque, alloc: std.mem.Allocator, request: ScalarSubqueryDefaultRequest) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"select\":[\"status\"],\"where\":{\"all\":[{\"field\":\"deleted_at\",\"op\":\"is_not_null\"}],\"not\":[{\"field\":\"id\",\"op\":\"eq\",\"value\":\"u3\"}]},\"limit\":1}", request.query_json);
+            self.calls += 1;
+            return try alloc.dupe(u8, "\"restored\"");
+        }
+    };
+
+    var tokenized_resolver = TokenizedResolver{};
+    var tokenized_batch = try parseRowsBatchRequestWithResolverAndDefaultContext(
+        std.testing.allocator,
+        "usage",
+        "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"u3\"},\"returning\":[\"id\",\"status\"]}]}",
+        tokenized_schema,
+        null,
+        .{ .scalar_subquery_resolver = tokenized_resolver.iface() },
+    );
+    defer tokenized_batch.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), tokenized_resolver.calls);
+    try std.testing.expectEqualStrings("{\"id\":\"u3\",\"status\":\"restored\"}", tokenized_batch.writes[0].value);
+
+    const expression_projection_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-default":{"op":"scalar_subquery","query":{"kind":"tokenized_sql","tokens":[{"kind":"identifier","text":"SELECT","keyword":"select"},{"kind":"identifier","text":"lower"},{"kind":"lparen","text":"("},{"kind":"identifier","text":"status"},{"kind":"rparen","text":")"},{"kind":"identifier","text":"AS","keyword":"as"},{"kind":"identifier","text":"status_key"},{"kind":"identifier","text":"FROM","keyword":"from"},{"kind":"identifier","text":"usage_records"},{"kind":"identifier","text":"WHERE","keyword":"where"},{"kind":"identifier","text":"id"},{"kind":"eq","text":"="},{"kind":"string","text":"u2"},{"kind":"identifier","text":"LIMIT","keyword":"limit"},{"kind":"number","text":"1"}]}}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var expression_projection_parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(std.testing.allocator, expression_projection_schema_json);
+    defer expression_projection_parsed.deinit(std.testing.allocator);
+    const expression_projection_schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(std.testing.allocator, expression_projection_parsed);
+    defer runtime_schema.freeSchema(std.testing.allocator, expression_projection_schema);
+
+    const ExpressionProjectionResolver = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) ScalarSubqueryDefaultResolver {
+            return .{
+                .ptr = self,
+                .value_json_alloc = valueJsonAlloc,
+            };
+        }
+
+        fn valueJsonAlloc(ptr: *anyopaque, alloc: std.mem.Allocator, request: ScalarSubqueryDefaultRequest) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("{\"table\":\"usage_records\",\"expressions\":[{\"as\":\"status_key\",\"expr\":{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]}}],\"where\":{\"field\":\"id\",\"op\":\"eq\",\"value\":\"u2\"},\"limit\":1}", request.query_json);
+            self.calls += 1;
+            return try alloc.dupe(u8, "\"queued\"");
+        }
+    };
+
+    var expression_projection_resolver = ExpressionProjectionResolver{};
+    var expression_projection_batch = try parseRowsBatchRequestWithResolverAndDefaultContext(
+        std.testing.allocator,
+        "usage",
+        "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"u4\"},\"returning\":[\"id\",\"status\"]}]}",
+        expression_projection_schema,
+        null,
+        .{ .scalar_subquery_resolver = expression_projection_resolver.iface() },
+    );
+    defer expression_projection_batch.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), expression_projection_resolver.calls);
+    try std.testing.expectEqualStrings("{\"id\":\"u4\",\"status\":\"queued\"}", expression_projection_batch.writes[0].value);
+}
+
 test "relational rows applies server on update policies" {
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"updated_at_ns":{"type":"numeric","x-antfly-on-update":{"op":"now_ns"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -24978,6 +28115,7 @@ test "relational rows query contract filters orders paginates and projects rows"
     defer request.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), request.not_predicates.len);
     try std.testing.expectEqual(@as(usize, 1), request.not_predicates[0].predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryRequest.TotalMode.exact, request.total_mode);
 
     var distinct_request = try parseRowsQueryRequest(
         std.testing.allocator,
@@ -24987,6 +28125,27 @@ test "relational rows query contract filters orders paginates and projects rows"
     defer distinct_request.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), distinct_request.distinct_on.len);
     try std.testing.expectEqualStrings("tenant_id", distinct_request.distinct_on[0]);
+    var bounded_total_request = try parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"select\":[\"tenant_id\",\"id\"],\"limit\":1,\"total_mode\":\"bounded\"}",
+        schema,
+    );
+    defer bounded_total_request.deinit(std.testing.allocator);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryRequest.TotalMode.bounded, bounded_total_request.total_mode);
+    var no_total_request = try parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"select\":[\"tenant_id\",\"id\"],\"limit\":1,\"total_mode\":\"none\"}",
+        schema,
+    );
+    defer no_total_request.deinit(std.testing.allocator);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryRequest.TotalMode.none, no_total_request.total_mode);
+    var profiled_request = try parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"select\":[\"tenant_id\",\"id\"],\"limit\":1,\"profile\":true}",
+        schema,
+    );
+    defer profiled_request.deinit(std.testing.allocator);
+    try std.testing.expect(profiled_request.profile);
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
         std.testing.allocator,
         "{\"select\":[\"tenant_id\",\"id\"],\"distinct_on\":[\"tenant_id\"],\"order_by\":[{\"field\":\"created_at\",\"direction\":\"desc\"}]}",
@@ -25021,6 +28180,102 @@ test "relational rows query contract filters orders paginates and projects rows"
     const response = try encodeRowsQueryResponseAlloc(std.testing.allocator, result);
     defer std.testing.allocator.free(response);
     try std.testing.expectEqualStrings("{\"total\":3,\"result_schema\":[],\"rows\":[{\"id\":\"u1\",\"status\":\"open\",\"created_at\":20},{\"id\":\"u4\",\"status\":\"open\",\"created_at\":10}]}", response);
+    result.total_exact = false;
+    const bounded_response = try encodeRowsQueryResponseAlloc(std.testing.allocator, result);
+    defer std.testing.allocator.free(bounded_response);
+    try std.testing.expectEqualStrings("{\"total\":3,\"total_exact\":false,\"result_schema\":[],\"rows\":[{\"id\":\"u1\",\"status\":\"open\",\"created_at\":20},{\"id\":\"u4\",\"status\":\"open\",\"created_at\":10}]}", bounded_response);
+
+    var bounded_total_result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, bounded_total_request, rows[0..]);
+    defer bounded_total_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 1), bounded_total_result.total);
+    try std.testing.expect(!bounded_total_result.total_exact);
+    try std.testing.expectEqual(@as(usize, 1), bounded_total_result.rows.len);
+
+    var no_total_result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, no_total_request, rows[0..]);
+    defer no_total_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 1), no_total_result.total);
+    try std.testing.expect(!no_total_result.total_exact);
+    try std.testing.expectEqual(@as(usize, 1), no_total_result.rows.len);
+
+    var profiled_result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, profiled_request, rows[0..]);
+    defer profiled_result.deinit(std.testing.allocator);
+    try std.testing.expect(profiled_result.include_profile);
+    const profiled_response = try encodeRowsQueryResponseAlloc(std.testing.allocator, profiled_result);
+    defer std.testing.allocator.free(profiled_response);
+    try std.testing.expect(std.mem.indexOf(u8, profiled_response, "\"profile\":{\"access_method\":\"unknown\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, profiled_response, "\"projected_rows\":0") != null);
+
+    const fallback_profile_response = try encodeRowsQueryResponseAlloc(std.testing.allocator, .{
+        .total = 0,
+        .include_profile = true,
+        .profile = .{
+            .access_method = .base_scan,
+            .fallback_reason = .ordered_tuple_predicate_not_proven,
+        },
+    });
+    defer std.testing.allocator.free(fallback_profile_response);
+    try std.testing.expect(std.mem.indexOf(u8, fallback_profile_response, "\"fallback_reason\":\"ordered_tuple_predicate_not_proven\"") != null);
+    const fallback_reasons = [_]db_mod.types.RelationalRowsQueryResult.FallbackReason{
+        .ordered_tuple_index_not_ready,
+        .ordered_tuple_stale_generation,
+        .ordered_tuple_access_method_mismatch,
+        .ordered_tuple_no_usable_bounds,
+        .ordered_tuple_order_field_not_covered,
+        .ordered_tuple_order_direction_not_covered,
+        .ordered_tuple_order_nulls_not_covered,
+        .ordered_tuple_order_collation_not_covered,
+        .ordered_tuple_collation_not_supported,
+    };
+    const fallback_reason_names = [_][]const u8{
+        "\"fallback_reason\":\"ordered_tuple_index_not_ready\"",
+        "\"fallback_reason\":\"ordered_tuple_stale_generation\"",
+        "\"fallback_reason\":\"ordered_tuple_access_method_mismatch\"",
+        "\"fallback_reason\":\"ordered_tuple_no_usable_bounds\"",
+        "\"fallback_reason\":\"ordered_tuple_order_field_not_covered\"",
+        "\"fallback_reason\":\"ordered_tuple_order_direction_not_covered\"",
+        "\"fallback_reason\":\"ordered_tuple_order_nulls_not_covered\"",
+        "\"fallback_reason\":\"ordered_tuple_order_collation_not_covered\"",
+        "\"fallback_reason\":\"ordered_tuple_collation_not_supported\"",
+    };
+    for (fallback_reasons, fallback_reason_names) |reason, expected_name| {
+        const encoded = try encodeRowsQueryResponseAlloc(std.testing.allocator, .{
+            .total = 0,
+            .include_profile = true,
+            .profile = .{
+                .access_method = .base_scan,
+                .fallback_reason = reason,
+            },
+        });
+        defer std.testing.allocator.free(encoded);
+        try std.testing.expect(std.mem.indexOf(u8, encoded, expected_name) != null);
+    }
+
+    const ordered_tuple_profile_response = try encodeRowsQueryResponseAlloc(std.testing.allocator, .{
+        .total = 0,
+        .include_profile = true,
+        .profile = .{
+            .access_method = .ordered_tuple_stream,
+            .fallback_reason = .none,
+            .ordered_tuple_plan_selected = true,
+            .ordered_tuple_catalog_ordinal = 1,
+            .ordered_tuple_index_generation = 7,
+            .ordered_tuple_key_count = 2,
+            .ordered_tuple_equality_prefix_len = 1,
+            .ordered_tuple_range_key_index = 1,
+            .ordered_tuple_filter_predicates = 3,
+            .ordered_tuple_proven_predicates = 2,
+            .ordered_tuple_residual_predicates = 1,
+            .ordered_tuple_lower_tuple_bytes = 12,
+            .ordered_tuple_upper_tuple_bytes = 18,
+            .ordered_tuple_prefix_scan = false,
+            .index_entries_scanned = 10,
+            .candidate_rows = 10,
+            .projected_rows = 2,
+        },
+    });
+    defer std.testing.allocator.free(ordered_tuple_profile_response);
+    try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, "\"access_method\":\"ordered_tuple_stream\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, "\"ordered_tuple\":{\"catalog_ordinal\":1,\"index_generation\":7,\"key_count\":2,\"equality_prefix_len\":1,\"filter_predicates\":3,\"proven_predicates\":2,\"residual_predicates\":1,\"range_key_index\":1") != null);
 
     var distinct_result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, distinct_request, rows[0..]);
     defer distinct_result.deinit(std.testing.allocator);
@@ -25031,6 +28286,16 @@ test "relational rows query contract filters orders paginates and projects rows"
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
         std.testing.allocator,
         "{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"},\"unknown\":true}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"select\":[\"id\"],\"total_mode\":\"fast\"}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"select\":[\"id\"],\"total_mode\":true}",
         schema,
     ));
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
@@ -28100,6 +31365,7 @@ test "relational rows query contract parses public expression operator surface" 
         .{ .op = "ascii", .expr_json = "{\"op\":\"ascii\",\"args\":[{\"field\":\"text_value\"}]}", .kind = .ascii },
         .{ .op = "chr", .expr_json = "{\"op\":\"chr\",\"args\":[{\"field\":\"n\"}]}", .kind = .chr },
         .{ .op = "md5", .expr_json = "{\"op\":\"md5\",\"args\":[{\"field\":\"text_value\"}]}", .kind = .md5 },
+        .{ .op = "soundex", .expr_json = "{\"op\":\"soundex\",\"args\":[{\"field\":\"text_value\"}]}", .kind = .soundex },
         .{ .op = "like", .expr_json = "{\"op\":\"like\",\"args\":[{\"field\":\"text_value\"},{\"value\":\"a%\"}]}", .kind = .like },
         .{ .op = "ilike", .expr_json = "{\"op\":\"ilike\",\"args\":[{\"field\":\"text_value\"},{\"value\":\"A%\"}]}", .kind = .ilike },
         .{ .op = "regexp_match", .expr_json = "{\"op\":\"regexp_match\",\"args\":[{\"field\":\"text_value\"},{\"value\":\"^[a-z]+\"},{\"value\":true}]}", .kind = .regexp_match },
@@ -28923,6 +32189,43 @@ test "relational rows query contract projects md5 expressions" {
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
         std.testing.allocator,
         "{\"expressions\":[{\"as\":\"bad\",\"expr\":{\"op\":\"md5\",\"args\":[{\"field\":\"score\"}]}}]}",
+        schema,
+    ));
+}
+
+test "relational rows query contract projects soundex expressions" {
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"label":{"type":"keyword"},"score":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(std.testing.allocator, schema_json);
+    defer parsed.deinit(std.testing.allocator);
+    const schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(std.testing.allocator, parsed);
+    defer runtime_schema.freeSchema(std.testing.allocator, schema);
+
+    var request = try parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"select\":[\"id\"],\"expressions\":[{\"as\":\"label_soundex\",\"expr\":{\"op\":\"soundex\",\"args\":[{\"field\":\"label\"}]}}],\"expression_where\":[{\"lhs\":{\"op\":\"soundex\",\"args\":[{\"field\":\"label\"}]},\"op\":\"eq\",\"rhs\":{\"value\":\"A300\"}}]}",
+        schema,
+    );
+    defer request.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), request.expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.soundex, request.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), request.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.soundex, request.expression_predicates[0].lhs.kind);
+
+    const rows = [_][]const u8{
+        "{\"id\":\"a\",\"label\":\"Ada\",\"score\":1}",
+        "{\"id\":\"b\",\"label\":\"Grace\",\"score\":2}",
+    };
+    var result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, request, rows[0..]);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"label_soundex\":\"A300\"}", result.rows[0]);
+
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"expressions\":[{\"as\":\"bad\",\"expr\":{\"op\":\"soundex\",\"args\":[{\"field\":\"score\"}]}}]}",
         schema,
     ));
 }

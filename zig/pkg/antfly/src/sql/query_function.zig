@@ -936,6 +936,103 @@ pub fn lowerAntflyGraphTableFunctionGeneratedAstAlloc(
     }
 }
 
+pub fn lowerNativeGraphMatchTableFunctionAlloc(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    index_name: []const u8,
+    start: []const u8,
+    pattern: []const u8,
+    return_aliases: []const u8,
+    alias_fields: ?[]const u8,
+) !db_mod.types.RelationalRowsTableFunction {
+    var args_buffer: [6]SqlQueryFunctionArg = undefined;
+    var len: usize = 0;
+    args_buffer[len] = .{ .name = "table_name", .value = .{ .string = table_name } };
+    len += 1;
+    args_buffer[len] = .{ .name = "index", .value = .{ .string = index_name } };
+    len += 1;
+    args_buffer[len] = .{ .name = "start", .value = .{ .string = start } };
+    len += 1;
+    args_buffer[len] = .{ .name = "pattern", .value = .{ .string = pattern } };
+    len += 1;
+    args_buffer[len] = .{ .name = "return", .value = .{ .string = return_aliases } };
+    len += 1;
+    if (alias_fields) |fields| {
+        args_buffer[len] = .{ .name = "alias_fields", .value = .{ .string = fields } };
+        len += 1;
+    }
+    return try lowerAntflyGraphTableFunctionFromArgsAlloc(alloc, .graph_match, args_buffer[0..len]);
+}
+
+fn lowerAntflyGraphTableFunctionFromArgsAlloc(
+    alloc: std.mem.Allocator,
+    function: AntflyQueryFunction,
+    args: []const SqlQueryFunctionArg,
+) !db_mod.types.RelationalRowsTableFunction {
+    if (function != .graph_traverse and
+        function != .graph_neighbors and
+        function != .graph_shortest_path and
+        function != .graph_k_shortest_paths and
+        function != .graph_match and
+        function != .graph_metric and
+        function != .graph_metric_rerank)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    const table_name = antflyQueryFunctionStringArg(args, "table_name") orelse
+        antflyQueryFunctionStringArg(args, "table") orelse return error.UnsupportedSqlShape;
+    var lowered = try lowerParsedAntflyQueryFunctionAlloc(alloc, null, function, args);
+    defer lowered.deinit(alloc);
+    if (lowered.req.dense != null or lowered.req.sparse != null or lowered.req.merge_config != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    const owned_table_name = try alloc.dupe(u8, table_name);
+    errdefer alloc.free(owned_table_name);
+    switch (function) {
+        .graph_traverse, .graph_neighbors, .graph_shortest_path, .graph_k_shortest_paths, .graph_match => {
+            if (lowered.req.full_text != null or lowered.req.graph_metric_rerank != null) return error.UnsupportedSqlShape;
+            if (lowered.req.graph_queries.len != 1 or lowered.req.graph_metric_queries.len != 0) return error.UnsupportedSqlShape;
+            const alias_projections = try graphAliasProjectionsFromArgsAlloc(alloc, args);
+            errdefer freeGraphAliasProjections(alloc, alias_projections);
+            if (alias_projections.len > 0 and function != .graph_match) return error.UnsupportedSqlShape;
+            const graph_queries = lowered.req.graph_queries;
+            const graph_query = graph_queries[0];
+            lowered.req.graph_queries = &.{};
+            if (graph_queries.len > 0) alloc.free(@constCast(graph_queries));
+            return .{ .graph_query = .{
+                .table_name = owned_table_name,
+                .query = graph_query,
+                .alias_projections = alias_projections,
+            } };
+        },
+        .graph_metric => {
+            if (lowered.req.full_text != null or lowered.req.graph_metric_rerank != null) return error.UnsupportedSqlShape;
+            if (lowered.req.graph_metric_queries.len != 1 or lowered.req.graph_queries.len != 0) return error.UnsupportedSqlShape;
+            const graph_metric_queries = lowered.req.graph_metric_queries;
+            const graph_metric_query = graph_metric_queries[0];
+            lowered.req.graph_metric_queries = &.{};
+            if (graph_metric_queries.len > 0) alloc.free(@constCast(graph_metric_queries));
+            return .{ .graph_metric_query = .{
+                .table_name = owned_table_name,
+                .query = graph_metric_query,
+            } };
+        },
+        .graph_metric_rerank => {
+            if (lowered.req.full_text == null or lowered.req.graph_metric_rerank == null) return error.UnsupportedSqlShape;
+            if (lowered.req.graph_queries.len != 0 or lowered.req.graph_metric_queries.len != 0) return error.UnsupportedSqlShape;
+            const request = lowered.req;
+            lowered.req = .{};
+            return .{ .graph_metric_rerank_query = .{
+                .table_name = owned_table_name,
+                .request = request,
+            } };
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
 fn graphAliasProjectionsFromArgsAlloc(
     alloc: std.mem.Allocator,
     args: []const SqlQueryFunctionArg,

@@ -84,6 +84,17 @@ pub const BatchProfile = struct {
     extract_embedding_artifacts_ns: u64 = 0,
     extract_graph_artifacts_ns: u64 = 0,
     extract_strip_store_value_ns: u64 = 0,
+    relational_row_value_ns: u64 = 0,
+    relational_prepare_upsert_ns: u64 = 0,
+    relational_prepare_delete_ns: u64 = 0,
+    relational_prepare_identity_rewrite_ns: u64 = 0,
+    relational_row_upserts: u64 = 0,
+    relational_row_deletes: u64 = 0,
+    relational_identity_rewrites: u64 = 0,
+    relational_store_writes: u64 = 0,
+    relational_store_deletes: u64 = 0,
+    relational_store_write_bytes: u64 = 0,
+    relational_store_delete_key_bytes: u64 = 0,
     extract_timestamp_ns: u64 = 0,
     overwrite_probe_ns: u64 = 0,
     delete_artifacts_ns: u64 = 0,
@@ -96,6 +107,8 @@ pub const BatchProfile = struct {
     store_write_ns: u64 = 0,
     store_write_count: u64 = 0,
     store_delete_count: u64 = 0,
+    store_write_bytes: u64 = 0,
+    store_delete_key_bytes: u64 = 0,
     split_delta_ns: u64 = 0,
     build_derived_ns: u64 = 0,
     apply_shadow_ns: u64 = 0,
@@ -298,7 +311,7 @@ pub fn logBatchProfile(req: types.BatchRequest, profile: BatchProfile) void {
         },
     );
     std.log.info(
-        "antfly_bench_batch_extract writes={d} total_extract_ms={d} vector_field_names_ms={d} mapper_ms={d} graph_fields_ms={d} index_field_embeddings_ms={d} embedding_artifacts_ms={d} graph_artifacts_ms={d} strip_store_value_ms={d} timestamp_ms={d} overwrite_probe_ms={d} identity_upserts={d} identity_deletes={d} store_writes={d} store_deletes={d}",
+        "antfly_bench_batch_extract writes={d} total_extract_ms={d} vector_field_names_ms={d} mapper_ms={d} graph_fields_ms={d} index_field_embeddings_ms={d} embedding_artifacts_ms={d} graph_artifacts_ms={d} strip_store_value_ms={d} timestamp_ms={d} overwrite_probe_ms={d} identity_upserts={d} identity_deletes={d} store_writes={d} store_deletes={d} store_write_bytes={d} store_delete_key_bytes={d}",
         .{
             req.writes.len,
             nsToMs(profile.extract_writes_ns),
@@ -315,6 +328,25 @@ pub fn logBatchProfile(req: types.BatchRequest, profile: BatchProfile) void {
             profile.identity_delete_keys,
             profile.store_write_count,
             profile.store_delete_count,
+            profile.store_write_bytes,
+            profile.store_delete_key_bytes,
+        },
+    );
+    std.log.info(
+        "antfly_bench_batch_relational writes={d} row_value_ms={d} prepare_upsert_ms={d} prepare_delete_ms={d} prepare_identity_rewrite_ms={d} row_upserts={d} row_deletes={d} identity_rewrites={d} relational_store_writes={d} relational_store_deletes={d} relational_store_write_bytes={d} relational_store_delete_key_bytes={d}",
+        .{
+            req.writes.len,
+            nsToMs(profile.relational_row_value_ns),
+            nsToMs(profile.relational_prepare_upsert_ns),
+            nsToMs(profile.relational_prepare_delete_ns),
+            nsToMs(profile.relational_prepare_identity_rewrite_ns),
+            profile.relational_row_upserts,
+            profile.relational_row_deletes,
+            profile.relational_identity_rewrites,
+            profile.relational_store_writes,
+            profile.relational_store_deletes,
+            profile.relational_store_write_bytes,
+            profile.relational_store_delete_key_bytes,
         },
     );
     std.log.info(
@@ -426,6 +458,32 @@ pub fn addBatchProfile(total: *BatchProfile, delta: BatchProfile) void {
 pub fn recordProfileNs(profile: ?*BatchProfile, field: *u64, start_ns: u64) void {
     if (profile == null) return;
     field.* += platform.time.monotonicNs() - start_ns;
+}
+
+fn stagedWriteBytes(writes: []const docstore_mod.KVPair) u64 {
+    var total: u64 = 0;
+    for (writes) |write| {
+        total +|= @intCast(write.key.len);
+        total +|= @intCast(write.value.len);
+    }
+    return total;
+}
+
+fn stagedDeleteKeyBytes(deletes: []const []const u8) u64 {
+    var total: u64 = 0;
+    for (deletes) |key| total +|= @intCast(key.len);
+    return total;
+}
+
+fn recordRelationalStagedBytes(
+    profile: *BatchProfile,
+    writes: []const docstore_mod.KVPair,
+    deletes: []const []const u8,
+    writes_start: usize,
+    deletes_start: usize,
+) void {
+    profile.relational_store_write_bytes +|= stagedWriteBytes(writes[writes_start..]);
+    profile.relational_store_delete_key_bytes +|= stagedDeleteKeyBytes(deletes[deletes_start..]);
 }
 
 fn nsToMs(ns: u64) u64 {
@@ -8069,22 +8127,33 @@ pub fn Impl(comptime DB: type) type {
                     // Document-mode tables keep the JSON blob under the primary
                     // document key.
                     const relational_columns = DB.WritePathCallbacks.relational_columns_for_store(self);
-                    const store_value = if (relational_columns) |columns|
-                        try relational_store_mod.relationalStoreRowValueAlloc(self.alloc, cleaned, columns, &owned_store_values)
-                    else
-                        try strippedStoredDocumentValueAlloc(
-                            self.alloc,
-                            cleaned,
-                            vector_store_field_names,
-                            &owned_store_values,
-                        );
+                    const store_value = if (relational_columns) |columns| blk: {
+                        const row_value_start_ns = DB.WritePathCallbacks.monotonic_time_ns();
+                        const row_value = try relational_store_mod.relationalStoreRowValueAlloc(self.alloc, cleaned, columns, &owned_store_values);
+                        if (profile) |active_profile| DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.relational_row_value_ns, row_value_start_ns);
+                        break :blk row_value;
+                    } else try strippedStoredDocumentValueAlloc(
+                        self.alloc,
+                        cleaned,
+                        vector_store_field_names,
+                        &owned_store_values,
+                    );
                     if (profile) |active_profile| DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.extract_strip_store_value_ns, strip_store_value_start_ns);
                     const store_key = if (relational_columns != null) blk: {
                         const row_write_index = store_writes.items.len;
+                        const row_delete_index = delete_keys.items.len;
+                        const prepare_upsert_start_ns = DB.WritePathCallbacks.monotonic_time_ns();
                         relational_participant.prepareUpsert("", write.key, store_value, null) catch |err| {
                             if (err == error.ForeignKeyViolation) DB.WritePathCallbacks.record_foreign_key_child_write_reject(self);
                             return err;
                         };
+                        if (profile) |active_profile| {
+                            DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.relational_prepare_upsert_ns, prepare_upsert_start_ns);
+                            active_profile.relational_row_upserts += 1;
+                            active_profile.relational_store_writes += @intCast(store_writes.items.len - row_write_index);
+                            active_profile.relational_store_deletes += @intCast(delete_keys.items.len - row_delete_index);
+                            recordRelationalStagedBytes(active_profile, store_writes.items, delete_keys.items, row_write_index, row_delete_index);
+                        }
                         relational_participant_prepared = true;
                         const primary_key = try internal_keys.documentKeyAlloc(self.alloc, write.key);
                         var primary_key_owned = true;
@@ -8123,11 +8192,23 @@ pub fn Impl(comptime DB: type) type {
             }
             for (effective_req.relational_identity_rewrites) |rewrite| {
                 const relational_columns = DB.WritePathCallbacks.relational_columns_for_store(self) orelse return error.UnsupportedOperation;
+                const row_value_start_ns = DB.WritePathCallbacks.monotonic_time_ns();
                 const store_value = try relational_store_mod.relationalStoreRowValueAlloc(self.alloc, rewrite.value, relational_columns, &owned_store_values);
+                if (profile) |active_profile| DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.relational_row_value_ns, row_value_start_ns);
+                const row_write_index = store_writes.items.len;
+                const row_delete_index = delete_keys.items.len;
+                const prepare_identity_start_ns = DB.WritePathCallbacks.monotonic_time_ns();
                 relational_participant.prepareIdentityRewrite("", rewrite.old_key, rewrite.new_key, store_value, null) catch |err| {
                     if (err == error.ForeignKeyViolation) DB.WritePathCallbacks.record_foreign_key_parent_delete_reject(self);
                     return err;
                 };
+                if (profile) |active_profile| {
+                    DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.relational_prepare_identity_rewrite_ns, prepare_identity_start_ns);
+                    active_profile.relational_identity_rewrites += 1;
+                    active_profile.relational_store_writes += @intCast(store_writes.items.len - row_write_index);
+                    active_profile.relational_store_deletes += @intCast(delete_keys.items.len - row_delete_index);
+                    recordRelationalStagedBytes(active_profile, store_writes.items, delete_keys.items, row_write_index, row_delete_index);
+                }
                 relational_participant_prepared = true;
                 try identity_upsert_keys.append(self.alloc, rewrite.new_key);
                 const old_document_key = try internal_keys.documentKeyAlloc(self.alloc, rewrite.old_key);
@@ -8227,10 +8308,20 @@ pub fn Impl(comptime DB: type) type {
             }
             for (effective_req.deletes) |key| {
                 if (DB.WritePathCallbacks.relational_columns_for_store(self) != null) {
+                    const row_write_index = store_writes.items.len;
+                    const row_delete_index = delete_keys.items.len;
+                    const prepare_delete_start_ns = DB.WritePathCallbacks.monotonic_time_ns();
                     relational_participant.prepareDelete("", key, null) catch |err| {
                         if (err == error.ForeignKeyViolation) DB.WritePathCallbacks.record_foreign_key_parent_delete_reject(self);
                         return err;
                     };
+                    if (profile) |active_profile| {
+                        DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.relational_prepare_delete_ns, prepare_delete_start_ns);
+                        active_profile.relational_row_deletes += 1;
+                        active_profile.relational_store_writes += @intCast(store_writes.items.len - row_write_index);
+                        active_profile.relational_store_deletes += @intCast(delete_keys.items.len - row_delete_index);
+                        recordRelationalStagedBytes(active_profile, store_writes.items, delete_keys.items, row_write_index, row_delete_index);
+                    }
                     relational_participant_prepared = true;
                     const primary_key = try internal_keys.documentKeyAlloc(self.alloc, key);
                     var primary_key_owned = true;
@@ -8493,6 +8584,8 @@ pub fn Impl(comptime DB: type) type {
                 DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.store_write_ns, store_write_start_ns);
                 active_profile.store_write_count += @intCast(store_writes.items.len);
                 active_profile.store_delete_count += @intCast(delete_keys.items.len);
+                active_profile.store_write_bytes +|= stagedWriteBytes(store_writes.items);
+                active_profile.store_delete_key_bytes +|= stagedDeleteKeyBytes(delete_keys.items);
             }
             if (DB.WritePathCallbacks.should_append_split_delta(self)) {
                 const split_delta_start_ns = DB.WritePathCallbacks.monotonic_time_ns();

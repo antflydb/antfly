@@ -949,6 +949,7 @@ fn generatedSelectItemStartAllowsExpressionKind(
         .repeat,
         .reverse,
         .md5,
+        .soundex,
         .starts_with,
         .ends_with,
         .date_trunc,
@@ -2203,14 +2204,14 @@ test "sql expr_window validates frame helpers" {
         .tokens = .{ .start = 0, .end = 3 },
         .function_name_tokens = .{ .start = 0, .end = 1 },
         .window_function_kind = .count,
-        .filter_expression_kind = .field,
+        .filter_expression_kind = .token_range,
     };
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         validateGeneratedWindowFunctionFilterPayloads(null, null, null, null, &stale_window_count_filter_kind),
     );
     var generated_filter_child = generated_parser.GeneratedSqlExpressionAst{
-        .kind = .eq,
+        .kind = .comparison,
         .tokens = .{ .start = 3, .end = 6 },
     };
     const filtered_window_count_ast = generated_parser.GeneratedSqlExpressionAst{

@@ -14,6 +14,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const platform = @import("antfly_platform");
 const structlog = @import("structlog");
 const testing = std.testing;
 
@@ -76,10 +77,12 @@ pub fn main(init: std.process.Init.Minimal) void {
     }
 
     const trace_cleanup = getenvBool("ANTFLY_TEST_CLEANUP_TRACE");
+    const trace_timings = getenvBool("ANTFLY_TEST_TIMINGS");
     var current_count: usize = 0;
     for (test_fns) |test_fn| {
         if (!matchesFilter(test_fn.name)) continue;
         current_count += 1;
+        const test_start_ns = if (trace_timings) platform.time.monotonicNs() else 0;
         testing.allocator_instance = .{};
         testing.io_instance = .init(testing.allocator, .{
             .argv0 = .init(init.args),
@@ -114,6 +117,10 @@ pub fn main(init: std.process.Init.Minimal) void {
             leak_count += 1;
         }
         if (trace_cleanup) std.debug.print("CLEANUP done {s}\n", .{test_fn.name});
+        if (trace_timings) {
+            const elapsed_ns = platform.time.monotonicNs() - test_start_ns;
+            std.debug.print("TIMING {d}ns {s}\n", .{ elapsed_ns, test_fn.name });
+        }
     }
 
     std.debug.print(

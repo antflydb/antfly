@@ -1307,6 +1307,18 @@ pub const GeneratedSqlViewAst = struct {
     }
 };
 
+pub const GeneratedSqlDdlScalarSubqueryDefaultAst = struct {
+    default_tokens: GeneratedSqlTokenRange,
+    query_tokens: GeneratedSqlTokenRange,
+    read_ast: *GeneratedSqlReadAst,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.read_ast.deinit(alloc);
+        alloc.destroy(self.read_ast);
+        self.* = undefined;
+    }
+};
+
 pub const GeneratedSqlDdlAst = struct {
     kind: GeneratedSqlDdlKind,
     statement_span: token_mod.SourceSpan,
@@ -1409,6 +1421,8 @@ pub const GeneratedSqlDdlAst = struct {
     policy_check_predicate_tokens: ?GeneratedSqlTokenRange = null,
     aggregate_argument_items: GeneratedSqlListAst = .{},
     aggregate_option_items: GeneratedSqlListAst = .{},
+    scalar_subquery_default_items: []GeneratedSqlDdlScalarSubqueryDefaultAst = &.{},
+    scalar_subquery_default_count: usize = 0,
     relation_population_source_tokens: ?GeneratedSqlTokenRange = null,
     relation_population_data_clause_tokens: ?GeneratedSqlTokenRange = null,
     relation_population_populate: ?bool = null,
@@ -1451,6 +1465,8 @@ pub const GeneratedSqlDdlAst = struct {
         self.policy_role_target_items.deinit(alloc);
         self.aggregate_argument_items.deinit(alloc);
         self.aggregate_option_items.deinit(alloc);
+        for (self.scalar_subquery_default_items) |*item| item.deinit(alloc);
+        if (self.scalar_subquery_default_items.len > 0) alloc.free(self.scalar_subquery_default_items);
         self.privilege_items.deinit(alloc);
         self.privilege_principal_items.deinit(alloc);
         self.default_privilege_target_role_items.deinit(alloc);
@@ -2816,6 +2832,7 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE SCHEMA analytics", .kind = .ddl },
     .{ .sql = "CREATE SCHEMA IF NOT EXISTS analytics", .kind = .ddl },
     .{ .sql = "CREATE TABLE usage_records (id text PRIMARY KEY, status text DEFAULT 'open')", .kind = .ddl },
+    .{ .sql = "CREATE OR REPLACE TABLE usage_records (id text PRIMARY KEY)", .kind = .ddl },
     .{ .sql = "CREATE TABLE IF NOT EXISTS usage_records (id text PRIMARY KEY)", .kind = .ddl },
     .{ .sql = "CREATE TEMP TABLE usage_session_records (id uuid PRIMARY KEY, status text)", .kind = .ddl },
     .{ .sql = "CREATE UNLOGGED TABLE IF NOT EXISTS usage_ingest_records (id uuid PRIMARY KEY, payload jsonb)", .kind = .ddl },
@@ -2828,6 +2845,7 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE VIEW active_usage AS SELECT id, status FROM usage_records", .kind = .ddl },
     .{ .sql = "CREATE OR REPLACE VIEW IF NOT EXISTS active_usage AS SELECT id, status FROM usage_records", .kind = .ddl },
     .{ .sql = "CREATE MATERIALIZED VIEW usage_summary AS SELECT status, count(*) FROM usage_records GROUP BY status", .kind = .ddl },
+    .{ .sql = "CREATE OR REPLACE MATERIALIZED VIEW usage_summary AS SELECT status FROM usage_records WITH NO DATA", .kind = .ddl },
     .{ .sql = "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0)", .kind = .ddl },
     .{ .sql = "CREATE PUBLICATION usage_pub FOR TABLE usage_records", .kind = .ddl },
     .{ .sql = "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=example dbname=usage' PUBLICATION usage_pub", .kind = .ddl },
@@ -3082,6 +3100,7 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CHECKPOINT", .kind = .unsupported },
     .{ .sql = "CLUSTER usage_records USING usage_status_idx", .kind = .unsupported },
     .{ .sql = "COMMENT ON TABLE usage_records IS 'billing rows'", .kind = .ddl },
+    .{ .sql = "COMMENT ON EXTENSION vector IS 'vector search extension'", .kind = .ddl },
     .{ .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)", .kind = .unsupported },
     .{ .sql = "DISCARD TEMP", .kind = .unsupported },
     .{ .sql = "DISCARD TEMPORARY", .kind = .unsupported },
@@ -3228,7 +3247,11 @@ fn generatedGrammarKindMatchesStatement(
                 .alter_table_cluster => return generatedAlterTableClusterUnsupported(tokens),
                 .alter_table_column_statistics => return generatedAlterTableColumnStatisticsUnsupported(tokens),
                 .alter_table_column_storage => return generatedAlterTableColumnStorageUnsupported(tokens),
+                .alter_table_inheritance => return generatedAlterTableInheritanceUnsupported(tokens),
                 .alter_table_owner => return generatedAlterTableOwnerUnsupported(tokens),
+                .alter_table_persistence => return generatedAlterTablePersistenceUnsupported(tokens),
+                .alter_table_replica_identity => return generatedAlterTableReplicaIdentityUnsupported(tokens),
+                .alter_table_set_schema => return generatedAlterTableSetSchemaUnsupported(tokens),
                 .alter_table_storage_parameters => return generatedAlterTableStorageParametersUnsupported(tokens),
                 .alter_table_tablespace => return generatedAlterTableTablespaceUnsupported(tokens),
                 .alter_table_trigger_state => return generatedAlterTableTriggerStateUnsupported(tokens),
@@ -4070,7 +4093,9 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (generatedCreateTableTargetRange(tokens, 0, statementTokenEnd(tokens)) != null) return .{ .ddl = .create_table };
         const second = tokens[1];
         if (second.matchesKeyword("document") and tokens.len > 2 and tokens[2].matchesKeywordTag(.table)) return .{ .unsupported = .create_document_table_shorthand };
+        if (second.matchesKeywordTag(.@"or") and tokens.len > 3 and tokens[2].matchesKeywordTag(.replace) and tokens[3].matchesKeywordTag(.table)) return .{ .ddl = .create_table };
         if (second.matchesKeywordTag(.@"or") and tokens.len > 3 and tokens[2].matchesKeywordTag(.replace) and tokens[3].matchesKeywordTag(.view)) return .{ .ddl = .create_view };
+        if (second.matchesKeywordTag(.@"or") and tokens.len > 4 and tokens[2].matchesKeywordTag(.replace) and tokens[3].matchesKeywordTag(.materialized) and tokens[4].matchesKeywordTag(.view)) return .{ .ddl = .create_materialized_view };
         if (second.matchesKeywordTag(.@"or") and tokens.len > 3 and tokens[2].matchesKeywordTag(.replace) and tokens[3].matchesKeywordTag(.function)) return .{ .ddl = .create_function };
         if (second.matchesKeywordTag(.@"or") and tokens.len > 3 and tokens[2].matchesKeywordTag(.replace) and tokens[3].matchesKeywordTag(.procedure)) return .{ .ddl = .create_procedure };
         if (second.matchesKeywordTag(.database)) {
@@ -4306,8 +4331,15 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     }
     if (first.matchesKeywordTag(.insert)) {
         if (generatedInsertHasOverridingValue(tokens)) return .{ .unsupported = .insert_overriding_value };
-        for (tokens) |token| {
-            if (token.matchesKeywordTag(.select)) return .{ .dml = .insert_select };
+        const select_index = findTopLevelKeyword(tokens, 1, tokens.len, .select);
+        const values_index = findTopLevelKeyword(tokens, 1, tokens.len, .values);
+        const default_index = findTopLevelKeyword(tokens, 1, tokens.len, .default);
+        if (select_index) |idx| {
+            if ((values_index == null or idx < values_index.?) and
+                (default_index == null or idx < default_index.?))
+            {
+                return .{ .dml = .insert_select };
+            }
         }
         return .{ .dml = .insert_values };
     }
@@ -6724,6 +6756,10 @@ fn buildDdlAst(
         },
         .create_table => {
             index = 1;
+            if (index + 2 < end and tokens[index].matchesKeywordTag(.@"or") and tokens[index + 1].matchesKeywordTag(.replace)) {
+                ast.replace_existing = true;
+                index += 2;
+            }
             consumeGeneratedRelationLifetime(tokens, &index, end);
             if (index < end and tokens[index].matchesKeywordTag(.table)) index += 1;
             consumeGeneratedOnlyPrefix(tokens, &index, end);
@@ -6733,10 +6769,7 @@ fn buildDdlAst(
                 if (table_range.end < end and tokens[table_range.end].kind == .lparen) {
                     if (findMatchingParen(tokens, table_range.end, end)) |definition_close| {
                         ast.alter_table_operation_tokens = .{ .start = table_range.end + 1, .end = definition_close };
-                        const summary = generatedTopLevelTokenItemSummary(tokens, ast.alter_table_operation_tokens.?);
-                        ast.alter_table_operation_items.first_tokens = summary.first_item;
-                        ast.alter_table_operation_items.last_tokens = summary.last_item;
-                        ast.alter_table_operation_items.count = summary.count;
+                        ast.alter_table_operation_items = try buildTopLevelTokenListAst(alloc, tokens, ast.alter_table_operation_tokens.?);
                         try populateGeneratedCreateTableLikeAst(alloc, tokens, ast.alter_table_operation_tokens.?, &ast);
                         try populateGeneratedCreateTableDocumentAst(alloc, tokens, definition_close + 1, end, &ast);
                         try populateGeneratedCreateTablePartitionedAst(alloc, tokens, definition_close + 1, end, &ast);
@@ -6763,8 +6796,13 @@ fn buildDdlAst(
             }
         },
         .create_materialized_view => {
-            if (end > 3 and tokens[1].matchesKeywordTag(.materialized) and tokens[2].matchesKeywordTag(.view)) {
-                index = 3;
+            index = 1;
+            if (index + 2 < end and tokens[index].matchesKeywordTag(.@"or") and tokens[index + 1].matchesKeywordTag(.replace)) {
+                ast.replace_existing = true;
+                index += 2;
+            }
+            if (index + 1 < end and tokens[index].matchesKeywordTag(.materialized) and tokens[index + 1].matchesKeywordTag(.view)) {
+                index += 2;
                 ast.if_not_exists = consumeGeneratedIfNotExists(tokens, &index, end);
                 ast.object_name_tokens = generatedQualifiedNameRange(tokens, index, end);
                 if (ast.object_name_tokens) |view_range| {
@@ -7454,7 +7492,44 @@ fn buildDdlAst(
         },
         else => {},
     }
+    try populateGeneratedDdlScalarSubqueryDefaultAst(alloc, tokens, end, &ast);
     return ast;
+}
+
+fn populateGeneratedDdlScalarSubqueryDefaultAst(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    end: usize,
+    ast: *GeneratedSqlDdlAst,
+) !void {
+    if (end > tokens.len) return error.UnsupportedSqlShape;
+    var items = std.ArrayListUnmanaged(GeneratedSqlDdlScalarSubqueryDefaultAst).empty;
+    errdefer {
+        for (items.items) |*item| item.deinit(alloc);
+        items.deinit(alloc);
+    }
+    var index: usize = 0;
+    while (index + 2 < end) : (index += 1) {
+        if (!tokens[index].matchesKeywordTag(.default) or tokens[index + 1].kind != .lparen or !tokens[index + 2].matchesKeywordTag(.select)) continue;
+        const close_index = findMatchingParen(tokens, index + 1, end) orelse return error.UnsupportedSqlShape;
+        if (close_index <= index + 2) return error.UnsupportedSqlShape;
+        const query_tokens = GeneratedSqlTokenRange{ .start = index + 2, .end = close_index };
+        const read_ast = try buildGeneratedReadAstForRangeAlloc(alloc, tokens, query_tokens);
+        var item = GeneratedSqlDdlScalarSubqueryDefaultAst{
+            .default_tokens = .{ .start = index + 1, .end = close_index + 1 },
+            .query_tokens = query_tokens,
+            .read_ast = read_ast,
+        };
+        var item_transferred = false;
+        errdefer if (!item_transferred) item.deinit(alloc);
+        try items.append(alloc, item);
+        item_transferred = true;
+        index = close_index;
+    }
+    const owned = try items.toOwnedSlice(alloc);
+    items = .empty;
+    ast.scalar_subquery_default_items = owned;
+    ast.scalar_subquery_default_count = owned.len;
 }
 
 fn buildGeneratedRelationPopulationSourceReadAstAlloc(
@@ -10289,6 +10364,7 @@ fn buildInsertDmlAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, 
         const values_end = conflict_index orelse returning_index;
         ast.values_tokens = .{ .start = values_index + 1, .end = values_end };
         ast.insert_value_rows = try buildTopLevelListAst(alloc, tokens, ast.values_tokens.?, .{});
+        try populateGeneratedInsertValueRowArgumentItems(alloc, tokens, &ast.insert_value_rows);
         if (conflict_index) |idx| {
             const conflict_end = if (returning_index < end) returning_index else end;
             try setGeneratedDmlConflictAst(alloc, tokens, idx, conflict_end, ast);
@@ -11788,6 +11864,38 @@ fn generatedListExpressionTokens(list: GeneratedSqlListAst, index: usize) ?Gener
     return null;
 }
 
+fn generatedRangeHasTopLevelComma(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) bool {
+    var depth: usize = 0;
+    var index = range.start;
+    while (index < range.end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            .comma => if (depth == 0) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn populateGeneratedInsertValueRowArgumentItems(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    rows: *GeneratedSqlListAst,
+) !void {
+    if (rows.expressions.len != rows.count) return;
+    for (rows.expressions) |*expression| {
+        if (expression.kind != .grouped) continue;
+        const inner_range = expression.inner_tokens orelse continue;
+        if (!generatedRangeHasTopLevelComma(tokens, inner_range)) continue;
+        expression.argument_items.deinit(alloc);
+        expression.argument_items = try buildTopLevelListAst(alloc, tokens, inner_range, .{});
+    }
+}
+
 fn recordGeneratedListItem(
     alloc: std.mem.Allocator,
     items: *std.ArrayListUnmanaged(GeneratedSqlTokenRange),
@@ -13211,6 +13319,7 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_table }, (try parseSqlAlloc(alloc, "CREATE UNLOGGED TABLE IF NOT EXISTS usage_ingest_records (id uuid)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_view }, (try parseSqlAlloc(alloc, "CREATE VIEW active_usage AS SELECT id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_materialized_view }, (try parseSqlAlloc(alloc, "CREATE MATERIALIZED VIEW usage_summary AS SELECT status FROM usage_records")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_materialized_view }, (try parseSqlAlloc(alloc, "CREATE OR REPLACE MATERIALIZED VIEW usage_summary AS SELECT status FROM usage_records WITH NO DATA")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_view }, (try parseSqlAlloc(alloc, "ALTER VIEW active_usage RENAME TO active_usage_v2")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_view }, (try parseSqlAlloc(alloc, "DROP VIEW active_usage")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_materialized_view }, (try parseSqlAlloc(alloc, "DROP MATERIALIZED VIEW usage_summary")).statement);
@@ -13240,6 +13349,7 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_policy }, (try parseSqlAlloc(alloc, "DROP POLICY IF EXISTS usage_policy ON usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .comment }, (try parseSqlAlloc(alloc, "COMMENT ON TABLE usage_records IS 'billing rows'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .comment }, (try parseSqlAlloc(alloc, "COMMENT ON SCHEMA public IS 'public schema'")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .comment }, (try parseSqlAlloc(alloc, "COMMENT ON EXTENSION vector IS 'vector search extension'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .comment }, (try parseSqlAlloc(alloc, "COMMENT ON FUNCTION normalize_status(text, integer) IS 'normalizes status'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .comment }, (try parseSqlAlloc(alloc, "COMMENT ON SEQUENCE usage_records_id_seq IS 'unsupported'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .grant }, (try parseSqlAlloc(alloc, "GRANT SELECT ON TABLE usage_records TO readonly")).statement);
@@ -13718,6 +13828,22 @@ test "generated SQL parser facade builds control AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const create_table_scalar_default_sql = "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text DEFAULT (SELECT status FROM usage_records LIMIT 1))";
+    const create_table_scalar_default_result = try parseSqlAlloc(alloc, create_table_scalar_default_sql);
+    switch (create_table_scalar_default_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.create_table, ddl.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 20 }, ddl.alter_table_operation_tokens.?);
+            try std.testing.expectEqual(@as(usize, 2), ddl.alter_table_operation_items.count);
+            try std.testing.expectEqual(@as(usize, 1), ddl.scalar_subquery_default_count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 20 }, ddl.scalar_subquery_default_items[0].default_tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 19 }, ddl.scalar_subquery_default_items[0].query_tokens);
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, ddl.scalar_subquery_default_items[0].read_ast.kind);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const create_document_table_sql = "CREATE TABLE docs () WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}'";
     var create_document_table_tokens = try lexer.tokenizeAlloc(alloc, create_document_table_sql);
     defer lexer.freeTokens(alloc, &create_document_table_tokens);
@@ -13829,6 +13955,17 @@ test "generated SQL parser facade builds control AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const create_replace_table_sql = "CREATE OR REPLACE TABLE usage_records (id text PRIMARY KEY)";
+    const create_replace_table_result = try parseSqlAlloc(alloc, create_replace_table_sql);
+    switch (create_replace_table_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.create_table, ddl.kind);
+            try std.testing.expect(ddl.replace_existing);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const table_primary_key_timing_sql = "CREATE TABLE table_primary_key_timing (tenant_id text NOT NULL, id uuid NOT NULL, status text, CONSTRAINT table_primary_key_timing_pk PRIMARY KEY (tenant_id, id) INCLUDE (status) NOT DEFERRABLE INITIALLY IMMEDIATE)";
     const table_primary_key_timing_result = try parseSqlAlloc(alloc, table_primary_key_timing_sql);
     switch (table_primary_key_timing_result.ast.?) {
@@ -13885,6 +14022,23 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(@as(usize, 0), view_metadata.column_items.count);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 15 }, view_metadata.query_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 15 }, ddl.materialized_view_data_clause_tokens.?);
+            try std.testing.expectEqual(false, ddl.materialized_view_populate.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const create_replace_materialized_view_sql = "CREATE OR REPLACE MATERIALIZED VIEW usage_summary AS SELECT status FROM usage_records WITH NO DATA";
+    const create_replace_materialized_view_result = try parseSqlAlloc(alloc, create_replace_materialized_view_sql);
+    switch (create_replace_materialized_view_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.create_materialized_view, ddl.kind);
+            try std.testing.expect(ddl.replace_existing);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 14 }, ddl.alter_table_operation_tokens.?);
+            const view_metadata = ddl.view_metadata orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 0), view_metadata.column_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 14 }, view_metadata.query_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 14 }, ddl.materialized_view_data_clause_tokens.?);
             try std.testing.expectEqual(false, ddl.materialized_view_populate.?);
         },
         else => return error.TestUnexpectedResult,
@@ -14160,6 +14314,18 @@ test "generated SQL parser facade builds control AST spans" {
         .ddl => |ddl| {
             try std.testing.expectEqual(GeneratedSqlDdlKind.comment, ddl.kind);
             try std.testing.expectEqual(GeneratedSqlCommentTarget.schema, ddl.comment_target.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, ddl.comment_value_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const comment_extension_sql = "COMMENT ON EXTENSION vector IS 'vector search extension'";
+    const comment_extension_result = try parseSqlAlloc(alloc, comment_extension_sql);
+    switch (comment_extension_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.comment, ddl.kind);
+            try std.testing.expectEqual(GeneratedSqlCommentTarget.extension, ddl.comment_target.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, ddl.object_name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, ddl.comment_value_tokens.?);
         },
@@ -14571,6 +14737,24 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 10 }, ddl.alter_table_operation_tokens.?);
             try std.testing.expectEqual(@as(usize, 1), ddl.alter_table_operation_items.count);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 10 }, ddl.alter_table_operation_items.items[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const alter_table_scalar_default_sql = "ALTER TABLE usage_records ALTER COLUMN status SET DEFAULT (SELECT status FROM usage_records LIMIT 1)";
+    const alter_table_scalar_default_result = try parseSqlAlloc(alloc, alter_table_scalar_default_sql);
+    switch (alter_table_scalar_default_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.alter_table, ddl.kind);
+            try std.testing.expect(!ddl.if_exists);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 16 }, ddl.alter_table_operation_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), ddl.alter_table_operation_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 16 }, ddl.alter_table_operation_items.items[0]);
+            try std.testing.expectEqual(@as(usize, 1), ddl.scalar_subquery_default_count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 16 }, ddl.scalar_subquery_default_items[0].default_tokens);
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, ddl.scalar_subquery_default_items[0].read_ast.kind);
+            try std.testing.expectEqual(@as(usize, 1), ddl.scalar_subquery_default_items[0].read_ast.projection_items.count);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -19345,19 +19529,6 @@ test "generated SQL parser facade builds extended read AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
-    const unsupported_alter_table_replica_identity_sql = "ALTER TABLE usage_records REPLICA IDENTITY USING INDEX usage_records_replica_idx";
-    const unsupported_alter_table_replica_identity_result = try parseSqlAlloc(alloc, unsupported_alter_table_replica_identity_sql);
-    switch (unsupported_alter_table_replica_identity_result.ast.?) {
-        .unsupported => |unsupported| {
-            try std.testing.expectEqual(GeneratedSqlUnsupportedKind.alter_table_replica_identity, unsupported.kind);
-            try std.testing.expectEqual(GeneratedSqlUnsupportedReason.alter_table_replica_identity_not_planned_by_generated_parser, unsupported.reason);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 8 }, unsupported.subject_tokens.?);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, unsupported.alter_table_name_tokens.?);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 8 }, unsupported.alter_table_operation_tokens.?);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-
     const unsupported_comment_sql = "COMMENT ON SEQUENCE usage_records_id_seq IS 'unsupported'";
     const unsupported_comment_result = try parseSqlAlloc(alloc, unsupported_comment_sql);
     switch (unsupported_comment_result.ast.?) {
@@ -19572,12 +19743,6 @@ test "generated SQL parser facade builds extended read AST spans" {
             .sql = "ALTER TABLE usage_records SET SCHEMA archive",
             .kind = .alter_table_set_schema,
             .reason = .alter_table_set_schema_not_planned_by_generated_parser,
-            .subject_tokens = .{ .start = 1, .end = 6 },
-        },
-        .{
-            .sql = "ALTER TABLE usage_records REPLICA IDENTITY FULL",
-            .kind = .alter_table_replica_identity,
-            .reason = .alter_table_replica_identity_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 6 },
         },
         .{

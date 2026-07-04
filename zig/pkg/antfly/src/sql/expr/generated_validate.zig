@@ -1251,6 +1251,7 @@ fn generatedFunctionNameMatchesRowExpressionKind(
         .repeat => expr_token.sqlTokenIsRepeatFunction(token),
         .reverse => expr_token.sqlTokenIsReverseFunction(token),
         .md5 => expr_token.sqlTokenIsMd5Function(token),
+        .soundex => std.ascii.eqlIgnoreCase(token.text, "soundex"),
         .starts_with => expr_token.sqlTokenIsStartsWithFunction(token),
         .ends_with => expr_token.sqlTokenIsEndsWithFunction(token),
         .regexp_match => expr_token.sqlTokenIsRegexpMatchFunction(token),
@@ -2784,23 +2785,36 @@ fn validateRebasedGeneratedComparisonPredicateRoot(
     operator_token_index: usize,
     op: runtime_schema.RelationalCheckOp,
 ) !void {
-    if (root.kind != .comparison or
-        root.tokens != null or
-        root.operator_tokens != null or
-        root.left_tokens != null or
-        root.negation_tokens != null or
-        root.quantifier_tokens != null or
-        root.between_modifier_tokens != null or
-        root.between_modifier != null)
-    {
-        return error.UnsupportedSqlShape;
+    const expected_token_kind = try tokenKindForComparisonOp(op);
+    if (operator_token_index >= tokens.len or tokens[operator_token_index].kind != expected_token_kind) return error.UnsupportedSqlShape;
+    if (root.kind != .comparison) {
+        switch (root.kind) {
+            .token_range => {
+                const left_tokens = root.tokens orelse return error.UnsupportedSqlShape;
+                if (left_tokens.start >= left_tokens.end or left_tokens.end != operator_token_index or left_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+                if (operator_token_index + 1 >= tokens.len or tokens[operator_token_index + 1].kind != .identifier) return error.UnsupportedSqlShape;
+                return;
+            },
+            .grouped, .logical_not, .quantified_comparison => {
+                if (operator_token_index == 0 or operator_token_index + 1 >= tokens.len) return error.UnsupportedSqlShape;
+                return;
+            },
+            else => return error.UnsupportedSqlShape,
+        }
+    }
+    if (root.tokens) |range| {
+        if (range.start > operator_token_index or range.end > tokens.len or range.end <= operator_token_index) return error.UnsupportedSqlShape;
+    }
+    if (root.operator_tokens) |range| {
+        if (range.start != operator_token_index or range.end != operator_token_index + 1) return error.UnsupportedSqlShape;
+    }
+    if (root.left_tokens) |range| {
+        if (range.start >= range.end or range.end != operator_token_index or range.end > tokens.len) return error.UnsupportedSqlShape;
     }
     const right_tokens = root.right_tokens orelse return error.UnsupportedSqlShape;
     if (operator_token_index >= tokens.len or right_tokens.start != operator_token_index + 1 or right_tokens.start >= right_tokens.end or right_tokens.end > tokens.len) {
         return error.UnsupportedSqlShape;
     }
-    const expected_token_kind = try tokenKindForComparisonOp(op);
-    if (tokens[operator_token_index].kind != expected_token_kind) return error.UnsupportedSqlShape;
 }
 
 fn validateGeneratedDistinctPredicateExpression(

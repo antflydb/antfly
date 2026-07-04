@@ -24,6 +24,54 @@ pub fn md5HexTextAlloc(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
     return out;
 }
 
+pub fn soundexTextAlloc(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out = try alloc.dupe(u8, "?000");
+    errdefer alloc.free(out);
+
+    var previous_code: u8 = 0;
+    var output_index: usize = 1;
+    var found_first = false;
+    for (text) |byte| {
+        if (!std.ascii.isAlphabetic(byte)) {
+            previous_code = 0;
+            continue;
+        }
+        const upper = std.ascii.toUpper(byte);
+        const code = soundexCode(upper);
+        if (!found_first) {
+            out[0] = upper;
+            previous_code = code;
+            found_first = true;
+            continue;
+        }
+        if (code == 0) {
+            if (upper != 'H' and upper != 'W') previous_code = 0;
+            continue;
+        }
+        if (code == previous_code) continue;
+        if (output_index < out.len) {
+            out[output_index] = '0' + code;
+            output_index += 1;
+        }
+        previous_code = code;
+        if (output_index == out.len) break;
+    }
+
+    return out;
+}
+
+fn soundexCode(upper: u8) u8 {
+    return switch (upper) {
+        'B', 'F', 'P', 'V' => 1,
+        'C', 'G', 'J', 'K', 'Q', 'S', 'X', 'Z' => 2,
+        'D', 'T' => 3,
+        'L' => 4,
+        'M', 'N' => 5,
+        'R' => 6,
+        else => 0,
+    };
+}
+
 pub fn initcapTextAlloc(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
     const out = try alloc.dupe(u8, text);
     var at_word_start = true;
@@ -47,4 +95,20 @@ test "sql expr_text transforms text" {
     const initcap = try initcapTextAlloc(alloc, "hello SQL-world");
     defer alloc.free(initcap);
     try std.testing.expectEqualStrings("Hello Sql-World", initcap);
+
+    const robert = try soundexTextAlloc(alloc, "Robert");
+    defer alloc.free(robert);
+    try std.testing.expectEqualStrings("R163", robert);
+
+    const rupert = try soundexTextAlloc(alloc, "Rupert");
+    defer alloc.free(rupert);
+    try std.testing.expectEqualStrings("R163", rupert);
+
+    const ashcraft = try soundexTextAlloc(alloc, "Ashcraft");
+    defer alloc.free(ashcraft);
+    try std.testing.expectEqualStrings("A261", ashcraft);
+
+    const empty = try soundexTextAlloc(alloc, "123");
+    defer alloc.free(empty);
+    try std.testing.expectEqualStrings("?000", empty);
 }

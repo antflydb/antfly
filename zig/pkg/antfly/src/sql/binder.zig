@@ -1639,12 +1639,14 @@ pub const CatalogLogicalWritePlan = struct {
 };
 
 pub const TransactionLogicalPlan = union(enum) {
+    boundary: ddl_plan.TransactionBoundaryPlan,
     control: ddl_plan.TransactionControlPlan,
     prepared: ddl_plan.PreparedTransactionPlan,
     savepoint: ddl_plan.SavepointTransactionPlan,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         switch (self.*) {
+            .boundary => {},
             .control => |*plan| plan.deinit(alloc),
             .prepared => |*plan| plan.deinit(alloc),
             .savepoint => |*plan| plan.deinit(alloc),

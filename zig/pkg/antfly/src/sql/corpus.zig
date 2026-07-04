@@ -228,6 +228,9 @@ pub const AppParityDdlTag = enum {
     savepoint_transaction,
     release_savepoint,
     rollback_to_savepoint,
+    begin_transaction,
+    commit_transaction,
+    rollback_transaction,
     comment_metadata,
     security_label,
     table_lock,
@@ -582,6 +585,7 @@ pub const AppParityParserFixtureSummary = struct {
     regexp_like_function: bool = false,
     regexp_match_function: bool = false,
     regexp_count_function: bool = false,
+    soundex_function: bool = false,
     regexp_instr_function: bool = false,
     regexp_substr_function: bool = false,
     regex_match_operator: bool = false,
@@ -1017,6 +1021,7 @@ pub fn appParityStructuredFixtureSummary(
             .regexp_like_function = appParityTokensHaveFunctionCall(sql_tokens, "regexp_like"),
             .regexp_match_function = appParityTokensHaveFunctionCall(sql_tokens, "regexp_match"),
             .regexp_count_function = appParityTokensHaveFunctionCall(sql_tokens, "regexp_count"),
+            .soundex_function = appParityTokensHaveFunctionCall(sql_tokens, "soundex"),
             .regexp_instr_function = appParityTokensHaveFunctionCall(sql_tokens, "regexp_instr"),
             .regexp_substr_function = appParityTokensHaveFunctionCall(sql_tokens, "regexp_substr"),
             .regex_match_operator = appParityTokensHaveKind(sql_tokens, .regex_match),
@@ -2628,13 +2633,28 @@ pub const AppParityExternalSourceCorpus = struct {
 };
 
 pub fn parseAppParityExternalSourceCorpusAlloc(alloc: std.mem.Allocator) !AppParityExternalSourceCorpus {
+    return try parseAppParityExternalSourceCorpusWithOptionsAlloc(alloc, .{});
+}
+
+pub fn parseAppParityExternalSourceCorpusStructureAlloc(alloc: std.mem.Allocator) !AppParityExternalSourceCorpus {
+    return try parseAppParityExternalSourceCorpusWithOptionsAlloc(alloc, .{ .validate_sql = false });
+}
+
+const AppParityExternalSourceCorpusParseOptions = struct {
+    validate_sql: bool = true,
+};
+
+fn parseAppParityExternalSourceCorpusWithOptionsAlloc(
+    alloc: std.mem.Allocator,
+    options: AppParityExternalSourceCorpusParseOptions,
+) !AppParityExternalSourceCorpus {
     const source_json = @embedFile("fixtures/sql_api_parity_source_corpus.json");
     const source_sha256 = try sourceCorpusSha256HexAlloc(alloc, source_json);
     errdefer alloc.free(source_sha256);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source_json, .{});
     errdefer parsed.deinit();
 
-    const root = try parseSourceCorpusRootAlloc(alloc, parsed.value);
+    const root = try parseSourceCorpusRootWithOptionsAlloc(alloc, parsed.value, options);
     errdefer freeSourceCorpusRoot(alloc, root);
 
     return .{
@@ -6855,6 +6875,14 @@ pub fn parseFixtureEntryAlloc(alloc: std.mem.Allocator, value: std.json.Value) !
 }
 
 pub fn parseSourceCorpusRootAlloc(alloc: std.mem.Allocator, value: std.json.Value) !AppParitySourceCorpusRoot {
+    return try parseSourceCorpusRootWithOptionsAlloc(alloc, value, .{});
+}
+
+fn parseSourceCorpusRootWithOptionsAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    options: AppParityExternalSourceCorpusParseOptions,
+) !AppParitySourceCorpusRoot {
     const root = try fixtureJsonObject(value);
     try fixtureRequireOnlyKeys(root, &.{ "source_format", "entries" });
     const source_format = try fixtureJsonOptionalU64(root, "source_format", 0);
@@ -6878,6 +6906,11 @@ pub fn parseSourceCorpusRootAlloc(alloc: std.mem.Allocator, value: std.json.Valu
         const entry = try parseFixtureEntryAlloc(alloc, entry_value);
         errdefer freeFixtureEntry(alloc, entry);
         if (entry.name.len == 0 or seen_names.contains(entry.name)) return error.TestUnexpectedResult;
+        if (!options.validate_sql) {
+            try seen_names.put(alloc, entry.name, {});
+            try entries.append(alloc, entry);
+            continue;
+        }
         var parsed_sql = tokenized.ParsedSql.initAlloc(alloc, entry.sql) catch |err| {
             if (try validateSourceCorpusGeneratedParseFailureEntryAlloc(alloc, entry, err)) {
                 try seen_names.put(alloc, entry.name, {});
@@ -6927,8 +6960,7 @@ fn validateSourceCorpusGeneratedParseFailureEntryAlloc(
         else => return false,
     }
     if (entry.family == .unsupported_ddl and
-        (sourceCorpusEntryHasMatchingReason(entry, "backup_lifecycle_sql_unavailable") or
-            sourceCorpusEntryHasMatchingReason(entry, "default_scalar_subquery_plan")))
+        sourceCorpusEntryHasMatchingReason(entry, "backup_lifecycle_sql_unavailable"))
     {
         return true;
     }
@@ -7856,6 +7888,7 @@ pub fn appParityCoverageArtifactForBucket(
     if (std.mem.startsWith(u8, bucket, "applied_") or
         std.mem.endsWith(u8, bucket, "_execution_contract") or
         std.mem.eql(u8, bucket, "deterministic_returning_rows") or
+        std.mem.eql(u8, bucket, "session_set_antfly_setting") or
         std.mem.eql(u8, bucket, "session_set_runtime_setting"))
     {
         return .runtime;
@@ -9077,6 +9110,7 @@ pub fn corpusDdlFixtureRequiresAppliedPlan(entry: AppParityCorpusEntry) !bool {
         .prepare_statement, .execute_statement, .deallocate_statement => false,
         .declare_cursor, .fetch_cursor, .close_cursor => false,
         .savepoint_transaction, .release_savepoint, .rollback_to_savepoint => false,
+        .begin_transaction, .commit_transaction, .rollback_transaction => false,
         .set_search_path, .set_setting, .reset_search_path, .reset_setting, .show_search_path, .discard_all => false,
         .comment_metadata => true,
         .security_label => true,
@@ -9583,6 +9617,9 @@ pub fn corpusFixtureDdlOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry,
         .savepoint_transaction,
         .release_savepoint,
         .rollback_to_savepoint,
+        .begin_transaction,
+        .commit_transaction,
+        .rollback_transaction,
         .set_search_path,
         .set_setting,
         .reset_search_path,
@@ -13493,12 +13530,6 @@ test "sql adapter corpus pins document sql bounded scan diagnostic fixture set" 
             .coverage_bucket = "document_query_view_mapping_rejected_incomplete_topk",
         },
         .{
-            .fixture = "unsupported document sql bounded residual expression read",
-            .family = .unsupported_read,
-            .reason = "document_sql_bounded_scan_unsupported_residual",
-            .coverage_bucket = "document_query_view_mapping_rejected_unsupported_residual",
-        },
-        .{
             .fixture = "unsupported document sql view mapping range read missing exact producer",
             .family = .unsupported_read,
             .reason = "document_sql_bounded_scan_missing_exact_producer",
@@ -15265,8 +15296,8 @@ test "sql adapter corpus owns fixture family policies" {
     try std.testing.expect(corpusReasonHasNativeRequirement("set_operation_plan"));
     try std.testing.expect(!corpusReasonHasNativeRequirement("future_unknown_reason"));
     try std.testing.expect(corpusPlanMatchesReason(.unsupported_write, "unsupported:write:requires=multi_table_generation_barrier", "multi_table_generation_barrier"));
-    try std.testing.expect(!corpusPlanMatchesReason(.unsupported_write, "unsupported:write:requires=session_setting", "session_setting"));
-    try std.testing.expect(corpusPlanMatchesReason(.adapter_noop_ddl, "adapter_noop:ddl:reason=session_setting", "session_setting"));
+    try std.testing.expect(corpusPlanMatchesReason(.unsupported_ddl, "unsupported:ddl:requires=session_setting", "session_setting"));
+    try std.testing.expect(!corpusPlanMatchesReason(.adapter_noop_ddl, "adapter_noop:ddl:reason=session_setting", "session_setting"));
     try std.testing.expect(corpusPlanMatchesFamily(.insert_source, "insert_source:table=usage_records"));
     try std.testing.expect(!corpusPlanMatchesFamily(.insert_source, "insert:table=usage_records"));
     try std.testing.expect(corpusPlanMatchesFamily(.read, "document_query"));
@@ -15471,7 +15502,7 @@ test "sql adapter corpus rejects fixture unknown keys and malformed scalars" {
     try std.testing.expectError(error.TestUnexpectedResult, fixtureJsonOptionalUsize(object, "unexpected"));
 }
 
-test "sql adapter corpus fingerprints unsupported and adapter no-op reasons" {
+test "sql adapter corpus fingerprints unsupported reasons and rejects removed adapter no-ops" {
     const alloc = std.testing.allocator;
     const unsupported = try unsupportedFingerprintAlloc(alloc, .write, .multi_table_generation_barrier);
     defer alloc.free(unsupported);
@@ -15480,14 +15511,14 @@ test "sql adapter corpus fingerprints unsupported and adapter no-op reasons" {
     try std.testing.expect(!unsupportedPlanMatchesReason(unsupported, .write, .session_setting));
     try std.testing.expect(!unsupportedPlanMatchesReason("unsupported:write:requires=multi_table_generation_barrier_extra", .write, .multi_table_generation_barrier));
 
-    const noop = try adapterNoopFingerprintAlloc(alloc, "ddl", .session_setting);
-    defer alloc.free(noop);
-    try std.testing.expectEqualStrings("adapter_noop:ddl:reason=session_setting", noop);
-    try std.testing.expect(adapterNoopPlanMatchesReason(noop, "ddl", .session_setting));
-    try std.testing.expect(!adapterNoopPlanMatchesReason(noop, "ddl", .set_operation_plan));
+    const unsupported_session = try unsupportedFingerprintAlloc(alloc, .ddl, .session_setting);
+    defer alloc.free(unsupported_session);
+    try std.testing.expectEqualStrings("unsupported:ddl:requires=session_setting", unsupported_session);
+    try std.testing.expect(unsupportedPlanMatchesReason(unsupported_session, .ddl, .session_setting));
+
+    try std.testing.expectError(error.UnsupportedSqlShape, adapterNoopFingerprintAlloc(alloc, "ddl", .session_setting));
     try std.testing.expect(!adapterNoopPlanMatchesReason("adapter_noop:ddl:reason=session_setting_extra", "ddl", .session_setting));
 
-    try std.testing.expectError(error.UnsupportedSqlShape, unsupportedFingerprintAlloc(alloc, .write, .session_setting));
     try std.testing.expectError(error.UnsupportedSqlShape, adapterNoopFingerprintAlloc(alloc, "ddl", .set_operation_plan));
 }
 
@@ -16863,7 +16894,9 @@ pub const AppParityCorpusCoverage = struct {
     read_quantified_subquery_not_like_any: bool = false,
     read_quantified_subquery_not_ilike_any: bool = false,
     read_non_equality_correlated_subquery: bool = false,
+    read_or_correlated_expression_array_payload: bool = false,
     read_or_correlated_subquery: bool = false,
+    read_or_correlated_nested_or_payload: bool = false,
     read_or_correlated_nested_subquery: bool = false,
     query: bool = false,
     query_select_all_disambiguated_outputs: bool = false,
@@ -16971,7 +17004,6 @@ pub const AppParityCorpusCoverage = struct {
     document_query_view_mapping_range_predicate_native_equivalence: bool = false,
     document_query_view_mapping_rejected_incomplete_topk: bool = false,
     document_query_view_mapping_rejected_missing_exact_producer: bool = false,
-    document_query_view_mapping_rejected_unsupported_residual: bool = false,
     document_query_view_mapping_rejected_unbounded_read: bool = false,
     document_query_view_mapping_residual_predicate: bool = false,
     document_query_view_mapping_residual_predicate_native_equivalence: bool = false,
@@ -17015,9 +17047,6 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_conversion_alter: bool = false,
     unsupported_ddl_conversion_create: bool = false,
     unsupported_ddl_conversion_drop: bool = false,
-    unsupported_ddl_create_default_scalar_subquery: bool = false,
-    unsupported_ddl_alter_default_scalar_subquery: bool = false,
-    unsupported_ddl_alter_default_scalar_subquery_paginated: bool = false,
     unsupported_ddl_document_table_duplicate_schema_name: bool = false,
     unsupported_ddl_document_table_invalid_antfly_extension: bool = false,
     unsupported_ddl_document_table_invalid_dynamic_template: bool = false,
@@ -17180,8 +17209,6 @@ pub const AppParityCorpusCoverage = struct {
     invalid_read_document_view_mapping_stale_source_metadata: bool = false,
     unsupported_insert: bool = false,
     unsupported_insert_overriding_value: bool = false,
-    unsupported_insert_row_batch_scalar_subquery_conflict_update: bool = false,
-    unsupported_insert_row_batch_scalar_subquery_values: bool = false,
     invalid_read_row_lock_target: bool = false,
     invalid_update_source_row_lock_mode: bool = false,
     invalid_update_source_row_lock_target: bool = false,
@@ -17517,6 +17544,7 @@ pub const AppParityCorpusCoverage = struct {
     session_set_search_path: bool = false,
     session_set_search_path_local: bool = false,
     session_set_search_path_multi_namespace: bool = false,
+    session_set_antfly_setting: bool = false,
     session_set_app_setting: bool = false,
     session_set_runtime_setting: bool = false,
     session_reset_search_path: bool = false,
@@ -18372,12 +18400,6 @@ pub const AppParityCorpusCoverage = struct {
                 structured_summary.parser.where_keyword and
                 structured_summary.parser.order_by and
                 !structured_summary.parser.unnest_function);
-        self.document_query_view_mapping_rejected_unsupported_residual = self.document_query_view_mapping_rejected_unsupported_residual or
-            (entry.family == .unsupported_read and
-                structured_summary.hasReason("document_sql_bounded_scan_unsupported_residual") and
-                structured_summary.parser.regexp_count_function and
-                structured_summary.parser.status_identifier and
-                structured_summary.parser.where_keyword);
         self.document_query_view_mapping_rejected_missing_exact_producer = self.document_query_view_mapping_rejected_missing_exact_producer or
             (entry.family == .unsupported_read and
                 structured_summary.hasReason("document_sql_bounded_scan_missing_exact_producer") and
@@ -18557,7 +18579,6 @@ pub const AppParityCorpusCoverage = struct {
                 std.mem.indexOf(u8, entry.plan, ":lateral_field=plan") != null and
                 std.mem.indexOf(u8, entry.plan, ":lateral_correlation_field=plan") != null and
                 std.mem.indexOf(u8, entry.plan, ":lateral_join_kind=left") != null and
-                std.mem.indexOf(u8, entry.plan, ":lateral_branch_lookup=1") != null and
                 std.mem.indexOf(u8, entry.plan, ":lateral_field_residuals=1") != null and
                 !appParityDocumentViewMappingCatalogContains(entry, "\"unique\":true"));
         self.document_query_view_mapping_nonunique_pinned_alternate_lateral_branch_row_native_equivalence = self.document_query_view_mapping_nonunique_pinned_alternate_lateral_branch_row_native_equivalence or
@@ -18575,7 +18596,6 @@ pub const AppParityCorpusCoverage = struct {
                 std.mem.indexOf(u8, entry.plan, ":lateral_correlation_field=plan") != null and
                 std.mem.indexOf(u8, entry.plan, ":lateral_join_kind=left") != null and
                 std.mem.indexOf(u8, entry.plan, ":lateral_branch_ordered=1") != null and
-                std.mem.indexOf(u8, entry.plan, ":lateral_branch_lookup=1") != null and
                 std.mem.indexOf(u8, entry.plan, ":lateral_residual=1") != null and
                 !appParityDocumentViewMappingCatalogContains(entry, "\"unique\":true"));
         self.document_query_view_mapping_nonunique_ordered_alternate_lateral_branch_row_native_equivalence = self.document_query_view_mapping_nonunique_ordered_alternate_lateral_branch_row_native_equivalence or
@@ -18594,7 +18614,6 @@ pub const AppParityCorpusCoverage = struct {
                 std.mem.indexOf(u8, entry.plan, ":lateral_correlation_field=plan") != null and
                 std.mem.indexOf(u8, entry.plan, ":lateral_join_kind=left") != null and
                 std.mem.indexOf(u8, entry.plan, ":lateral_branch_ordered=1") != null and
-                std.mem.indexOf(u8, entry.plan, ":lateral_branch_lookup=1") != null and
                 std.mem.indexOf(u8, entry.plan, ":lateral_residual=0") != null and
                 appParityDocumentViewMappingCatalogContains(entry, "\"unique\":true"));
         self.document_query_view_mapping_nonunique_compound_ordered_alternate_lateral_branch_row_native_equivalence = self.document_query_view_mapping_nonunique_compound_ordered_alternate_lateral_branch_row_native_equivalence or
@@ -18613,7 +18632,6 @@ pub const AppParityCorpusCoverage = struct {
                 std.mem.indexOf(u8, entry.plan, ":lateral_correlation_field=plan") != null and
                 std.mem.indexOf(u8, entry.plan, ":lateral_join_kind=left") != null and
                 std.mem.indexOf(u8, entry.plan, ":lateral_branch_ordered=1") != null and
-                std.mem.indexOf(u8, entry.plan, ":lateral_branch_lookup=1") != null and
                 std.mem.indexOf(u8, entry.plan, ":lateral_residual=0") != null and
                 appParityDocumentViewMappingCatalogContains(entry, "\"unique\":true"));
         self.document_query_view_mapping_nonunique_later_unique_compound_ordered_alternate_lateral_branch_row_native_equivalence = self.document_query_view_mapping_nonunique_later_unique_compound_ordered_alternate_lateral_branch_row_native_equivalence or
@@ -18633,7 +18651,6 @@ pub const AppParityCorpusCoverage = struct {
                 std.mem.indexOf(u8, entry.plan, ":lateral_join_kind=left") != null and
                 std.mem.indexOf(u8, entry.plan, ":lateral_branch_ordered=1") != null and
                 std.mem.indexOf(u8, entry.plan, ":lateral_branch_order_keys=2") != null and
-                std.mem.indexOf(u8, entry.plan, ":lateral_branch_lookup=1") != null and
                 std.mem.indexOf(u8, entry.plan, ":lateral_residual=0") != null and
                 appParityDocumentViewMappingCatalogContains(entry, "\"unique\":true"));
         self.document_query_view_mapping_text_field_native_equivalence = self.document_query_view_mapping_text_field_native_equivalence or
@@ -20439,16 +20456,6 @@ pub const AppParityCorpusCoverage = struct {
                 self.unsupported_insert = true;
                 self.unsupported_insert_overriding_value = self.unsupported_insert_overriding_value or
                     structured_summary.hasReason("insert_overriding_value_plan");
-                self.unsupported_insert_row_batch_scalar_subquery_conflict_update =
-                    self.unsupported_insert_row_batch_scalar_subquery_conflict_update or
-                    (structured_summary.hasReason("row_batch_scalar_subquery_plan") and
-                        structured_summary.parser.select_keyword and
-                        std.mem.indexOf(u8, entry.sql, "ON CONFLICT") != null);
-                self.unsupported_insert_row_batch_scalar_subquery_values =
-                    self.unsupported_insert_row_batch_scalar_subquery_values or
-                    (structured_summary.hasReason("row_batch_scalar_subquery_plan") and
-                        structured_summary.parser.select_keyword and
-                        std.mem.indexOf(u8, entry.sql, "ON CONFLICT") == null);
             },
             .unsupported_update => {},
             .unsupported_update_source => {},
@@ -20502,10 +20509,22 @@ pub const AppParityCorpusCoverage = struct {
                             std.mem.indexOf(u8, entry.sql, " < outer_usage.") != null or
                             std.mem.indexOf(u8, entry.sql, " >= outer_usage.") != null or
                             std.mem.indexOf(u8, entry.sql, " <= outer_usage.") != null));
+                self.read_or_correlated_expression_array_payload = self.read_or_correlated_expression_array_payload or
+                    (is_public_quantified_subquery and
+                        std.mem.indexOf(u8, entry.name, "expression array") != null and
+                        std.mem.indexOf(u8, entry.sql, " AS outer_usage ") != null and
+                        std.mem.indexOf(u8, entry.sql, " string_to_array(") != null and
+                        std.mem.indexOf(u8, entry.sql, " @> ARRAY") != null);
                 self.read_or_correlated_subquery = self.read_or_correlated_subquery or
                     (is_public_quantified_subquery and
                         std.mem.indexOf(u8, entry.sql, " AS outer_usage ") != null and
                         std.mem.indexOf(u8, entry.sql, " OR ") != null);
+                self.read_or_correlated_nested_or_payload = self.read_or_correlated_nested_or_payload or
+                    (is_public_quantified_subquery and
+                        std.mem.indexOf(u8, entry.name, "nested-or payload") != null and
+                        std.mem.indexOf(u8, entry.sql, " AS outer_usage ") != null and
+                        std.mem.indexOf(u8, entry.sql, " OR ((") != null and
+                        std.mem.indexOf(u8, entry.sql, ") AND (") != null);
                 self.read_or_correlated_nested_subquery = self.read_or_correlated_nested_subquery or
                     (is_public_quantified_subquery and
                         std.mem.indexOf(u8, entry.sql, " AS outer_usage ") != null and
@@ -20705,6 +20724,12 @@ pub const AppParityCorpusCoverage = struct {
                     structured_summary.parser.return_identifier and
                     std.mem.indexOf(u8, entry.sql, "-[:") != null);
         } else if (entry.family == .unsupported_ddl) {
+            self.unsupported_ddl_backup_database_sql_unavailable = self.unsupported_ddl_backup_database_sql_unavailable or
+                (structured_summary.hasReason("backup_lifecycle_sql_unavailable") and
+                    std.mem.startsWith(u8, entry.sql, "BACKUP DATABASE "));
+            self.unsupported_ddl_restore_database_sql_unavailable = self.unsupported_ddl_restore_database_sql_unavailable or
+                (structured_summary.hasReason("backup_lifecycle_sql_unavailable") and
+                    std.mem.startsWith(u8, entry.sql, "RESTORE DATABASE "));
             self.unsupported_ddl_copy_wrong_stream_endpoint = self.unsupported_ddl_copy_wrong_stream_endpoint or
                 (structured_summary.hasReason("bulk_io_plan") and
                     structured_summary.parser.starts_with_copy and
@@ -20725,22 +20750,6 @@ pub const AppParityCorpusCoverage = struct {
                 (structured_summary.hasReason("conversion_catalog_plan") and
                     structured_summary.parser.starts_with_drop and
                     structured_summary.parser.conversion_catalog);
-            self.unsupported_ddl_create_default_scalar_subquery = self.unsupported_ddl_create_default_scalar_subquery or
-                (structured_summary.hasReason("default_scalar_subquery_plan") and
-                    structured_summary.parser.starts_with_create and
-                    std.mem.indexOf(u8, entry.sql, "CREATE TABLE") != null and
-                    structured_summary.parser.select_keyword);
-            self.unsupported_ddl_alter_default_scalar_subquery = self.unsupported_ddl_alter_default_scalar_subquery or
-                (structured_summary.hasReason("default_scalar_subquery_plan") and
-                    structured_summary.parser.starts_with_alter and
-                    structured_summary.parser.alter_table and
-                    structured_summary.parser.select_keyword);
-            self.unsupported_ddl_alter_default_scalar_subquery_paginated = self.unsupported_ddl_alter_default_scalar_subquery_paginated or
-                (structured_summary.hasReason("default_scalar_subquery_plan") and
-                    structured_summary.parser.starts_with_alter and
-                    structured_summary.parser.alter_table and
-                    structured_summary.parser.select_keyword and
-                    std.mem.indexOf(u8, entry.sql, " LIMIT ") != null);
             self.unsupported_ddl_document_table_duplicate_schema_name = self.unsupported_ddl_document_table_duplicate_schema_name or
                 sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_duplicate_schema_name");
             self.unsupported_ddl_document_table_invalid_antfly_extension = self.unsupported_ddl_document_table_invalid_antfly_extension or
@@ -21443,6 +21452,7 @@ pub const AppParityCorpusCoverage = struct {
                 .savepoint_transaction => self.ddl_savepoint_transaction = true,
                 .release_savepoint => self.ddl_release_savepoint = true,
                 .rollback_to_savepoint => self.ddl_rollback_to_savepoint = true,
+                .begin_transaction, .commit_transaction, .rollback_transaction => {},
                 .comment_metadata => {
                     self.ddl_comment_table = self.ddl_comment_table or sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "table");
                     self.ddl_comment_column = self.ddl_comment_column or sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "column");
@@ -21509,6 +21519,8 @@ pub const AppParityCorpusCoverage = struct {
                         (sql_adapter.planUsizeTokenValue(entry.plan, ":namespaces=") orelse 0) > 1;
                 },
                 .set_setting => {
+                    self.session_set_antfly_setting = self.session_set_antfly_setting or
+                        sql_adapter.planHasExactStringToken(entry.plan, ":setting_kind=", "antfly");
                     self.session_set_app_setting = self.session_set_app_setting or
                         sql_adapter.planHasExactStringToken(entry.plan, ":setting_kind=", "app");
                     self.session_set_runtime_setting = self.session_set_runtime_setting or
@@ -22404,58 +22416,54 @@ test "sql adapter corpus emits structured fixture summaries" {
     try std.testing.expect(document_merge.parser.docs_underscore_id_identifier);
     try std.testing.expect(document_merge.parser.source_underscore_id_identifier);
 
-    var noop_commit_sql = try tokenized.ParsedSql.initAlloc(alloc, "COMMIT");
-    defer noop_commit_sql.deinit(alloc);
-    const noop_commit = appParityStructuredFixtureSummary(.{
-        .name = "adapter noop commit summary",
+    var boundary_commit_sql = try tokenized.ParsedSql.initAlloc(alloc, "COMMIT");
+    defer boundary_commit_sql.deinit(alloc);
+    const boundary_commit = appParityStructuredFixtureSummary(.{
+        .name = "transaction boundary commit summary",
         .sql = "COMMIT",
-        .family = .adapter_noop_ddl,
-        .classification_reason = "transaction_control",
-        .plan = "adapter_noop:ddl:reason=transaction_control",
-    }, &noop_commit_sql);
-    try std.testing.expect(noop_commit.parser.starts_with_commit);
-    try std.testing.expect(!noop_commit.parser.starts_with_rollback);
-    try std.testing.expect(noop_commit.hasReason("transaction_control"));
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .commit_transaction, .operations = 0 },
+        .plan = "ddl:transaction_boundary:action=commit",
+    }, &boundary_commit_sql);
+    try std.testing.expect(boundary_commit.parser.starts_with_commit);
+    try std.testing.expect(!boundary_commit.parser.starts_with_rollback);
 
-    var noop_rollback_sql = try tokenized.ParsedSql.initAlloc(alloc, "ROLLBACK");
-    defer noop_rollback_sql.deinit(alloc);
-    const noop_rollback = appParityStructuredFixtureSummary(.{
-        .name = "adapter noop rollback summary",
+    var boundary_rollback_sql = try tokenized.ParsedSql.initAlloc(alloc, "ROLLBACK");
+    defer boundary_rollback_sql.deinit(alloc);
+    const boundary_rollback = appParityStructuredFixtureSummary(.{
+        .name = "transaction boundary rollback summary",
         .sql = "ROLLBACK",
-        .family = .adapter_noop_ddl,
-        .classification_reason = "transaction_control",
-        .plan = "adapter_noop:ddl:reason=transaction_control",
-    }, &noop_rollback_sql);
-    try std.testing.expect(noop_rollback.parser.starts_with_rollback);
-    try std.testing.expect(!noop_rollback.parser.starts_with_commit);
-    try std.testing.expect(noop_rollback.hasReason("transaction_control"));
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .rollback_transaction, .operations = 0 },
+        .plan = "ddl:transaction_boundary:action=rollback",
+    }, &boundary_rollback_sql);
+    try std.testing.expect(boundary_rollback.parser.starts_with_rollback);
+    try std.testing.expect(!boundary_rollback.parser.starts_with_commit);
 
-    var noop_session_probe_sql = try tokenized.ParsedSql.initAlloc(alloc, "SHOW search_path");
-    defer noop_session_probe_sql.deinit(alloc);
-    const noop_session_probe = appParityStructuredFixtureSummary(.{
-        .name = "adapter noop session probe summary",
+    var session_probe_sql = try tokenized.ParsedSql.initAlloc(alloc, "SHOW search_path");
+    defer session_probe_sql.deinit(alloc);
+    const session_probe = appParityStructuredFixtureSummary(.{
+        .name = "session catalog probe summary",
         .sql = "SHOW search_path",
-        .family = .adapter_noop_ddl,
-        .classification_reason = "session_setting",
-        .plan = "adapter_noop:ddl:reason=session_setting",
-    }, &noop_session_probe_sql);
-    try std.testing.expect(noop_session_probe.parser.starts_with_show);
-    try std.testing.expect(!noop_session_probe.parser.starts_with_reset);
-    try std.testing.expect(!noop_session_probe.parser.starts_with_discard);
-    try std.testing.expect(noop_session_probe.hasReason("session_setting"));
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .show_search_path },
+        .plan = "ddl:session:show_search_path",
+    }, &session_probe_sql);
+    try std.testing.expect(session_probe.parser.starts_with_show);
+    try std.testing.expect(!session_probe.parser.starts_with_reset);
+    try std.testing.expect(!session_probe.parser.starts_with_discard);
 
-    var noop_discard_sql = try tokenized.ParsedSql.initAlloc(alloc, "DISCARD ALL");
-    defer noop_discard_sql.deinit(alloc);
-    const noop_discard = appParityStructuredFixtureSummary(.{
-        .name = "adapter noop discard summary",
+    var session_discard_sql = try tokenized.ParsedSql.initAlloc(alloc, "DISCARD ALL");
+    defer session_discard_sql.deinit(alloc);
+    const session_discard = appParityStructuredFixtureSummary(.{
+        .name = "session catalog discard summary",
         .sql = "DISCARD ALL",
-        .family = .adapter_noop_ddl,
-        .classification_reason = "session_setting",
-        .plan = "adapter_noop:ddl:reason=session_setting",
-    }, &noop_discard_sql);
-    try std.testing.expect(noop_discard.parser.starts_with_discard);
-    try std.testing.expect(!noop_discard.parser.starts_with_show);
-    try std.testing.expect(noop_discard.hasReason("session_setting"));
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .discard_all },
+        .plan = "ddl:session:discard_all",
+    }, &session_discard_sql);
+    try std.testing.expect(session_discard.parser.starts_with_discard);
+    try std.testing.expect(!session_discard.parser.starts_with_show);
 
     var boolean_predicates_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE enabled IS TRUE OR enabled IS NOT FALSE OR enabled IS UNKNOWN");
     defer boolean_predicates_sql.deinit(alloc);

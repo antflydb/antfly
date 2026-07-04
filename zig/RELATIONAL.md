@@ -1110,6 +1110,88 @@ through the lake scan hook or the shared materialized full-row executor. Broader
 active Iceberg delete handling across every derived stage and large lake
 spill/backpressure belong to external/lake production hardening.
 
+### Relational index access methods
+
+Relational index metadata describes logical query capabilities, not a mandatory
+physical data structure. The catalog should not expose "btree versus trie" as a
+user-facing storage choice. Instead, each index definition declares an access
+method whose implementation advertises the predicates, ordering, maintenance,
+and lifecycle guarantees it can satisfy.
+
+The baseline access methods are:
+
+- `ordered_tuple` — the default SQL scalar index. It stores a canonical ordered
+  tuple key such as `index_id | encoded_key_tuple | doc_key`, plus a reverse
+  by-document entry for overwrite/delete cleanup. This method owns compound SQL
+  semantics: left-prefix equality, range scans after an equality prefix,
+  `ORDER BY` satisfaction from index order, uniqueness and foreign-key owner
+  lookup, explicit collation/null ordering, descending key parts, partial
+  predicates, generation checks, and a stable row tie-breaker.
+- `algebraic_filter` — a schema/fact/postings/dictionary-backed access method
+  for selective doc-set production. It is appropriate for path facts, scalar
+  constraint intersections, prefix/wildcard/regexp/fuzzy-like selectors,
+  algebraic materializations, and derived aggregate planning. It can accelerate
+  relational predicates only when it proves the same row-generation visibility
+  and predicate semantics as the row planner expects.
+- `text_search` — the full-text segment-backed method used by
+  `CREATE TEXT SEARCH` and `USING antfly_full_text`. It owns analyzed terms,
+  scoring, highlights/snippets, and text-specific lifecycle state while row
+  hydration still reads the relational base row.
+- Future methods such as `vector`, `array`, or `json_path` may join the same
+  catalog once they expose explicit planner capabilities and rebuild state.
+
+Algebraic dictionaries and FST/trie-like structures are therefore allowed as a
+physical backend for an access method, but they do not replace ordered tuple
+indexes unless they satisfy the ordered SQL contract above. In particular,
+compound relational indexes must preserve tuple ordering, left-prefix/range
+planning, deterministic null/collation semantics, reverse cleanup by document,
+and synchronous constraint enforcement. If a trie-backed implementation can
+prove those properties and benchmark faster, it can implement `ordered_tuple`;
+otherwise it remains an `algebraic_filter` or `text_search` accelerator that
+intersects doc sets with ordered relational candidates.
+
+Every relational index has explicit durable lifecycle and generation metadata.
+`ready` is the only query-plannable state. `building` and `catching_up` entries
+may be maintained by foreground writes so a rebuild can converge without
+serving reads. `stale`, `rebuild_required`, `failed`, `dropping`, and legacy
+`invalid` are fail-closed for planning and ordinary write maintenance; they
+require rebuild, repair, retry, or cleanup work before promotion. Promotion to
+`ready` must be a compare-and-swap catalog transition over the expected schema
+fingerprint, access method, generation, and all covered owner ranges. The
+metadata apply path enforces the same owner-range readiness gate for direct
+promotion commands, so stale or incomplete rebuild evidence cannot bypass the
+worker's promotion checks.
+
+Rebuild progress is durable owner-range state, not local worker memory. Each
+secondary-index rebuild range records the access identity, row-key span, group
+owner, lifecycle state, lease owner/expiry, attempts, completed row count,
+resume row key, and last error. A worker claims a declared or expired building
+range, streams a bounded page from committed packed rows only, then either saves
+progress with the next resume row key and releases the lease, finishes the range
+as `ready`, or invalidates it with a deterministic error. Saved progress stays
+`building` and is immediately claimable by a later worker because its lease is
+cleared. Catalog promotion remains blocked until every required rebuild range
+for the target index generation has finished.
+
+The query planner chooses indexes by capability:
+
+1. Use `ordered_tuple` for equality/range predicates that can also satisfy
+   ordering, uniqueness, FK lookup, or compound-key selectivity.
+2. Use `text_search` for analyzed text predicates and scores.
+3. Use `algebraic_filter` for fact/path/dictionary predicates and derived
+   aggregate shortcuts.
+4. Intersect compatible doc sets and always hydrate/recheck from the committed
+   row when a derived method is involved or when partial-predicate proof is not
+   complete.
+
+This keeps the relational schema stable while leaving the physical backend open
+to benchmark-driven replacement. The first production compound index should be
+an `ordered_tuple` implementation over the relational KV keyspace; algebraic
+tries/FSTs should be compared as an implementation candidate with correctness
+tests for equality-prefix scans, range scans, ordering, partial indexes,
+collation/null ordering, generation handoff, overwrite churn, and reverse
+delete cleanup.
+
 ### SQL adapter boundary
 
 Relational mode is the storage and API substrate that a SQL DSL can target. It
@@ -2839,7 +2921,19 @@ or that are JSON/array payload columns. Ordinary btree secondary indexes,
 generated-expression secondary indexes, and JSON/array GIN secondary indexes all
 preserve `INCLUDE (...)` payload columns as `x-antfly-index-include`, so
 PostgreSQL covering-index syntax is not accepted unless the catalog can retain
-the covering-column metadata exactly.
+the covering-column metadata exactly. Ordered tuple scans may project simple
+declared-column selections from the include payload only after reading the
+current authoritative packed row and proving the stored tuple and payload still
+match that row. Query profiles and benchmark matrix rows report those fast-path
+projections as `covering_payload_rows`; fallback row materialization remains
+visible as `residual_rechecks`.
+
+Paged row-query callers can choose total semantics with
+`total_mode: "exact" | "bounded" | "none"` in the typed row-query JSON
+contract. Exact mode preserves the historical exact count. Bounded and none
+allow ordered tuple scans and materialized candidate plans to stop once the page
+is filled; responses that intentionally do not prove the full count include
+`total_exact: false`.
 
 Unique expression constraints store the expression key directly on the unique
 constraint, evaluate the key from the committed row, and maintain the

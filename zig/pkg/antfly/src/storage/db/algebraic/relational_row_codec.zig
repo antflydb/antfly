@@ -152,6 +152,54 @@ pub fn deserialize(alloc: Allocator, data: []const u8) !Row {
     return .{ .cells = cells };
 }
 
+/// Validate a serialized row without allocating a decoded cell array. This is
+/// used by paths that only need a few cells but must still reject malformed
+/// authoritative packed rows before trusting derived index payloads.
+pub fn validate(data: []const u8) !void {
+    if (data.len < magic.len + 8) return error.InvalidRelationalRow;
+    if (!std.mem.eql(u8, data[0..magic.len], &magic)) return error.InvalidRelationalRow;
+    var pos: usize = magic.len;
+    const ver = readU32(data, &pos);
+    if (ver != version) return error.UnsupportedRelationalRowVersion;
+    const count = readU32(data, &pos);
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        _ = try readCellAt(data, &pos);
+    }
+}
+
+pub const CellLookup = struct {
+    path: []const u8,
+    alternate_path: []const u8 = "",
+};
+
+/// Collect several cells from one serialized row scan. This validates the row
+/// while scanning, but only copies matching cell descriptors into `out`; the
+/// returned cells still borrow `value`.
+pub fn collectCellsByLookup(value: []const u8, lookups: []const CellLookup, out: []?Cell) !void {
+    if (lookups.len != out.len) return error.InvalidArgument;
+    for (out) |*item| item.* = null;
+    if (value.len < magic.len + 8) return error.InvalidRelationalRow;
+    if (!std.mem.eql(u8, value[0..magic.len], &magic)) return error.InvalidRelationalRow;
+    var pos: usize = magic.len;
+    const ver = readU32(value, &pos);
+    if (ver != version) return error.UnsupportedRelationalRowVersion;
+    const count = readU32(value, &pos);
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const cell = try readCellAt(value, &pos);
+        for (lookups, 0..) |lookup, lookup_index| {
+            if (out[lookup_index] != null) continue;
+            if (std.mem.eql(u8, cell.path, lookup.path) or
+                (lookup.alternate_path.len != 0 and std.mem.eql(u8, cell.path, lookup.alternate_path)))
+            {
+                out[lookup_index] = cell;
+            }
+        }
+    }
+}
+
 /// Decode the cell at `pos.*`, advancing `pos`. Shared by full deserialization
 /// and the single-column accessor. The `path`/`bytes_val` slices borrow `data`.
 fn readCellAt(data: []const u8, pos: *usize) !Cell {
@@ -283,16 +331,43 @@ pub fn appendCellValue(
     }
 }
 
-fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
-    defer alloc.free(encoded);
-    try out.appendSlice(alloc, encoded);
+pub fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    try out.append(alloc, '"');
+    for (value) |byte| {
+        switch (byte) {
+            '"' => try out.appendSlice(alloc, "\\\""),
+            '\\' => try out.appendSlice(alloc, "\\\\"),
+            0x08 => try out.appendSlice(alloc, "\\b"),
+            0x0c => try out.appendSlice(alloc, "\\f"),
+            '\n' => try out.appendSlice(alloc, "\\n"),
+            '\r' => try out.appendSlice(alloc, "\\r"),
+            '\t' => try out.appendSlice(alloc, "\\t"),
+            0x00...0x07, 0x0b, 0x0e...0x1f => {
+                try out.appendSlice(alloc, "\\u00");
+                try out.append(alloc, hexDigit(byte >> 4));
+                try out.append(alloc, hexDigit(byte & 0x0f));
+            },
+            else => try out.append(alloc, byte),
+        }
+    }
+    try out.append(alloc, '"');
 }
 
 fn appendFmt(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), comptime fmt: []const u8, args: anytype) !void {
-    const text = try std.fmt.allocPrint(alloc, fmt, args);
-    defer alloc.free(text);
+    var stack: [256]u8 = undefined;
+    const text = std.fmt.bufPrint(&stack, fmt, args) catch |err| switch (err) {
+        error.NoSpaceLeft => {
+            const heap_text = try std.fmt.allocPrint(alloc, fmt, args);
+            defer alloc.free(heap_text);
+            try out.appendSlice(alloc, heap_text);
+            return;
+        },
+    };
     try out.appendSlice(alloc, text);
+}
+
+fn hexDigit(value: u8) u8 {
+    return if (value < 10) '0' + value else 'a' + (value - 10);
 }
 
 fn valueTypeFromByte(tag: u8) ?typed_dv.ValueType {
@@ -389,6 +464,7 @@ test "relational row codec escapes string paths and values" {
     const alloc = std.testing.allocator;
     const cells = [_]Cell{
         .{ .path = "na\"me", .value_type = .bytes_val, .value = .{ .bytes_val = "a\"b" } },
+        .{ .path = "slash\\path", .value_type = .bytes_val, .value = .{ .bytes_val = "line\n tab\t nul\x00" } },
     };
     const encoded = try serialize(alloc, &cells);
     defer alloc.free(encoded);
@@ -396,7 +472,7 @@ test "relational row codec escapes string paths and values" {
     defer row.deinit(alloc);
     const json = try reconstructDocumentAlloc(alloc, row.cells);
     defer alloc.free(json);
-    try std.testing.expectEqualStrings("{\"na\\\"me\":\"a\\\"b\"}", json);
+    try std.testing.expectEqualStrings("{\"na\\\"me\":\"a\\\"b\",\"slash\\\\path\":\"line\\n tab\\t nul\\u0000\"}", json);
 }
 
 test "relational row codec rejects bad magic, version, and truncation" {
@@ -404,7 +480,9 @@ test "relational row codec rejects bad magic, version, and truncation" {
     try std.testing.expect(!looksLikeRow("XXXX"));
     try std.testing.expect(!looksLikeRow("AR"));
     try std.testing.expectError(error.InvalidRelationalRow, deserialize(alloc, "XXXXxxxxxxxx"));
+    try std.testing.expectError(error.InvalidRelationalRow, validate("XXXXxxxxxxxx"));
     try std.testing.expectError(error.InvalidRelationalRow, deserialize(alloc, "AROW"));
+    try std.testing.expectError(error.InvalidRelationalRow, validate("AROW"));
 
     // Valid header claiming one cell but no cell bytes -> truncation error.
     var buf: [12]u8 = undefined;
@@ -412,6 +490,7 @@ test "relational row codec rejects bad magic, version, and truncation" {
     std.mem.writeInt(u32, buf[4..8], version, .little);
     std.mem.writeInt(u32, buf[8..12], 1, .little);
     try std.testing.expectError(error.InvalidRelationalRow, deserialize(alloc, &buf));
+    try std.testing.expectError(error.InvalidRelationalRow, validate(&buf));
 
     // Unsupported version.
     var verbuf: [12]u8 = undefined;
@@ -419,6 +498,7 @@ test "relational row codec rejects bad magic, version, and truncation" {
     std.mem.writeInt(u32, verbuf[4..8], version + 1, .little);
     std.mem.writeInt(u32, verbuf[8..12], 0, .little);
     try std.testing.expectError(error.UnsupportedRelationalRowVersion, deserialize(alloc, &verbuf));
+    try std.testing.expectError(error.UnsupportedRelationalRowVersion, validate(&verbuf));
 }
 
 test "findCellByPath reads a single column without full deserialization" {
@@ -430,6 +510,7 @@ test "findCellByPath reads a single column without full deserialization" {
     };
     const encoded = try serialize(alloc, &cells);
     defer alloc.free(encoded);
+    try validate(encoded);
 
     const id = (try findCellByPath(encoded, "id")).?;
     try std.testing.expectEqual(typed_dv.ValueType.bytes_val, id.value_type);
@@ -441,4 +522,30 @@ test "findCellByPath reads a single column without full deserialization" {
     try std.testing.expect((try findCellByPath(encoded, "missing")) == null);
     // Non-row value yields null, not an error.
     try std.testing.expect((try findCellByPath("{\"id\":\"x\"}", "id")) == null);
+}
+
+test "collectCellsByLookup validates and reads several columns in one scan" {
+    const alloc = std.testing.allocator;
+    const cells = [_]Cell{
+        .{ .path = "id", .value_type = .bytes_val, .value = .{ .bytes_val = "abc" } },
+        .{ .path = "amount", .value_type = .f64_val, .value = .{ .f64_val = 12.5 } },
+        .{ .path = "payload.note", .value_type = .bytes_val, .value = .{ .bytes_val = "memo" } },
+    };
+    const encoded = try serialize(alloc, &cells);
+    defer alloc.free(encoded);
+
+    const lookups = [_]CellLookup{
+        .{ .path = "id" },
+        .{ .path = "note", .alternate_path = "payload.note" },
+        .{ .path = "missing" },
+    };
+    var found: [lookups.len]?Cell = undefined;
+    try collectCellsByLookup(encoded, lookups[0..], found[0..]);
+    try std.testing.expectEqualStrings("abc", found[0].?.value.bytes_val);
+    try std.testing.expectEqualStrings("memo", found[1].?.value.bytes_val);
+    try std.testing.expect(found[2] == null);
+
+    var bad: [1]?Cell = undefined;
+    try std.testing.expectError(error.InvalidRelationalRow, collectCellsByLookup("not-a-row", lookups[0..1], bad[0..]));
+    try std.testing.expectError(error.InvalidArgument, collectCellsByLookup(encoded, lookups[0..2], bad[0..]));
 }

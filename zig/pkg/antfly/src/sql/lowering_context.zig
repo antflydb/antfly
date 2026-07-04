@@ -28,6 +28,7 @@ const metadata_transition_state = @import("../metadata/transition_state.zig");
 const parser_mod = @import("parser.zig");
 const parser_context = @import("parser_context.zig");
 const plan = @import("plan.zig");
+const query_function = @import("query_function.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const relational_rows = @import("relational_rows.zig");
 const table_catalog = @import("../metadata/catalog/source.zig");
@@ -122,18 +123,7 @@ pub const ReadPlanLoweringContext = struct {
     fn lowerNativeGraphParsed(self: *@This(), parsed_sql: *const tokenized.ParsedSql) !?plan.LoweredReadPlan {
         const unsupported = nativeGraphUnsupportedAst(parsed_sql) orelse return null;
         if (unsupported.graph_source_binding_tokens == null) return null;
-        const synthetic_sql = try nativeGraphSyntheticSelectSqlAlloc(self.alloc, parsed_sql.sql(), parsed_sql.items(), unsupported);
-        defer self.alloc.free(synthetic_sql);
-        var synthetic = try tokenized.ParsedSql.initAlloc(self.alloc, synthetic_sql);
-        defer synthetic.deinit(self.alloc);
-        return .{ .query = try self.callbacks.lower_query_plan(
-            self.alloc,
-            &synthetic,
-            self.schema,
-            self.source_schema,
-            self.params,
-            self.function_bindings,
-        ) };
+        return .{ .query = try nativeGraphLoweredQueryPlanAlloc(self.alloc, parsed_sql.sql(), parsed_sql.items(), self.params, unsupported) };
     }
 
     fn lowerParsedWithClassifier(self: *@This(), parsed_sql: *const tokenized.ParsedSql) !plan.LoweredReadPlan {
@@ -211,68 +201,102 @@ fn nativeGraphUnsupportedAst(parsed_sql: *const tokenized.ParsedSql) ?generated_
     };
 }
 
-fn nativeGraphSyntheticSelectSqlAlloc(
+fn nativeGraphLoweredQueryPlanAlloc(
     alloc: std.mem.Allocator,
     source_sql: []const u8,
     tokens: []const token_mod.Token,
+    params: []const value_mod.SqlValue,
     unsupported: generated_parser.GeneratedSqlUnsupportedAst,
-) ![]const u8 {
+) !plan.LoweredQueryPlan {
     const projection = unsupported.graph_return_projection_tokens orelse return error.UnsupportedSqlShape;
     const path = unsupported.graph_path_tokens orelse return error.UnsupportedSqlShape;
     const table = unsupported.graph_source_table_tokens orelse return error.UnsupportedSqlShape;
     const index = unsupported.graph_source_index_tokens orelse return error.UnsupportedSqlShape;
     const start = unsupported.graph_source_start_tokens orelse return error.UnsupportedSqlShape;
+    if (projection.start >= projection.end or projection.end > tokens.len) return error.UnsupportedSqlShape;
 
     const alias_context = try makeNativeGraphAliasContext(tokens, unsupported);
     var alias_fields = std.ArrayListUnmanaged(NativeGraphAliasField).empty;
     defer alias_fields.deinit(alloc);
 
-    const projection_sql = try nativeGraphRewriteAliasFieldsAlloc(alloc, source_sql, tokens, projection, alias_context, &alias_fields);
-    defer alloc.free(projection_sql);
-    const order_sql = if (unsupported.graph_order_tokens) |order|
-        try nativeGraphRewriteAliasFieldsAlloc(alloc, source_sql, tokens, order, alias_context, &alias_fields)
-    else
-        null;
-    defer if (order_sql) |sql| alloc.free(sql);
+    const select = try nativeGraphSelectAlloc(alloc, tokens, unsupported.graph_return_projection_items, alias_context, &alias_fields);
+    var select_transferred = false;
+    errdefer if (!select_transferred) nativeGraphFreeStringSlice(alloc, select);
 
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    try out.appendSlice(alloc, "SELECT ");
-    try out.appendSlice(alloc, projection_sql);
-    try out.appendSlice(alloc, " FROM antfly.graph_match(table_name => ");
-    try appendNativeGraphSqlStringLiteral(alloc, &out, nativeGraphSingleTokenValue(tokens, table));
-    try out.appendSlice(alloc, ", index => ");
-    try appendNativeGraphSqlStringLiteral(alloc, &out, nativeGraphSingleTokenValue(tokens, index));
-    try out.appendSlice(alloc, ", start => ");
-    try appendNativeGraphSqlStringLiteral(alloc, &out, nativeGraphSingleTokenValue(tokens, start));
-    try out.appendSlice(alloc, ", pattern => ");
-    try appendNativeGraphSqlStringLiteral(alloc, &out, nativeGraphSourceText(source_sql, tokens, path));
-    try out.appendSlice(alloc, ", return => ");
+    const order_by = try nativeGraphOrderByAlloc(alloc, tokens, unsupported.graph_order_items, alias_context, &alias_fields);
+    var order_transferred = false;
+    errdefer if (!order_transferred) nativeGraphFreeOrderBy(alloc, order_by);
+
+    const predicates = try nativeGraphWherePredicatesAlloc(alloc, tokens, params, unsupported.graph_where_expression);
+    var predicates_transferred = false;
+    errdefer if (!predicates_transferred) nativeGraphFreePredicates(alloc, predicates);
+
+    const limit = try nativeGraphOptionalU32(tokens, params, unsupported.graph_limit_expression);
+    const offset = (try nativeGraphOptionalU32(tokens, params, unsupported.graph_offset_expression)) orelse 0;
+    const cte_name = try alloc.dupe(u8, "__antfly_native_graph");
+    var cte_name_transferred = false;
+    errdefer if (!cte_name_transferred) alloc.free(cte_name);
+    const query_source_cte = try alloc.dupe(u8, "__antfly_native_graph");
+    var query_source_cte_transferred = false;
+    errdefer if (!query_source_cte_transferred) alloc.free(query_source_cte);
+
     const aliases = try nativeGraphReturnAliasesAlloc(alloc, tokens, unsupported);
     defer alloc.free(aliases);
-    try appendNativeGraphSqlStringLiteral(alloc, &out, aliases);
-    if (alias_fields.items.len > 0) {
-        try out.appendSlice(alloc, ", alias_fields => ");
-        try appendNativeGraphAliasFieldsLiteral(alloc, &out, alias_fields.items);
+    const alias_fields_text = if (alias_fields.items.len > 0)
+        try nativeGraphAliasFieldsTextAlloc(alloc, alias_fields.items)
+    else
+        null;
+    defer if (alias_fields_text) |text| alloc.free(text);
+
+    var table_function = try query_function.lowerNativeGraphMatchTableFunctionAlloc(
+        alloc,
+        nativeGraphSingleTokenValue(tokens, table),
+        nativeGraphSingleTokenValue(tokens, index),
+        nativeGraphSingleTokenValue(tokens, start),
+        nativeGraphSourceText(source_sql, tokens, path),
+        aliases,
+        alias_fields_text,
+    );
+    var table_function_transferred = false;
+    errdefer if (!table_function_transferred) table_function.deinit(alloc);
+
+    const ctes = try alloc.alloc(db_mod.types.RelationalRowsCte, 1);
+    var ctes_initialized = false;
+    errdefer {
+        if (ctes_initialized) {
+            var cte = ctes[0];
+            cte.deinit(alloc);
+        }
+        alloc.free(ctes);
     }
-    try out.appendSlice(alloc, ") AS __antfly_native_graph");
-    if (unsupported.graph_where_tokens) |where| {
-        try out.appendSlice(alloc, " WHERE ");
-        try appendNativeGraphSourceRange(alloc, &out, source_sql, tokens, .{ .start = where.start + 1, .end = where.end });
-    }
-    if (order_sql) |order| {
-        try out.appendSlice(alloc, " ORDER BY ");
-        try out.appendSlice(alloc, order);
-    }
-    if (unsupported.graph_limit_tokens) |limit| {
-        try out.appendSlice(alloc, " LIMIT ");
-        try appendNativeGraphSourceRange(alloc, &out, source_sql, tokens, limit);
-    }
-    if (unsupported.graph_offset_tokens) |offset| {
-        try out.appendSlice(alloc, " OFFSET ");
-        try appendNativeGraphSourceRange(alloc, &out, source_sql, tokens, offset);
-    }
-    return try out.toOwnedSlice(alloc);
+    ctes[0] = .{
+        .name = cte_name,
+        .table_function = table_function,
+    };
+    ctes_initialized = true;
+    cte_name_transferred = true;
+    table_function_transferred = true;
+
+    const table_name = try alloc.dupe(u8, nativeGraphSingleTokenValue(tokens, table));
+    errdefer alloc.free(table_name);
+    select_transferred = true;
+    order_transferred = true;
+    predicates_transferred = true;
+    query_source_cte_transferred = true;
+    return .{
+        .table_name = table_name,
+        .plan = .{
+            .ctes = ctes,
+            .query = .{
+                .source_cte = query_source_cte,
+                .select = select,
+                .predicates = predicates,
+                .order_by = order_by,
+                .limit = limit,
+                .offset = offset,
+            },
+        },
+    };
 }
 
 fn nativeGraphReturnAliasesAlloc(
@@ -289,6 +313,264 @@ fn nativeGraphReturnAliasesAlloc(
         try out.appendSlice(alloc, nativeGraphSingleTokenValue(tokens, target_alias));
     }
     return try out.toOwnedSlice(alloc);
+}
+
+fn nativeGraphSelectAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    items: generated_parser.GeneratedSqlListAst,
+    alias_context: NativeGraphAliasContext,
+    alias_fields: *std.ArrayListUnmanaged(NativeGraphAliasField),
+) ![]const []const u8 {
+    if (items.items.len != items.count or items.items.len == 0) return error.UnsupportedSqlShape;
+    const out = try alloc.alloc([]const u8, items.items.len);
+    var initialized: usize = 0;
+    errdefer nativeGraphFreeStringSlice(alloc, out[0..initialized]);
+    for (items.items) |item| {
+        out[initialized] = try nativeGraphProjectionFieldAlloc(alloc, tokens, item, alias_context, alias_fields);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn nativeGraphProjectionFieldAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+    alias_context: NativeGraphAliasContext,
+    alias_fields: *std.ArrayListUnmanaged(NativeGraphAliasField),
+) ![]const u8 {
+    if (item.start >= item.end or item.end > tokens.len) return error.UnsupportedSqlShape;
+    const output = try nativeGraphFieldOutputAlloc(alloc, alias_context, tokens[item.start], alias_fields);
+    var output_transferred = false;
+    errdefer if (!output_transferred) alloc.free(output);
+    var pos = item.start + 1;
+    if (pos < item.end) {
+        if (!tokens[pos].matchesKeywordTag(.as)) return error.UnsupportedSqlShape;
+        pos += 1;
+        if (pos >= item.end or tokens[pos].kind != .identifier) return error.UnsupportedSqlShape;
+        pos += 1;
+    }
+    if (pos != item.end) return error.UnsupportedSqlShape;
+    output_transferred = true;
+    return output;
+}
+
+fn nativeGraphOrderByAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    items: generated_parser.GeneratedSqlListAst,
+    alias_context: NativeGraphAliasContext,
+    alias_fields: *std.ArrayListUnmanaged(NativeGraphAliasField),
+) ![]const db_mod.types.RelationalRowsQueryOrder {
+    if (items.items.len != items.count) return error.UnsupportedSqlShape;
+    if (items.items.len == 0) return &.{};
+    const out = try alloc.alloc(db_mod.types.RelationalRowsQueryOrder, items.items.len);
+    var initialized: usize = 0;
+    errdefer nativeGraphFreeOrderBy(alloc, out[0..initialized]);
+    for (items.items) |item| {
+        out[initialized] = try nativeGraphOrderItemAlloc(alloc, tokens, item, alias_context, alias_fields);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn nativeGraphOrderItemAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+    alias_context: NativeGraphAliasContext,
+    alias_fields: *std.ArrayListUnmanaged(NativeGraphAliasField),
+) !db_mod.types.RelationalRowsQueryOrder {
+    if (item.start >= item.end or item.end > tokens.len) return error.UnsupportedSqlShape;
+    const field = try nativeGraphFieldOutputAlloc(alloc, alias_context, tokens[item.start], alias_fields);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    var pos = item.start + 1;
+    const direction: db_mod.types.RelationalRowsQueryOrderDirection = if (pos < item.end and tokens[pos].matchesKeywordTag(.desc)) blk: {
+        pos += 1;
+        break :blk .desc;
+    } else if (pos < item.end and tokens[pos].matchesKeywordTag(.asc)) blk: {
+        pos += 1;
+        break :blk .asc;
+    } else .asc;
+    const null_test: ?db_mod.types.RelationalRowsQueryOrderNullTest = if (pos < item.end and tokens[pos].matchesKeywordTag(.nulls)) blk: {
+        pos += 1;
+        if (pos >= item.end) return error.UnsupportedSqlShape;
+        if (tokens[pos].matchesKeywordTag(.first)) {
+            pos += 1;
+            break :blk .is_null;
+        }
+        if (tokens[pos].matchesKeywordTag(.last)) {
+            pos += 1;
+            break :blk .is_not_null;
+        }
+        return error.UnsupportedSqlShape;
+    } else null;
+    if (pos != item.end) return error.UnsupportedSqlShape;
+    field_transferred = true;
+    return .{ .field = field, .direction = direction, .null_test = null_test };
+}
+
+fn nativeGraphWherePredicatesAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    params: []const value_mod.SqlValue,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) ![]const runtime_schema.RelationalCheck {
+    if (expression.tokens == null) return &.{};
+    if (expression.kind != .comparison and expression.kind != .is_null and expression.kind != .is_not_null) return error.UnsupportedSqlShape;
+    const out = try alloc.alloc(runtime_schema.RelationalCheck, 1);
+    errdefer alloc.free(out);
+    out[0] = switch (expression.kind) {
+        .comparison => try nativeGraphComparisonPredicateAlloc(alloc, tokens, params, expression),
+        .is_null, .is_not_null => try nativeGraphNullPredicateAlloc(alloc, tokens, expression),
+        else => unreachable,
+    };
+    return out;
+}
+
+fn nativeGraphComparisonPredicateAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    params: []const value_mod.SqlValue,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !runtime_schema.RelationalCheck {
+    const left = expression.left_tokens orelse return error.UnsupportedSqlShape;
+    const op = expression.operator_tokens orelse return error.UnsupportedSqlShape;
+    const right = expression.right_tokens orelse return error.UnsupportedSqlShape;
+    if (left.end != left.start + 1 or op.end != op.start + 1 or right.end != right.start + 1) return error.UnsupportedSqlShape;
+    if (left.end > tokens.len or op.end > tokens.len or right.end > tokens.len) return error.UnsupportedSqlShape;
+    const field = try nativeGraphPlainFieldAlloc(alloc, tokens[left.start]);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    const value_json = try nativeGraphValueJsonAlloc(alloc, tokens[right.start], params);
+    var value_transferred = false;
+    errdefer if (!value_transferred) alloc.free(value_json);
+    const check_op = nativeGraphComparisonOp(tokens[op.start]) orelse return error.UnsupportedSqlShape;
+    field_transferred = true;
+    value_transferred = true;
+    return .{ .name = "", .field = field, .op = check_op, .value_json = value_json };
+}
+
+fn nativeGraphNullPredicateAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !runtime_schema.RelationalCheck {
+    const left = expression.left_tokens orelse return error.UnsupportedSqlShape;
+    if (left.end != left.start + 1 or left.end > tokens.len) return error.UnsupportedSqlShape;
+    const field = try nativeGraphPlainFieldAlloc(alloc, tokens[left.start]);
+    return .{
+        .name = "",
+        .field = field,
+        .op = if (expression.kind == .is_null) .is_null else .is_not_null,
+    };
+}
+
+fn nativeGraphComparisonOp(token: token_mod.Token) ?runtime_schema.RelationalCheckOp {
+    return switch (token.kind) {
+        .eq => .eq,
+        .neq => .ne,
+        .gt => .gt,
+        .gte => .gte,
+        .lt => .lt,
+        .lte => .lte,
+        else => null,
+    };
+}
+
+fn nativeGraphValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    token: token_mod.Token,
+    params: []const value_mod.SqlValue,
+) ![]const u8 {
+    return switch (token.kind) {
+        .string => try std.json.Stringify.valueAlloc(alloc, token.text, .{}),
+        .number => try alloc.dupe(u8, token.text),
+        .placeholder => try value_mod.boundSqlValueJsonAlloc(alloc, token, params),
+        .identifier => if (token.matchesKeywordTag(.true))
+            try alloc.dupe(u8, "true")
+        else if (token.matchesKeywordTag(.false))
+            try alloc.dupe(u8, "false")
+        else if (token.matchesKeywordTag(.null))
+            try alloc.dupe(u8, "null")
+        else
+            error.UnsupportedSqlShape,
+        else => error.UnsupportedSqlShape,
+    };
+}
+
+fn nativeGraphOptionalU32(
+    tokens: []const token_mod.Token,
+    params: []const value_mod.SqlValue,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !?u32 {
+    const range = expression.tokens orelse return null;
+    if (range.end != range.start + 1 or range.end > tokens.len) return error.UnsupportedSqlShape;
+    const token = tokens[range.start];
+    return switch (token.kind) {
+        .number => try std.fmt.parseUnsigned(u32, token.text, 10),
+        .placeholder => try (try value_mod.boundSqlValue(token, params)).asU32(),
+        else => error.UnsupportedSqlShape,
+    };
+}
+
+fn nativeGraphFieldOutputAlloc(
+    alloc: std.mem.Allocator,
+    alias_context: NativeGraphAliasContext,
+    token: token_mod.Token,
+    alias_fields: *std.ArrayListUnmanaged(NativeGraphAliasField),
+) ![]const u8 {
+    if (token.kind != .identifier) return error.UnsupportedSqlShape;
+    if (try nativeGraphAliasFieldForToken(alias_context, token)) |alias_field| {
+        try nativeGraphRecordAliasField(alloc, alias_fields, alias_field);
+        return try std.fmt.allocPrint(alloc, "{s}_{s}", .{ alias_field.alias, alias_field.field });
+    }
+    if (!nativeGraphIdentifierIsValid(token.text)) return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, token.text);
+}
+
+fn nativeGraphPlainFieldAlloc(alloc: std.mem.Allocator, token: token_mod.Token) ![]const u8 {
+    if (token.kind != .identifier or !nativeGraphIdentifierIsValid(token.text)) return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, token.text);
+}
+
+fn nativeGraphAliasFieldsTextAlloc(
+    alloc: std.mem.Allocator,
+    alias_fields: []const NativeGraphAliasField,
+) ![]const u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    for (alias_fields, 0..) |alias_field, index| {
+        if (index > 0) try out.append(alloc, ',');
+        try out.appendSlice(alloc, alias_field.alias);
+        try out.append(alloc, '.');
+        try out.appendSlice(alloc, alias_field.field);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn nativeGraphFreeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
+    for (values) |value| alloc.free(@constCast(value));
+    if (values.len > 0) alloc.free(@constCast(values));
+}
+
+fn nativeGraphFreeOrderBy(alloc: std.mem.Allocator, order_by: []const db_mod.types.RelationalRowsQueryOrder) void {
+    for (order_by) |order| {
+        if (order.field.len > 0) alloc.free(@constCast(order.field));
+        if (order.collation) |collation| alloc.free(@constCast(collation));
+    }
+    if (order_by.len > 0) alloc.free(@constCast(order_by));
+}
+
+fn nativeGraphFreePredicates(alloc: std.mem.Allocator, predicates: []const runtime_schema.RelationalCheck) void {
+    for (predicates) |predicate| {
+        if (predicate.field.len > 0) alloc.free(@constCast(predicate.field));
+        if (predicate.value_json) |value_json| alloc.free(@constCast(value_json));
+        if (predicate.collation) |collation| alloc.free(@constCast(collation));
+    }
+    if (predicates.len > 0) alloc.free(@constCast(predicates));
 }
 
 const NativeGraphAliasContext = struct {
@@ -326,32 +608,6 @@ fn makeNativeGraphAliasContext(
     };
 }
 
-fn nativeGraphRewriteAliasFieldsAlloc(
-    alloc: std.mem.Allocator,
-    source_sql: []const u8,
-    tokens: []const token_mod.Token,
-    range: generated_parser.GeneratedSqlTokenRange,
-    alias_context: NativeGraphAliasContext,
-    alias_fields: *std.ArrayListUnmanaged(NativeGraphAliasField),
-) ![]const u8 {
-    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    var cursor = tokens[range.start].source_start;
-    for (tokens[range.start..range.end]) |token| {
-        const alias_field = try nativeGraphAliasFieldForToken(alias_context, token) orelse continue;
-        if (cursor > token.source_start or token.source_end > source_sql.len) return error.UnsupportedSqlShape;
-        try out.appendSlice(alloc, source_sql[cursor..token.source_start]);
-        try nativeGraphAppendAliasFieldOutput(alloc, &out, alias_field);
-        try nativeGraphRecordAliasField(alloc, alias_fields, alias_field);
-        cursor = token.source_end;
-    }
-    const end = tokens[range.end - 1].source_end;
-    if (cursor > end or end > source_sql.len) return error.UnsupportedSqlShape;
-    try out.appendSlice(alloc, source_sql[cursor..end]);
-    return try out.toOwnedSlice(alloc);
-}
-
 fn nativeGraphAliasFieldForToken(
     alias_context: NativeGraphAliasContext,
     token: token_mod.Token,
@@ -381,32 +637,6 @@ fn nativeGraphRecordAliasField(
     try alias_fields.append(alloc, alias_field);
 }
 
-fn nativeGraphAppendAliasFieldOutput(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    alias_field: NativeGraphAliasField,
-) !void {
-    try out.appendSlice(alloc, alias_field.alias);
-    try out.append(alloc, '_');
-    try out.appendSlice(alloc, alias_field.field);
-}
-
-fn appendNativeGraphAliasFieldsLiteral(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    alias_fields: []const NativeGraphAliasField,
-) !void {
-    var literal = std.ArrayListUnmanaged(u8).empty;
-    defer literal.deinit(alloc);
-    for (alias_fields, 0..) |alias_field, index| {
-        if (index > 0) try literal.append(alloc, ',');
-        try literal.appendSlice(alloc, alias_field.alias);
-        try literal.append(alloc, '.');
-        try literal.appendSlice(alloc, alias_field.field);
-    }
-    try appendNativeGraphSqlStringLiteral(alloc, out, literal.items);
-}
-
 fn nativeGraphIdentifierIsValid(value: []const u8) bool {
     if (value.len == 0) return false;
     for (value, 0..) |ch, index| {
@@ -425,16 +655,6 @@ fn nativeGraphAliasFieldIsValid(value: []const u8) bool {
         std.mem.eql(u8, value, "distance");
 }
 
-fn appendNativeGraphSourceRange(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    source_sql: []const u8,
-    tokens: []const token_mod.Token,
-    range: generated_parser.GeneratedSqlTokenRange,
-) !void {
-    try out.appendSlice(alloc, nativeGraphSourceText(source_sql, tokens, range));
-}
-
 fn nativeGraphSourceText(
     source_sql: []const u8,
     tokens: []const token_mod.Token,
@@ -446,19 +666,6 @@ fn nativeGraphSourceText(
 fn nativeGraphSingleTokenValue(tokens: []const token_mod.Token, range: generated_parser.GeneratedSqlTokenRange) []const u8 {
     if (range.end != range.start + 1 or range.end > tokens.len) return "";
     return tokens[range.start].text;
-}
-
-fn appendNativeGraphSqlStringLiteral(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    value: []const u8,
-) !void {
-    try out.append(alloc, '\'');
-    for (value) |ch| {
-        if (ch == '\'') try out.append(alloc, '\'');
-        try out.append(alloc, ch);
-    }
-    try out.append(alloc, '\'');
 }
 
 fn generatedReadAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) !?*const generated_parser.GeneratedSqlReadAst {
@@ -530,22 +737,8 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
             context.params,
         ) },
         .set_operation => blk: {
-            if (generatedSetOperationAllowsQueryFallback(read_ast)) {
-                const lowered_query: ?plan.LoweredQueryPlan = context.callbacks.lower_query_plan(
-                    context.alloc,
-                    parsed_sql,
-                    context.schema,
-                    context.source_schema,
-                    context.params,
-                    context.function_bindings,
-                ) catch |err| switch (err) {
-                    error.UnsupportedSqlShape => null,
-                    error.InvalidSqlCatalog => null,
-                    else => return err,
-                };
-                if (lowered_query) |lowered| {
-                    break :blk .{ .query = lowered };
-                }
+            if (try lowerGeneratedSetOperationQueryPlanAlloc(context, parsed_sql, read_ast)) |lowered| {
+                break :blk .{ .query = lowered };
             }
             break :blk .{ .set_operation = try context.callbacks.lower_set_operation_optional_source_schema(
                 context.alloc,
@@ -560,7 +753,38 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
     };
 }
 
-fn generatedSetOperationAllowsQueryFallback(read_ast: *const generated_parser.GeneratedSqlReadAst) bool {
+fn lowerGeneratedSetOperationQueryPlanAlloc(
+    context: *ReadPlanLoweringContext,
+    parsed_sql: *const tokenized.ParsedSql,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
+) !?plan.LoweredQueryPlan {
+    if (!generatedSetOperationAllowsQueryPlanLowering(read_ast)) return null;
+    const tokens = parsed_sql.items();
+    var parser_state = parser_context.ParserState{
+        .alloc = context.alloc,
+        .tokens = tokens,
+        .schema = context.schema,
+        .params = context.params,
+        .function_bindings = context.function_bindings,
+        .generated_read_ast = read_ast,
+    };
+    return lower_expr.parseQueryPlanAlloc(
+        context.alloc,
+        tokens,
+        &parser_state.pos,
+        context.params,
+        read_ast,
+        parser_context.ParserState.ContextAccessors.cteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.queryPlanParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.simpleSelectSetTailHooks(&parser_state),
+    ) catch |err| switch (err) {
+        error.UnsupportedSqlShape => null,
+        error.InvalidSqlCatalog => null,
+        else => return err,
+    };
+}
+
+fn generatedSetOperationAllowsQueryPlanLowering(read_ast: *const generated_parser.GeneratedSqlReadAst) bool {
     const set_operation_tokens = read_ast.set_operation.tokens orelse return false;
     const right_query_tokens = read_ast.set_operation.right_query_tokens orelse return false;
     return right_query_tokens.end < set_operation_tokens.end;
@@ -5460,6 +5684,23 @@ fn lowerQueryParsedSqlForLoweringContextTestAlloc(
     return lowered;
 }
 
+fn lowerQueryUnexpectedForGeneratedSetOperationTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    source_schema: ?runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
+) !plan.LoweredQueryPlan {
+    _ = alloc;
+    _ = parsed_sql;
+    _ = schema;
+    _ = source_schema;
+    _ = params;
+    _ = function_bindings;
+    return error.TestUnexpectedResult;
+}
+
 fn lowerWindowParsedSqlForLoweringContextTestAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
@@ -5697,6 +5938,60 @@ test "sql adapter lowering context lowers generated read AST through typed read 
         var generated = try lowerGeneratedReadPlanForLoweringContextTestAlloc(alloc, sql, schema, &.{});
         defer generated.deinit(alloc);
         try std.testing.expectEqual(std.meta.activeTag(legacy), std.meta.activeTag(generated));
+    }
+}
+
+test "sql adapter lowering context lowers generated set operations without query fallback" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"name":{"type":"keyword"}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLoweringContextTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE status = 'closed' UNION ALL SELECT id FROM usage_records WHERE status = 'pending' ORDER BY id ASC LIMIT 5",
+    );
+    defer parsed_sql.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.set_operation, parsed_sql.generatedReadStatementKind().?);
+    const read_ast = switch ((parsed_sql.generated_statement orelse return error.UnsupportedSqlShape).ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    try std.testing.expectEqual(generated_parser.GeneratedSqlReadKind.set_operation, read_ast.kind);
+
+    var context = ReadPlanLoweringContext{
+        .alloc = alloc,
+        .schema = schema,
+        .source_schema = null,
+        .params = &.{},
+        .function_bindings = .{},
+        .callbacks = .{
+            .lower_lateral_with_schemas = lowerLateralWithSchemasParsedSqlForLoweringContextTestAlloc,
+            .lower_window = lowerWindowParsedSqlForLoweringContextTestAlloc,
+            .lower_aggregate_plan = lowerAggregateParsedSqlForLoweringContextTestAlloc,
+            .lower_recursive_cte_plan = lowerRecursiveCteParsedSqlForLoweringContextTestAlloc,
+            .lower_join_with_schemas = lowerJoinWithSchemasParsedSqlForLoweringContextTestAlloc,
+            .lower_query_plan = lowerQueryUnexpectedForGeneratedSetOperationTestAlloc,
+            .lower_set_operation_optional_source_schema = lowerSetOperationParsedSqlForLoweringContextTestAlloc,
+        },
+    };
+
+    var lowered = try lowerReadPlanFromGeneratedReadAstAlloc(&context, &parsed_sql, read_ast);
+    defer lowered.deinit(alloc);
+    switch (lowered) {
+        .query => |query| {
+            try std.testing.expectEqualStrings("usage_records", query.table_name);
+            try std.testing.expectEqual(@as(usize, 3), query.plan.query.or_predicates.len);
+            try std.testing.expectEqualStrings("\"open\"", query.plan.query.or_predicates[0].predicates[0].value_json.?);
+            try std.testing.expectEqualStrings("\"closed\"", query.plan.query.or_predicates[1].predicates[0].value_json.?);
+            try std.testing.expectEqualStrings("\"pending\"", query.plan.query.or_predicates[2].predicates[0].value_json.?);
+            try std.testing.expectEqual(@as(usize, 1), query.plan.query.order_by.len);
+            try std.testing.expectEqualStrings("id", query.plan.query.order_by[0].field);
+            try std.testing.expectEqual(@as(u32, 5), query.plan.query.limit.?);
+        },
+        else => return error.TestUnexpectedResult,
     }
 }
 

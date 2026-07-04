@@ -158,6 +158,9 @@ pub fn addBenchSteps(ctx: anytype) BenchSteps {
     const platform_mod = ctx.platform_mod;
     const lmdb_engine_mod = ctx.lmdb_engine_mod;
     const json_mod = ctx.json_mod;
+    const indexes_openapi_mod = ctx.indexes_openapi_mod;
+    const metadata_openapi_mod = ctx.metadata_openapi_mod;
+    const query_openapi_mod = ctx.query_openapi_mod;
     const bloom_mod = ctx.bloom_mod;
     const vector_mod = ctx.vector_mod;
     const vectorindex_mod = ctx.vectorindex_mod;
@@ -535,10 +538,19 @@ pub fn addBenchSteps(ctx: anytype) BenchSteps {
     regex_bench_step.dependOn(&run_regex_bench.step);
 
     const sql_parser_bench_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/sql/parser_bench.zig"),
+        .root_source_file = b.path("pkg/antfly/src/sql_parser_bench_root.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
+    sql_parser_bench_mod.addImport("bloom", bloom_mod);
+    sql_parser_bench_mod.addImport("antfly_platform", platform_mod);
+    sql_parser_bench_mod.addImport("antfly_regex", regex_mod);
+    sql_parser_bench_mod.addImport("antfly-json", json_mod);
+    sql_parser_bench_mod.addImport("antfly_reranking", reranking_mod);
+    sql_parser_bench_mod.addImport("antfly_vector", vector_mod);
+    sql_parser_bench_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
+    sql_parser_bench_mod.addImport("antfly_metadata_openapi", metadata_openapi_mod);
+    sql_parser_bench_mod.addImport("antfly_query_openapi", query_openapi_mod);
     const sql_parser_bench = b.addExecutable(.{
         .name = "sql_parser_bench",
         .root_module = sql_parser_bench_mod,
@@ -1234,6 +1246,29 @@ pub fn addBenchSteps(ctx: anytype) BenchSteps {
     }
     const batch_bench_step = b.step("batch-bench", "Benchmark overwrite-heavy batch writes and bulk-session coalescing");
     batch_bench_step.dependOn(&run_batch_bench.step);
+
+    const run_relational_index_bench_matrix = b.addRunArtifact(batch_bench);
+    if (b.args) |args| {
+        run_relational_index_bench_matrix.addArgs(args);
+    } else {
+        run_relational_index_bench_matrix.addArgs(&.{
+            "--matrix",
+            "--matrix-preset",
+            "smoke",
+            "--primary",
+            "mem",
+            "--overwrite-passes",
+            "1",
+            "--batch-size",
+            "1000",
+            "--query-repeats",
+            "3",
+            "--query-limit",
+            "100",
+        });
+    }
+    const relational_index_bench_matrix_step = b.step("relational-index-bench-matrix", "Run relational index benchmark matrix");
+    relational_index_bench_matrix_step.dependOn(&run_relational_index_bench_matrix.step);
 
     const docid_write_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/docid_write_bench.zig"),

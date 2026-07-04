@@ -3166,7 +3166,7 @@ test "sql expr_aggregate validates output type and filter ownership" {
         .tokens = .{ .start = 0, .end = 3 },
         .function_name_tokens = .{ .start = 0, .end = 1 },
         .aggregate_function_kind = .count,
-        .filter_expression_kind = .field,
+        .filter_expression_kind = .token_range,
     };
     try std.testing.expectError(
         error.UnsupportedSqlShape,

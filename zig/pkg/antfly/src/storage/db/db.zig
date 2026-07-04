@@ -969,6 +969,18 @@ pub const DB = struct {
         return try schema_runtime_impl.rebuildRelationalSecondaryIndexInRange(self, index_name, index_generation, lower_doc_key, upper_doc_key);
     }
 
+    pub fn rebuildRelationalSecondaryIndexPageInRange(
+        self: *DB,
+        index_name: []const u8,
+        index_generation: u64,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        max_rows: usize,
+    ) !relational_store_mod.SecondaryIndexRebuildPage {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try schema_runtime_impl.rebuildRelationalSecondaryIndexPageInRange(self, index_name, index_generation, lower_doc_key, upper_doc_key, max_rows);
+    }
+
     pub fn validateForeignKeyRefsInRange(
         self: *DB,
         lower_doc_key: []const u8,
