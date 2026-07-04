@@ -255,6 +255,19 @@ test "api module compiles" {
     _ = HostedGroupRouter;
     _ = ApiHttpServer;
     _ = ApiHttpClient;
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, query_contract.parseQueryRequest(std.testing.allocator, null, "docs",
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "order_by": [{"field":"_id"},{"field":"created_at"}]
+        \\}
+    ));
+    try std.testing.expectError(error.UnsupportedQueryRequest, query_contract.parseQueryRequest(std.testing.allocator, null, "docs",
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "order_by": [{"field":"created_at"},{"field":"_id","desc":true}]
+        \\}
+    ));
 }
 
 test "artifact enrichment request permits asset full text routing" {

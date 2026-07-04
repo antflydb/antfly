@@ -368,6 +368,13 @@ The collector should support forward and reverse paging by comparing against
 the cursor tuple before admission. It should not collect all matches just to
 drop rows before the cursor.
 
+Once the planner has selected a native doc-values sort plan, doc-value misses
+from missing ordinals, unresolved native document ids, or absent physical
+coverage are planning/execution errors unless the value is represented by the
+typed missing/null marker. The native path must not silently fall back to stored
+JSON extraction because that would hide index coverage bugs and turn a
+production exact-sort request into an unbounded source scan.
+
 Collector implementation requirements:
 
 - one comparator implementation for in-memory, segment, and distributed merge
@@ -384,7 +391,8 @@ Sort encoding must be canonical. Recommended order-preserving encodings:
 
 - signed integers: flip sign bit before unsigned byte comparison
 - unsigned integers/dates: big-endian sortable integer bytes
-- floats: IEEE sortable transform with explicit NaN policy
+- floats: IEEE sortable transform with NaN ordered after all numeric values in
+  ascending order
 - booleans: `false = 0`, `true = 1`
 - keywords: normalized UTF-8 bytes with length-safe delimiters
 - missing/null: explicit sentinel outside the value domain according to policy
@@ -702,6 +710,15 @@ The planner should select among:
 - `score_top_k`
 - `distributed_k_way_merge`
 - `unsupported_exact_sort`
+
+The incremental implementation should expose those choices through an explicit
+sort execution plan instead of encoding them as nullable loaders or hidden
+fallbacks. The current in-process plan names should distinguish at least:
+`none`, `id_only`, `native_doc_values`, `stored_json_fallback`, and
+`unsupported_exact_sort`. `stored_json_fallback` is a temporary compatibility
+plan; once a request has planned as `native_doc_values`, execution must require
+native values and fail closed if the required ordinal/doc-value coverage is not
+available.
 
 ## API Contract
 

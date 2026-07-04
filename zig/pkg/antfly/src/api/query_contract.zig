@@ -1793,13 +1793,16 @@ fn cloneSortFieldsWithStableTiebreaker(
     fields: []const metadata_openapi.SortField,
 ) ![]const db_mod.types.SortField {
     if (fields.len == 0) return error.UnsupportedQueryRequest;
-    var has_id = false;
-    for (fields) |field| {
+    var has_final_id = false;
+    for (fields, 0..) |field, i| {
         if (field.field.len == 0) return error.UnsupportedQueryRequest;
-        if (std.mem.eql(u8, field.field, "_id")) has_id = true;
+        if (std.mem.eql(u8, field.field, "_id")) {
+            if (i + 1 != fields.len or (field.desc orelse false)) return error.UnsupportedQueryRequest;
+            has_final_id = true;
+        }
     }
 
-    const out_len = fields.len + @as(usize, if (has_id) 0 else 1);
+    const out_len = fields.len + @as(usize, if (has_final_id) 0 else 1);
     const out = try alloc.alloc(db_mod.types.SortField, out_len);
     var initialized: usize = 0;
     errdefer {
@@ -1813,7 +1816,7 @@ fn cloneSortFieldsWithStableTiebreaker(
         };
         initialized += 1;
     }
-    if (!has_id) {
+    if (!has_final_id) {
         out[fields.len] = .{
             .field = try alloc.dupe(u8, "_id"),
             .desc = false,
@@ -6507,6 +6510,24 @@ test "api query contract rejects cursor width that omits stable id tiebreaker" {
     ;
 
     try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
+}
+
+test "api query contract rejects ambiguous explicit id sort tiebreaker" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs",
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "order_by": [{"field":"_id"},{"field":"created_at"}]
+        \\}
+    ));
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs",
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "order_by": [{"field":"created_at"},{"field":"_id","desc":true}]
+        \\}
+    ));
 }
 
 test "api query contract parses packed dense embeddings via antfly-json" {

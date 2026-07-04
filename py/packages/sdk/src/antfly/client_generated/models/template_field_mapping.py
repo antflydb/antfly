@@ -24,6 +24,7 @@ class TemplateFieldMapping:
         store (bool | Unset): Whether to store the field value (default false) Default: False.
         include_in_all (bool | Unset): Whether to include in the _all field for cross-field search Default: False.
         doc_values (bool | Unset): Whether to enable doc values for sorting/faceting Default: False.
+        sortable (bool | Unset): Whether this doc-valued scalar field can be used in order_by Default: False.
     """
 
     type_: AntflyType2 | Unset = UNSET
@@ -32,6 +33,7 @@ class TemplateFieldMapping:
     store: bool | Unset = False
     include_in_all: bool | Unset = False
     doc_values: bool | Unset = False
+    sortable: bool | Unset = False
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -49,6 +51,8 @@ class TemplateFieldMapping:
 
         doc_values = self.doc_values
 
+        sortable = self.sortable
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -64,6 +68,8 @@ class TemplateFieldMapping:
             field_dict["include_in_all"] = include_in_all
         if doc_values is not UNSET:
             field_dict["doc_values"] = doc_values
+        if sortable is not UNSET:
+            field_dict["sortable"] = sortable
 
         return field_dict
 
@@ -87,6 +93,8 @@ class TemplateFieldMapping:
 
         doc_values = d.pop("doc_values", UNSET)
 
+        sortable = d.pop("sortable", UNSET)
+
         template_field_mapping = cls(
             type_=type_,
             analyzer=analyzer,
@@ -94,6 +102,7 @@ class TemplateFieldMapping:
             store=store,
             include_in_all=include_in_all,
             doc_values=doc_values,
+            sortable=sortable,
         )
 
         template_field_mapping.additional_properties = d

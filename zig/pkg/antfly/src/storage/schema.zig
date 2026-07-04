@@ -754,6 +754,11 @@ pub fn validateFields(schema: TableSchema, field_names: []const []const u8) !voi
     }
 }
 
+pub fn parseDateTimeToNs(text: []const u8) ?u64 {
+    if (parseRfc3339ToNs(text)) |ns| return ns;
+    return parseDateToNs(text);
+}
+
 fn parseRfc3339ToNs(text: []const u8) ?u64 {
     if (text.len < 20) return null;
     if (text[4] != '-' or text[7] != '-' or text[10] != 'T' or text[13] != ':' or text[16] != ':') return null;
@@ -787,12 +792,18 @@ fn parseRfc3339ToNs(text: []const u8) ?u64 {
     return @as(u64, @intCast(secs)) * std.time.ns_per_s + nanos;
 }
 
+fn parseDateToNs(value: []const u8) ?u64 {
+    if (value.len != 10 or value[4] != '-' or value[7] != '-') return null;
+    const year = std.fmt.parseInt(i64, value[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(i64, value[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(i64, value[8..10], 10) catch return null;
+    const days = daysFromCivil(year, month, day);
+    if (days < 0) return null;
+    return @as(u64, @intCast(days * 86_400)) * std.time.ns_per_s;
+}
+
 fn isValidDate(value: []const u8) bool {
-    if (value.len != 10 or value[4] != '-' or value[7] != '-') return false;
-    const year = std.fmt.parseInt(i64, value[0..4], 10) catch return false;
-    const month = std.fmt.parseInt(i64, value[5..7], 10) catch return false;
-    const day = std.fmt.parseInt(i64, value[8..10], 10) catch return false;
-    return daysFromCivil(year, month, day) >= 0;
+    return parseDateToNs(value) != null;
 }
 
 fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
@@ -1245,4 +1256,10 @@ test "dynamic template selector and mapping-option resolution" {
     try std.testing.expect(tag != null);
     try std.testing.expectEqual(AntflyType.keyword, tag.?.field_type);
     try std.testing.expect(tag.?.include_in_all);
+}
+
+test "parseDateTimeToNs accepts rfc3339 and date-only values" {
+    try std.testing.expectEqual(@as(?u64, 15), parseDateTimeToNs("1970-01-01T00:00:00.000000015Z"));
+    try std.testing.expectEqual(@as(?u64, 0), parseDateTimeToNs("1970-01-01"));
+    try std.testing.expect(parseDateTimeToNs("not-a-date") == null);
 }

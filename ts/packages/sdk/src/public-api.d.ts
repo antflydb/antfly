@@ -7565,6 +7565,11 @@ export interface components {
              * @default false
              */
             doc_values?: boolean;
+            /**
+             * @description Whether this doc-valued scalar field can be used in order_by
+             * @default false
+             */
+            sortable?: boolean;
         };
         /**
          * @description A rule for mapping dynamically detected fields. Templates are checked in order
