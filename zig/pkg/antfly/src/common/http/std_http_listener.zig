@@ -694,7 +694,14 @@ pub const StdHttpListener = struct {
             .timeout => |timeout_result| {
                 try timeout_result;
                 if (stream) |active_stream| active_stream.shutdown(io, .both) catch {};
-                while (select.cancel()) |_| {}
+                while (select.cancel()) |result| switch (result) {
+                    .read => |read_result| {
+                        if (read_result) |body| {
+                            self.alloc.free(body);
+                        } else |_| {}
+                    },
+                    .timeout => |cancel_timeout| cancel_timeout catch {},
+                };
                 return error.Timeout;
             },
         }

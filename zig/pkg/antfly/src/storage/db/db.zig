@@ -10868,28 +10868,16 @@ pub const DB = struct {
     }
 
     fn countDerivedCoverageSkipped(self: *DB, index_name: []const u8, generation: u64) !u64 {
-        const lower = try internal_keys.derivedCoverageOutcomeKindPrefixAlloc(self.core.alloc, index_name, generation, "skipped");
-        defer self.core.alloc.free(lower);
-        const upper = try internal_keys.nextPrefixAlloc(self.core.alloc, lower);
-        defer if (upper) |key| self.core.alloc.free(key);
-        const upper_bound = if (upper) |key| key else "";
+        if (try self.loadDerivedCoverageSkippedCounter(self.core.alloc, index_name, generation)) |count| return count;
+        return try self.scanDerivedCoverageSkipped(index_name, generation);
+    }
 
-        var skipped: u64 = 0;
-        const CountState = struct {
-            skipped: *u64,
+    fn loadDerivedCoverageSkippedCounter(self: *DB, alloc: Allocator, index_name: []const u8, generation: u64) !?u64 {
+        return try loadDerivedCoverageSkippedCounterFromStore(alloc, self.core.store, index_name, generation);
+    }
 
-            fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
-                _ = key;
-                _ = value;
-                const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-                state.skipped.* += 1;
-                return .@"continue";
-            }
-        };
-
-        var state = CountState{ .skipped = &skipped };
-        try self.core.store.scanWithContext(lower, upper_bound, .{}, &state, CountState.scanEntry);
-        return skipped;
+    fn scanDerivedCoverageSkipped(self: *DB, index_name: []const u8, generation: u64) !u64 {
+        return try scanDerivedCoverageSkippedFromStore(self.core.alloc, self.core.store, index_name, generation);
     }
 
     fn deleteDerivedCoverageForIndex(self: *DB, index_name: []const u8) !void {
@@ -21061,6 +21049,62 @@ fn applyDerivedBatchToIndexContext(ctx: *const AsyncContext, batch: derived_type
     try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, null);
 }
 
+fn loadDerivedCoverageSkippedCounterFromStore(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_name: []const u8,
+    generation: u64,
+) !?u64 {
+    const counter_key = try internal_keys.derivedCoverageSkippedCountKeyAlloc(alloc, index_name, generation);
+    defer alloc.free(counter_key);
+    const raw = store.get(alloc, counter_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    return try internal_keys.decodeDerivedCoverageSkippedCount(raw);
+}
+
+fn scanDerivedCoverageSkippedFromStore(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_name: []const u8,
+    generation: u64,
+) !u64 {
+    const lower = try internal_keys.derivedCoverageOutcomeKindPrefixAlloc(alloc, index_name, generation, "skipped");
+    defer alloc.free(lower);
+    const upper = try internal_keys.nextPrefixAlloc(alloc, lower);
+    defer if (upper) |key| alloc.free(key);
+    const upper_bound = if (upper) |key| key else "";
+
+    var skipped: u64 = 0;
+    const CountState = struct {
+        skipped: *u64,
+
+        fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            _ = key;
+            _ = value;
+            const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            state.skipped.* += 1;
+            return .@"continue";
+        }
+    };
+
+    var state = CountState{ .skipped = &skipped };
+    try store.scanWithContext(lower, upper_bound, .{}, &state, CountState.scanEntry);
+    return skipped;
+}
+
+fn derivedCoverageSkippedCounterValueForStore(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_name: []const u8,
+    generation: u64,
+) !u64 {
+    return (try loadDerivedCoverageSkippedCounterFromStore(alloc, store, index_name, generation)) orelse
+        try scanDerivedCoverageSkippedFromStore(alloc, store, index_name, generation);
+}
+
 fn deleteDerivedCoverageSkippedForDocKeys(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
@@ -21077,13 +21121,49 @@ fn deleteDerivedCoverageSkippedForDocKeys(
         deletes.deinit(alloc);
     }
 
+    var removed_count: u64 = 0;
     for (doc_keys) |doc_key| {
         const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, index_name, generation, doc_key, "skipped");
         errdefer alloc.free(marker_key);
+        var duplicate_delete = false;
+        for (deletes.items) |existing_delete| {
+            if (std.mem.eql(u8, existing_delete, marker_key)) {
+                duplicate_delete = true;
+                break;
+            }
+        }
+        if (duplicate_delete) {
+            alloc.free(marker_key);
+            continue;
+        }
+        const had_marker = blk: {
+            const existing = store.get(alloc, marker_key) catch |err| switch (err) {
+                error.NotFound => break :blk false,
+                else => return err,
+            };
+            alloc.free(existing);
+            break :blk true;
+        };
+        if (had_marker) removed_count +|= 1;
         try deletes.append(alloc, marker_key);
     }
 
-    if (deletes.items.len > 0) try store.putBatch(&.{}, deletes.items);
+    if (deletes.items.len == 0) return;
+    if (removed_count == 0) {
+        try store.putBatch(&.{}, deletes.items);
+        return;
+    }
+
+    const current_count = try derivedCoverageSkippedCounterValueForStore(alloc, store, index_name, generation);
+    const counter_key = try internal_keys.derivedCoverageSkippedCountKeyAlloc(alloc, index_name, generation);
+    defer alloc.free(counter_key);
+    var counter_value: [8]u8 = undefined;
+    const new_count = if (current_count > removed_count) current_count - removed_count else 0;
+    const write = docstore_mod.KVPair{
+        .key = counter_key,
+        .value = internal_keys.encodeDerivedCoverageSkippedCount(&counter_value, new_count),
+    };
+    try store.putBatch(&.{write}, deletes.items);
 }
 
 fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, profile: ?*BatchProfile) !void {

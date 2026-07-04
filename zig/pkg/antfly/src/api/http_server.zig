@@ -5696,6 +5696,7 @@ pub const ApiHttpServer = struct {
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
             error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
             error.ModelNotFound => return error.ModelNotFound,
+            error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -5767,6 +5768,7 @@ pub const ApiHttpServer = struct {
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
                 error.TableNotFound => return error.TableNotFound,
                 error.ModelNotFound => return error.ModelNotFound,
+                error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
                 error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
                 error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
                 error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
@@ -5785,6 +5787,7 @@ pub const ApiHttpServer = struct {
         if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             error.ModelNotFound => return error.ModelNotFound,
+            error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
             error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
@@ -5822,6 +5825,7 @@ pub const ApiHttpServer = struct {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             error.TableNotFound => return error.NotFound,
             error.ModelNotFound => return error.ModelNotFound,
+            error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
             error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,

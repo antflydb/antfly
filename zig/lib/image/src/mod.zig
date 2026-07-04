@@ -27,6 +27,25 @@ pub const conformance = conformance_impl;
 
 pub const Format = enum { png, jpeg, jpeg2000_jp2, jpeg2000_j2k, gif, bmp, webp, unknown };
 
+pub const DecodeLimits = struct {
+    max_pixels: usize,
+    max_rgba_bytes: usize,
+
+    pub const inference_default = DecodeLimits{
+        .max_pixels = 32 * 1024 * 1024,
+        .max_rgba_bytes = 128 * 1024 * 1024,
+    };
+
+    pub fn validate(self: DecodeLimits, width: u32, height: u32) !void {
+        const pixels_u64 = @as(u64, width) * @as(u64, height);
+        if (pixels_u64 > std.math.maxInt(usize)) return error.ImageTooLarge;
+        const pixels: usize = @intCast(pixels_u64);
+        if (pixels > self.max_pixels) return error.ImageTooLarge;
+        if (pixels > std.math.maxInt(usize) / 4) return error.ImageTooLarge;
+        if (pixels * 4 > self.max_rgba_bytes) return error.ImageTooLarge;
+    }
+};
+
 pub fn detectFormat(bytes: []const u8) Format {
     if (png.hasSignature(bytes)) return .png;
     if (jpeg2000.box.hasSignature(bytes)) return .jpeg2000_jp2;

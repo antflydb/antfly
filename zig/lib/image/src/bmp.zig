@@ -27,8 +27,38 @@ pub const DecodedImage = struct {
     height: u32,
 };
 
+pub const Info = struct {
+    width: u32,
+    height: u32,
+    bits_per_pixel: u16,
+};
+
 pub fn hasSignature(bytes: []const u8) bool {
     return bytes.len >= 2 and bytes[0] == 'B' and bytes[1] == 'M';
+}
+
+pub fn probe(bmp_bytes: []const u8) !Info {
+    if (!hasSignature(bmp_bytes)) return error.BmpDecodeFailed;
+    if (bmp_bytes.len < file_header_len + dib_bitmap_info_header_len) return error.BmpDecodeFailed;
+
+    const dib_header_len = try readU32Le(bmp_bytes, 14);
+    if (dib_header_len < dib_bitmap_info_header_len) return error.UnsupportedBmpFormat;
+    const dib_header_len_usize: usize = @intCast(dib_header_len);
+    const dib_end = try std.math.add(usize, file_header_len, dib_header_len_usize);
+    if (dib_end > bmp_bytes.len) return error.BmpDecodeFailed;
+
+    const dib_start: usize = file_header_len;
+    const width_i = try readI32Le(bmp_bytes, dib_start + 4);
+    const height_i = try readI32Le(bmp_bytes, dib_start + 8);
+    if (width_i <= 0 or height_i == 0 or height_i == std.math.minInt(i32)) return error.BmpDecodeFailed;
+
+    const bits_per_pixel = try readU16Le(bmp_bytes, dib_start + 14);
+    const height_abs_i = if (height_i < 0) -height_i else height_i;
+    return .{
+        .width = @intCast(width_i),
+        .height = @intCast(height_abs_i),
+        .bits_per_pixel = bits_per_pixel,
+    };
 }
 
 pub fn decodeRgba(alloc: Allocator, bmp_bytes: []const u8) !DecodedImage {

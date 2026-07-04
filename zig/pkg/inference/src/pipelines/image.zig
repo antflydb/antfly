@@ -56,12 +56,58 @@ pub const Pix2StructPatches = struct {
 
 /// Decode a JPEG/PNG/GIF/BMP/WebP from raw bytes. Always returns 3-channel RGB.
 pub fn decode(allocator: std.mem.Allocator, image_bytes: []const u8) !Image {
+    try validateEncodedImageDimensions(image_bytes);
     switch (antfly_image.detectFormat(image_bytes)) {
         .png => return decodePng(allocator, image_bytes),
         .jpeg => return decodeJpeg(allocator, image_bytes),
         .gif => return decodeGif(allocator, image_bytes),
         .bmp => return decodeBmp(allocator, image_bytes),
         .webp => return decodeWebp(allocator, image_bytes),
+        else => return error.ImageDecodeFailed,
+    }
+}
+
+fn validateImageDimensions(width: u32, height: u32) !void {
+    return antfly_image.DecodeLimits.inference_default.validate(width, height) catch |err| switch (err) {
+        error.ImageTooLarge => error.ImageDecodeFailed,
+    };
+}
+
+fn validateEncodedImageDimensions(image_bytes: []const u8) !void {
+    switch (antfly_image.detectFormat(image_bytes)) {
+        .png => {
+            if (image_bytes.len < 24) return error.ImageDecodeFailed;
+            const width = std.mem.readInt(u32, image_bytes[16..20], .big);
+            const height = std.mem.readInt(u32, image_bytes[20..24], .big);
+            try validateImageDimensions(width, height);
+        },
+        .jpeg => {
+            const info = antfly_image.jpeg.probe(image_bytes) catch |err| switch (err) {
+                error.JpegDecodeFailed, error.UnsupportedJpegFormat => return error.ImageDecodeFailed,
+            };
+            try validateImageDimensions(info.width, info.height);
+        },
+        .gif => {
+            if (image_bytes.len < 10) return error.ImageDecodeFailed;
+            const width = std.mem.readInt(u16, image_bytes[6..8], .little);
+            const height = std.mem.readInt(u16, image_bytes[8..10], .little);
+            try validateImageDimensions(width, height);
+        },
+        .bmp => {
+            const info = antfly_image.bmp.probe(image_bytes) catch |err| switch (err) {
+                error.BmpDecodeFailed, error.UnsupportedBmpFormat => return error.ImageDecodeFailed,
+                else => return err,
+            };
+            try validateImageDimensions(info.width, info.height);
+        },
+        .webp => {
+            const info = antfly_image.webp.probe(image_bytes) catch |err| switch (err) {
+                error.WebpDecodeFailed, error.UnsupportedWebpFormat => return error.ImageDecodeFailed,
+            };
+            const width = info.width orelse return error.ImageDecodeFailed;
+            const height = info.height orelse return error.ImageDecodeFailed;
+            try validateImageDimensions(width, height);
+        },
         else => return error.ImageDecodeFailed,
     }
 }
@@ -116,6 +162,7 @@ fn decodeWebp(allocator: std.mem.Allocator, image_bytes: []const u8) !Image {
 }
 
 fn imageFromRgba(allocator: std.mem.Allocator, rgba: []u8, width: u32, height: u32) !Image {
+    try validateImageDimensions(width, height);
     const rgb = try rgbaToRgbAlloc(allocator, rgba);
     allocator.free(rgba);
     return .{
@@ -127,6 +174,7 @@ fn imageFromRgba(allocator: std.mem.Allocator, rgba: []u8, width: u32, height: u
 }
 
 fn imageFromRgbaNoFree(allocator: std.mem.Allocator, rgba: []const u8, width: u32, height: u32) !Image {
+    try validateImageDimensions(width, height);
     return .{
         .data = try rgbaToRgbAlloc(allocator, rgba),
         .width = width,
@@ -211,6 +259,18 @@ test "decode bmp fixture returns rgb image" {
     try std.testing.expectEqual(@as(u32, 3), img.channels);
     try std.testing.expectEqualSlices(u8, &.{ 0xff, 0x00, 0x00 }, img.data[0..3]);
     try std.testing.expectEqualSlices(u8, &.{ 0x00, 0xff, 0x00 }, img.data[3..6]);
+}
+
+test "decode rejects oversized image dimensions before full decode" {
+    var png = red_png_2x2;
+    std.mem.writeInt(u32, png[16..20], 100_000, .big);
+    std.mem.writeInt(u32, png[20..24], 100_000, .big);
+    try std.testing.expectError(error.ImageDecodeFailed, decode(std.testing.allocator, &png));
+
+    var bmp = bmp_24_2x2;
+    std.mem.writeInt(i32, bmp[18..22], 100_000, .little);
+    std.mem.writeInt(i32, bmp[22..26], 100_000, .little);
+    try std.testing.expectError(error.ImageDecodeFailed, decode(std.testing.allocator, &bmp));
 }
 
 test "decode webp fixture returns rgb image" {

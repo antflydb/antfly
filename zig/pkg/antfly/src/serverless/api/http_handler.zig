@@ -4350,6 +4350,7 @@ pub const HttpHandler = struct {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.FileNotFound => return error.NotFound,
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
+            error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             else => {
                 std.log.err("serverless public table query failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;

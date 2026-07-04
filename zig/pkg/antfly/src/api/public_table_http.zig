@@ -73,6 +73,7 @@ pub const TableApi = struct {
         ReadRequiresPrimary,
         ReadUnavailable,
         ModelNotFound,
+        QueryCandidateBudgetExceeded,
         InternalFailure,
     };
 
@@ -547,6 +548,10 @@ pub fn handleTableQueryRequest(
             error.ModelNotFound => {
                 std.log.warn("public table query model not found table={s} err={}", .{ table_name, err });
                 return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}") };
+            },
+            error.QueryCandidateBudgetExceeded => {
+                std.log.warn("public table query candidate budget exceeded table={s} err={}", .{ table_name, err });
+                return .{ .status = 422, .body = try alloc.dupe(u8, "query candidate budget exceeded") };
             },
             error.InternalFailure => {
                 std.log.err("public table query failed table={s} err={}", .{ table_name, err });
@@ -1740,6 +1745,45 @@ test "public table query handler maps backend errors" {
 
     try std.testing.expectEqual(@as(u16, 400), resp.status);
     try std.testing.expectEqualStrings("invalid query request", resp.body);
+}
+
+test "public table query handler maps candidate budget exhaustion" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+        ) TableApi.ExecuteQueryError![]u8 {
+            return error.QueryCandidateBudgetExceeded;
+        }
+    };
+
+    var resp = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"query":{"match_all":{}},"order_by":[{"field":"created_at"}]}
+    , null, Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expectEqualStrings("query candidate budget exceeded", resp.body);
 }
 
 test "public table query view handler maps doc identity unavailable errors" {

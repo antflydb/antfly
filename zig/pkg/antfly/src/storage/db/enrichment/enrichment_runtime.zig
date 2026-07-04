@@ -103,6 +103,7 @@ const transient_worker_retry_sleep_ns: u64 = 100 * std.time.ns_per_ms;
 const CoverageMarkerDelete = struct {
     key: []u8,
     had_marker: bool,
+    counter_key: ?[]u8 = null,
 };
 
 const GeneratedReplayWindow = struct {
@@ -7071,8 +7072,21 @@ fn markDerivedCoverageSkippedForIndex(runtime: *EnrichmentRuntime, index_name: [
         runtime.alloc.free(existing);
         break :blk true;
     };
-    try storePutWithRetry(runtime, key, "skipped");
-    if (!already_marked) runtime.skipped_source_count += 1;
+    if (already_marked) {
+        try storePutWithRetry(runtime, key, "skipped");
+        return;
+    }
+
+    const counter_key = try internal_keys.derivedCoverageSkippedCountKeyAlloc(runtime.alloc, index_name, generation);
+    defer runtime.alloc.free(counter_key);
+    const current_count = try derivedCoverageSkippedCounterValue(runtime, counter_key, index_name, generation);
+    var counter_value: [8]u8 = undefined;
+    const writes = [_]KVPair{
+        .{ .key = key, .value = "skipped" },
+        .{ .key = counter_key, .value = internal_keys.encodeDerivedCoverageSkippedCount(&counter_value, current_count +| 1) },
+    };
+    try storePutBatchWithRetry(runtime, &writes, &.{});
+    runtime.skipped_source_count += 1;
 }
 
 fn queuedCoverageMarkerDelete(window: *GeneratedReplayWindow, key: []const u8) ?usize {
@@ -7083,8 +7097,49 @@ fn queuedCoverageMarkerDelete(window: *GeneratedReplayWindow, key: []const u8) ?
 }
 
 fn clearQueuedCoverageMarkerDeletes(alloc: Allocator, marker_deletes: *std.ArrayListUnmanaged(CoverageMarkerDelete)) void {
-    for (marker_deletes.items) |item| alloc.free(item.key);
+    for (marker_deletes.items) |item| {
+        alloc.free(item.key);
+        if (item.counter_key) |key| alloc.free(key);
+    }
     marker_deletes.clearRetainingCapacity();
+}
+
+fn loadDerivedCoverageSkippedCounter(runtime: *EnrichmentRuntime, counter_key: []const u8) !?u64 {
+    const raw = storeGetAlloc(runtime, counter_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer runtime.alloc.free(raw);
+    return try internal_keys.decodeDerivedCoverageSkippedCount(raw);
+}
+
+fn scanDerivedCoverageSkipped(runtime: *EnrichmentRuntime, index_name: []const u8, generation: u64) !u64 {
+    const lower = try internal_keys.derivedCoverageOutcomeKindPrefixAlloc(runtime.alloc, index_name, generation, "skipped");
+    defer runtime.alloc.free(lower);
+    const upper = try internal_keys.nextPrefixAlloc(runtime.alloc, lower);
+    defer if (upper) |key| runtime.alloc.free(key);
+    const upper_bound = if (upper) |key| key else "";
+
+    var skipped: u64 = 0;
+    const CountState = struct {
+        skipped: *u64,
+
+        fn scan(ctx_ptr: ?*anyopaque, key: []const u8, value: []const u8) anyerror!backend_scan.ScanAction {
+            _ = key;
+            _ = value;
+            const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr orelse return error.InvalidArgument));
+            ctx.skipped.* += 1;
+            return .@"continue";
+        }
+    };
+    var state = CountState{ .skipped = &skipped };
+    try backend_scan.scanWithContext(&runtime.store, lower, upper_bound, .{}, &state, CountState.scan);
+    return skipped;
+}
+
+fn derivedCoverageSkippedCounterValue(runtime: *EnrichmentRuntime, counter_key: []const u8, index_name: []const u8, generation: u64) !u64 {
+    return (try loadDerivedCoverageSkippedCounter(runtime, counter_key)) orelse
+        try scanDerivedCoverageSkipped(runtime, index_name, generation);
 }
 
 fn queueDerivedCoverageProducedForIndex(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, index_name: []const u8, doc_key: []const u8) !void {
@@ -7104,7 +7159,12 @@ fn queueDerivedCoverageProducedForIndex(runtime: *EnrichmentRuntime, window: *Ge
         runtime.alloc.free(existing);
         break :blk true;
     };
-    try window.coverage_marker_deletes.append(runtime.alloc, .{ .key = key, .had_marker = had_marker });
+    const counter_key = if (had_marker)
+        try internal_keys.derivedCoverageSkippedCountKeyAlloc(runtime.alloc, index_name, generation)
+    else
+        null;
+    errdefer if (counter_key) |owned| runtime.alloc.free(owned);
+    try window.coverage_marker_deletes.append(runtime.alloc, .{ .key = key, .had_marker = had_marker, .counter_key = counter_key });
 }
 
 fn markDerivedCoverageSkipped(runtime: *EnrichmentRuntime, doc_key: []const u8, consumer_indexes: []const []const u8) !void {
@@ -7120,7 +7180,37 @@ fn deleteCoverageMarkersAfterReplayAppend(runtime: *EnrichmentRuntime, marker_de
     const keys = try runtime.alloc.alloc([]const u8, marker_deletes.len);
     defer runtime.alloc.free(keys);
     for (marker_deletes, 0..) |item, i| keys[i] = item.key;
-    try storePutBatchWithRetry(runtime, &.{}, keys);
+
+    const CounterState = struct {
+        key: []const u8,
+        count: u64,
+        value: [8]u8 = undefined,
+    };
+    var counter_states = std.ArrayListUnmanaged(CounterState).empty;
+    defer counter_states.deinit(runtime.alloc);
+    for (marker_deletes) |item| {
+        if (!item.had_marker) continue;
+        const counter_key = item.counter_key orelse continue;
+        const state_index = blk: {
+            for (counter_states.items, 0..) |state, i| {
+                if (std.mem.eql(u8, state.key, counter_key)) break :blk i;
+            }
+            const current_count = (try loadDerivedCoverageSkippedCounter(runtime, counter_key)) orelse continue;
+            try counter_states.append(runtime.alloc, .{ .key = counter_key, .count = current_count });
+            break :blk counter_states.items.len - 1;
+        };
+        if (counter_states.items[state_index].count > 0) counter_states.items[state_index].count -= 1;
+    }
+
+    const counter_writes = try runtime.alloc.alloc(KVPair, counter_states.items.len);
+    defer runtime.alloc.free(counter_writes);
+    for (counter_states.items, 0..) |*state, i| {
+        counter_writes[i] = .{
+            .key = state.key,
+            .value = internal_keys.encodeDerivedCoverageSkippedCount(&state.value, state.count),
+        };
+    }
+    try storePutBatchWithRetry(runtime, counter_writes, keys);
     for (marker_deletes) |item| {
         if (item.had_marker and runtime.skipped_source_count > 0) runtime.skipped_source_count -= 1;
     }
