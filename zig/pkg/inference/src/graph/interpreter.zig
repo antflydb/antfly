@@ -1332,6 +1332,8 @@ fn resolveRuntimeReshapeDims(actual: []const i64, declared: Shape, target: Shape
     }
 
     if (countNegativeDims(out[0..rank]) > 1) {
+        if (resolveRuntimeCollapsedResizeDims(actual, target, input_numel, out)) |resolved| return resolved;
+        if (resolveRuntimeInterleavedResizeDims(actual, target, input_numel, out)) |resolved| return resolved;
         if (resolveRuntimeSplitLastDim(actual, target, input_numel, out)) |resolved| return resolved;
         if (resolveRuntimeAlignedDynamicDims(actual, target, input_numel, out)) |resolved| return resolved;
     }
@@ -1339,6 +1341,51 @@ fn resolveRuntimeReshapeDims(actual: []const i64, declared: Shape, target: Shape
     if (countNegativeDims(out[0..rank]) <= 1 and resolveSingleInferredDim(out[0..rank], input_numel)) {
         return out[0..rank];
     }
+    return null;
+}
+
+fn resolveRuntimeCollapsedResizeDims(actual: []const i64, target: Shape, input_numel: usize, out: *[8]i64) ?[]const i64 {
+    const rank = target.rank();
+    if (actual.len != rank * 2 or rank == 0 or rank > out.len) return null;
+
+    for (0..rank) |i| {
+        const copied_axis = i * 2;
+        const scale_axis = copied_axis + 1;
+        const copied_dim = actual[copied_axis];
+        const scale_dim = actual[scale_axis];
+        if (copied_dim <= 0 or scale_dim <= 0) return null;
+
+        const target_dim = target.dim(@intCast(i));
+        const resolved_dim = std.math.mul(i64, copied_dim, scale_dim) catch return null;
+        if (target_dim > 0 and target_dim != resolved_dim) return null;
+        out[i] = resolved_dim;
+    }
+
+    if (safeElementCountFromDims(out[0..rank]) == input_numel) return out[0..rank];
+    return null;
+}
+
+fn resolveRuntimeInterleavedResizeDims(actual: []const i64, target: Shape, input_numel: usize, out: *[8]i64) ?[]const i64 {
+    const rank = target.rank();
+    if (rank != actual.len * 2 or rank > out.len or actual.len == 0) return null;
+
+    for (0..actual.len) |i| {
+        const source_dim = actual[i];
+        if (source_dim <= 0) return null;
+
+        const copied_axis = i * 2;
+        const inserted_axis = copied_axis + 1;
+        const copied_dim = target.dim(@intCast(copied_axis));
+        const inserted_dim = target.dim(@intCast(inserted_axis));
+
+        if (copied_dim > 0 and copied_dim != source_dim) return null;
+        if (inserted_dim != 1) return null;
+
+        out[copied_axis] = source_dim;
+        out[inserted_axis] = 1;
+    }
+
+    if (safeElementCountFromDims(out[0..rank]) == input_numel) return out[0..rank];
     return null;
 }
 
@@ -3798,6 +3845,30 @@ test "resolveRuntimeReshapeDims preserves dynamic leading axes when splitting hi
     try std.testing.expectEqualSlices(i64, &.{ 3, 512, 2, 64 }, resolved);
 }
 
+test "resolveRuntimeReshapeDims preserves dynamic resize interleaved axes" {
+    var out: [8]i64 = undefined;
+    const resolved = resolveRuntimeReshapeDims(
+        &.{ 1, 24, 120, 120 },
+        Shape.init(.f32, &.{ -1, 24, -1, -1 }),
+        Shape.init(.f32, &.{ -1, 1, 24, 1, -1, 1, -1, 1 }),
+        &out,
+    ) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualSlices(i64, &.{ 1, 1, 24, 1, 120, 1, 120, 1 }, resolved);
+}
+
+test "resolveRuntimeReshapeDims collapses dynamic resize interleaved axes" {
+    var out: [8]i64 = undefined;
+    const resolved = resolveRuntimeReshapeDims(
+        &.{ 1, 1, 24, 1, 120, 8, 120, 8 },
+        Shape.init(.f32, &.{ -1, 1, 24, 1, -1, 8, -1, 8 }),
+        Shape.init(.f32, &.{ -1, 24, -1, -1 }),
+        &out,
+    ) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualSlices(i64, &.{ 1, 24, 960, 960 }, resolved);
+}
+
 test "resolveProjectionRestoreFromSourceActual restores batch sequence after flattened matmul" {
     var out: [8]i64 = undefined;
     const resolved = resolveProjectionRestoreFromSourceActual(
@@ -4909,6 +4980,62 @@ test "runtime shape drives symbolic broadcast_in_dim" {
         4, 5, 6,
         4, 5, 6,
         4, 5, 6,
+    }, actual);
+}
+
+test "runtime shape drives dynamic integer resize broadcast values" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ -1, 1, -1, -1 }));
+    const reshaped = try builder.reshape(x, Shape.init(.f32, &.{ -1, 1, 1, 1, -1, 1, -1, 1 }));
+
+    var attrs = ml.graph.node.BroadcastAttrs{ .target_shape = Shape.init(.f32, &.{ -1, 1, 1, 1, -1, 2, -1, 2 }) };
+    attrs.broadcast_axes = .{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    attrs.num_axes = 8;
+    const broadcasted = try g.addNode(.{
+        .op = .{ .broadcast_in_dim = attrs },
+        .output_shape = attrs.target_shape,
+        .inputs = .{ reshaped, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
+    const out = try builder.reshape(broadcasted, Shape.init(.f32, &.{ -1, 1, -1, -1 }));
+    try g.markOutput(out);
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb_val = compute.computeBackend();
+
+    const input = [_]f32{
+        1, 2,
+        3, 4,
+    };
+    const x_ct = try cb_val.fromFloat32Shape(&input, &.{ 1, 1, 2, 2 });
+    defer cb_val.free(x_ct);
+
+    const rt_inputs = [_]RuntimeInput{
+        .{ .node_id = x, .value = x_ct },
+    };
+
+    var result = try execute(allocator, &g, &cb_val, .{
+        .runtime_inputs = &rt_inputs,
+    });
+    defer result.deinit(&cb_val);
+
+    const actual_shape = try cb_val.tensorShape(result.outputs[0], allocator);
+    defer allocator.free(actual_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 1, 4, 4 }, actual_shape);
+
+    const actual = try cb_val.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{
+        1, 1, 2, 2,
+        1, 1, 2, 2,
+        3, 3, 4, 4,
+        3, 3, 4, 4,
     }, actual);
 }
 
