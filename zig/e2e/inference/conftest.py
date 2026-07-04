@@ -356,7 +356,7 @@ def api(base_url):
             return payload
 
         def readyz(self):
-            r = requests.get(f"{self.base_url}/readyz", timeout=10)
+            r = requests.get(f"{self.url}/readyz", timeout=10)
             _check(r)
             return r.json()
 

@@ -35,6 +35,7 @@
 // redirects. Unreachable nodes are dropped (implicit DCE).
 
 const std = @import("std");
+const platform = @import("antfly_platform");
 const graph_mod = @import("../graph.zig");
 const node_mod = @import("../node.zig");
 const shape_mod = @import("../shape.zig");
@@ -2797,7 +2798,7 @@ fn fuseSDPA(allocator: std.mem.Allocator, work: *Graph) !PairFusionResult {
     errdefer redirects.deinit(allocator);
     var num_rewrites: u32 = 0;
 
-    if (std.c.getenv("ANTFLY_DISABLE_SDPA_FUSION") != null) {
+    if (platform.env.getenvBool("ANTFLY_DISABLE_SDPA_FUSION")) {
         return .{ .redirects = redirects, .num_rewrites = num_rewrites };
     }
 

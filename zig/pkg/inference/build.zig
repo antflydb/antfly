@@ -1304,6 +1304,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
             .single_threaded = true,
         });
+        wasm_ml_mod.addImport("antfly_platform", wasm_platform_mod);
         const wasm_onnx_graph_mod = b.createModule(.{
             .root_source_file = b.path(b.fmt("{s}/lib/onnx/src/root.zig", .{shared_lib_root})),
             .target = wasm_target,
