@@ -122,6 +122,30 @@ fn buildTextSegmentIntoSink(ctx_any: *anyopaque, sink: *segment_mod.SegmentSink)
     );
 }
 
+fn textIndexSortFieldsForSegmentAlloc(
+    alloc: Allocator,
+    index_sort: []const schema_mod.IndexSortField,
+) ![]segment_mod.SegmentIndexSortField {
+    if (index_sort.len == 0) return &.{};
+    const fields = try alloc.alloc(segment_mod.SegmentIndexSortField, index_sort.len);
+    for (index_sort, 0..) |field, i| {
+        fields[i] = .{
+            .field = field.field,
+            .desc = field.desc,
+        };
+    }
+    return fields;
+}
+
+fn withTextIndexSort(
+    options: introducer_mod.BuildTextOptions,
+    index_sort: []const segment_mod.SegmentIndexSortField,
+) introducer_mod.BuildTextOptions {
+    var out = options;
+    out.index_sort = index_sort;
+    return out;
+}
+
 const text_backfill_batch_size: usize = 1024;
 const text_merge_scheduler_default_steps: usize = 1;
 const text_merge_quarantine_backoff_ns: u64 = 30 * std.time.ns_per_s;
@@ -8165,11 +8189,13 @@ pub const IndexManager = struct {
                     defer segment_arena_state.deinit();
                     var segment_tracking = PhaseTrackingAllocator.init(segment_arena_state.allocator(), &segment_alloc_stats);
                     const segment_alloc = if (detailed_profile_enabled) segment_tracking.allocator() else segment_arena_state.allocator();
+                    const runtime_index_sort = if (entry.runtime_schema) |schema| schema.index_sort else &.{};
+                    const index_sort = try textIndexSortFieldsForSegmentAlloc(segment_alloc, runtime_index_sort);
                     var build_ctx = TextSegmentSinkBuildContext{
                         .alloc = segment_alloc,
                         .projection_batch = chunk,
                         .text_analysis = entry.text_analysis,
-                        .build_options = build_options,
+                        .build_options = withTextIndexSort(build_options, index_sort),
                     };
                     const built_len = try entry.persistent.indexSegmentFromSinkBuilder(&build_ctx, buildTextSegmentIntoSink);
                     segment_bytes += built_len;

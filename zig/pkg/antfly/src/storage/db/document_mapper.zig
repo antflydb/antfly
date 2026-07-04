@@ -18,6 +18,7 @@ const vector_codec = @import("antfly_vector").codec;
 const regex_mod = @import("antfly_regex");
 const introducer_mod = @import("../../introducer.zig");
 const segment_mod = @import("../../segment.zig");
+const typed_dv = @import("../../section/typed_doc_values.zig");
 const analysis_mod = @import("../../search/analysis.zig");
 const schema_api = @import("../../schema/mod.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
@@ -124,6 +125,7 @@ pub const BuildTextSegmentsOptions = struct {
     target_segment_bytes: usize = default_text_segment_target_bytes,
     target_build_memory_bytes: ?usize = null,
     doc_scratch_retained_bytes: ?usize = null,
+    index_sort: []const segment_mod.SegmentIndexSortField = &.{},
     profile: ?*introducer_mod.BuildTextProfile = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
 };
@@ -260,6 +262,7 @@ pub fn buildTextSegmentFromDocumentsWithMetadata(
     const arena = arena_state.allocator();
 
     var observed_field_analyzers = std.ArrayListUnmanaged(ObservedFieldAnalyzer).empty;
+    try validateIndexSortForSchema(schema);
 
     const projection_batch = try buildTextProjectionBatch(arena, docs, text_analysis, schema, &observed_field_analyzers);
 
@@ -269,7 +272,10 @@ pub fn buildTextSegmentFromDocumentsWithMetadata(
             .observed_field_analyzers = try cloneObservedFieldAnalyzers(alloc, observed_field_analyzers.items),
         };
     }
-    const segment = try buildTextSegmentFromProjectionBatch(alloc, projection_batch, text_analysis);
+    const index_sort = try indexSortFieldsForSchemaAlloc(arena, schema);
+    const segment = try introducer_mod.buildSegmentFromTextWithAnalysisOptions(alloc, projection_batch.docs, &analysis_mod.default_analyzer, text_analysis, .{
+        .index_sort = index_sort,
+    });
     return .{
         .segment = segment,
         .observed_field_analyzers = try cloneObservedFieldAnalyzers(alloc, observed_field_analyzers.items),
@@ -288,15 +294,69 @@ pub fn buildTextSegmentsFromDocumentsWithMetadata(
     const arena = arena_state.allocator();
 
     var observed_field_analyzers = std.ArrayListUnmanaged(ObservedFieldAnalyzer).empty;
+    try validateIndexSortForSchema(schema);
     const projection_batch = try buildTextProjectionBatch(arena, docs, text_analysis, schema, &observed_field_analyzers);
 
-    const segments = try buildTextSegmentsFromProjectionBatch(alloc, projection_batch, text_analysis, options);
+    var build_options = options;
+    if (build_options.index_sort.len == 0) {
+        build_options.index_sort = try indexSortFieldsForSchemaAlloc(arena, schema);
+    }
+    const segments = try buildTextSegmentsFromProjectionBatch(alloc, projection_batch, text_analysis, build_options);
     errdefer freeTextSegments(alloc, segments);
 
     return .{
         .segments = segments,
         .observed_field_analyzers = try cloneObservedFieldAnalyzers(alloc, observed_field_analyzers.items),
     };
+}
+
+fn indexSortFieldsForSchemaAlloc(
+    alloc: Allocator,
+    schema: ?runtime_schema.TableSchema,
+) ![]const segment_mod.SegmentIndexSortField {
+    try validateIndexSortForSchema(schema);
+    const index_sort = if (schema) |s| s.index_sort else &.{};
+    if (index_sort.len == 0) return &.{};
+    const fields = try alloc.alloc(segment_mod.SegmentIndexSortField, index_sort.len);
+    for (index_sort, 0..) |field, i| {
+        fields[i] = .{
+            .field = field.field,
+            .desc = field.desc,
+        };
+    }
+    return fields;
+}
+
+fn sortFieldIsReservedId(field: []const u8) bool {
+    return std.mem.eql(u8, field, "_id");
+}
+
+fn mappedIndexSortFieldIsScalar(field_type: runtime_schema.AntflyType) bool {
+    return switch (field_type) {
+        .keyword, .numeric, .boolean, .datetime, .link => true,
+        else => false,
+    };
+}
+
+fn validateIndexSortField(schema: runtime_schema.TableSchema, field: runtime_schema.IndexSortField) !void {
+    if (sortFieldIsReservedId(field.field)) return;
+    const mapping = runtime_schema.resolveFieldType(schema, field.field) orelse return error.UnsupportedQueryRequest;
+    if (!mappedIndexSortFieldIsScalar(mapping.field_type)) return error.UnsupportedQueryRequest;
+    if (!mapping.doc_values or !mapping.sortable) return error.UnsupportedQueryRequest;
+}
+
+fn validateIndexSortForSchema(schema: ?runtime_schema.TableSchema) !void {
+    const resolved_schema = schema orelse return;
+    const index_sort = resolved_schema.index_sort;
+    if (index_sort.len == 0) return;
+    if (!sortFieldIsReservedId(index_sort[index_sort.len - 1].field)) return error.UnsupportedQueryRequest;
+    for (index_sort, 0..) |field, i| {
+        if (field.field.len == 0) return error.UnsupportedQueryRequest;
+        for (index_sort[0..i]) |prior| {
+            if (std.mem.eql(u8, prior.field, field.field)) return error.UnsupportedQueryRequest;
+        }
+        try validateIndexSortField(resolved_schema, field);
+    }
 }
 
 pub fn buildTextProjectionBatch(
@@ -437,6 +497,7 @@ fn buildTextOptionsFromSegmentOptions(options: BuildTextSegmentsOptions) introdu
     var build_options = introducer_mod.BuildTextOptions{
         .profile = options.profile,
         .resource_manager = options.resource_manager,
+        .index_sort = options.index_sort,
     };
     if (options.target_build_memory_bytes) |target| build_options.build_memory_target_bytes = target;
     if (options.doc_scratch_retained_bytes) |retained| build_options.doc_scratch_retained_bytes = retained;
@@ -2987,6 +3048,118 @@ test "document mapper records observed dynamic-template field analyzers" {
     try std.testing.expectEqualStrings("french", result.observed_field_analyzers[0].analyzer_name);
     try std.testing.expectEqualStrings("meta.published", result.observed_field_analyzers[1].field_name);
     try std.testing.expectEqualStrings("keyword", result.observed_field_analyzers[1].analyzer_name);
+}
+
+test "document mapper flushes schema index_sort segments in physical sort order" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const templates = [_]runtime_schema.DynamicTemplate{
+        .{
+            .name = "price",
+            .path_match = "price",
+            .mapping = .{
+                .field_type = .numeric,
+                .doc_values = true,
+                .sortable = true,
+            },
+        },
+        .{
+            .name = "content",
+            .path_match = "content",
+            .match_mapping_type = "string",
+            .mapping = .{
+                .field_type = .text,
+                .analyzer = "standard",
+            },
+        },
+    };
+    const index_sort = [_]runtime_schema.IndexSortField{
+        .{ .field = "price", .desc = false },
+        .{ .field = "_id", .desc = false },
+    };
+    const schema: runtime_schema.TableSchema = .{
+        .dynamic_templates = &templates,
+        .index_sort = &index_sort,
+    };
+
+    var result = try buildTextSegmentFromDocumentsWithMetadata(alloc, &.{
+        .{ .key = "doc:b", .value = "{\"price\":2,\"content\":\"second\"}" },
+        .{ .key = "doc:a", .value = "{\"price\":1,\"content\":\"first\"}" },
+    }, text_analysis, schema);
+    defer result.deinit(alloc);
+
+    const segment = result.segment orelse return error.TestExpectedEqual;
+    var reader = try segment_mod.SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+    try std.testing.expectEqualStrings("doc:a", reader.storedDoc(0).?.id);
+    try std.testing.expectEqualStrings("doc:b", reader.storedDoc(1).?.id);
+
+    const fields = (try reader.indexSortFieldsAlloc(alloc)) orelse return error.TestExpectedEqual;
+    defer segment_mod.freeIndexSortFields(alloc, fields);
+    try std.testing.expectEqual(@as(usize, 2), fields.len);
+    try std.testing.expectEqualStrings("price", fields[0].field);
+    try std.testing.expectEqualStrings("_id", fields[1].field);
+
+    const section = reader.getSection("price", .typed_doc_values) orelse return error.TestExpectedEqual;
+    var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
+    try std.testing.expectEqual(@as(?f64, 1.0), try values.getF64(0));
+    try std.testing.expectEqual(@as(?f64, 2.0), try values.getF64(1));
+}
+
+test "document mapper validates schema index_sort field capabilities" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const templates = [_]runtime_schema.DynamicTemplate{
+        .{
+            .name = "price",
+            .path_match = "price",
+            .mapping = .{
+                .field_type = .numeric,
+                .doc_values = true,
+                .sortable = true,
+            },
+        },
+        .{
+            .name = "content",
+            .path_match = "content",
+            .mapping = .{
+                .field_type = .text,
+                .doc_values = false,
+                .sortable = false,
+                .analyzer = "standard",
+            },
+        },
+    };
+    const docs = [_]MapperDoc{
+        .{ .key = "doc:a", .value = "{\"price\":1,\"content\":\"first\"}" },
+    };
+
+    const missing_id_sort = [_]runtime_schema.IndexSortField{
+        .{ .field = "price", .desc = false },
+    };
+    try std.testing.expectError(error.UnsupportedQueryRequest, buildTextSegmentFromDocumentsWithMetadata(alloc, &docs, text_analysis, .{
+        .dynamic_templates = &templates,
+        .index_sort = &missing_id_sort,
+    }));
+
+    const non_sortable_sort = [_]runtime_schema.IndexSortField{
+        .{ .field = "content", .desc = false },
+        .{ .field = "_id", .desc = false },
+    };
+    try std.testing.expectError(error.UnsupportedQueryRequest, buildTextSegmentFromDocumentsWithMetadata(alloc, &docs, text_analysis, .{
+        .dynamic_templates = &templates,
+        .index_sort = &non_sortable_sort,
+    }));
+
+    const duplicate_sort = [_]runtime_schema.IndexSortField{
+        .{ .field = "price", .desc = false },
+        .{ .field = "price", .desc = false },
+        .{ .field = "_id", .desc = false },
+    };
+    try std.testing.expectError(error.UnsupportedQueryRequest, buildTextSegmentFromDocumentsWithMetadata(alloc, &docs, text_analysis, .{
+        .dynamic_templates = &templates,
+        .index_sort = &duplicate_sort,
+    }));
 }
 
 test "document mapper emits additional-properties search_as_you_type variants" {

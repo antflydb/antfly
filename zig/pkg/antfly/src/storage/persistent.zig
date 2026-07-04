@@ -1727,6 +1727,8 @@ pub const PersistentIndex = struct {
                 .deleted = seg.shared.deleted,
             };
         }
+        const index_sort = try segment_mod.commonIndexSortForMergeInputsAlloc(self.alloc, inputs);
+        defer segment_mod.freeIndexSortFields(self.alloc, index_sort);
 
         const path = try store.pathAlloc(new_seg_id);
         defer store.allocator.free(path);
@@ -1737,7 +1739,9 @@ pub const PersistentIndex = struct {
 
         var sink_adapter = AtomicSegmentSink{ .writer = &writer };
         var sink = sink_adapter.sink();
-        try segment_mod.writeMergedSegmentToSink(self.alloc, &sink, inputs);
+        try segment_mod.writeMergedSegmentToSinkWithOptions(self.alloc, &sink, inputs, .{
+            .index_sort = index_sort,
+        });
 
         writer_active = false;
         try writer.finish();

@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const db_mod = @import("../storage/db/mod.zig");
+const db_query_search = @import("../storage/db/query/search_exec.zig");
 const graph_paths = @import("../graph/paths.zig");
 const graph_query_mod = @import("../graph/query.zig");
 const query_contract = @import("query_contract.zig");
@@ -83,6 +84,40 @@ pub fn mergeSearchResults(
         if (result.graph_results.len > 0) has_graph_results = true;
         total_hits +|= result.total_hits;
         if (result.total_hits_relation == .gte) total_hits_relation = .gte;
+    }
+
+    if (req.order_by.len > 0) {
+        var merge_req = req;
+        merge_req.offset = offset;
+        merge_req.limit = limit;
+        const final_hits = try db_query_search.mergeDistributedSortedSearchResultHitsAlloc(alloc, merge_req, results);
+        errdefer {
+            for (final_hits) |*hit| hit.deinit(alloc);
+            if (final_hits.len > 0) alloc.free(final_hits);
+        }
+
+        const graph_results = if (has_graph_results)
+            try mergeGraphSearchResults(alloc, results)
+        else
+            @constCast((&[_]db_mod.types.GraphSearchResult{})[0..]);
+        errdefer {
+            for (graph_results) |*graph_result| graph_result.deinit(alloc);
+            if (graph_results.len > 0) alloc.free(graph_results);
+        }
+
+        if (results.len > 1) {
+            clearMergedDocOrdinals(final_hits);
+            for (graph_results) |*graph_result| clearMergedDocOrdinals(graph_result.hits);
+        }
+
+        return .{
+            .alloc = alloc,
+            .hits = final_hits,
+            .total_hits = total_hits,
+            .total_hits_relation = total_hits_relation,
+            .identity_read_generation = mergedSearchResultIdentityReadGeneration(req, results),
+            .graph_results = graph_results,
+        };
     }
 
     var merged_hits = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
@@ -1170,6 +1205,95 @@ test "query merge applies global score ordering and offset" {
     try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
     try std.testing.expectEqualStrings("doc:b", merged.hits[0].id);
     try std.testing.expectEqual(@as(?u32, null), merged.hits[0].doc_ordinal);
+}
+
+fn testSortedQueryHitAlloc(alloc: std.mem.Allocator, id: []const u8, rank: i64) !db_mod.types.SearchHit {
+    const sort_values = try alloc.alloc(std.json.Value, 2);
+    errdefer alloc.free(sort_values);
+    sort_values[0] = .{ .integer = rank };
+    sort_values[1] = .{ .string = try alloc.dupe(u8, id) };
+    errdefer db_mod.types.deinitJsonValue(alloc, &sort_values[1]);
+    return .{
+        .id = try alloc.dupe(u8, id),
+        .doc_ordinal = @intCast(@max(rank, 0)),
+        .sort_values = sort_values,
+    };
+}
+
+test "query merge applies distributed typed sort ordering and cursor paging" {
+    const alloc = std.testing.allocator;
+    const order_by = [_]db_mod.types.SortField{
+        .{ .field = "rank" },
+        .{ .field = "_id" },
+    };
+
+    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 3);
+    left_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:a", 1);
+    left_hits[1] = try testSortedQueryHitAlloc(alloc, "doc:c", 3);
+    left_hits[2] = try testSortedQueryHitAlloc(alloc, "doc:e", 5);
+    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+    right_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:b", 2);
+    right_hits[1] = try testSortedQueryHitAlloc(alloc, "doc:d", 4);
+
+    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 3 };
+    defer left.deinit();
+    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 2, .total_hits_relation = .gte };
+    defer right.deinit();
+
+    var first_page = try mergeSearchResults(alloc, .{ .order_by = &order_by }, &.{ left, right }, 1, 3);
+    defer first_page.deinit();
+    try std.testing.expectEqual(@as(u32, 5), first_page.total_hits);
+    try std.testing.expectEqual(db_mod.types.TotalHitsRelation.gte, first_page.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 3), first_page.hits.len);
+    try std.testing.expectEqualStrings("doc:b", first_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", first_page.hits[1].id);
+    try std.testing.expectEqualStrings("doc:d", first_page.hits[2].id);
+    try std.testing.expectEqual(@as(?u32, null), first_page.hits[0].doc_ordinal);
+
+    const after_cursor = [_]std.json.Value{
+        .{ .integer = 2 },
+        .{ .string = "doc:b" },
+    };
+    var after_page = try mergeSearchResults(alloc, .{
+        .order_by = &order_by,
+        .search_after = &after_cursor,
+    }, &.{ left, right }, 0, 2);
+    defer after_page.deinit();
+    try std.testing.expectEqual(@as(usize, 2), after_page.hits.len);
+    try std.testing.expectEqualStrings("doc:c", after_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:d", after_page.hits[1].id);
+
+    const before_cursor = [_]std.json.Value{
+        .{ .integer = 5 },
+        .{ .string = "doc:e" },
+    };
+    var before_page = try mergeSearchResults(alloc, .{
+        .order_by = &order_by,
+        .search_before = &before_cursor,
+    }, &.{ left, right }, 0, 2);
+    defer before_page.deinit();
+    try std.testing.expectEqual(@as(usize, 2), before_page.hits.len);
+    try std.testing.expectEqualStrings("doc:c", before_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:d", before_page.hits[1].id);
+}
+
+test "query merge rejects sorted shards without complete sort tuples" {
+    const alloc = std.testing.allocator;
+    const order_by = [_]db_mod.types.SortField{
+        .{ .field = "rank" },
+        .{ .field = "_id" },
+    };
+
+    var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .sort_values = try alloc.alloc(std.json.Value, 1),
+    };
+    hits[0].sort_values[0] = .{ .integer = 1 };
+    var result = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 1 };
+    defer result.deinit();
+
+    try std.testing.expectError(error.InvalidQueryRequest, mergeSearchResults(alloc, .{ .order_by = &order_by }, &.{result}, 0, 10));
 }
 
 test "query merge preserves single-result doc ordinals" {

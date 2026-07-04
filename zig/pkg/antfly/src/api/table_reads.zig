@@ -4110,6 +4110,12 @@ fn queryHostedAcrossGroupsParallel(
     return merged;
 }
 
+fn distributedSearchShardLimit(req: db_mod.types.SearchRequest) u32 {
+    if (req.search_after.len > 0 or req.search_before.len > 0) return req.limit;
+    const shard_limit = req.limit +| req.offset;
+    return if (shard_limit == 0) req.limit else shard_limit;
+}
+
 fn cloneRuntimePreflightSummary(
     alloc: std.mem.Allocator,
     summary: db_mod.RuntimePreflightSummary,
@@ -4471,11 +4477,10 @@ fn queryProvisionedAcrossGroups(
     try validateResolvedDocFilterForGroups(alloc, self.catalog, table_name, group_ids, req);
     const distributed_text_stats = try collectProvisionedSearchRequestTextStats(self, alloc, group_ids, req, table_name);
     defer distributed_stats_mod.deinitTextFieldStats(alloc, distributed_text_stats);
-    const shard_limit = req.limit + req.offset;
     const shard_req = blk: {
         var copy = req;
         copy.offset = 0;
-        copy.limit = if (shard_limit == 0) req.limit else shard_limit;
+        copy.limit = distributedSearchShardLimit(req);
         copy.distributed_text_stats = distributed_text_stats;
         break :blk copy;
     };
@@ -4514,11 +4519,10 @@ fn queryHostedAcrossGroups(
     try rejectHostedRemoteResolvedDocFilter(self, alloc, group_ids, table_name, req, consistency);
     const distributed_text_stats = try collectHostedSearchRequestTextStats(self, alloc, group_ids, req, table_name, consistency);
     defer distributed_stats_mod.deinitTextFieldStats(alloc, distributed_text_stats);
-    const shard_limit = req.limit + req.offset;
     const shard_req = blk: {
         var copy = req;
         copy.offset = 0;
-        copy.limit = if (shard_limit == 0) req.limit else shard_limit;
+        copy.limit = distributedSearchShardLimit(req);
         copy.distributed_text_stats = distributed_text_stats;
         break :blk copy;
     };

@@ -50,6 +50,39 @@ The runtime engine should then choose the most efficient exact plan available:
 Stored JSON is the source payload. It is not the production search index and
 should not be on the hot path for exact filter or sort execution.
 
+## Recommended Long-Term Shape
+
+The long-term design should be:
+
+1. Use Antfly mappings as the only user-facing declaration of field
+   capabilities.
+2. Lower sortable keyword, numeric, date, boolean, and `_id` fields into native
+   doc values and planner capability metadata.
+3. Keep analyzed `text` fields search-only; users sort on keyword/scalar
+   fields such as `title.keyword`, not `title`.
+4. Treat `search_after` and `search_before` as typed cursor tuples over the
+   effective `order_by`, including the implicit `_id` tie-breaker.
+5. Use doc-values top-N collection as the general exact sort path.
+6. Use Lucene-style `index_sort` as an optional acceleration path for the
+   dominant sort, with segments flushed and merged in that physical order.
+7. Push filters into native postings/doc-set/vector structures before sorting
+   whenever that preserves the query's exactness contract.
+8. Reject exact `order_by` requests that would require approximate ANN
+   overfetch/rerank or unbounded stored JSON scans.
+
+This means Antfly should not add a separate sort-index DSL and should not rely
+on coordinator reranking as the normal answer for sorted pagination. The
+production API remains Elasticsearch-like: mappings define what can be
+searched, filtered, aggregated, and sorted; `_sort` values are returned with
+hits; clients pass those values back as `search_after`; and the engine chooses
+the best exact physical plan available.
+
+The physical implementation should be Antfly-native. Elasticsearch is the right
+public mental model, and Lucene's segment sorting/doc-values design is the
+right performance model, but Antfly should compile those ideas into its own
+segment metadata, typed doc-value sections, identity/live-doc model, and
+distributed merge protocol.
+
 ## Long-Term Target Architecture
 
 The long-term search architecture should be a native planner over mapped field

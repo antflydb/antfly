@@ -304,6 +304,27 @@ pub const TypedDocValuesReader = struct {
         return found.chunk_data[val_off] != 0;
     }
 
+    /// Get a single bytes value for a doc. Caller owns the returned slice.
+    pub fn getBytesAlloc(self: *const TypedDocValuesReader, doc_id: u32) !?[]u8 {
+        if (self.value_type != .bytes_val) return error.InvalidData;
+        const found = try self.findDoc(doc_id) orelse return null;
+        defer self.alloc.free(found.chunk_data);
+        const num_docs = std.mem.readInt(u32, found.chunk_data[0..4], .little);
+        var cursor: usize = 4 + @as(usize, num_docs) * 4;
+        for (0..found.pos) |_| {
+            if (cursor + 4 > found.chunk_data.len) return error.InvalidData;
+            const value_len = std.mem.readInt(u32, found.chunk_data[cursor..][0..4], .little);
+            cursor += 4;
+            if (value_len > found.chunk_data.len - cursor) return error.InvalidData;
+            cursor += value_len;
+        }
+        if (cursor + 4 > found.chunk_data.len) return error.InvalidData;
+        const value_len = std.mem.readInt(u32, found.chunk_data[cursor..][0..4], .little);
+        cursor += 4;
+        if (value_len > found.chunk_data.len - cursor) return error.InvalidData;
+        return try self.alloc.dupe(u8, found.chunk_data[cursor..][0..value_len]);
+    }
+
     /// Read all u64 values in a chunk. Caller owns returned slice.
     pub fn readU64Chunk(self: *const TypedDocValuesReader, chunk_idx: u32) ![]u64 {
         const chunk_data = try self.decompressChunk(chunk_idx);
