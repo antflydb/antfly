@@ -184,54 +184,66 @@ fn imageFromRgbaNoFree(allocator: std.mem.Allocator, rgba: []const u8, width: u3
 }
 
 fn decodeRgba(allocator: std.mem.Allocator, image_bytes: []const u8) !Image {
-    if (isPng(image_bytes)) {
-        const decoded = antfly_image.png.decodeRgba(allocator, image_bytes) catch |err| switch (err) {
-            error.PngDecodeFailed, error.UnsupportedPngFormat => return error.ImageDecodeFailed,
-            else => return err,
-        };
-        return .{
-            .data = decoded.rgba,
-            .width = decoded.width,
-            .height = decoded.height,
-            .channels = 4,
-        };
-    }
-
-    if (isJpeg(image_bytes)) {
-        const decoded = antfly_image.jpeg.decodeRgba(allocator, image_bytes) catch |err| switch (err) {
-            error.JpegDecodeFailed => return error.ImageDecodeFailed,
-            else => return err,
-        };
-        return .{
-            .data = decoded.rgba,
-            .width = decoded.width,
-            .height = decoded.height,
-            .channels = 4,
-        };
-    }
-
-    if (isGif(image_bytes)) {
-        const frames = antfly_image.gif.decodeFramesAlloc(allocator, image_bytes) catch |err| switch (err) {
-            error.GifDecodeFailed, error.UnsupportedGifFormat => return error.ImageDecodeFailed,
-            else => return err,
-        };
-        errdefer {
-            for (frames) |frame| allocator.free(frame.rgba);
+    try validateEncodedImageDimensions(image_bytes);
+    switch (antfly_image.detectFormat(image_bytes)) {
+        .png => {
+            const decoded = antfly_image.png.decodeRgba(allocator, image_bytes) catch |err| switch (err) {
+                error.PngDecodeFailed, error.UnsupportedPngFormat => return error.ImageDecodeFailed,
+                else => return err,
+            };
+            return try imageFromOwnedRgba(allocator, decoded.rgba, decoded.width, decoded.height);
+        },
+        .jpeg => {
+            const decoded = antfly_image.jpeg.decodeRgba(allocator, image_bytes) catch |err| switch (err) {
+                error.JpegDecodeFailed => return error.ImageDecodeFailed,
+                else => return err,
+            };
+            return try imageFromOwnedRgba(allocator, decoded.rgba, decoded.width, decoded.height);
+        },
+        .gif => {
+            const frames = antfly_image.gif.decodeFramesAlloc(allocator, image_bytes) catch |err| switch (err) {
+                error.GifDecodeFailed, error.UnsupportedGifFormat => return error.ImageDecodeFailed,
+                else => return err,
+            };
+            var cleanup_frames = true;
+            errdefer if (cleanup_frames) {
+                for (frames) |frame| allocator.free(frame.rgba);
+                allocator.free(frames);
+            };
+            if (frames.len == 0) return error.ImageDecodeFailed;
+            const first = frames[0];
+            for (frames[1..]) |frame| allocator.free(frame.rgba);
             allocator.free(frames);
-        }
-        if (frames.len == 0) return error.ImageDecodeFailed;
-        const first = frames[0];
-        for (frames[1..]) |frame| allocator.free(frame.rgba);
-        allocator.free(frames);
-        return .{
-            .data = first.rgba,
-            .width = first.width,
-            .height = first.height,
-            .channels = 4,
-        };
+            cleanup_frames = false;
+            return try imageFromOwnedRgba(allocator, first.rgba, first.width, first.height);
+        },
+        .bmp => {
+            const decoded = antfly_image.bmp.decodeRgbaLimited(allocator, image_bytes, antfly_image.DecodeLimits.inference_default) catch |err| switch (err) {
+                error.BmpDecodeFailed, error.UnsupportedBmpFormat, error.ImageTooLarge => return error.ImageDecodeFailed,
+                else => return err,
+            };
+            return try imageFromOwnedRgba(allocator, decoded.rgba, decoded.width, decoded.height);
+        },
+        .webp => {
+            const decoded = antfly_image.webp.decodeRgbaLimited(allocator, image_bytes, antfly_image.DecodeLimits.inference_default) catch |err| switch (err) {
+                error.WebpDecodeFailed, error.UnsupportedWebpFormat, error.AnimatedWebpUnsupported, error.ImageTooLarge => return error.ImageDecodeFailed,
+                else => return err,
+            };
+            return try imageFromOwnedRgba(allocator, decoded.rgba, decoded.width, decoded.height);
+        },
+        else => return error.ImageDecodeFailed,
     }
+}
 
-    return error.ImageDecodeFailed;
+fn imageFromOwnedRgba(allocator: std.mem.Allocator, rgba: []u8, width: u32, height: u32) !Image {
+    errdefer allocator.free(rgba);
+    try validateImageDimensions(width, height);
+    return .{
+        .data = rgba,
+        .width = width,
+        .height = height,
+        .channels = 4,
+    };
 }
 
 fn rgbaToRgbAlloc(allocator: std.mem.Allocator, rgba: []const u8) ![]u8 {
@@ -245,18 +257,6 @@ fn rgbaToRgbAlloc(allocator: std.mem.Allocator, rgba: []const u8) ![]u8 {
         rgb[i * 3 + 2] = rgba[i * 4 + 2];
     }
     return rgb;
-}
-
-fn isPng(bytes: []const u8) bool {
-    return antfly_image.detectFormat(bytes) == .png;
-}
-
-fn isJpeg(bytes: []const u8) bool {
-    return antfly_image.detectFormat(bytes) == .jpeg;
-}
-
-fn isGif(bytes: []const u8) bool {
-    return antfly_image.detectFormat(bytes) == .gif;
 }
 
 const red_png_2x2 = [_]u8{
@@ -1059,7 +1059,7 @@ fn preprocessClipImage(
     mean: [3]f32,
     std_dev: [3]f32,
 ) !void {
-    if (isJpeg(image_bytes)) {
+    if (antfly_image.detectFormat(image_bytes) == .jpeg) {
         const fast = preprocessClipJpegChw(allocator, image_bytes, target_size, mean, std_dev) catch |err| switch (err) {
             error.UnsupportedJpegFormat => null,
             error.JpegDecodeFailed => return error.ImageDecodeFailed,
