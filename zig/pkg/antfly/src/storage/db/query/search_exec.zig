@@ -2706,6 +2706,8 @@ const SortExecutionPlan = struct {
     source_load: SortPlanSourceLoad = .unspecified,
     distributed_behavior: SortPlanDistributedBehavior = .unspecified,
     runtime_schema: ?runtime_schema_mod.TableSchema = null,
+    index_sort_match: bool = false,
+    sorted_segment_executor_available: bool = false,
 };
 
 fn defaultSortPlanExactness(kind: SortExecutionPlanKind) SortPlanExactness {
@@ -4039,7 +4041,7 @@ fn logBenchSortCollectorProfile(
     profile: SortCollectorProfile,
 ) void {
     std.log.info(
-        "antfly_bench_sort_collector total_us={d} decorate_us={d} native_doc_value_load_us={d} native_doc_value_hits={d} native_doc_value_misses={d} stored_json_load_us={d} stored_json_loads={d} final_sort_us={d} candidates={d} cursor_rejected={d} admitted={d} replaced={d} discarded={d} selected={d} window_capacity={d} window_len={d} order_fields={d} cursor={s} plan={s} exactness={s} source={s} cursor_support={s} source_load={s} distributed={s} require_native={} native_loader={}",
+        "antfly_bench_sort_collector total_us={d} decorate_us={d} native_doc_value_load_us={d} native_doc_value_hits={d} native_doc_value_misses={d} stored_json_load_us={d} stored_json_loads={d} final_sort_us={d} candidates={d} cursor_rejected={d} admitted={d} replaced={d} discarded={d} selected={d} window_capacity={d} window_len={d} order_fields={d} cursor={s} plan={s} exactness={s} source={s} cursor_support={s} source_load={s} distributed={s} require_native={} native_loader={} index_sort_match={} sorted_segment_executor_available={}",
         .{
             nsToUs(profile.total_ns),
             nsToUs(profile.decorate_ns),
@@ -4067,6 +4069,8 @@ fn logBenchSortCollectorProfile(
             sortPlanDistributedBehaviorName(sortExecutionPlanDistributedBehavior(plan)),
             plan.require_native,
             native_loader_enabled,
+            plan.index_sort_match,
+            plan.sorted_segment_executor_available,
         },
     );
     if (profile.native_doc_value_hit_count > 0 or profile.native_doc_value_miss_count > 0 or profile.stored_json_load_count > 0) {
@@ -7606,6 +7610,21 @@ fn mappedSortCursorValueIsValid(mapping: runtime_schema_mod.FieldMapping, value:
     };
 }
 
+fn sortFieldMatchesIndexSortField(requested: types.SortField, configured: runtime_schema_mod.IndexSortField) bool {
+    return requested.desc == configured.desc and std.mem.eql(u8, requested.field, configured.field);
+}
+
+fn sortRequestMatchesIndexSort(req: types.SearchRequest, schema: runtime_schema_mod.TableSchema) bool {
+    if (schema.index_sort.len == 0 or req.order_by.len == 0) return false;
+    const field_count = effectiveSortFieldCount(req.order_by);
+    if (field_count != schema.index_sort.len) return false;
+    for (schema.index_sort, 0..) |configured, i| {
+        const requested = effectiveSortFieldAt(req.order_by, i);
+        if (!sortFieldMatchesIndexSortField(requested, configured)) return false;
+    }
+    return true;
+}
+
 fn planTextNativeSortFields(
     req: types.SearchRequest,
     snapshot: *const index_mod.IndexSnapshot,
@@ -7644,6 +7663,7 @@ fn planTextNativeSortFields(
             return error.UnsupportedQueryRequest;
         }
     }
+    const exact_index_sort_match = sortRequestMatchesIndexSort(req, schema);
     return .{
         .kind = .native_doc_values_top_n,
         .require_native = true,
@@ -7653,6 +7673,8 @@ fn planTextNativeSortFields(
         .source_load = .projected_source_after_page,
         .distributed_behavior = .shard_local_only,
         .runtime_schema = runtime_schema,
+        .index_sort_match = exact_index_sort_match,
+        .sorted_segment_executor_available = false,
     };
 }
 
@@ -9716,8 +9738,13 @@ test "native text sort validation uses runtime sortable mappings" {
             },
         },
     };
+    const index_sort = [_]runtime_schema_mod.IndexSortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id", .desc = false },
+    };
     const schema = runtime_schema_mod.TableSchema{
         .dynamic_templates = &templates,
+        .index_sort = &index_sort,
     };
 
     const valid_order_by = [_]types.SortField{.{ .field = "created_at", .desc = true }};
@@ -9731,6 +9758,8 @@ test "native text sort validation uses runtime sortable mappings" {
     }, snapshot, schema);
     try std.testing.expectEqual(SortExecutionPlanKind.native_doc_values_top_n, native_plan.kind);
     try std.testing.expect(native_plan.require_native);
+    try std.testing.expect(native_plan.index_sort_match);
+    try std.testing.expect(!native_plan.sorted_segment_executor_available);
 
     const valid_cursor = [_]std.json.Value{
         .{ .integer = 123 },
@@ -9773,6 +9802,58 @@ test "native text sort validation uses runtime sortable mappings" {
         .order_by = &unknown_order_by,
         .limit = 10,
     }, snapshot, schema));
+}
+
+test "sort planner detects exact index sort eligibility after implicit id normalization" {
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "created_at",
+        .path_match = "created_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const exact_index_sort = [_]runtime_schema_mod.IndexSortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id", .desc = false },
+    };
+    const exact_schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &templates,
+        .index_sort = &exact_index_sort,
+    };
+
+    const created_desc = [_]types.SortField{.{ .field = "created_at", .desc = true }};
+    try std.testing.expect(sortRequestMatchesIndexSort(.{
+        .order_by = &created_desc,
+    }, exact_schema));
+
+    const created_desc_with_id = [_]types.SortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id", .desc = false },
+    };
+    try std.testing.expect(sortRequestMatchesIndexSort(.{
+        .order_by = &created_desc_with_id,
+    }, exact_schema));
+
+    const wrong_direction = [_]types.SortField{.{ .field = "created_at", .desc = false }};
+    try std.testing.expect(!sortRequestMatchesIndexSort(.{
+        .order_by = &wrong_direction,
+    }, exact_schema));
+
+    const category_middle_index_sort = [_]runtime_schema_mod.IndexSortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "category", .desc = false },
+        .{ .field = "_id", .desc = false },
+    };
+    const category_schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &templates,
+        .index_sort = &category_middle_index_sort,
+    };
+    try std.testing.expect(!sortRequestMatchesIndexSort(.{
+        .order_by = &created_desc,
+    }, category_schema));
 }
 
 test "native text sort validation requires runtime mapping for non-id fields" {
