@@ -570,6 +570,7 @@ pub const GatedFrameLayerWindow = struct {
 pub const GatedFrameTailWindow = struct {
     start: usize,
     logits_end: usize,
+    end: usize,
 };
 
 pub const GatedFramePlanCursor = struct {
@@ -633,7 +634,7 @@ pub const GatedFramePlanCursor = struct {
         const logits_end = index;
         if (self.expectAt(index, .tail_argmax)) index += 1;
         self.next_index = index;
-        return .{ .start = start, .logits_end = logits_end };
+        return .{ .start = start, .logits_end = logits_end, .end = index };
     }
 
     pub fn complete(self: *const GatedFramePlanCursor) bool {
@@ -2367,6 +2368,54 @@ test "metal command planner handles full quantized row-1 layer dependency shape"
     try std.testing.expect(found_ffn_scratch);
 }
 
+test "metal command planner handles gated layer without ple" {
+    var layer_plan = GatedLayerCommandLowerer{};
+
+    try layer_plan.build(.{
+        .shares_kv = false,
+        .has_attention_pre_norm = true,
+        .attention_pre_norm_slot = 11,
+        .q_linear_slot = 21,
+        .k_linear_slot = 22,
+        .v_linear_slot = 23,
+        .q_head_norm_slot = 31,
+        .k_head_norm_slot = 32,
+        .attention_layer_index = 4,
+        .value_norm = true,
+        .attention_linear_slot = 24,
+        .attention_post_norm_slot = 12,
+        .ffn_pre_norm_slot = 13,
+        .gate_linear_slot = 25,
+        .up_linear_slot = 26,
+        .down_linear_slot = 27,
+        .ffn_post_norm_slot = 14,
+        .include_ple = false,
+        .source = 11,
+        .region = 7,
+        .kv_len = 17,
+        .hidden_size = 2048,
+        .attention_input_size = 2048,
+        .kv_dim = 512,
+        .head_dim = 128,
+        .intermediate_size = 8192,
+    });
+
+    const plan = layer_plan.view();
+    const command = layer_plan.commandView();
+    try std.testing.expectEqual(@as(usize, 12), plan.planned_ops.len);
+    try std.testing.expectEqual(plan.planned_ops.len, command.ops.len);
+    for (plan.planned_ops) |planned| {
+        try std.testing.expect(planned.kind != .ple_gate_activation);
+        try std.testing.expect(planned.kind != .ple_projection);
+        try std.testing.expect(planned.kind != .ple_post_norm_residual);
+    }
+    for (command.scratch_slots) |scratch| {
+        try std.testing.expect(scratch.slot != @intFromEnum(GatedLayerCommandLowerer.Resource.ple_input));
+        try std.testing.expect(scratch.slot != @intFromEnum(GatedLayerCommandLowerer.Resource.ple_gated));
+        try std.testing.expect(scratch.slot != @intFromEnum(GatedLayerCommandLowerer.Resource.ple_projected));
+    }
+}
+
 test "metal command planner keeps paged f32 attention distinct from dense flash" {
     var layer_plan = GatedLayerCommandLowerer{};
 
@@ -3203,8 +3252,10 @@ test "metal command planner builds quantized prefill graph command plan before e
     const tail_window = cursor.nextTailLogits() orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(usize, 29), tail_window.start);
     try std.testing.expectEqual(@as(usize, 31), tail_window.logits_end);
+    try std.testing.expectEqual(@as(usize, 32), tail_window.end);
     try std.testing.expectEqual(OpKind.tail_final_norm, view.ops[tail_window.start].kind);
     try std.testing.expectEqual(OpKind.tail_lm_head, view.ops[tail_window.logits_end - 1].kind);
+    try std.testing.expectEqual(OpKind.tail_argmax, view.ops[tail_window.end - 1].kind);
     try std.testing.expect(cursor.complete());
     var found_logits = false;
     for (view.scratch_slots) |scratch| {

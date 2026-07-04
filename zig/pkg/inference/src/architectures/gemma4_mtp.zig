@@ -194,12 +194,7 @@ pub const DraftDeviceRequest = struct {
 };
 
 fn monotonicNowNs() u64 {
-    if (comptime @import("builtin").os.tag == .freestanding) return 0;
-    var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
-        .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
-        else => return 0,
-    }
+    return platform.time.monotonicNs();
 }
 
 fn profileNow(enabled: bool) u64 {
@@ -419,6 +414,7 @@ fn maskedEmbeddingArgmax(
 }
 
 fn wantsMaskedEmbeddingArgmax(draft_cfg: gpt_mod.Config) bool {
+    if (getenvBool("ANTFLY_GEMMA4_MTP_DISABLE_MASKED_EMBEDDING")) return false;
     return draft_cfg.mtp_use_ordered_embeddings and
         draft_cfg.mtp_num_centroids != 0 and
         draft_cfg.mtp_centroid_intermediate_top_k != 0;
@@ -820,6 +816,13 @@ pub fn draftTokenDevice(request: DraftDeviceRequest) !DraftDeviceResult {
     };
     profileEvalTensor(request.draft_cb, assistant_input, request.profile_sync);
     profile.preprojection_ns = profileElapsedNs(preprojection_started_at);
+    var draft_frame_active = false;
+    if (request.draft_cb.kind() == .metal and !request.draft_cb.decoderRuntimeHasActiveFrame() and !getenvBool("ANTFLY_GEMMA4_MTP_DISABLE_DRAFT_FRAME")) {
+        draft_frame_active = request.draft_cb.decoderRuntimeBeginFrame() catch false;
+    }
+    errdefer if (draft_frame_active) {
+        request.draft_cb.decoderRuntimeCancelFrame() catch {};
+    };
 
     const assistant_started_at = profileNow(request.profile_enabled);
     const assistant_hidden = if (mtpAssistantReplayEnabled()) blk: {
@@ -863,6 +866,10 @@ pub fn draftTokenDevice(request: DraftDeviceRequest) !DraftDeviceResult {
     profileEvalTensor(request.draft_cb, projected, request.profile_sync);
     profile.postprojection_ns = profileElapsedNs(postprojection_started_at);
 
+    if (draft_frame_active) {
+        draft_frame_active = false;
+        try request.draft_cb.decoderRuntimeSubmitAndWaitFrame();
+    }
     const argmax_started_at = profileNow(request.profile_enabled);
     const draft_lm_w = try gpt_arch.getEmbeddingWeight(request.draft_cb, draft_cfg);
     defer request.draft_cb.free(draft_lm_w);
@@ -907,10 +914,12 @@ pub fn draftTokenDevice(request: DraftDeviceRequest) !DraftDeviceResult {
         profile.lm_head_ns +|= profileElapsedNs(lm_head_started_at);
 
         const selection_started_at = profileNow(request.profile_enabled);
-        if (try maskedEmbeddingArgmaxForBackend(allocator, request.draft_cb, draft_cfg, assistant_hidden, logits_ct)) |token_id| {
-            profile.selection_ns +|= profileElapsedNs(selection_started_at);
-            logit_source = .masked_embedding;
-            break :blk token_id;
+        if (wants_masked_embedding) {
+            if (try maskedEmbeddingArgmaxForBackend(allocator, request.draft_cb, draft_cfg, assistant_hidden, logits_ct)) |token_id| {
+                profile.selection_ns +|= profileElapsedNs(selection_started_at);
+                logit_source = .masked_embedding;
+                break :blk token_id;
+            }
         }
         if (try request.draft_cb.argmaxLastRow(logits_ct, 1, @intCast(draft_cfg.vocab_size))) |token_id| {
             profile.selection_ns +|= profileElapsedNs(selection_started_at);

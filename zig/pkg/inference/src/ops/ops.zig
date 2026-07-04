@@ -369,6 +369,7 @@ pub const DecoderRuntimeApplyRmsNormLinearArgmaxRequest = backend_contracts.Deco
 pub const DecoderRuntimeApplyRmsNormLinearRequest = backend_contracts.DecoderRuntimeApplyRmsNormLinearRequest;
 pub const DecoderRuntimeApplyLayerNormLinearSampleRequest = backend_contracts.DecoderRuntimeApplyLayerNormLinearSampleRequest;
 pub const DecoderRuntimeApplyRmsNormLinearSampleRequest = backend_contracts.DecoderRuntimeApplyRmsNormLinearSampleRequest;
+pub const DecoderRuntimeSampleResidentLogitsRequest = backend_contracts.DecoderRuntimeSampleResidentLogitsRequest;
 pub const DecoderRuntimePrepareLinearRequest = backend_contracts.DecoderRuntimePrepareLinearRequest;
 pub const DecoderRuntimeEnsureLinearSlotRequest = backend_contracts.DecoderRuntimeEnsureLinearSlotRequest;
 pub const DecoderRuntimeApplyLinearRequest = backend_contracts.DecoderRuntimeApplyLinearRequest;
@@ -512,6 +513,7 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_deberta_attention_legacy_calls: u64 = 0,
     metal_runtime_deberta_attention_gemm_calls: u64 = 0,
     metal_runtime_deberta_attention_gemm_fallbacks: u64 = 0,
+    metal_runtime_paged_attention_1x_calls: u64 = 0,
     metal_runtime_compute_encoder_count: u64 = 0,
     metal_runtime_blit_encoder_count: u64 = 0,
     metal_runtime_last_frame_compute_encoder_count: u64 = 0,
@@ -564,6 +566,24 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_q8_0_pair_activation_rms_scale_mmv_f16_output: u64 = 0,
     metal_runtime_q8_0_linear_mmv_f16_input: u64 = 0,
     metal_runtime_q8_0_linear_family_dispatch_counts: [12][4]u64 = [_][4]u64{[_]u64{0} ** 4} ** 12,
+    metal_runtime_q4_0_linear_reduce: u64 = 0,
+    metal_runtime_q4_0_linear_reduce_f16_input: u64 = 0,
+    metal_runtime_q4_0_linear_reduce_f16_output: u64 = 0,
+    metal_runtime_q4_0_linear_reduce_f16_input_f16_output: u64 = 0,
+    metal_runtime_q4_0_linear_reduce_sumsq: u64 = 0,
+    metal_runtime_q4_0_pair: u64 = 0,
+    metal_runtime_q4_0_pair_reduce: u64 = 0,
+    metal_runtime_q4_0_pair_activation_reduce: u64 = 0,
+    metal_runtime_q4_0_pair_activation_reduce_f16_output: u64 = 0,
+    metal_runtime_q4_0_pair_activation_rms_scale_reduce_f16_output: u64 = 0,
+    metal_runtime_q4_0_activation_rhs_reduce: u64 = 0,
+    metal_runtime_q4_0_activation_rhs_reduce_f16_output: u64 = 0,
+    metal_runtime_q4_0_ple_activation_rhs_reduce_f16_output: u64 = 0,
+    metal_runtime_q4_0_ple_linear_reduce_f16_input: u64 = 0,
+    metal_runtime_q4_0_linear_reduce_encode_nanos: u64 = 0,
+    metal_runtime_q4_0_pair_reduce_encode_nanos: u64 = 0,
+    metal_runtime_q4_0_pair_activation_reduce_encode_nanos: u64 = 0,
+    metal_runtime_q4_0_activation_rhs_reduce_encode_nanos: u64 = 0,
     metal_runtime_q4_k_linear_reduce: u64 = 0,
     metal_runtime_q4_k_pair_reduce: u64 = 0,
     metal_runtime_q4_k_pair_activation_reduce: u64 = 0,
@@ -571,6 +591,7 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_q4_k_activation_rhs_reduce: u64 = 0,
     metal_runtime_q6_k_linear_reduce: u64 = 0,
     metal_runtime_q6_k_linear_reduce_f16_input: u64 = 0,
+    metal_runtime_rms_norm_add_sumsq: u64 = 0,
     metal_provider_quantized_slots: u64 = 0,
     metal_provider_quantized_raw_bytes: u64 = 0,
     metal_provider_quantized_raw_owned_bytes: u64 = 0,
@@ -1809,6 +1830,11 @@ pub const ComputeBackend = struct {
         /// token from the resulting last-row logits using a penalty-free
         /// sampling config.
         decoderRuntimeApplyRmsNormLinearSample: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyRmsNormLinearSampleRequest) anyerror!?usize = null,
+
+        /// Sample a token from the full logits left resident in the backend's
+        /// sample-logits buffer by the most recent decode frame's fused
+        /// lm-head tail.
+        decoderRuntimeSampleResidentLogits: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeSampleResidentLogitsRequest) anyerror!?usize = null,
 
         /// Upload dense linear parameters into a backend-owned whole-token
         /// runtime slot. Weight shape is [out_dim, in_dim], bias shape is
@@ -3535,6 +3561,13 @@ pub const ComputeBackend = struct {
 
     pub fn decoderRuntimeApplyRmsNormLinearSample(self: *const ComputeBackend, request: *const DecoderRuntimeApplyRmsNormLinearSampleRequest) !?usize {
         if (self.vtable.decoderRuntimeApplyRmsNormLinearSample) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn decoderRuntimeSampleResidentLogits(self: *const ComputeBackend, request: *const DecoderRuntimeSampleResidentLogitsRequest) !?usize {
+        if (self.vtable.decoderRuntimeSampleResidentLogits) |op| {
             return op(self.ptr, request);
         }
         return null;

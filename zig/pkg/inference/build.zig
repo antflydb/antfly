@@ -353,6 +353,27 @@ pub fn build(b: *std.Build) void {
     );
     metal_prefill_bucket_bench_step.dependOn(&run_metal_prefill_bucket_bench.step);
 
+    const metal_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-metal-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/metal_q4_0_linear.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    metal_bench_exe.root_module.addImport("build_options", build_options_mod);
+    metal_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    configureNativeTool(b, metal_bench_exe, target, enable_system_blas, blas_root, enable_metal);
+    const run_metal_bench = b.addRunArtifact(metal_bench_exe);
+    if (b.args) |args| {
+        run_metal_bench.addArgs(args);
+    }
+    const metal_bench_step = b.step(
+        "inference-metal-bench",
+        "Run the focused Metal kernel benchmark; pass --mode and shape filters after --",
+    );
+    metal_bench_step.dependOn(&run_metal_bench.step);
+
     const run_finetune = b.addRunArtifact(exe);
     run_finetune.step.dependOn(b.getInstallStep());
     run_finetune.addArg("finetune");

@@ -247,6 +247,68 @@ pub fn printBackendTimingDetails(
         },
     );
     std.debug.print(
+        "{s}_q8_0_dispatch: scalar={d} mmv={d} small_batch={d} mm={d} rows_1={d} rows_2_8={d} rows_9_64={d} rows_65_plus={d} pair_act_mm_out_f16={d} linear_mm_in_f16={d} pair_act_rms_mmv_out_f16={d} linear_mmv_in_f16={d}\n",
+        .{
+            prefix,
+            provider_stats.metal_runtime_q8_0_linear_dispatch_scalar,
+            provider_stats.metal_runtime_q8_0_linear_dispatch_mmv,
+            provider_stats.metal_runtime_q8_0_linear_dispatch_small_batch,
+            provider_stats.metal_runtime_q8_0_linear_dispatch_mm,
+            provider_stats.metal_runtime_q8_0_linear_rows_1,
+            provider_stats.metal_runtime_q8_0_linear_rows_2_8,
+            provider_stats.metal_runtime_q8_0_linear_rows_9_64,
+            provider_stats.metal_runtime_q8_0_linear_rows_65_plus,
+            provider_stats.metal_runtime_q8_0_pair_activation_mm_f16_output,
+            provider_stats.metal_runtime_q8_0_linear_mm_f16_input,
+            provider_stats.metal_runtime_q8_0_pair_activation_rms_scale_mmv_f16_output,
+            provider_stats.metal_runtime_q8_0_linear_mmv_f16_input,
+        },
+    );
+    std.debug.print(
+        "{s}_attention_dispatch: paged_1x={d}\n",
+        .{ prefix, provider_stats.metal_runtime_paged_attention_1x_calls },
+    );
+    std.debug.print(
+        "{s}_q4_0_dispatch: linear_reduce={d} linear_reduce_in_f16={d} linear_reduce_out_f16={d} linear_reduce_in_f16_out_f16={d} linear_reduce_sumsq={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} pair_act_rms_scale_reduce_out_f16={d} activation_rhs_reduce={d} activation_rhs_reduce_out_f16={d} rms_norm_add_sumsq={d} pair_reduce={d} pair={d}\n",
+        .{
+            prefix,
+            provider_stats.metal_runtime_q4_0_linear_reduce,
+            provider_stats.metal_runtime_q4_0_linear_reduce_f16_input,
+            provider_stats.metal_runtime_q4_0_linear_reduce_f16_output,
+            provider_stats.metal_runtime_q4_0_linear_reduce_f16_input_f16_output,
+            provider_stats.metal_runtime_q4_0_linear_reduce_sumsq,
+            provider_stats.metal_runtime_q4_0_pair_activation_reduce,
+            provider_stats.metal_runtime_q4_0_pair_activation_reduce_f16_output,
+            provider_stats.metal_runtime_q4_0_pair_activation_rms_scale_reduce_f16_output,
+            provider_stats.metal_runtime_q4_0_activation_rhs_reduce,
+            provider_stats.metal_runtime_q4_0_activation_rhs_reduce_f16_output,
+            provider_stats.metal_runtime_rms_norm_add_sumsq,
+            provider_stats.metal_runtime_q4_0_pair_reduce,
+            provider_stats.metal_runtime_q4_0_pair,
+        },
+    );
+    std.debug.print(
+        "{s}_q4_q6_k_dispatch: q4_linear_reduce={d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_in_f16={d}\n",
+        .{
+            prefix,
+            provider_stats.metal_runtime_q4_k_linear_reduce,
+            provider_stats.metal_runtime_q4_k_pair_reduce,
+            provider_stats.metal_runtime_q4_k_pair_activation_reduce,
+            provider_stats.metal_runtime_q4_k_pair_activation_reduce_f16_output,
+            provider_stats.metal_runtime_q4_k_activation_rhs_reduce,
+            provider_stats.metal_runtime_q6_k_linear_reduce,
+            provider_stats.metal_runtime_q6_k_linear_reduce_f16_input,
+        },
+    );
+    std.debug.print(
+        "{s}_q4_0_ple_dispatch: activation_rhs_reduce_out_f16={d} linear_reduce_in_f16={d}\n",
+        .{
+            prefix,
+            provider_stats.metal_runtime_q4_0_ple_activation_rhs_reduce_f16_output,
+            provider_stats.metal_runtime_q4_0_ple_linear_reduce_f16_input,
+        },
+    );
+    std.debug.print(
         "{s}_quant_exec_classes: attn_device_native={d} attn_backend_dense={d} attn_wrapper={d} attn_dense_lazy={d} router_device_native={d} router_backend_dense={d} router_wrapper={d} lm_head_device_native={d} lm_head_backend_dense={d} lm_head_wrapper={d}\n",
         .{
             prefix,

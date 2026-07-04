@@ -48,7 +48,7 @@ pub fn getTimingStats() TimingStats {
 
 fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingStats, has_runtime: bool) void {
     std.debug.print(
-        "metal_executor_ms: runtime_prepare_calls={d} runtime_prepare={d} runtime_prepare_family={d} runtime_prepare_greedy={d} runtime_prepare_fast_hits={d} prefill_calls={d} prefill_prepare={d} prefill_direct_last={d} prefill_direct_family={d} prefill_family_project={d} prefill_family_span_prep={d} prefill_family_quant_attn={d} prefill_family_block_apply={d} prefill_family_frame_wait={d} prefill_family_frame_gpu={d} prefill_fallback={d} decode_begin={d} sample_calls={d} sample_direct={d} sample_fallback={d} greedy_calls={d} greedy_direct={d} greedy_fallback={d} greedy_token_handoff_attempts={d} greedy_token_handoff_hits={d} greedy_token_handoff_fallbacks={d} greedy_token_seeds={d} ensure_prepared_calls={d} ensure_prepared={d} ensure_sync={d} ensure_family={d} ensure_greedy={d} ensure_fast_hits={d}\n",
+        "metal_executor_ms: runtime_prepare_calls={d} runtime_prepare={d} runtime_prepare_family={d} runtime_prepare_greedy={d} runtime_prepare_fast_hits={d} prefill_calls={d} prefill_prepare={d} prefill_direct_last={d} prefill_direct_family={d} prefill_family_project={d} prefill_family_span_prep={d} prefill_family_quant_attn={d} prefill_family_block_apply={d} prefill_family_frame_wait={d} prefill_family_frame_gpu={d} prefill_fallback={d} decode_begin={d} sample_calls={d} sample_direct={d} sample_fallback={d}\n",
         .{
             metal_stats.runtime_prepare_calls,
             @divTrunc(metal_stats.runtime_prepare_nanos, std.time.ns_per_ms),
@@ -70,6 +70,11 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
             metal_stats.decode_sample_calls,
             @divTrunc(metal_stats.decode_sample_direct_nanos, std.time.ns_per_ms),
             @divTrunc(metal_stats.decode_sample_fallback_nanos, std.time.ns_per_ms),
+        },
+    );
+    std.debug.print(
+        "metal_executor_ms2: greedy_calls={d} greedy_direct={d} greedy_fallback={d} greedy_token_handoff_attempts={d} greedy_token_handoff_hits={d} greedy_token_handoff_fallbacks={d} greedy_token_seeds={d} ensure_prepared_calls={d} ensure_prepared={d} ensure_sync={d} ensure_family={d} ensure_greedy={d} ensure_fast_hits={d}\n",
+        .{
             metal_stats.decode_greedy_calls,
             @divTrunc(metal_stats.decode_greedy_direct_nanos, std.time.ns_per_ms),
             @divTrunc(metal_stats.decode_greedy_fallback_nanos, std.time.ns_per_ms),
@@ -654,6 +659,33 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
         },
     );
     std.debug.print(
+        "metal_q4_0_dispatch: linear_reduce={d} linear_reduce_in_f16={d} linear_reduce_out_f16={d} linear_reduce_in_f16_out_f16={d} linear_reduce_sumsq={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} pair_act_rms_scale_reduce_out_f16={d} activation_rhs_reduce={d} activation_rhs_reduce_out_f16={d} rms_norm_add_sumsq={d} pair_reduce={d} pair={d}\n",
+        .{
+            provider_stats.metal_runtime_q4_0_linear_reduce,
+            provider_stats.metal_runtime_q4_0_linear_reduce_f16_input,
+            provider_stats.metal_runtime_q4_0_linear_reduce_f16_output,
+            provider_stats.metal_runtime_q4_0_linear_reduce_f16_input_f16_output,
+            provider_stats.metal_runtime_q4_0_linear_reduce_sumsq,
+            provider_stats.metal_runtime_q4_0_pair_activation_reduce,
+            provider_stats.metal_runtime_q4_0_pair_activation_reduce_f16_output,
+            provider_stats.metal_runtime_q4_0_pair_activation_rms_scale_reduce_f16_output,
+            provider_stats.metal_runtime_q4_0_activation_rhs_reduce,
+            provider_stats.metal_runtime_q4_0_activation_rhs_reduce_f16_output,
+            provider_stats.metal_runtime_rms_norm_add_sumsq,
+            provider_stats.metal_runtime_q4_0_pair_reduce,
+            provider_stats.metal_runtime_q4_0_pair,
+        },
+    );
+    std.debug.print(
+        "metal_q4_0_encode_us: linear_reduce={d} pair_reduce={d} pair_act_reduce={d} activation_rhs_reduce={d}\n",
+        .{
+            @divTrunc(provider_stats.metal_runtime_q4_0_linear_reduce_encode_nanos, 1000),
+            @divTrunc(provider_stats.metal_runtime_q4_0_pair_reduce_encode_nanos, 1000),
+            @divTrunc(provider_stats.metal_runtime_q4_0_pair_activation_reduce_encode_nanos, 1000),
+            @divTrunc(provider_stats.metal_runtime_q4_0_activation_rhs_reduce_encode_nanos, 1000),
+        },
+    );
+    std.debug.print(
         "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_in_f16={d}\n",
         .{
             provider_stats.metal_runtime_q4_k_linear_reduce,
@@ -663,6 +695,13 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
             provider_stats.metal_runtime_q4_k_activation_rhs_reduce,
             provider_stats.metal_runtime_q6_k_linear_reduce,
             provider_stats.metal_runtime_q6_k_linear_reduce_f16_input,
+        },
+    );
+    std.debug.print(
+        "metal_q4_0_ple_dispatch: activation_rhs_reduce_out_f16={d} linear_reduce_in_f16={d}\n",
+        .{
+            provider_stats.metal_runtime_q4_0_ple_activation_rhs_reduce_f16_output,
+            provider_stats.metal_runtime_q4_0_ple_linear_reduce_f16_input,
         },
     );
     const q8_family_dispatch = provider_stats.metal_runtime_q8_0_linear_family_dispatch_counts;
@@ -1080,6 +1119,9 @@ const RuntimeContext = struct {
     mirrored_token_count: usize,
     mirrored_kv_view: ?generation.KvView,
     mirrored_kv_compacted: bool,
+    pipelined_decode_armed: bool = false,
+    pipelined_next_position: usize = 0,
+    pipelined_kv_advanced_for: ?usize = null,
     raw_span_state: ?DecoderRuntimeSpanState,
     greedy_device_token_tensor: ?ops.CT,
     greedy_device_token_id: ?i64,
@@ -1272,7 +1314,7 @@ const RuntimeContext = struct {
     }
 
     fn decoderRuntimeExecutorEnabled(self: *const RuntimeContext) bool {
-        return self.use_decoder_runtime_executor;
+        return self.use_decoder_runtime_executor and !envFlag("TERMITE_METAL_DISABLE_DECODER_RUNTIME_EXECUTOR");
     }
 
     fn notePrefill(self: *RuntimeContext, token_count: usize) !void {
@@ -1619,6 +1661,113 @@ const RuntimeContext = struct {
         return output;
     }
 
+    fn drainPipelinedDecode(self: *RuntimeContext) void {
+        if (!self.pipelined_decode_armed) return;
+        _ = metal_runtime.decoderRuntimePipelinedAwaitToken(&self.cb) catch null;
+        self.pipelined_decode_armed = false;
+        self.pipelined_kv_advanced_for = null;
+    }
+
+    fn decodeGreedyPipelined(
+        self: *RuntimeContext,
+        allocator: std.mem.Allocator,
+        request: model_runtime.DecodeRequest,
+    ) !?i64 {
+        if (request.attention_mode != .paged_decode) return null;
+        if (self.gpt_config.family != .gemma) return null;
+        const configured_layer_count = self.decoderRuntimeConfiguredLayerCount();
+        if (self.pipelined_decode_armed and self.pipelined_next_position != request.position) {
+            self.drainPipelinedDecode();
+        }
+        if (!self.pipelined_decode_armed) {
+            var arm_seq_len: usize = 0;
+            var arm_context: gpt_arch.DecodeContext = undefined;
+            if (self.pipelined_kv_advanced_for) |advanced_position| {
+                if (advanced_position != request.position) return null;
+                self.pipelined_kv_advanced_for = null;
+                arm_seq_len = request.position + 1;
+                arm_context = self.makeDecodeContext(arm_seq_len, 1, request.attention_mode);
+            } else {
+                const step = try self.beginDecodeStep(request.position, request.attention_mode);
+                arm_seq_len = step.seq_len;
+                arm_context = step.decode_context;
+            }
+            if (!(try self.ensureDecoderRuntimePrepared())) {
+                // KV already advanced; run the synchronous forward on this state.
+                return try metal_runtime.forwardGreedyTokenFamily(
+                    &self.cb,
+                    allocator,
+                    self.gpt_config,
+                    configured_layer_count,
+                    request.token_id,
+                    arm_seq_len,
+                    &arm_context,
+                );
+            }
+            const armed = metal_runtime.forwardGreedyTokenPipelinedArmFamily(
+                &self.cb,
+                allocator,
+                self.gpt_config,
+                configured_layer_count,
+                request.token_id,
+                arm_seq_len,
+                &arm_context,
+            ) catch false;
+            if (!armed) {
+                return try metal_runtime.forwardGreedyTokenFamily(
+                    &self.cb,
+                    allocator,
+                    self.gpt_config,
+                    configured_layer_count,
+                    request.token_id,
+                    arm_seq_len,
+                    &arm_context,
+                );
+            }
+            self.pipelined_decode_armed = true;
+            self.pipelined_next_position = request.position;
+        }
+        // Pending frame produces the token at position request.position + 1.
+        // Speculatively advance KV bookkeeping and encode the next frame with
+        // the device-resident token id, then wait the pending frame.
+        const next_step = try self.beginDecodeStep(request.position + 1, request.attention_mode);
+        if (!(try self.ensureDecoderRuntimePrepared())) {
+            self.pipelined_kv_advanced_for = request.position + 1;
+            const token = (try metal_runtime.decoderRuntimePipelinedAwaitToken(&self.cb)) orelse return error.InvalidModelOutput;
+            self.pipelined_decode_armed = false;
+            if (token < 0) return error.InvalidModelOutput;
+            self.noteDecoderRuntimeStateFromCurrentView();
+            return token;
+        }
+        if (try metal_runtime.forwardGreedyTokenPipelinedStepFamily(
+            &self.cb,
+            allocator,
+            self.gpt_config,
+            configured_layer_count,
+            next_step.seq_len,
+            &next_step.decode_context,
+        )) |token| {
+            if (token < 0) return error.InvalidModelOutput;
+            if (metal_runtime.decoderRuntimePipelinedSubmitPending(&self.cb)) {
+                self.pipelined_decode_armed = true;
+                self.pipelined_next_position = request.position + 1;
+            } else {
+                metal_runtime.decoderRuntimePipelinedCancelPending(&self.cb);
+                self.pipelined_decode_armed = false;
+                self.pipelined_kv_advanced_for = request.position + 1;
+            }
+            self.noteDecoderRuntimeStateFromCurrentView();
+            return token;
+        }
+        // Step failed after speculative append: drain pending frame for its token.
+        self.pipelined_kv_advanced_for = request.position + 1;
+        const token = (try metal_runtime.decoderRuntimePipelinedAwaitToken(&self.cb)) orelse return error.InvalidModelOutput;
+        self.pipelined_decode_armed = false;
+        if (token < 0) return error.InvalidModelOutput;
+        self.noteDecoderRuntimeStateFromCurrentView();
+        return token;
+    }
+
     fn forwardDecoderRuntimeGreedyToken(
         self: *RuntimeContext,
         allocator: std.mem.Allocator,
@@ -1695,6 +1844,10 @@ fn envFlag(name: [:0]const u8) bool {
     const value = c_std.getenv(name) orelse return false;
     const slice = std.mem.span(value);
     return slice.len > 0 and !std.mem.eql(u8, slice, "0");
+}
+
+fn pipelinedDecodeFrameEnabled() bool {
+    return !envFlag("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME");
 }
 
 fn decoderRuntimePrefillAfterPrepareRequested() bool {
@@ -1848,6 +2001,7 @@ fn runtimePrepare(
 
 fn runtimeReset(ctx: *anyopaque) !void {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
+    runtime_ctx.drainPipelinedDecode();
     try runtime_ctx.resetState();
 }
 
@@ -1885,6 +2039,7 @@ fn runtimePrefill(
     request: model_runtime.PrefillRequest,
 ) !model_runtime.ModelOutput {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
+    runtime_ctx.drainPipelinedDecode();
     if (request.input_ids.len == 0 or request.query_seq_len == 0) return error.EmptyPrompt;
     if (request.input_ids.len != request.query_seq_len) return error.UnsupportedShape;
     if (request.query_seq_len > request.seq_len) return error.UnsupportedShape;
@@ -1928,6 +2083,7 @@ fn runtimePrefill(
             request.input_ids,
             request.seq_len,
             &decode_context,
+            request.prefer_greedy_token,
         )) |tail| {
             const timing_after = runtime_ctx.cb.directFamilyTimingSnapshot();
             const delta = timing_after.delta(timing_before);
@@ -1949,6 +2105,7 @@ fn runtimePrefill(
                 .vocab_size = tail.vocab_size,
                 .eps = tail.norm_eps,
                 .final_logit_softcap = runtime_ctx.gpt_config.final_logit_softcapping,
+                .greedy_token_id = tail.greedy_token_id,
             } };
         }
         const timing_after = runtime_ctx.cb.directFamilyTimingSnapshot();
@@ -1980,6 +2137,7 @@ fn runtimeDecode(
     request: model_runtime.DecodeRequest,
 ) !model_runtime.ModelOutput {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
+    runtime_ctx.drainPipelinedDecode();
     runtime_ctx.clearGreedyDeviceToken();
     const step = try runtime_ctx.beginDecodeStep(request.position, request.attention_mode);
 
@@ -2005,6 +2163,7 @@ fn runtimeDecodeSample(
         const greedy = try runtimeDecodeGreedy(ctx, allocator, request.decode);
         return .{ .token_id = greedy.token_id };
     }
+    runtime_ctx.drainPipelinedDecode();
 
     timing_stats.decode_sample_calls += 1;
     runtime_ctx.clearGreedyDeviceToken();
@@ -2083,6 +2242,13 @@ fn runtimeDecodeGreedy(
 ) !model_runtime.GreedyDecodeOutput {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
     timing_stats.decode_greedy_calls += 1;
+    if (pipelinedDecodeFrameEnabled()) {
+        const pipelined_started_at = monotonicNowNs();
+        if (try runtime_ctx.decodeGreedyPipelined(allocator, request)) |token_id| {
+            timing_stats.decode_greedy_direct_nanos += @intCast(monotonicNowNs() - pipelined_started_at);
+            return .{ .token_id = token_id };
+        }
+    }
     const begin_started_at = monotonicNowNs();
     const step = try runtime_ctx.beginDecodeStep(request.position, request.attention_mode);
     timing_stats.decode_begin_step_nanos += @intCast(monotonicNowNs() - begin_started_at);
