@@ -1770,7 +1770,18 @@ fn appendRuntimeSchemaObject(
     const ttl_text = try std.fmt.allocPrint(alloc, "{d}", .{schema.ttl_duration_ns});
     defer alloc.free(ttl_text);
     try out.appendSlice(alloc, ttl_text);
-    try out.appendSlice(alloc, ",\"dynamic_templates\":[");
+    try out.appendSlice(alloc, ",\"index_sort\":[");
+    for (schema.index_sort, 0..) |field, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, '{');
+        try appendJsonString(alloc, out, "field");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, field.field);
+        try out.appendSlice(alloc, ",\"order\":");
+        try appendJsonString(alloc, out, if (field.desc) "desc" else "asc");
+        try out.append(alloc, '}');
+    }
+    try out.appendSlice(alloc, "],\"dynamic_templates\":[");
     for (schema.dynamic_templates, 0..) |tmpl, i| {
         if (i > 0) try out.append(alloc, ',');
         try out.append(alloc, '{');

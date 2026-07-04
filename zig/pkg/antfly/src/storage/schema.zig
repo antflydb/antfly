@@ -117,6 +117,11 @@ pub const FullTextDocument = struct {
     infer_type_dynamic_paths: []const []const u8 = &.{},
 };
 
+pub const IndexSortField = struct {
+    field: []const u8,
+    desc: bool = false,
+};
+
 pub const TableSchema = struct {
     version: u32 = 0,
     default_type: []const u8 = "_default",
@@ -125,6 +130,7 @@ pub const TableSchema = struct {
     enforce_types: bool = false,
     dynamic_templates: []const DynamicTemplate = &.{},
     full_text_documents: []const FullTextDocument = &.{},
+    index_sort: []const IndexSortField = &.{},
 };
 
 // ============================================================================
@@ -145,7 +151,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 9); // format version
+    try appendU32(&buf, alloc, 10); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -198,6 +204,12 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         for (doc.infer_type_dynamic_paths) |path| try appendStr(&buf, alloc, path);
     }
 
+    try appendU32(&buf, alloc, @intCast(schema.index_sort.len));
+    for (schema.index_sort) |field| {
+        try appendStr(&buf, alloc, field.field);
+        try buf.append(alloc, if (field.desc) 1 else 0);
+    }
+
     const result = try alloc.dupe(u8, buf.items);
     buf.deinit(alloc);
     return result;
@@ -211,7 +223,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 9) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 10) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -463,6 +475,25 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         break :blk docs;
     } else &.{};
 
+    const index_sort: []IndexSortField = if (fmt_version >= 10) blk: {
+        const field_count = readU32(data, &pos);
+        const fields = try alloc.alloc(IndexSortField, field_count);
+        var fields_initialized: usize = 0;
+        errdefer {
+            for (fields[0..fields_initialized]) |field| alloc.free(field.field);
+            alloc.free(fields);
+        }
+        for (fields) |*field| {
+            field.* = .{
+                .field = try alloc.dupe(u8, readStr(data, &pos)),
+                .desc = data[pos] == 1,
+            };
+            pos += 1;
+            fields_initialized += 1;
+        }
+        break :blk fields;
+    } else &.{};
+
     return .{
         .version = version,
         .default_type = default_type,
@@ -471,6 +502,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         .enforce_types = enforce_types,
         .dynamic_templates = templates,
         .full_text_documents = full_text_documents,
+        .index_sort = index_sort,
     };
 }
 
@@ -513,6 +545,8 @@ pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
         if (doc.infer_type_dynamic_paths.len > 0) alloc.free(doc.infer_type_dynamic_paths);
     }
     if (s.full_text_documents.len > 0) alloc.free(s.full_text_documents);
+    for (s.index_sort) |field| alloc.free(field.field);
+    if (s.index_sort.len > 0) alloc.free(s.index_sort);
 }
 
 /// Save a schema to DocStore.
@@ -995,6 +1029,10 @@ test "schema serialize/deserialize round-trip" {
                 .infer_type_dynamic_paths = &.{"typed"},
             },
         },
+        .index_sort = &.{
+            .{ .field = "created_at", .desc = true },
+            .{ .field = "_id" },
+        },
     };
 
     const data = try serializeSchema(alloc, schema);
@@ -1038,6 +1076,11 @@ test "schema serialize/deserialize round-trip" {
     try std.testing.expectEqualStrings("meta", loaded.full_text_documents[0].open_dynamic_paths[1]);
     try std.testing.expectEqual(@as(usize, 1), loaded.full_text_documents[0].infer_type_dynamic_paths.len);
     try std.testing.expectEqualStrings("typed", loaded.full_text_documents[0].infer_type_dynamic_paths[0]);
+    try std.testing.expectEqual(@as(usize, 2), loaded.index_sort.len);
+    try std.testing.expectEqualStrings("created_at", loaded.index_sort[0].field);
+    try std.testing.expect(loaded.index_sort[0].desc);
+    try std.testing.expectEqualStrings("_id", loaded.index_sort[1].field);
+    try std.testing.expect(!loaded.index_sort[1].desc);
 }
 
 test "schema save/load via DocStore" {

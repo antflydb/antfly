@@ -60,9 +60,6 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         }
         alloc.free(dynamic_templates);
     };
-    const full_text_documents = try deriveRuntimeFullTextDocuments(alloc, schema);
-    errdefer freeRuntimeFullTextDocuments(alloc, full_text_documents);
-
     for (schema.dynamic_templates, 0..) |template, i| {
         const field_type = parseRuntimeFieldType(template.field_type orelse "text");
         const doc_values = template.doc_values orelse false;
@@ -86,6 +83,12 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         initialized += 1;
     }
 
+    const full_text_documents = try deriveRuntimeFullTextDocuments(alloc, schema);
+    errdefer freeRuntimeFullTextDocuments(alloc, full_text_documents);
+
+    const index_sort = try deriveRuntimeIndexSort(alloc, schema.index_sort, dynamic_templates);
+    errdefer freeRuntimeIndexSort(alloc, index_sort);
+
     return .{
         .version = schema.version,
         .default_type = try alloc.dupe(u8, if (schema.default_type.len > 0) schema.default_type else "_default"),
@@ -94,6 +97,7 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .enforce_types = schema.enforce_types,
         .dynamic_templates = dynamic_templates,
         .full_text_documents = full_text_documents,
+        .index_sort = index_sort,
     };
 }
 
@@ -148,6 +152,71 @@ fn freeRuntimeFullTextDocuments(alloc: std.mem.Allocator, docs: []storage_schema
         if (doc.infer_type_dynamic_paths.len > 0) alloc.free(doc.infer_type_dynamic_paths);
     }
     if (docs.len > 0) alloc.free(docs);
+}
+
+fn freeRuntimeIndexSort(alloc: std.mem.Allocator, fields: []const storage_schema.IndexSortField) void {
+    for (fields) |field| alloc.free(field.field);
+    if (fields.len > 0) alloc.free(fields);
+}
+
+fn deriveRuntimeIndexSort(
+    alloc: std.mem.Allocator,
+    parsed_fields: []const impl.IndexSortField,
+    dynamic_templates: []const storage_schema.DynamicTemplate,
+) ![]const storage_schema.IndexSortField {
+    if (parsed_fields.len == 0) return &.{};
+
+    var saw_id = false;
+    for (parsed_fields, 0..) |field, i| {
+        if (std.mem.eql(u8, field.field, "_id")) {
+            if (field.desc or i != parsed_fields.len - 1) return error.InvalidSchemaUpdateRequest;
+            saw_id = true;
+        }
+        for (parsed_fields[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.field, field.field)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+
+    const count = parsed_fields.len + @as(usize, if (saw_id) 0 else 1);
+    const fields = try alloc.alloc(storage_schema.IndexSortField, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (fields[0..initialized]) |field| alloc.free(field.field);
+        alloc.free(fields);
+    }
+
+    const validation_schema = storage_schema.TableSchema{
+        .dynamic_templates = dynamic_templates,
+    };
+    for (parsed_fields) |field| {
+        if (!std.mem.eql(u8, field.field, "_id")) {
+            const mapping = storage_schema.resolveFieldType(validation_schema, field.field) orelse return error.InvalidSchemaUpdateRequest;
+            if (!mapping.sortable or !mapping.doc_values or !isRuntimeIndexSortScalar(mapping.field_type)) {
+                return error.InvalidSchemaUpdateRequest;
+            }
+        }
+        fields[initialized] = .{
+            .field = try alloc.dupe(u8, field.field),
+            .desc = field.desc,
+        };
+        initialized += 1;
+    }
+
+    if (!saw_id) {
+        fields[initialized] = .{
+            .field = try alloc.dupe(u8, "_id"),
+            .desc = false,
+        };
+        initialized += 1;
+    }
+    return fields;
+}
+
+fn isRuntimeIndexSortScalar(field_type: storage_schema.AntflyType) bool {
+    return switch (field_type) {
+        .keyword, .numeric, .boolean, .datetime, .link => true,
+        else => false,
+    };
 }
 
 fn deriveRuntimeFullTextDocuments(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![]storage_schema.FullTextDocument {
@@ -688,4 +757,73 @@ test "runtime schema derives sortable capability from scalar doc values" {
     try std.testing.expect(!runtime.dynamic_templates[1].mapping.sortable);
     try std.testing.expect(runtime.dynamic_templates[2].mapping.doc_values);
     try std.testing.expect(!runtime.dynamic_templates[2].mapping.sortable);
+}
+
+test "runtime schema derives and validates index sort metadata" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{
+        \\  "dynamic_templates": [
+        \\    {"name":"created","path_match":"created_at","mapping":{"type":"datetime","doc_values":true}},
+        \\    {"name":"rank","path_match":"rank","mapping":{"type":"numeric","doc_values":true,"sortable":false}}
+        \\  ],
+        \\  "index_sort": [
+        \\    {"field":"created_at","order":"desc"}
+        \\  ]
+        \\}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    try std.testing.expectEqual(@as(usize, 2), runtime.index_sort.len);
+    try std.testing.expectEqualStrings("created_at", runtime.index_sort[0].field);
+    try std.testing.expect(runtime.index_sort[0].desc);
+    try std.testing.expectEqualStrings("_id", runtime.index_sort[1].field);
+    try std.testing.expect(!runtime.index_sort[1].desc);
+
+    var explicit_id = try parseValidatedTableSchema(alloc,
+        \\{
+        \\  "dynamic_templates": [
+        \\    {"name":"created","path_match":"created_at","mapping":{"type":"datetime","doc_values":true}}
+        \\  ],
+        \\  "index_sort": [
+        \\    {"field":"created_at","order":"asc"},
+        \\    {"field":"_id","order":"asc"}
+        \\  ]
+        \\}
+    );
+    defer explicit_id.deinit(alloc);
+    const explicit_runtime = try deriveRuntimeTableSchema(alloc, explicit_id);
+    defer storage_schema.freeSchema(alloc, explicit_runtime);
+    try std.testing.expectEqual(@as(usize, 2), explicit_runtime.index_sort.len);
+    try std.testing.expectEqualStrings("_id", explicit_runtime.index_sort[1].field);
+
+    var unsortable = try parseValidatedTableSchema(alloc,
+        \\{
+        \\  "dynamic_templates": [
+        \\    {"name":"rank","path_match":"rank","mapping":{"type":"numeric","doc_values":true,"sortable":false}}
+        \\  ],
+        \\  "index_sort": [
+        \\    {"field":"rank","order":"asc"}
+        \\  ]
+        \\}
+    );
+    defer unsortable.deinit(alloc);
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(alloc, unsortable));
+
+    var id_not_final = try parseValidatedTableSchema(alloc,
+        \\{
+        \\  "dynamic_templates": [
+        \\    {"name":"created","path_match":"created_at","mapping":{"type":"datetime","doc_values":true}}
+        \\  ],
+        \\  "index_sort": [
+        \\    {"field":"_id","order":"asc"},
+        \\    {"field":"created_at","order":"asc"}
+        \\  ]
+        \\}
+    );
+    defer id_not_final.deinit(alloc);
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(alloc, id_not_final));
 }

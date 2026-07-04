@@ -357,6 +357,13 @@ The field name convention should be Elasticsearch-like:
 This keeps sort, filters, dynamic templates, generated SDKs, and public docs
 aligned around one field namespace.
 
+The long-term Antfly answer should be "use the Antfly mappings." There should
+not be a parallel sort-field registry that operators have to keep in sync with
+schema, SDKs, OpenAPI, and docs. Elasticsearch users already expect
+keyword/numeric/date/boolean mapping metadata to determine whether a field is
+filterable, aggregatable, and sortable. Antfly should preserve that mental model
+while compiling it into Antfly-native segment metadata and doc-value sections.
+
 ### Reserved Fields
 
 `_id` is a reserved Antfly document id field and the default final tie-breaker.
@@ -819,6 +826,13 @@ Production rules:
   planner may execute exact vector scoring over that set and then sort/page
   according to the requested semantics.
 
+Native filtering is still the right building block for vector search. The
+problem is using a bounded ANN result set as though it were the complete
+eligible set for an exact field sort. A native filter can reduce the vector
+candidate universe efficiently; it does not by itself prove that the first ANN
+page contains the globally earliest or latest documents under an unrelated
+field order.
+
 ### Hybrid And Composed Queries
 
 Hybrid queries combine score-bearing and field-ordering semantics. The planner
@@ -901,8 +915,7 @@ Capability fields:
 The planner should select among:
 
 - `sorted_segment_seek`
-- `doc_values_top_n`
-- `candidate_then_doc_values_sort`
+- `native_doc_values_top_n`
 - `score_top_k`
 - `distributed_k_way_merge`
 - `unsupported_exact_sort`
@@ -910,11 +923,20 @@ The planner should select among:
 The incremental implementation should expose those choices through an explicit
 sort execution plan instead of encoding them as nullable loaders or hidden
 fallbacks. The current in-process plan names should distinguish at least:
-`none`, `id_only`, `native_doc_values`, `stored_json_debug`, and
-`unsupported_exact_sort`. `stored_json_debug` is a test/debug-only compatibility
-plan; once a request has planned as `native_doc_values`, execution must require
-native values and fail closed if the required ordinal/doc-value coverage is not
-available.
+`none`, `id_only`, `id_seek`, `sorted_segment_seek`,
+`native_doc_values_top_n`, `score_top_k`, `distributed_k_way_merge`,
+`stored_json_debug`, and `unsupported_exact_sort`. `sorted_segment_seek` and
+`distributed_k_way_merge` are first-class plan names but must fail closed until
+their physical executors are implemented. `stored_json_debug` is a
+test/debug-only compatibility plan; once a request has planned as
+`native_doc_values_top_n`, execution must require native values and fail closed
+if the required ordinal/doc-value coverage is not available.
+
+`native_doc_values_top_n` is the general "candidate source plus typed
+doc-values collector" plan. The candidate source can be postings, a filter doc
+set, match-all identity iteration, or another exact source. The plan name should
+stay focused on the sorting primitive because that is what operators need to
+see in profiles and alerts.
 
 ## API Contract
 
@@ -983,10 +1005,11 @@ Every sorted query profile should include:
 - budget rejection reason, when rejected
 
 The stable plan names should be suitable for logs, traces, metrics, and tests.
-The current implementation should expose at least `none`, `id_only`,
-`native_doc_values`, `stored_json_debug`, and `unsupported_exact_sort`; the
-long-term planner should grow those into `id_seek`, `sorted_segment_seek`,
-`native_doc_values_top_n`, `score_top_k`, and `distributed_k_way_merge`.
+The current implementation should expose at least `none`, `id_only`, `id_seek`,
+`sorted_segment_seek`, `native_doc_values_top_n`, `score_top_k`,
+`distributed_k_way_merge`, `stored_json_debug`, and `unsupported_exact_sort`;
+unimplemented physical/distributed plans should be visible to diagnostics but
+rejected at runtime until their executors exist.
 
 The most important invariant is that telemetry must distinguish "native path
 was selected and succeeded" from "native path was unavailable." A public sorted

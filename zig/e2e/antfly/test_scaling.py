@@ -593,6 +593,7 @@ class MultiNodeScalingCluster:
         pending = {int(node["id"]): node for node in nodes}
         consecutive_successes = {node_id: 0 for node_id in pending}
         last_probe: dict[int, str] = {}
+        path = "/status" if public_api else "/healthz"
 
         while pending and time.monotonic() < deadline:
             request_timeout = max(0.1, min(2.0, deadline - time.monotonic()))
@@ -606,7 +607,7 @@ class MultiNodeScalingCluster:
 
                 url = self.data_api_url_for_node(node) if public_api else self.data_base_url_for_node(node)
                 try:
-                    response = requests.get(f"{url}/status", timeout=request_timeout)
+                    response = requests.get(f"{url}{path}", timeout=request_timeout)
                     if response.ok:
                         consecutive_successes[node_id] += 1
                         if consecutive_successes[node_id] >= 2:

@@ -23,6 +23,7 @@ pub const TableSchema = struct {
     enforce_types: bool = false,
     document_schemas: []DocumentSchema = &.{},
     dynamic_templates: []DynamicTemplate = &.{},
+    index_sort: []IndexSortField = &.{},
 
     pub fn deinit(self: *TableSchema, alloc: std.mem.Allocator) void {
         alloc.free(self.default_type);
@@ -31,6 +32,18 @@ pub const TableSchema = struct {
         if (self.document_schemas.len > 0) alloc.free(self.document_schemas);
         for (self.dynamic_templates) |*dynamic_template| dynamic_template.deinit(alloc);
         if (self.dynamic_templates.len > 0) alloc.free(self.dynamic_templates);
+        for (self.index_sort) |*field| field.deinit(alloc);
+        if (self.index_sort.len > 0) alloc.free(self.index_sort);
+        self.* = undefined;
+    }
+};
+
+pub const IndexSortField = struct {
+    field: []const u8,
+    desc: bool = false,
+
+    pub fn deinit(self: *IndexSortField, alloc: std.mem.Allocator) void {
+        alloc.free(self.field);
         self.* = undefined;
     }
 };
@@ -615,6 +628,7 @@ fn validateSchemaValue(value: std.json.Value) !void {
     if (root.get("enforce_types")) |enforce_types| if (enforce_types != .null and enforce_types != .bool) return error.InvalidSchemaUpdateRequest;
     if (root.get("document_schemas")) |document_schemas| if (document_schemas != .null) try validateDocumentSchemas(document_schemas);
     if (root.get("dynamic_templates")) |dynamic_templates| if (dynamic_templates != .null) try validateDynamicTemplates(dynamic_templates);
+    if (root.get("index_sort")) |index_sort| if (index_sort != .null) try validateIndexSort(index_sort);
 }
 
 fn validateDocumentSchemas(value: std.json.Value) !void {
@@ -1351,6 +1365,32 @@ fn validateDynamicTemplate(value: std.json.Value) !void {
     }
 }
 
+fn validateIndexSort(value: std.json.Value) !void {
+    const array = switch (value) {
+        .array => |array| array,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    if (array.items.len == 0) return error.InvalidSchemaUpdateRequest;
+    for (array.items) |entry| {
+        const object = switch (entry) {
+            .object => |object| object,
+            else => return error.InvalidSchemaUpdateRequest,
+        };
+        const field = object.get("field") orelse return error.InvalidSchemaUpdateRequest;
+        if (field != .string or field.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        if (object.get("order")) |order| {
+            if (order != .string) return error.InvalidSchemaUpdateRequest;
+            if (!std.mem.eql(u8, order.string, "asc") and !std.mem.eql(u8, order.string, "desc")) {
+                return error.InvalidSchemaUpdateRequest;
+            }
+        }
+        if (object.get("desc")) |desc| {
+            if (desc != .bool) return error.InvalidSchemaUpdateRequest;
+            if (object.get("order") != null) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+}
+
 fn mappingTypeCanSort(mapping_type: []const u8) bool {
     return std.mem.eql(u8, mapping_type, "keyword") or
         std.mem.eql(u8, mapping_type, "numeric") or
@@ -1404,7 +1444,40 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
     if (root.get("dynamic_templates")) |dynamic_templates| {
         if (dynamic_templates != .null) parsed.dynamic_templates = try parseDynamicTemplates(alloc, dynamic_templates);
     }
+    if (root.get("index_sort")) |index_sort| {
+        if (index_sort != .null) parsed.index_sort = try parseIndexSort(alloc, index_sort);
+    }
     return parsed;
+}
+
+fn parseIndexSort(alloc: std.mem.Allocator, value: std.json.Value) ![]IndexSortField {
+    const array = switch (value) {
+        .array => |array| array,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    const fields = try alloc.alloc(IndexSortField, array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (fields[0..initialized]) |*field| field.deinit(alloc);
+        alloc.free(fields);
+    }
+
+    for (array.items) |entry| {
+        const object = entry.object;
+        const field = object.get("field").?.string;
+        const desc = if (object.get("order")) |order|
+            std.mem.eql(u8, order.string, "desc")
+        else if (object.get("desc")) |desc_value|
+            desc_value.bool
+        else
+            false;
+        fields[initialized] = .{
+            .field = try alloc.dupe(u8, field),
+            .desc = desc,
+        };
+        initialized += 1;
+    }
+    return fields;
 }
 
 fn validateParsedTtlSchema(schema: TableSchema) !void {
