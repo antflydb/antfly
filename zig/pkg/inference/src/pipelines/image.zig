@@ -183,6 +183,57 @@ fn imageFromRgbaNoFree(allocator: std.mem.Allocator, rgba: []const u8, width: u3
     };
 }
 
+fn decodeRgba(allocator: std.mem.Allocator, image_bytes: []const u8) !Image {
+    if (isPng(image_bytes)) {
+        const decoded = antfly_image.png.decodeRgba(allocator, image_bytes) catch |err| switch (err) {
+            error.PngDecodeFailed, error.UnsupportedPngFormat => return error.ImageDecodeFailed,
+            else => return err,
+        };
+        return .{
+            .data = decoded.rgba,
+            .width = decoded.width,
+            .height = decoded.height,
+            .channels = 4,
+        };
+    }
+
+    if (isJpeg(image_bytes)) {
+        const decoded = antfly_image.jpeg.decodeRgba(allocator, image_bytes) catch |err| switch (err) {
+            error.JpegDecodeFailed => return error.ImageDecodeFailed,
+            else => return err,
+        };
+        return .{
+            .data = decoded.rgba,
+            .width = decoded.width,
+            .height = decoded.height,
+            .channels = 4,
+        };
+    }
+
+    if (isGif(image_bytes)) {
+        const frames = antfly_image.gif.decodeFramesAlloc(allocator, image_bytes) catch |err| switch (err) {
+            error.GifDecodeFailed, error.UnsupportedGifFormat => return error.ImageDecodeFailed,
+            else => return err,
+        };
+        errdefer {
+            for (frames) |frame| allocator.free(frame.rgba);
+            allocator.free(frames);
+        }
+        if (frames.len == 0) return error.ImageDecodeFailed;
+        const first = frames[0];
+        for (frames[1..]) |frame| allocator.free(frame.rgba);
+        allocator.free(frames);
+        return .{
+            .data = first.rgba,
+            .width = first.width,
+            .height = first.height,
+            .channels = 4,
+        };
+    }
+
+    return error.ImageDecodeFailed;
+}
+
 fn rgbaToRgbAlloc(allocator: std.mem.Allocator, rgba: []const u8) ![]u8 {
     if (rgba.len % 4 != 0) return error.ImageDecodeFailed;
     const pixel_count = rgba.len / 4;
@@ -317,21 +368,17 @@ test "decode rejects unsupported image format" {
     try std.testing.expectError(error.ImageDecodeFailed, decode(alloc, "not-an-image"));
 }
 
-test "clip preprocessing center crops before resize" {
+test "clip preprocessing resizes short edge before center crop" {
     var rgb = [_]u8{
-        10, 0, 0,
-        20, 0, 0,
-        30, 0, 0,
-        40, 0, 0,
-        50, 0, 0,
-        60, 0, 0,
-        70, 0, 0,
-        80, 0, 0,
+        0, 0, 0, 10, 0, 0, 20, 0, 0, 30, 0, 0, 40, 0, 0, 50, 0, 0, 60, 0, 0, 70, 0, 0,
+        0, 0, 0, 10, 0, 0, 20, 0, 0, 30, 0, 0, 40, 0, 0, 50, 0, 0, 60, 0, 0, 70, 0, 0,
+        0, 0, 0, 10, 0, 0, 20, 0, 0, 30, 0, 0, 40, 0, 0, 50, 0, 0, 60, 0, 0, 70, 0, 0,
+        0, 0, 0, 10, 0, 0, 20, 0, 0, 30, 0, 0, 40, 0, 0, 50, 0, 0, 60, 0, 0, 70, 0, 0,
     };
     const img = Image{
         .data = rgb[0..],
-        .width = 4,
-        .height = 2,
+        .width = 8,
+        .height = 4,
         .channels = 3,
     };
     var out: [12]f32 = undefined;
@@ -345,12 +392,12 @@ test "clip preprocessing center crops before resize" {
     );
 
     try std.testing.expectApproxEqAbs(@as(f32, 20.0 / 255.0), out[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 30.0 / 255.0), out[1], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 60.0 / 255.0), out[2], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 70.0 / 255.0), out[3], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 40.0 / 255.0), out[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 20.0 / 255.0), out[2], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 40.0 / 255.0), out[3], 1e-6);
 }
 
-test "clip preprocessing uses legacy resize source coordinates" {
+test "clip preprocessing uses resize source coordinates" {
     var rgb = [_]u8{
         0,   0, 0,
         10,  0, 0,
@@ -382,6 +429,77 @@ test "clip preprocessing uses legacy resize source coordinates" {
     for (expected_red, 0..) |expected, i| {
         try std.testing.expectApproxEqAbs(expected / 255.0, out[i], 1e-6);
     }
+}
+
+test "clip preprocessing accepts decoded rgba without changing rgb result" {
+    var rgb = [_]u8{
+        10,  20,  30,
+        40,  50,  60,
+        70,  80,  90,
+        100, 110, 120,
+    };
+    var rgba = [_]u8{
+        10,  20,  30,  255,
+        40,  50,  60,  128,
+        70,  80,  90,  64,
+        100, 110, 120, 0,
+    };
+    const rgb_img = Image{
+        .data = rgb[0..],
+        .width = 2,
+        .height = 2,
+        .channels = 3,
+    };
+    const rgba_img = Image{
+        .data = rgba[0..],
+        .width = 2,
+        .height = 2,
+        .channels = 4,
+    };
+    var rgb_out: [12]f32 = undefined;
+    var rgba_out: [12]f32 = undefined;
+
+    preprocessDecodedClip(
+        rgb_img,
+        &rgb_out,
+        2,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+    );
+    preprocessDecodedClip(
+        rgba_img,
+        &rgba_out,
+        2,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+    );
+
+    try std.testing.expectEqualSlices(f32, &rgb_out, &rgba_out);
+}
+
+test "clip batch preprocessing matches single image preprocessing" {
+    const alloc = std.testing.allocator;
+    const images = [_][]const u8{ red_png_2x2[0..], red_png_2x2[0..] };
+
+    const batch = try preprocessClipBatch(
+        alloc,
+        &images,
+        2,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+    );
+    defer alloc.free(batch);
+    const single = try preprocessClipBatch(
+        alloc,
+        images[0..1],
+        2,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+    );
+    defer alloc.free(single);
+
+    try std.testing.expectEqualSlices(f32, single, batch[0..single.len]);
+    try std.testing.expectEqualSlices(f32, single, batch[single.len .. single.len * 2]);
 }
 
 test "decode png fixture dimensions are stable" {
@@ -812,16 +930,8 @@ pub fn preprocessBatch(
     return result;
 }
 
-/// Preprocess CLIP embedding images using Antfly's CLIP runtime contract.
-///
-/// The math intentionally matches the legacy Go termite CLIP path in
-/// go/pkg/termite/lib/pipelines/image.go: crop a centered target_size window
-/// capped by source dimensions, resize that crop to target_size using source
-/// coordinates `dst * src_dim / target_dim`, and normalize to CHW f32.
-///
-/// This is not the generic vision preprocessor. Use it only for CLIP/ClipClap
-/// image embeddings that must stay compatible with vectors produced by the
-/// legacy Go runtime.
+/// Preprocess CLIP embedding images: resize the shortest edge to target_size,
+/// center crop target_size x target_size, and normalize to CHW f32.
 pub fn preprocessClipBatch(
     allocator: std.mem.Allocator,
     image_list: []const []const u8,
@@ -834,12 +944,15 @@ pub fn preprocessClipBatch(
     const result = try allocator.alloc(f32, image_list.len * per_image);
     errdefer allocator.free(result);
 
-    for (image_list, 0..) |image_bytes, i| {
-        const img = try decode(allocator, image_bytes);
-        defer img.deinit(allocator);
+    if (image_list.len > 1) {
+        try preprocessClipBatchParallel(image_list, result, per_image, target_size, mean, std_dev);
+        return result;
+    }
 
-        preprocessDecodedClip(
-            img,
+    for (image_list, 0..) |image_bytes, i| {
+        try preprocessClipImage(
+            allocator,
+            image_bytes,
             result[i * per_image ..][0..per_image],
             target_size,
             mean,
@@ -848,6 +961,140 @@ pub fn preprocessClipBatch(
     }
 
     return result;
+}
+
+const max_clip_preprocess_threads: usize = 8;
+
+const ClipPreprocessBatch = struct {
+    image_list: []const []const u8,
+    result: []f32,
+    per_image: usize,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    next: std.atomic.Value(usize) = .{ .raw = 0 },
+};
+
+const ClipPreprocessWorker = struct {
+    batch: *ClipPreprocessBatch,
+    err: ?anyerror = null,
+
+    fn run(self: *ClipPreprocessWorker) void {
+        const allocator = std.heap.page_allocator;
+
+        while (true) {
+            const i = self.batch.next.fetchAdd(1, .monotonic);
+            if (i >= self.batch.image_list.len) return;
+
+            preprocessClipImage(
+                allocator,
+                self.batch.image_list[i],
+                self.batch.result[i * self.batch.per_image ..][0..self.batch.per_image],
+                self.batch.target_size,
+                self.batch.mean,
+                self.batch.std_dev,
+            ) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    }
+};
+
+fn preprocessClipBatchParallel(
+    image_list: []const []const u8,
+    result: []f32,
+    per_image: usize,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+) !void {
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    const thread_count = @min(image_list.len, @min(cpu_count, max_clip_preprocess_threads));
+    if (thread_count <= 1) {
+        const allocator = std.heap.page_allocator;
+        for (image_list, 0..) |image_bytes, i| {
+            try preprocessClipImage(
+                allocator,
+                image_bytes,
+                result[i * per_image ..][0..per_image],
+                target_size,
+                mean,
+                std_dev,
+            );
+        }
+        return;
+    }
+
+    var batch = ClipPreprocessBatch{
+        .image_list = image_list,
+        .result = result,
+        .per_image = per_image,
+        .target_size = target_size,
+        .mean = mean,
+        .std_dev = std_dev,
+    };
+    var workers: [max_clip_preprocess_threads]ClipPreprocessWorker = undefined;
+    var threads: [max_clip_preprocess_threads]std.Thread = undefined;
+    var spawned: usize = 0;
+
+    while (spawned < thread_count) : (spawned += 1) {
+        workers[spawned] = .{ .batch = &batch };
+        threads[spawned] = std.Thread.spawn(.{}, ClipPreprocessWorker.run, .{&workers[spawned]}) catch |err| {
+            for (threads[0..spawned]) |thread| thread.join();
+            return err;
+        };
+    }
+    for (threads[0..spawned]) |thread| thread.join();
+    for (workers[0..spawned]) |worker| {
+        if (worker.err) |err| return err;
+    }
+}
+
+fn preprocessClipImage(
+    allocator: std.mem.Allocator,
+    image_bytes: []const u8,
+    result: []f32,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+) !void {
+    if (isJpeg(image_bytes)) {
+        const fast = preprocessClipJpegChw(allocator, image_bytes, target_size, mean, std_dev) catch |err| switch (err) {
+            error.UnsupportedJpegFormat => null,
+            error.JpegDecodeFailed => return error.ImageDecodeFailed,
+            else => return err,
+        };
+        if (fast) |chw| {
+            defer allocator.free(chw);
+            @memcpy(result, chw);
+            return;
+        }
+    }
+
+    const img = try decodeRgba(allocator, image_bytes);
+    defer img.deinit(allocator);
+    preprocessDecodedClip(img, result, target_size, mean, std_dev);
+}
+
+fn preprocessClipJpegChw(
+    allocator: std.mem.Allocator,
+    image_bytes: []const u8,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+) ![]f32 {
+    if (clipJpegDctScaleEnabled()) {
+        // Opt-in only: DCT scaling is faster but changes the resulting CLIP tensor.
+        return antfly_image.jpeg.preprocessClipChwDctScaled(allocator, image_bytes, target_size, mean, std_dev);
+    }
+    return antfly_image.jpeg.preprocessClipChw(allocator, image_bytes, target_size, mean, std_dev);
+}
+
+fn clipJpegDctScaleEnabled() bool {
+    const raw = std.c.getenv("TERMITE_CLIP_JPEG_DCT_SCALE") orelse return false;
+    const value = std.mem.span(raw);
+    return std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "TRUE");
 }
 
 fn preprocessDecodedClip(
@@ -861,34 +1108,93 @@ fn preprocessDecodedClip(
     std.debug.assert(img.width > 0 and img.height > 0);
 
     const ts: usize = target_size;
-    const crop_w: u32 = @min(img.width, target_size);
-    const crop_h: u32 = @min(img.height, target_size);
-    const crop_left: u32 = (img.width - crop_w) / 2;
-    const crop_top: u32 = (img.height - crop_h) / 2;
-    const scale_x = @as(f32, @floatFromInt(crop_w)) / @as(f32, @floatFromInt(target_size));
-    const scale_y = @as(f32, @floatFromInt(crop_h)) / @as(f32, @floatFromInt(target_size));
+    const resized = clipResizeDims(img.width, img.height, target_size);
+    const resized_w = resized.width;
+    const resized_h = resized.height;
+    const crop_left = (resized_w - target_size) / 2;
+    const crop_top = (resized_h - target_size) / 2;
+    const scale_x = @as(f32, @floatFromInt(img.width)) / @as(f32, @floatFromInt(resized_w));
+    const scale_y = @as(f32, @floatFromInt(img.height)) / @as(f32, @floatFromInt(resized_h));
+
+    if (img.width == target_size and img.height == target_size) {
+        preprocessClipCenterCropNoResize(img, result, ts, 0, 0, mean, std_dev);
+        return;
+    }
 
     for (0..ts) |y| {
-        const src_y = @as(f32, @floatFromInt(y)) * scale_y;
+        const src_y = @as(f32, @floatFromInt(crop_top + @as(u32, @intCast(y)))) * scale_y;
         const y0: u32 = @intFromFloat(@floor(src_y));
-        const y1: u32 = @min(y0 + 1, crop_h - 1);
+        const y1: u32 = @min(y0 + 1, img.height - 1);
         const fy = src_y - @as(f32, @floatFromInt(y0));
 
         for (0..ts) |x| {
-            const src_x = @as(f32, @floatFromInt(x)) * scale_x;
+            const src_x = @as(f32, @floatFromInt(crop_left + @as(u32, @intCast(x)))) * scale_x;
             const x0: u32 = @intFromFloat(@floor(src_x));
-            const x1: u32 = @min(x0 + 1, crop_w - 1);
+            const x1: u32 = @min(x0 + 1, img.width - 1);
             const fx = src_x - @as(f32, @floatFromInt(x0));
 
             for (0..3) |ch| {
-                const p00 = pixelAt(img, crop_left + x0, crop_top + y0, ch);
-                const p10 = pixelAt(img, crop_left + x1, crop_top + y0, ch);
-                const p01 = pixelAt(img, crop_left + x0, crop_top + y1, ch);
-                const p11 = pixelAt(img, crop_left + x1, crop_top + y1, ch);
+                const p00 = pixelAt(img, x0, y0, ch);
+                const p10 = pixelAt(img, x1, y0, ch);
+                const p01 = pixelAt(img, x0, y1, ch);
+                const p11 = pixelAt(img, x1, y1, ch);
                 const top = p00 * (1.0 - fx) + p10 * fx;
                 const bottom = p01 * (1.0 - fx) + p11 * fx;
                 const value = top * (1.0 - fy) + bottom * fy;
                 result[ch * ts * ts + y * ts + x] = (value / 255.0 - mean[ch]) / std_dev[ch];
+            }
+        }
+    }
+}
+
+const ClipResizeDims = struct {
+    width: u32,
+    height: u32,
+};
+
+fn clipResizeDims(width: u32, height: u32, target_size: u32) ClipResizeDims {
+    if (width <= height) {
+        return .{ .width = target_size, .height = scaledLongEdge(height, width, target_size) };
+    }
+    return .{ .width = scaledLongEdge(width, height, target_size), .height = target_size };
+}
+
+fn scaledLongEdge(long_edge: u32, short_edge: u32, target_size: u32) u32 {
+    const scaled = @divFloor(@as(u64, long_edge) * @as(u64, target_size), @as(u64, short_edge));
+    return @max(target_size, @as(u32, @intCast(scaled)));
+}
+
+fn preprocessClipCenterCropNoResize(
+    img: Image,
+    result: []f32,
+    target_size: usize,
+    crop_left: u32,
+    crop_top: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+) void {
+    const width: usize = @intCast(img.width);
+    const channels: usize = @intCast(img.channels);
+    const left: usize = @intCast(crop_left);
+    const top: usize = @intCast(crop_top);
+    const plane_stride = target_size * target_size;
+
+    const inv_std = [3]f32{
+        1.0 / std_dev[0],
+        1.0 / std_dev[1],
+        1.0 / std_dev[2],
+    };
+    const inv_255 = 1.0 / 255.0;
+
+    for (0..target_size) |y| {
+        const row_base = ((top + y) * width + left) * channels;
+        const dst_row = y * target_size;
+        for (0..target_size) |x| {
+            const src = row_base + x * channels;
+            const dst = dst_row + x;
+            inline for (0..3) |ch| {
+                const value = @as(f32, @floatFromInt(img.data[src + ch])) * inv_255;
+                result[ch * plane_stride + dst] = (value - mean[ch]) * inv_std[ch];
             }
         }
     }
