@@ -2732,6 +2732,14 @@ fn sortExecutionPlanSourceLoad(plan: SortExecutionPlan) SortPlanSourceLoad {
     return if (plan.source_load == .unspecified) defaultSortPlanSourceLoad(plan.kind) else plan.source_load;
 }
 
+fn sortExecutionPlanSourceLoadForRequest(plan: SortExecutionPlan, req: types.SearchRequest) SortPlanSourceLoad {
+    const source_load = sortExecutionPlanSourceLoad(plan);
+    return switch (source_load) {
+        .projected_source_after_page => if (req.include_stored) .projected_source_after_page else .source_free,
+        else => source_load,
+    };
+}
+
 fn sortExecutionPlanDistributedBehavior(plan: SortExecutionPlan) SortPlanDistributedBehavior {
     return if (plan.distributed_behavior == .unspecified) defaultSortPlanDistributedBehavior(plan.kind) else plan.distributed_behavior;
 }
@@ -2753,6 +2761,17 @@ test "sort execution plan dimensions default from kind unless explicit" {
     const native_plan = SortExecutionPlan{ .kind = .native_doc_values };
     try std.testing.expectEqual(SortPlanSource.doc_values_collector, sortExecutionPlanSource(native_plan));
     try std.testing.expectEqual(SortPlanSourceLoad.projected_source_after_page, sortExecutionPlanSourceLoad(native_plan));
+    try std.testing.expectEqual(SortPlanSourceLoad.source_free, sortExecutionPlanSourceLoadForRequest(native_plan, .{
+        .include_stored = false,
+    }));
+    try std.testing.expectEqual(SortPlanSourceLoad.projected_source_after_page, sortExecutionPlanSourceLoadForRequest(native_plan, .{
+        .include_stored = true,
+    }));
+
+    const debug_plan = SortExecutionPlan{ .kind = .stored_json_debug };
+    try std.testing.expectEqual(SortPlanSourceLoad.stored_source_required, sortExecutionPlanSourceLoadForRequest(debug_plan, .{
+        .include_stored = false,
+    }));
 }
 
 const DecoratedSortHit = struct {
@@ -3843,7 +3862,7 @@ fn logBenchSortCollectorProfile(
             sortPlanExactnessName(sortExecutionPlanExactness(plan)),
             sortPlanSourceName(sortExecutionPlanSource(plan)),
             sortPlanCursorSupportName(sortExecutionPlanCursorSupport(plan)),
-            sortPlanSourceLoadName(sortExecutionPlanSourceLoad(plan)),
+            sortPlanSourceLoadName(sortExecutionPlanSourceLoadForRequest(plan, req)),
             sortPlanDistributedBehaviorName(sortExecutionPlanDistributedBehavior(plan)),
             plan.require_native,
             native_loader_enabled,
@@ -7126,7 +7145,7 @@ fn logBenchProjectedSourceLoadProfile(
             req.order_by.len,
             sortCursorMode(req),
             sortExecutionPlanKindName(plan.kind),
-            sortPlanSourceLoadName(sortExecutionPlanSourceLoad(plan)),
+            sortPlanSourceLoadName(sortExecutionPlanSourceLoadForRequest(plan, req)),
         },
     );
 }
@@ -9090,10 +9109,10 @@ test "sort resolves match_all doc ordinals to native text doc values" {
     defer seg_writer.deinit();
     const price_idx = try seg_writer.addField("price");
     try seg_writer.addSection(price_idx, .typed_doc_values, dv_data);
-    try seg_writer.addDocOrdinals(&.{ 101, 102, 103 });
     try seg_writer.addStoredDoc("doc:a", "{\"price\":30}");
     try seg_writer.addStoredDoc("doc:b", "{\"price\":10}");
     try seg_writer.addStoredDoc("doc:c", "{\"price\":20}");
+    try seg_writer.addDocOrdinals(&.{ 101, 102, 103 });
     const seg_bytes = try seg_writer.build();
     defer alloc.free(seg_bytes);
 
@@ -9903,11 +9922,22 @@ test "native text sort validation ignores fully deleted segments without typed d
     try std.testing.expect(try writer.deleteById("doc:deleted"));
     const snapshot = writer.snapshot();
 
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "price",
+        .path_match = "price",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
     const order_by = [_]types.SortField{.{ .field = "price", .desc = false }};
     try validateTextNativeSortFields(.{
         .order_by = &order_by,
         .limit = 10,
-    }, snapshot, null);
+    }, snapshot, schema);
 }
 
 test "stored json debug sort can decorate bounded test results" {
