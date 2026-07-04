@@ -3058,9 +3058,6 @@ pub const DB = struct {
             if (optional_runtimes_enabled and opts.open_mode == .writer) {
                 db.startQuarantineRetryWorkerIfNeeded();
             }
-            if (opts.open_mode == .writer) {
-                db.startArtifactRepairMetadataWorkerIfNeeded();
-            }
             profile.total_ns = monotonicTimeNs() - open_started_ns;
             if (openProfileEnabled()) {
                 logOpenProfile(path, opts.open_mode, db.start_index_workers, profile);
