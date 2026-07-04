@@ -1913,6 +1913,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSafe,
         .single_threaded = true,
     });
+    wasm_inference_ml_mod.addImport("antfly_platform", wasm_platform_mod);
     const wasm_inference_onnx_graph_mod = b.createModule(.{
         .root_source_file = b.path("lib/onnx/src/root.zig"),
         .target = wasm_target,
