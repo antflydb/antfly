@@ -6365,13 +6365,11 @@ fn requestNeedsNativeSortValues(req: types.SearchRequest) bool {
 }
 
 fn snapshotHasTypedDocValuesCoverage(snapshot: *const index_mod.IndexSnapshot, field: []const u8) bool {
-    var has_live_docs = false;
     for (snapshot.segments) |*segment| {
         if (segment.liveDocCount() == 0) continue;
-        has_live_docs = true;
         if (segment.reader.getSection(field, .typed_doc_values) == null) return false;
     }
-    return has_live_docs;
+    return true;
 }
 
 fn sortFieldMapping(schema: runtime_schema_mod.TableSchema, field: []const u8) ?runtime_schema_mod.FieldMapping {
@@ -8218,6 +8216,43 @@ test "native text sort validation requires typed doc values on every live segmen
         .order_by = &order_by,
         .limit = 10,
     }, snapshot, null));
+}
+
+test "native text sort validation ignores fully deleted segments without typed doc values" {
+    const alloc = std.testing.allocator;
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .f64_val = 10.0 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var covered_seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer covered_seg_writer.deinit();
+    const covered_price_idx = try covered_seg_writer.addField("price");
+    try covered_seg_writer.addSection(covered_price_idx, .typed_doc_values, dv_data);
+    try covered_seg_writer.addStoredDoc("doc:live", "{\"price\":10}");
+    const covered_seg_bytes = try covered_seg_writer.build();
+    defer alloc.free(covered_seg_bytes);
+
+    var deleted_seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer deleted_seg_writer.deinit();
+    try deleted_seg_writer.addStoredDoc("doc:deleted", "{\"price\":20}");
+    const deleted_seg_bytes = try deleted_seg_writer.build();
+    defer alloc.free(deleted_seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(covered_seg_bytes);
+    try writer.addSegment(deleted_seg_bytes);
+    try std.testing.expect(try writer.deleteById("doc:deleted"));
+    const snapshot = writer.snapshot();
+
+    const order_by = [_]types.SortField{.{ .field = "price", .desc = false }};
+    try validateTextNativeSortFields(.{
+        .order_by = &order_by,
+        .limit = 10,
+    }, snapshot, null);
 }
 
 test "sort falls back to stored json when native text doc values are unavailable" {
