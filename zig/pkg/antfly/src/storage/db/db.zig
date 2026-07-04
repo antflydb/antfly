@@ -11094,7 +11094,7 @@ pub const DB = struct {
             if (replay_batch.writes.len == 0) break;
 
             var pending_batch = derived_types.DerivedBatch{};
-            defer derived_types.deinitDerivedBatch(alloc, &pending_batch);
+            defer derived_types.deinitDerivedBatch(self.alloc, &pending_batch);
             try appendGeneratedEnrichments(self, &pending_batch, .{
                 .writes = replay_batch.writes,
                 .sync_level = .write,
