@@ -50,6 +50,97 @@ The runtime engine should then choose the most efficient exact plan available:
 Stored JSON is the source payload. It is not the production search index and
 should not be on the hot path for exact filter or sort execution.
 
+## Long-Term Target Architecture
+
+The long-term search architecture should be a native planner over mapped field
+capabilities, not a set of request-specific fallbacks. The same mapping metadata
+should drive indexing, filtering, sort validation, cursor encoding, distributed
+merge, and generated API documentation.
+
+Core layers:
+
+- API schema: validates the user-facing query shape and returns stable errors.
+- Runtime mappings: describe field type, analyzer, doc values, sortability,
+  dynamic-template provenance, and physical coverage.
+- Segment metadata: describes live docs, deletes, min/max values, doc-value
+  sections, postings sections, vector sections, and optional `index_sort`.
+- Query planner: lowers a logical query into one exact or approximate physical
+  plan with explicit capabilities and budgets.
+- Executors: scan postings, doc sets, vector indexes, sorted segments, or
+  doc-values collectors without parsing `_source` on the hot path.
+- Coordinator: merges shard-local hits using the same typed comparator and
+  cursor semantics as a single shard.
+
+The production invariant is that exact APIs use exact physical plans. If a
+requested `order_by` cannot be executed through a native exact path and would
+require an unbounded stored-document scan, the request should fail with a clear
+422. Approximate execution should be a separate opt-in feature, not an
+implementation detail behind exact `order_by`.
+
+### Elasticsearch And Lucene Alignment
+
+Antfly should follow Elasticsearch's public model and Lucene's physical lessons
+where they fit Antfly's storage engine:
+
+- Elasticsearch-like mappings define field semantics. `text` is analyzed and
+  searched; `keyword`, numeric, date, boolean, and `_id` fields are exact scalar
+  values that can be doc-valued and sorted.
+- Elasticsearch-like `search_after` uses the returned sort tuple. The cursor is
+  tied to the effective `order_by`, including the implicit `_id` tie-breaker.
+- Lucene-like doc values provide the general columnar primitive for sorting,
+  filtering, and aggregations.
+- Lucene-like index sorting physically orders each segment by one configured
+  dominant sort and enables early termination when the requested order matches.
+- Lucene-like segment merging preserves the configured physical sort order
+  while deletes remain tombstones until compaction.
+
+Antfly should not copy Elasticsearch internals blindly. The important contract
+is that users can reason about mappings and sorted pagination the same way:
+field sort is exact when the field is mapped as sortable/doc-valued, and
+`search_after` is stable because `_sort` contains the full typed tuple.
+
+### Native Sortable Index Path
+
+A native sortable field/index path is the set of durable structures and planner
+metadata required to execute a sort without reading stored JSON:
+
+1. Mapping declares the field as a scalar sortable type.
+2. Segment build writes a typed doc-value column for the field.
+3. Segment metadata records that the doc-value section is present and complete
+   for the live-doc generation.
+4. The field has a canonical comparator and cursor encoder.
+5. The planner verifies all live segments have the required coverage.
+6. The executor loads typed values by document ordinal and applies missing/null
+   policy explicitly.
+7. The coordinator merges shard-local hits using the same encoded tuple.
+8. The response serializes JSON-compatible `_sort` values.
+
+For `_id`, the native sortable path is backed by identity metadata and primary
+document key order rather than user-defined doc values. `_id` remains the final
+tie-breaker for all explicit field sorts.
+
+For non-`_id` fields, the minimal production path is doc values plus a top-N
+collector. The higher-performance path is an `index_sort` configuration that
+physically orders segments and allows sorted seek plus early termination.
+
+### Production Query Planning Contract
+
+Every selected physical plan should make these properties explicit:
+
+- ordering: score, `_id`, native field tuple, or unsupported
+- exactness: exact, bounded exact, or approximate
+- source: postings, doc set, vector index, sorted segment, primary key scan, or
+  doc-values collector
+- cursor support: comparator-only, segment seek, distributed seek, or none
+- source-load behavior: source-free, projected-source-after-page, or
+  stored-source-required
+- distributed behavior: shard-local only, coordinator merge, or unsupported
+
+This avoids hidden behavior such as "native sort unless one segment is missing
+coverage, then parse stored JSON." Once a plan is chosen as native, missing
+native coverage is an execution error unless it is represented by the
+field's typed missing/null marker.
+
 ## Current State
 
 The public API already has the right high-level shape:
@@ -299,6 +390,47 @@ field path. Query-time validation should not guess sortability from the latest
 document payload. It should validate against compiled explicit mappings,
 compiled dynamic rules, or persisted observed dynamic field metadata.
 
+### Field Capability Matrix
+
+Mappings should lower into a compact capability matrix that the planner can use
+without reinterpreting JSON Schema on every query.
+
+| Field type | Search primitive | Filter primitive | Sort primitive |
+| --- | --- | --- | --- |
+| `text` | analyzer + postings | postings/query lowering | unsupported directly |
+| `keyword` | exact term postings | postings or doc values | doc values / index sort |
+| `integer` | numeric range index | doc values/range metadata | doc values / index sort |
+| `number` | numeric range index | doc values/range metadata | doc values / index sort |
+| `date` | date range index | doc values/range metadata | doc values / index sort |
+| `boolean` | boolean bitset | doc values/bitset | doc values / index sort |
+| `geo` | geo index | geo structure | unsupported unless explicitly designed |
+| `vector` | ANN/exact vector index | vector-native filters | score order only |
+| `_id` | identity lookup | identity/doc set | identity key order |
+
+The capability matrix should be persisted with each index generation and
+included in segment metadata. A query should validate against the matrix before
+opening stored documents. This is how `www-antfly` docs, OpenAPI examples, SDK
+validation, and runtime behavior stay aligned: one mapping model describes what
+the engine can actually execute.
+
+For arrays and multi-valued fields, sort must remain unsupported until Antfly
+has an explicit sort mode such as `min`, `max`, or `median`. Guessing from
+payload shape would create unstable cursor semantics.
+
+### Dynamic Field Promotion
+
+Dynamic mappings need a durable promotion path:
+
+1. A dynamic template matches a previously unseen field path.
+2. The write path records the inferred field type and mapping provenance.
+3. Segment build writes the appropriate postings/doc-values sections.
+4. Reopen/merge verifies the section is complete.
+5. Query planning treats the field as sortable only after physical coverage is
+   present for all relevant live segments.
+
+This prevents a field from becoming sortable just because the newest document
+looks scalar. Sortability is a physical guarantee, not a payload observation.
+
 ## Doc Values
 
 Doc values are the first native primitive Antfly needs for production sorting.
@@ -468,6 +600,70 @@ An index-sort path is available when:
 
 When those conditions hold, sorted segment seek should be the preferred plan for
 broad match-all/filter queries with small pages.
+
+### Sorted Segment Seek
+
+Sorted segment seek is the target path for broad queries whose requested sort
+matches physical `index_sort`.
+
+Execution shape:
+
+1. Encode `search_after` or `search_before` into the physical sort tuple.
+2. Seek each segment to the first candidate tuple after/before the cursor.
+3. Walk segment documents in physical sort order.
+4. Skip deleted, expired, or superseded documents through live-doc metadata.
+5. Test native filter/postings membership without loading `_source`.
+6. Emit hits until the shard page window is full.
+7. Stop scanning the segment when early-termination conditions are satisfied.
+
+For match-all with `_id asc`, the existing primary document key order can be a
+special case of sorted seek. The executor should seek the primary-key range from
+the `_id` cursor and stop after the page window, subject to live-doc, TTL, and
+identity generation checks. It should not build and sort an in-memory list of
+all document ids for this common path.
+
+For non-`_id` sorts, sorted seek requires durable segment ordering. Doc values
+alone are not enough to seek directly by sort tuple; they support exact top-N
+collection but still require visiting candidate ordinals.
+
+### Collector Path
+
+When the requested sort does not match `index_sort`, the exact native fallback
+is a doc-values collector.
+
+The collector path should:
+
+- iterate the exact candidate source only once
+- load typed doc values by ordinal
+- compare against `search_after` / `search_before` before admitting a row
+- maintain a bounded heap/window sized by page requirement and shard merge
+  needs
+- defer `_source` loads until after the final page has been selected
+- return 422 if exact candidate processing exceeds configured production
+  budgets
+
+This path is `O(matches * log(page_window))`, not `O(matches * log(matches))`,
+and memory is bounded by the requested page/shard window rather than corpus
+size.
+
+### Native Filter And Sort Cooperation
+
+Filter and sort planning should be costed together:
+
+- selective filter + non-matching sort: iterate filter doc set and use
+  doc-values top-N
+- broad filter + matching `index_sort`: scan sorted segments and test filter
+  membership
+- full-text + field sort: choose between postings candidate collection and
+  sorted-order scan against a text-match doc set
+- vector + filter: push filters into the vector source only when the vector
+  implementation can preserve the requested exactness class
+
+The planner should use segment statistics such as doc count, live count,
+min/max sort values, field cardinality, postings sizes, and filter selectivity
+estimates. A fixed "always collect candidates then sort" rule will not scale for
+broad queries, while a fixed "always scan sort order" rule will not scale for
+highly selective filters.
 
 ## Sort Tuple And Cursor Semantics
 
@@ -766,17 +962,73 @@ The `_sort` array should be present when `order_by` is present.
 
 ## Rollout Plan
 
+### Phase 0: Make Current Behavior Fail Closed
+
 1. Keep the current exact budgeted fallback as the safety baseline.
-2. Compile sortable/doc-value capability from mappings into the runtime schema.
-3. Persist doc values for mapped scalar fields during segment build/replay.
-4. Use doc values for stored-field sort instead of parsing stored JSON.
-5. Reject unmapped/non-sortable fields by default.
-6. Add index-sort configuration and segment build support.
-7. Teach match-all and filter-only queries to use sorted segment seek.
-8. Teach full-text queries to choose between text-candidate collection,
+2. Make public sorted queries validate mapping and physical coverage up front.
+3. Reject unmapped, non-sortable, or physically uncovered sort fields.
+4. Ensure native sort plans never fall back to stored JSON once selected.
+5. Keep stored JSON sorting behind test/debug-only paths.
+
+### Phase 1: Native Doc-Values Sort
+
+1. Compile sortable/doc-value capability from mappings into runtime schema.
+2. Persist typed doc values for mapped scalar fields during segment build,
+   replay, reopen, and compaction.
+3. Add canonical per-type sort encoding and comparator tests.
+4. Use doc values for field sort instead of parsing stored JSON.
+5. Defer projected `_source` loading until after page selection.
+6. Add observability for candidate count, doc-value load time, cursor rejects,
+   source loads, and budget rejections.
+
+This phase makes arbitrary mapped scalar sort exact and production-safe, even
+before physical segment sorting exists.
+
+### Phase 2: `_id` Storage-Order Seek
+
+1. Treat `_id asc` match-all as a native primary-key ordered scan.
+2. Lower `search_after` on `_id` into an exclusive primary-key range lower
+   bound.
+3. Apply live-doc, TTL, identity generation, filters, and exclusions during the
+   scan.
+4. Stop after the requested page/shard window.
+
+This phase removes the need to collect every document id for the most basic
+sorted pagination path.
+
+### Phase 3: Physical `index_sort`
+
+1. Add `index_sort` configuration to mappings/index metadata.
+2. Validate `index_sort` against mapped sortable/doc-value fields.
+3. Flush new segments in configured sort order.
+4. Preserve sort order during segment merges.
+5. Store segment min/max tuple metadata for pruning.
+6. Teach match-all and filter-only queries to use sorted segment seek.
+
+Changing `index_sort` requires a new index generation or reindex because it is a
+durable physical layout choice.
+
+### Phase 4: Planner And Distributed Search
+
+1. Add explicit sort execution plans: `none`, `id_seek`,
+   `sorted_segment_seek`, `native_doc_values_top_n`, `score_top_k`,
+   `distributed_k_way_merge`, `stored_json_debug`, and
+   `unsupported_exact_sort`.
+2. Teach full-text queries to choose between text-candidate collection,
    doc-values top-N, and sorted-order scan with text-match testing.
-9. Add distributed k-way merge over typed sort tuples.
-10. Remove or hide stored JSON sorting behind a test/debug-only option.
+3. Add distributed k-way merge over typed sort tuples.
+4. Forward `search_after` to every shard and merge shard-local windows at the
+   coordinator.
+5. Return exact or lower-bound total-hit relations based on shard capabilities.
+
+### Phase 5: Cleanup
+
+1. Remove stored JSON sort from public query execution.
+2. Keep compatibility/debug hooks only where they are explicitly named.
+3. Update SDKs, OpenAPI examples, and docs so supported sort behavior matches
+   runtime mappings.
+4. Add production dashboards for sort plan selection, budget failures, doc-value
+   coverage failures, and source-load counts.
 
 ## Testing Requirements
 

@@ -12670,11 +12670,13 @@ pub const DB = struct {
         return try db_query_search.searchMatchAll(alloc, req, .{
             .ctx = self,
             .collect_candidates = collectSearchMatchAllCandidatesCallback,
+            .collect_candidates_stream = streamSearchMatchAllCandidatesCallback,
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
+            .load_projected_documents = loadProjectedSearchDocumentManyCallback,
             .load_stored = loadStoredSearchDocumentCallback,
             .load_many_stored = loadStoredSearchDocumentManyCallback,
         });
@@ -12694,6 +12696,24 @@ pub const DB = struct {
             .is_expired_key = isExpiredDocumentKeyCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalCallback,
         }, options);
+    }
+
+    fn streamSearchMatchAllCandidatesCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        options: db_query_search.MatchAllCandidateCollectOptions,
+        consumer_ctx: ?*anyopaque,
+        consumer: db_query_search.MatchAllCandidateConsumer,
+    ) anyerror!db_query_search.MatchAllCandidateStreamStats {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try db_query_search.streamMatchAllCandidatesWithOptions(alloc, req, .{
+            .ctx = self,
+            .scan_store_range = scanStoreRangeCallback,
+            .scan_store_range_with_context = scanStoreRangeWithContextCallback,
+            .is_expired_key = isExpiredDocumentKeyCallback,
+            .lookup_doc_ordinal = lookupLiveDocOrdinalCallback,
+        }, options, consumer_ctx, consumer);
     }
 
     fn lookupLiveDocOrdinalCallback(

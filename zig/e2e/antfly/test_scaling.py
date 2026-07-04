@@ -506,20 +506,19 @@ class MultiNodeScalingCluster:
         for node in self.data_nodes:
             self._start_data_node(node)
 
-        for node in self.data_nodes:
-            base_url = self.data_base_url_for_node(node)
-            if not wait_for_server(base_url, timeout=self.startup_timeout(30.0)):
-                raise RuntimeError(f"Data node process failed to become healthy at {base_url}\n{self.debug_logs()}")
+        self._wait_for_data_nodes_http(self.data_nodes, max_timeout_s=60.0, label="Data node process")
         if not self.wait_for_all_data_nodes_registered(timeout_s=self.startup_timeout(60.0)):
             raise RuntimeError(
                 "Data nodes did not register on all metadata nodes\n"
                 f"metadata statuses: {json.dumps(self.metadata_statuses(), indent=2, sort_keys=True)}\n"
                 f"{self.debug_logs()}"
             )
-        for node in self.data_nodes:
-            url = self.data_api_url_for_node(node)
-            if not wait_for_server(url, timeout=self.startup_timeout(30.0)):
-                raise RuntimeError(f"Data node public API failed to become ready at {url}\n{self.debug_logs()}")
+        self._wait_for_data_nodes_http(
+            self.data_nodes,
+            public_api=True,
+            max_timeout_s=60.0,
+            label="Data node public API",
+        )
 
     def startup_timeout(self, max_timeout_s: float) -> float:
         if self.startup_deadline is None:
@@ -566,19 +565,74 @@ class MultiNodeScalingCluster:
         node = self._new_data_node(max(int(existing["id"]) for existing in self.data_nodes) + 1)
         self.data_nodes.append(node)
         self._start_data_node(node)
-        base_url = self.data_base_url_for_node(node)
-        if not wait_for_server(base_url):
-            raise RuntimeError(f"Added data node process failed to become healthy at {base_url}\n{self.debug_logs()}")
-        url = self.data_api_url_for_node(node)
+        self._wait_for_data_nodes_http([node], max_timeout_s=60.0, label="Added data node process")
         if not self.wait_for_data_nodes_registered({int(node["id"])}, timeout_s=60.0):
             raise RuntimeError(
                 f"Added data node {node['id']} did not register on all metadata nodes\n"
                 f"metadata statuses: {json.dumps(self.metadata_statuses(), indent=2, sort_keys=True)}\n"
                 f"{self.debug_logs()}"
             )
-        if not wait_for_server(url):
-            raise RuntimeError(f"Added data node public API failed to become ready at {url}\n{self.debug_logs()}")
+        self._wait_for_data_nodes_http(
+            [node],
+            public_api=True,
+            max_timeout_s=60.0,
+            label="Added data node public API",
+        )
         return node
+
+    def _wait_for_data_nodes_http(
+        self,
+        nodes: list[dict[str, int]],
+        *,
+        public_api: bool = False,
+        max_timeout_s: float,
+        label: str,
+    ) -> None:
+        timeout_s = self.startup_timeout(max_timeout_s)
+        deadline = time.monotonic() + timeout_s
+        pending = {int(node["id"]): node for node in nodes}
+        consecutive_successes = {node_id: 0 for node_id in pending}
+        last_probe: dict[int, str] = {}
+
+        while pending and time.monotonic() < deadline:
+            request_timeout = max(0.1, min(2.0, deadline - time.monotonic()))
+            for node_id, node in list(pending.items()):
+                proc = self.data_proc_by_node_id.get(node_id)
+                if proc is not None and proc.poll() is not None:
+                    raise RuntimeError(
+                        f"{label} {node_id} exited before becoming ready rc={proc.returncode}\n"
+                        f"{self.debug_logs()}"
+                    )
+
+                url = self.data_api_url_for_node(node) if public_api else self.data_base_url_for_node(node)
+                try:
+                    response = requests.get(f"{url}/status", timeout=request_timeout)
+                    if response.ok:
+                        consecutive_successes[node_id] += 1
+                        if consecutive_successes[node_id] >= 2:
+                            del pending[node_id]
+                        continue
+                    consecutive_successes[node_id] = 0
+                    last_probe[node_id] = f"{response.status_code}: {response.text[:500]}"
+                except requests.RequestException as exc:
+                    consecutive_successes[node_id] = 0
+                    last_probe[node_id] = repr(exc)
+            if pending:
+                time.sleep(0.25)
+
+        if pending:
+            pending_urls = {
+                node_id: (
+                    self.data_api_url_for_node(node) if public_api else self.data_base_url_for_node(node)
+                )
+                for node_id, node in pending.items()
+            }
+            raise RuntimeError(
+                f"{label} failed to become ready for data nodes {sorted(pending)} within {timeout_s:.1f}s\n"
+                f"pending urls: {json.dumps(pending_urls, indent=2, sort_keys=True)}\n"
+                f"last probes: {json.dumps(last_probe, indent=2, sort_keys=True)}\n"
+                f"{self.debug_logs()}"
+            )
 
     def stop_data_node(self, node_id: int) -> None:
         proc = self.data_proc_by_node_id.get(node_id)
