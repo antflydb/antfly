@@ -342,6 +342,7 @@ fn parseChunks(webp_bytes: []const u8) !ParsedChunks {
     var parsed = ParsedChunks{};
     var cursor: usize = riff_header_len;
     var saw_vp8x = false;
+    var vp8x_alpha = false;
     var saw_alph = false;
     var saw_image = false;
 
@@ -358,10 +359,10 @@ fn parseChunks(webp_bytes: []const u8) !ParsedChunks {
             if (saw_vp8x or saw_image or saw_alph) return error.WebpDecodeFailed;
             saw_vp8x = true;
             try parseVp8x(payload, &parsed.info);
+            vp8x_alpha = parsed.info.alpha;
         } else if (std.mem.eql(u8, fourcc, "ALPH")) {
             if (saw_alph or saw_image) return error.WebpDecodeFailed;
             saw_alph = true;
-            parsed.info.alpha = true;
             parsed.alph_payload = payload;
         } else if (std.mem.eql(u8, fourcc, "VP8 ")) {
             if (saw_image) return error.WebpDecodeFailed;
@@ -375,8 +376,10 @@ fn parseChunks(webp_bytes: []const u8) !ParsedChunks {
             saw_image = true;
             parsed.info.bitstream = .vp8l;
             parsed.vp8l_payload = payload;
-            const dim = try parseVp8lDimensions(payload);
-            try mergeDimensions(&parsed.info, dim.width, dim.height);
+            const header = try parseVp8lHeader(payload);
+            if (saw_vp8x and header.alpha and !vp8x_alpha) return error.WebpDecodeFailed;
+            parsed.info.alpha = parsed.info.alpha or header.alpha;
+            try mergeDimensions(&parsed.info, header.width, header.height);
         } else if (std.mem.eql(u8, fourcc, "ANIM") or std.mem.eql(u8, fourcc, "ANMF")) {
             parsed.info.animated = true;
         }
@@ -388,7 +391,7 @@ fn parseChunks(webp_bytes: []const u8) !ParsedChunks {
     if (cursor != riff_len) return error.WebpDecodeFailed;
     if (!saw_image and !parsed.info.animated) return error.WebpDecodeFailed;
     if (saw_alph and !saw_vp8x) return error.WebpDecodeFailed;
-    if (saw_alph and !parsed.info.alpha) return error.WebpDecodeFailed;
+    if (saw_alph and !vp8x_alpha) return error.WebpDecodeFailed;
     if (saw_alph and parsed.info.bitstream != .vp8) return error.WebpDecodeFailed;
     if (saw_vp8x and parsed.info.alpha and !saw_alph and parsed.info.bitstream == .vp8) return error.WebpDecodeFailed;
 
@@ -2235,16 +2238,19 @@ fn vp8ReadMacroblockCoeffs(
     return coeffs;
 }
 
-fn parseVp8lDimensions(payload: []const u8) !struct { width: u32, height: u32 } {
+fn parseVp8lHeader(payload: []const u8) !struct { width: u32, height: u32, alpha: bool } {
     if (payload.len < 5) return error.WebpDecodeFailed;
     if (payload[0] != 0x2f) return error.WebpDecodeFailed;
     const b0: u32 = payload[1];
     const b1: u32 = payload[2];
     const b2: u32 = payload[3];
     const b3: u32 = payload[4];
+    const version = b3 >> 5;
+    if (version != 0) return error.UnsupportedWebpFormat;
     return .{
         .width = 1 + (((b1 & 0x3f) << 8) | b0),
         .height = 1 + (((b3 & 0x0f) << 10) | (b2 << 2) | ((b1 & 0xc0) >> 6)),
+        .alpha = (b3 & 0x10) != 0,
     };
 }
 
@@ -3019,9 +3025,14 @@ fn decodeVp8lImageStream(alloc: Allocator, reader: *BitReader, width: u32, heigh
     errdefer alloc.free(decoded.rgba);
 
     while (transform_count > 0) {
-        transform_count -= 1;
-        decoded = try applyVp8lTransform(alloc, transforms[transform_count], decoded);
-        transforms[transform_count].deinit(alloc);
+        const transform_index = transform_count - 1;
+        decoded = applyVp8lTransform(alloc, transforms[transform_index], decoded) catch |err| {
+            transforms[transform_index].deinit(alloc);
+            transform_count = transform_index;
+            return err;
+        };
+        transforms[transform_index].deinit(alloc);
+        transform_count = transform_index;
     }
 
     return decoded;
@@ -3764,7 +3775,7 @@ fn testBuildSubtractGreenVp8lWebp(alloc: Allocator, rgba: [4]u8) ![]u8 {
 }
 
 fn testBuildPredictorVp8lWebp(alloc: Allocator, width: u32, height: u32, mode: u8, residual: [4]u8) ![]u8 {
-    if (width == 0 or height == 0 or mode > 13) return error.InvalidTestFixture;
+    if (width == 0 or height == 0 or mode > 15) return error.InvalidTestFixture;
 
     var payload = std.ArrayListUnmanaged(u8).empty;
     defer payload.deinit(alloc);
@@ -4968,12 +4979,35 @@ test "probe basic vp8l webp dimensions" {
     try std.testing.expectEqual(@as(u32, 3), info.height.?);
 }
 
+test "probe standalone vp8l alpha bit" {
+    const alloc = std.testing.allocator;
+    const webp = try testBuildLiteralVp8lWebp(alloc, 1, 1, .{ 0x10, 0x20, 0x30, 0x40 });
+    defer alloc.free(webp);
+
+    const info = try probe(webp);
+    try std.testing.expectEqual(Bitstream.vp8l, info.bitstream.?);
+    try std.testing.expect(info.alpha);
+}
+
 test "probe vp8x alpha chunk before lossy image" {
     const info = try probe(&webp_vp8x_alpha_1x1);
     try std.testing.expectEqual(Bitstream.vp8, info.bitstream.?);
     try std.testing.expect(info.extended);
     try std.testing.expect(info.alpha);
     try std.testing.expect(!info.animated);
+}
+
+test "probe rejects alph chunk when vp8x alpha flag is clear" {
+    const alloc = std.testing.allocator;
+    const first_partition = [_]u8{0} ** 200;
+    const token_partition = [_]u8{0} ** 64;
+    const alpha_payload = [_]u8{ 0, 0x7d };
+    const webp = try testBuildVp8xAlphVp8Webp(alloc, &alpha_payload, 1, 1, &first_partition, &.{&token_partition});
+    defer alloc.free(webp);
+
+    webp[20] = 0;
+    try std.testing.expectError(error.WebpDecodeFailed, probe(webp));
+    try std.testing.expectError(error.WebpDecodeFailed, decodeRgba(alloc, webp));
 }
 
 test "decode vp8x alpha flag with vp8l uses lossless alpha channel" {
@@ -5207,6 +5241,15 @@ test "decode vp8l predictor transform restores border and tile-predicted pixels"
     for (expected, 0..) |pixel, i| {
         try std.testing.expectEqualSlices(u8, &pixel, decoded.rgba[i * 4 ..][0..4]);
     }
+}
+
+test "decode vp8l invalid predictor mode cleans transform allocations" {
+    const alloc = std.testing.allocator;
+    const residual = [4]u8{ 0, 0, 0, 0 };
+    const webp = try testBuildPredictorVp8lWebp(alloc, 3, 2, 15, residual);
+    defer alloc.free(webp);
+
+    try std.testing.expectError(error.WebpDecodeFailed, decodeRgba(alloc, webp));
 }
 
 test "decode vp8l cross-color transform restores red and blue" {
