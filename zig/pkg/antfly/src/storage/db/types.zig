@@ -169,6 +169,24 @@ pub const IndexConfig = struct {
     }
 };
 
+pub const PublicIndexConfig = struct {
+    name: []const u8,
+    kind: IndexKind,
+    config_json: []const u8,
+};
+
+pub fn publicIndexConfigsAlloc(alloc: Allocator, configs: []const IndexConfig) ![]PublicIndexConfig {
+    const public_configs = try alloc.alloc(PublicIndexConfig, configs.len);
+    for (configs, 0..) |cfg, i| {
+        public_configs[i] = .{
+            .name = cfg.name,
+            .kind = cfg.kind,
+            .config_json = cfg.config_json,
+        };
+    }
+    return public_configs;
+}
+
 pub fn freeIndexConfigs(alloc: Allocator, configs: []IndexConfig) void {
     for (configs) |*cfg| cfg.deinit(alloc);
     if (configs.len > 0) alloc.free(configs);

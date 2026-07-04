@@ -3765,8 +3765,8 @@ fn appendCachedChunkDenseEmbeddingToWindow(
     chunk_key: []const u8,
     artifact_key: []const u8,
     consumer_indexes: []const []const u8,
-) !void {
-    if (generatedArtifactAlreadyPublished(runtime, artifact_key)) return;
+) !bool {
+    if (generatedArtifactAlreadyPublished(runtime, artifact_key)) return false;
     const index_name = try runtime.alloc.dupe(u8, request.index_name);
     var index_name_owned = true;
     errdefer if (index_name_owned) runtime.alloc.free(index_name);
@@ -3799,6 +3799,7 @@ fn appendCachedChunkDenseEmbeddingToWindow(
         if (expanded_cached.len > 0) runtime.alloc.free(expanded_cached);
     }
     try appendOwnedDenseEmbeddingsToWindow(runtime, window, &expanded_cached);
+    return true;
 }
 
 fn freeChunkedDenseWindowItems(
@@ -3926,9 +3927,14 @@ fn processCachedChunkDenseItems(
     cached_items: *std.ArrayListUnmanaged(CachedChunkDenseWindowItem),
     max_window_items: usize,
 ) !void {
-    if (cached_items.items.len > 0) try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+    var queued_produced = false;
     for (cached_items.items) |item| {
-        try appendCachedChunkDenseEmbeddingToWindow(runtime, window, request, item.chunk_key, item.embedding_key, consumer_indexes);
+        if (try appendCachedChunkDenseEmbeddingToWindow(runtime, window, request, item.chunk_key, item.embedding_key, consumer_indexes)) {
+            if (!queued_produced) {
+                try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+                queued_produced = true;
+            }
+        }
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
     }
     freeCachedChunkDenseWindowItems(runtime.alloc, cached_items.items);
@@ -4144,9 +4150,14 @@ fn processCachedChunkSparseItems(
     cached_items: *std.ArrayListUnmanaged(CachedChunkDenseWindowItem),
     max_window_items: usize,
 ) !void {
-    if (cached_items.items.len > 0) try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+    var queued_produced = false;
     for (cached_items.items) |item| {
-        try appendCachedSparseEmbeddingToWindow(runtime, window, item.chunk_key, item.embedding_key, consumer_indexes);
+        if (try appendCachedSparseEmbeddingToWindow(runtime, window, item.chunk_key, item.embedding_key, consumer_indexes)) {
+            if (!queued_produced) {
+                try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+                queued_produced = true;
+            }
+        }
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
     }
     freeCachedChunkDenseWindowItems(runtime.alloc, cached_items.items);
@@ -4340,8 +4351,9 @@ fn collectPlainDenseBatchItem(
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     errdefer runtime.alloc.free(artifact_key);
     if (try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) {
-        try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
-        try appendCachedDenseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes);
+        if (try appendCachedDenseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes)) {
+            try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+        }
         runtime.alloc.free(@constCast(source_text));
         runtime.alloc.free(artifact_key);
         return null;
@@ -4540,7 +4552,9 @@ fn processChunkedDenseWindow(
                 const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, embedding_artifact_name);
                 defer runtime.alloc.free(embedding_key);
                 if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
-                    try appendCachedChunkDenseEmbeddingToWindow(runtime, window, request, source.key, embedding_key, consumer_indexes);
+                    if (try appendCachedChunkDenseEmbeddingToWindow(runtime, window, request, source.key, embedding_key, consumer_indexes)) {
+                        try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+                    }
                     try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
                     continue;
                 }
@@ -4736,10 +4750,11 @@ fn appendCachedDenseEmbeddingToWindow(
     doc_key: []const u8,
     artifact_key: []const u8,
     consumer_indexes: []const []const u8,
-) !void {
-    if (generatedArtifactAlreadyPublished(runtime, artifact_key)) return;
+) !bool {
+    if (generatedArtifactAlreadyPublished(runtime, artifact_key)) return false;
     var embeddings = try singleDenseEmbeddingForConsumers(runtime, doc_key, artifact_key, &.{}, consumer_indexes);
     try appendOwnedDenseEmbeddingsToWindow(runtime, window, &embeddings);
+    return true;
 }
 
 fn appendCachedSparseEmbeddingToWindow(
@@ -4748,10 +4763,11 @@ fn appendCachedSparseEmbeddingToWindow(
     doc_key: []const u8,
     artifact_key: []const u8,
     consumer_indexes: []const []const u8,
-) !void {
-    if (generatedArtifactAlreadyPublished(runtime, artifact_key)) return;
+) !bool {
+    if (generatedArtifactAlreadyPublished(runtime, artifact_key)) return false;
     var embeddings = try singleSparseEmbeddingForConsumers(runtime, doc_key, artifact_key, &.{}, &.{}, consumer_indexes);
     try appendOwnedSparseEmbeddingsToWindow(runtime, window, &embeddings);
+    return true;
 }
 
 fn mergeOwnedDeletedKeysIntoWindow(
@@ -5039,8 +5055,9 @@ fn processDenseEmbedding(
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     defer runtime.alloc.free(artifact_key);
     if (try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) {
-        try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
-        try appendCachedDenseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes);
+        if (try appendCachedDenseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes)) {
+            try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+        }
         return;
     }
 
@@ -5139,8 +5156,9 @@ fn processSparseEmbedding(
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     defer runtime.alloc.free(artifact_key);
     if (try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) {
-        try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
-        try appendCachedSparseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes);
+        if (try appendCachedSparseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes)) {
+            try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+        }
         return;
     }
 

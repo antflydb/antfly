@@ -256,7 +256,9 @@ fn indexList(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator)
 
     const configs = try lite.db.listIndexes(allocator);
     defer db_types.freeIndexConfigs(allocator, configs);
-    const json = try std.json.Stringify.valueAlloc(allocator, configs, .{});
+    const public_configs = try db_types.publicIndexConfigsAlloc(allocator, configs);
+    defer allocator.free(public_configs);
+    const json = try std.json.Stringify.valueAlloc(allocator, public_configs, .{});
     defer allocator.free(json);
     writeJsonLine(io, json);
 }
@@ -273,6 +275,7 @@ fn indexCreate(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterato
         .ignore_unknown_fields = true,
     });
     defer parsed.deinit();
+    parsed.value.coverage_generation = 0;
 
     var lite = try LiteDb.open(allocator, path, .writer);
     defer lite.close();
@@ -1100,7 +1103,9 @@ fn liteHttpIndexList(ctx: *httpx.Context) anyerror!httpx.Response {
     defer state.mutex.unlock();
     const configs = state.lite.db.listIndexes(ctx.allocator) catch |err| return liteHttpError(ctx, err);
     defer db_types.freeIndexConfigs(ctx.allocator, configs);
-    const json = std.json.Stringify.valueAlloc(ctx.allocator, configs, .{}) catch |err| return liteHttpError(ctx, err);
+    const public_configs = db_types.publicIndexConfigsAlloc(ctx.allocator, configs) catch |err| return liteHttpError(ctx, err);
+    defer ctx.allocator.free(public_configs);
+    const json = std.json.Stringify.valueAlloc(ctx.allocator, public_configs, .{}) catch |err| return liteHttpError(ctx, err);
     defer ctx.allocator.free(json);
     return liteHttpJson(ctx, 200, json);
 }
@@ -1111,6 +1116,7 @@ fn liteHttpIndexCreate(ctx: *httpx.Context) anyerror!httpx.Response {
         .ignore_unknown_fields = true,
     }) catch |err| return liteHttpError(ctx, err);
     defer parsed.deinit();
+    parsed.value.coverage_generation = 0;
     const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
     lockLiteHttpState(state);
     defer state.mutex.unlock();

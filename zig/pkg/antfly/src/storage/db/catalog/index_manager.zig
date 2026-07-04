@@ -2674,7 +2674,7 @@ pub const IndexManager = struct {
         self.bindPrimaryStore(store);
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
 
-        var stored_cfg = try indexConfigWithCoverageGeneration(self.alloc, cfg);
+        var stored_cfg = try indexConfigWithFreshCoverageGeneration(self.alloc, cfg);
         defer stored_cfg.deinit(self.alloc);
 
         const enrichment_checkpoint = self.enrichments.items.len;
@@ -11841,6 +11841,15 @@ fn indexConfigWithCoverageGeneration(alloc: Allocator, cfg: types.IndexConfig) !
     return stored_cfg;
 }
 
+fn indexConfigWithFreshCoverageGeneration(alloc: Allocator, cfg: types.IndexConfig) !types.IndexConfig {
+    var stored_cfg = try types.IndexConfig.clone(alloc, cfg);
+    errdefer stored_cfg.deinit(alloc);
+    while (stored_cfg.coverage_generation == cfg.coverage_generation) {
+        stored_cfg.coverage_generation = try newCoverageGeneration();
+    }
+    return stored_cfg;
+}
+
 fn coverageGenerationForConfig(cfg: types.IndexConfig) u64 {
     return internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json);
 }
@@ -12009,6 +12018,38 @@ test "index catalog preserves coverage generation and migrates legacy generation
     defer types.freeIndexConfigs(alloc, legacy_decoded);
     try std.testing.expectEqual(@as(usize, 1), legacy_decoded.len);
     try std.testing.expectEqual(internal_keys.derivedCoverageGeneration(config_json), legacy_decoded[0].coverage_generation);
+}
+
+test "index create ignores caller supplied coverage generation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+
+    const caller_generation: u64 = 0x1234_5678_9abc_def0;
+    try manager.add(&store, .{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .config_json = "{}",
+        .coverage_generation = caller_generation,
+    });
+
+    const configs = try manager.listIndexesPublic(alloc);
+    defer types.freeIndexConfigs(alloc, configs);
+    try std.testing.expectEqual(@as(usize, 1), configs.len);
+    const stored_generation = configs[0].coverage_generation;
+    try std.testing.expect(stored_generation != 0);
+    try std.testing.expect(stored_generation != caller_generation);
 }
 
 const DenseConfig = struct {
