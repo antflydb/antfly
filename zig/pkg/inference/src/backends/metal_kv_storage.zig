@@ -227,6 +227,21 @@ pub const MetalKvStorage = struct {
         };
     }
 
+    fn traceKvGather() bool {
+        // Cached: this runs per KV write/read in the decode inner loop.
+        const S = struct {
+            var cached: ?bool = null;
+        };
+        if (S.cached) |value| return value;
+        const enabled = blk: {
+            const value = std.c.getenv("TERMITE_METAL_TRACE_KV_GATHER") orelse break :blk false;
+            const span = std.mem.span(value);
+            break :blk span.len > 0 and !std.mem.eql(u8, span, "0");
+        };
+        S.cached = enabled;
+        return enabled;
+    }
+
     fn writeLayerKvSuffix(
         ctx: *anyopaque,
         write: storage_runtime.KvSuffixWrite,
@@ -250,6 +265,7 @@ pub const MetalKvStorage = struct {
             .sequence_id = write.sequence_id,
             .layer_index = @intCast(write.layer_index),
         });
+        if (traceKvGather()) std.debug.print("kv-write: seq={d} layer={d} suffix={d} total={d} slot={d}\n", .{ write.sequence_id, write.layer_index, write.suffix_token_count, write.total_token_count, slot });
 
         const rc = if (write.logical_blocks) |logical_blocks| paged: {
             if (logical_blocks.len == 0 or write.page_size_tokens == 0) break :paged -9999;
@@ -385,6 +401,7 @@ pub const MetalKvStorage = struct {
         const expected_elems = gather.token_count * token_width;
         if (k_out.len < expected_elems or v_out.len < expected_elems) return error.InvalidKvShape;
 
+        if (traceKvGather()) std.debug.print("kv-read: seq={d} layer={d} tokens={d}\n", .{ gather.sequence_id, gather.layer_index, gather.token_count });
         const slot = self.slot_map.get(.{
             .sequence_id = gather.sequence_id,
             .layer_index = @intCast(gather.layer_index),
@@ -470,6 +487,7 @@ pub const MetalKvStorage = struct {
         const token_width: usize = @as(usize, gather.num_kv_heads) * @as(usize, gather.head_dim);
         const byte_len = gather.token_count * token_width * @sizeOf(f32);
 
+        if (traceKvGather()) std.debug.print("kv-read: seq={d} layer={d} tokens={d}\n", .{ gather.sequence_id, gather.layer_index, gather.token_count });
         const slot = self.slot_map.get(.{
             .sequence_id = gather.sequence_id,
             .layer_index = @intCast(gather.layer_index),
@@ -532,10 +550,7 @@ pub const MetalKvStorage = struct {
             .layer_index = @intCast(gather.layer_index),
         };
         const active_frame = metal_runtime.hasActiveFrame(self.runtime);
-        const slot = self.slot_map.get(key) orelse blk: {
-            if (!active_frame) return error.DeviceReadFallback;
-            break :blk try self.acquireSlot(key);
-        };
+        const slot = self.slot_map.get(key) orelse return error.DeviceReadFallback;
         const info_opt = self.slotInfo(slot) catch |err| blk: {
             if (!active_frame) return err;
             break :blk null;
