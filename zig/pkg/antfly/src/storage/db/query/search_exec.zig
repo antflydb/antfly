@@ -27,6 +27,7 @@ const result_shape = @import("result_shape.zig");
 const search_mod = @import("../../../search/search.zig");
 const index_mod = @import("../../../index.zig");
 const segment_mod = @import("../../../segment.zig");
+const typed_dv = @import("../../../section/typed_doc_values.zig");
 const distributed_stats_mod = @import("../../../search/distributed_stats.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
 const introducer_mod = @import("../../../introducer.zig");
@@ -2358,6 +2359,16 @@ const SortValue = union(enum) {
     }
 };
 
+const NativeSortValueLoader = struct {
+    ctx: ?*anyopaque,
+    load: *const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        hit: types.SearchHit,
+        field: []const u8,
+    ) anyerror!?SortValue,
+};
+
 const DecoratedSortHit = struct {
     hit: types.SearchHit,
     keys: []SortValue,
@@ -2512,12 +2523,86 @@ fn searchHitSortStoredJsonAlloc(
     return try std.json.parseFromSlice(std.json.Value, alloc, hit.stored_data.?, .{});
 }
 
+const TextDocValueSortContext = struct {
+    snapshot: *const index_mod.IndexSnapshot,
+    ordinal_to_text_doc_id: ?*const std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32) = null,
+};
+
+fn readBytesDocValueAlloc(
+    alloc: Allocator,
+    reader: *const typed_dv.TypedDocValuesReader,
+    local_doc_id: u32,
+) !?[]u8 {
+    const found = try reader.findDoc(local_doc_id) orelse return null;
+    defer alloc.free(found.chunk_data);
+
+    const num_docs = std.mem.readInt(u32, found.chunk_data[0..4], .little);
+    var cursor: usize = 4 + @as(usize, num_docs) * 4;
+    for (0..found.pos) |_| {
+        const value_len = std.mem.readInt(u32, found.chunk_data[cursor..][0..4], .little);
+        cursor += 4 + value_len;
+    }
+    const value_len = std.mem.readInt(u32, found.chunk_data[cursor..][0..4], .little);
+    cursor += 4;
+    return try alloc.dupe(u8, found.chunk_data[cursor..][0..value_len]);
+}
+
+fn nativeSortValueFromTextDocValuesAlloc(
+    alloc: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    native_text_doc_id: u32,
+    field: []const u8,
+) !?SortValue {
+    const resolved = snapshot.resolveDocId(native_text_doc_id) orelse return null;
+    const segment = &snapshot.segments[resolved.seg_idx];
+    const section_data = segment.reader.getSection(field, .typed_doc_values) orelse return null;
+    var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
+    return switch (reader.value_type) {
+        .u64_val => {
+            const value = try reader.getU64(resolved.local_id) orelse return .null_value;
+            if (value <= @as(u64, @intCast(std.math.maxInt(i64)))) {
+                return .{ .integer = @intCast(value) };
+            }
+            return .{ .number = @floatFromInt(value) };
+        },
+        .f64_val => {
+            const value = try reader.getF64(resolved.local_id) orelse return .null_value;
+            return .{ .number = value };
+        },
+        .bool_val => {
+            const value = try reader.getBool(resolved.local_id) orelse return .null_value;
+            return .{ .bool_value = value };
+        },
+        .bytes_val => {
+            const value = try readBytesDocValueAlloc(alloc, &reader, resolved.local_id) orelse return .null_value;
+            return .{ .string = value };
+        },
+        .geo_point => null,
+    };
+}
+
+fn loadTextDocValueSortValue(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    hit: types.SearchHit,
+    field: []const u8,
+) anyerror!?SortValue {
+    const sort_ctx: *const TextDocValueSortContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    const native_text_doc_id = hit.native_text_doc_id orelse blk: {
+        const ordinal = hit.doc_ordinal orelse return null;
+        const ordinal_map = sort_ctx.ordinal_to_text_doc_id orelse return null;
+        break :blk ordinal_map.get(ordinal) orelse return null;
+    };
+    return try nativeSortValueFromTextDocValuesAlloc(alloc, sort_ctx.snapshot, native_text_doc_id, field);
+}
+
 fn decorateSortHitAlloc(
     alloc: Allocator,
     req: types.SearchRequest,
     hit: types.SearchHit,
     load_ctx: ?*anyopaque,
     load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
+    native_loader: ?NativeSortValueLoader,
 ) !DecoratedSortHit {
     var owned_hit = hit;
     errdefer owned_hit.deinit(alloc);
@@ -2538,6 +2623,11 @@ fn decorateSortHitAlloc(
         const sort_value: SortValue = if (std.mem.eql(u8, field.field, "_id"))
             .{ .string = try alloc.dupe(u8, owned_hit.id) }
         else blk: {
+            if (native_loader) |loader| {
+                if (try loader.load(loader.ctx, alloc, owned_hit, field.field)) |native_value| {
+                    break :blk native_value;
+                }
+            }
             if (parsed_doc == null) parsed_doc = try searchHitSortStoredJsonAlloc(alloc, &owned_hit, load_ctx, load_stored);
             break :blk try ownedSortValueFromJson(alloc, jsonFieldValue(parsed_doc.?.value, field.field));
         };
@@ -2554,6 +2644,7 @@ fn sortAndPageSearchResultInPlace(
     req: types.SearchRequest,
     load_ctx: ?*anyopaque,
     load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
+    native_loader: ?NativeSortValueLoader,
 ) !void {
     if (req.order_by.len == 0 or req.count_only) return;
     try checkSearchRequestDeadline(req);
@@ -2567,7 +2658,7 @@ fn sortAndPageSearchResultInPlace(
     }
     for (result.hits, 0..) |*hit, i| {
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
-        decorated[i] = try decorateSortHitAlloc(alloc, req, hit.*, load_ctx, load_stored);
+        decorated[i] = try decorateSortHitAlloc(alloc, req, hit.*, load_ctx, load_stored, native_loader);
         hit.* = undefined;
         initialized += 1;
     }
@@ -4005,7 +4096,7 @@ pub fn searchTextQuery(
     const full_candidate_limit = effectiveTextCandidateLimit(snapshot.global_doc_count, native_constraints);
     const search_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints, effective_req.count_only);
     const load_stored_in_search_engine = effective_req.include_stored and !chunk_backed;
-    const requires_stored_sort = effective_req.order_by.len > 0;
+    const requires_field_sort = effective_req.order_by.len > 0;
     const exact_late_visibility_totals = late_visibility_paginate and
         (effective_req.count_only or
             effective_req.limit == 0 or
@@ -4033,9 +4124,9 @@ pub fn searchTextQuery(
     }
     const adaptive_late_visibility = late_visibility_paginate and !exact_late_visibility_totals;
     const requested_visible_end = effective_req.offset +| effective_req.limit;
-    const collect_window_candidates = group_chunk_parents or late_visibility_paginate or requires_stored_sort;
+    const collect_window_candidates = group_chunk_parents or late_visibility_paginate or requires_field_sort;
     var candidate_limit: u32 = if (collect_window_candidates)
-        if (requires_stored_sort)
+        if (requires_field_sort)
             @min(full_candidate_limit, exact_candidate_budget)
         else if (adaptive_late_visibility)
             @min(full_candidate_limit, @max(@as(u32, 1), @max(paging.limit, requested_visible_end)))
@@ -4052,7 +4143,7 @@ pub fn searchTextQuery(
         try checkSearchRequestDeadline(effective_req);
         candidate_iterations += 1;
         var postprocess_req = effective_req;
-        if (late_visibility_paginate or requires_stored_sort) {
+        if (late_visibility_paginate or requires_field_sort) {
             postprocess_req.offset = 0;
             postprocess_req.limit = candidate_limit;
         }
@@ -4097,6 +4188,7 @@ pub fn searchTextQuery(
                 var materialized = types.SearchHit{
                     .id = try alloc.dupe(u8, stored.id),
                     .doc_ordinal = doc_ordinal,
+                    .native_text_doc_id = hit.doc_id,
                     .score = hit.score,
                     .stored_data = null,
                 };
@@ -4112,6 +4204,7 @@ pub fn searchTextQuery(
             var materialized = types.SearchHit{
                 .id = try alloc.dupe(u8, id),
                 .doc_ordinal = doc_ordinal,
+                .native_text_doc_id = hit.doc_id,
                 .score = hit.score,
                 .stored_data = null,
             };
@@ -4155,8 +4248,8 @@ pub fn searchTextQuery(
             out.total_hits = visible_candidate_count;
             out.total_hits_relation = .gte;
         }
-        if (requires_stored_sort and !candidates_exhausted) {
-            std.log.warn("text query stored sort candidate budget exceeded index={s} candidates={d} budget={d}", .{
+        if (requires_field_sort and !candidates_exhausted) {
+            std.log.warn("text query field sort candidate budget exceeded index={s} candidates={d} budget={d}", .{
                 effective_req.index_name orelse "",
                 result.total_hits,
                 candidate_limit,
@@ -4164,8 +4257,12 @@ pub fn searchTextQuery(
             return error.QueryCandidateBudgetExceeded;
         }
         try checkSearchRequestDeadline(effective_req);
-        if (requires_stored_sort) {
-            try sortAndPageSearchResultInPlace(&out, effective_req, executor.ctx, executor.load_stored);
+        if (requires_field_sort) {
+            const native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+            try sortAndPageSearchResultInPlace(&out, effective_req, executor.ctx, executor.load_stored, .{
+                .ctx = @constCast(&native_sort_ctx),
+                .load = loadTextDocValueSortValue,
+            });
         } else if (late_visibility_paginate and !effective_req.count_only) {
             try paginateSearchResultInPlace(&out, effective_req.offset, effective_req.limit);
         }
@@ -5841,6 +5938,55 @@ fn freeOptionalOwnedBytes(alloc: Allocator, values: []?[]u8) void {
     alloc.free(values);
 }
 
+fn requestNeedsNativeSortValues(req: types.SearchRequest) bool {
+    for (req.order_by) |field| {
+        if (!std.mem.eql(u8, field.field, "_id")) return true;
+    }
+    return false;
+}
+
+fn buildOrdinalTextDocIdMapAlloc(
+    alloc: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    candidates: []const MatchAllCandidate,
+    ordinal_to_text_doc_id: *std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32),
+) !bool {
+    if (!snapshot.hasDocOrdinalCoverage()) return false;
+
+    var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+    defer ordinals.deinit(alloc);
+    for (candidates) |candidate| {
+        const ordinal = candidate.ordinal orelse continue;
+        try ordinals.append(alloc, ordinal);
+    }
+    if (ordinals.items.len == 0) return false;
+
+    const doc_nums = try snapshot.docNumsForOrdinalsAlloc(alloc, ordinals.items);
+    defer alloc.free(doc_nums);
+    for (doc_nums) |doc_num| {
+        const ordinal = (try snapshot.docOrdinal(doc_num)) orelse continue;
+        try ordinal_to_text_doc_id.put(alloc, ordinal, doc_num);
+    }
+    return ordinal_to_text_doc_id.count() > 0;
+}
+
+fn buildMatchAllNativeSortContextAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: MatchAllExecutor,
+    candidates: []const MatchAllCandidate,
+    ordinal_to_text_doc_id: *std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32),
+) !?TextDocValueSortContext {
+    if (req.order_by.len == 0 or !requestNeedsNativeSortValues(req)) return null;
+    const text_entry = (try executor.text_index_entry(executor.ctx, req.index_name)) orelse return null;
+    const snapshot = text_entry.persistent.snapshot();
+    if (!(try buildOrdinalTextDocIdMapAlloc(alloc, snapshot, candidates, ordinal_to_text_doc_id))) return null;
+    return .{
+        .snapshot = snapshot,
+        .ordinal_to_text_doc_id = ordinal_to_text_doc_id,
+    };
+}
+
 fn pageSearchResultInPlace(
     alloc: Allocator,
     result: types.SearchResult,
@@ -5918,6 +6064,18 @@ pub fn searchMatchAll(
         };
     }
 
+    var ordinal_to_text_doc_id = std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32).empty;
+    defer ordinal_to_text_doc_id.deinit(alloc);
+    var native_sort_ctx: TextDocValueSortContext = undefined;
+    var native_sort_loader: ?NativeSortValueLoader = null;
+    if (try buildMatchAllNativeSortContextAlloc(alloc, req, executor, candidates.items, &ordinal_to_text_doc_id)) |ctx| {
+        native_sort_ctx = ctx;
+        native_sort_loader = .{
+            .ctx = &native_sort_ctx,
+            .load = loadTextDocValueSortValue,
+        };
+    }
+
     const needs_stored_pattern_filter =
         req.filter_query_json.len > 0 or
         req.exclusion_query_json.len > 0 or
@@ -5957,7 +6115,7 @@ pub fn searchMatchAll(
         errdefer if (filtered_owned) filtered.deinit();
 
         if (req.order_by.len > 0) {
-            try sortAndPageSearchResultInPlace(&filtered, req, executor.ctx, executor.load_stored);
+            try sortAndPageSearchResultInPlace(&filtered, req, executor.ctx, executor.load_stored, native_sort_loader);
             filtered_owned = false;
             errdefer filtered.deinit();
             if (req.include_stored) {
@@ -6017,7 +6175,7 @@ pub fn searchMatchAll(
     };
     errdefer out.deinit();
     if (req.order_by.len > 0) {
-        try sortAndPageSearchResultInPlace(&out, req, executor.ctx, executor.load_stored);
+        try sortAndPageSearchResultInPlace(&out, req, executor.ctx, executor.load_stored, native_sort_loader);
     }
     return out;
 }
@@ -7079,6 +7237,167 @@ fn testMatchAllLoadStoredCallback(
     else
         return null;
     return try alloc.dupe(u8, json);
+}
+
+fn testUnexpectedLoadStoredCallback(
+    _: ?*anyopaque,
+    _: Allocator,
+    _: []const u8,
+) anyerror!?[]u8 {
+    return error.UnexpectedTestCall;
+}
+
+test "sort uses native text doc values before stored json fallback" {
+    const alloc = std.testing.allocator;
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .f64_val = 30.0 });
+    try dv_writer.add(1, .{ .f64_val = 10.0 });
+    try dv_writer.add(2, .{ .f64_val = 20.0 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const price_idx = try seg_writer.addField("price");
+    try seg_writer.addSection(price_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"price\":30}");
+    try seg_writer.addStoredDoc("doc:b", "{\"price\":10}");
+    try seg_writer.addStoredDoc("doc:c", "{\"price\":20}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+
+    var hits = try alloc.alloc(types.SearchHit, 3);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .native_text_doc_id = 0, .score = 1.0 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .native_text_doc_id = 1, .score = 1.0 };
+    hits[2] = .{ .id = try alloc.dupe(u8, "doc:c"), .native_text_doc_id = 2, .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 3,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{
+        .{ .field = "price", .desc = false },
+        .{ .field = "_id", .desc = false },
+    };
+    try sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .ctx = @constCast(&native_sort_ctx),
+        .load = loadTextDocValueSortValue,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+    try std.testing.expectApproxEqAbs(@as(f64, 10.0), result.hits[0].sort_values[0].float, 0.001);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].sort_values[1].string);
+}
+
+test "sort resolves match_all doc ordinals to native text doc values" {
+    const alloc = std.testing.allocator;
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .f64_val = 30.0 });
+    try dv_writer.add(1, .{ .f64_val = 10.0 });
+    try dv_writer.add(2, .{ .f64_val = 20.0 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const price_idx = try seg_writer.addField("price");
+    try seg_writer.addSection(price_idx, .typed_doc_values, dv_data);
+    try seg_writer.addDocOrdinals(&.{ 101, 102, 103 });
+    try seg_writer.addStoredDoc("doc:a", "{\"price\":30}");
+    try seg_writer.addStoredDoc("doc:b", "{\"price\":10}");
+    try seg_writer.addStoredDoc("doc:c", "{\"price\":20}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+
+    var ordinal_to_text_doc_id = std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32).empty;
+    defer ordinal_to_text_doc_id.deinit(alloc);
+    const candidates = [_]MatchAllCandidate{
+        .{ .id = @constCast("doc:a"), .ordinal = 101 },
+        .{ .id = @constCast("doc:b"), .ordinal = 102 },
+        .{ .id = @constCast("doc:c"), .ordinal = 103 },
+    };
+    try std.testing.expect(try buildOrdinalTextDocIdMapAlloc(alloc, snapshot, &candidates, &ordinal_to_text_doc_id));
+    const native_sort_ctx = TextDocValueSortContext{
+        .snapshot = snapshot,
+        .ordinal_to_text_doc_id = &ordinal_to_text_doc_id,
+    };
+
+    var hits = try alloc.alloc(types.SearchHit, 3);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .doc_ordinal = 101, .score = 1.0 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .doc_ordinal = 102, .score = 1.0 };
+    hits[2] = .{ .id = try alloc.dupe(u8, "doc:c"), .doc_ordinal = 103, .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 3,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{.{ .field = "price", .desc = false }};
+    try sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 3,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .ctx = @constCast(&native_sort_ctx),
+        .load = loadTextDocValueSortValue,
+    });
+
+    try std.testing.expectEqual(@as(usize, 3), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+    try std.testing.expectEqualStrings("doc:a", result.hits[2].id);
+}
+
+test "sort falls back to stored json when native text doc values are unavailable" {
+    const alloc = std.testing.allocator;
+
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 1.0 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{.{ .field = "rank", .desc = false }};
+    try sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+    }, null, testMatchAllLoadStoredCallback, null);
+
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expectEqual(@as(i64, 1), result.hits[0].sort_values[0].integer);
+    try std.testing.expectEqualStrings("doc:a", result.hits[1].id);
 }
 
 fn testMatchAllExecutor(ctx: *const TestMatchAllCtx) MatchAllExecutor {

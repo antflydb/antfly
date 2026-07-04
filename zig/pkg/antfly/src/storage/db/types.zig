@@ -1202,6 +1202,7 @@ pub const MergeConfig = struct {
 pub const SearchHit = struct {
     id: []u8,
     doc_ordinal: ?u32 = null,
+    native_text_doc_id: ?u32 = null,
     score: ?f32 = null,
     index_scores: []fusion_mod.IndexScore = &.{},
     sort_values: []std.json.Value = &.{},
@@ -1215,6 +1216,7 @@ pub const SearchHit = struct {
         var cloned = SearchHit{
             .id = try alloc.dupe(u8, self.id),
             .doc_ordinal = self.doc_ordinal,
+            .native_text_doc_id = self.native_text_doc_id,
             .score = self.score,
             .index_scores = try cloneIndexScores(alloc, self.index_scores),
             .sort_values = try cloneJsonValues(alloc, self.sort_values),

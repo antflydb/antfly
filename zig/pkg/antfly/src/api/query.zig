@@ -167,7 +167,10 @@ fn mergedSearchResultIdentityReadGeneration(
 }
 
 fn clearMergedDocOrdinals(hits: []db_mod.types.SearchHit) void {
-    for (hits) |*hit| hit.doc_ordinal = null;
+    for (hits) |*hit| {
+        hit.doc_ordinal = null;
+        hit.native_text_doc_id = null;
+    }
 }
 
 fn isPureDenseRequest(req: db_mod.types.SearchRequest) bool {
@@ -919,6 +922,7 @@ test "query encoder does not expose internal doc ordinals" {
     hits[0] = .{
         .id = try alloc.dupe(u8, "doc:a"),
         .doc_ordinal = 42,
+        .native_text_doc_id = 7,
         .score = 1.25,
         .stored_data = try alloc.dupe(u8, "{\"title\":\"alpha\"}"),
     };
@@ -933,6 +937,7 @@ test "query encoder does not expose internal doc ordinals" {
     defer encoded.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"_id\":\"doc:a\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.json, "doc_ordinal") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "native_text_doc_id") == null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.json, "ordinal") == null);
 }
 
