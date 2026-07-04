@@ -16,7 +16,7 @@
 //!
 //! Matches Go antfly's lib/schema/ types:
 //!   - AntflyType: text, keyword, numeric, embedding, link, boolean, datetime, geopoint, etc.
-//!   - FieldMapping: type + index/store/doc_values/analyzer settings
+//!   - FieldMapping: type + index/store/doc_values/sortable/analyzer settings
 //!   - DynamicTemplate: glob-based pattern matching for field names
 //!   - TableSchema: version, TTL config, default type, dynamic templates
 
@@ -74,6 +74,7 @@ pub const FieldMapping = struct {
     do_index: bool = true,
     store: bool = true,
     doc_values: bool = false,
+    sortable: bool = false,
     include_in_all: bool = false,
     analyzer: []const u8 = "standard",
 };
@@ -144,7 +145,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 8); // format version
+    try appendU32(&buf, alloc, 9); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -164,6 +165,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         try buf.append(alloc, if (tmpl.mapping.do_index) 1 else 0);
         try buf.append(alloc, if (tmpl.mapping.store) 1 else 0);
         try buf.append(alloc, if (tmpl.mapping.doc_values) 1 else 0);
+        try buf.append(alloc, if (tmpl.mapping.sortable) 1 else 0);
         try buf.append(alloc, if (tmpl.mapping.include_in_all) 1 else 0);
         try appendStr(&buf, alloc, tmpl.mapping.analyzer);
     }
@@ -209,7 +211,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version != 1 and fmt_version != 2 and fmt_version != 3 and fmt_version != 4 and fmt_version != 5 and fmt_version != 6 and fmt_version != 7 and fmt_version != 8) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 9) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -272,6 +274,11 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         pos += 1;
         const doc_values = data[pos] == 1;
         pos += 1;
+        const sortable = if (fmt_version >= 9) blk: {
+            const value = data[pos] == 1;
+            pos += 1;
+            break :blk value;
+        } else defaultSortableForMapping(field_type, doc_values);
         const include_in_all = data[pos] == 1;
         pos += 1;
         const analyzer = try alloc.dupe(u8, readStr(data, &pos));
@@ -288,6 +295,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
                 .do_index = do_index,
                 .store = store_val,
                 .doc_values = doc_values,
+                .sortable = sortable,
                 .include_in_all = include_in_all,
                 .analyzer = analyzer,
             },
@@ -660,6 +668,14 @@ pub fn resolveFieldTypeForValue(schema: TableSchema, path: []const u8, value: ?s
     return null;
 }
 
+pub fn defaultSortableForMapping(field_type: AntflyType, doc_values: bool) bool {
+    if (!doc_values) return false;
+    return switch (field_type) {
+        .keyword, .numeric, .boolean, .datetime, .link => true,
+        else => false,
+    };
+}
+
 fn dynamicTemplateMatches(
     tmpl: DynamicTemplate,
     path: []const u8,
@@ -865,6 +881,7 @@ test "schema serialize/deserialize round-trip" {
                     .do_index = false,
                     .store = false,
                     .doc_values = true,
+                    .sortable = true,
                     .include_in_all = false,
                     .analyzer = "keyword",
                 },
@@ -945,6 +962,7 @@ test "schema serialize/deserialize round-trip" {
     try std.testing.expectEqual(AntflyType.datetime, loaded.dynamic_templates[0].mapping.field_type);
     try std.testing.expect(!loaded.dynamic_templates[0].mapping.do_index);
     try std.testing.expect(loaded.dynamic_templates[0].mapping.doc_values);
+    try std.testing.expect(loaded.dynamic_templates[0].mapping.sortable);
     try std.testing.expectEqual(@as(usize, 1), loaded.full_text_documents.len);
     try std.testing.expectEqualStrings("my_type", loaded.full_text_documents[0].name);
     try std.testing.expectEqual(@as(usize, 4), loaded.full_text_documents[0].fields.len);
@@ -1143,12 +1161,12 @@ test "dynamic template field resolution" {
         .{
             .name = "embeddings",
             .match_pattern = "*_embedding",
-            .mapping = .{ .field_type = .embedding, .doc_values = true },
+            .mapping = .{ .field_type = .embedding, .doc_values = true, .sortable = false },
         },
         .{
             .name = "keywords",
             .match_pattern = "*_id",
-            .mapping = .{ .field_type = .keyword },
+            .mapping = .{ .field_type = .keyword, .doc_values = true, .sortable = true },
         },
     };
 
@@ -1165,6 +1183,7 @@ test "dynamic template field resolution" {
     const kw = resolveFieldType(schema, "user_id");
     try std.testing.expect(kw != null);
     try std.testing.expectEqual(AntflyType.keyword, kw.?.field_type);
+    try std.testing.expect(kw.?.sortable);
 
     const unknown = resolveFieldType(schema, "random_field");
     try std.testing.expect(unknown == null);
@@ -1191,6 +1210,7 @@ test "dynamic template selector and mapping-option resolution" {
                 .do_index = false,
                 .store = false,
                 .doc_values = true,
+                .sortable = true,
                 .include_in_all = false,
                 .analyzer = "keyword",
             },
@@ -1214,6 +1234,7 @@ test "dynamic template selector and mapping-option resolution" {
     try std.testing.expectEqual(AntflyType.datetime, created.?.field_type);
     try std.testing.expect(!created.?.do_index);
     try std.testing.expect(created.?.doc_values);
+    try std.testing.expect(created.?.sortable);
     try std.testing.expectEqualStrings("keyword", created.?.analyzer);
 
     try std.testing.expect(resolveFieldTypeForValue(schema, "meta.skip_created_at", .{ .string = "2026-01-03T00:00:00Z" }) == null);

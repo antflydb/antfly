@@ -305,6 +305,7 @@ pub const DynamicTemplate = struct {
     do_index: ?bool = null,
     store: ?bool = null,
     doc_values: ?bool = null,
+    sortable: ?bool = null,
     include_in_all: ?bool = null,
 
     pub fn deinit(self: *DynamicTemplate, alloc: std.mem.Allocator) void {
@@ -1338,7 +1339,24 @@ fn validateDynamicTemplate(value: std.json.Value) !void {
     if (mapping.object.get("index")) |index| if (index != .null and index != .bool) return error.InvalidSchemaUpdateRequest;
     if (mapping.object.get("store")) |store| if (store != .null and store != .bool) return error.InvalidSchemaUpdateRequest;
     if (mapping.object.get("doc_values")) |doc_values| if (doc_values != .null and doc_values != .bool) return error.InvalidSchemaUpdateRequest;
+    if (mapping.object.get("sortable")) |sortable| if (sortable != .null and sortable != .bool) return error.InvalidSchemaUpdateRequest;
     if (mapping.object.get("include_in_all")) |include_in_all| if (include_in_all != .null and include_in_all != .bool) return error.InvalidSchemaUpdateRequest;
+    if (mapping.object.get("sortable")) |sortable| {
+        if (sortable == .bool and sortable.bool) {
+            const doc_values = mapping.object.get("doc_values") orelse return error.InvalidSchemaUpdateRequest;
+            if (doc_values != .bool or !doc_values.bool) return error.InvalidSchemaUpdateRequest;
+            const mapping_type = mapping.object.get("type") orelse return error.InvalidSchemaUpdateRequest;
+            if (mapping_type != .string or !mappingTypeCanSort(mapping_type.string)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+}
+
+fn mappingTypeCanSort(mapping_type: []const u8) bool {
+    return std.mem.eql(u8, mapping_type, "keyword") or
+        std.mem.eql(u8, mapping_type, "numeric") or
+        std.mem.eql(u8, mapping_type, "boolean") or
+        std.mem.eql(u8, mapping_type, "datetime") or
+        std.mem.eql(u8, mapping_type, "link");
 }
 
 fn validateNonNegativeInteger(value: std.json.Value) !void {
@@ -2326,6 +2344,10 @@ fn parseDynamicTemplate(alloc: std.mem.Allocator, default_name: []const u8, valu
             else => null,
         } else null,
         .doc_values = if (mapping.get("doc_values")) |doc_values| switch (doc_values) {
+            .bool => |enabled| enabled,
+            else => null,
+        } else null,
+        .sortable = if (mapping.get("sortable")) |sortable| switch (sortable) {
             .bool => |enabled| enabled,
             else => null,
         } else null,
@@ -3392,7 +3414,7 @@ test "parse schema and validate document writes" {
 test "parse dynamic template contract and validate selectors" {
     var parsed = try parseSchema(
         std.testing.allocator,
-        "{\"default_type\":\"doc\",\"enforce_types\":true,\"dynamic_templates\":[{\"name\":\"dates\",\"match\":\"*_at\",\"unmatch\":\"skip_*\",\"path_match\":\"meta.*\",\"path_unmatch\":\"meta.private.*\",\"match_mapping_type\":\"date\",\"mapping\":{\"type\":\"datetime\",\"analyzer\":\"keyword\",\"index\":false,\"store\":false,\"doc_values\":true,\"include_in_all\":false}}],\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}}}}}}",
+        "{\"default_type\":\"doc\",\"enforce_types\":true,\"dynamic_templates\":[{\"name\":\"dates\",\"match\":\"*_at\",\"unmatch\":\"skip_*\",\"path_match\":\"meta.*\",\"path_unmatch\":\"meta.private.*\",\"match_mapping_type\":\"date\",\"mapping\":{\"type\":\"datetime\",\"analyzer\":\"keyword\",\"index\":false,\"store\":false,\"doc_values\":true,\"sortable\":true,\"include_in_all\":false}}],\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}}}}}}",
     );
     defer parsed.deinit(std.testing.allocator);
 
@@ -3408,6 +3430,7 @@ test "parse dynamic template contract and validate selectors" {
     try std.testing.expectEqual(false, parsed.dynamic_templates[0].do_index.?);
     try std.testing.expectEqual(false, parsed.dynamic_templates[0].store.?);
     try std.testing.expectEqual(true, parsed.dynamic_templates[0].doc_values.?);
+    try std.testing.expectEqual(true, parsed.dynamic_templates[0].sortable.?);
     try std.testing.expectEqual(false, parsed.dynamic_templates[0].include_in_all.?);
 
     try validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"title\":\"alpha\",\"meta.created_at\":\"2026-01-03T00:00:00Z\"}" }});
@@ -3418,6 +3441,30 @@ test "parse dynamic template contract and validate selectors" {
     try std.testing.expectError(
         error.InvalidBatchRequest,
         validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"title\":\"alpha\",\"meta.created_at\":\"not-a-date\"}" }}),
+    );
+}
+
+test "parse rejects non-scalar or non-doc-valued sortable dynamic templates" {
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"dynamic_templates\":[{\"name\":\"body\",\"path_match\":\"body\",\"mapping\":{\"type\":\"text\",\"doc_values\":true,\"sortable\":true}}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"dynamic_templates\":[{\"name\":\"rank\",\"path_match\":\"rank\",\"mapping\":{\"type\":\"numeric\",\"sortable\":true}}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"dynamic_templates\":[{\"name\":\"rank\",\"path_match\":\"rank\",\"mapping\":{\"type\":\"numeric\",\"doc_values\":false,\"sortable\":true}}]}",
+        ),
     );
 }
 

@@ -1807,6 +1807,8 @@ fn appendRuntimeSchemaObject(
         try out.appendSlice(alloc, if (tmpl.mapping.store) "true" else "false");
         try out.appendSlice(alloc, ",\"doc_values\":");
         try out.appendSlice(alloc, if (tmpl.mapping.doc_values) "true" else "false");
+        try out.appendSlice(alloc, ",\"sortable\":");
+        try out.appendSlice(alloc, if (tmpl.mapping.sortable) "true" else "false");
         try out.appendSlice(alloc, ",\"include_in_all\":");
         try out.appendSlice(alloc, if (tmpl.mapping.include_in_all) "true" else "false");
         try out.appendSlice(alloc, ",\"analyzer\":");
@@ -2424,7 +2426,7 @@ test "metadata.table status encoder projects inline enrichment configs as names"
 
 test "metadata.table debug encoder emits runtime schemas and index bindings" {
     const schema_v1 =
-        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"string","x-antfly-types":["text"],"x-antfly-analyzer":"french"}}}}}}
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"dates","path_match":"created_at","mapping":{"type":"datetime","doc_values":true}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"string","x-antfly-types":["text"],"x-antfly-analyzer":"french"}}}}}}
     ;
     const schema_v0 =
         \\{"version":0,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"name":{"type":"string","x-antfly-types":["search_as_you_type"]}}}}}}
@@ -2456,6 +2458,7 @@ test "metadata.table debug encoder emits runtime schemas and index bindings" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"schema_slot\":\"read\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"schema_slot\":\"active\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"analyzer\":\"french\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"sortable\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"algebraic_capabilities\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"capability_fingerprint\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lifecycle_status\":\"rebuild_required\"") != null);

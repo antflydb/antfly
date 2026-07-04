@@ -65,6 +65,7 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
 
     for (schema.dynamic_templates, 0..) |template, i| {
         const field_type = parseRuntimeFieldType(template.field_type orelse "text");
+        const doc_values = template.doc_values orelse false;
         dynamic_templates[i] = .{
             .name = try alloc.dupe(u8, template.name),
             .match_pattern = if (template.match_pattern) |value| try alloc.dupe(u8, value) else null,
@@ -76,7 +77,8 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
                 .field_type = field_type,
                 .do_index = template.do_index orelse true,
                 .store = template.store orelse false,
-                .doc_values = template.doc_values orelse false,
+                .doc_values = doc_values,
+                .sortable = template.sortable orelse storage_schema.defaultSortableForMapping(field_type, doc_values),
                 .include_in_all = template.include_in_all orelse false,
                 .analyzer = try alloc.dupe(u8, template.analyzer orelse defaultDynamicTemplateAnalyzer(field_type)),
             },
@@ -661,4 +663,29 @@ fn appendUniqueOwnedPath(
 fn fieldNameFromPath(path: []const u8) []const u8 {
     const idx = std.mem.lastIndexOfScalar(u8, path, '.') orelse return path;
     return path[idx + 1 ..];
+}
+
+test "runtime schema derives sortable capability from scalar doc values" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{
+        \\  "dynamic_templates": [
+        \\    {"name":"dates","path_match":"created_at","mapping":{"type":"datetime","doc_values":true}},
+        \\    {"name":"body","path_match":"body","mapping":{"type":"text","doc_values":true}},
+        \\    {"name":"rank","path_match":"rank","mapping":{"type":"numeric","doc_values":true,"sortable":false}}
+        \\  ]
+        \\}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    try std.testing.expectEqual(@as(usize, 3), runtime.dynamic_templates.len);
+    try std.testing.expect(runtime.dynamic_templates[0].mapping.doc_values);
+    try std.testing.expect(runtime.dynamic_templates[0].mapping.sortable);
+    try std.testing.expect(runtime.dynamic_templates[1].mapping.doc_values);
+    try std.testing.expect(!runtime.dynamic_templates[1].mapping.sortable);
+    try std.testing.expect(runtime.dynamic_templates[2].mapping.doc_values);
+    try std.testing.expect(!runtime.dynamic_templates[2].mapping.sortable);
 }

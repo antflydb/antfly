@@ -2511,6 +2511,55 @@ fn compareDecoratedHitToCursor(req: types.SearchRequest, hit: DecoratedSortHit, 
     return .eq;
 }
 
+fn validateSortCursorContract(req: types.SearchRequest) !void {
+    if (req.search_after.len > 0 and req.search_before.len > 0) return error.InvalidQueryRequest;
+    if (req.search_after.len > 0 and req.search_after.len != req.order_by.len) return error.InvalidQueryRequest;
+    if (req.search_before.len > 0 and req.search_before.len != req.order_by.len) return error.InvalidQueryRequest;
+    const cursor = activeSortCursor(req);
+    for (req.order_by, 0..) |field, i| {
+        if (std.mem.eql(u8, field.field, "_id") and cursor.len > 0 and cursor[i] != .string) {
+            return error.InvalidQueryRequest;
+        }
+    }
+}
+
+fn activeSortCursor(req: types.SearchRequest) []const std.json.Value {
+    if (req.search_after.len > 0) return req.search_after;
+    if (req.search_before.len > 0) return req.search_before;
+    return &.{};
+}
+
+fn sortWindowCapacity(req: types.SearchRequest) usize {
+    if (req.search_after.len > 0 or req.search_before.len > 0) return @intCast(req.limit);
+    const wanted = @as(u64, req.offset) +| @as(u64, req.limit);
+    return @intCast(@min(wanted, @as(u64, std.math.maxInt(usize))));
+}
+
+fn decoratedHitAllowedByCursor(req: types.SearchRequest, hit: DecoratedSortHit) bool {
+    if (req.search_after.len > 0) return compareDecoratedHitToCursor(req, hit, req.search_after) == .gt;
+    if (req.search_before.len > 0) return compareDecoratedHitToCursor(req, hit, req.search_before) == .lt;
+    return true;
+}
+
+fn decoratedWindowWorstIndex(req: types.SearchRequest, window: []const DecoratedSortHit, keep_previous_page: bool) usize {
+    var worst: usize = 0;
+    for (window[1..], 1..) |item, i| {
+        const order = compareDecoratedSortHits(req, item, window[worst]);
+        if (keep_previous_page) {
+            if (order == .lt) worst = i;
+        } else {
+            if (order == .gt) worst = i;
+        }
+    }
+    return worst;
+}
+
+fn decoratedHitBetterThanWorst(req: types.SearchRequest, candidate: DecoratedSortHit, worst: DecoratedSortHit, keep_previous_page: bool) bool {
+    const order = compareDecoratedSortHits(req, candidate, worst);
+    if (keep_previous_page) return order == .gt;
+    return order == .lt;
+}
+
 fn searchHitSortStoredJsonAlloc(
     alloc: Allocator,
     hit: *types.SearchHit,
@@ -2555,7 +2604,7 @@ fn nativeSortValueFromTextDocValuesAlloc(
 ) !?SortValue {
     const resolved = snapshot.resolveDocId(native_text_doc_id) orelse return null;
     const segment = &snapshot.segments[resolved.seg_idx];
-    const section_data = segment.reader.getSection(field, .typed_doc_values) orelse return null;
+    const section_data = segment.reader.getSection(field, .typed_doc_values) orelse return .null_value;
     var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
     return switch (reader.value_type) {
         .u64_val => {
@@ -2577,7 +2626,7 @@ fn nativeSortValueFromTextDocValuesAlloc(
             const value = try readBytesDocValueAlloc(alloc, &reader, resolved.local_id) orelse return .null_value;
             return .{ .string = value };
         },
-        .geo_point => null,
+        .geo_point => error.UnsupportedQueryRequest,
     };
 }
 
@@ -2647,45 +2696,67 @@ fn sortAndPageSearchResultInPlace(
     native_loader: ?NativeSortValueLoader,
 ) !void {
     if (req.order_by.len == 0 or req.count_only) return;
+    try validateSortCursorContract(req);
     try checkSearchRequestDeadline(req);
 
     const alloc = result.alloc;
-    var decorated = try alloc.alloc(DecoratedSortHit, result.hits.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (decorated[0..initialized]) |*item| item.deinit(alloc);
-        if (decorated.len > 0) alloc.free(decorated);
-    }
-    for (result.hits, 0..) |*hit, i| {
-        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
-        decorated[i] = try decorateSortHitAlloc(alloc, req, hit.*, load_ctx, load_stored, native_loader);
-        hit.* = undefined;
-        initialized += 1;
-    }
-    if (result.hits.len > 0) alloc.free(result.hits);
+    const input_hits = result.hits;
     result.hits = &.{};
+    const window_capacity = sortWindowCapacity(req);
+    const keep_previous_page = req.search_before.len > 0;
+    var window: []DecoratedSortHit = if (window_capacity > 0)
+        try alloc.alloc(DecoratedSortHit, window_capacity)
+    else
+        &.{};
+    var window_len: usize = 0;
+    var processed_hits: usize = 0;
+    var input_owned = true;
+    var window_drained_prefix: usize = 0;
+    errdefer {
+        for (window[window_drained_prefix..window_len]) |*item| item.deinit(alloc);
+        if (window.len > 0) alloc.free(window);
+        if (input_owned) {
+            for (input_hits[processed_hits..]) |*hit| hit.deinit(alloc);
+            if (input_hits.len > 0) alloc.free(input_hits);
+        }
+    }
+    for (input_hits, 0..) |*hit, i| {
+        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
+        const raw_hit = hit.*;
+        hit.* = undefined;
+        processed_hits = i + 1;
+        var decorated = try decorateSortHitAlloc(alloc, req, raw_hit, load_ctx, load_stored, native_loader);
+
+        if (!decoratedHitAllowedByCursor(req, decorated) or window_capacity == 0) {
+            decorated.deinit(alloc);
+            continue;
+        }
+        if (window_len < window_capacity) {
+            window[window_len] = decorated;
+            window_len += 1;
+            continue;
+        }
+
+        const worst_index = decoratedWindowWorstIndex(req, window[0..window_len], keep_previous_page);
+        if (decoratedHitBetterThanWorst(req, decorated, window[worst_index], keep_previous_page)) {
+            window[worst_index].deinit(alloc);
+            window[worst_index] = decorated;
+        } else {
+            decorated.deinit(alloc);
+        }
+    }
+    if (input_hits.len > 0) alloc.free(input_hits);
+    input_owned = false;
 
     try checkSearchRequestDeadline(req);
-    std.sort.pdq(DecoratedSortHit, decorated, req, decoratedLessThan);
+    std.sort.pdq(DecoratedSortHit, window[0..window_len], req, decoratedLessThan);
     try checkSearchRequestDeadline(req);
 
     var start: usize = 0;
-    var end: usize = decorated.len;
-    if (req.search_after.len > 0) {
-        while (start < decorated.len and compareDecoratedHitToCursor(req, decorated[start], req.search_after) != .gt) {
-            start += 1;
-        }
-    } else if (req.search_before.len > 0) {
-        end = 0;
-        while (end < decorated.len and compareDecoratedHitToCursor(req, decorated[end], req.search_before) == .lt) {
-            end += 1;
-        }
-        start = if (end > req.limit) end - req.limit else 0;
-    } else {
-        start = @min(@as(usize, @intCast(req.offset)), decorated.len);
-    }
-    if (req.search_before.len == 0) {
-        end = @min(start + @as(usize, @intCast(req.limit)), decorated.len);
+    var end: usize = window_len;
+    if (req.search_after.len == 0 and req.search_before.len == 0) {
+        start = @min(@as(usize, @intCast(req.offset)), window_len);
+        end = @min(start + @as(usize, @intCast(req.limit)), window_len);
     }
 
     const selected = try alloc.alloc(types.SearchHit, end - start);
@@ -2694,7 +2765,7 @@ fn sortAndPageSearchResultInPlace(
         for (selected[0..selected_initialized]) |*hit| hit.deinit(alloc);
         if (selected.len > 0) alloc.free(selected);
     }
-    for (decorated, 0..) |*item, i| {
+    for (window[0..window_len], 0..) |*item, i| {
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
         if (i >= start and i < end) {
             selected[selected_initialized] = item.hit;
@@ -2704,8 +2775,9 @@ fn sortAndPageSearchResultInPlace(
             item.hit.deinit(alloc);
         }
         freeSortValues(alloc, item.keys);
+        window_drained_prefix = i + 1;
     }
-    if (decorated.len > 0) alloc.free(decorated);
+    if (window.len > 0) alloc.free(window);
     result.hits = selected;
 }
 
@@ -4097,6 +4169,7 @@ pub fn searchTextQuery(
     const search_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints, effective_req.count_only);
     const load_stored_in_search_engine = effective_req.include_stored and !chunk_backed;
     const requires_field_sort = effective_req.order_by.len > 0;
+    if (requires_field_sort) try validateTextNativeSortFields(effective_req, snapshot, text_entry.runtime_schema);
     const exact_late_visibility_totals = late_visibility_paginate and
         (effective_req.count_only or
             effective_req.limit == 0 or
@@ -5945,6 +6018,75 @@ fn requestNeedsNativeSortValues(req: types.SearchRequest) bool {
     return false;
 }
 
+fn snapshotHasTypedDocValuesField(snapshot: *const index_mod.IndexSnapshot, field: []const u8) bool {
+    for (snapshot.segments) |*segment| {
+        if (segment.reader.getSection(field, .typed_doc_values) != null) return true;
+    }
+    return false;
+}
+
+fn sortFieldMapping(schema: runtime_schema_mod.TableSchema, field: []const u8) ?runtime_schema_mod.FieldMapping {
+    if (runtime_schema_mod.resolveFieldType(schema, field)) |mapping| return mapping;
+    const field_name = fieldNameFromPath(field);
+    if (!std.mem.eql(u8, field_name, field)) {
+        if (runtime_schema_mod.resolveFieldType(schema, field_name)) |mapping| return mapping;
+    }
+    return null;
+}
+
+fn sortFieldTypeIsScalar(field_type: runtime_schema_mod.AntflyType) bool {
+    return switch (field_type) {
+        .keyword, .numeric, .boolean, .datetime, .link => true,
+        else => false,
+    };
+}
+
+fn validateMappedSortField(mapping: runtime_schema_mod.FieldMapping) !void {
+    if (!mapping.sortable or !mapping.doc_values or !sortFieldTypeIsScalar(mapping.field_type)) {
+        return error.UnsupportedQueryRequest;
+    }
+}
+
+fn jsonValueIsNumeric(value: std.json.Value) bool {
+    return switch (value) {
+        .integer, .float, .number_string => true,
+        else => false,
+    };
+}
+
+fn validateMappedSortCursorValue(mapping: runtime_schema_mod.FieldMapping, value: std.json.Value) !void {
+    if (value == .null) return;
+    const valid = switch (mapping.field_type) {
+        .keyword, .link => value == .string,
+        .numeric, .datetime => jsonValueIsNumeric(value),
+        .boolean => value == .bool,
+        else => false,
+    };
+    if (!valid) return error.InvalidQueryRequest;
+}
+
+fn validateTextNativeSortFields(
+    req: types.SearchRequest,
+    snapshot: *const index_mod.IndexSnapshot,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) !void {
+    if (req.order_by.len == 0) return;
+    try validateSortCursorContract(req);
+    const cursor = activeSortCursor(req);
+    if (!requestNeedsNativeSortValues(req)) return;
+    for (req.order_by, 0..) |field, i| {
+        if (std.mem.eql(u8, field.field, "_id")) continue;
+        if (runtime_schema) |schema| {
+            const mapping = sortFieldMapping(schema, field.field) orelse return error.UnsupportedQueryRequest;
+            try validateMappedSortField(mapping);
+            if (cursor.len > 0) try validateMappedSortCursorValue(mapping, cursor[i]);
+            continue;
+        }
+        if (snapshot.global_doc_count == 0) continue;
+        if (!snapshotHasTypedDocValuesField(snapshot, field.field)) return error.UnsupportedQueryRequest;
+    }
+}
+
 fn buildOrdinalTextDocIdMapAlloc(
     alloc: Allocator,
     snapshot: *const index_mod.IndexSnapshot,
@@ -5980,6 +6122,7 @@ fn buildMatchAllNativeSortContextAlloc(
     if (req.order_by.len == 0 or !requestNeedsNativeSortValues(req)) return null;
     const text_entry = (try executor.text_index_entry(executor.ctx, req.index_name)) orelse return null;
     const snapshot = text_entry.persistent.snapshot();
+    try validateTextNativeSortFields(req, snapshot, text_entry.runtime_schema);
     if (!(try buildOrdinalTextDocIdMapAlloc(alloc, snapshot, candidates, ordinal_to_text_doc_id))) return null;
     return .{
         .snapshot = snapshot,
@@ -7374,6 +7517,106 @@ test "sort resolves match_all doc ordinals to native text doc values" {
     try std.testing.expectEqualStrings("doc:a", result.hits[2].id);
 }
 
+test "native text sort validation rejects fields without typed doc values" {
+    const alloc = std.testing.allocator;
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    try seg_writer.addStoredDoc("doc:a", "{\"title\":\"alpha\"}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+
+    const invalid_order_by = [_]types.SortField{.{ .field = "title", .desc = false }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, validateTextNativeSortFields(.{
+        .order_by = &invalid_order_by,
+        .limit = 10,
+    }, snapshot, null));
+
+    const id_order_by = [_]types.SortField{.{ .field = "_id", .desc = false }};
+    try validateTextNativeSortFields(.{
+        .order_by = &id_order_by,
+        .limit = 10,
+    }, snapshot, null);
+}
+
+test "native text sort validation uses runtime sortable mappings" {
+    const alloc = std.testing.allocator;
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    try seg_writer.addStoredDoc("doc:a", "{\"created_at\":null,\"title\":\"alpha\"}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{
+        .{
+            .name = "created_at",
+            .path_match = "created_at",
+            .mapping = .{
+                .field_type = .datetime,
+                .doc_values = true,
+                .sortable = true,
+                .analyzer = "keyword",
+            },
+        },
+        .{
+            .name = "title",
+            .path_match = "title",
+            .mapping = .{
+                .field_type = .keyword,
+                .doc_values = true,
+                .sortable = false,
+                .analyzer = "keyword",
+            },
+        },
+    };
+    const schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &templates,
+    };
+
+    const valid_order_by = [_]types.SortField{.{ .field = "created_at", .desc = true }};
+    try validateTextNativeSortFields(.{
+        .order_by = &valid_order_by,
+        .limit = 10,
+    }, snapshot, schema);
+
+    const valid_cursor = [_]std.json.Value{.{ .integer = 123 }};
+    try validateTextNativeSortFields(.{
+        .order_by = &valid_order_by,
+        .search_after = &valid_cursor,
+        .limit = 10,
+    }, snapshot, schema);
+
+    const invalid_cursor = [_]std.json.Value{.{ .string = "2026-01-01T00:00:00Z" }};
+    try std.testing.expectError(error.InvalidQueryRequest, validateTextNativeSortFields(.{
+        .order_by = &valid_order_by,
+        .search_after = &invalid_cursor,
+        .limit = 10,
+    }, snapshot, schema));
+
+    const invalid_order_by = [_]types.SortField{.{ .field = "title", .desc = false }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, validateTextNativeSortFields(.{
+        .order_by = &invalid_order_by,
+        .limit = 10,
+    }, snapshot, schema));
+
+    const unknown_order_by = [_]types.SortField{.{ .field = "unknown", .desc = false }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, validateTextNativeSortFields(.{
+        .order_by = &unknown_order_by,
+        .limit = 10,
+    }, snapshot, schema));
+}
+
 test "sort falls back to stored json when native text doc values are unavailable" {
     const alloc = std.testing.allocator;
 
@@ -7666,6 +7909,77 @@ test "match_all applies stored sort before cursor pagination" {
     try std.testing.expectEqualStrings("doc:a", second_page.hits[0].id);
     try std.testing.expectEqual(@as(i64, 2), second_page.hits[0].sort_values[0].integer);
     try std.testing.expectEqualStrings("doc:a", second_page.hits[0].sort_values[1].string);
+}
+
+test "match_all applies stored sort before offset pagination" {
+    const alloc = std.testing.allocator;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+    };
+    const order_by = [_]types.SortField{
+        .{ .field = "rank" },
+        .{ .field = "_id" },
+    };
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+    var result = try searchMatchAll(alloc, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .offset = 1,
+        .limit = 1,
+    }, executor);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 3), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:c", result.hits[0].id);
+    try std.testing.expectEqual(@as(i64, 1), result.hits[0].sort_values[0].integer);
+    try std.testing.expectEqualStrings("doc:c", result.hits[0].sort_values[1].string);
+}
+
+test "match_all rejects invalid sort cursor contract" {
+    const alloc = std.testing.allocator;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+    };
+    const order_by = [_]types.SortField{
+        .{ .field = "rank" },
+        .{ .field = "_id" },
+    };
+    const short_cursor = [_]std.json.Value{.{ .integer = 1 }};
+    const full_cursor = [_]std.json.Value{
+        .{ .integer = 1 },
+        .{ .string = "doc:b" },
+    };
+    const bad_id_cursor = [_]std.json.Value{
+        .{ .integer = 1 },
+        .{ .integer = 9 },
+    };
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+    try std.testing.expectError(error.InvalidQueryRequest, searchMatchAll(alloc, .{
+        .order_by = &order_by,
+        .search_after = &short_cursor,
+        .include_stored = false,
+        .limit = 2,
+    }, executor));
+    try std.testing.expectError(error.InvalidQueryRequest, searchMatchAll(alloc, .{
+        .order_by = &order_by,
+        .search_after = &full_cursor,
+        .search_before = &full_cursor,
+        .include_stored = false,
+        .limit = 2,
+    }, executor));
+    try std.testing.expectError(error.InvalidQueryRequest, searchMatchAll(alloc, .{
+        .order_by = &order_by,
+        .search_after = &bad_id_cursor,
+        .include_stored = false,
+        .limit = 2,
+    }, executor));
 }
 
 test "match_all supports dotted stored sort and search_before" {

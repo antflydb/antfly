@@ -140,3 +140,7 @@ components:
           type: boolean
           default: false
           description: Whether to enable doc values for sorting/faceting
+        sortable:
+          type: boolean
+          default: false
+          description: Whether this doc-valued scalar field can be used in order_by

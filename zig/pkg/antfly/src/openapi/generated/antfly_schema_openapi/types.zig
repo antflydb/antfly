@@ -80,6 +80,8 @@ pub const TemplateFieldMapping = struct {
     include_in_all: ?bool = null,
     /// Whether to enable doc values for sorting/faceting
     doc_values: ?bool = null,
+    /// Whether this doc-valued scalar field can be used in order_by
+    sortable: ?bool = null,
 };
 
 /// A rule for mapping dynamically detected fields. Templates are checked in order and the first matching template's mapping is used.
