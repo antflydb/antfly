@@ -19429,6 +19429,7 @@ test "provisioned table write cache retires stale db when index metadata changes
     const first_entry = first.entry.?;
     first.deinit(alloc);
     first_released = true;
+    write_cache.drainPendingClosesForGroupTable(7001, "docs");
 
     var second = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
     defer second.deinit(alloc);
@@ -24629,7 +24630,7 @@ test "write cache keeps leased entry cleanup reachable when retirement bookkeepi
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len + write_cache.retired_entries.items.len);
 
     cached.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
 }
 

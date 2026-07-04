@@ -210,6 +210,7 @@ const JournalMatchingCursor = struct {
 const PrimaryStoreMatchingCursor = struct {
     store: *docstore_mod.DocStore,
     kind_ordinal: u8,
+    hint: TargetHint,
     next_sequence: u64,
     hint_exhausted: bool = false,
 
@@ -285,8 +286,17 @@ fn primaryStoreMatchingCursorForEachNext(
         Context.handle,
     ) catch |err| switch (err) {
         error.ReplayIndexUnavailable => {
-            cursor.hint_exhausted = true;
-            return .{};
+            const stats = try primaryStoreForEachMatchingRecordFallbackAll(
+                cursor.store,
+                cursor.next_sequence,
+                cursor.hint,
+                max_matched_entries,
+                ctx,
+                consume,
+            );
+            cursor.next_sequence = @max(cursor.next_sequence, stats.last_sequence);
+            if (stats.matched_entries == 0) cursor.hint_exhausted = true;
+            return stats;
         },
         StopReplayChunk.StopReplayChunk => {
             cursor.next_sequence = @max(cursor.next_sequence, callback_ctx.stats.last_sequence);
@@ -295,7 +305,73 @@ fn primaryStoreMatchingCursorForEachNext(
         else => return err,
     };
     cursor.next_sequence = @max(cursor.next_sequence, replay_stats.last_sequence);
-    if (replay_stats.matched_entries == 0) cursor.hint_exhausted = true;
+    if (replay_stats.matched_entries == 0) {
+        const fallback_stats = try primaryStoreForEachMatchingRecordFallbackAll(
+            cursor.store,
+            cursor.next_sequence,
+            cursor.hint,
+            max_matched_entries,
+            ctx,
+            consume,
+        );
+        cursor.next_sequence = @max(cursor.next_sequence, fallback_stats.last_sequence);
+        if (fallback_stats.matched_entries == 0) cursor.hint_exhausted = true;
+        return fallback_stats;
+    }
+    callback_ctx.stats.scanned_entries = @max(callback_ctx.stats.scanned_entries, replay_stats.scanned_entries);
+    callback_ctx.stats.hint_filter_skips += replay_stats.hint_filter_skips;
+    callback_ctx.stats.scan_batches = @max(callback_ctx.stats.scan_batches, replay_stats.scan_batches);
+    return callback_ctx.stats;
+}
+
+fn primaryStoreForEachMatchingRecordFallbackAll(
+    store: *docstore_mod.DocStore,
+    from_sequence: u64,
+    hint: TargetHint,
+    max_matched_entries: usize,
+    ctx: *anyopaque,
+    consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
+) !MatchingRecordStats {
+    const Context = struct {
+        consumer_ctx: *anyopaque,
+        consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
+        hint: TargetHint,
+        max_matched_entries: usize,
+        stats: MatchingRecordStats = .{},
+
+        fn handle(self: *@This(), sequence: u64, payload: []const u8) !void {
+            self.stats.scanned_entries += 1;
+            if (!try change_journal_mod.encodedRecordHasHint(payload, self.hint)) {
+                self.stats.hint_filter_skips += 1;
+                return;
+            }
+            try self.consume(self.consumer_ctx, sequence, payload);
+            self.stats.matched_entries += 1;
+            self.stats.last_sequence = sequence;
+            if (self.max_matched_entries != 0 and self.stats.matched_entries >= self.max_matched_entries) {
+                return StopReplayChunk.StopReplayChunk;
+            }
+        }
+    };
+
+    var callback_ctx = Context{
+        .consumer_ctx = ctx,
+        .consume = consume,
+        .hint = hint,
+        .max_matched_entries = max_matched_entries,
+    };
+    callback_ctx.stats.scan_batches = 1;
+    const replay_stats = store.forEachReplayLaneFrom(
+        internal_keys.replay_all_kind,
+        from_sequence + 1,
+        0,
+        &callback_ctx,
+        Context.handle,
+    ) catch |err| switch (err) {
+        error.ReplayIndexUnavailable => return .{},
+        StopReplayChunk.StopReplayChunk => return callback_ctx.stats,
+        else => return err,
+    };
     callback_ctx.stats.scanned_entries = @max(callback_ctx.stats.scanned_entries, replay_stats.scanned_entries);
     callback_ctx.stats.hint_filter_skips += replay_stats.hint_filter_skips;
     callback_ctx.stats.scan_batches = @max(callback_ctx.stats.scan_batches, replay_stats.scan_batches);
@@ -337,6 +413,7 @@ fn primaryStoreOpenMatchingCursor(
             .primary_store = .{
                 .store = store,
                 .kind_ordinal = kind_ordinal,
+                .hint = hint,
                 .next_sequence = from_sequence,
             },
         },
@@ -434,10 +511,27 @@ fn primaryStoreForEachMatchingRecord(
         &callback_ctx,
         Context.handle,
     ) catch |err| switch (err) {
-        error.ReplayIndexUnavailable => return .{},
+        error.ReplayIndexUnavailable => return try primaryStoreForEachMatchingRecordFallbackAll(
+            store,
+            from_sequence,
+            hint,
+            max_matched_entries,
+            ctx,
+            consume,
+        ),
         StopReplayChunk.StopReplayChunk => return callback_ctx.stats,
         else => return err,
     };
+    if (replay_stats.matched_entries == 0) {
+        return try primaryStoreForEachMatchingRecordFallbackAll(
+            store,
+            from_sequence,
+            hint,
+            max_matched_entries,
+            ctx,
+            consume,
+        );
+    }
     callback_ctx.stats.scanned_entries = @max(callback_ctx.stats.scanned_entries, replay_stats.scanned_entries);
     callback_ctx.stats.hint_filter_skips += replay_stats.hint_filter_skips;
     callback_ctx.stats.scan_batches = @max(callback_ctx.stats.scan_batches, replay_stats.scan_batches);

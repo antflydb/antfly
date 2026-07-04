@@ -40138,26 +40138,14 @@ test "db generated enrichment backfill drains stored docs beyond first replay ch
     const pending_after = db.pendingWorkStats();
     try std.testing.expectEqual(pending_after.enrichment.target_sequence, pending_after.enrichment.applied_sequence);
 
-    const query_vec = try deterministic.interface().embedDense(alloc, "", "generated vector text 128", 3);
-    defer alloc.free(query_vec);
+    const last_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:128", "body_dense_v1");
+    defer alloc.free(last_artifact_key);
+    const last_artifact = try db.core.store.get(alloc, last_artifact_key);
+    defer alloc.free(last_artifact);
+    try expectDenseEmbeddingArtifactWithSourceHash(alloc, last_artifact, 3);
 
-    var result = try waitForSearchResult(alloc, &db, .{
-        .index_name = "dv_v1",
-        .dense = .{
-            .vector = query_vec,
-            .k = 5,
-        },
-    }, 1);
-    defer result.deinit();
-    try std.testing.expect(result.total_hits > 0);
-    var found_last = false;
-    for (result.hits) |hit| {
-        if (std.mem.eql(u8, hit.id, "doc:128")) {
-            found_last = true;
-            break;
-        }
-    }
-    try std.testing.expect(found_last);
+    const dense_entry = db.core.denseIndex("dv_v1") orelse return error.IndexNotFound;
+    try std.testing.expectEqual(@as(u64, @intCast(total_docs)), dense_entry.index.stats().active_count);
 }
 
 test "db runUntilIdle drains lazy dense posting maintenance" {

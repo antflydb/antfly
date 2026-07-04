@@ -4032,7 +4032,7 @@ pub const ApiHttpServer = struct {
                 while (true) {
                     self.source.createTable(self.alloc, table_name, create_req) catch |err| switch (err) {
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
-                        error.NotLeader => return err,
+                        error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return err,
                         error.UnexpectedHttpStatus => {
                             if (platform_time.monotonicNs() -| metadata_create_start_ns >= metadata_create_timeout_ns) {
                                 std.log.err("public create table metadata create failed table={s} err={}", .{ table_name, err });
@@ -6514,8 +6514,7 @@ pub const ApiHttpServer = struct {
             _ = table_writes_source.dropIndex(alloc, table_name, index_name) catch |err| switch (err) {
                 error.IndexNotFound => {},
                 else => {
-                    std.log.err("public delete index local apply failed table={s} index={s} err={}", .{ table_name, index_name, err });
-                    return error.InternalFailure;
+                    std.log.warn("public delete index local apply deferred table={s} index={s} err={}", .{ table_name, index_name, err });
                 },
             };
         }
