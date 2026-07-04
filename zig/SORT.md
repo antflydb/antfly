@@ -910,8 +910,8 @@ The planner should select among:
 The incremental implementation should expose those choices through an explicit
 sort execution plan instead of encoding them as nullable loaders or hidden
 fallbacks. The current in-process plan names should distinguish at least:
-`none`, `id_only`, `native_doc_values`, `stored_json_fallback`, and
-`unsupported_exact_sort`. `stored_json_fallback` is a temporary compatibility
+`none`, `id_only`, `native_doc_values`, `stored_json_debug`, and
+`unsupported_exact_sort`. `stored_json_debug` is a test/debug-only compatibility
 plan; once a request has planned as `native_doc_values`, execution must require
 native values and fail closed if the required ordinal/doc-value coverage is not
 available.
@@ -959,6 +959,61 @@ Response:
 ```
 
 The `_sort` array should be present when `order_by` is present.
+
+## Production Observability
+
+Sorted search needs first-class telemetry because correctness failures often
+look like performance fallbacks. Operators should be able to answer, for any
+slow or rejected query, which physical plan ran and why the planner did not
+choose a better one.
+
+Every sorted query profile should include:
+
+- selected sort plan name
+- requested order fields after implicit `_id` normalization
+- exactness class
+- candidate count
+- cursor-rejected count
+- doc-value load count and latency
+- doc-value miss or physical coverage failure count
+- stored-source load count and latency
+- collector window size
+- final sort/merge latency
+- distributed shard window size, when applicable
+- budget rejection reason, when rejected
+
+The stable plan names should be suitable for logs, traces, metrics, and tests.
+The current implementation should expose at least `none`, `id_only`,
+`native_doc_values`, `stored_json_debug`, and `unsupported_exact_sort`; the
+long-term planner should grow those into `id_seek`, `sorted_segment_seek`,
+`native_doc_values_top_n`, `score_top_k`, and `distributed_k_way_merge`.
+
+The most important invariant is that telemetry must distinguish "native path
+was selected and succeeded" from "native path was unavailable." A public sorted
+query must not quietly move from native doc values to stored JSON. If native
+coverage is missing, the request should fail closed and report the missing
+capability: unmapped field, non-sortable field, missing doc-values section,
+typed-value kind mismatch, sparse live-doc coverage, unsupported cursor type, or
+unsupported distributed merge.
+
+## Release Gates
+
+Each phase should have an explicit production gate before it is relied on by
+public APIs:
+
+- correctness tests for the comparator, cursor, and `_id` tie-breaker
+- reopen/compaction tests proving doc-value and live-doc coverage survives
+- planner tests that reject unsupported exact sorts instead of falling back
+- profile/log tests for stable plan names and failure reasons
+- benchmark coverage for broad match-all, broad text, selective filter, and
+  distributed merge paths
+- migration/reindex tooling for layout changes such as `index_sort`
+
+For deployment, new exact sort paths should be enabled behind a runtime
+capability check, not only a code version. Rolling upgrades must tolerate mixed
+segments where some generations do not yet have the required physical sections.
+Those mixed states should reject newly unsupported exact sorts with clear 422s
+until backfill, compaction, or reindex has made coverage complete.
 
 ## Rollout Plan
 
