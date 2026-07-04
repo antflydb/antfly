@@ -2944,6 +2944,12 @@ pub const TableWriteSource = struct {
             alloc: std.mem.Allocator,
             table_name: []const u8,
         ) anyerror!?void = null,
+        request_table_index_structural_reconcile: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+        ) anyerror!?void = null,
     };
 
     pub fn batch(
@@ -3330,6 +3336,16 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.request_table_structural_reconcile orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name);
+    }
+
+    pub fn requestTableIndexStructuralReconcile(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.request_table_index_structural_reconcile orelse return try self.requestTableStructuralReconcile(alloc, table_name);
+        return try fn_ptr(self.ptr, alloc, table_name, index_name);
     }
 };
 
@@ -3939,6 +3955,30 @@ pub const ProvisionedTableWriteSource = struct {
         on_change: *const fn (ptr: *anyopaque, table_name: []const u8, kind: LocalChangeKind) void,
     };
 
+    const StructuralReconcileRequest = struct {
+        table_name: []u8,
+        index_name: ?[]u8 = null,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.table_name);
+            if (self.index_name) |name| alloc.free(name);
+            self.* = undefined;
+        }
+
+        fn sameTarget(self: @This(), table_name: []const u8, index_name: ?[]const u8) bool {
+            if (!std.mem.eql(u8, self.table_name, table_name)) return false;
+            if (self.index_name == null or index_name == null) return self.index_name == null and index_name == null;
+            return std.mem.eql(u8, self.index_name.?, index_name.?);
+        }
+
+        fn covers(self: @This(), table_name: []const u8, index_name: ?[]const u8) bool {
+            if (!std.mem.eql(u8, self.table_name, table_name)) return false;
+            if (self.index_name == null) return true;
+            if (index_name == null) return false;
+            return std.mem.eql(u8, self.index_name.?, index_name.?);
+        }
+    };
+
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
     local_db_mutex: std.atomic.Mutex = .unlocked,
@@ -3961,7 +4001,7 @@ pub const ProvisionedTableWriteSource = struct {
     restore_repair_completions: std.ArrayListUnmanaged([]u8) = .empty,
     structural_reconcile_mutex: Io.Mutex = .init,
     structural_reconcile_scheduled: std.atomic.Value(bool) = .init(false),
-    structural_reconcile_tables: std.ArrayListUnmanaged([]u8) = .empty,
+    structural_reconcile_tables: std.ArrayListUnmanaged(StructuralReconcileRequest) = .empty,
     runtime_status_cache: ?*runtime_status.TableRuntimeSnapshotCache = null,
     local_change_hook: ?LocalChangeHook = null,
     raft_batcher: ?RaftBatcher = null,
@@ -7238,12 +7278,24 @@ pub const ProvisionedTableWriteSource = struct {
         const alloc = std.heap.page_allocator;
         self.structural_reconcile_mutex.lockUncancelable(io);
         defer self.structural_reconcile_mutex.unlock(io);
-        for (self.structural_reconcile_tables.items) |table_name| alloc.free(table_name);
+        for (self.structural_reconcile_tables.items) |*request| request.deinit(alloc);
         self.structural_reconcile_tables.deinit(alloc);
         self.structural_reconcile_tables = .empty;
     }
 
     fn enqueueTableStructuralReconcile(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        self.enqueueTableStructuralReconcileTarget(table_name, null);
+    }
+
+    fn enqueueTableIndexStructuralReconcile(self: *ProvisionedTableWriteSource, table_name: []const u8, index_name: []const u8) void {
+        self.enqueueTableStructuralReconcileTarget(table_name, index_name);
+    }
+
+    fn enqueueTableStructuralReconcileTarget(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        index_name: ?[]const u8,
+    ) void {
         if (self.restore_repair_shutdown.load(.acquire)) return;
         const alloc = std.heap.page_allocator;
         const io = self.table_activity_threaded.io();
@@ -7252,24 +7304,45 @@ pub const ProvisionedTableWriteSource = struct {
         defer self.structural_reconcile_mutex.unlock(io);
 
         for (self.structural_reconcile_tables.items) |candidate| {
-            if (std.mem.eql(u8, candidate, table_name)) return;
+            if (candidate.covers(table_name, index_name) or candidate.sameTarget(table_name, index_name)) return;
+        }
+
+        if (index_name == null) {
+            var i: usize = 0;
+            while (i < self.structural_reconcile_tables.items.len) {
+                if (std.mem.eql(u8, self.structural_reconcile_tables.items[i].table_name, table_name)) {
+                    var removed = self.structural_reconcile_tables.orderedRemove(i);
+                    removed.deinit(alloc);
+                    continue;
+                }
+                i += 1;
+            }
         }
 
         const owned_table_name = alloc.dupe(u8, table_name) catch |err| {
             std.log.warn("structural reconcile table name allocation failed table={s} err={}", .{ table_name, err });
             return;
         };
-        errdefer alloc.free(owned_table_name);
+        const owned_index_name = if (index_name) |name| alloc.dupe(u8, name) catch |err| {
+            alloc.free(owned_table_name);
+            std.log.warn("structural reconcile index name allocation failed table={s} index={s} err={}", .{ table_name, name, err });
+            return;
+        } else null;
         const appended_index = self.structural_reconcile_tables.items.len;
-        self.structural_reconcile_tables.append(alloc, owned_table_name) catch |err| {
+        self.structural_reconcile_tables.append(alloc, .{
+            .table_name = owned_table_name,
+            .index_name = owned_index_name,
+        }) catch |err| {
+            alloc.free(owned_table_name);
+            if (owned_index_name) |name| alloc.free(name);
             std.log.warn("structural reconcile queue append failed table={s} err={}", .{ table_name, err });
             return;
         };
 
         if (self.structural_reconcile_scheduled.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
         self.restore_repair_work_group.concurrent(io, drainStructuralReconcileTask, .{self}) catch |err| {
-            const removed = self.structural_reconcile_tables.orderedRemove(appended_index);
-            alloc.free(removed);
+            var removed = self.structural_reconcile_tables.orderedRemove(appended_index);
+            removed.deinit(alloc);
             self.structural_reconcile_scheduled.store(false, .release);
             std.log.warn("structural reconcile submit failed table={s} err={}", .{ table_name, err });
         };
@@ -7290,10 +7363,14 @@ pub const ProvisionedTableWriteSource = struct {
             self.structural_reconcile_mutex.unlock(io);
             defer pending.deinit(alloc);
 
-            for (pending.items) |table_name| {
-                defer alloc.free(table_name);
-                self.reconcileTableStructureUntilIdle(alloc, table_name) catch |err| {
-                    std.log.warn("structural reconcile failed table={s} err={s}", .{ table_name, @errorName(err) });
+            for (pending.items) |*request| {
+                defer request.deinit(alloc);
+                self.reconcileTableStructureUntilIdle(alloc, request.table_name, request.index_name) catch |err| {
+                    if (request.index_name) |index_name| {
+                        std.log.warn("structural reconcile failed table={s} index={s} err={s}", .{ request.table_name, index_name, @errorName(err) });
+                    } else {
+                        std.log.warn("structural reconcile failed table={s} err={s}", .{ request.table_name, @errorName(err) });
+                    }
                 };
             }
         }
@@ -7303,21 +7380,14 @@ pub const ProvisionedTableWriteSource = struct {
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         table_name: []const u8,
+        target_index_name: ?[]const u8,
     ) !void {
-        const group_ids = try table_catalog.resolveGroupsForSpanEventually(
-            alloc,
-            self.catalog,
-            table_name,
-            "",
-            "",
-            5 * std.time.ns_per_s,
-            10,
-        );
-        defer alloc.free(group_ids);
-
-        if (group_ids.len == 0) return;
         const io = self.table_activity_threaded.io();
-        std.log.info("structural reconcile begin table={s} groups={d}", .{ table_name, group_ids.len });
+        if (target_index_name) |index_name| {
+            std.log.info("structural reconcile begin table={s} index={s}", .{ table_name, index_name });
+        } else {
+            std.log.info("structural reconcile begin table={s}", .{table_name});
+        }
         lockAtomic(&self.local_db_mutex);
         self.invalidateWriteCache(table_name);
         self.invalidateReadCache(table_name);
@@ -7329,6 +7399,17 @@ pub const ProvisionedTableWriteSource = struct {
             if (self.restore_repair_shutdown.load(.acquire)) return;
             attempts += 1;
             var any_busy = false;
+            const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+                alloc,
+                self.catalog,
+                table_name,
+                "",
+                "",
+                5 * std.time.ns_per_s,
+                10,
+            );
+            defer alloc.free(group_ids);
+            if (group_ids.len == 0) return;
             const metadata = (try loadTableManagedMetadata(alloc, self.catalog, table_name)) orelse return;
             defer {
                 if (metadata.indexes_json) |value| alloc.free(value);
@@ -7338,6 +7419,7 @@ pub const ProvisionedTableWriteSource = struct {
                 if (try self.reconcileTableGroupStructureWithRuntime(alloc, group_id, table_name, .{
                     .indexes_json = metadata.indexes_json,
                     .schema_json = metadata.schema_json,
+                    .target_index_name = target_index_name,
                 })) {
                     any_busy = true;
                     continue;
@@ -7345,7 +7427,11 @@ pub const ProvisionedTableWriteSource = struct {
             }
             if (!any_busy) {
                 self.notifyLocalChange(table_name, .structural);
-                std.log.info("structural reconcile complete table={s} attempts={d}", .{ table_name, attempts });
+                if (target_index_name) |index_name| {
+                    std.log.info("structural reconcile complete table={s} index={s} attempts={d}", .{ table_name, index_name, attempts });
+                } else {
+                    std.log.info("structural reconcile complete table={s} attempts={d}", .{ table_name, attempts });
+                }
                 return;
             }
             io.sleep(Io.Duration.fromMilliseconds(100), .awake) catch |err| switch (err) {
@@ -7388,11 +7474,18 @@ pub const ProvisionedTableWriteSource = struct {
 
             if (metadata.schema_json) |schema_json| try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
             if (configured_indexes_storage) |configured_indexes| {
-                for (configured_indexes.items) |item| {
-                    _ = cached.db.deleteIndex(item.name) catch |err| switch (err) {
+                if (metadata.target_index_name) |target_index_name| {
+                    _ = cached.db.deleteIndex(target_index_name) catch |err| switch (err) {
                         error.IndexNotFound => {},
                         else => return err,
                     };
+                } else {
+                    for (configured_indexes.items) |item| {
+                        _ = cached.db.deleteIndex(item.name) catch |err| switch (err) {
+                            error.IndexNotFound => {},
+                            else => return err,
+                        };
+                    }
                 }
             }
             if (metadata.indexes_json) |indexes_json| {
@@ -7402,6 +7495,9 @@ pub const ProvisionedTableWriteSource = struct {
             }
             if (configured_indexes_storage) |configured_indexes| {
                 for (configured_indexes.items) |item| {
+                    if (metadata.target_index_name) |target_index_name| {
+                        if (!std.mem.eql(u8, item.name, target_index_name)) continue;
+                    }
                     catchUpManagedIndexCreate(alloc, cached.db, item.name) catch |err| {
                         lockAtomic(&self.local_db_mutex);
                         defer self.local_db_mutex.unlock();
@@ -7476,11 +7572,18 @@ pub const ProvisionedTableWriteSource = struct {
         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
         if (metadata.schema_json) |schema_json| try applyLocalTableSchemaJson(alloc, &db, schema_json);
         if (configured_indexes_storage) |configured_indexes| {
-            for (configured_indexes.items) |item| {
-                _ = db.deleteIndex(item.name) catch |err| switch (err) {
+            if (metadata.target_index_name) |target_index_name| {
+                _ = db.deleteIndex(target_index_name) catch |err| switch (err) {
                     error.IndexNotFound => {},
                     else => return err,
                 };
+            } else {
+                for (configured_indexes.items) |item| {
+                    _ = db.deleteIndex(item.name) catch |err| switch (err) {
+                        error.IndexNotFound => {},
+                        else => return err,
+                    };
+                }
             }
         }
         if (metadata.indexes_json) |indexes_json| {
@@ -7489,7 +7592,12 @@ pub const ProvisionedTableWriteSource = struct {
             });
         }
         if (configured_indexes_storage) |configured_indexes| {
-            for (configured_indexes.items) |item| try catchUpManagedIndexCreate(alloc, &db, item.name);
+            for (configured_indexes.items) |item| {
+                if (metadata.target_index_name) |target_index_name| {
+                    if (!std.mem.eql(u8, item.name, target_index_name)) continue;
+                }
+                try catchUpManagedIndexCreate(alloc, &db, item.name);
+            }
         } else {
             try db.runUntilIdle();
         }
@@ -7505,6 +7613,18 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.localWriteOwnerSource()) |owner| return try owner.requestTableStructuralReconcile(std.heap.page_allocator, table_name);
         self.enqueueTableStructuralReconcile(table_name);
+        return {};
+    }
+
+    fn requestTableIndexStructuralReconcile(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+    ) !?void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.requestTableIndexStructuralReconcile(std.heap.page_allocator, table_name, index_name);
+        self.enqueueTableIndexStructuralReconcile(table_name, index_name);
         return {};
     }
 
@@ -7588,6 +7708,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .apply_document_artifact_child_range_batch_group_local = applyDocumentArtifactChildRangeBatchGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
                 .request_table_structural_reconcile = requestTableStructuralReconcile,
+                .request_table_index_structural_reconcile = requestTableIndexStructuralReconcile,
             },
         };
     }
@@ -12071,7 +12192,10 @@ fn catchUpManagedIndexCreate(
         try db.catchUpPendingDerivedReplay();
         try db.runUntilIdle();
     }
-    if (requires_enrichment_replay) try repairManagedEmbeddingArtifactsForIndex(alloc, db, index_name);
+    if (requires_enrichment_replay) {
+        const debt_remaining = try repairManagedEmbeddingArtifactsForIndex(alloc, db, index_name);
+        if (debt_remaining) try markManagedIndexRepairRequired(alloc, db, index_name);
+    }
     try db.core.index_manager.syncAll(true);
 }
 
@@ -12085,7 +12209,7 @@ fn repairManagedEmbeddingArtifactsForIndex(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
     index_name: []const u8,
-) !void {
+) !bool {
     const max_passes: usize = 4;
     var pass: usize = 0;
     while (pass < max_passes) : (pass += 1) {
@@ -12096,14 +12220,31 @@ fn repairManagedEmbeddingArtifactsForIndex(
         });
         defer repair.deinit(alloc);
 
-        if (repair.reprocessed == 0 and repair.repaired == 0) return;
+        if (repair.reprocessed == 0 and repair.repaired == 0) return repair.has_more or repair.debt_remaining;
         db.catchUpPendingDerivedReplay() catch |err| switch (err) {
             error.ArtifactRepairRequired => {},
             else => return err,
         };
         try db.runUntilIdle();
-        if (!repair.has_more and !repair.debt_remaining) return;
+        if (!repair.has_more and !repair.debt_remaining) return false;
     }
+    var remaining = try db.listArtifactRepairIssuesPage(alloc, .{
+        .artifact_kind = .embedding,
+        .index_name = index_name,
+        .limit = 1,
+    });
+    defer remaining.deinit(alloc);
+    return remaining.issues.len != 0 or remaining.has_more;
+}
+
+fn markManagedIndexRepairRequired(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    index_name: []const u8,
+) !void {
+    var checkpoint = try db.core.loadProjectionCheckpoint(alloc, index_name);
+    checkpoint.status = .repair_required;
+    try db.core.saveProjectionCheckpoint(index_name, checkpoint);
 }
 
 fn managedIndexReplayDebtRequired(replay_debt: anytype, index_name: []const u8) bool {
@@ -12611,6 +12752,7 @@ pub const StartupCatchUpMetadata = struct {
     indexes_json: ?[]const u8 = null,
     schema_json: ?[]const u8 = null,
     identity_namespace: ?doc_identity.Namespace = null,
+    target_index_name: ?[]const u8 = null,
 };
 
 fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(

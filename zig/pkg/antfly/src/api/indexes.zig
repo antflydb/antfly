@@ -1229,6 +1229,7 @@ fn normalizeReadyEmbeddingsAggregate(aggregate: *AggregatedIndexStatus) void {
     if (aggregate.load_error != null or aggregate.repair_degraded or aggregate.enrichment_failed) return;
     const enrichment_blocked = aggregate.enrichment.enabled and (aggregate.enrichment.retrying or aggregate.enrichment.worker_failed);
     if (enrichment_blocked) return;
+    if (aggregate.catch_up_active or aggregate.catch_up_target_sequence > aggregate.catch_up_applied_sequence) return;
     if (!embeddingsArtifactVisible(aggregate.*, kind == .sparse_vector)) return;
     if (aggregate.table_doc_count > 0 and aggregate.doc_count < aggregate.table_doc_count) return;
 

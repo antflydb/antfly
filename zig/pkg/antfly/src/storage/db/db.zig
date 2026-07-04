@@ -10989,66 +10989,134 @@ pub const DB = struct {
         return rebuilt;
     }
 
-    pub fn replayGeneratedEnrichmentsFromStoredDocs(self: *DB, alloc: Allocator) !usize {
+    const StoredGeneratedReplayBatch = struct {
+        writes: []types.BatchWrite = &.{},
+        extracted: []mapper.ExtractedWrite = &.{},
+        next_lower: ?[]u8 = null,
+
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            for (self.writes) |write| {
+                alloc.free(@constCast(write.key));
+                alloc.free(@constCast(write.value));
+            }
+            if (self.writes.len > 0) alloc.free(self.writes);
+            for (self.extracted) |*item| item.deinit(alloc);
+            if (self.extracted.len > 0) alloc.free(self.extracted);
+            if (self.next_lower) |buf| alloc.free(buf);
+            self.* = .{};
+        }
+    };
+
+    fn collectStoredGeneratedReplayBatch(
+        self: *DB,
+        alloc: Allocator,
+        lower: []const u8,
+        limit: usize,
+    ) !StoredGeneratedReplayBatch {
+        const ScanState = struct {
+            alloc: Allocator,
+            limit: usize,
+            writes: std.ArrayListUnmanaged(types.BatchWrite) = .empty,
+            extracted: std.ArrayListUnmanaged(mapper.ExtractedWrite) = .empty,
+            last_store_key: ?[]u8 = null,
+
+            fn deinitPartial(state: *@This()) void {
+                for (state.writes.items) |write| {
+                    state.alloc.free(@constCast(write.key));
+                    state.alloc.free(@constCast(write.value));
+                }
+                state.writes.deinit(state.alloc);
+                for (state.extracted.items) |*item| item.deinit(state.alloc);
+                state.extracted.deinit(state.alloc);
+                if (state.last_store_key) |key| state.alloc.free(key);
+            }
+
+            fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                if (!isPrimaryDocumentStoreKey(key)) return .@"continue";
+                const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(state.alloc, key)) orelse return .@"continue";
+                errdefer state.alloc.free(raw_key);
+                const raw_value = try state.alloc.dupe(u8, value);
+                errdefer state.alloc.free(raw_value);
+                try state.writes.append(state.alloc, .{
+                    .key = raw_key,
+                    .value = raw_value,
+                });
+                var extracted = try mapper.extractWrite(state.alloc, raw_key, raw_value);
+                errdefer extracted.deinit(state.alloc);
+                const next_last_store_key = try state.alloc.dupe(u8, key);
+                errdefer state.alloc.free(next_last_store_key);
+                try state.extracted.append(state.alloc, extracted);
+                if (state.last_store_key) |last| state.alloc.free(last);
+                state.last_store_key = next_last_store_key;
+                if (state.writes.items.len >= state.limit) return .stop;
+                return .@"continue";
+            }
+        };
+
+        var state = ScanState{ .alloc = alloc, .limit = limit };
+        errdefer state.deinitPartial();
+        try self.core.store.scanWithContext(lower, "", .{}, &state, ScanState.scanEntry);
+
+        var next_lower: ?[]u8 = null;
+        if (state.last_store_key) |last| {
+            next_lower = try alloc.alloc(u8, last.len + 1);
+            @memcpy(next_lower.?[0..last.len], last);
+            next_lower.?[last.len] = 0;
+            alloc.free(last);
+            state.last_store_key = null;
+        }
+
+        return .{
+            .writes = try state.writes.toOwnedSlice(alloc),
+            .extracted = try state.extracted.toOwnedSlice(alloc),
+            .next_lower = next_lower,
+        };
+    }
+
+    fn appendGeneratedEnrichmentsFromStoredDocs(
+        self: *DB,
+        alloc: Allocator,
+        force_generated_artifact_names: []const []const u8,
+    ) !usize {
         if (self.enrichment_runtime == null) return 0;
 
-        const lower = try self.core.documentRangeLowerAlloc("");
-        defer self.core.alloc.free(lower);
-        const docs = try self.core.scanStoreRange(alloc, lower, "");
-        defer docstore_mod.DocStore.freeResults(alloc, docs);
         const chunk_size: usize = 128;
-        var index: usize = 0;
+        const initial_lower = try self.core.documentRangeLowerAlloc("");
+        defer self.core.alloc.free(initial_lower);
+        var lower = try alloc.dupe(u8, initial_lower);
+        defer alloc.free(lower);
+
         var generated_ref_count: usize = 0;
-        while (index < docs.len) {
-            var write_count: usize = 0;
-            var probe = index;
-            while (probe < docs.len and write_count < chunk_size) : (probe += 1) {
-                if (isPrimaryDocumentStoreKey(docs[probe].key)) write_count += 1;
-            }
-            if (write_count == 0) break;
-
-            var writes = try alloc.alloc(types.BatchWrite, write_count);
-            defer {
-                for (writes) |write| alloc.free(@constCast(write.key));
-                alloc.free(writes);
-            }
-
-            var extracted = try alloc.alloc(mapper.ExtractedWrite, write_count);
-            var extracted_initialized: usize = 0;
-            defer {
-                for (extracted[0..extracted_initialized]) |*item| item.deinit(alloc);
-                alloc.free(extracted);
-            }
-
-            var filled: usize = 0;
-            while (index < docs.len and filled < write_count) : (index += 1) {
-                const doc = docs[index];
-                if (!isPrimaryDocumentStoreKey(doc.key)) continue;
-                const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, doc.key)) orelse continue;
-                errdefer alloc.free(raw_key);
-                writes[filled] = .{
-                    .key = raw_key,
-                    .value = doc.value,
-                };
-                extracted[filled] = try mapper.extractWrite(alloc, raw_key, doc.value);
-                extracted_initialized += 1;
-                filled += 1;
-            }
+        while (true) {
+            var replay_batch = try self.collectStoredGeneratedReplayBatch(alloc, lower, chunk_size);
+            defer replay_batch.deinit(alloc);
+            if (replay_batch.writes.len == 0) break;
 
             var pending_batch = derived_types.DerivedBatch{};
             defer derived_types.deinitDerivedBatch(alloc, &pending_batch);
             try appendGeneratedEnrichments(self, &pending_batch, .{
-                .writes = writes[0..filled],
+                .writes = replay_batch.writes,
                 .sync_level = .write,
-            }, extracted[0..filled]);
-            if (pending_batch.generated_enrichment_refs.len == 0) continue;
-            generated_ref_count += pending_batch.generated_enrichment_refs.len;
-            const sequence = try appendDerivedBatchRecord(self, pending_batch);
-            self.executor.notifySequence(sequence);
-            if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
-            self.notifyResolverReplayRuntimes(sequence);
+            }, replay_batch.extracted, force_generated_artifact_names);
+            if (pending_batch.generated_enrichment_refs.len != 0) {
+                generated_ref_count += pending_batch.generated_enrichment_refs.len;
+                const sequence = try appendDerivedBatchRecord(self, pending_batch);
+                self.executor.notifySequence(sequence);
+                if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
+                self.notifyResolverReplayRuntimes(sequence);
+            }
+
+            const next_lower = replay_batch.next_lower orelse break;
+            replay_batch.next_lower = null;
+            alloc.free(lower);
+            lower = next_lower;
         }
         return generated_ref_count;
+    }
+
+    pub fn replayGeneratedEnrichmentsFromStoredDocs(self: *DB, alloc: Allocator) !usize {
+        return try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &.{});
     }
 
     pub fn reprocessGeneratedEnrichmentFromStoredDocs(
@@ -11056,61 +11124,11 @@ pub const DB = struct {
         alloc: Allocator,
         artifact_name: ?[]const u8,
     ) !usize {
-        if (self.enrichment_runtime == null) return 0;
-
-        const lower = try self.core.documentRangeLowerAlloc("");
-        defer self.core.alloc.free(lower);
-        const docs = try self.core.scanStoreRange(alloc, lower, "");
-        defer docstore_mod.DocStore.freeResults(alloc, docs);
-
-        const chunk_size: usize = 128;
-        var index: usize = 0;
-        var reprocessed: usize = 0;
-        while (index < docs.len) {
-            var write_count: usize = 0;
-            var probe = index;
-            while (probe < docs.len and write_count < chunk_size) : (probe += 1) {
-                if (isPrimaryDocumentStoreKey(docs[probe].key)) write_count += 1;
-            }
-            if (write_count == 0) break;
-
-            var writes = try alloc.alloc(types.BatchWrite, write_count);
-            var filled: usize = 0;
-            defer {
-                for (writes[0..filled]) |write| alloc.free(@constCast(write.key));
-                alloc.free(writes);
-            }
-
-            while (index < docs.len and filled < write_count) : (index += 1) {
-                const doc = docs[index];
-                if (!isPrimaryDocumentStoreKey(doc.key)) continue;
-                const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, doc.key)) orelse continue;
-                errdefer alloc.free(raw_key);
-                writes[filled] = .{
-                    .key = raw_key,
-                    .value = doc.value,
-                };
-                filled += 1;
-            }
-            if (filled == 0) continue;
-
-            if (artifact_name) |name| {
-                const force_artifacts = [_][]const u8{name};
-                try self.batchInternal(.{
-                    .writes = writes[0..filled],
-                    .sync_level = .full_index,
-                }, null, .{
-                    .force_generated_artifact_names = &force_artifacts,
-                });
-            } else {
-                try self.batchInternal(.{
-                    .writes = writes[0..filled],
-                    .sync_level = .full_index,
-                }, null, .{});
-            }
-            reprocessed += filled;
+        if (artifact_name) |name| {
+            const force_artifacts = [_][]const u8{name};
+            return try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &force_artifacts);
         }
-        return reprocessed;
+        return try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &.{});
     }
 
     fn waitForSyncLevel(self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets) !void {
@@ -15892,6 +15910,15 @@ fn requestArtifactName(request: enrichment_types.GeneratedEnrichmentRequest) []c
 
 fn requestEmbeddingName(request: enrichment_types.GeneratedEnrichmentRequest) []const u8 {
     return if (request.embedding_name.len > 0) request.embedding_name else request.index_name;
+}
+
+fn generatedRequestMatchesForcedArtifact(
+    force_generated_artifact_names: []const []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+) bool {
+    if (force_generated_artifact_names.len == 0) return true;
+    return containsName(force_generated_artifact_names, requestArtifactName(request)) or
+        containsName(force_generated_artifact_names, requestEmbeddingName(request));
 }
 
 fn requestHasChunking(request: enrichment_types.GeneratedEnrichmentRequest) bool {
@@ -21143,6 +21170,7 @@ fn appendGeneratedEnrichments(
     batch: *derived_types.DerivedBatch,
     req: types.BatchRequest,
     extracted: []const mapper.ExtractedWrite,
+    force_generated_artifact_names: []const []const u8,
 ) !void {
     var planned = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef).empty;
     errdefer {
@@ -21186,6 +21214,7 @@ fn appendGeneratedEnrichments(
         );
         defer enrichment_types.deinitGeneratedRequests(self.alloc, generated);
         for (generated) |request| {
+            if (!generatedRequestMatchesForcedArtifact(force_generated_artifact_names, request)) continue;
             try planned.append(self.alloc, try enrichment_types.requestToRef(self.alloc, request));
         }
     }

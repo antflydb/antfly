@@ -1359,15 +1359,20 @@ pub const ApiHttpServer = struct {
                 }
             }
         }
-        if ((self.table_reads == null or !read_statuses_present or read_needs_refresh) and self.table_writes != null) {
+        if (snapshot) |admin_snapshot| {
+            try self.appendRemoteRuntimeStatusesFromSnapshot(&items, table_name, admin_snapshot);
+        }
+        const snapshot_has_groups = self.snapshotHasProjectedTableGroups(table_name, snapshot);
+        const should_query_writes = if (snapshot == null)
+            self.table_reads == null or !read_statuses_present or read_needs_refresh
+        else
+            !snapshot_has_groups and (items.items.len == 0 or !read_statuses_present or read_needs_refresh);
+        if (should_query_writes and self.table_writes != null) {
             if (try self.table_writes.?.localRuntimeStatuses(self.alloc, table_name)) |statuses| {
                 var owned = statuses;
                 errdefer owned.deinit(self.alloc);
                 try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &owned, if (read_needs_refresh) .replace_existing else .append);
             }
-        }
-        if (snapshot) |admin_snapshot| {
-            try self.appendRemoteRuntimeStatusesFromSnapshot(&items, table_name, admin_snapshot);
         }
         if (items.items.len == 0) {
             items.deinit(self.alloc);
@@ -1485,7 +1490,9 @@ pub const ApiHttpServer = struct {
         for (items.items) |*existing| {
             if (existing.group_id != status.group_id) continue;
             if (existing.metadata.source != .remote_store) {
-                status.deinit(alloc);
+                existing.deinit(alloc);
+                existing.* = status.*;
+                status.* = undefined;
                 return;
             }
             if (existing.metadata.updated_at_ns >= status.metadata.updated_at_ns) {
@@ -6490,7 +6497,7 @@ pub const ApiHttpServer = struct {
                 error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
                 else => {
                     std.log.err("public create index local apply failed table={s} index={s} err={}", .{ table_name, index_name, err });
-                    _ = table_writes_source.requestTableStructuralReconcile(alloc, table_name) catch |reconcile_err| {
+                    _ = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |reconcile_err| {
                         std.log.warn("public create index structural reconcile enqueue failed table={s} index={s} err={}", .{ table_name, index_name, reconcile_err });
                     };
                 },
@@ -6531,7 +6538,7 @@ pub const ApiHttpServer = struct {
                 error.IndexNotFound => {},
                 else => {
                     std.log.warn("public delete index local apply deferred table={s} index={s} err={}", .{ table_name, index_name, err });
-                    _ = table_writes_source.requestTableStructuralReconcile(alloc, table_name) catch |reconcile_err| {
+                    _ = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |reconcile_err| {
                         std.log.warn("public delete index structural reconcile enqueue failed table={s} index={s} err={}", .{ table_name, index_name, reconcile_err });
                     };
                 },
