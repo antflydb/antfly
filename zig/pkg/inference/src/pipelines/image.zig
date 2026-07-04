@@ -196,6 +196,18 @@ fn rgbaToRgbAlloc(allocator: std.mem.Allocator, rgba: []const u8) ![]u8 {
     return rgb;
 }
 
+fn isPng(bytes: []const u8) bool {
+    return antfly_image.detectFormat(bytes) == .png;
+}
+
+fn isJpeg(bytes: []const u8) bool {
+    return antfly_image.detectFormat(bytes) == .jpeg;
+}
+
+fn isGif(bytes: []const u8) bool {
+    return antfly_image.detectFormat(bytes) == .gif;
+}
+
 const red_png_2x2 = [_]u8{
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
     0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02,
