@@ -2380,6 +2380,25 @@ const DecoratedSortHit = struct {
     }
 };
 
+const SortCollectorProfile = struct {
+    candidate_count: u64 = 0,
+    cursor_rejected_count: u64 = 0,
+    admitted_count: u64 = 0,
+    replaced_count: u64 = 0,
+    discarded_count: u64 = 0,
+    selected_count: u64 = 0,
+    decorate_ns: u64 = 0,
+    native_doc_value_load_ns: u64 = 0,
+    native_doc_value_hit_count: u64 = 0,
+    native_doc_value_miss_count: u64 = 0,
+    stored_json_load_ns: u64 = 0,
+    stored_json_load_count: u64 = 0,
+    final_sort_ns: u64 = 0,
+    total_ns: u64 = 0,
+    window_capacity: usize = 0,
+    window_len: usize = 0,
+};
+
 fn freeSortValues(alloc: Allocator, values: []SortValue) void {
     for (values) |value| value.deinit(alloc);
     if (values.len > 0) alloc.free(values);
@@ -2652,6 +2671,7 @@ fn decorateSortHitAlloc(
     load_ctx: ?*anyopaque,
     load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
     native_loader: ?NativeSortValueLoader,
+    profile: ?*SortCollectorProfile,
 ) !DecoratedSortHit {
     var owned_hit = hit;
     errdefer owned_hit.deinit(alloc);
@@ -2673,11 +2693,28 @@ fn decorateSortHitAlloc(
             .{ .string = try alloc.dupe(u8, owned_hit.id) }
         else blk: {
             if (native_loader) |loader| {
-                if (try loader.load(loader.ctx, alloc, owned_hit, field.field)) |native_value| {
+                const native_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+                const loaded_native = try loader.load(loader.ctx, alloc, owned_hit, field.field);
+                if (profile) |p| {
+                    p.native_doc_value_load_ns += platform_time.monotonicNs() - native_start_ns;
+                    if (loaded_native != null) {
+                        p.native_doc_value_hit_count += 1;
+                    } else {
+                        p.native_doc_value_miss_count += 1;
+                    }
+                }
+                if (loaded_native) |native_value| {
                     break :blk native_value;
                 }
             }
-            if (parsed_doc == null) parsed_doc = try searchHitSortStoredJsonAlloc(alloc, &owned_hit, load_ctx, load_stored);
+            if (parsed_doc == null) {
+                const stored_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+                parsed_doc = try searchHitSortStoredJsonAlloc(alloc, &owned_hit, load_ctx, load_stored);
+                if (profile) |p| {
+                    p.stored_json_load_ns += platform_time.monotonicNs() - stored_start_ns;
+                    p.stored_json_load_count += 1;
+                }
+            }
             break :blk try ownedSortValueFromJson(alloc, jsonFieldValue(parsed_doc.?.value, field.field));
         };
         keys[i] = sort_value;
@@ -2699,10 +2736,14 @@ fn sortAndPageSearchResultInPlace(
     try validateSortCursorContract(req);
     try checkSearchRequestDeadline(req);
 
+    const bench_query_profile = shouldLogBenchQueryProfile();
+    const sort_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+    var profile = SortCollectorProfile{};
     const alloc = result.alloc;
     const input_hits = result.hits;
     result.hits = &.{};
     const window_capacity = sortWindowCapacity(req);
+    if (bench_query_profile) profile.window_capacity = window_capacity;
     const keep_previous_page = req.search_before.len > 0;
     var window: []DecoratedSortHit = if (window_capacity > 0)
         try alloc.alloc(DecoratedSortHit, window_capacity)
@@ -2722,18 +2763,38 @@ fn sortAndPageSearchResultInPlace(
     }
     for (input_hits, 0..) |*hit, i| {
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
+        if (bench_query_profile) profile.candidate_count += 1;
         const raw_hit = hit.*;
         hit.* = undefined;
         processed_hits = i + 1;
-        var decorated = try decorateSortHitAlloc(alloc, req, raw_hit, load_ctx, load_stored, native_loader);
+        const decorate_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+        var decorated = try decorateSortHitAlloc(
+            alloc,
+            req,
+            raw_hit,
+            load_ctx,
+            load_stored,
+            native_loader,
+            if (bench_query_profile) &profile else null,
+        );
+        if (bench_query_profile) profile.decorate_ns += platform_time.monotonicNs() - decorate_start_ns;
 
-        if (!decoratedHitAllowedByCursor(req, decorated) or window_capacity == 0) {
+        const allowed_by_cursor = decoratedHitAllowedByCursor(req, decorated);
+        if (!allowed_by_cursor or window_capacity == 0) {
+            if (bench_query_profile) {
+                if (!allowed_by_cursor) {
+                    profile.cursor_rejected_count += 1;
+                } else {
+                    profile.discarded_count += 1;
+                }
+            }
             decorated.deinit(alloc);
             continue;
         }
         if (window_len < window_capacity) {
             window[window_len] = decorated;
             window_len += 1;
+            if (bench_query_profile) profile.admitted_count += 1;
             continue;
         }
 
@@ -2741,7 +2802,12 @@ fn sortAndPageSearchResultInPlace(
         if (decoratedHitBetterThanWorst(req, decorated, window[worst_index], keep_previous_page)) {
             window[worst_index].deinit(alloc);
             window[worst_index] = decorated;
+            if (bench_query_profile) {
+                profile.replaced_count += 1;
+                profile.admitted_count += 1;
+            }
         } else {
+            if (bench_query_profile) profile.discarded_count += 1;
             decorated.deinit(alloc);
         }
     }
@@ -2749,7 +2815,9 @@ fn sortAndPageSearchResultInPlace(
     input_owned = false;
 
     try checkSearchRequestDeadline(req);
+    const final_sort_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     std.sort.pdq(DecoratedSortHit, window[0..window_len], req, decoratedLessThan);
+    if (bench_query_profile) profile.final_sort_ns = platform_time.monotonicNs() - final_sort_start_ns;
     try checkSearchRequestDeadline(req);
 
     var start: usize = 0;
@@ -2771,6 +2839,7 @@ fn sortAndPageSearchResultInPlace(
             selected[selected_initialized] = item.hit;
             item.hit = undefined;
             selected_initialized += 1;
+            if (bench_query_profile) profile.selected_count += 1;
         } else {
             item.hit.deinit(alloc);
         }
@@ -2779,6 +2848,51 @@ fn sortAndPageSearchResultInPlace(
     }
     if (window.len > 0) alloc.free(window);
     result.hits = selected;
+    if (bench_query_profile) {
+        profile.window_len = window_len;
+        profile.total_ns = platform_time.monotonicNs() - sort_start_ns;
+        logBenchSortCollectorProfile(req, native_loader != null, profile);
+    }
+}
+
+fn sortCursorMode(req: types.SearchRequest) []const u8 {
+    if (req.search_after.len > 0) return "after";
+    if (req.search_before.len > 0) return "before";
+    return "none";
+}
+
+fn logBenchSortCollectorProfile(req: types.SearchRequest, native_loader_enabled: bool, profile: SortCollectorProfile) void {
+    std.log.info(
+        "antfly_bench_sort_collector total_us={d} decorate_us={d} native_doc_value_load_us={d} stored_json_load_us={d} final_sort_us={d} candidates={d} cursor_rejected={d} admitted={d} replaced={d} discarded={d} selected={d} window_capacity={d} window_len={d} order_fields={d} cursor={s} native_loader={}",
+        .{
+            nsToUs(profile.total_ns),
+            nsToUs(profile.decorate_ns),
+            nsToUs(profile.native_doc_value_load_ns),
+            nsToUs(profile.stored_json_load_ns),
+            nsToUs(profile.final_sort_ns),
+            profile.candidate_count,
+            profile.cursor_rejected_count,
+            profile.admitted_count,
+            profile.replaced_count,
+            profile.discarded_count,
+            profile.selected_count,
+            profile.window_capacity,
+            profile.window_len,
+            req.order_by.len,
+            sortCursorMode(req),
+            native_loader_enabled,
+        },
+    );
+    if (profile.native_doc_value_hit_count > 0 or profile.native_doc_value_miss_count > 0 or profile.stored_json_load_count > 0) {
+        std.log.info(
+            "antfly_bench_sort_values native_doc_value_hits={d} native_doc_value_misses={d} stored_json_loads={d}",
+            .{
+                profile.native_doc_value_hit_count,
+                profile.native_doc_value_miss_count,
+                profile.stored_json_load_count,
+            },
+        );
+    }
 }
 
 fn collectStructuredFilterResolvedDocSetAlloc(
