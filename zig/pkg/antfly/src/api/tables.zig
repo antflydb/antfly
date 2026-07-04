@@ -2437,7 +2437,7 @@ test "metadata.table status encoder projects inline enrichment configs as names"
 
 test "metadata.table debug encoder emits runtime schemas and index bindings" {
     const schema_v1 =
-        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"dates","path_match":"created_at","mapping":{"type":"datetime","doc_values":true}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"string","x-antfly-types":["text"],"x-antfly-analyzer":"french"}}}}}}
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"dates","path_match":"created_at","mapping":{"type":"datetime","doc_values":true}}],"index_sort":[{"field":"created_at","order":"desc"}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"string","x-antfly-types":["text"],"x-antfly-analyzer":"french"}}}}}}
     ;
     const schema_v0 =
         \\{"version":0,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"name":{"type":"string","x-antfly-types":["search_as_you_type"]}}}}}}
@@ -2470,6 +2470,7 @@ test "metadata.table debug encoder emits runtime schemas and index bindings" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"schema_slot\":\"active\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"analyzer\":\"french\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"sortable\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"index_sort\":[{\"field\":\"created_at\",\"order\":\"desc\"},{\"field\":\"_id\",\"order\":\"asc\"}]") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"algebraic_capabilities\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"capability_fingerprint\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lifecycle_status\":\"rebuild_required\"") != null);
@@ -2662,12 +2663,24 @@ test "schema update parser rejects invalid top-level schema fields" {
         error.InvalidSchemaUpdateRequest,
         parseSchemaUpdateRequest(std.testing.allocator, "{\"dynamic_templates\":{\"body\":{\"mapping\":true}}}"),
     );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchemaUpdateRequest(std.testing.allocator, "{\"index_sort\":[]}"),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchemaUpdateRequest(std.testing.allocator, "{\"index_sort\":[{\"field\":\"created_at\",\"order\":\"newest\"}]}"),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchemaUpdateRequest(std.testing.allocator, "{\"index_sort\":[{\"field\":\"created_at\",\"order\":\"asc\",\"desc\":false}]}"),
+    );
 }
 
 test "validated table schema parses default type and dynamic templates" {
     var parsed = try parseValidatedTableSchema(
         std.testing.allocator,
-        "{\"default_type\":\"doc\",\"enforce_types\":true,\"dynamic_templates\":{\"meta\":{\"match\":\"meta_*\",\"mapping\":{\"type\":\"keyword\"}}},\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"published\":{\"type\":\"boolean\"}}}}}}",
+        "{\"default_type\":\"doc\",\"enforce_types\":true,\"dynamic_templates\":{\"meta\":{\"match\":\"meta_*\",\"mapping\":{\"type\":\"keyword\"}}},\"index_sort\":[{\"field\":\"meta_rank\",\"order\":\"desc\"}],\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"published\":{\"type\":\"boolean\"}}}}}}",
     );
     defer parsed.deinit(std.testing.allocator);
 
@@ -2675,6 +2688,9 @@ test "validated table schema parses default type and dynamic templates" {
     try std.testing.expect(parsed.enforce_types);
     try std.testing.expectEqual(@as(usize, 1), parsed.document_schemas.len);
     try std.testing.expectEqual(@as(usize, 1), parsed.dynamic_templates.len);
+    try std.testing.expectEqual(@as(usize, 1), parsed.index_sort.len);
+    try std.testing.expectEqualStrings("meta_rank", parsed.index_sort[0].field);
+    try std.testing.expect(parsed.index_sort[0].desc);
 }
 
 test "table schema write validation rejects unknown fields when enforce_types is enabled" {
