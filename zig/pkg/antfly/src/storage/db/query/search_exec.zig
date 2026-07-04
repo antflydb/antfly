@@ -3126,6 +3126,286 @@ fn decoratedLessThan(req: types.SearchRequest, a: DecoratedSortHit, b: Decorated
     return compareDecoratedSortHits(req, a, b) == .lt;
 }
 
+fn sortValueFromSortJson(plan: SortExecutionPlan, field: types.SortField, value: std.json.Value) !SortValue {
+    if (!sortCursorValueIsScalar(value)) return error.InvalidQueryRequest;
+    if (sortFieldIsScore(field) and !jsonValueIsNumeric(value)) return error.InvalidQueryRequest;
+    if (sortFieldIsId(field) and value != .string) return error.InvalidQueryRequest;
+    return try sortValueFromCursorJson(plan, field.field, value);
+}
+
+fn compareSearchHitSortValues(req: types.SearchRequest, plan: SortExecutionPlan, a: types.SearchHit, b: types.SearchHit) !std.math.Order {
+    const field_count = effectiveSortFieldCount(req.order_by);
+    if (a.sort_values.len != field_count or b.sort_values.len != field_count) return error.InvalidQueryRequest;
+    for (0..field_count) |i| {
+        const field = effectiveSortFieldAt(req.order_by, i);
+        const a_value = try sortValueFromSortJson(plan, field, a.sort_values[i]);
+        const b_value = try sortValueFromSortJson(plan, field, b.sort_values[i]);
+        const order = compareSortValues(a_value, b_value);
+        if (order != .eq) {
+            if (field.desc) {
+                return switch (order) {
+                    .lt => .gt,
+                    .eq => .eq,
+                    .gt => .lt,
+                };
+            }
+            return order;
+        }
+    }
+    return .eq;
+}
+
+fn searchHitAllowedByCursor(req: types.SearchRequest, plan: SortExecutionPlan, hit: types.SearchHit) !bool {
+    const field_count = effectiveSortFieldCount(req.order_by);
+    if (hit.sort_values.len != field_count) return error.InvalidQueryRequest;
+    const cursor = activeSortCursor(req);
+    if (cursor.len == 0) return true;
+    for (0..field_count) |i| {
+        const field = effectiveSortFieldAt(req.order_by, i);
+        const hit_value = try sortValueFromSortJson(plan, field, hit.sort_values[i]);
+        const cursor_value = try sortValueFromCursorJson(plan, field.field, cursor[i]);
+        const order = compareSortValues(hit_value, cursor_value);
+        if (order != .eq) {
+            const effective_order = if (field.desc) switch (order) {
+                .lt => std.math.Order.gt,
+                .eq => std.math.Order.eq,
+                .gt => std.math.Order.lt,
+            } else order;
+            if (req.search_after.len > 0) return effective_order == .gt;
+            if (req.search_before.len > 0) return effective_order == .lt;
+            return true;
+        }
+    }
+    return false;
+}
+
+const DistributedSortedShard = struct {
+    hits: []const types.SearchHit = &.{},
+};
+
+const DistributedMergeHeapEntry = struct {
+    shard_index: usize,
+    hit_index: usize,
+};
+
+fn distributedMergeEntryLess(
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    shards: []const DistributedSortedShard,
+    a: DistributedMergeHeapEntry,
+    b: DistributedMergeHeapEntry,
+) !bool {
+    const order = try compareSearchHitSortValues(req, plan, shards[a.shard_index].hits[a.hit_index], shards[b.shard_index].hits[b.hit_index]);
+    if (order != .eq) return order == .lt;
+    if (a.shard_index != b.shard_index) return a.shard_index < b.shard_index;
+    return a.hit_index < b.hit_index;
+}
+
+fn distributedMergeHeapSwap(heap: []DistributedMergeHeapEntry, a: usize, b: usize) void {
+    const tmp = heap[a];
+    heap[a] = heap[b];
+    heap[b] = tmp;
+}
+
+fn distributedMergeHeapSiftUp(
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    shards: []const DistributedSortedShard,
+    heap: []DistributedMergeHeapEntry,
+    start_index: usize,
+) !void {
+    var index = start_index;
+    while (index > 0) {
+        const parent = (index - 1) / 2;
+        if (!(try distributedMergeEntryLess(req, plan, shards, heap[index], heap[parent]))) break;
+        distributedMergeHeapSwap(heap, index, parent);
+        index = parent;
+    }
+}
+
+fn distributedMergeHeapSiftDown(
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    shards: []const DistributedSortedShard,
+    heap: []DistributedMergeHeapEntry,
+) !void {
+    var index: usize = 0;
+    while (true) {
+        const left = index * 2 + 1;
+        if (left >= heap.len) break;
+        const right = left + 1;
+        var best = left;
+        if (right < heap.len and try distributedMergeEntryLess(req, plan, shards, heap[right], heap[left])) {
+            best = right;
+        }
+        if (!(try distributedMergeEntryLess(req, plan, shards, heap[best], heap[index]))) break;
+        distributedMergeHeapSwap(heap, index, best);
+        index = best;
+    }
+}
+
+fn distributedMergeHeapPush(
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    shards: []const DistributedSortedShard,
+    heap: []DistributedMergeHeapEntry,
+    heap_len: *usize,
+    entry: DistributedMergeHeapEntry,
+) !void {
+    heap[heap_len.*] = entry;
+    heap_len.* += 1;
+    try distributedMergeHeapSiftUp(req, plan, shards, heap[0..heap_len.*], heap_len.* - 1);
+}
+
+fn distributedMergeHeapPop(
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    shards: []const DistributedSortedShard,
+    heap: []DistributedMergeHeapEntry,
+    heap_len: *usize,
+) !DistributedMergeHeapEntry {
+    const out = heap[0];
+    heap_len.* -= 1;
+    if (heap_len.* > 0) {
+        heap[0] = heap[heap_len.*];
+        try distributedMergeHeapSiftDown(req, plan, shards, heap[0..heap_len.*]);
+    }
+    return out;
+}
+
+fn appendDistributedMergedHit(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(types.SearchHit),
+    source: types.SearchHit,
+    selected_count: *usize,
+    skip_count: usize,
+    limit: usize,
+) !bool {
+    if (selected_count.* < skip_count) {
+        selected_count.* += 1;
+        return false;
+    }
+    if (out.items.len >= limit) return true;
+    try out.append(alloc, try source.clone(alloc));
+    selected_count.* += 1;
+    return out.items.len >= limit;
+}
+
+fn retainDistributedPreviousHit(
+    alloc: Allocator,
+    ring: []types.SearchHit,
+    ring_start: *usize,
+    ring_len: *usize,
+    source: types.SearchHit,
+) !void {
+    if (ring.len == 0) return;
+    const cloned = try source.clone(alloc);
+    errdefer {
+        var owned = cloned;
+        owned.deinit(alloc);
+    }
+    if (ring_len.* < ring.len) {
+        ring[(ring_start.* + ring_len.*) % ring.len] = cloned;
+        ring_len.* += 1;
+        return;
+    }
+    ring[ring_start.*].deinit(alloc);
+    ring[ring_start.*] = cloned;
+    ring_start.* = (ring_start.* + 1) % ring.len;
+}
+
+fn mergeDistributedSortedHitsAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    shards: []const DistributedSortedShard,
+) ![]types.SearchHit {
+    var effective = try effectiveSortRequestAlloc(alloc, req);
+    defer effective.deinit(alloc);
+    const effective_req = effective.req;
+
+    try validateSortPageOptions(effective_req);
+    try validateSortCursorContract(effective_req);
+    if (effective_req.order_by.len == 0) return error.InvalidQueryRequest;
+    if (effective_req.search_before.len > 0 and effective_req.offset != 0) return error.InvalidQueryRequest;
+
+    var heap: []DistributedMergeHeapEntry = if (shards.len > 0)
+        try alloc.alloc(DistributedMergeHeapEntry, shards.len)
+    else
+        &.{};
+    defer if (heap.len > 0) alloc.free(heap);
+    var heap_len: usize = 0;
+    for (shards, 0..) |shard, shard_index| {
+        if (shard.hits.len == 0) continue;
+        try distributedMergeHeapPush(effective_req, plan, shards, heap, &heap_len, .{
+            .shard_index = shard_index,
+            .hit_index = 0,
+        });
+    }
+
+    const limit: usize = @intCast(effective_req.limit);
+    if (effective_req.search_before.len > 0) {
+        var ring: []types.SearchHit = if (limit > 0) try alloc.alloc(types.SearchHit, limit) else &.{};
+        var ring_start: usize = 0;
+        var ring_len: usize = 0;
+        errdefer {
+            for (0..ring_len) |i| ring[(ring_start + i) % ring.len].deinit(alloc);
+            if (ring.len > 0) alloc.free(ring);
+        }
+        while (heap_len > 0) {
+            const entry = try distributedMergeHeapPop(effective_req, plan, shards, heap, &heap_len);
+            const hit = shards[entry.shard_index].hits[entry.hit_index];
+            if (try searchHitAllowedByCursor(effective_req, plan, hit)) {
+                try retainDistributedPreviousHit(alloc, ring, &ring_start, &ring_len, hit);
+            }
+            const next_index = entry.hit_index + 1;
+            if (next_index < shards[entry.shard_index].hits.len) {
+                try distributedMergeHeapPush(effective_req, plan, shards, heap, &heap_len, .{
+                    .shard_index = entry.shard_index,
+                    .hit_index = next_index,
+                });
+            }
+        }
+        const out = try alloc.alloc(types.SearchHit, ring_len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*hit| hit.deinit(alloc);
+            if (out.len > 0) alloc.free(out);
+        }
+        for (0..ring_len) |i| {
+            const ring_index = (ring_start + i) % ring.len;
+            out[i] = ring[ring_index];
+            ring[ring_index] = undefined;
+            initialized += 1;
+        }
+        if (ring.len > 0) alloc.free(ring);
+        return out;
+    }
+
+    var out = std.ArrayListUnmanaged(types.SearchHit).empty;
+    errdefer {
+        for (out.items) |*hit| hit.deinit(alloc);
+        out.deinit(alloc);
+    }
+    const skip_count: usize = if (effective_req.search_after.len > 0) 0 else @intCast(effective_req.offset);
+    var selected_count: usize = 0;
+    while (heap_len > 0 and out.items.len < limit) {
+        const entry = try distributedMergeHeapPop(effective_req, plan, shards, heap, &heap_len);
+        const hit = shards[entry.shard_index].hits[entry.hit_index];
+        if (try searchHitAllowedByCursor(effective_req, plan, hit)) {
+            if (try appendDistributedMergedHit(alloc, &out, hit, &selected_count, skip_count, limit)) break;
+        }
+        const next_index = entry.hit_index + 1;
+        if (next_index < shards[entry.shard_index].hits.len) {
+            try distributedMergeHeapPush(effective_req, plan, shards, heap, &heap_len, .{
+                .shard_index = entry.shard_index,
+                .hit_index = next_index,
+            });
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
 fn jsonFieldValue(value: std.json.Value, field: []const u8) ?std.json.Value {
     var current = value;
     var parts = std.mem.splitScalar(u8, field, '.');
