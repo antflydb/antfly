@@ -30,6 +30,9 @@ pub const PendingDocumentGroup = struct {
 
 pub const StopReplayChunk = error{StopReplayChunk};
 
+const primary_store_fallback_scan_budget_min: usize = 256;
+const primary_store_fallback_scan_budget_max: usize = 4096;
+
 pub const MatchingRecordStats = struct {
     matched_entries: usize = 0,
     scanned_entries: usize = 0,
@@ -219,6 +222,12 @@ const PrimaryStoreMatchingCursor = struct {
     }
 };
 
+fn primaryStoreFallbackScanBudget(max_matched_entries: usize) usize {
+    if (max_matched_entries == 0) return primary_store_fallback_scan_budget_max;
+    const requested = max_matched_entries *| 32;
+    return @min(@max(requested, primary_store_fallback_scan_budget_min), primary_store_fallback_scan_budget_max);
+}
+
 fn journalMatchingCursorForEachNext(
     cursor: *JournalMatchingCursor,
     max_matched_entries: usize,
@@ -291,11 +300,12 @@ fn primaryStoreMatchingCursorForEachNext(
                 cursor.next_sequence,
                 cursor.hint,
                 max_matched_entries,
+                primaryStoreFallbackScanBudget(max_matched_entries),
                 ctx,
                 consume,
             );
             cursor.next_sequence = @max(cursor.next_sequence, stats.last_sequence);
-            if (stats.matched_entries == 0) cursor.hint_exhausted = true;
+            if (stats.matched_entries == 0 and stats.scanned_entries == 0) cursor.hint_exhausted = true;
             return stats;
         },
         StopReplayChunk.StopReplayChunk => {
@@ -311,11 +321,12 @@ fn primaryStoreMatchingCursorForEachNext(
             cursor.next_sequence,
             cursor.hint,
             max_matched_entries,
+            primaryStoreFallbackScanBudget(max_matched_entries),
             ctx,
             consume,
         );
         cursor.next_sequence = @max(cursor.next_sequence, fallback_stats.last_sequence);
-        if (fallback_stats.matched_entries == 0) cursor.hint_exhausted = true;
+        if (fallback_stats.matched_entries == 0 and fallback_stats.scanned_entries == 0) cursor.hint_exhausted = true;
         return fallback_stats;
     }
     callback_ctx.stats.scanned_entries = @max(callback_ctx.stats.scanned_entries, replay_stats.scanned_entries);
@@ -329,6 +340,7 @@ fn primaryStoreForEachMatchingRecordFallbackAll(
     from_sequence: u64,
     hint: TargetHint,
     max_matched_entries: usize,
+    max_scanned_entries: usize,
     ctx: *anyopaque,
     consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
 ) !MatchingRecordStats {
@@ -364,7 +376,7 @@ fn primaryStoreForEachMatchingRecordFallbackAll(
     const replay_stats = store.forEachReplayLaneFrom(
         internal_keys.replay_all_kind,
         from_sequence + 1,
-        0,
+        max_scanned_entries,
         &callback_ctx,
         Context.handle,
     ) catch |err| switch (err) {
@@ -516,6 +528,7 @@ fn primaryStoreForEachMatchingRecord(
             from_sequence,
             hint,
             max_matched_entries,
+            primaryStoreFallbackScanBudget(max_matched_entries),
             ctx,
             consume,
         ),
@@ -528,6 +541,7 @@ fn primaryStoreForEachMatchingRecord(
             from_sequence,
             hint,
             max_matched_entries,
+            primaryStoreFallbackScanBudget(max_matched_entries),
             ctx,
             consume,
         );
@@ -1038,7 +1052,7 @@ test "replay source primary store hinted replay skips non-matching records befor
     try std.testing.expectEqual(@as(u64, 2), stats.last_sequence);
 }
 
-test "replay source primary store requires hint lane for hinted replay" {
+test "replay source primary store falls back to all lane when hint lane is missing" {
     const alloc = std.testing.allocator;
 
     var backend = mem_backend_mod.Backend.init(alloc, .{});
@@ -1091,13 +1105,77 @@ test "replay source primary store requires hint lane for hinted replay" {
         Context.consume,
     );
 
-    try std.testing.expectEqual(@as(usize, 0), context.calls);
-    try std.testing.expectEqual(@as(u64, 0), context.last_sequence);
-    try std.testing.expectEqual(@as(usize, 0), stats.matched_entries);
-    try std.testing.expectEqual(@as(usize, 0), stats.scanned_entries);
-    try std.testing.expectEqual(@as(usize, 0), stats.hint_filter_skips);
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+    try std.testing.expectEqual(@as(u64, 2), context.last_sequence);
+    try std.testing.expectEqual(@as(usize, 1), stats.matched_entries);
+    try std.testing.expectEqual(@as(usize, 2), stats.scanned_entries);
+    try std.testing.expectEqual(@as(usize, 1), stats.hint_filter_skips);
     try std.testing.expectEqual(@as(usize, 1), stats.scan_batches);
-    try std.testing.expectEqual(@as(u64, 0), stats.last_sequence);
+    try std.testing.expectEqual(@as(u64, 2), stats.last_sequence);
+}
+
+test "replay source primary fallback cursor is bounded across unrelated rows" {
+    const alloc = std.testing.allocator;
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    var batch = try store.beginWriteBatch();
+    errdefer batch.abort();
+    try batch.put(internal_keys.replay_meta_init_key[0..], "");
+    var sequence: u64 = 1;
+    while (sequence <= primary_store_fallback_scan_budget_min) : (sequence += 1) {
+        const payload = try change_journal_mod.encodeRecord(alloc, .{
+            .sequence = sequence,
+            .changed_doc_keys = &.{"doc:ft"},
+            .target_hints = &.{.full_text},
+        });
+        defer alloc.free(payload);
+        const key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
+        try batch.put(key[0..], payload);
+    }
+    const dense_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = sequence,
+        .changed_doc_keys = &.{"doc:dense"},
+        .target_hints = &.{.dense_vector},
+    });
+    defer alloc.free(dense_payload);
+    const dense_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
+    try batch.put(dense_key[0..], dense_payload);
+    try batch.commit();
+
+    const Context = struct {
+        calls: usize = 0,
+        last_sequence: u64 = 0,
+
+        fn consume(ptr: *anyopaque, sequence_value: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.last_sequence = sequence_value;
+        }
+    };
+
+    var cursor = try Source.fromPrimaryStore(&store, null, null).openMatchingCursor(alloc, 0, .dense_vector);
+    defer cursor.deinit(alloc);
+
+    var first = Context{};
+    const first_stats = try cursor.forEachNext(1, &first, Context.consume);
+    try std.testing.expectEqual(@as(usize, 0), first.calls);
+    try std.testing.expectEqual(@as(usize, 0), first_stats.matched_entries);
+    try std.testing.expectEqual(primary_store_fallback_scan_budget_min, first_stats.scanned_entries);
+    try std.testing.expectEqual(@as(usize, primary_store_fallback_scan_budget_min), first_stats.hint_filter_skips);
+    try std.testing.expectEqual(@as(u64, primary_store_fallback_scan_budget_min), first_stats.last_sequence);
+
+    var second = Context{};
+    const second_stats = try cursor.forEachNext(1, &second, Context.consume);
+    try std.testing.expectEqual(@as(usize, 1), second.calls);
+    try std.testing.expectEqual(@as(u64, primary_store_fallback_scan_budget_min + 1), second.last_sequence);
+    try std.testing.expectEqual(@as(usize, 1), second_stats.matched_entries);
+    try std.testing.expectEqual(@as(usize, 1), second_stats.scanned_entries);
+    try std.testing.expectEqual(@as(u64, primary_store_fallback_scan_budget_min + 1), second_stats.last_sequence);
 }
 
 test "replay source primary cursor resumes after stop chunk progress" {

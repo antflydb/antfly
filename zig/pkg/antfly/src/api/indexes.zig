@@ -1205,6 +1205,7 @@ fn aggregateIndexStatus(
     if (!found and expected_group_ids.len == 0) return null;
     if (active_count > 0) aggregate.backfill_progress = active_progress_sum / @as(f64, @floatFromInt(active_count));
     normalizeReadyFullTextAggregate(&aggregate);
+    normalizeReadyEmbeddingsAggregate(&aggregate);
     return aggregate;
 }
 
@@ -1217,6 +1218,25 @@ fn normalizeReadyFullTextAggregate(aggregate: *AggregatedIndexStatus) void {
 
     aggregate.replay_catch_up_required = false;
     aggregate.catch_up_active = false;
+    aggregate.backfill_active = false;
+    aggregate.backfill_progress = 1.0;
+}
+
+fn normalizeReadyEmbeddingsAggregate(aggregate: *AggregatedIndexStatus) void {
+    const kind = aggregate.kind orelse return;
+    if (kind != .dense_vector and kind != .sparse_vector) return;
+    if (aggregate.reported_group_count == 0 or aggregate.missing_group_count > 0 or aggregate.remote_unknown_group_count > 0) return;
+    if (aggregate.load_error != null or aggregate.repair_degraded or aggregate.enrichment_failed) return;
+    const enrichment_blocked = aggregate.enrichment.enabled and (aggregate.enrichment.retrying or aggregate.enrichment.worker_failed);
+    if (enrichment_blocked) return;
+    if (!embeddingsArtifactVisible(aggregate.*, kind == .sparse_vector)) return;
+    if (aggregate.table_doc_count > 0 and aggregate.doc_count < aggregate.table_doc_count) return;
+
+    aggregate.replay_applied_sequence = @max(aggregate.replay_applied_sequence, aggregate.replay_target_sequence);
+    aggregate.catch_up_applied_sequence = @max(aggregate.catch_up_applied_sequence, aggregate.catch_up_target_sequence);
+    aggregate.replay_catch_up_required = false;
+    aggregate.catch_up_active = false;
+    aggregate.catch_up_phase = .idle;
     aggregate.backfill_active = false;
     aggregate.backfill_progress = 1.0;
 }
@@ -1458,7 +1478,6 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, require_table_cove
 fn aggregateRuntimeCoverageIncomplete(item: anytype) bool {
     const Item = @TypeOf(item);
     if (@hasField(Item, "missing_group_count") and item.missing_group_count > 0) return true;
-    if (@hasField(Item, "stale_group_count") and item.stale_group_count > 0) return true;
     if (@hasField(Item, "remote_unknown_group_count") and item.remote_unknown_group_count > 0) return true;
     return false;
 }
@@ -3114,6 +3133,72 @@ test "index encoders aggregate preserved synthetic shard counters" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"published_node_count\":8837") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"runtime_present\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"shard_status\":{\"7\":{") != null);
+}
+
+test "single embeddings index encoder treats stale enrichment tail as ready when coverage is complete" {
+    const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
+    defer std.testing.allocator.free(indexes);
+    indexes[0] = .{
+        .name = try std.testing.allocator.dupe(u8, "semantic_idx"),
+        .kind = .dense_vector,
+        .doc_count = 3,
+        .node_count = 1,
+        .root_node = 1,
+        .backfill_active = true,
+        .backfill_progress = 0.667,
+        .replay_applied_sequence = 2,
+        .replay_target_sequence = 3,
+        .replay_catch_up_required = true,
+        .catch_up_applied_sequence = 2,
+        .catch_up_target_sequence = 3,
+    };
+    defer std.testing.allocator.free(indexes[0].name);
+
+    const local_items = try std.testing.allocator.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+    defer std.testing.allocator.free(local_items);
+    local_items[0] = .{
+        .group_id = 7,
+        .metadata = .{
+            .source = .synthetic_config,
+            .freshness = .stale,
+        },
+        .stats = .{
+            .doc_count = 3,
+            .index_count = 1,
+            .indexes = indexes,
+            .enrichment = .{
+                .enabled = true,
+                .target_sequence = 3,
+                .applied_sequence = 2,
+                .retryable_error_count = 8,
+            },
+        },
+    };
+    var local_status = runtime_status.LocalTableRuntimeStatuses{ .items = local_items };
+
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3}}",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "semantic_idx", &local_status)).?;
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"runtime_fresh\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"stale_groups\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"pending_sequence_count\":1") != null);
 }
 
 test "index encoders report missing and stale topology groups without probing databases" {
