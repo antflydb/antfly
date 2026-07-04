@@ -759,6 +759,24 @@ pub fn parseDateTimeToNs(text: []const u8) ?u64 {
     return parseDateToNs(text);
 }
 
+pub fn formatDateTimeNsAlloc(alloc: Allocator, ns: u64) ![]u8 {
+    const seconds = ns / std.time.ns_per_s;
+    const nanos = ns % std.time.ns_per_s;
+    const days: i64 = @intCast(seconds / 86_400);
+    const seconds_of_day = seconds % 86_400;
+    const civil = civilFromDays(days);
+    if (civil.year < 0 or civil.year > 9999) return error.InvalidDateTime;
+    return try std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>9}Z", .{
+        @as(u64, @intCast(civil.year)),
+        civil.month,
+        civil.day,
+        seconds_of_day / 3_600,
+        (seconds_of_day % 3_600) / 60,
+        seconds_of_day % 60,
+        nanos,
+    });
+}
+
 fn parseRfc3339ToNs(text: []const u8) ?u64 {
     if (text.len < 20) return null;
     if (text[4] != '-' or text[7] != '-' or text[10] != 'T' or text[13] != ':' or text[16] != ':') return null;
@@ -804,6 +822,30 @@ fn parseDateToNs(value: []const u8) ?u64 {
 
 fn isValidDate(value: []const u8) bool {
     return parseDateToNs(value) != null;
+}
+
+const CivilDate = struct {
+    year: i64,
+    month: u8,
+    day: u8,
+};
+
+fn civilFromDays(days_since_epoch: i64) CivilDate {
+    const z = days_since_epoch + 719_468;
+    const era = @divFloor(if (z >= 0) z else z - 146_096, 146_097);
+    const doe = z - era * 146_097;
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36_524) - @divFloor(doe, 146_096), 365);
+    var year = yoe + era * 400;
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const day = doy - @divFloor(153 * mp + 2, 5) + 1;
+    const month = mp + if (mp < 10) @as(i64, 3) else @as(i64, -9);
+    year += if (month <= 2) @as(i64, 1) else @as(i64, 0);
+    return .{
+        .year = year,
+        .month = @intCast(month),
+        .day = @intCast(day),
+    };
 }
 
 fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
@@ -1262,4 +1304,9 @@ test "parseDateTimeToNs accepts rfc3339 and date-only values" {
     try std.testing.expectEqual(@as(?u64, 15), parseDateTimeToNs("1970-01-01T00:00:00.000000015Z"));
     try std.testing.expectEqual(@as(?u64, 0), parseDateTimeToNs("1970-01-01"));
     try std.testing.expect(parseDateTimeToNs("not-a-date") == null);
+
+    const formatted = try formatDateTimeNsAlloc(std.testing.allocator, 15);
+    defer std.testing.allocator.free(formatted);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00.000000015Z", formatted);
+    try std.testing.expectEqual(@as(?u64, 15), parseDateTimeToNs(formatted));
 }

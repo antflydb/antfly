@@ -5534,11 +5534,15 @@ test "metadata http cluster simulation seeds default admin for auth-enabled publ
 
     var auth_managers: [3]SimAuthManager = undefined;
     var auth_count: usize = 0;
-    errdefer for (auth_managers[0..auth_count]) |*auth| auth.deinit();
+    var auth_init_complete = false;
+    errdefer if (!auth_init_complete) {
+        for (auth_managers[0..auth_count]) |*auth| auth.deinit();
+    };
     for (&auth_managers) |*auth| {
         auth.* = try SimAuthManager.init(sim_alloc);
         auth_count += 1;
     }
+    auth_init_complete = true;
     defer for (auth_managers[0..auth_count]) |*auth| auth.deinit();
 
     const roots = [_][]const u8{ root_a, root_b, root_c };

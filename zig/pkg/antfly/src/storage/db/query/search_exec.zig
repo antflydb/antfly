@@ -2655,8 +2655,32 @@ fn ownedSortValueFromJson(alloc: Allocator, value: ?std.json.Value) !SortValue {
     };
 }
 
-fn appendSortValueJson(alloc: Allocator, values: *std.ArrayListUnmanaged(std.json.Value), value: SortValue) !void {
-    const json_value: std.json.Value = switch (value) {
+fn sortValueAsU64(value: SortValue) ?u64 {
+    return switch (value) {
+        .integer => |v| if (v >= 0) @intCast(v) else null,
+        .number => |v| blk: {
+            if (std.math.isNan(v) or v < 0) break :blk null;
+            if (v >= 18446744073709551616.0) break :blk null;
+            const int_value: u64 = @intFromFloat(v);
+            if (@as(f64, @floatFromInt(int_value)) != v) break :blk null;
+            break :blk int_value;
+        },
+        .number_string => |v| std.fmt.parseInt(u64, v, 10) catch null,
+        else => null,
+    };
+}
+
+fn sortValueJsonForFieldAlloc(alloc: Allocator, plan: SortExecutionPlan, field: []const u8, value: SortValue) !std.json.Value {
+    if (plan.runtime_schema) |schema| {
+        if (sortFieldMapping(schema, field)) |mapping| {
+            if (mapping.field_type == .datetime) {
+                if (sortValueAsU64(value)) |ns| {
+                    return .{ .string = try runtime_schema_mod.formatDateTimeNsAlloc(alloc, ns) };
+                }
+            }
+        }
+    }
+    return switch (value) {
         .null_value => .null,
         .bool_value => |v| .{ .bool = v },
         .integer => |v| .{ .integer = v },
@@ -2664,6 +2688,10 @@ fn appendSortValueJson(alloc: Allocator, values: *std.ArrayListUnmanaged(std.jso
         .number_string => |v| .{ .number_string = try alloc.dupe(u8, v) },
         .string => |v| .{ .string = try alloc.dupe(u8, v) },
     };
+}
+
+fn appendSortValueJson(alloc: Allocator, values: *std.ArrayListUnmanaged(std.json.Value), plan: SortExecutionPlan, field: []const u8, value: SortValue) !void {
+    const json_value = try sortValueJsonForFieldAlloc(alloc, plan, field, value);
     errdefer {
         var owned = json_value;
         types.deinitJsonValue(alloc, &owned);
@@ -2849,6 +2877,7 @@ fn loadTextDocValueSortValue(
 fn decorateSortHitAlloc(
     alloc: Allocator,
     req: types.SearchRequest,
+    plan: SortExecutionPlan,
     hit: types.SearchHit,
     load_ctx: ?*anyopaque,
     load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
@@ -2902,7 +2931,7 @@ fn decorateSortHitAlloc(
         };
         keys[i] = sort_value;
         keys_initialized += 1;
-        try appendSortValueJson(alloc, &values, sort_value);
+        try appendSortValueJson(alloc, &values, plan, field.field, sort_value);
     }
     owned_hit.sort_values = try values.toOwnedSlice(alloc);
     return .{ .hit = owned_hit, .keys = keys };
@@ -2965,6 +2994,7 @@ fn sortAndPageSearchResultInPlace(
         var decorated = try decorateSortHitAlloc(
             alloc,
             effective_req,
+            plan,
             raw_hit,
             load_ctx,
             load_stored,
@@ -8228,6 +8258,10 @@ test "native datetime sort accepts iso string cursor" {
     try std.testing.expectEqual(@as(usize, 2), result.hits.len);
     try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
     try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00.000000020Z", result.hits[0].sort_values[0].string);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].sort_values[1].string);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00.000000030Z", result.hits[1].sort_values[0].string);
+    try std.testing.expectEqualStrings("doc:c", result.hits[1].sort_values[1].string);
 }
 
 test "native doc values sort plan requires a native loader" {
