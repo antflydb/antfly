@@ -43,6 +43,7 @@ from helpers import wait_until
 
 
 MULTI_SHARD_WRITE_ROUTE_TIMEOUT_S = 120.0
+DATA_NODE_REGISTRATION_TIMEOUT_S = 180.0
 
 
 class _ClusterStartupDeadline:
@@ -507,9 +508,12 @@ class MultiNodeScalingCluster:
             self._start_data_node(node)
 
         self._wait_for_data_nodes_http(self.data_nodes, max_timeout_s=60.0, label="Data node process")
-        if not self.wait_for_all_data_nodes_registered(timeout_s=self.startup_timeout(60.0)):
+        if not self.wait_for_all_data_nodes_registered(
+            timeout_s=self.startup_timeout(DATA_NODE_REGISTRATION_TIMEOUT_S)
+        ):
             raise RuntimeError(
                 "Data nodes did not register on all metadata nodes\n"
+                f"metadata snapshot: {self.metadata_snapshot_diagnostic()}\n"
                 f"metadata statuses: {json.dumps(self.metadata_statuses(), indent=2, sort_keys=True)}\n"
                 f"{self.debug_logs()}"
             )
@@ -635,6 +639,17 @@ class MultiNodeScalingCluster:
                 f"{self.debug_logs()}"
             )
 
+    def _ensure_data_nodes_running(self, expected_node_ids: set[int], *, label: str) -> None:
+        for node_id in sorted(expected_node_ids):
+            proc = self.data_proc_by_node_id.get(node_id)
+            if proc is None:
+                raise RuntimeError(f"{label} {node_id} has no process\n{self.debug_logs()}")
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"{label} {node_id} exited while waiting for registration rc={proc.returncode}\n"
+                    f"{self.debug_logs()}"
+                )
+
     def stop_data_node(self, node_id: int) -> None:
         proc = self.data_proc_by_node_id.get(node_id)
         if proc is None:
@@ -729,6 +744,7 @@ class MultiNodeScalingCluster:
 
     def wait_for_data_nodes_registered(self, expected_node_ids: set[int], *, timeout_s: float) -> dict[str, Any] | None:
         def registered_on_all_metadata_nodes() -> dict[str, Any] | None:
+            self._ensure_data_nodes_running(expected_node_ids, label="Data node process")
             try:
                 snapshots = [self.metadata_snapshot(index) for index in range(len(self.metadata_urls))]
             except (AssertionError, requests.RequestException):
