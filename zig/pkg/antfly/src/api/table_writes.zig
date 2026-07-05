@@ -1388,8 +1388,6 @@ pub const ProvisionedTableWriteCache = struct {
         // Updating its visible generation in place keeps concurrent leases on the
         // same writer instead of forcing a second physical open.
         entry.lsm_root_generation = lsm_root_generation;
-        entry.allow_generation_adoption = false;
-        entry.allow_active_generation_adoption = false;
         return true;
     }
 
@@ -2295,8 +2293,6 @@ pub const ProvisionedTableWriteCache = struct {
 
             _ = self.entries.orderedRemove(i);
             entry.lsm_root_generation = dest_generation;
-            entry.allow_generation_adoption = false;
-            entry.allow_active_generation_adoption = false;
             try dest.entries.append(dest.alloc, entry);
             moved += 1;
         }
@@ -7839,6 +7835,8 @@ pub const ProvisionedTableWriteSource = struct {
             _ = try metadata_table_provisioner.ensureResolvers(alloc, &opened.?, indexes_json);
             if (seed_create_table_writer) {
                 try self.write_cache.?.seedCreatedDbLocked(&opened, group_id, lsm_root_generation, table_name, indexes_json, schema_json);
+            } else {
+                try drainManagedDbBeforeClose(&opened.?);
             }
             std.log.info("provisioned create table local group ready table={s} group_id={d}", .{ table_name, group_id });
         }
@@ -26828,7 +26826,7 @@ test "write cache adopts just-created db across reconcile generation bump" {
 
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(u64, 2), write_cache.entries.items[0].lsm_root_generation);
-    try std.testing.expect(!write_cache.entries.items[0].allow_generation_adoption);
+    try std.testing.expect(write_cache.entries.items[0].allow_generation_adoption);
 
     var cached_after_bump = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .default_async, null, null);
     cached_after_bump.deinit(alloc);
@@ -27192,7 +27190,7 @@ test "write cache adopts active just-created db across generation bump" {
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expect(write_cache.entries.items[0] == seeded_entry);
     try std.testing.expectEqual(@as(u64, 2), write_cache.entries.items[0].lsm_root_generation);
-    try std.testing.expect(!write_cache.entries.items[0].allow_generation_adoption);
+    try std.testing.expect(write_cache.entries.items[0].allow_generation_adoption);
     try std.testing.expectEqual(@as(usize, 2), write_cache.entries.items[0].active_leases);
     try std.testing.expectEqual(misses_before, write_cache.miss_count.load(.monotonic));
 }
@@ -27344,7 +27342,7 @@ test "primary lookup adopts seeded write cache across visible generation bump" {
     defer lease.release(alloc);
 
     try std.testing.expectEqual(@as(u64, 2), write_cache.entries.items[0].lsm_root_generation);
-    try std.testing.expect(!write_cache.entries.items[0].allow_generation_adoption);
+    try std.testing.expect(write_cache.entries.items[0].allow_generation_adoption);
     try std.testing.expectEqual(misses_before, write_cache.miss_count.load(.monotonic));
 
     var result = (try lease.db.lookup(alloc, "doc:gold", .{})).?;
@@ -27448,8 +27446,8 @@ test "replica root reconcile seeds write cache across generation bump" {
     try std.testing.expectEqual(@as(usize, 0), refreshed_summary.dbs_opened);
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(u64, 2), write_cache.entries.items[0].lsm_root_generation);
-    try std.testing.expect(!write_cache.entries.items[0].allow_generation_adoption);
-    try std.testing.expect(!write_cache.entries.items[0].allow_active_generation_adoption);
+    try std.testing.expect(write_cache.entries.items[0].allow_generation_adoption);
+    try std.testing.expect(write_cache.entries.items[0].allow_active_generation_adoption);
     try std.testing.expectEqual(misses_before, write_cache.miss_count.load(.monotonic));
 
     var cached_after_bump = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .default_async, null, null);

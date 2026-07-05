@@ -2300,7 +2300,6 @@ pub const DataServer = struct {
             apply_sm.write_cache.remote_content = api_server_cfg.remote_content;
             _ = apply_sm.write_source.withHAWriteGate(ha_write_gate);
             _ = apply_sm.write_source.withHAMirror(ha_primary_mirror);
-            _ = apply_sm.write_source.withCreateTableWriterSeeding(false);
             apply_sm.write_source.setLocalChangeHook(self.localChangeHook());
             _ = self.write_source.withLocalWriteOwner(&apply_sm.write_source);
         }

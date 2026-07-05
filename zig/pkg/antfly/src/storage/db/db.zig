@@ -11011,6 +11011,7 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         lower: []const u8,
+        lower_exclusive: bool,
         limit: usize,
     ) !StoredGeneratedReplayBatch {
         const ScanState = struct {
@@ -11056,13 +11057,11 @@ pub const DB = struct {
 
         var state = ScanState{ .alloc = alloc, .limit = limit };
         errdefer state.deinitPartial();
-        try self.core.store.scanWithContext(lower, "", .{}, &state, ScanState.scanEntry);
+        try self.core.store.scanWithContext(lower, "", .{ .lower_exclusive = lower_exclusive }, &state, ScanState.scanEntry);
 
         var next_lower: ?[]u8 = null;
         if (state.last_store_key) |last| {
-            next_lower = try alloc.alloc(u8, last.len + 1);
-            @memcpy(next_lower.?[0..last.len], last);
-            next_lower.?[last.len] = 0;
+            next_lower = try alloc.dupe(u8, last);
             alloc.free(last);
             state.last_store_key = null;
         }
@@ -11086,10 +11085,11 @@ pub const DB = struct {
         defer self.core.alloc.free(initial_lower);
         var lower = try alloc.dupe(u8, initial_lower);
         defer alloc.free(lower);
+        var lower_exclusive = false;
 
         var generated_ref_count: usize = 0;
         while (true) {
-            var replay_batch = try self.collectStoredGeneratedReplayBatch(alloc, lower, chunk_size);
+            var replay_batch = try self.collectStoredGeneratedReplayBatch(alloc, lower, lower_exclusive, chunk_size);
             defer replay_batch.deinit(alloc);
             if (replay_batch.writes.len == 0) break;
 
@@ -11111,6 +11111,7 @@ pub const DB = struct {
             replay_batch.next_lower = null;
             alloc.free(lower);
             lower = next_lower;
+            lower_exclusive = true;
         }
         return generated_ref_count;
     }
