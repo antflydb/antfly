@@ -123,11 +123,16 @@ class AuthApi:
         return response.json()
 
     def get(self, path: str):
+        deadline = time.monotonic() + 5.0
         with self._request_lock:
-            try:
-                response = self.s.get(self._url_for(path), timeout=30)
-            except requests.RequestException as err:
-                raise_request_error_with_logs(err, self._server)
+            while True:
+                try:
+                    response = self.s.get(self._url_for(path), timeout=30)
+                    break
+                except requests.RequestException as err:
+                    if time.monotonic() >= deadline:
+                        raise_request_error_with_logs(err, self._server)
+                    time.sleep(0.1)
             return self._check(response)
 
     def post(self, path: str, payload: dict):
