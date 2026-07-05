@@ -264,22 +264,39 @@ def raise_request_error_with_logs(
     server_ref: AntflyServer | PublicAntflyServer | SwarmAntflyServer | StatefulAntflyServer | None,
 ) -> None:
     logs = ""
-    proc_status = None
+    proc_statuses: list[str] = []
     if server_ref is not None:
         logs = server_ref.debug_logs().strip()
-        proc = getattr(server_ref, "proc", None)
-        if proc is not None:
-            proc_status = proc.poll()
-    if not logs and proc_status is None:
+        for name, proc in _server_processes(server_ref):
+            proc_statuses.append(f"{name}: {proc.poll()}")
+    if not logs and not proc_statuses:
         raise err
     message = f"{err}\nserver logs:\n{logs}"
-    if proc_status is not None:
-        message += f"\nserver exit status: {proc_status}"
+    if proc_statuses:
+        message += f"\nserver exit status:\n" + "\n".join(proc_statuses)
     raise err.__class__(
         message,
         request=getattr(err, "request", None),
         response=getattr(err, "response", None),
     ) from err
+
+
+def _server_processes(server_ref: Any) -> list[tuple[str, subprocess.Popen[Any]]]:
+    processes: list[tuple[str, subprocess.Popen[Any]]] = []
+    proc = getattr(server_ref, "proc", None)
+    if proc is not None:
+        processes.append(("proc", proc))
+    metadata_proc = getattr(server_ref, "metadata_proc", None)
+    if metadata_proc is not None:
+        processes.append(("metadata_proc", metadata_proc))
+    data_proc = getattr(server_ref, "data_proc", None)
+    if data_proc is not None:
+        processes.append(("data_proc", data_proc))
+    nested = getattr(server_ref, "_server", None)
+    if nested is not None and nested is not server_ref:
+        for name, nested_proc in _server_processes(nested):
+            processes.append((f"_server.{name}", nested_proc))
+    return processes
 
 
 def _read_log_tail(path: Path, *, limit: int = 200000) -> str:

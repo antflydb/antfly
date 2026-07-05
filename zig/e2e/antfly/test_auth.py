@@ -42,6 +42,8 @@ from conftest import (
 )
 
 AUTH_PUBLIC_API_ROOT = "/auth/v1"
+AUTH_STARTUP_TIMEOUT_SECONDS = 30.0
+AUTH_SETUP_RETRY_TIMEOUT_SECONDS = 30.0
 
 
 def _basic_auth(username: str, password: str) -> str:
@@ -57,6 +59,23 @@ def _wait_for_auth_server(url: str, timeout: float = 30.0) -> bool:
             if resp.status_code in (200, 401):
                 return True
         except requests.ConnectionError:
+            pass
+        time.sleep(0.25)
+    return False
+
+
+def _wait_for_admin_auth(auth_url: str, timeout: float = AUTH_STARTUP_TIMEOUT_SECONDS) -> bool:
+    deadline = time.monotonic() + timeout
+    session = requests.Session()
+    session.headers["Connection"] = "close"
+    session.headers["Authorization"] = _basic_auth("admin", "admin")
+    while time.monotonic() < deadline:
+        try:
+            request_timeout = max(0.1, min(2.0, deadline - time.monotonic()))
+            response = session.get(f"{auth_url}/me", timeout=request_timeout)
+            if response.status_code == 200 and response.json().get("username") == "admin":
+                return True
+        except (ValueError, requests.RequestException):
             pass
         time.sleep(0.25)
     return False
@@ -161,17 +180,17 @@ class AuthApi:
 
     def create_table(self, table_name: str, payload: dict | None = None):
         body = payload or {"num_shards": 1}
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + AUTH_SETUP_RETRY_TIMEOUT_SECONDS
         while True:
             try:
                 with self._request_lock:
                     response = self.s.post(f"{self.url}/tables/{table_name}", json=body, timeout=30)
-            except requests.RequestException:
+            except requests.RequestException as err:
                 if time.monotonic() >= deadline:
-                    raise
+                    raise_request_error_with_logs(err, self._server)
                 time.sleep(0.1)
                 continue
-            if response.status_code not in (404, 500):
+            if response.status_code not in (404, 500, 503):
                 return self._check(response)
             if time.monotonic() >= deadline:
                 return self._check(response)
@@ -214,6 +233,10 @@ class SwarmAuthServer:
             out = _read_log_tail(self.log_path)
             raise RuntimeError(f"Auth swarm failed to start at {self.api_url}\n{out}")
         self.metadata_admin_url = self._poll_metadata_admin_url()
+        if not _wait_for_admin_auth(AuthApi._auth_url_from_db_url(self.api_url)):
+            out = self.debug_logs()
+            self.stop()
+            raise RuntimeError(f"Auth swarm failed to initialize admin auth at {self.api_url}\n{out}")
 
     def debug_logs(self) -> str:
         self.log_file.flush()
@@ -247,6 +270,10 @@ class SplitAuthServer:
         self._server = StatefulAntflyServer(binary, host, port, auth_enabled=True)
         self.url = self._server.url
         self.api_url = self._server.api_url
+        if not _wait_for_admin_auth(AuthApi._auth_url_from_db_url(self.api_url)):
+            out = self.debug_logs()
+            self.stop()
+            raise RuntimeError(f"Stateful auth server failed to initialize admin auth at {self.api_url}\n{out}")
 
     def debug_logs(self) -> str:
         return self._server.debug_logs()
