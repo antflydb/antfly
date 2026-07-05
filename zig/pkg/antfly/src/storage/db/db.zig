@@ -11088,6 +11088,7 @@ pub const DB = struct {
         var lower_exclusive = false;
 
         var generated_ref_count: usize = 0;
+        var latest_sequence: u64 = 0;
         while (true) {
             var replay_batch = try self.collectStoredGeneratedReplayBatch(alloc, lower, lower_exclusive, chunk_size);
             defer replay_batch.deinit(alloc);
@@ -11102,9 +11103,7 @@ pub const DB = struct {
             if (pending_batch.generated_enrichment_refs.len != 0) {
                 generated_ref_count += pending_batch.generated_enrichment_refs.len;
                 const sequence = try appendDerivedBatchRecord(self, pending_batch);
-                self.executor.notifySequence(sequence);
-                if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
-                self.notifyResolverReplayRuntimes(sequence);
+                latest_sequence = @max(latest_sequence, sequence);
             }
 
             const next_lower = replay_batch.next_lower orelse break;
@@ -11112,6 +11111,11 @@ pub const DB = struct {
             alloc.free(lower);
             lower = next_lower;
             lower_exclusive = true;
+        }
+        if (latest_sequence != 0) {
+            self.executor.notifySequence(latest_sequence);
+            if (self.enrichment_runtime) |runtime| runtime.notifySequence(latest_sequence);
+            self.notifyResolverReplayRuntimes(latest_sequence);
         }
         return generated_ref_count;
     }

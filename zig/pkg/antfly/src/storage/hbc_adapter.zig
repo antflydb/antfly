@@ -4111,7 +4111,7 @@ pub const HBCIndex = struct {
             if (gop.found_existing) continue;
 
             var node = try self.loadNodeFromStorage(&txn, node_id);
-            defer node.deinit(alloc);
+            defer node.deinit(self.alloc);
 
             if (node.is_leaf) {
                 if (node.members.len == 0) return error.Corrupted;
