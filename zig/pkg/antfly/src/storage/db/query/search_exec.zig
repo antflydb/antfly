@@ -9730,12 +9730,12 @@ fn typedDocValuesCoverageStatusName(status: TypedDocValuesCoverageStatus) []cons
 fn typedDocValuesCoverageRejectionReason(status: TypedDocValuesCoverageStatus) ?NativeSortPlanRejectionReason {
     return switch (status) {
         .covered => null,
-        .missing_doc_values_section => .missing_doc_values_capability,
+        .missing_doc_values_section,
         .malformed_doc_values_section,
         .doc_values_kind_mismatch,
         .invalid_doc_value_doc_id,
         .duplicate_doc_value_doc_id,
-        => .invalid_doc_value_type,
+        => .missing_doc_values_capability,
         .sparse_live_doc_values => .missing_null_policy,
     };
 }
@@ -9757,11 +9757,11 @@ test "typed doc values coverage rejection reasons distinguish missing policy fro
         typedDocValuesCoverageRejectionReason(.missing_doc_values_section).?,
     );
     try std.testing.expectEqual(
-        NativeSortPlanRejectionReason.invalid_doc_value_type,
+        NativeSortPlanRejectionReason.missing_doc_values_capability,
         typedDocValuesCoverageRejectionReason(.malformed_doc_values_section).?,
     );
     try std.testing.expectEqual(
-        NativeSortPlanRejectionReason.invalid_doc_value_type,
+        NativeSortPlanRejectionReason.missing_doc_values_capability,
         typedDocValuesCoverageRejectionReason(.doc_values_kind_mismatch).?,
     );
     try std.testing.expectEqual(
@@ -9769,11 +9769,11 @@ test "typed doc values coverage rejection reasons distinguish missing policy fro
         typedDocValuesCoverageRejectionReason(.sparse_live_doc_values).?,
     );
     try std.testing.expectEqual(
-        NativeSortPlanRejectionReason.invalid_doc_value_type,
+        NativeSortPlanRejectionReason.missing_doc_values_capability,
         typedDocValuesCoverageRejectionReason(.invalid_doc_value_doc_id).?,
     );
     try std.testing.expectEqual(
-        NativeSortPlanRejectionReason.invalid_doc_value_type,
+        NativeSortPlanRejectionReason.missing_doc_values_capability,
         typedDocValuesCoverageRejectionReason(.duplicate_doc_value_doc_id).?,
     );
 }
@@ -12152,7 +12152,7 @@ fn testUnexpectedLoadStoredCallback(
     return error.UnexpectedTestCall;
 }
 
-test "sort uses native text doc values before stored json fallback" {
+test "sort uses native text doc values without stored json fallback" {
     const alloc = std.testing.allocator;
 
     var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
@@ -14159,10 +14159,15 @@ test "native text sort validation rejects typed doc value kind mismatch" {
     const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
 
     const order_by = [_]types.SortField{.{ .field = "created_at", .desc = false }};
+    resetLastSortRejectionDiagnostic();
     try std.testing.expectError(error.UnsupportedExactSort, validateTextNativeSortFields(.{
         .order_by = &order_by,
         .limit = 10,
     }, snapshot, schema));
+    const diagnostic = takeLastSortRejectionDiagnostic().?;
+    try std.testing.expectEqualStrings("created_at", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", diagnostic.reason);
+    try std.testing.expectEqualStrings("doc_values_kind_mismatch", diagnostic.detail);
 }
 
 test "native sort planner classifies mapping and cursor rejection reasons" {

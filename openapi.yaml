@@ -11005,15 +11005,19 @@ components:
 
             Antfly appends `_id` ascending as a stable tie-breaker when it is omitted.
 
-            Supported for exact text-backed, match_all, and filter-only requests.
+            Supported for exact text-backed, match_all, and filter-only requests
 
-            Stored-field sorting is exact and may return 422 if the required
+            when each non-`_id` field is a mapped scalar field with sortable native
 
-            candidate window exceeds the server's exact-sort budget. Semantic
+            doc-value coverage. Analyzed `text` fields are search-only; sort on
 
-            searches are always sorted by similarity score. Not supported when
+            a keyword/scalar mapping such as `title.keyword` instead. Requests
 
-            `count` is true.
+            that cannot be executed through an exact native sort path return 422
+
+            rather than falling back to stored JSON sorting. Semantic searches
+
+            are always sorted by similarity score. Not supported when `count` is true.
           example:
             - field: created_at
               desc: true
@@ -11029,7 +11033,11 @@ components:
 
             Values preserve their JSON types; for example numbers remain numbers,
 
-            booleans remain booleans, null remains null, and strings remain strings.
+            booleans remain booleans, and strings remain strings. Cursor values
+
+            must be replayable JSON scalars; nulls, arrays, objects, and non-finite
+
+            numbers are rejected.
 
             Mutually exclusive with `offset`.
 
@@ -11048,7 +11056,11 @@ components:
 
             Values preserve their JSON types; for example numbers remain numbers,
 
-            booleans remain booleans, null remains null, and strings remain strings.
+            booleans remain booleans, and strings remain strings. Cursor values
+
+            must be replayable JSON scalars; nulls, arrays, objects, and non-finite
+
+            numbers are rejected.
 
             Mutually exclusive with `offset`.
 

@@ -5153,11 +5153,13 @@ export interface components {
             /**
              * @description Sort order for results. Array of sort fields with direction.
              *     Antfly appends `_id` ascending as a stable tie-breaker when it is omitted.
-             *     Supported for exact text-backed, match_all, and filter-only requests.
-             *     Stored-field sorting is exact and may return 422 if the required
-             *     candidate window exceeds the server's exact-sort budget. Semantic
-             *     searches are always sorted by similarity score. Not supported when
-             *     `count` is true.
+             *     Supported for exact text-backed, match_all, and filter-only requests
+             *     when each non-`_id` field is a mapped scalar field with sortable native
+             *     doc-value coverage. Analyzed `text` fields are search-only; sort on
+             *     a keyword/scalar mapping such as `title.keyword` instead. Requests
+             *     that cannot be executed through an exact native sort path return 422
+             *     rather than falling back to stored JSON sorting. Semantic searches
+             *     are always sorted by similarity score. Not supported when `count` is true.
              * @example [
              *       {
              *         "field": "created_at",
@@ -5174,7 +5176,9 @@ export interface components {
              * @description Cursor for forward pagination. Pass the `_sort` values from the last hit
              *     of the previous page exactly, including the appended `_id` tie-breaker.
              *     Values preserve their JSON types; for example numbers remain numbers,
-             *     booleans remain booleans, null remains null, and strings remain strings.
+             *     booleans remain booleans, and strings remain strings. Cursor values
+             *     must be replayable JSON scalars; nulls, arrays, objects, and non-finite
+             *     numbers are rejected.
              *     Mutually exclusive with `offset`.
              *     Requires `order_by` to be set. Supported for text-backed, match_all,
              *     and filter-only requests; not supported for semantic_search or
@@ -5185,7 +5189,9 @@ export interface components {
              * @description Cursor for backward pagination. Pass the `_sort` values from the first hit
              *     of the current page exactly, including the appended `_id` tie-breaker.
              *     Values preserve their JSON types; for example numbers remain numbers,
-             *     booleans remain booleans, null remains null, and strings remain strings.
+             *     booleans remain booleans, and strings remain strings. Cursor values
+             *     must be replayable JSON scalars; nulls, arrays, objects, and non-finite
+             *     numbers are rejected.
              *     Mutually exclusive with `offset`.
              *     Requires `order_by` to be set. Supported for text-backed, match_all,
              *     and filter-only requests; not supported for semantic_search or
