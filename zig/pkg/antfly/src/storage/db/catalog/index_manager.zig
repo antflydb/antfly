@@ -125,6 +125,7 @@ fn buildTextSegmentIntoSink(ctx_any: *anyopaque, sink: *segment_mod.SegmentSink)
 const text_backfill_batch_size: usize = 1024;
 const text_merge_scheduler_default_steps: usize = 1;
 const text_merge_quarantine_backoff_ns: u64 = 30 * std.time.ns_per_s;
+pub var test_text_backfill_batch_size: ?usize = null;
 pub var test_abort_text_backfill_after_batches: ?usize = null;
 pub var test_inject_index_open_error: ?anyerror = null;
 const sparse_backfill_batch_size: usize = 1024;
@@ -5972,7 +5973,8 @@ pub const IndexManager = struct {
                 max_flushed_key = doc.key;
             }
 
-            if (mapped_docs.items.len >= text_backfill_batch_size) {
+            const backfill_batch_size = if (@import("builtin").is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
+            if (mapped_docs.items.len >= backfill_batch_size) {
                 try flush_batch(self, store, entry, rebuild_state, &mapped_docs, max_flushed_key.?, &flushed_batches);
             }
         }
@@ -6267,7 +6269,7 @@ pub const IndexManager = struct {
                 }
 
                 const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
-                const resume_from = rebuild_state.check(self.alloc) catch |err| {
+                var resume_from = rebuild_state.check(self.alloc) catch |err| {
                     std.log.warn("full_text open failed step=rebuild_state_check name={s} err={s}", .{
                         cfg.name,
                         @errorName(err),
@@ -6276,7 +6278,15 @@ pub const IndexManager = struct {
                 };
                 defer if (resume_from) |buf| self.alloc.free(buf);
 
-                if (allow_backfill and (resume_from != null or (entry.persistent.snapshot().global_doc_count == 0 and persisted_ranges.len == 0))) {
+                var rebuild_from_scratch_after_interruption = false;
+                if (allow_backfill and resume_from != null) {
+                    try entry.persistent.resetAllForRebuild();
+                    self.alloc.free(resume_from.?);
+                    resume_from = null;
+                    rebuild_from_scratch_after_interruption = true;
+                }
+
+                if (allow_backfill and (rebuild_from_scratch_after_interruption or resume_from != null or (entry.persistent.snapshot().global_doc_count == 0 and persisted_ranges.len == 0))) {
                     const backfill_started_ns = nowNs();
                     try rebuild_state.update(if (resume_from) |buf| buf else "");
                     try self.backfillTextIndex(store, &entry, resume_from);

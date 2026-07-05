@@ -46405,7 +46405,7 @@ test "db full-text backfill resumes after interrupted reopen" {
             writes.deinit(alloc);
         }
 
-        for (0..300) |i| {
+        for (0..10) |i| {
             try writes.append(alloc, .{
                 .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
                 .value = try std.fmt.allocPrint(alloc, "{{\"title\":\"alpha\",\"n\":{d}}}", .{i}),
@@ -46420,6 +46420,8 @@ test "db full-text backfill resumes after interrupted reopen" {
         }});
     }
 
+    index_manager_mod.test_text_backfill_batch_size = 4;
+    defer index_manager_mod.test_text_backfill_batch_size = null;
     index_manager_mod.test_abort_text_backfill_after_batches = 1;
     defer index_manager_mod.test_abort_text_backfill_after_batches = null;
     {
@@ -46446,11 +46448,11 @@ test "db full-text backfill resumes after interrupted reopen" {
 
     var result = try reopened.search(alloc, .{
         .index_name = "ft_v1",
-        .query = .{ .match_all = {} },
-        .limit = 400,
+        .query = .{ .term = .{ .field = "title", .term = "alpha" } },
+        .limit = 20,
     });
     defer result.deinit();
-    try std.testing.expectEqual(@as(u32, 300), result.total_hits);
+    try std.testing.expectEqual(@as(u32, 10), result.total_hits);
 
     const stats = try reopened.stats(alloc);
     defer types.freeDBStats(alloc, stats);
