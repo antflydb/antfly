@@ -74,6 +74,30 @@ def _maybe_serverless_build(serverless_api, table_name: str) -> dict | None:
         raise
 
 
+def _serverless_build_or_wait_for_publish(
+    serverless_api,
+    table_name: str,
+    *,
+    min_head_version: int,
+    published_wal_end_lsn: int,
+    timeout_s: float = 60.0,
+) -> dict:
+    assert _maybe_serverless_build(serverless_api, table_name) is not None
+
+    return _wait_for_serverless_build_status(
+        serverless_api,
+        table_name,
+        lambda current: (
+            current.get("head_version", 0) >= min_head_version
+            and current.get("published_wal_end_lsn") == published_wal_end_lsn
+            and current.get("publish_recommended") is False
+            and current.get("head_republish_recommended") is False
+        ),
+        timeout_s=timeout_s,
+        reason=f"serverless publish did not complete for head version >= {min_head_version}",
+    )
+
+
 def _wait_for_serverless_build_status(
     serverless_api,
     table_name: str,
@@ -1820,7 +1844,12 @@ def test_serverless_same_name_dense_index_update_republishes_head(serverless_api
     assert planned["artifact_actions"]["dense_vector"] == "rebuild"
     assert planned["published_wal_end_lsn"] == first_published_wal_end
 
-    rebuilt = _maybe_serverless_build(serverless_api, table_name)
+    rebuilt = _serverless_build_or_wait_for_publish(
+        serverless_api,
+        table_name,
+        min_head_version=first_head_version + 1,
+        published_wal_end_lsn=first_published_wal_end,
+    )
     assert rebuilt is not None
     target_head_version = rebuilt.get("version") or rebuilt.get("head_version") or (first_head_version + 1)
     ready = _wait_for_serverless_build_status(
@@ -1829,8 +1858,10 @@ def test_serverless_same_name_dense_index_update_republishes_head(serverless_api
         lambda current: (
             current.get("head_version", 0) >= target_head_version
             and current.get("published_wal_end_lsn") == first_published_wal_end
+            and current.get("publish_recommended") is False
             and _named_action(current, "head_vector_index_actions", "semantic_idx") == "rebuild"
         ),
+        timeout_s=60.0,
         reason=f"serverless dense-index republish did not reach head version {target_head_version}",
     )
 

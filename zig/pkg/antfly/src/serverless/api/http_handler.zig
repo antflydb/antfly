@@ -4350,6 +4350,7 @@ pub const HttpHandler = struct {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.FileNotFound => return error.NotFound,
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
+            error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             else => {
                 std.log.err("serverless public table query failed table={s} err={}", .{ table_name, err });
@@ -8598,6 +8599,45 @@ test "http handler accepts structured table updates for metadata-only republish 
     try std.testing.expectEqual(@as(usize, 1), parsed_build_status.value.vector_index_actions.len);
     try std.testing.expectEqualStrings("semantic_idx", parsed_build_status.value.vector_index_actions[0].name);
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.rebuild, parsed_build_status.value.vector_index_actions[0].action);
+
+    var republish = try handler.handle(.{
+        .method = .post,
+        .path = "/internal/v1/tables/docs/build",
+    });
+    defer republish.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 202), republish.status);
+    var parsed_republish = try parseJsonTestBody(api_types.TableBuildResult, alloc, republish.body);
+    defer parsed_republish.deinit();
+    try std.testing.expect(parsed_republish.value.published);
+    try std.testing.expectEqual(@as(u64, 2), parsed_republish.value.version);
+    try std.testing.expectEqual(@as(u64, 1), parsed_republish.value.wal_end_lsn);
+
+    var after_status = try handler.handle(.{
+        .method = .get,
+        .path = "/internal/v1/tables/docs/build-status",
+    });
+    defer after_status.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), after_status.status);
+    var parsed_after_status = try parseJsonTestBody(api_types.TableBuildStatus, alloc, after_status.body);
+    defer parsed_after_status.deinit();
+    try std.testing.expect(!parsed_after_status.value.publish_recommended);
+    try std.testing.expect(!parsed_after_status.value.head_republish_recommended);
+    try std.testing.expectEqual(@as(u64, 2), parsed_after_status.value.head_version);
+    try std.testing.expectEqual(@as(u64, 1), parsed_after_status.value.published_wal_end_lsn);
+    try std.testing.expectEqual(@as(usize, 1), parsed_after_status.value.head_vector_index_actions.len);
+    try std.testing.expectEqualStrings("semantic_idx", parsed_after_status.value.head_vector_index_actions[0].name);
+    try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.rebuild, parsed_after_status.value.head_vector_index_actions[0].action);
+
+    var semantic_index = try handler.handle(.{
+        .method = .get,
+        .path = "/tables/docs/indexes/semantic_idx",
+    });
+    defer semantic_index.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), semantic_index.status);
+    var parsed_semantic_index = try parseServerlessIndexStatusTestResponse(alloc, semantic_index.body, "semantic_idx");
+    defer parsed_semantic_index.deinit();
+    try std.testing.expectEqualStrings("rebuild", parsed_semantic_index.value.status.head_publication_action.?);
+    try std.testing.expectEqual(@as(?bool, false), parsed_semantic_index.value.status.materialization_blocked);
 }
 
 test "http handler query publication exposes vector compaction targets" {

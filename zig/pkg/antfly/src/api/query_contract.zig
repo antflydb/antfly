@@ -1784,8 +1784,19 @@ fn applyCommonSearchRequestOptions(
     if ((req.search_after.len > 0 or req.search_before.len > 0) and req.order_by.len == 0) return error.UnsupportedQueryRequest;
     if (req.search_after.len > 0 and req.search_after.len != req.order_by.len) return error.UnsupportedQueryRequest;
     if (req.search_before.len > 0 and req.search_before.len != req.order_by.len) return error.UnsupportedQueryRequest;
+    try validatePublicSortCursorTuple(req.*);
     if (request.embedding_template != null and request.semantic_search == null) return error.UnsupportedQueryRequest;
     if (request.embedding_template != null and request.embeddings != null) return error.UnsupportedQueryRequest;
+}
+
+fn validatePublicSortCursorTuple(req: db_mod.types.SearchRequest) !void {
+    const cursor = if (req.search_after.len > 0) req.search_after else req.search_before;
+    if (cursor.len == 0) return;
+    for (cursor, 0..) |value, i| {
+        if (!openApiSortValueIsCursorReplayable(value)) return error.InvalidQueryRequest;
+        if (std.mem.eql(u8, req.order_by[i].field, "_score") and !openApiSortValueIsNumeric(value)) return error.InvalidQueryRequest;
+        if (std.mem.eql(u8, req.order_by[i].field, "_id") and value != .string) return error.InvalidQueryRequest;
+    }
 }
 
 fn cloneSortFieldsWithStableTiebreaker(
@@ -1796,6 +1807,9 @@ fn cloneSortFieldsWithStableTiebreaker(
     var has_final_id = false;
     for (fields, 0..) |field, i| {
         if (field.field.len == 0) return error.UnsupportedQueryRequest;
+        for (fields[0..i]) |prior| {
+            if (std.mem.eql(u8, prior.field, field.field)) return error.UnsupportedQueryRequest;
+        }
         if (std.mem.eql(u8, field.field, "_id")) {
             if (i + 1 != fields.len or (field.desc orelse false)) return error.UnsupportedQueryRequest;
             has_final_id = true;
@@ -2338,6 +2352,8 @@ pub fn encodeQueryResponses(
 }
 
 fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit) !metadata_openapi.QueryHit {
+    try validateOpenApiHitSortTuple(req, hit);
+
     return .{
         ._id = hit.id,
         ._score = if (hit.score) |score| finiteScoreOrZero(score) else 0,
@@ -2354,6 +2370,47 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
         else
             null,
         .hierarchy = try searchHitHierarchyJsonValue(alloc, req, hit),
+    };
+}
+
+fn validateOpenApiHitSortTuple(req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit) !void {
+    if (req.order_by.len == 0) return;
+    const expected_len = sortProfileEffectiveOrderLen(req);
+    if (hit.sort_values.len != expected_len) return error.InvalidQueryRequest;
+    for (0..expected_len) |i| {
+        const field = sortProfileEffectiveOrderField(req, i);
+        const value = hit.sort_values[i];
+        if (!openApiSortValueIsCursorReplayable(value)) return error.InvalidQueryRequest;
+        if (std.mem.eql(u8, field.field, "_score") and !openApiSortValueIsNumeric(value)) return error.InvalidQueryRequest;
+        if (std.mem.eql(u8, field.field, "_id")) {
+            if (value != .string or !std.mem.eql(u8, value.string, hit.id)) return error.InvalidQueryRequest;
+        }
+    }
+}
+
+fn openApiSortValueIsCursorReplayable(value: std.json.Value) bool {
+    return switch (value) {
+        .float => |v| std.math.isFinite(v),
+        .number_string => |text| openApiSortNumberStringIsCursorReplayable(text),
+        .bool, .integer, .string => true,
+        .null => false,
+        .array, .object => false,
+    };
+}
+
+fn openApiSortNumberStringIsCursorReplayable(text: []const u8) bool {
+    if (std.fmt.parseInt(i64, text, 10)) |_| return true else |_| {}
+    if (std.fmt.parseInt(u64, text, 10)) |_| return true else |_| {}
+    const parsed = std.fmt.parseFloat(f64, text) catch return false;
+    return std.math.isFinite(parsed);
+}
+
+fn openApiSortValueIsNumeric(value: std.json.Value) bool {
+    return switch (value) {
+        .integer => true,
+        .float => |v| std.math.isFinite(v),
+        .number_string => |text| openApiSortNumberStringIsCursorReplayable(text),
+        else => false,
     };
 }
 
@@ -2652,6 +2709,271 @@ test "api query contract serializes fused index scores" {
     try std.testing.expectEqual(@as(usize, 2), object.count());
     try std.testing.expectEqual(@as(f64, 0.75), object.get("text_idx").?.float);
     try std.testing.expectEqual(@as(f64, 0.25), object.get("semantic_idx").?.float);
+}
+
+test "api query contract serializes sort profile diagnostics" {
+    const alloc = std.testing.allocator;
+
+    var result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 2,
+        .sort_profile = .{
+            .plan = "sorted_segment_seek",
+            .exactness = "exact",
+            .source = "sorted_segment_scan",
+            .cursor_support = "segment_seek",
+            .source_load = "projected_source_after_page",
+            .distributed_behavior = "shard_local_only",
+            .require_native = true,
+            .native_loader = true,
+            .index_sort_match = true,
+            .sorted_segment_executor_available = true,
+            .sorted_segment_bounds_available = true,
+            .candidate_count = 7,
+            .cursor_rejected_count = 1,
+            .admitted_count = 5,
+            .replaced_count = 2,
+            .discarded_count = 3,
+            .selected_count = 2,
+            .decorate_us = 11,
+            .native_doc_value_load_us = 13,
+            .native_doc_value_hit_count = 17,
+            .native_doc_value_miss_count = 19,
+            .stored_json_load_us = 23,
+            .stored_json_load_count = 29,
+            .final_sort_us = 31,
+            .total_us = 37,
+            .window_capacity = 41,
+            .window_len = 2,
+            .collector_heap_peak = 5,
+            .distributed_shard_count = 3,
+            .distributed_shard_window = 11,
+            .budget_rejection_reason = "match_all_candidate_collect_limit",
+            .sort_rejection_reason = "missing_doc_values_coverage",
+            .sort_rejection_detail = "missing_doc_values_section",
+            .sort_rejection_field = db_mod.types.SortProfileField.init("created_at"),
+        },
+    };
+    defer result.deinit();
+
+    const order_by = [_]db_mod.types.SortField{.{ .field = "created_at", .desc = true }};
+    const cursor = [_]std.json.Value{
+        .{ .string = "2026-01-01T00:00:00.000000000Z" },
+        .{ .string = "doc:a" },
+    };
+    var response = try encodeQueryResponses(alloc, "docs", .{
+        .profile = true,
+        .order_by = &order_by,
+        .search_after = &cursor,
+    }, .{}, result);
+    defer response.deinit(alloc);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
+    defer parsed.deinit();
+    const profile = parsed.value.object.get("responses").?.array.items[0].object.get("profile").?.object;
+    const sort = profile.get("sort").?.object;
+    try std.testing.expectEqualStrings("sorted_segment_seek", sort.get("plan").?.string);
+    const emitted_order = sort.get("order_by").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), emitted_order.len);
+    try std.testing.expectEqualStrings("created_at", emitted_order[0].object.get("field").?.string);
+    try std.testing.expect(emitted_order[0].object.get("desc").?.bool);
+    try std.testing.expectEqualStrings("_id", emitted_order[1].object.get("field").?.string);
+    try std.testing.expect(!emitted_order[1].object.get("desc").?.bool);
+    try std.testing.expectEqualStrings("after", sort.get("cursor").?.string);
+    try std.testing.expectEqualStrings("exact", sort.get("exactness").?.string);
+    try std.testing.expectEqualStrings("sorted_segment_scan", sort.get("source").?.string);
+    try std.testing.expectEqualStrings("segment_seek", sort.get("cursor_support").?.string);
+    try std.testing.expectEqualStrings("projected_source_after_page", sort.get("source_load").?.string);
+    try std.testing.expectEqualStrings("shard_local_only", sort.get("distributed_behavior").?.string);
+    try std.testing.expect(sort.get("require_native").?.bool);
+    try std.testing.expect(sort.get("native_loader").?.bool);
+    try std.testing.expect(sort.get("index_sort_match").?.bool);
+    try std.testing.expect(sort.get("sorted_segment_executor_available").?.bool);
+    try std.testing.expect(sort.get("sorted_segment_bounds_available").?.bool);
+    try std.testing.expectEqual(@as(i64, 7), sort.get("candidate_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), sort.get("cursor_rejected_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 17), sort.get("native_doc_value_hit_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 19), sort.get("native_doc_value_miss_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 29), sort.get("stored_json_load_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 37), sort.get("total_us").?.integer);
+    try std.testing.expectEqual(@as(i64, 41), sort.get("window_capacity").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), sort.get("window_len").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), sort.get("collector_heap_peak").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), sort.get("distributed_shard_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 11), sort.get("distributed_shard_window").?.integer);
+    try std.testing.expectEqualStrings("match_all_candidate_collect_limit", sort.get("budget_rejection_reason").?.string);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", sort.get("sort_rejection_reason").?.string);
+    try std.testing.expectEqualStrings("missing_doc_values_section", sort.get("sort_rejection_detail").?.string);
+    try std.testing.expectEqualStrings("created_at", sort.get("sort_rejection_field").?.string);
+}
+
+test "api query contract serializes ordered hit sort tuple" {
+    const alloc = std.testing.allocator;
+
+    var result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+        .total_hits = 1,
+    };
+    defer result.deinit();
+
+    const sort_values = try alloc.alloc(std.json.Value, 2);
+    sort_values[0] = .{ .integer = 42 };
+    sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:a") };
+    result.hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .score = 0.9,
+        .sort_values = sort_values,
+    };
+
+    const order_by = [_]db_mod.types.SortField{.{ .field = "created_at", .desc = true }};
+    var response = try encodeQueryResponses(alloc, "docs", .{
+        .order_by = &order_by,
+    }, .{}, result);
+    defer response.deinit(alloc);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
+    defer parsed.deinit();
+    const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0].object;
+    const sort = hit.get("_sort").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), sort.len);
+    try std.testing.expectEqual(@as(i64, 42), sort[0].integer);
+    try std.testing.expectEqualStrings("doc:a", sort[1].string);
+}
+
+test "api query contract rejects ordered hits without complete sort tuple" {
+    const alloc = std.testing.allocator;
+
+    const order_by = [_]db_mod.types.SortField{.{ .field = "created_at", .desc = true }};
+
+    var missing = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+        .total_hits = 1,
+    };
+    defer missing.deinit();
+    missing.hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .score = 0.9,
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
+        .order_by = &order_by,
+    }, .{}, missing));
+
+    var incomplete = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+        .total_hits = 1,
+    };
+    defer incomplete.deinit();
+    const sort_values = try alloc.alloc(std.json.Value, 1);
+    sort_values[0] = .{ .integer = 42 };
+    incomplete.hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .score = 0.9,
+        .sort_values = sort_values,
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
+        .order_by = &order_by,
+    }, .{}, incomplete));
+}
+
+test "api query contract rejects ordered hits with non replayable sort tuple" {
+    const alloc = std.testing.allocator;
+
+    const order_by = [_]db_mod.types.SortField{.{ .field = "created_at", .desc = true }};
+
+    var nested = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+        .total_hits = 1,
+    };
+    defer nested.deinit();
+    const nested_sort_values = try alloc.alloc(std.json.Value, 2);
+    nested_sort_values[0] = .{ .array = std.json.Array.init(alloc) };
+    nested_sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:a") };
+    nested.hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .score = 0.9,
+        .sort_values = nested_sort_values,
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
+        .order_by = &order_by,
+    }, .{}, nested));
+
+    var null_sort = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+        .total_hits = 1,
+    };
+    defer null_sort.deinit();
+    const null_sort_values = try alloc.alloc(std.json.Value, 2);
+    null_sort_values[0] = .null;
+    null_sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:a") };
+    null_sort.hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .score = 0.9,
+        .sort_values = null_sort_values,
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
+        .order_by = &order_by,
+    }, .{}, null_sort));
+
+    var non_finite = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+        .total_hits = 1,
+    };
+    defer non_finite.deinit();
+    const non_finite_sort_values = try alloc.alloc(std.json.Value, 2);
+    non_finite_sort_values[0] = .{ .float = std.math.inf(f64) };
+    non_finite_sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:a") };
+    non_finite.hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .score = 0.9,
+        .sort_values = non_finite_sort_values,
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
+        .order_by = &order_by,
+    }, .{}, non_finite));
+
+    const score_order_by = [_]db_mod.types.SortField{.{ .field = "_score", .desc = true }};
+    var non_numeric_score = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+        .total_hits = 1,
+    };
+    defer non_numeric_score.deinit();
+    const non_numeric_score_sort_values = try alloc.alloc(std.json.Value, 2);
+    non_numeric_score_sort_values[0] = .{ .string = try alloc.dupe(u8, "high") };
+    non_numeric_score_sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:a") };
+    non_numeric_score.hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .score = 0.9,
+        .sort_values = non_numeric_score_sort_values,
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
+        .order_by = &score_order_by,
+    }, .{}, non_numeric_score));
+
+    var id_mismatch = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+        .total_hits = 1,
+    };
+    defer id_mismatch.deinit();
+    const mismatched_sort_values = try alloc.alloc(std.json.Value, 2);
+    mismatched_sort_values[0] = .{ .integer = 42 };
+    mismatched_sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:b") };
+    id_mismatch.hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .score = 0.9,
+        .sort_values = mismatched_sort_values,
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
+        .order_by = &order_by,
+    }, .{}, id_mismatch));
 }
 
 test "api query contract serializes derived hierarchy ancestry" {
@@ -3710,7 +4032,102 @@ fn buildProfileValue(
         const dense_parsed = try std.json.parseFromSlice(std.json.Value, alloc, dense_json, .{});
         try parsed.value.object.put(alloc, "dense_search", dense_parsed.value);
     }
+    if (result.sort_profile) |sort_profile| {
+        if (parsed.value != .object) return error.InvalidQueryRequest;
+        try parsed.value.object.put(alloc, "sort", try buildSortProfileValue(alloc, req, sort_profile));
+    }
     return parsed.value;
+}
+
+fn buildProfileUnsignedValue(alloc: std.mem.Allocator, value: u64) !std.json.Value {
+    if (value <= @as(u64, @intCast(std.math.maxInt(i64)))) {
+        return .{ .integer = @intCast(value) };
+    }
+    return .{ .number_string = try std.fmt.allocPrint(alloc, "{d}", .{value}) };
+}
+
+fn buildProfileSizeValue(alloc: std.mem.Allocator, value: usize) !std.json.Value {
+    return buildProfileUnsignedValue(alloc, @intCast(value));
+}
+
+fn buildSortProfileValue(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    profile: db_mod.types.SortProfile,
+) !std.json.Value {
+    var sort = std.json.ObjectMap.empty;
+    try sort.put(alloc, "plan", .{ .string = profile.plan });
+    try sort.put(alloc, "order_by", try buildSortProfileOrderValue(alloc, req));
+    try sort.put(alloc, "cursor", .{ .string = sortProfileCursorMode(req) });
+    try sort.put(alloc, "exactness", .{ .string = profile.exactness });
+    try sort.put(alloc, "source", .{ .string = profile.source });
+    try sort.put(alloc, "cursor_support", .{ .string = profile.cursor_support });
+    try sort.put(alloc, "source_load", .{ .string = profile.source_load });
+    try sort.put(alloc, "distributed_behavior", .{ .string = profile.distributed_behavior });
+    try sort.put(alloc, "require_native", .{ .bool = profile.require_native });
+    try sort.put(alloc, "native_loader", .{ .bool = profile.native_loader });
+    try sort.put(alloc, "index_sort_match", .{ .bool = profile.index_sort_match });
+    try sort.put(alloc, "sorted_segment_executor_available", .{ .bool = profile.sorted_segment_executor_available });
+    try sort.put(alloc, "sorted_segment_bounds_available", .{ .bool = profile.sorted_segment_bounds_available });
+    try sort.put(alloc, "candidate_count", try buildProfileUnsignedValue(alloc, profile.candidate_count));
+    try sort.put(alloc, "cursor_rejected_count", try buildProfileUnsignedValue(alloc, profile.cursor_rejected_count));
+    try sort.put(alloc, "admitted_count", try buildProfileUnsignedValue(alloc, profile.admitted_count));
+    try sort.put(alloc, "replaced_count", try buildProfileUnsignedValue(alloc, profile.replaced_count));
+    try sort.put(alloc, "discarded_count", try buildProfileUnsignedValue(alloc, profile.discarded_count));
+    try sort.put(alloc, "selected_count", try buildProfileUnsignedValue(alloc, profile.selected_count));
+    try sort.put(alloc, "decorate_us", try buildProfileUnsignedValue(alloc, profile.decorate_us));
+    try sort.put(alloc, "native_doc_value_load_us", try buildProfileUnsignedValue(alloc, profile.native_doc_value_load_us));
+    try sort.put(alloc, "native_doc_value_hit_count", try buildProfileUnsignedValue(alloc, profile.native_doc_value_hit_count));
+    try sort.put(alloc, "native_doc_value_miss_count", try buildProfileUnsignedValue(alloc, profile.native_doc_value_miss_count));
+    try sort.put(alloc, "stored_json_load_us", try buildProfileUnsignedValue(alloc, profile.stored_json_load_us));
+    try sort.put(alloc, "stored_json_load_count", try buildProfileUnsignedValue(alloc, profile.stored_json_load_count));
+    try sort.put(alloc, "final_sort_us", try buildProfileUnsignedValue(alloc, profile.final_sort_us));
+    try sort.put(alloc, "total_us", try buildProfileUnsignedValue(alloc, profile.total_us));
+    try sort.put(alloc, "window_capacity", try buildProfileSizeValue(alloc, profile.window_capacity));
+    try sort.put(alloc, "window_len", try buildProfileSizeValue(alloc, profile.window_len));
+    try sort.put(alloc, "collector_heap_peak", try buildProfileSizeValue(alloc, profile.collector_heap_peak));
+    try sort.put(alloc, "distributed_shard_count", try buildProfileSizeValue(alloc, profile.distributed_shard_count));
+    try sort.put(alloc, "distributed_shard_window", try buildProfileSizeValue(alloc, profile.distributed_shard_window));
+    try sort.put(alloc, "budget_rejection_reason", .{ .string = profile.budget_rejection_reason });
+    try sort.put(alloc, "sort_rejection_reason", .{ .string = profile.sort_rejection_reason });
+    try sort.put(alloc, "sort_rejection_detail", .{ .string = profile.sort_rejection_detail });
+    try sort.put(alloc, "sort_rejection_field", .{ .string = try alloc.dupe(u8, profile.sort_rejection_field.slice()) });
+    return .{ .object = sort };
+}
+
+fn sortProfileNeedsImplicitIdTiebreaker(req: db_mod.types.SearchRequest) bool {
+    if (req.order_by.len == 0) return false;
+    return !std.mem.eql(u8, req.order_by[req.order_by.len - 1].field, "_id");
+}
+
+fn sortProfileEffectiveOrderLen(req: db_mod.types.SearchRequest) usize {
+    return req.order_by.len + @intFromBool(sortProfileNeedsImplicitIdTiebreaker(req));
+}
+
+fn sortProfileEffectiveOrderField(req: db_mod.types.SearchRequest, index: usize) db_mod.types.SortField {
+    if (index < req.order_by.len) return req.order_by[index];
+    return .{ .field = "_id" };
+}
+
+fn buildSortProfileOrderValue(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) !std.json.Value {
+    var order = std.json.Array.init(alloc);
+    errdefer order.deinit();
+    const field_count = sortProfileEffectiveOrderLen(req);
+    for (0..field_count) |i| {
+        const field = sortProfileEffectiveOrderField(req, i);
+        var field_obj = std.json.ObjectMap.empty;
+        errdefer field_obj.deinit(alloc);
+        try field_obj.put(alloc, "field", .{ .string = field.field });
+        try field_obj.put(alloc, "desc", .{ .bool = field.desc });
+        try order.append(.{ .object = field_obj });
+    }
+    return .{ .array = order };
+}
+
+fn sortProfileCursorMode(req: db_mod.types.SearchRequest) []const u8 {
+    if (req.search_after.len > 0) return "after";
+    if (req.search_before.len > 0) return "before";
+    return "none";
 }
 
 fn parseMergeConfig(alloc: std.mem.Allocator, generated: indexes_openapi.MergeConfig) !db_mod.types.MergeConfig {
@@ -6512,6 +6929,54 @@ test "api query contract rejects cursor width that omits stable id tiebreaker" {
     try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
 }
 
+test "api query contract rejects non replayable search_after cursor values" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "order_by": [{"field":"created_at","desc":true}],
+        \\  "search_after": [null, "doc-9"]
+        \\}
+    ));
+
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "order_by": [{"field":"created_at","desc":true}],
+        \\  "search_after": [{"value":"2026-01-01"}, "doc-9"]
+        \\}
+    ));
+
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "order_by": [{"field":"_score","desc":true}],
+        \\  "search_after": ["high", "doc-9"]
+        \\}
+    ));
+}
+
+test "api query contract rejects non replayable search_before cursor values" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "order_by": [{"field":"created_at","desc":true}],
+        \\  "search_before": [[], "doc-9"]
+        \\}
+    ));
+
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "order_by": [{"field":"created_at","desc":true}],
+        \\  "search_before": ["2026-01-01", 9]
+        \\}
+    ));
+}
+
 test "api query contract rejects ambiguous explicit id sort tiebreaker" {
     const alloc = std.testing.allocator;
 
@@ -6526,6 +6991,13 @@ test "api query contract rejects ambiguous explicit id sort tiebreaker" {
         \\{
         \\  "full_text_search": {"match":"raft","field":"body"},
         \\  "order_by": [{"field":"created_at"},{"field":"_id","desc":true}]
+        \\}
+    ));
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs",
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "order_by": [{"field":"created_at"},{"field":"created_at","desc":true}]
         \\}
     ));
 }

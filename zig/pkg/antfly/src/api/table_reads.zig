@@ -35,6 +35,7 @@ const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const asset_producer_mod = @import("../storage/db/enrichment/asset_producer.zig");
 const ha_read_gate_mod = @import("../storage/ha/read_gate.zig");
 const ha_standby_mod = @import("../storage/ha/standby.zig");
+const storage_schema = @import("../storage/schema.zig");
 const hbc_mod = @import("../storage/hbc_adapter.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
@@ -46,6 +47,7 @@ const reranking_runtime = @import("../reranking/mod.zig");
 const template_mod = @import("../template.zig");
 const table_catalog = @import("table_catalog.zig");
 const table_router = @import("table_router.zig");
+const tables_api = @import("tables.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const distributed_graph = @import("distributed_graph.zig");
@@ -132,6 +134,7 @@ pub const BackgroundTextStatsResponse = struct {
 };
 
 pub const LsmStorageStats = runtime_status.LsmStorageStats;
+pub const ObservedDynamicFieldCapabilitySet = db_mod.IndexManager.ObservedDynamicFieldCapabilitySet;
 
 pub const ParsedTextStatsHttpResponse = union(enum) {
     fields: TextStatsResponse,
@@ -1419,6 +1422,11 @@ pub const TableReadSource = struct {
             alloc: std.mem.Allocator,
             table_name: []const u8,
         ) anyerror!?LsmStorageStats = null,
+        observed_dynamic_field_capability_sets: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+        ) anyerror!?[]ObservedDynamicFieldCapabilitySet = null,
         document_artifact_manifest: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1740,6 +1748,15 @@ pub const TableReadSource = struct {
         const fn_ptr = self.vtable.lsm_storage_stats orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name);
     }
+
+    pub fn observedDynamicFieldCapabilitySets(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !?[]ObservedDynamicFieldCapabilitySet {
+        const fn_ptr = self.vtable.observed_dynamic_field_capability_sets orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name);
+    }
 };
 
 pub fn searchRequestFromVectorWorkerEnvelope(envelope: *const query_contract.OwnedAlgebraicVectorWorkerRequestEnvelope) db_mod.types.SearchRequest {
@@ -1988,6 +2005,7 @@ pub const BoundTableReadSource = struct {
                 .graph_edges_group_local = graphEdgesGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
                 .lsm_storage_stats = lsmStorageStats,
+                .observed_dynamic_field_capability_sets = observedDynamicFieldCapabilitySets,
                 .document_artifact_manifest = documentArtifactManifest,
                 .document_artifact_manifests = documentArtifactManifests,
             },
@@ -2033,6 +2051,16 @@ pub const BoundTableReadSource = struct {
             .maintenance_score = self.db.lsmMaintenanceScore(),
             .maintenance_debt_hint = self.db.lsmMaintenanceDebtHint(),
         };
+    }
+
+    fn observedDynamicFieldCapabilitySets(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !?[]ObservedDynamicFieldCapabilitySet {
+        const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
+        return self.db.observedDynamicFieldCapabilitySetsAlloc(alloc);
     }
 
     fn localRuntimeStatuses(
@@ -2478,6 +2506,7 @@ pub const ProvisionedTableReadSource = struct {
                 .graph_edges_group_local = graphEdgesGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
                 .lsm_storage_stats = lsmStorageStats,
+                .observed_dynamic_field_capability_sets = observedDynamicFieldCapabilitySets,
                 .document_artifact_manifest = documentArtifactManifest,
                 .document_artifact_manifests = documentArtifactManifests,
                 .document_artifact_manifest_group_local = documentArtifactManifestGroupLocal,
@@ -2965,7 +2994,131 @@ pub const ProvisionedTableReadSource = struct {
         }
         return out;
     }
+
+    fn observedDynamicFieldCapabilitySets(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !?[]ObservedDynamicFieldCapabilitySet {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
+        defer alloc.free(group_ids);
+        if (group_ids.len == 0) return null;
+
+        var merged = std.ArrayListUnmanaged(ObservedDynamicFieldCapabilitySet).empty;
+        errdefer freeObservedDynamicFieldCapabilitySetsFromList(alloc, &merged);
+
+        for (group_ids) |group_id| {
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
+            const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
+            var db = try openProvisionedWarmStatusDbForTable(
+                alloc,
+                path,
+                self.visibleRootGeneration(group_id),
+                self.backend_runtime,
+                identity_namespace,
+            );
+            defer db.close();
+
+            const group_sets = try db.observedDynamicFieldCapabilitySetsAlloc(alloc);
+            defer freeObservedDynamicFieldCapabilitySets(alloc, group_sets);
+            for (group_sets) |set| try mergeObservedDynamicFieldCapabilitySet(alloc, &merged, set);
+        }
+
+        return try merged.toOwnedSlice(alloc);
+    }
 };
+
+fn freeObservedDynamicFieldCapabilitySets(
+    alloc: std.mem.Allocator,
+    sets: []ObservedDynamicFieldCapabilitySet,
+) void {
+    for (sets) |*set| set.deinit(alloc);
+    if (sets.len > 0) alloc.free(sets);
+}
+
+fn freeObservedDynamicFieldCapabilitySetsFromList(
+    alloc: std.mem.Allocator,
+    sets: *std.ArrayListUnmanaged(ObservedDynamicFieldCapabilitySet),
+) void {
+    for (sets.items) |*set| set.deinit(alloc);
+    sets.deinit(alloc);
+}
+
+fn mergeObservedDynamicFieldCapabilitySet(
+    alloc: std.mem.Allocator,
+    merged: *std.ArrayListUnmanaged(ObservedDynamicFieldCapabilitySet),
+    incoming: ObservedDynamicFieldCapabilitySet,
+) !void {
+    for (merged.items) |*existing| {
+        if (!std.mem.eql(u8, existing.index_name, incoming.index_name)) continue;
+        for (incoming.field_capabilities) |capability| {
+            if (containsEquivalentFieldCapability(existing.field_capabilities, capability)) continue;
+            const cloned = try storage_schema.cloneFieldCapabilityAlloc(alloc, capability);
+            const old_len = existing.field_capabilities.len;
+            const expanded = alloc.realloc(existing.field_capabilities, old_len + 1) catch |err| {
+                storage_schema.freeOwnedFieldCapability(alloc, cloned);
+                return err;
+            };
+            existing.field_capabilities = expanded;
+            existing.field_capabilities[old_len] = cloned;
+        }
+        return;
+    }
+
+    {
+        var new_set = ObservedDynamicFieldCapabilitySet{
+            .index_name = try alloc.dupe(u8, incoming.index_name),
+            .field_capabilities = &.{},
+        };
+        errdefer new_set.deinit(alloc);
+        new_set.field_capabilities = try storage_schema.cloneFieldCapabilitiesAlloc(alloc, incoming.field_capabilities);
+        try merged.append(alloc, new_set);
+    }
+}
+
+fn containsEquivalentFieldCapability(
+    capabilities: []const storage_schema.FieldCapability,
+    needle: storage_schema.FieldCapability,
+) bool {
+    for (capabilities) |capability| {
+        if (fieldCapabilitiesEquivalent(capability, needle)) return true;
+    }
+    return false;
+}
+
+fn fieldCapabilitiesEquivalent(left: storage_schema.FieldCapability, right: storage_schema.FieldCapability) bool {
+    return optionalStringsEqual(left.name, right.name) and
+        optionalStringsEqual(left.field, right.field) and
+        optionalStringsEqual(left.path_pattern, right.path_pattern) and
+        optionalStringsEqual(left.field_pattern, right.field_pattern) and
+        optionalStringsEqual(left.match_mapping_type, right.match_mapping_type) and
+        optionalStringsEqual(left.emitted_name, right.emitted_name) and
+        optionalStringsEqual(left.document_schema, right.document_schema) and
+        left.field_type == right.field_type and
+        left.searchable == right.searchable and
+        left.filterable == right.filterable and
+        left.aggregatable == right.aggregatable and
+        left.doc_values == right.doc_values and
+        left.sortable == right.sortable and
+        std.mem.eql(u8, left.doc_value_coverage, right.doc_value_coverage) and
+        std.mem.eql(u8, left.provenance, right.provenance) and
+        std.mem.eql(u8, left.missing_null_policy, right.missing_null_policy) and
+        std.mem.eql(u8, left.queryability_state, right.queryability_state) and
+        optionalStringsEqual(left.analyzer, right.analyzer) and
+        indexSortMembershipEqual(left.index_sort, right.index_sort);
+}
+
+fn optionalStringsEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+fn indexSortMembershipEqual(left: ?storage_schema.IndexSortMembership, right: ?storage_schema.IndexSortMembership) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return left.?.position == right.?.position and left.?.desc == right.?.desc;
+}
 
 pub const HostedProvisionedTableReadSource = struct {
     replica_root_dir: []const u8,
@@ -4032,7 +4185,7 @@ fn queryProvisionedAcrossGroupsParallel(
     const shard_results = try alloc.alloc(db_mod.types.SearchResult, group_ids.len);
     defer alloc.free(shard_results);
     for (slots, 0..) |slot, i| shard_results[i] = slot.result.?;
-    const merged = try query_api.mergeSearchResults(alloc, req, shard_results, req.offset, req.limit);
+    const merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results, req.offset, req.limit);
     recordParallelFanout(.query, @intCast(platform_time.monotonicNs() - start_ns));
     return merged;
 }
@@ -4105,7 +4258,7 @@ fn queryHostedAcrossGroupsParallel(
     const shard_results = try alloc.alloc(db_mod.types.SearchResult, group_ids.len);
     defer alloc.free(shard_results);
     for (slots, 0..) |slot, i| shard_results[i] = slot.result.?;
-    const merged = try query_api.mergeSearchResults(alloc, req, shard_results, req.offset, req.limit);
+    const merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results, req.offset, req.limit);
     recordParallelFanout(.query, @intCast(platform_time.monotonicNs() - start_ns));
     return merged;
 }
@@ -4114,6 +4267,36 @@ fn distributedSearchShardLimit(req: db_mod.types.SearchRequest) u32 {
     if (req.search_after.len > 0 or req.search_before.len > 0) return req.limit;
     const shard_limit = req.limit +| req.offset;
     return if (shard_limit == 0) req.limit else shard_limit;
+}
+
+fn queryMergeRuntimeSchemaAlloc(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+) !?storage_schema.TableSchema {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+    const schema_json = if (table.read_schema_json.len > 0) table.read_schema_json else table.schema_json;
+    if (schema_json.len == 0) return null;
+
+    var parsed = try tables_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    return try tables_api.deriveRuntimeTableSchema(alloc, parsed);
+}
+
+fn mergeSearchResultsWithTableRuntimeSchema(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    req: db_mod.types.SearchRequest,
+    shard_results: []const db_mod.types.SearchResult,
+    offset: u32,
+    limit: u32,
+) !db_mod.types.SearchResult {
+    const runtime_schema = try queryMergeRuntimeSchemaAlloc(alloc, catalog, table_name);
+    defer if (runtime_schema) |schema| storage_schema.freeSchema(alloc, schema);
+    return try query_api.mergeSearchResultsWithRuntimeSchema(alloc, req, shard_results, offset, limit, runtime_schema);
 }
 
 fn cloneRuntimePreflightSummary(
@@ -4503,7 +4686,7 @@ fn queryProvisionedAcrossGroups(
         shard_results[i] = try queryHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, shard_req, consistency);
         initialized += 1;
     }
-    return try query_api.mergeSearchResults(alloc, req, shard_results[0..initialized], req.offset, req.limit);
+    return try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results[0..initialized], req.offset, req.limit);
 }
 
 fn queryHostedAcrossGroups(
@@ -4550,7 +4733,7 @@ fn queryHostedAcrossGroups(
         };
         initialized += 1;
     }
-    return try query_api.mergeSearchResults(alloc, req, shard_results[0..initialized], req.offset, req.limit);
+    return try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results[0..initialized], req.offset, req.limit);
 }
 
 fn provisionedGraphWorker(self: *ProvisionedTableReadSource) distributed_graph.Worker {

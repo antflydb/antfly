@@ -3076,6 +3076,49 @@ export interface components {
              */
             replication_sources?: components["schemas"]["ReplicationSource"][];
         };
+        /** @description Runtime field capability exposed for planning, sortable field discovery, and operator diagnostics. */
+        FieldCapability: {
+            /** @description Mapping or dynamic-template name, when applicable. */
+            name?: string;
+            /** @description Concrete query field path when known. Pattern-only dynamic templates may omit this. */
+            field?: string;
+            /** @description Dynamic-template path_match pattern, when applicable. */
+            path_pattern?: string;
+            /** @description Dynamic-template match pattern, when applicable. */
+            field_pattern?: string;
+            /** @description Dynamic-template match_mapping_type, when applicable. */
+            match_mapping_type?: string;
+            /** @description Physical emitted field name for schema-derived text fields, when different from the logical path. */
+            emitted_name?: string;
+            /** @description Document schema that produced this capability, when applicable. */
+            document_schema?: string;
+            type: components["schemas"]["AntflyType"];
+            searchable: boolean;
+            filterable: boolean;
+            aggregatable: boolean;
+            doc_values: boolean;
+            sortable: boolean;
+            /** @description Coverage state for native doc values, such as identity_metadata, schema_declared, observed_declared, or not_declared. */
+            doc_value_coverage: string;
+            /** @description Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic. */
+            provenance: string;
+            /** @description Current missing/null handling policy for this field. */
+            missing_null_policy: string;
+            /** @description Whether the field is currently usable by public query planning. */
+            queryability_state: string;
+            /** @description Analyzer name for text/searchable fields, when applicable. */
+            analyzer?: string;
+            /**
+             * Format: int64
+             * @description Zero-based position in the table index_sort tuple when this field participates.
+             */
+            index_sort_position?: number;
+            /**
+             * @description Sort direction in the table index_sort tuple when this field participates.
+             * @enum {string}
+             */
+            index_sort_order?: "asc" | "desc";
+        };
         /** @enum {string} */
         AntflyType: "search_as_you_type" | "keyword" | "text" | "html" | "numeric" | "datetime" | "boolean" | "link" | "geopoint" | "geoshape" | "embedding" | "blob";
         Table: {
@@ -3096,6 +3139,13 @@ export interface components {
             migration?: components["schemas"]["TableMigration"];
             /** @description PostgreSQL CDC replication sources configured for this table. */
             replication_sources?: components["schemas"]["ReplicationSource"][];
+            /**
+             * @description Effective runtime field capabilities for this table. Clients can use this to discover
+             *     concrete searchable, filterable, aggregatable, and sortable fields. Public exact
+             *     field sort is supported only for `_id` or scalar fields marked sortable with native
+             *     doc-value coverage and queryable state.
+             */
+            field_capabilities?: components["schemas"]["FieldCapability"][];
         };
         /** @description Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema. */
         TableMigration: {
@@ -5487,6 +5537,68 @@ export interface components {
             reranker?: components["schemas"]["RerankerProfile"];
             /** @description Result merge statistics (present for hybrid search). */
             merge?: components["schemas"]["MergeProfile"];
+            /** @description Sort execution statistics (present when the query used order_by and profiling was enabled). */
+            sort?: components["schemas"]["SortProfile"];
+        };
+        /**
+         * @description Sort execution profile. The fields below are the stable public
+         *     diagnostic surface; profiling responses may include additional
+         *     implementation counters.
+         */
+        SortProfile: {
+            /** @description Stable physical sort plan name. */
+            plan?: string;
+            /** @description Requested order fields, including the implicit _id tie-breaker when applicable. */
+            order_by?: components["schemas"]["SortField"][];
+            /** @description Cursor mode for this request. */
+            cursor?: string;
+            /** @description Exactness class for the selected plan. */
+            exactness?: string;
+            /** @description Candidate source used by the selected plan. */
+            source?: string;
+            /** @description Cursor support level for the selected plan. */
+            cursor_support?: string;
+            /** @description Stored source load strategy. */
+            source_load?: string;
+            /** @description Distributed sort behavior. */
+            distributed_behavior?: string;
+            /** @description Whether exact execution required native typed sort values. */
+            require_native?: boolean;
+            /**
+             * Format: int64
+             * @description Candidate documents considered by sort execution.
+             */
+            candidate_count?: number;
+            /**
+             * Format: int64
+             * @description Candidates rejected by cursor comparison.
+             */
+            cursor_rejected_count?: number;
+            /**
+             * Format: int64
+             * @description Hits selected for the returned page.
+             */
+            selected_count?: number;
+            /**
+             * Format: int64
+             * @description Total sort execution time in microseconds.
+             */
+            total_us?: number;
+            /**
+             * Format: int64
+             * @description Shards participating in distributed sort execution.
+             */
+            distributed_shard_count?: number;
+            /** @description Stable budget rejection reason. */
+            budget_rejection_reason?: string;
+            /** @description Stable exact-sort rejection reason. */
+            sort_rejection_reason?: string;
+            /** @description Stable rejection detail. */
+            sort_rejection_detail?: string;
+            /** @description Sort field associated with the rejection when safe to expose. */
+            sort_rejection_field?: string;
+        } & {
+            [key: string]: unknown;
         };
         /** @description Shard-level execution statistics. */
         ShardsProfile: {

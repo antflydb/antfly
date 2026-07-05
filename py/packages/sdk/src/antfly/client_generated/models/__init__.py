@@ -204,6 +204,8 @@ from .extraction_token import ExtractionToken
 from .failed_operation import FailedOperation
 from .failed_operation_operation import FailedOperationOperation
 from .fetch_config import FetchConfig
+from .field_capability import FieldCapability
+from .field_capability_index_sort_order import FieldCapabilityIndexSortOrder
 from .field_statistics import FieldStatistics
 from .filter_spec import FilterSpec
 from .filter_spec_operator import FilterSpecOperator
@@ -518,6 +520,7 @@ from .shard_config import ShardConfig
 from .shards_profile import ShardsProfile
 from .significance_algorithm import SignificanceAlgorithm
 from .sort_field import SortField
+from .sort_profile import SortProfile
 from .sse_error import SSEError
 from .sse_event import SSEEvent
 from .sse_step_completed import SSEStepCompleted
@@ -802,6 +805,8 @@ __all__ = (
     "FailedOperation",
     "FailedOperationOperation",
     "FetchConfig",
+    "FieldCapability",
+    "FieldCapabilityIndexSortOrder",
     "FieldStatistics",
     "FilterSpec",
     "FilterSpecOperator",
@@ -1116,6 +1121,7 @@ __all__ = (
     "ShardsProfile",
     "SignificanceAlgorithm",
     "SortField",
+    "SortProfile",
     "SSEError",
     "SSEEvent",
     "SSEStepCompleted",

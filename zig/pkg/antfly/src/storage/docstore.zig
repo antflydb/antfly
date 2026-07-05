@@ -1566,6 +1566,7 @@ pub const DocStore = struct {
     pub const ScanOptions = struct {
         /// Return true to skip this key (callback not invoked).
         skip_fn: ?*const fn (key: []const u8) bool = null,
+        reverse: bool = false,
     };
 
     pub const ScanAction = enum { @"continue", stop };
@@ -1611,32 +1612,52 @@ pub const DocStore = struct {
 
         var cur = try txn.openCursor();
         defer cur.close();
-        cur.setUpperBound(if (upper.len > 0) upper else null);
+        if (!options.reverse) {
+            cur.setUpperBound(if (upper.len > 0) upper else null);
 
-        // Seek to first key >= lower (use .first when lower is empty)
-        const first = if (lower.len == 0)
-            (try cur.first()) orelse return
-        else
-            (try cur.seekAtOrAfter(lower)) orelse return;
+            // Seek to first key >= lower (use .first when lower is empty)
+            const first = if (lower.len == 0)
+                (try cur.first()) orelse return
+            else
+                (try cur.seekAtOrAfter(lower)) orelse return;
 
-        // Check upper bound
-        if (upper.len > 0 and std.mem.order(u8, first.key, upper) != .lt) return;
+            // Check upper bound
+            if (upper.len > 0 and std.mem.order(u8, first.key, upper) != .lt) return;
 
-        // Process first entry
-        if (options.skip_fn == null or !options.skip_fn.?(first.key)) {
-            const action = try callback(ctx, first.key, first.value);
-            if (action == .stop) return;
+            // Process first entry
+            if (options.skip_fn == null or !options.skip_fn.?(first.key)) {
+                const action = try callback(ctx, first.key, first.value);
+                if (action == .stop) return;
+            }
+
+            // Iterate remaining
+            var entry = try cur.next();
+            while (entry) |kv| : (entry = try cur.next()) {
+                if (upper.len > 0 and std.mem.order(u8, kv.key, upper) != .lt) break;
+                if (options.skip_fn) |skip| {
+                    if (skip(kv.key)) continue;
+                }
+                const action = try callback(ctx, kv.key, kv.value);
+                if (action == .stop) return;
+            }
+            return;
         }
 
-        // Iterate remaining
-        var entry = try cur.next();
-        while (entry) |kv| : (entry = try cur.next()) {
-            if (upper.len > 0 and std.mem.order(u8, kv.key, upper) != .lt) break;
-            if (options.skip_fn) |skip| {
-                if (skip(kv.key)) continue;
+        var entry = if (upper.len == 0)
+            try cur.last()
+        else
+            try cur.seekAtOrBefore(upper);
+        while (entry) |kv| {
+            if (upper.len > 0 and std.mem.order(u8, kv.key, upper) != .lt) {
+                entry = try cur.prev();
+                continue;
             }
-            const action = try callback(ctx, kv.key, kv.value);
-            if (action == .stop) return;
+            if (lower.len > 0 and std.mem.order(u8, kv.key, lower) == .lt) break;
+            if (options.skip_fn == null or !options.skip_fn.?(kv.key)) {
+                const action = try callback(ctx, kv.key, kv.value);
+                if (action == .stop) return;
+            }
+            entry = try cur.prev();
         }
     }
 
@@ -2220,6 +2241,38 @@ test "docstore streaming scan visits all keys" {
     try store.scan("b", "d", .{}, &Context.cb);
     try std.testing.expectEqual(@as(usize, 2), Context.count);
     try std.testing.expectEqual(@as(u8, 'c'), Context.last_key[0]);
+}
+
+test "docstore streaming scan supports reverse bounded ranges" {
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+
+    var store = try DocStore.open(std.testing.allocator, path, .{});
+    defer store.close();
+
+    try store.put("a", "1");
+    try store.put("b", "2");
+    try store.put("c", "3");
+    try store.put("d", "4");
+
+    const Context = struct {
+        var keys: [3]u8 = undefined;
+        var count: usize = 0;
+
+        fn cb(key: []const u8, _: []const u8) anyerror!DocStore.ScanAction {
+            keys[count] = key[0];
+            count += 1;
+            return .@"continue";
+        }
+    };
+    Context.count = 0;
+
+    try store.scan("a", "d", .{ .reverse = true }, &Context.cb);
+    try std.testing.expectEqual(@as(usize, 3), Context.count);
+    try std.testing.expectEqual(@as(u8, 'c'), Context.keys[0]);
+    try std.testing.expectEqual(@as(u8, 'b'), Context.keys[1]);
+    try std.testing.expectEqual(@as(u8, 'a'), Context.keys[2]);
 }
 
 test "docstore streaming scan skip_fn" {

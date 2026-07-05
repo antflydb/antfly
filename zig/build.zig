@@ -1675,6 +1675,13 @@ pub fn build(b: *std.Build) void {
     });
     antfly_imports.configure(b, lib_test_mod, true, true);
 
+    const introducer_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/introducer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, introducer_test_mod, true, true);
+
     const data_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/data_runtime_test_root.zig"),
         .target = target,
@@ -2838,6 +2845,18 @@ pub fn build(b: *std.Build) void {
     const root_test_step = b.step("root-test", "Run fast root-module compile smoke tests");
     root_test_step.dependOn(&run_lib_unit_tests.step);
 
+    const introducer_tests = b.addTest(.{
+        .root_module = introducer_test_mod,
+        .filters = selectTestFilters(b, &.{}),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_introducer_tests = b.addRunArtifact(introducer_tests);
+    const introducer_test_step = b.step("introducer-test", "Run segment introducer unit tests");
+    introducer_test_step.dependOn(&run_introducer_tests.step);
+
     const lite_native_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lite_native_test.zig"),
         .target = target,
@@ -3250,13 +3269,42 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db search ",
             "storage.db.db.test.db document _edges",
             "storage.db.db.test.db document _embeddings",
+            "sort execution plan dimension names are stable for profiles",
+            "sort cursor contract classifies arity separately from type",
+            "json sort values reject non-finite floats at API boundaries",
+            "score sort source detection rejects non-scoring text queries",
+            "score sort rejects hits without finite scores",
+            "match_all rejects score sort without score-bearing source",
+            "match_all candidate sort rejects direct score sort execution",
+            "distributed sorted hit merge uses typed sort tuple ordering and cursors",
+            "distributed merge uses runtime schema for typed date cursors",
+            "vector score top k sort profile uses common sort vocabulary",
+            "native sort planner classifies mapping and cursor rejection reasons",
+            "text score query exposes score top k sort profile",
             "native text sort planner requires live segment index sort coverage for sorted executor",
             "native text sort planner ignores fully deleted legacy segments for index sort coverage",
             "match_all sorted segment seek merges sorted segments and applies cursors",
             "match_all sorted segment seek uses cursor seek within each segment",
+            "match_all sorted segment seek ignores unavailable segment bounds",
+            "text field sort uses sorted segment membership path when index sort matches",
+            "native numeric sort rejects non-finite doc values",
+            "document mapper emits schema keyword typed doc values",
+            "document mapper omits multi-valued schema keyword typed doc values",
+            "document mapper omits multi-valued schema numeric typed doc values",
+            "document mapper preserves integer numeric doc values as i64",
+            "document mapper preserves unsigned numeric doc values beyond i64 as u64",
+            "document mapper omits mixed numeric typed doc value domains",
+            "document mapper omits non-finite numeric doc values",
             "document mapper flushes schema index_sort segments in physical sort order",
+            "document mapper rejects mixed native value types for index_sort field",
             "document mapper validates schema index_sort field capabilities",
             "merge preserves common sorted segment index_sort metadata",
+            "sort planner rejects non-finite numeric index sort bounds",
+            "schema keyword doc values back native sort planner",
+            "schema link doc values back native sort planner",
+            "schema numeric u64 doc values back native sort planner without rounding",
+            "schema numeric i64 doc values back native sort planner",
+            "schema boolean doc values back native sort planner",
         },
     });
     const run_lib_db_query_tests = b.addRunArtifact(lib_db_query_tests);
@@ -3700,8 +3748,19 @@ pub fn build(b: *std.Build) void {
             "distributed graph edge reader carries identity generation",
             "query merge preserves common identity read generation",
             "query merge applies distributed typed sort ordering and cursor paging",
+            "query merge applies runtime schema to distributed date cursors",
             "query merge rejects sorted shards without complete sort tuples",
+            "query merge rejects sorted shards whose id tiebreaker mismatches hit id",
+            "query merge rejects sorted shards with mixed sort value domains",
+            "query merge rejects score ordered hits without finite scores",
+            "query merge orders non score bearing hits by id without requiring scores",
             "query encoder does not expose internal doc ordinals",
+            "api query contract serializes sort profile diagnostics",
+            "api query contract serializes ordered hit sort tuple",
+            "api query contract rejects ordered hits without complete sort tuple",
+            "api query contract rejects ordered hits with non replayable sort tuple",
+            "api query contract rejects non replayable search_after cursor values",
+            "api query contract rejects non replayable search_before cursor values",
             "graph edge local read rejects stale identity generation",
             "catalog doc identity readiness checks table range health",
             "catalog resolved filter validation accepts preserved split identity domains",
@@ -3814,12 +3873,15 @@ pub fn build(b: *std.Build) void {
             "text native constraints fall back for mixed ordinal sidecar coverage",
             "text native constraints fail closed when resolved ordinals cannot be projected",
             "text native constraints treat resolved all-doc exclusion as empty candidates",
+            "sort cursor contract classifies arity separately from type",
             "segment doc ordinal sidecar roundtrip and merge preserve live order",
             "segment index sort metadata roundtrip",
             "segment merge drops index sort metadata until physical sort is preserved",
             "segment sorted merge preserves index sort and remaps doc addressed sections",
+            "segment sorted merge rejects non-finite f64 index sort values",
             "match_all sorted segment seek merges sorted segments and applies cursors",
             "match_all sorted segment seek uses cursor seek within each segment",
+            "match_all sorted segment seek ignores unavailable segment bounds",
             "document mapper flushes schema index_sort segments in physical sort order",
             "document mapper validates schema index_sort field capabilities",
             "merge preserves common sorted segment index_sort metadata",
@@ -3939,6 +4001,8 @@ pub fn build(b: *std.Build) void {
             "public table batch handler maps HA write gate errors",
             "public table query handler maps doc identity unavailable errors",
             "public table query handler maps HA read gate errors",
+            "public table query handler maps unsupported exact sort",
+            "public table query handler surfaces exact sort rejection diagnostics",
             "public table query view handler maps doc identity unavailable errors",
             "public table backup handler accepts portable format",
             "public table query view handler maps HA read gate errors",
@@ -4446,6 +4510,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lite_native_tests.step);
     unit_test_step.dependOn(&run_lite_cli_tests.step);
     unit_test_step.dependOn(&run_lib_db_tests.step);
+    unit_test_step.dependOn(&run_introducer_tests.step);
     unit_test_step.dependOn(&run_lib_db_text_query_tests.step);
     unit_test_step.dependOn(&run_lib_db_result_shape_tests.step);
     unit_test_step.dependOn(&run_serverless_tests.step);

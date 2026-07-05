@@ -44,6 +44,7 @@ const schema_mod = @import("../../schema.zig");
 const ttl_mod = @import("../../ttl.zig");
 const lmdb = @import("../../lmdb.zig");
 const mapper = @import("../document_mapper.zig");
+const typed_dv = @import("../../../section/typed_doc_values.zig");
 const merger_mod = @import("../../../merger.zig");
 const index_mod = @import("../../../index.zig");
 const text_index_maintenance = @import("text_index_maintenance.zig");
@@ -809,6 +810,17 @@ pub const IndexManager = struct {
         rebuild_root_path: []u8,
         persistent: persistent_mod.PersistentIndex,
         compaction_pending: bool = false,
+    };
+
+    pub const ObservedDynamicFieldCapabilitySet = struct {
+        index_name: []u8,
+        field_capabilities: []schema_mod.FieldCapability,
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            alloc.free(self.index_name);
+            schema_mod.freeOwnedFieldCapabilities(alloc, self.field_capabilities);
+            self.* = undefined;
+        }
     };
 
     pub const AlgebraicIndex = struct {
@@ -3768,6 +3780,128 @@ pub const IndexManager = struct {
 
         if (self.text_indexes.items.len == 1) return &self.text_indexes.items[0];
         return null;
+    }
+
+    pub fn observedDynamicFieldCapabilitiesAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        name: ?[]const u8,
+    ) ![]schema_mod.FieldCapability {
+        const entry = self.textIndexEntry(name) orelse return &.{};
+        if (entry.observed_field_analyzers.len == 0) return &.{};
+
+        const capabilities = try alloc.alloc(schema_mod.FieldCapability, entry.observed_field_analyzers.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (capabilities[0..initialized]) |item| schema_mod.freeOwnedFieldCapability(alloc, item);
+            alloc.free(capabilities);
+        }
+        for (entry.observed_field_analyzers, 0..) |item, i| {
+            var capability = schema_mod.observedDynamicFieldCapability(entry.runtime_schema, item.field_name, item.mapping());
+            if (try observedDynamicFieldHasCompleteTypedDocValueCoverage(alloc, entry, item.field_name, item.mapping())) {
+                capability.doc_value_coverage = "covered";
+                capability.queryability_state = "queryable";
+            }
+            capabilities[i] = try schema_mod.cloneFieldCapabilityAlloc(
+                alloc,
+                capability,
+            );
+            initialized += 1;
+        }
+        return capabilities;
+    }
+
+    fn observedDynamicFieldHasCompleteTypedDocValueCoverage(
+        alloc: Allocator,
+        entry: *TextIndex,
+        field: []const u8,
+        mapping: schema_mod.FieldMapping,
+    ) !bool {
+        if (!schema_mod.mappingIsSortable(mapping)) return false;
+        const snapshot = entry.persistent.snapshot();
+        if (snapshot.global_doc_count == 0) return false;
+
+        var covered_live_segment = false;
+        for (snapshot.segments) |*segment| {
+            if (segment.liveDocCount() == 0) continue;
+            covered_live_segment = true;
+            const section_data = segment.reader.getSection(field, .typed_doc_values) orelse return false;
+            const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch return false;
+            if (!typedDocValueReaderMatchesMapping(reader.value_type, mapping)) return false;
+            for (0..segment.reader.doc_count) |local_usize| {
+                const local_doc: u32 = @intCast(local_usize);
+                if (segment.shared.deleted) |deleted| {
+                    if (deleted.contains(local_doc)) continue;
+                }
+                const has_value = typedDocValueReaderHasDocValue(reader, local_doc) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return false,
+                };
+                if (!has_value) return false;
+            }
+        }
+        return covered_live_segment;
+    }
+
+    fn typedDocValueReaderMatchesMapping(value_type: typed_dv.ValueType, mapping: schema_mod.FieldMapping) bool {
+        return switch (mapping.field_type) {
+            .datetime => value_type == .u64_val,
+            .numeric => switch (value_type) {
+                .u64_val, .i64_val, .f64_val => true,
+                else => false,
+            },
+            .boolean => value_type == .bool_val,
+            .keyword, .link => value_type == .bytes_val,
+            else => false,
+        };
+    }
+
+    fn typedDocValueReaderHasDocValue(reader: typed_dv.TypedDocValuesReader, doc_id: u32) !bool {
+        return switch (reader.value_type) {
+            .u64_val => (try reader.getU64(doc_id)) != null,
+            .i64_val => (try reader.getI64(doc_id)) != null,
+            .f64_val => (try reader.getF64(doc_id)) != null,
+            .bool_val => (try reader.getBool(doc_id)) != null,
+            .bytes_val => blk: {
+                const value = try reader.getBytesAlloc(doc_id) orelse break :blk false;
+                defer reader.alloc.free(value);
+                break :blk true;
+            },
+            .geo_point => false,
+        };
+    }
+
+    pub fn observedDynamicFieldCapabilitySetsAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+    ) ![]ObservedDynamicFieldCapabilitySet {
+        var set_count: usize = 0;
+        for (self.text_indexes.items) |entry| {
+            if (entry.observed_field_analyzers.len > 0) set_count += 1;
+        }
+        if (set_count == 0) return &.{};
+
+        const sets = try alloc.alloc(ObservedDynamicFieldCapabilitySet, set_count);
+        var initialized: usize = 0;
+        errdefer {
+            for (sets[0..initialized]) |*set| set.deinit(alloc);
+            alloc.free(sets);
+        }
+
+        for (self.text_indexes.items) |*entry| {
+            if (entry.observed_field_analyzers.len == 0) continue;
+            sets[initialized] = blk: {
+                const index_name = try alloc.dupe(u8, entry.config.name);
+                errdefer alloc.free(index_name);
+                const field_capabilities = try self.observedDynamicFieldCapabilitiesAlloc(alloc, entry.config.name);
+                break :blk .{
+                    .index_name = index_name,
+                    .field_capabilities = field_capabilities,
+                };
+            };
+            initialized += 1;
+        }
+        return sets;
     }
 
     pub fn fullTextLexicalAccessPath(self: *IndexManager, name: ?[]const u8, field: []const u8, analyzer: []const u8) ?algebraic_mod.ir.PhysicalAccessPath {
@@ -12616,10 +12750,16 @@ fn mergeObservedTextFieldAnalyzers(
     }
 
     for (observed) |item| {
-        if (containsObservedFieldAnalyzer(entry.observed_field_analyzers, item.field_name, item.analyzer_name)) continue;
+        if (containsObservedFieldAnalyzer(entry.observed_field_analyzers, item)) continue;
         try additions.append(self.alloc, .{
             .field_name = try self.alloc.dupe(u8, item.field_name),
             .analyzer_name = try self.alloc.dupe(u8, item.analyzer_name),
+            .field_type = item.field_type,
+            .do_index = item.do_index,
+            .store = item.store,
+            .doc_values = item.doc_values,
+            .sortable = item.sortable,
+            .include_in_all = item.include_in_all,
         });
     }
     if (additions.items.len == 0) return;
@@ -12630,6 +12770,12 @@ fn mergeObservedTextFieldAnalyzers(
         expanded[original_len + i] = .{
             .field_name = try self.alloc.dupe(u8, item.field_name),
             .analyzer_name = try self.alloc.dupe(u8, item.analyzer_name),
+            .field_type = item.field_type,
+            .do_index = item.do_index,
+            .store = item.store,
+            .doc_values = item.doc_values,
+            .sortable = item.sortable,
+            .include_in_all = item.include_in_all,
         };
     }
     entry.observed_field_analyzers = expanded;
@@ -12641,13 +12787,22 @@ fn mergeObservedTextFieldAnalyzers(
 
 fn containsObservedFieldAnalyzer(
     observed: []const mapper.ObservedFieldAnalyzer,
-    field_name: []const u8,
-    analyzer_name: []const u8,
+    needle: mapper.ObservedFieldAnalyzer,
 ) bool {
     for (observed) |item| {
-        if (std.mem.eql(u8, item.field_name, field_name) and std.mem.eql(u8, item.analyzer_name, analyzer_name)) return true;
+        if (std.mem.eql(u8, item.field_name, needle.field_name) and observedFieldAnalyzerMappingEquals(item, needle)) return true;
     }
     return false;
+}
+
+fn observedFieldAnalyzerMappingEquals(left: mapper.ObservedFieldAnalyzer, right: mapper.ObservedFieldAnalyzer) bool {
+    return left.field_type == right.field_type and
+        left.do_index == right.do_index and
+        left.store == right.store and
+        left.doc_values == right.doc_values and
+        left.sortable == right.sortable and
+        left.include_in_all == right.include_in_all and
+        std.mem.eql(u8, left.analyzer_name, right.analyzer_name);
 }
 
 fn appendUniqueProjectionPath(alloc: Allocator, items: *std.ArrayListUnmanaged([]const u8), path: []const u8) !void {
@@ -13702,11 +13857,17 @@ fn serializeObservedTextFieldAnalyzers(alloc: Allocator, observed: []const mappe
     errdefer out.deinit(alloc);
 
     try out.appendSlice(alloc, "ATFA");
-    try appendU32(&out, alloc, 1);
+    try appendU32(&out, alloc, 2);
     try appendU32(&out, alloc, @intCast(observed.len));
     for (observed) |item| {
         try appendStr(&out, alloc, item.field_name);
         try appendStr(&out, alloc, item.analyzer_name);
+        try out.append(alloc, @intFromEnum(item.field_type));
+        try out.append(alloc, if (item.do_index) 1 else 0);
+        try out.append(alloc, if (item.store) 1 else 0);
+        try out.append(alloc, if (item.doc_values) 1 else 0);
+        try out.append(alloc, if (item.sortable) 1 else 0);
+        try out.append(alloc, if (item.include_in_all) 1 else 0);
     }
 
     const owned = try alloc.dupe(u8, out.items);
@@ -13719,7 +13880,7 @@ fn deserializeObservedTextFieldAnalyzers(alloc: Allocator, data: []const u8) ![]
 
     var pos: usize = 4;
     const version = try readU32(data, &pos);
-    if (version != 1) return error.UnsupportedIndexCatalogVersion;
+    if (version != 1 and version != 2) return error.UnsupportedIndexCatalogVersion;
 
     const count = try readU32(data, &pos);
     const observed = try alloc.alloc(mapper.ObservedFieldAnalyzer, count);
@@ -13733,9 +13894,53 @@ fn deserializeObservedTextFieldAnalyzers(alloc: Allocator, data: []const u8) ![]
     }
 
     for (0..count) |i| {
-        observed[i] = .{
-            .field_name = try alloc.dupe(u8, try readStr(data, &pos)),
-            .analyzer_name = try alloc.dupe(u8, try readStr(data, &pos)),
+        observed[i] = blk: {
+            const field_name = try alloc.dupe(u8, try readStr(data, &pos));
+            errdefer alloc.free(field_name);
+            const analyzer_name = try alloc.dupe(u8, try readStr(data, &pos));
+            errdefer alloc.free(analyzer_name);
+            const mapping = if (version >= 2) mapping_blk: {
+                if (pos + 6 > data.len) return error.InvalidIndexCatalog;
+                const field_type: schema_mod.AntflyType = @enumFromInt(data[pos]);
+                pos += 1;
+                const do_index = data[pos] != 0;
+                pos += 1;
+                const store = data[pos] != 0;
+                pos += 1;
+                const doc_values = data[pos] != 0;
+                pos += 1;
+                const sortable = data[pos] != 0;
+                pos += 1;
+                const include_in_all = data[pos] != 0;
+                pos += 1;
+                break :mapping_blk schema_mod.FieldMapping{
+                    .field_type = field_type,
+                    .do_index = do_index,
+                    .store = store,
+                    .doc_values = doc_values,
+                    .sortable = sortable,
+                    .include_in_all = include_in_all,
+                    .analyzer = analyzer_name,
+                };
+            } else schema_mod.FieldMapping{
+                .field_type = if (std.mem.eql(u8, analyzer_name, "keyword")) .keyword else .text,
+                .do_index = true,
+                .store = false,
+                .doc_values = false,
+                .sortable = false,
+                .include_in_all = false,
+                .analyzer = analyzer_name,
+            };
+            break :blk .{
+                .field_name = field_name,
+                .analyzer_name = analyzer_name,
+                .field_type = mapping.field_type,
+                .do_index = mapping.do_index,
+                .store = mapping.store,
+                .doc_values = mapping.doc_values,
+                .sortable = mapping.sortable,
+                .include_in_all = mapping.include_in_all,
+            };
         };
         initialized += 1;
     }
@@ -15865,6 +16070,20 @@ test "observed full text analyzers publish shared dictionary ownership" {
     const entry = manager.textIndexEntry("ft_v1").?;
     try mergeObservedTextFieldAnalyzers(&manager, &store, entry, observed[0..]);
 
+    const capabilities = try manager.observedDynamicFieldCapabilitiesAlloc(alloc, "ft_v1");
+    defer schema_mod.freeOwnedFieldCapabilities(alloc, capabilities);
+    try std.testing.expectEqual(@as(usize, 1), capabilities.len);
+    try std.testing.expectEqualStrings("meta.body", capabilities[0].field.?);
+    try std.testing.expectEqual(schema_mod.AntflyType.text, capabilities[0].field_type);
+    try std.testing.expect(capabilities[0].searchable);
+    try std.testing.expect(!capabilities[0].filterable);
+    try std.testing.expect(!capabilities[0].aggregatable);
+    try std.testing.expect(!capabilities[0].doc_values);
+    try std.testing.expect(!capabilities[0].sortable);
+    try std.testing.expectEqualStrings("not_declared", capabilities[0].doc_value_coverage);
+    try std.testing.expectEqualStrings("observed_dynamic", capabilities[0].provenance);
+    try std.testing.expectEqualStrings("non_scalar", capabilities[0].queryability_state);
+
     const identity = algebraic_mod.lexical.DictionaryIdentity.analyzedText("ft_v1", "meta.body", "french");
     const registry_key = try identity.registryKeyAlloc(alloc);
     defer alloc.free(registry_key);
@@ -15890,6 +16109,222 @@ test "observed full text analyzers publish shared dictionary ownership" {
         algebraic_mod.lexical.RegistryClaim.owned_by_other,
         try algebraic_mod.lexical.claimRegistryOwnerTxn(alloc, &txn, identity, "algebraic:path-promotion", .lexicon_postings_rows, "ready"),
     );
+}
+
+test "observed dynamic sortable field capability reports covered queryable state" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    try manager.addAllNoBackfill(&store, &.{
+        .{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        },
+    });
+    const entry = manager.textIndexEntry("ft_v1").?;
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .f64_val = 10.0 });
+    try dv_writer.add(1, .{ .f64_val = 20.0 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const price_idx = try seg_writer.addField("price");
+    try seg_writer.addSection(price_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"price\":10}");
+    try seg_writer.addStoredDoc("doc:b", "{\"price\":20}");
+    const segment = try seg_writer.build();
+    defer alloc.free(segment);
+    try entry.persistent.indexSegment(segment);
+
+    const observed_field = try alloc.dupe(u8, "price");
+    defer alloc.free(observed_field);
+    const observed_analyzer = try alloc.dupe(u8, "keyword");
+    defer alloc.free(observed_analyzer);
+    const observed = [_]mapper.ObservedFieldAnalyzer{.{
+        .field_name = observed_field,
+        .analyzer_name = observed_analyzer,
+        .field_type = .numeric,
+        .doc_values = true,
+        .sortable = true,
+    }};
+    try mergeObservedTextFieldAnalyzers(&manager, &store, entry, observed[0..]);
+
+    const capabilities = try manager.observedDynamicFieldCapabilitiesAlloc(alloc, "ft_v1");
+    defer schema_mod.freeOwnedFieldCapabilities(alloc, capabilities);
+    try std.testing.expectEqual(@as(usize, 1), capabilities.len);
+    try std.testing.expectEqualStrings("price", capabilities[0].field.?);
+    try std.testing.expectEqual(schema_mod.AntflyType.numeric, capabilities[0].field_type);
+    try std.testing.expect(capabilities[0].doc_values);
+    try std.testing.expect(capabilities[0].sortable);
+    try std.testing.expectEqualStrings("covered", capabilities[0].doc_value_coverage);
+    try std.testing.expectEqualStrings("queryable", capabilities[0].queryability_state);
+}
+
+test "observed dynamic sortable field capability stays declared for sparse doc values" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    try manager.addAllNoBackfill(&store, &.{
+        .{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        },
+    });
+    const entry = manager.textIndexEntry("ft_v1").?;
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .f64_val = 10.0 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const price_idx = try seg_writer.addField("price");
+    try seg_writer.addSection(price_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"price\":10}");
+    try seg_writer.addStoredDoc("doc:b", "{\"price\":20}");
+    const segment = try seg_writer.build();
+    defer alloc.free(segment);
+    try entry.persistent.indexSegment(segment);
+
+    const observed_field = try alloc.dupe(u8, "price");
+    defer alloc.free(observed_field);
+    const observed_analyzer = try alloc.dupe(u8, "keyword");
+    defer alloc.free(observed_analyzer);
+    const observed = [_]mapper.ObservedFieldAnalyzer{.{
+        .field_name = observed_field,
+        .analyzer_name = observed_analyzer,
+        .field_type = .numeric,
+        .doc_values = true,
+        .sortable = true,
+    }};
+    try mergeObservedTextFieldAnalyzers(&manager, &store, entry, observed[0..]);
+
+    const capabilities = try manager.observedDynamicFieldCapabilitiesAlloc(alloc, "ft_v1");
+    defer schema_mod.freeOwnedFieldCapabilities(alloc, capabilities);
+    try std.testing.expectEqual(@as(usize, 1), capabilities.len);
+    try std.testing.expectEqualStrings("observed_declared", capabilities[0].doc_value_coverage);
+    try std.testing.expectEqualStrings("declared", capabilities[0].queryability_state);
+}
+
+test "observed full text analyzer metadata persists mapping decisions" {
+    const alloc = std.testing.allocator;
+
+    const observed = [_]mapper.ObservedFieldAnalyzer{
+        .{
+            .field_name = @constCast("meta.status"),
+            .analyzer_name = @constCast("keyword"),
+            .field_type = .keyword,
+            .do_index = true,
+            .store = true,
+            .doc_values = true,
+            .sortable = true,
+            .include_in_all = false,
+        },
+        .{
+            .field_name = @constCast("meta.body"),
+            .analyzer_name = @constCast("english"),
+            .field_type = .text,
+            .do_index = true,
+            .store = false,
+            .doc_values = false,
+            .sortable = false,
+            .include_in_all = true,
+        },
+    };
+
+    const encoded = try serializeObservedTextFieldAnalyzers(alloc, observed[0..]);
+    defer alloc.free(encoded);
+    const decoded = try deserializeObservedTextFieldAnalyzers(alloc, encoded);
+    defer freeObservedTextFieldAnalyzers(alloc, decoded);
+
+    try std.testing.expectEqual(@as(usize, 2), decoded.len);
+    try std.testing.expectEqualStrings("meta.status", decoded[0].field_name);
+    try std.testing.expectEqualStrings("keyword", decoded[0].analyzer_name);
+    try std.testing.expectEqual(schema_mod.AntflyType.keyword, decoded[0].field_type);
+    try std.testing.expect(decoded[0].do_index);
+    try std.testing.expect(decoded[0].store);
+    try std.testing.expect(decoded[0].doc_values);
+    try std.testing.expect(decoded[0].sortable);
+    try std.testing.expect(!decoded[0].include_in_all);
+
+    try std.testing.expectEqualStrings("meta.body", decoded[1].field_name);
+    try std.testing.expectEqualStrings("english", decoded[1].analyzer_name);
+    try std.testing.expectEqual(schema_mod.AntflyType.text, decoded[1].field_type);
+    try std.testing.expect(decoded[1].do_index);
+    try std.testing.expect(!decoded[1].store);
+    try std.testing.expect(!decoded[1].doc_values);
+    try std.testing.expect(!decoded[1].sortable);
+    try std.testing.expect(decoded[1].include_in_all);
+}
+
+test "observed full text analyzer metadata reads legacy analyzer-only format" {
+    const alloc = std.testing.allocator;
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+
+    try encoded.appendSlice(alloc, "ATFA");
+    try appendU32(&encoded, alloc, 1);
+    try appendU32(&encoded, alloc, 2);
+    try appendStr(&encoded, alloc, "meta.keyword");
+    try appendStr(&encoded, alloc, "keyword");
+    try appendStr(&encoded, alloc, "meta.body");
+    try appendStr(&encoded, alloc, "standard");
+
+    const decoded = try deserializeObservedTextFieldAnalyzers(alloc, encoded.items);
+    defer freeObservedTextFieldAnalyzers(alloc, decoded);
+
+    try std.testing.expectEqual(@as(usize, 2), decoded.len);
+    try std.testing.expectEqualStrings("meta.keyword", decoded[0].field_name);
+    try std.testing.expectEqualStrings("keyword", decoded[0].analyzer_name);
+    try std.testing.expectEqual(schema_mod.AntflyType.keyword, decoded[0].field_type);
+    try std.testing.expect(decoded[0].do_index);
+    try std.testing.expect(!decoded[0].store);
+    try std.testing.expect(!decoded[0].doc_values);
+    try std.testing.expect(!decoded[0].sortable);
+    try std.testing.expect(!decoded[0].include_in_all);
+
+    try std.testing.expectEqualStrings("meta.body", decoded[1].field_name);
+    try std.testing.expectEqualStrings("standard", decoded[1].analyzer_name);
+    try std.testing.expectEqual(schema_mod.AntflyType.text, decoded[1].field_type);
+    try std.testing.expect(decoded[1].do_index);
+    try std.testing.expect(!decoded[1].store);
+    try std.testing.expect(!decoded[1].doc_values);
+    try std.testing.expect(!decoded[1].sortable);
+    try std.testing.expect(!decoded[1].include_in_all);
 }
 
 test "dense bulk-ingest uses recursive bulk build for large empty index batch" {

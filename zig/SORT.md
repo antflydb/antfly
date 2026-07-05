@@ -110,6 +110,34 @@ require an unbounded stored-document scan, the request should fail with a clear
 422. Approximate execution should be a separate opt-in feature, not an
 implementation detail behind exact `order_by`.
 
+### Canonical Search Pipeline
+
+The long-term engine should route every search through the same planner
+pipeline instead of using separate ad hoc paths for match-all, full-text,
+semantic, and filter-only queries:
+
+1. Normalize the request into a logical query, filter set, requested order,
+   cursor, limit, and response projection.
+2. Resolve field references through runtime mappings, including dynamic
+   mappings that have been durably promoted.
+3. Normalize `order_by` by appending `_id asc` when needed.
+4. Validate cursor arity and typed cursor values against the effective order.
+5. Build native candidate sources: postings, doc sets, primary-key scans,
+   vector candidate iterators, or graph results.
+6. Choose exactly one sort executor: score top-k, `_id` seek, sorted segment
+   seek, doc-values top-N, distributed k-way merge, or unsupported.
+7. Execute without reading stored `_source` until after the page has been
+   selected, unless `_source` is itself the requested payload.
+8. Return hits with stable `_sort` tuples and profile metadata describing the
+   selected plan.
+
+This makes the public API behavior consistent even when different physical
+sources are involved. A full-text query with `order_by: created_at`, a
+filter-only query with the same order, and a match-all query with the same
+order should all validate against the same mapping and cursor rules. They may
+choose different candidate sources, but they should share the same comparator,
+doc-value access, `_id` tie-breaker, and coordinator merge logic.
+
 ### Elasticsearch And Lucene Alignment
 
 Antfly should follow Elasticsearch's public model and Lucene's physical lessons
@@ -131,6 +159,19 @@ Antfly should not copy Elasticsearch internals blindly. The important contract
 is that users can reason about mappings and sorted pagination the same way:
 field sort is exact when the field is mapped as sortable/doc-valued, and
 `search_after` is stable because `_sort` contains the full typed tuple.
+
+Elasticsearch does not make users declare a second "sort index" for ordinary
+field sorting. It uses mappings and doc values. Antfly should do the same:
+`keyword`, numeric, date, boolean, and `_id` mappings define the fields that can
+participate in exact filters, aggregations, and sort. A separate Antfly-only
+sort registry would create drift between schema, OpenAPI, SDKs, docs, and
+runtime behavior.
+
+Lucene's sorted segment model should be treated as an optimization layered on
+top of those mapped doc values. Index sorting is useful because it changes the
+physical document order of a segment, which allows early termination and cursor
+seek for the one configured dominant order. It does not replace doc values and
+it does not solve arbitrary user sort orders.
 
 ### Native Sortable Index Path
 
@@ -155,6 +196,12 @@ tie-breaker for all explicit field sorts.
 For non-`_id` fields, the minimal production path is doc values plus a top-N
 collector. The higher-performance path is an `index_sort` configuration that
 physically orders segments and allows sorted seek plus early termination.
+
+The native path should be observable as a capability, not inferred from a lucky
+payload shape. A field is sortable only when the runtime mapping says it is
+sortable and every relevant live segment can prove doc-value coverage for that
+field. This lets operators understand whether a query failed because of schema,
+segment coverage, mixed-version rollout, or an unsupported physical plan.
 
 ### Production Query Planning Contract
 
@@ -262,6 +309,13 @@ Antfly should be explicit about the requested ordering:
 - no `order_by` on full-text or vector search means relevance/score order
 - `order_by` on scalar fields means field order with `_id` tie-break
 - `_score` in `order_by` means score participates in the tuple
+- `_score` sort requires every candidate hit to carry a finite score from a
+  score-bearing executor; missing, `NaN`, and infinite scores are not coerced
+  into sortable values
+- match-all and filter-only plans must not manufacture constant scores to
+  satisfy `_score` ordering
+- text `match_all`, doc-id/range/geo/boolean filter shapes, and bool queries
+  with no positive scoring child are not score-bearing sources for `_score`
 - field order after approximate vector top-k is approximate unless the eligible
   candidate set is exact
 
@@ -286,6 +340,32 @@ fallback. It should not be required for production filter correctness.
 For search performance, filters and sort cannot be designed independently. A
 good field-sort plan often needs a filter doc set, and a good filter plan often
 needs sort selectivity information. The planner should consider both.
+
+### Native Candidate Sets
+
+Native candidate sets are the bridge between query matching and sort execution.
+They should represent exact document eligibility without requiring stored JSON
+loads:
+
+- full-text candidates come from inverted postings and analyzer-aware query
+  lowering
+- structured candidates come from doc values, bitsets, range metadata, or
+  exact postings
+- `_id` candidates come from identity metadata and primary-key order
+- vector candidates come from vector-native iterators with explicit exact or
+  approximate semantics
+- graph candidates come from graph traversal outputs with explicit bounds
+
+The sort executor should consume these candidates through a common abstraction:
+document identity, document ordinal, optional score, and optional segment-local
+membership bitmap. This is what allows the planner to choose between
+candidate-first doc-values top-N and sorted-order scan with membership testing.
+
+For broad queries whose requested order matches `index_sort`, scanning sorted
+segments and testing membership is usually better than collecting and sorting a
+large candidate set. For highly selective queries, iterating the candidate doc
+set and using a doc-values collector is usually better. Both paths must produce
+the same visible order and cursor tuples.
 
 ## Mapping Model
 
@@ -471,6 +551,32 @@ Dynamic mappings need a durable promotion path:
 This prevents a field from becoming sortable just because the newest document
 looks scalar. Sortability is a physical guarantee, not a payload observation.
 
+### Sortable Field Lifecycle
+
+A field should move through explicit lifecycle states before public sorted
+queries can rely on it:
+
+1. `declared`: schema or dynamic-template metadata says the field is intended
+   to be scalar, doc-valued, and sortable.
+2. `indexed`: new writes are producing typed doc values for the field.
+3. `covered`: every live segment relevant to the index generation has complete
+   doc-value coverage or an explicit typed missing/null marker.
+4. `queryable`: the planner capability matrix can prove exact sort/filter use
+   for the field.
+5. `accelerated`: optional `index_sort` or range metadata can make common
+   plans cheaper, but the field is already correct through doc values.
+
+Only `queryable` fields should be accepted by public `order_by`. Earlier states
+are useful for rollout, backfill, and diagnostics, but they are not enough for
+an exact public sort contract.
+
+This lifecycle is also the right shape for operations. A rollout can declare a
+field, start writing doc values for new segments, backfill or compact old
+segments, and only then expose the field as sortable in the generated docs.
+The public `www-antfly` documentation, OpenAPI examples, SDK validation, and
+runtime planner should all derive from the same effective mapping/capability
+view rather than from hand-maintained release notes.
+
 ## Doc Values
 
 Doc values are the first native primitive Antfly needs for production sorting.
@@ -494,14 +600,19 @@ The exact key layout can differ, but the semantics should be:
 Doc-value encodings must be stable and type-aware:
 
 - integers use sortable signed integer encoding
+- unsigned numeric values use exact unsigned integer comparison and must not be
+  coerced through floating point
 - floats use sortable IEEE encoding with a defined NaN policy
-- dates normalize to epoch nanoseconds or milliseconds before encoding
+- dates normalize to epoch nanoseconds before encoding and compare as unsigned
+  integers
 - keywords use normalized UTF-8 bytes plus length delimiters
 - booleans use false < true
 - missing/null values use explicit sentinels
 
 The result hit should expose the original JSON-compatible sort value, not the
-internal byte encoding.
+internal byte encoding. In particular, date/datetime doc values may be stored
+as unsigned epoch nanoseconds, but `_sort` should expose a date-time string
+that can be fed back unchanged as `search_after` or `search_before`.
 
 ### Native Sortable Field Path
 
@@ -632,11 +743,19 @@ reindexing because existing segments have durable physical order.
 An index-sort path is available when:
 
 - every requested sort field is mapped and sortable
-- requested sort is a prefix of the configured `index_sort`, or exactly matches
-  it after implicit `_id` normalization
+- the effective requested sort tuple, including Antfly's implicit `_id`
+  tiebreaker, is a leading prefix of the configured `index_sort`
 - cursor tuple can be encoded into the same comparator domain
 - query source can test document eligibility in sorted order
 - the result does not require a conflicting primary order such as ANN score
+
+This prefix rule is intentionally defined over the effective tuple rather than
+only the fields explicitly supplied by the client. For example, a request for
+`created_at desc` can use `index_sort=[created_at desc, _id asc]`, because the
+effective request is `[created_at desc, _id asc]`. It cannot use
+`index_sort=[created_at desc, category asc, _id asc]`, because the physical
+order includes `category` before `_id`; scanning that layout would not be sorted
+by `[created_at desc, _id asc]` for documents with equal `created_at`.
 
 When those conditions hold, sorted segment seek should be the preferred plan for
 broad match-all/filter queries with small pages.
@@ -705,6 +824,28 @@ estimates. A fixed "always collect candidates then sort" rule will not scale for
 broad queries, while a fixed "always scan sort order" rule will not scale for
 highly selective filters.
 
+### Planner Decision Matrix
+
+The long-term planner should make the following decisions explicitly:
+
+| Query shape | Requested order | Preferred exact plan | Fallback exact plan |
+| --- | --- | --- | --- |
+| match-all | `_id asc` | primary-key seek | doc-values top-N |
+| match-all | matches `index_sort` | sorted segment seek | doc-values top-N |
+| match-all | arbitrary sortable field | doc-values top-N | reject on budget/coverage |
+| selective structured filter | arbitrary sortable field | filter doc set + doc-values top-N | reject on budget/coverage |
+| broad structured filter | matches `index_sort` | sorted segment seek + filter membership | doc-values top-N |
+| full-text, no `order_by` | relevance | score top-k | reject on scorer failure |
+| full-text + field sort | field tuple | doc-values top-N or sorted segment seek + text membership | reject on budget/coverage |
+| vector ANN, no `order_by` | vector score | vector top-k | reject on vector failure |
+| vector ANN + field sort | field tuple | unsupported unless eligible set is exact | approximate only through explicit future API |
+| distributed field sort | field tuple | shard-local exact plan + coordinator k-way merge | reject on unsupported shard |
+
+The table is intentionally conservative. Exact `order_by` should never mean
+"sort whatever candidates an approximate source happened to return." When the
+eligible set is approximate, field sorting is approximate too and needs a
+separate API contract.
+
 ## Sort Tuple And Cursor Semantics
 
 The public cursor value is the typed sort tuple:
@@ -728,7 +869,16 @@ Rules:
   sort order.
 - Cursor arity must match the effective `order_by`, including the appended
   `_id`.
+- Public cursor values must be replayable JSON scalars: string, integer,
+  finite float/number, or boolean. `null`, arrays, objects, and non-finite
+  numbers are rejected at the API boundary because they cannot form stable
+  cursor tokens.
 - Cursor value types must match mapped field types after coercion.
+- Cursor positions for `_id` must be strings and must match the `_id` value in
+  returned hit `_sort` tuples.
+- Date/datetime cursors accept returned date-time strings or exact
+  non-negative epoch nanoseconds; internal unsigned nanosecond values must not
+  be rounded through `float`.
 - `_id` must always be present as the final deterministic tie-breaker unless
   the user already supplied it.
 
@@ -831,12 +981,31 @@ When `order_by` is present:
 - Otherwise, the planner collects text matches into a top-N field-sort
   collector.
 
+The sorted segment path for full-text requires a segment-local text membership
+structure. The planner should lower the text query into exact postings/doc-set
+membership first, then scan documents in physical sort order and test whether
+each local document id is a member. This avoids two bad outcomes:
+
+- collecting every full-text hit into memory before sorting a broad query
+- overfetching a score-ordered text page and pretending it is globally sorted by
+  a field
+
+The doc-values top-N path remains the right general fallback. It is better for
+selective text queries and for field orders that do not match `index_sort`.
+Both paths must share the same typed sort tuple, cursor comparison, and `_id`
+tie-breaker.
+
 Text queries must not return a partial field sort. If exact sort would exceed
 budget and no native plan can prove exactness, return 422.
 
 Score sorting should remain separate:
 
 - `_score` is produced by the text/vector engine.
+- `_score` sort fails closed if any candidate lacks a finite score.
+- match-all and filter-only executors reject `_score` ordering unless they are
+  explicitly wrapped by a real score-bearing query source.
+- text planning accepts `_score` only for lexical/scoring query shapes, not for
+  filter-shaped text queries that happen to run through the text executor.
 - `_score, _id` sort is a scorer/top-k problem.
 - field sort is a doc-values/sorted-segment problem.
 
@@ -865,6 +1034,17 @@ eligible set for an exact field sort. A native filter can reduce the vector
 candidate universe efficiently; it does not by itself prove that the first ANN
 page contains the globally earliest or latest documents under an unrelated
 field order.
+
+The future production shape for vector-plus-field-order should be one of:
+
+- score order over vector results, with optional native filters pushed into the
+  vector index
+- exact vector scoring over a proven bounded eligible set, followed by the
+  requested exact field order if that is the documented semantics
+- an explicitly approximate API that says it overfetches vector hits and reranks
+  or sorts that approximate candidate set
+
+The current exact `order_by` contract should use only the first two shapes.
 
 ### Hybrid And Composed Queries
 
@@ -971,6 +1151,71 @@ set, match-all identity iteration, or another exact source. The plan name should
 stay focused on the sorting primitive because that is what operators need to
 see in profiles and alerts.
 
+### Cost Model
+
+The planner should choose between exact physical plans with a small,
+explainable cost model rather than fixed request-shape rules. Inputs should
+come from segment metadata and runtime mappings:
+
+- live document count and delete ratio
+- candidate estimate for postings, filters, vector sources, or match-all
+- field doc-value coverage and expected load cost
+- `index_sort` compatibility and segment min/max tuple bounds
+- cursor position, when it can be estimated from bounds
+- requested `limit`, `offset`, and distributed shard window
+- source projection cost
+
+The first production implementation can use conservative heuristics, but the
+decision should still be explicit and observable. For example:
+
+- choose `sorted_segment_seek` when the requested order matches `index_sort`,
+  the query can test membership in sorted order, and the expected scan to fill
+  the page is smaller than collecting candidates
+- choose `native_doc_values_top_n` when the candidate set is selective or the
+  requested order does not match physical segment order
+- choose `_id` primary-key seek for match-all `_id asc` pagination
+- reject exact sort when the only available path is unbounded stored source
+  extraction or an approximate candidate source
+
+The cost model must never trade correctness for speed. It may choose a slower
+exact plan over a faster approximate one for the exact `order_by` API. If a
+query needs approximate behavior, that should be exposed through a separate
+contract with different naming and profile metadata.
+
+### Production Budgets And Rejection Reasons
+
+Exact sorted search needs bounded failure modes. A request should be rejected
+before doing unbounded work when the planner cannot prove an exact native path
+within configured budgets.
+
+Recommended budget dimensions:
+
+- maximum candidate ordinals visited for bounded-exact fallback paths
+- maximum source documents parsed on test/debug stored-sort paths
+- maximum doc-value misses before treating coverage as broken
+- maximum coordinator shard windows for distributed sorted merge
+- maximum cursor seek/scanned-document ratio for sorted-segment paths
+- per-query deadline budget shared across candidate generation, sort, and
+  source projection
+
+Rejections should use stable machine-readable reasons, such as:
+
+- `unmapped_sort_field`
+- `non_sortable_sort_field`
+- `missing_doc_values_coverage`
+- `invalid_cursor_arity`
+- `invalid_cursor_type`
+- `approximate_candidate_source`
+- `candidate_budget_exceeded`
+- `stored_json_sort_disabled`
+- `distributed_merge_unsupported`
+
+Those reason strings should appear in API errors, logs, metrics, and
+`profile.sort.budget_rejection_reason` where a profile can be returned. They
+are part of the operations contract: an on-call should be able to tell whether
+the fix is schema, backfill/compaction, query shape, budget tuning, or a missing
+executor.
+
 ## API Contract
 
 The API should keep the current user-facing shape:
@@ -1015,6 +1260,64 @@ Response:
 
 The `_sort` array should be present when `order_by` is present.
 
+## Documentation, OpenAPI, And SDK Contract
+
+Supported sort behavior should be generated from effective Antfly mappings and
+capabilities, not copied into each release by hand.
+
+The durable source of truth is:
+
+1. declared schema and dynamic-template configuration
+2. persisted observed dynamic mapping metadata
+3. segment capability coverage for doc values and optional `index_sort`
+4. planner support for the requested physical plan
+
+Public documentation should expose two related views:
+
+- schema-time support: which field types and mapping options make a field
+  sortable in principle
+- runtime support: which configured fields are currently queryable in a
+  deployed index generation
+
+`www-antfly`, OpenAPI examples, and generated SDK docs should describe the
+schema-time rules: sort on `_id` or mapped scalar fields with doc values; do not
+sort on analyzed `text`; use `.keyword` multi-fields for exact string sorting;
+pass returned `_sort` tuples to `search_after` / `search_before`; expect 422
+when exact native execution is unavailable.
+
+Runtime introspection should expose the per-index field capability matrix so
+operators and clients can discover concrete configured fields. That endpoint or
+manifest should include:
+
+- field path
+- field type
+- `searchable`, `filterable`, `aggregatable`, and `sortable`
+- doc-value coverage state
+- dynamic/static provenance
+- missing/null policy
+- whether the field participates in `index_sort`
+- current queryability state from the sortable field lifecycle
+
+The OpenAPI contract should keep `order_by.field` as a string because legal
+fields are index-specific and can be dynamic. SDKs can add optional helper
+types generated from an index manifest, but the base client should still accept
+strings and surface server validation errors. This avoids baking one tenant's
+schema into the global API while still letting managed workflows generate
+strongly typed helpers for known production indexes.
+
+Release tooling should validate that docs and generated clients describe the
+same behavior as the engine:
+
+- schema examples compile into runtime mappings with expected capabilities
+- documented cursor examples round-trip through the parser
+- public examples do not use unsupported `text` sorting
+- generated SDK models include `_sort`, `search_after`, and `search_before`
+- release manifests list supported field types and index-sort limitations
+
+This is the long-term replacement for release-by-release migration notes. A
+tagged release should publish engine code, mapping capability metadata, OpenAPI,
+SDKs, and docs from the same configuration snapshot.
+
 ## Production Observability
 
 Sorted search needs first-class telemetry because correctness failures often
@@ -1036,6 +1339,23 @@ Every sorted query profile should include:
 - final sort/merge latency
 - distributed shard window size, when applicable
 - budget rejection reason, when rejected
+
+The request profile should expose these under `profile.sort` so they are
+available through the normal API response, not only logs. The stable public
+fields should stay compact and operationally meaningful: `plan`, `order_by`,
+`cursor`, `exactness`, `source`, `cursor_support`, `source_load`,
+`distributed_behavior`, `require_native`, candidate/selected/cursor-rejected
+counts, distributed shard count, total sort time, and bounded rejection fields
+such as `budget_rejection_reason`, `sort_rejection_reason`,
+`sort_rejection_detail`, and `sort_rejection_field`.
+
+Lower-level executor counters such as doc-value load timings, stored-source
+load counts, collector heap peaks, index-sort availability flags, and
+implementation-specific window counters are still useful diagnostics, but they
+should be treated as additive profile properties rather than a frozen SDK
+contract. Logs and traces can carry the richer internal detail; OpenAPI and the
+base SDKs should stabilize only the fields that operators can rely on across
+executor rewrites.
 
 The stable plan names should be suitable for logs, traces, metrics, and tests.
 The current implementation should expose at least `none`, `id_only`, `id_seek`,

@@ -36,6 +36,7 @@ from conftest import (
     find_free_port,
     lookup_key_path,
     maybe_preserve_tempdir,
+    raise_if_server_process_exited,
     raise_request_error_with_logs,
     resolve_binary_path,
     wait_for_server,
@@ -145,6 +146,7 @@ class AuthApi:
         deadline = time.monotonic() + 5.0
         with self._request_lock:
             while True:
+                raise_if_server_process_exited(self._server)
                 try:
                     response = self.s.get(self._url_for(path), timeout=30)
                     break
@@ -156,6 +158,7 @@ class AuthApi:
 
     def post(self, path: str, payload: dict):
         with self._request_lock:
+            raise_if_server_process_exited(self._server)
             try:
                 response = self.s.post(self._url_for(path), json=payload, timeout=30)
             except requests.RequestException as err:
@@ -164,6 +167,7 @@ class AuthApi:
 
     def put(self, path: str, payload: dict):
         with self._request_lock:
+            raise_if_server_process_exited(self._server)
             try:
                 response = self.s.put(self._url_for(path), json=payload, timeout=30)
             except requests.RequestException as err:
@@ -172,6 +176,7 @@ class AuthApi:
 
     def delete(self, path: str):
         with self._request_lock:
+            raise_if_server_process_exited(self._server)
             try:
                 response = self.s.delete(self._url_for(path), timeout=30)
             except requests.RequestException as err:
@@ -182,6 +187,7 @@ class AuthApi:
         body = payload or {"num_shards": 1}
         deadline = time.monotonic() + AUTH_SETUP_RETRY_TIMEOUT_SECONDS
         while True:
+            raise_if_server_process_exited(self._server)
             try:
                 with self._request_lock:
                     response = self.s.post(f"{self.url}/tables/{table_name}", json=body, timeout=30)
@@ -203,6 +209,7 @@ class AuthApi:
         return self.get(lookup_key_path(table_name, key))
 
     def scan_keys(self, table_name: str, payload: dict) -> list[dict]:
+        raise_if_server_process_exited(self._server)
         response = self.s.post(f"{self.url}/tables/{table_name}/documents", json=payload, timeout=30)
         if response.status_code >= 400:
             self._check(response)

@@ -1735,6 +1735,22 @@ pub const ApiHttpServer = struct {
         return tables_api.lsmStorageStatusFromStats(stats);
     }
 
+    fn bestEffortObservedDynamicFieldCapabilitySets(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+    ) ![]table_reads.ObservedDynamicFieldCapabilitySet {
+        const source = self.table_reads orelse return &.{};
+        return (try source.observedDynamicFieldCapabilitySets(self.alloc, table_name)) orelse &.{};
+    }
+
+    fn freeObservedDynamicFieldCapabilitySets(
+        self: *ApiHttpServer,
+        sets: []table_reads.ObservedDynamicFieldCapabilitySet,
+    ) void {
+        for (sets) |*set| set.deinit(self.alloc);
+        if (sets.len > 0) self.alloc.free(sets);
+    }
+
     pub fn bestEffortSingleTableStorageStatuses(
         self: *ApiHttpServer,
         table_name: []const u8,
@@ -3904,7 +3920,13 @@ pub const ApiHttpServer = struct {
                     ) catch return try textResponse(self.alloc, 500, "index lookup failed")) orelse return try textResponse(self.alloc, 404, "not found");
                     var value = parseOwnedJsonValueAlloc(arena, body) catch return try textResponse(self.alloc, 500, "index lookup failed");
                     if (value != .object) return try textResponse(self.alloc, 500, "index lookup failed");
-                    try value.object.put(arena, try arena.dupe(u8, "debug"), try tables_api.buildTableIndexRuntimeSchemaDebugValue(arena, table, index_name));
+                    const observed_dynamic_capability_sets = try self.bestEffortObservedDynamicFieldCapabilitySets(table_name);
+                    defer self.freeObservedDynamicFieldCapabilitySets(observed_dynamic_capability_sets);
+                    try value.object.put(
+                        arena,
+                        try arena.dupe(u8, "debug"),
+                        try tables_api.buildTableIndexRuntimeSchemaDebugValueWithObserved(arena, table, index_name, observed_dynamic_capability_sets),
+                    );
                     return try jsonResponse(self.alloc, value);
                 }
                 return try self.handlePublicTableGetIndex(table_name, index_name);
@@ -4259,6 +4281,11 @@ pub const ApiHttpServer = struct {
                 var storage_status_buf: [1]tables_api.TableStorageStatus = undefined;
                 const storage_statuses = try self.bestEffortSingleTableStorageStatuses(table_name, &storage_status_buf);
                 if (runtimeSchemaDebugRequested(uri_parts.query)) {
+                    const observed_dynamic_capability_sets = try self.bestEffortObservedDynamicFieldCapabilitySets(table_name);
+                    defer self.freeObservedDynamicFieldCapabilitySets(observed_dynamic_capability_sets);
+                    if (storage_statuses != null) {
+                        storage_status_buf[0].observed_dynamic_field_capability_sets = observed_dynamic_capability_sets;
+                    }
                     var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                     defer arena_impl.deinit();
                     const response =
@@ -5696,6 +5723,7 @@ pub const ApiHttpServer = struct {
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
             error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
             error.ModelNotFound => return error.ModelNotFound,
+            error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
@@ -5766,6 +5794,7 @@ pub const ApiHttpServer = struct {
                 row_filter_json,
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
+                error.UnsupportedExactSort => return error.UnsupportedExactSort,
                 error.TableNotFound => return error.TableNotFound,
                 error.ModelNotFound => return error.ModelNotFound,
                 error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
@@ -5786,6 +5815,7 @@ pub const ApiHttpServer = struct {
 
         if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
+            error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
@@ -5823,6 +5853,7 @@ pub const ApiHttpServer = struct {
             row_filter_json,
         ) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
+            error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.TableNotFound => return error.NotFound,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
@@ -6968,6 +6999,7 @@ pub const ApiHttpServer = struct {
         defer if (row_filter_json) |value| self.alloc.free(value);
 
         const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
+        db_mod.resetLastSortRejectionDiagnostic();
         const response_body = self.executePublicTableQueryDispatchWithReadinessRetry(
             self.alloc,
             source,
@@ -6977,8 +7009,9 @@ pub const ApiHttpServer = struct {
             authenticated_identity,
         ) catch |err| switch (err) {
             error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
-            error.UnsupportedQueryRequest => return try textResponse(self.alloc, 422, "unsupported query request"),
-            error.QueryCandidateBudgetExceeded => return try textResponse(self.alloc, 422, "query candidate budget exceeded"),
+            error.UnsupportedExactSort => return try unsupportedExactSortResponse(self.alloc),
+            error.UnsupportedQueryRequest => return try unsupportedPublicQueryResponse(self.alloc, body),
+            error.QueryCandidateBudgetExceeded => return try queryCandidateBudgetExceededResponse(self.alloc),
             error.Timeout => return try textResponse(self.alloc, 504, "query timed out"),
             error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
@@ -7031,6 +7064,7 @@ pub const ApiHttpServer = struct {
             defer if (row_filter_json) |value| self.alloc.free(value);
 
             const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
+            db_mod.resetLastSortRejectionDiagnostic();
             const response_body = self.executePublicTableQueryDispatchWithReadinessRetry(
                 self.alloc,
                 source,
@@ -7040,8 +7074,9 @@ pub const ApiHttpServer = struct {
                 authenticated_identity,
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
-                error.UnsupportedQueryRequest => return try textResponse(self.alloc, 422, "unsupported query request"),
-                error.QueryCandidateBudgetExceeded => return try textResponse(self.alloc, 422, "query candidate budget exceeded"),
+                error.UnsupportedExactSort => return try unsupportedExactSortResponse(self.alloc),
+                error.UnsupportedQueryRequest => return try unsupportedPublicQueryResponse(self.alloc, line),
+                error.QueryCandidateBudgetExceeded => return try queryCandidateBudgetExceededResponse(self.alloc),
                 error.Timeout => return try textResponse(self.alloc, 504, "query timed out"),
                 error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
                 error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
@@ -8617,6 +8652,48 @@ fn jsonResponse(alloc: std.mem.Allocator, value: anytype) !http_common.HttpRespo
     return try jsonResponseWithStatus(alloc, 200, value);
 }
 
+fn queryCandidateBudgetExceededResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
+    return try jsonResponseWithStatus(alloc, 422, .{
+        .status = 422,
+        .@"error" = "query_candidate_budget_exceeded",
+        .message = "query candidate budget exceeded",
+        .reason = "candidate_budget_exceeded",
+        .budget_rejection_reason = "candidate_budget_exceeded",
+    });
+}
+
+fn unsupportedPublicQueryResponse(alloc: std.mem.Allocator, body: []const u8) !http_common.HttpResponse {
+    if (queryBodyHasSortPageControls(alloc, body)) {
+        return try unsupportedExactSortResponse(alloc);
+    }
+    return try textResponse(alloc, 422, "unsupported query request");
+}
+
+fn unsupportedExactSortResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse db_mod.SortRejectionDiagnostic{};
+    return try jsonResponseWithStatus(alloc, 422, .{
+        .status = 422,
+        .@"error" = "unsupported_exact_sort",
+        .message = "exact sort is unsupported for this query",
+        .reason = diagnostic.reason,
+        .sort_rejection_reason = diagnostic.reason,
+        .sort_rejection_detail = diagnostic.detail,
+        .sort_rejection_field = diagnostic.field,
+    });
+}
+
+fn queryBodyHasSortPageControls(alloc: std.mem.Allocator, body: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return false;
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return false,
+    };
+    return object.get("order_by") != null or
+        object.get("search_after") != null or
+        object.get("search_before") != null;
+}
+
 fn writeMaybeAbsoluteUrl(writer: *std.Io.Writer, base_url: ?[]const u8, url: []const u8) !void {
     const base = base_url orelse return try std.json.Stringify.value(url, .{}, writer);
     if (base.len == 0 or !std.mem.startsWith(u8, url, "/")) return try std.json.Stringify.value(url, .{}, writer);
@@ -9969,6 +10046,103 @@ test "api http server serves status" {
     const request_stats = server.requestStats();
     try std.testing.expectEqual(@as(u64, 6), request_stats.request_count);
     try std.testing.expect(request_stats.first_request_started_at_ns >= server.created_at_ns);
+}
+
+test "api http query budget rejection response exposes stable sort reason" {
+    const alloc = std.testing.allocator;
+    var resp = try queryCandidateBudgetExceededResponse(alloc);
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        message: []const u8,
+        reason: []const u8,
+        budget_rejection_reason: []const u8,
+    }, alloc, resp.body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
+    try std.testing.expectEqualStrings("query_candidate_budget_exceeded", parsed.value.@"error");
+    try std.testing.expectEqualStrings("query candidate budget exceeded", parsed.value.message);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.reason);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.budget_rejection_reason);
+}
+
+test "api http unsupported sorted query response exposes stable sort reason" {
+    const alloc = std.testing.allocator;
+    db_mod.resetLastSortRejectionDiagnostic();
+    var resp = try unsupportedPublicQueryResponse(alloc, "{\"order_by\":[{\"field\":\"created_at\"}]}");
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        message: []const u8,
+        reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+    }, alloc, resp.body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
+    try std.testing.expectEqualStrings("exact sort is unsupported for this query", parsed.value.message);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.reason);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("", parsed.value.sort_rejection_field);
+}
+
+test "api http unsupported sorted query response surfaces exact sort diagnostics" {
+    const alloc = std.testing.allocator;
+    db_mod.testing.recordSortRejectionDiagnostic(
+        "created_at",
+        "missing_doc_values_coverage",
+        "missing_doc_values_section",
+    );
+    var resp = try unsupportedPublicQueryResponse(alloc, "{\"order_by\":[{\"field\":\"created_at\"}]}");
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        message: []const u8,
+        reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+    }, alloc, resp.body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
+    try std.testing.expectEqualStrings("exact sort is unsupported for this query", parsed.value.message);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", parsed.value.reason);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("missing_doc_values_section", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("created_at", parsed.value.sort_rejection_field);
+}
+
+test "api http unsupported unsorted query response remains generic" {
+    const alloc = std.testing.allocator;
+    db_mod.resetLastSortRejectionDiagnostic();
+    var resp = try unsupportedPublicQueryResponse(alloc, "{\"join\":{}}");
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expectEqualStrings("text/plain", resp.content_type.?);
+    try std.testing.expectEqualStrings("unsupported query request", resp.body);
 }
 
 test "api http server serves extension catalog reads" {

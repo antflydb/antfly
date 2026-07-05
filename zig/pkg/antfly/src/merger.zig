@@ -484,6 +484,18 @@ test "merge preserves common sorted segment index_sort metadata" {
     try std.testing.expectEqual(@as(usize, 2), fields.len);
     try std.testing.expectEqualStrings("price", fields[0].field);
     try std.testing.expectEqualStrings("_id", fields[1].field);
+
+    var bounds = (try reader.indexSortBoundsAlloc(alloc)) orelse return error.TestExpectedEqual;
+    defer bounds.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), bounds.first.len);
+    try std.testing.expect(bounds.first[0] == .u64_val);
+    try std.testing.expectEqual(@as(u64, 1), bounds.first[0].u64_val);
+    try std.testing.expect(bounds.first[1] == .id);
+    try std.testing.expectEqualStrings("doc:a", bounds.first[1].id);
+    try std.testing.expect(bounds.last[0] == .u64_val);
+    try std.testing.expectEqual(@as(u64, 3), bounds.last[0].u64_val);
+    try std.testing.expect(bounds.last[1] == .id);
+    try std.testing.expectEqualStrings("doc:c", bounds.last[1].id);
 }
 
 test "bounded merge splits output and preserves live documents" {

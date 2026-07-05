@@ -1801,6 +1801,46 @@ pub const RowFilterEntry = struct {
     filter: std.json.ArrayHashMap(std.json.Value),
 };
 
+/// Sort execution profile. The fields below are the stable public diagnostic surface; profiling responses may include additional implementation counters.
+pub const SortProfile = struct {
+    /// Stable physical sort plan name.
+    plan: ?[]const u8 = null,
+    /// Requested order fields, including the implicit _id tie-breaker when applicable.
+    order_by: ?[]const SortField = null,
+    /// Cursor mode for this request.
+    cursor: ?[]const u8 = null,
+    /// Exactness class for the selected plan.
+    exactness: ?[]const u8 = null,
+    /// Candidate source used by the selected plan.
+    source: ?[]const u8 = null,
+    /// Cursor support level for the selected plan.
+    cursor_support: ?[]const u8 = null,
+    /// Stored source load strategy.
+    source_load: ?[]const u8 = null,
+    /// Distributed sort behavior.
+    distributed_behavior: ?[]const u8 = null,
+    /// Whether exact execution required native typed sort values.
+    require_native: ?bool = null,
+    /// Candidate documents considered by sort execution.
+    candidate_count: ?i64 = null,
+    /// Candidates rejected by cursor comparison.
+    cursor_rejected_count: ?i64 = null,
+    /// Hits selected for the returned page.
+    selected_count: ?i64 = null,
+    /// Total sort execution time in microseconds.
+    total_us: ?i64 = null,
+    /// Shards participating in distributed sort execution.
+    distributed_shard_count: ?i64 = null,
+    /// Stable budget rejection reason.
+    budget_rejection_reason: ?[]const u8 = null,
+    /// Stable exact-sort rejection reason.
+    sort_rejection_reason: ?[]const u8 = null,
+    /// Stable rejection detail.
+    sort_rejection_detail: ?[]const u8 = null,
+    /// Sort field associated with the rejection when safe to expose.
+    sort_rejection_field: ?[]const u8 = null,
+};
+
 pub const InferenceConnection = struct {
     provider: InferenceProviderType,
     /// Resolved endpoint URL when applicable.
@@ -2008,6 +2048,44 @@ pub const LinearMergeRequest = struct {
     /// If true, returns what would be deleted without making changes. Use cases: - Validate sync behavior before committing - Check which records will be removed - Test key range boundaries Response includes deleted_ids array when dry_run=true.
     dry_run: ?bool = null,
     sync_level: ?SyncLevel = null,
+};
+
+/// Runtime field capability exposed for planning, sortable field discovery, and operator diagnostics.
+pub const FieldCapability = struct {
+    /// Mapping or dynamic-template name, when applicable.
+    name: ?[]const u8 = null,
+    /// Concrete query field path when known. Pattern-only dynamic templates may omit this.
+    field: ?[]const u8 = null,
+    /// Dynamic-template path_match pattern, when applicable.
+    path_pattern: ?[]const u8 = null,
+    /// Dynamic-template match pattern, when applicable.
+    field_pattern: ?[]const u8 = null,
+    /// Dynamic-template match_mapping_type, when applicable.
+    match_mapping_type: ?[]const u8 = null,
+    /// Physical emitted field name for schema-derived text fields, when different from the logical path.
+    emitted_name: ?[]const u8 = null,
+    /// Document schema that produced this capability, when applicable.
+    document_schema: ?[]const u8 = null,
+    type: AntflyType,
+    searchable: bool,
+    filterable: bool,
+    aggregatable: bool,
+    doc_values: bool,
+    sortable: bool,
+    /// Coverage state for native doc values, such as identity_metadata, schema_declared, observed_declared, or not_declared.
+    doc_value_coverage: []const u8,
+    /// Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
+    provenance: []const u8,
+    /// Current missing/null handling policy for this field.
+    missing_null_policy: []const u8,
+    /// Whether the field is currently usable by public query planning.
+    queryability_state: []const u8,
+    /// Analyzer name for text/searchable fields, when applicable.
+    analyzer: ?[]const u8 = null,
+    /// Zero-based position in the table index_sort tuple when this field participates.
+    index_sort_position: ?i64 = null,
+    /// Sort direction in the table index_sort tuple when this field participates.
+    index_sort_order: ?[]const u8 = null,
 };
 
 pub const AggregationRequest = struct {
@@ -2513,6 +2591,8 @@ pub const QueryProfile = struct {
     reranker: ?RerankerProfile = null,
     /// Result merge statistics (present for hybrid search).
     merge: ?MergeProfile = null,
+    /// Sort execution statistics (present when the query used order_by and profiling was enabled).
+    sort: ?SortProfile = null,
 };
 
 pub const ReplicationSource = struct {
@@ -2687,6 +2767,8 @@ pub const Table = struct {
     migration: ?TableMigration = null,
     /// PostgreSQL CDC replication sources configured for this table.
     replication_sources: ?[]const ReplicationSource = null,
+    /// Effective runtime field capabilities for this table. Clients can use this to discover concrete searchable, filterable, aggregatable, and sortable fields. Public exact field sort is supported only for `_id` or scalar fields marked sortable with native doc-value coverage and queryable state.
+    field_capabilities: ?[]const FieldCapability = null,
 };
 
 /// API key creation response including the cleartext secret (shown once).
@@ -2833,6 +2915,8 @@ pub const TableStatus = struct {
     migration: ?TableMigration = null,
     /// PostgreSQL CDC replication sources configured for this table.
     replication_sources: ?[]const ReplicationSource = null,
+    /// Effective runtime field capabilities for this table. Clients can use this to discover concrete searchable, filterable, aggregatable, and sortable fields. Public exact field sort is supported only for `_id` or scalar fields marked sortable with native doc-value coverage and queryable state.
+    field_capabilities: ?[]const FieldCapability = null,
     storage_status: StorageStatus,
     /// Table-level generated artifact enrichments registered outside a specific index.
     artifact_enrichments: ?[]const antfly_indexes_openapi.EnrichmentConfig = null,

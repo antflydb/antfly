@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from ..models.merge_profile import MergeProfile
     from ..models.reranker_profile import RerankerProfile
     from ..models.shards_profile import ShardsProfile
+    from ..models.sort_profile import SortProfile
 
 
 T = TypeVar("T", bound="QueryProfile")
@@ -28,12 +29,16 @@ class QueryProfile:
             join (JoinProfile | Unset): Join execution statistics.
             reranker (RerankerProfile | Unset): Reranking execution statistics.
             merge (MergeProfile | Unset): Result merge statistics for hybrid search.
+            sort (SortProfile | Unset): Sort execution profile. The fields below are the stable public
+                diagnostic surface; profiling responses may include additional
+                implementation counters.
     """
 
     shards: ShardsProfile | Unset = UNSET
     join: JoinProfile | Unset = UNSET
     reranker: RerankerProfile | Unset = UNSET
     merge: MergeProfile | Unset = UNSET
+    sort: SortProfile | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -53,6 +58,10 @@ class QueryProfile:
         if not isinstance(self.merge, Unset):
             merge = self.merge.to_dict()
 
+        sort: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.sort, Unset):
+            sort = self.sort.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -64,6 +73,8 @@ class QueryProfile:
             field_dict["reranker"] = reranker
         if merge is not UNSET:
             field_dict["merge"] = merge
+        if sort is not UNSET:
+            field_dict["sort"] = sort
 
         return field_dict
 
@@ -73,6 +84,7 @@ class QueryProfile:
         from ..models.merge_profile import MergeProfile
         from ..models.reranker_profile import RerankerProfile
         from ..models.shards_profile import ShardsProfile
+        from ..models.sort_profile import SortProfile
 
         d = dict(src_dict)
         _shards = d.pop("shards", UNSET)
@@ -103,11 +115,19 @@ class QueryProfile:
         else:
             merge = MergeProfile.from_dict(_merge)
 
+        _sort = d.pop("sort", UNSET)
+        sort: SortProfile | Unset
+        if isinstance(_sort, Unset):
+            sort = UNSET
+        else:
+            sort = SortProfile.from_dict(_sort)
+
         query_profile = cls(
             shards=shards,
             join=join,
             reranker=reranker,
             merge=merge,
+            sort=sort,
         )
 
         query_profile.additional_properties = d

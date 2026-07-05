@@ -2618,6 +2618,79 @@ components:
             Multiple sources can feed into a single table (e.g., `users` + `scores` → Antfly `users`).
             Each source uses `on_update`/`on_delete` transforms to control how PG events map to
             Antfly document operations. Requires `wal_level=logical` on the PostgreSQL source.
+    FieldCapability:
+      type: object
+      description: Runtime field capability exposed for planning, sortable field discovery, and operator diagnostics.
+      required:
+        - type
+        - searchable
+        - filterable
+        - aggregatable
+        - doc_values
+        - sortable
+        - doc_value_coverage
+        - provenance
+        - missing_null_policy
+        - queryability_state
+      properties:
+        name:
+          type: string
+          description: Mapping or dynamic-template name, when applicable.
+        field:
+          type: string
+          description: Concrete query field path when known. Pattern-only dynamic templates may omit this.
+        path_pattern:
+          type: string
+          description: Dynamic-template path_match pattern, when applicable.
+        field_pattern:
+          type: string
+          description: Dynamic-template match pattern, when applicable.
+        match_mapping_type:
+          type: string
+          description: Dynamic-template match_mapping_type, when applicable.
+        emitted_name:
+          type: string
+          description: Physical emitted field name for schema-derived text fields, when different from the logical path.
+        document_schema:
+          type: string
+          description: Document schema that produced this capability, when applicable.
+        type:
+          $ref: "#/components/schemas/AntflyType"
+        searchable:
+          type: boolean
+        filterable:
+          type: boolean
+        aggregatable:
+          type: boolean
+        doc_values:
+          type: boolean
+        sortable:
+          type: boolean
+        doc_value_coverage:
+          type: string
+          description: Coverage state for native doc values, such as identity_metadata, schema_declared, observed_declared, or not_declared.
+        provenance:
+          type: string
+          description: Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
+        missing_null_policy:
+          type: string
+          description: Current missing/null handling policy for this field.
+        queryability_state:
+          type: string
+          description: Whether the field is currently usable by public query planning.
+        analyzer:
+          type: string
+          description: Analyzer name for text/searchable fields, when applicable.
+        index_sort_position:
+          type: integer
+          format: int64
+          description: Zero-based position in the table index_sort tuple when this field participates.
+        index_sort_order:
+          type: string
+          enum:
+            - asc
+            - desc
+          description: Sort direction in the table index_sort tuple when this field participates.
     AntflyType:
       rules:
         no-unused-components: off
@@ -2656,6 +2729,15 @@ components:
             $ref: "#/components/schemas/ReplicationSource"
           description: |
             PostgreSQL CDC replication sources configured for this table.
+        field_capabilities:
+          type: array
+          description: |
+            Effective runtime field capabilities for this table. Clients can use this to discover
+            concrete searchable, filterable, aggregatable, and sortable fields. Public exact
+            field sort is supported only for `_id` or scalar fields marked sortable with native
+            doc-value coverage and queryable state.
+          items:
+            $ref: "#/components/schemas/FieldCapability"
     TableMigration:
       x-go-type-skip-optional-pointer: false
       type: object
@@ -5773,6 +5855,78 @@ components:
         merge:
           $ref: "#/components/schemas/MergeProfile"
           description: Result merge statistics (present for hybrid search).
+        sort:
+          $ref: "#/components/schemas/SortProfile"
+          description: Sort execution statistics (present when the query used order_by and profiling was enabled).
+    SortProfile:
+      type: object
+      additionalProperties: true
+      description: |
+        Sort execution profile. The fields below are the stable public
+        diagnostic surface; profiling responses may include additional
+        implementation counters.
+      properties:
+        plan:
+          type: string
+          description: Stable physical sort plan name.
+        order_by:
+          type: array
+          description: Requested order fields, including the implicit _id tie-breaker when applicable.
+          items:
+            $ref: "#/components/schemas/SortField"
+        cursor:
+          type: string
+          description: Cursor mode for this request.
+        exactness:
+          type: string
+          description: Exactness class for the selected plan.
+        source:
+          type: string
+          description: Candidate source used by the selected plan.
+        cursor_support:
+          type: string
+          description: Cursor support level for the selected plan.
+        source_load:
+          type: string
+          description: Stored source load strategy.
+        distributed_behavior:
+          type: string
+          description: Distributed sort behavior.
+        require_native:
+          type: boolean
+          description: Whether exact execution required native typed sort values.
+        candidate_count:
+          type: integer
+          format: int64
+          description: Candidate documents considered by sort execution.
+        cursor_rejected_count:
+          type: integer
+          format: int64
+          description: Candidates rejected by cursor comparison.
+        selected_count:
+          type: integer
+          format: int64
+          description: Hits selected for the returned page.
+        total_us:
+          type: integer
+          format: int64
+          description: Total sort execution time in microseconds.
+        distributed_shard_count:
+          type: integer
+          format: int64
+          description: Shards participating in distributed sort execution.
+        budget_rejection_reason:
+          type: string
+          description: Stable budget rejection reason.
+        sort_rejection_reason:
+          type: string
+          description: Stable exact-sort rejection reason.
+        sort_rejection_detail:
+          type: string
+          description: Stable rejection detail.
+        sort_rejection_field:
+          type: string
+          description: Sort field associated with the rejection when safe to expose.
     ShardsProfile:
       type: object
       description: Shard-level execution statistics.

@@ -3970,6 +3970,44 @@ pub const DB = struct {
         return self.core.index_manager.snapshotTextMemoryAttribution();
     }
 
+    pub fn observedDynamicFieldCapabilitiesAlloc(
+        self: *DB,
+        alloc: Allocator,
+        index_name: ?[]const u8,
+    ) ![]schema_mod.FieldCapability {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return try self.core.index_manager.observedDynamicFieldCapabilitiesAlloc(alloc, index_name);
+    }
+
+    pub fn tryObservedDynamicFieldCapabilitiesAlloc(
+        self: *DB,
+        alloc: Allocator,
+        index_name: ?[]const u8,
+    ) ?[]schema_mod.FieldCapability {
+        if (!self.core.tryLockApplyShared()) return null;
+        defer self.core.unlockApplyShared();
+        return self.core.index_manager.observedDynamicFieldCapabilitiesAlloc(alloc, index_name) catch null;
+    }
+
+    pub fn observedDynamicFieldCapabilitySetsAlloc(
+        self: *DB,
+        alloc: Allocator,
+    ) ![]index_manager_mod.IndexManager.ObservedDynamicFieldCapabilitySet {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return try self.core.index_manager.observedDynamicFieldCapabilitySetsAlloc(alloc);
+    }
+
+    pub fn tryObservedDynamicFieldCapabilitySetsAlloc(
+        self: *DB,
+        alloc: Allocator,
+    ) ?[]index_manager_mod.IndexManager.ObservedDynamicFieldCapabilitySet {
+        if (!self.core.tryLockApplyShared()) return null;
+        defer self.core.unlockApplyShared();
+        return self.core.index_manager.observedDynamicFieldCapabilitySetsAlloc(alloc) catch null;
+    }
+
     pub fn snapshotTextMergeStats(self: *DB) types.TextMergeStats {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
@@ -11275,14 +11313,15 @@ pub const DB = struct {
         try self.proveTextQueryAccessPaths(algebraic_filter.req.index_name, text_query);
         const metric_name = self.textQueryMetricIndexName(algebraic_filter.req);
         const start_ns = platform_time.monotonicNs();
-        defer db_query_metrics.observe(metric_name, .search, platform_time.monotonicNs() -| start_ns);
-        return try db_query_search.searchTextQuery(alloc, algebraic_filter.req, text_query, .{
+        errdefer db_query_metrics.observe(metric_name, .search, platform_time.monotonicNs() -| start_ns);
+        const result = try db_query_search.searchTextQuery(alloc, algebraic_filter.req, text_query, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .text_index_is_chunk_backed = textIndexIsChunkBackedCallback,
             .search_match_all = searchMatchAllCallback,
             .project_stored_search = projectStoredBytesForSearchCallback,
             .load_stored = loadStoredSearchDocumentCallback,
+            .is_expired_key = isExpiredDocumentKeyCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
@@ -11290,6 +11329,8 @@ pub const DB = struct {
             .requires_full_candidate_visibility_filter = requiresFullCandidateVisibilityFilterCallback,
             .postprocess = postprocessTextSearchResultCallback,
         });
+        db_query_metrics.observeSortProfile(metric_name, .search, platform_time.monotonicNs() -| start_ns, result.sort_profile);
+        return result;
     }
 
     fn proveTextQueryAccessPaths(self: *DB, index_name: ?[]const u8, text_query: types.TextQuery) !void {
@@ -12679,6 +12720,7 @@ pub const DB = struct {
             .load_projected_documents = loadProjectedSearchDocumentManyCallback,
             .load_stored = loadStoredSearchDocumentCallback,
             .load_many_stored = loadStoredSearchDocumentManyCallback,
+            .is_expired_key = isExpiredDocumentKeyCallback,
         });
     }
 
@@ -12813,11 +12855,12 @@ pub const DB = struct {
         ctx: ?*anyopaque,
         lower: []const u8,
         upper: []const u8,
+        options: docstore_mod.DocStore.ScanOptions,
         scan_ctx: ?*anyopaque,
         callback: docstore_mod.DocStore.ScanWithContextCallback,
     ) anyerror!void {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.core.scanStoreRangeWithContext(lower, upper, .{}, scan_ctx, callback);
+        return try self.core.scanStoreRangeWithContext(lower, upper, options, scan_ctx, callback);
     }
 
     fn searchGraph(self: *DB, alloc: Allocator, req: types.SearchRequest, graph_query: graph_query_mod.GraphQuery, base_hits: ?[]const types.SearchHit) !types.SearchResult {
@@ -24898,11 +24941,41 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     }
 }
 
+fn storeHasReplayRecordForHintAfter(
+    store: *docstore_mod.DocStore,
+    hint: change_journal_mod.TargetHint,
+    from_sequence: u64,
+) !bool {
+    const Context = struct {
+        found: bool = false,
+
+        fn handle(self: *@This(), sequence: u64, payload: []const u8) !void {
+            _ = sequence;
+            _ = payload;
+            self.found = true;
+        }
+    };
+
+    var ctx = Context{};
+    const stats = store.forEachReplayLaneFrom(
+        @intCast(@intFromEnum(hint)),
+        from_sequence + 1,
+        1,
+        &ctx,
+        Context.handle,
+    ) catch |err| switch (err) {
+        error.ReplayIndexUnavailable => return false,
+        else => return err,
+    };
+    return ctx.found or stats.matched_entries != 0;
+}
+
 fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) !bool {
-    _ = from_sequence;
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
     const persisted_applied = try apply_state.loadAppliedSequence(ctx.alloc, ctx.store, index_ref.name);
     if (persisted_applied >= target_sequence) return true;
+
+    if (try storeHasReplayRecordForHintAfter(ctx.store, managedIndexReplayHint(index_ref.kind), from_sequence)) return false;
     if (index_ref.kind != .dense_vector) return true;
 
     ctx.apply_mutex.lockExclusive();
@@ -31036,7 +31109,10 @@ test "db backfills a mention name embedding so ann/cosine resolution links end-t
     defer cleanupTempDir(path);
 
     var embedder = FixedVectorEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{ .resolution_embedder = embedder.interface() });
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .resolution_embedder = embedder.interface(),
+        .start_index_workers = false,
+    });
     defer db.close();
 
     try db.addIndex(.{
@@ -33370,6 +33446,40 @@ test "db enrichments precomputed watermark advances across replay entries withou
     });
 
     try std.testing.expectEqual(db.core.nextDerivedSequence(), db.enrichment_runtime.?.stats().applied_sequence);
+}
+
+test "db derived target advance does not skip unseen matching replay records" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const graph_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_artifact_keys = &.{resolution_key},
+        .target_hints = &.{.graph},
+    });
+    defer alloc.free(graph_payload);
+    try db.core.store.appendReplayOpaque(alloc, 1, graph_payload);
+
+    try std.testing.expect(!try canAdvanceDerivedToTargetAsync(
+        db.async_context,
+        .{ .name = "relations_graph", .kind = .graph },
+        0,
+        1,
+    ));
+    try std.testing.expect(try canAdvanceDerivedToTargetAsync(
+        db.async_context,
+        .{ .name = "ft_v1", .kind = .full_text },
+        0,
+        1,
+    ));
 }
 
 const TestAssetProducer = struct {
@@ -38954,13 +39064,16 @@ test "db full-text chunk consumer filters expired parents under ttl" {
     try db.batch(.{
         .writes = &.{.{ .key = "doc:old", .value = "{\"body\":\"abcdefghijklmno\"}" }},
         .timestamp_ns = now_ns - 2 * ttl_duration_ns,
-        .sync_level = .full_text,
+        .sync_level = .full_index,
     });
     try db.batch(.{
         .writes = &.{.{ .key = "doc:fresh", .value = "{\"body\":\"abcdefghijklmno\"}" }},
         .timestamp_ns = now_ns,
-        .sync_level = .full_text,
+        .sync_level = .full_index,
     });
+
+    try db.enrichment_runtime.?.waitForApplied(2);
+    try waitForDerivedReplayTarget(&db);
 
     var chunk_result = try waitForSearchResult(alloc, &db, .{
         .index_name = "ft_chunks",

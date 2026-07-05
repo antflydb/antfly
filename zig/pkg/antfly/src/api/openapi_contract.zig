@@ -41,6 +41,17 @@ test "public openapi contract module is generated and wired" {
     try std.testing.expect(@hasDecl(generated, "FullTextIndexStats"));
     try std.testing.expect(@hasDecl(generated, "TableMigration"));
     try std.testing.expect(@hasDecl(generated, "QueryRequest"));
+    try std.testing.expect(@hasDecl(generated, "SortProfile"));
+    try std.testing.expect(@hasField(generated.QueryProfile, "sort"));
+    try std.testing.expect(@hasField(generated.SortProfile, "plan"));
+    try std.testing.expect(@hasField(generated.SortProfile, "candidate_count"));
+    try std.testing.expect(@hasField(generated.SortProfile, "sort_rejection_reason"));
+    try std.testing.expect(!@hasField(generated.SortProfile, "native_doc_value_load_us"));
+    try std.testing.expect(!@hasField(generated.SortProfile, "collector_heap_peak"));
+    try std.testing.expect(@hasDecl(metadata_generated, "SortProfile"));
+    try std.testing.expect(@hasField(metadata_generated.QueryProfile, "sort"));
+    try std.testing.expect(@hasDecl(client_generated, "SortProfile"));
+    try std.testing.expect(@hasField(client_generated.QueryProfile, "sort"));
     try std.testing.expect(@hasDecl(generated, "BackupRequest"));
     try std.testing.expect(@hasDecl(generated, "RestoreRequest"));
     try std.testing.expect(@hasDecl(generated, "ClusterBackupRequest"));

@@ -110,6 +110,14 @@ test "protocol adapters carry matched extension runtime package digest" {
     try protocol_adapters.testExtensionRuntimeBindingCarriesMatchedInstalledPackageDigest();
 }
 
+test "api table runtime schema debug emits sort capabilities" {
+    try tables.testRuntimeSchemaDebugEmitsSortCapabilities();
+}
+
+test "api table runtime schema debug emits observed dynamic capabilities" {
+    try tables.testRuntimeSchemaDebugEmitsObservedDynamicCapabilities();
+}
+
 test "public batch default schema accepts docsaf doc_type row and rejects reserved _type" {
     const alloc = std.testing.allocator;
 

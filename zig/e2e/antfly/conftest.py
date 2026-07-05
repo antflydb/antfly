@@ -132,10 +132,13 @@ def wait_for_server(
     path: str = "/status",
     *,
     allow_unauthorized: bool = False,
+    processes: list[tuple[str, subprocess.Popen[Any]]] | None = None,
 ) -> bool:
     deadline = time.monotonic() + timeout
     consecutive_successes = 0
     while time.monotonic() < deadline:
+        if _dead_process_statuses(processes):
+            return False
         try:
             request_timeout = max(0.1, min(2.0, deadline - time.monotonic()))
             resp = requests.get(f"{url}{path}", timeout=request_timeout)
@@ -279,6 +282,27 @@ def raise_request_error_with_logs(
         request=getattr(err, "request", None),
         response=getattr(err, "response", None),
     ) from err
+
+
+def raise_if_server_process_exited(server_ref: Any) -> None:
+    statuses = _dead_process_statuses(_server_processes(server_ref))
+    if not statuses:
+        return
+    logs = server_ref.debug_logs().strip() if server_ref is not None else ""
+    message = "server process exited during request retry"
+    if logs:
+        message += f"\nserver logs:\n{logs}"
+    message += "\nserver exit status:\n" + "\n".join(statuses)
+    raise RuntimeError(message)
+
+
+def _dead_process_statuses(processes: list[tuple[str, subprocess.Popen[Any]]] | None) -> list[str]:
+    statuses: list[str] = []
+    for name, proc in processes or []:
+        status = proc.poll()
+        if status is not None:
+            statuses.append(f"{name}: {status}")
+    return statuses
 
 
 def _server_processes(server_ref: Any) -> list[tuple[str, subprocess.Popen[Any]]]:
@@ -592,7 +616,11 @@ class StatefulAntflyServer:
             stderr=subprocess.STDOUT,
             cwd=self.root,
         )
-        if not wait_for_server(self.metadata_admin_url, path="/metadata/v1/status"):
+        if not wait_for_server(
+            self.metadata_admin_url,
+            path="/metadata/v1/status",
+            processes=[("metadata_proc", self.metadata_proc)],
+        ):
             self.metadata_log_file.flush()
             metadata_out = _read_log_tail(self.metadata_log_path)
             self.stop()
@@ -613,7 +641,11 @@ class StatefulAntflyServer:
             stderr=subprocess.STDOUT,
             cwd=self.root,
         )
-        if not wait_for_server(self.api_url, allow_unauthorized=self.auth_enabled):
+        if not wait_for_server(
+            self.api_url,
+            allow_unauthorized=self.auth_enabled,
+            processes=[("metadata_proc", self.metadata_proc), ("data_proc", self.data_proc)],
+        ):
             self.metadata_log_file.flush()
             self.data_log_file.flush()
             metadata_out = _read_log_tail(self.metadata_log_path)

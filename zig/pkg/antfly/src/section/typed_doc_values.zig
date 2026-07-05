@@ -20,6 +20,7 @@
 //!
 //! Supported types:
 //!   - u64: unsigned 64-bit integers
+//!   - i64: signed 64-bit integers
 //!   - f64: 64-bit floating point
 //!   - bytes: variable-length byte strings
 //!   - geo_point: packed (lat, lon) as two f64s = 16 bytes
@@ -47,6 +48,7 @@ pub const ValueType = enum(u8) {
     bytes_val = 2,
     geo_point = 3,
     bool_val = 4,
+    i64_val = 5,
 };
 
 pub const GeoPoint = struct {
@@ -56,11 +58,80 @@ pub const GeoPoint = struct {
 
 pub const TypedValue = union(enum) {
     u64_val: u64,
+    i64_val: i64,
     f64_val: f64,
     bytes_val: []const u8,
     geo_point: GeoPoint,
     bool_val: bool,
 };
+
+fn typedValueMatchesValueType(value: TypedValue, value_type: ValueType) bool {
+    return switch (value_type) {
+        .u64_val => value == .u64_val,
+        .i64_val => value == .i64_val,
+        .f64_val => value == .f64_val,
+        .bytes_val => value == .bytes_val,
+        .geo_point => value == .geo_point,
+        .bool_val => value == .bool_val,
+    };
+}
+
+fn typedValueIsSerializable(value: TypedValue) bool {
+    return switch (value) {
+        .f64_val => |v| std.math.isFinite(v),
+        .geo_point => |v| std.math.isFinite(v.lat) and std.math.isFinite(v.lon),
+        else => true,
+    };
+}
+
+fn decodeSerializableF64(raw: [8]u8) !f64 {
+    const value: f64 = @bitCast(raw);
+    if (!std.math.isFinite(value)) return error.InvalidData;
+    return value;
+}
+
+fn decodeSerializableBool(raw: u8) !bool {
+    return switch (raw) {
+        0 => false,
+        1 => true,
+        else => error.InvalidData,
+    };
+}
+
+fn parseValueType(raw: u8) !ValueType {
+    return switch (raw) {
+        @intFromEnum(ValueType.u64_val) => .u64_val,
+        @intFromEnum(ValueType.f64_val) => .f64_val,
+        @intFromEnum(ValueType.bytes_val) => .bytes_val,
+        @intFromEnum(ValueType.geo_point) => .geo_point,
+        @intFromEnum(ValueType.bool_val) => .bool_val,
+        @intFromEnum(ValueType.i64_val) => .i64_val,
+        else => error.InvalidData,
+    };
+}
+
+fn valuesStartForDocIds(chunk_data: []const u8, num_docs: u32) !usize {
+    const num_docs_usize: usize = @intCast(num_docs);
+    if (num_docs_usize > (std.math.maxInt(usize) - 4) / 4) return error.InvalidData;
+    const values_start = 4 + num_docs_usize * 4;
+    if (values_start > chunk_data.len) return error.InvalidData;
+    return values_start;
+}
+
+fn fixedValueSpanStart(chunk_data: []const u8, num_docs: u32, value_width: usize) !usize {
+    const values_start = try valuesStartForDocIds(chunk_data, num_docs);
+    const num_docs_usize: usize = @intCast(num_docs);
+    if (value_width != 0 and num_docs_usize > (std.math.maxInt(usize) - values_start) / value_width) return error.InvalidData;
+    const values_bytes = num_docs_usize * value_width;
+    if (values_bytes > chunk_data.len - values_start) return error.InvalidData;
+    return values_start;
+}
+
+fn fixedValueOffset(chunk_data: []const u8, num_docs: u32, pos: u32, value_width: usize) !usize {
+    if (pos >= num_docs) return error.InvalidData;
+    const values_start = try fixedValueSpanStart(chunk_data, num_docs, value_width);
+    return values_start + @as(usize, @intCast(pos)) * value_width;
+}
 
 /// Default number of documents per chunk.
 pub const default_chunk_size: u32 = 1024;
@@ -74,6 +145,7 @@ pub const TypedDocValuesWriter = struct {
     value_type: ValueType,
     chunk_size: u32,
     entries: std.ArrayListUnmanaged(Entry),
+    last_doc_id: ?u32 = null,
 
     const Entry = struct {
         doc_id: u32,
@@ -107,6 +179,12 @@ pub const TypedDocValuesWriter = struct {
     }
 
     pub fn add(self: *TypedDocValuesWriter, doc_id: u32, value: TypedValue) !void {
+        if (!typedValueMatchesValueType(value, self.value_type)) return error.InvalidData;
+        if (!typedValueIsSerializable(value)) return error.InvalidData;
+        if (self.last_doc_id) |last_doc_id| {
+            if (doc_id <= last_doc_id) return error.InvalidData;
+        }
+
         var entry = Entry{ .doc_id = doc_id, .value = value };
         // For bytes, dupe the data so we own it
         if (value == .bytes_val) {
@@ -115,6 +193,7 @@ pub const TypedDocValuesWriter = struct {
             entry.value = .{ .bytes_val = owned };
         }
         try self.entries.append(self.alloc, entry);
+        self.last_doc_id = doc_id;
     }
 
     /// Build serialized typed doc values section. Caller owns returned bytes.
@@ -177,6 +256,10 @@ pub const TypedDocValuesWriter = struct {
                 const v = value.u64_val;
                 try out.appendSlice(self.alloc, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, v))));
             },
+            .i64_val => {
+                const v = value.i64_val;
+                try out.appendSlice(self.alloc, &@as([8]u8, @bitCast(std.mem.nativeToLittle(i64, v))));
+            },
             .f64_val => {
                 const v = value.f64_val;
                 try out.appendSlice(self.alloc, &@as([8]u8, @bitCast(v)));
@@ -212,8 +295,9 @@ pub const TypedDocValuesReader = struct {
 
     pub fn init(alloc: Allocator, data: []const u8) !TypedDocValuesReader {
         if (data.len < 5) return error.InvalidData;
-        const value_type: ValueType = @enumFromInt(data[0]);
+        const value_type = try parseValueType(data[0]);
         const num_chunks = std.mem.readInt(u32, data[1..5], .little);
+        if (@as(usize, num_chunks) > (std.math.maxInt(usize) - 5) / 8) return error.InvalidData;
         const offset_table_end = 5 + @as(usize, num_chunks) * 8;
         if (data.len < offset_table_end) return error.InvalidData;
 
@@ -236,11 +320,19 @@ pub const TypedDocValuesReader = struct {
         return self.chunkEndOffset(chunk_idx - 1);
     }
 
+    fn chunkRange(self: *const TypedDocValuesReader, chunk_idx: u32) !struct { start: usize, end: usize } {
+        if (chunk_idx >= self.num_chunks) return error.InvalidData;
+        const start = self.chunkStartOffset(chunk_idx);
+        const end = self.chunkEndOffset(chunk_idx);
+        if (start > end) return error.InvalidData;
+        if (end > self.data.len) return error.InvalidData;
+        return .{ .start = @intCast(start), .end = @intCast(end) };
+    }
+
     /// Decompress a chunk and return its raw bytes. Caller owns result.
     fn decompressChunk(self: *const TypedDocValuesReader, chunk_idx: u32) ![]u8 {
-        const start: usize = @intCast(self.chunkStartOffset(chunk_idx));
-        const end: usize = @intCast(self.chunkEndOffset(chunk_idx));
-        const compressed = self.data[start..end];
+        const range = try self.chunkRange(chunk_idx);
+        const compressed = self.data[range.start..range.end];
         return snappy.decode(self.alloc, compressed);
     }
 
@@ -249,7 +341,15 @@ pub const TypedDocValuesReader = struct {
     pub fn findDoc(self: *const TypedDocValuesReader, doc_id: u32) !?struct { chunk_idx: u32, pos: u32, chunk_data: []u8 } {
         for (0..self.num_chunks) |ci| {
             const chunk_data = try self.decompressChunk(@intCast(ci));
+            if (chunk_data.len < 4) {
+                self.alloc.free(chunk_data);
+                return error.InvalidData;
+            }
             const num_docs = std.mem.readInt(u32, chunk_data[0..4], .little);
+            _ = valuesStartForDocIds(chunk_data, num_docs) catch |err| {
+                self.alloc.free(chunk_data);
+                return err;
+            };
             for (0..num_docs) |i| {
                 const off = 4 + i * 4;
                 const did = std.mem.readInt(u32, chunk_data[off..][0..4], .little);
@@ -264,44 +364,54 @@ pub const TypedDocValuesReader = struct {
 
     /// Get a single u64 value for a doc.
     pub fn getU64(self: *const TypedDocValuesReader, doc_id: u32) !?u64 {
+        if (self.value_type != .u64_val) return error.InvalidData;
         const found = try self.findDoc(doc_id) orelse return null;
         defer self.alloc.free(found.chunk_data);
         const num_docs = std.mem.readInt(u32, found.chunk_data[0..4], .little);
-        const values_start = 4 + @as(usize, num_docs) * 4;
-        const val_off = values_start + @as(usize, found.pos) * 8;
+        const val_off = try fixedValueOffset(found.chunk_data, num_docs, found.pos, 8);
         return std.mem.readInt(u64, found.chunk_data[val_off..][0..8], .little);
+    }
+
+    /// Get a single i64 value for a doc.
+    pub fn getI64(self: *const TypedDocValuesReader, doc_id: u32) !?i64 {
+        if (self.value_type != .i64_val) return error.InvalidData;
+        const found = try self.findDoc(doc_id) orelse return null;
+        defer self.alloc.free(found.chunk_data);
+        const num_docs = std.mem.readInt(u32, found.chunk_data[0..4], .little);
+        const val_off = try fixedValueOffset(found.chunk_data, num_docs, found.pos, 8);
+        return std.mem.readInt(i64, found.chunk_data[val_off..][0..8], .little);
     }
 
     /// Get a single f64 value for a doc.
     pub fn getF64(self: *const TypedDocValuesReader, doc_id: u32) !?f64 {
+        if (self.value_type != .f64_val) return error.InvalidData;
         const found = try self.findDoc(doc_id) orelse return null;
         defer self.alloc.free(found.chunk_data);
         const num_docs = std.mem.readInt(u32, found.chunk_data[0..4], .little);
-        const values_start = 4 + @as(usize, num_docs) * 4;
-        const val_off = values_start + @as(usize, found.pos) * 8;
-        return @bitCast(found.chunk_data[val_off..][0..8].*);
+        const val_off = try fixedValueOffset(found.chunk_data, num_docs, found.pos, 8);
+        return try decodeSerializableF64(found.chunk_data[val_off..][0..8].*);
     }
 
     /// Get a single GeoPoint value for a doc.
     pub fn getGeoPoint(self: *const TypedDocValuesReader, doc_id: u32) !?GeoPoint {
+        if (self.value_type != .geo_point) return error.InvalidData;
         const found = try self.findDoc(doc_id) orelse return null;
         defer self.alloc.free(found.chunk_data);
         const num_docs = std.mem.readInt(u32, found.chunk_data[0..4], .little);
-        const values_start = 4 + @as(usize, num_docs) * 4;
-        const val_off = values_start + @as(usize, found.pos) * 16;
-        const lat: f64 = @bitCast(found.chunk_data[val_off..][0..8].*);
-        const lon: f64 = @bitCast(found.chunk_data[val_off + 8 ..][0..8].*);
+        const val_off = try fixedValueOffset(found.chunk_data, num_docs, found.pos, 16);
+        const lat = try decodeSerializableF64(found.chunk_data[val_off..][0..8].*);
+        const lon = try decodeSerializableF64(found.chunk_data[val_off + 8 ..][0..8].*);
         return .{ .lat = lat, .lon = lon };
     }
 
     /// Get a single bool value for a doc.
     pub fn getBool(self: *const TypedDocValuesReader, doc_id: u32) !?bool {
+        if (self.value_type != .bool_val) return error.InvalidData;
         const found = try self.findDoc(doc_id) orelse return null;
         defer self.alloc.free(found.chunk_data);
         const num_docs = std.mem.readInt(u32, found.chunk_data[0..4], .little);
-        const values_start = 4 + @as(usize, num_docs) * 4;
-        const val_off = values_start + @as(usize, found.pos);
-        return found.chunk_data[val_off] != 0;
+        const val_off = try fixedValueOffset(found.chunk_data, num_docs, found.pos, 1);
+        return try decodeSerializableBool(found.chunk_data[val_off]);
     }
 
     /// Get a single bytes value for a doc. Caller owns the returned slice.
@@ -327,10 +437,12 @@ pub const TypedDocValuesReader = struct {
 
     /// Read all u64 values in a chunk. Caller owns returned slice.
     pub fn readU64Chunk(self: *const TypedDocValuesReader, chunk_idx: u32) ![]u64 {
+        if (self.value_type != .u64_val) return error.InvalidData;
         const chunk_data = try self.decompressChunk(chunk_idx);
         defer self.alloc.free(chunk_data);
+        if (chunk_data.len < 4) return error.InvalidData;
         const num_docs = std.mem.readInt(u32, chunk_data[0..4], .little);
-        const values_start = 4 + @as(usize, num_docs) * 4;
+        const values_start = try fixedValueSpanStart(chunk_data, num_docs, 8);
         const result = try self.alloc.alloc(u64, num_docs);
         for (0..num_docs) |i| {
             const off = values_start + i * 8;
@@ -339,32 +451,52 @@ pub const TypedDocValuesReader = struct {
         return result;
     }
 
-    /// Read all f64 values in a chunk. Caller owns returned slice.
-    pub fn readF64Chunk(self: *const TypedDocValuesReader, chunk_idx: u32) ![]f64 {
+    /// Read all i64 values in a chunk. Caller owns returned slice.
+    pub fn readI64Chunk(self: *const TypedDocValuesReader, chunk_idx: u32) ![]i64 {
+        if (self.value_type != .i64_val) return error.InvalidData;
         const chunk_data = try self.decompressChunk(chunk_idx);
         defer self.alloc.free(chunk_data);
+        if (chunk_data.len < 4) return error.InvalidData;
         const num_docs = std.mem.readInt(u32, chunk_data[0..4], .little);
-        const values_start = 4 + @as(usize, num_docs) * 4;
+        const values_start = try fixedValueSpanStart(chunk_data, num_docs, 8);
+        const result = try self.alloc.alloc(i64, num_docs);
+        for (0..num_docs) |i| {
+            const off = values_start + i * 8;
+            result[i] = std.mem.readInt(i64, chunk_data[off..][0..8], .little);
+        }
+        return result;
+    }
+
+    /// Read all f64 values in a chunk. Caller owns returned slice.
+    pub fn readF64Chunk(self: *const TypedDocValuesReader, chunk_idx: u32) ![]f64 {
+        if (self.value_type != .f64_val) return error.InvalidData;
+        const chunk_data = try self.decompressChunk(chunk_idx);
+        defer self.alloc.free(chunk_data);
+        if (chunk_data.len < 4) return error.InvalidData;
+        const num_docs = std.mem.readInt(u32, chunk_data[0..4], .little);
+        const values_start = try fixedValueSpanStart(chunk_data, num_docs, 8);
         const result = try self.alloc.alloc(f64, num_docs);
         for (0..num_docs) |i| {
             const off = values_start + i * 8;
-            result[i] = @bitCast(chunk_data[off..][0..8].*);
+            result[i] = try decodeSerializableF64(chunk_data[off..][0..8].*);
         }
         return result;
     }
 
     /// Read all GeoPoint values in a chunk. Caller owns returned slice.
     pub fn readGeoPointChunk(self: *const TypedDocValuesReader, chunk_idx: u32) ![]GeoPoint {
+        if (self.value_type != .geo_point) return error.InvalidData;
         const chunk_data = try self.decompressChunk(chunk_idx);
         defer self.alloc.free(chunk_data);
+        if (chunk_data.len < 4) return error.InvalidData;
         const num_docs = std.mem.readInt(u32, chunk_data[0..4], .little);
-        const values_start = 4 + @as(usize, num_docs) * 4;
+        const values_start = try fixedValueSpanStart(chunk_data, num_docs, 16);
         const result = try self.alloc.alloc(GeoPoint, num_docs);
         for (0..num_docs) |i| {
             const off = values_start + i * 16;
             result[i] = .{
-                .lat = @bitCast(chunk_data[off..][0..8].*),
-                .lon = @bitCast(chunk_data[off + 8 ..][0..8].*),
+                .lat = try decodeSerializableF64(chunk_data[off..][0..8].*),
+                .lon = try decodeSerializableF64(chunk_data[off + 8 ..][0..8].*),
             };
         }
         return result;
@@ -374,7 +506,9 @@ pub const TypedDocValuesReader = struct {
     pub fn readChunkDocIds(self: *const TypedDocValuesReader, chunk_idx: u32) ![]u32 {
         const chunk_data = try self.decompressChunk(chunk_idx);
         defer self.alloc.free(chunk_data);
+        if (chunk_data.len < 4) return error.InvalidData;
         const num_docs = std.mem.readInt(u32, chunk_data[0..4], .little);
+        _ = try valuesStartForDocIds(chunk_data, num_docs);
         const result = try self.alloc.alloc(u32, num_docs);
         for (0..num_docs) |i| {
             const off = 4 + i * 4;
@@ -387,6 +521,26 @@ pub const TypedDocValuesReader = struct {
 // ============================================================================
 // Tests
 // ============================================================================
+
+fn buildSingleDocFixedSectionAlloc(alloc: Allocator, value_type: ValueType, doc_id: u32, value_bytes: []const u8) ![]u8 {
+    var chunk = std.ArrayListUnmanaged(u8).empty;
+    defer chunk.deinit(alloc);
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, doc_id))));
+    try chunk.appendSlice(alloc, value_bytes);
+
+    const compressed = try snappy.encode(alloc, chunk.items);
+    defer alloc.free(compressed);
+
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(alloc);
+    try data.append(alloc, @intFromEnum(value_type));
+    try data.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
+    const chunk_end: u64 = @intCast(5 + 8 + compressed.len);
+    try data.appendSlice(alloc, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, chunk_end))));
+    try data.appendSlice(alloc, compressed);
+    return try data.toOwnedSlice(alloc);
+}
 
 test "typed doc values u64 round-trip" {
     const alloc = std.testing.allocator;
@@ -408,6 +562,175 @@ test "typed doc values u64 round-trip" {
     try std.testing.expectEqual(@as(?u64, 200), try reader.getU64(1));
     try std.testing.expectEqual(@as(?u64, 500), try reader.getU64(5));
     try std.testing.expectEqual(@as(?u64, null), try reader.getU64(3));
+}
+
+test "typed doc values writer rejects mismatched value type" {
+    const alloc = std.testing.allocator;
+
+    var writer = TypedDocValuesWriter.init(alloc, .u64_val, 1024);
+    defer writer.deinit();
+
+    try std.testing.expectError(error.InvalidData, writer.add(0, .{ .i64_val = -1 }));
+    try std.testing.expectError(error.InvalidData, writer.add(1, .{ .bytes_val = "not-u64" }));
+    try std.testing.expectEqual(@as(usize, 0), writer.entries.items.len);
+}
+
+test "typed doc values writer rejects duplicate and out-of-order doc ids" {
+    const alloc = std.testing.allocator;
+
+    var duplicate_writer = TypedDocValuesWriter.init(alloc, .u64_val, 1024);
+    defer duplicate_writer.deinit();
+    try duplicate_writer.add(0, .{ .u64_val = 10 });
+    try std.testing.expectError(error.InvalidData, duplicate_writer.add(0, .{ .u64_val = 20 }));
+
+    var out_of_order_writer = TypedDocValuesWriter.init(alloc, .u64_val, 1024);
+    defer out_of_order_writer.deinit();
+    try out_of_order_writer.add(2, .{ .u64_val = 20 });
+    try std.testing.expectError(error.InvalidData, out_of_order_writer.add(1, .{ .u64_val = 10 }));
+}
+
+test "typed doc values writer rejects non-finite floating values" {
+    const alloc = std.testing.allocator;
+
+    var f64_writer = TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+    defer f64_writer.deinit();
+    try std.testing.expectError(error.InvalidData, f64_writer.add(0, .{ .f64_val = std.math.nan(f64) }));
+    try std.testing.expectError(error.InvalidData, f64_writer.add(0, .{ .f64_val = std.math.inf(f64) }));
+    try f64_writer.add(0, .{ .f64_val = 1.5 });
+
+    var geo_writer = TypedDocValuesWriter.init(alloc, .geo_point, 1024);
+    defer geo_writer.deinit();
+    try std.testing.expectError(error.InvalidData, geo_writer.add(0, .{ .geo_point = .{ .lat = std.math.nan(f64), .lon = 10.0 } }));
+    try std.testing.expectError(error.InvalidData, geo_writer.add(0, .{ .geo_point = .{ .lat = 10.0, .lon = std.math.inf(f64) } }));
+    try geo_writer.add(0, .{ .geo_point = .{ .lat = 10.0, .lon = 20.0 } });
+}
+
+test "typed doc values reader rejects mismatched accessor type" {
+    const alloc = std.testing.allocator;
+
+    var writer = TypedDocValuesWriter.init(alloc, .u64_val, 1024);
+    defer writer.deinit();
+
+    try writer.add(0, .{ .u64_val = 42 });
+
+    const data = try writer.build();
+    defer alloc.free(data);
+
+    var reader = try TypedDocValuesReader.init(alloc, data);
+    try std.testing.expectEqual(@as(?u64, 42), try reader.getU64(0));
+
+    try std.testing.expectError(error.InvalidData, reader.getI64(0));
+    try std.testing.expectError(error.InvalidData, reader.getF64(0));
+    try std.testing.expectError(error.InvalidData, reader.getBool(0));
+    try std.testing.expectError(error.InvalidData, reader.getBytesAlloc(0));
+    try std.testing.expectError(error.InvalidData, reader.readI64Chunk(0));
+    try std.testing.expectError(error.InvalidData, reader.readF64Chunk(0));
+    try std.testing.expectError(error.InvalidData, reader.readGeoPointChunk(0));
+}
+
+test "typed doc values reader rejects malformed headers and chunk bounds" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectError(error.InvalidData, TypedDocValuesReader.init(alloc, &.{ 255, 0, 0, 0, 0 }));
+
+    var writer = TypedDocValuesWriter.init(alloc, .u64_val, 1024);
+    defer writer.deinit();
+
+    try writer.add(0, .{ .u64_val = 42 });
+
+    const data = try writer.build();
+    defer alloc.free(data);
+
+    var reader = try TypedDocValuesReader.init(alloc, data);
+    try std.testing.expectError(error.InvalidData, reader.readU64Chunk(1));
+
+    const corrupt_data = try alloc.dupe(u8, data);
+    defer alloc.free(corrupt_data);
+    std.mem.writeInt(u64, corrupt_data[5..][0..8], @as(u64, @intCast(corrupt_data.len + 1)), .little);
+
+    var corrupt_reader = try TypedDocValuesReader.init(alloc, corrupt_data);
+    try std.testing.expectError(error.InvalidData, corrupt_reader.readU64Chunk(0));
+}
+
+test "typed doc values reader rejects malformed bytes value lengths" {
+    const alloc = std.testing.allocator;
+
+    var chunk = std.ArrayListUnmanaged(u8).empty;
+    defer chunk.deinit(alloc);
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 0))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 8))));
+    try chunk.appendSlice(alloc, "abc");
+
+    const compressed = try snappy.encode(alloc, chunk.items);
+    defer alloc.free(compressed);
+
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(alloc);
+    try data.append(alloc, @intFromEnum(ValueType.bytes_val));
+    try data.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
+    const chunk_end: u64 = @intCast(5 + 8 + compressed.len);
+    try data.appendSlice(alloc, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, chunk_end))));
+    try data.appendSlice(alloc, compressed);
+
+    var reader = try TypedDocValuesReader.init(alloc, data.items);
+    try std.testing.expectError(error.InvalidData, reader.getBytesAlloc(0));
+}
+
+test "typed doc values reader rejects non-canonical bool values" {
+    const alloc = std.testing.allocator;
+
+    const data = try buildSingleDocFixedSectionAlloc(alloc, .bool_val, 0, &.{2});
+    defer alloc.free(data);
+
+    var reader = try TypedDocValuesReader.init(alloc, data);
+    try std.testing.expectError(error.InvalidData, reader.getBool(0));
+}
+
+test "typed doc values reader rejects non-finite floating payloads" {
+    const alloc = std.testing.allocator;
+
+    const nan_bytes = @as([8]u8, @bitCast(std.math.nan(f64)));
+    const f64_data = try buildSingleDocFixedSectionAlloc(alloc, .f64_val, 0, &nan_bytes);
+    defer alloc.free(f64_data);
+
+    var f64_reader = try TypedDocValuesReader.init(alloc, f64_data);
+    try std.testing.expectError(error.InvalidData, f64_reader.getF64(0));
+    try std.testing.expectError(error.InvalidData, f64_reader.readF64Chunk(0));
+
+    var geo_bytes = std.ArrayListUnmanaged(u8).empty;
+    defer geo_bytes.deinit(alloc);
+    try geo_bytes.appendSlice(alloc, &@as([8]u8, @bitCast(std.math.inf(f64))));
+    try geo_bytes.appendSlice(alloc, &@as([8]u8, @bitCast(@as(f64, 10.0))));
+
+    const geo_data = try buildSingleDocFixedSectionAlloc(alloc, .geo_point, 0, geo_bytes.items);
+    defer alloc.free(geo_data);
+
+    var geo_reader = try TypedDocValuesReader.init(alloc, geo_data);
+    try std.testing.expectError(error.InvalidData, geo_reader.getGeoPoint(0));
+    try std.testing.expectError(error.InvalidData, geo_reader.readGeoPointChunk(0));
+}
+
+test "typed doc values i64 round-trip" {
+    const alloc = std.testing.allocator;
+
+    var writer = TypedDocValuesWriter.init(alloc, .i64_val, 1024);
+    defer writer.deinit();
+
+    try writer.add(0, .{ .i64_val = -100 });
+    try writer.add(1, .{ .i64_val = 0 });
+    try writer.add(5, .{ .i64_val = 500 });
+
+    const data = try writer.build();
+    defer alloc.free(data);
+
+    var reader = try TypedDocValuesReader.init(alloc, data);
+    try std.testing.expectEqual(ValueType.i64_val, reader.value_type);
+
+    try std.testing.expectEqual(@as(?i64, -100), try reader.getI64(0));
+    try std.testing.expectEqual(@as(?i64, 0), try reader.getI64(1));
+    try std.testing.expectEqual(@as(?i64, 500), try reader.getI64(5));
+    try std.testing.expectEqual(@as(?i64, null), try reader.getI64(3));
 }
 
 test "typed doc values f64 round-trip" {

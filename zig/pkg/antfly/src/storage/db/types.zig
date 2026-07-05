@@ -1423,12 +1423,71 @@ pub const TotalHitsRelation = enum {
     gte,
 };
 
+pub const SortProfileField = struct {
+    bytes: [256]u8 = undefined,
+    len: u16 = 0,
+
+    pub fn init(value: []const u8) SortProfileField {
+        var out = SortProfileField{};
+        out.set(value);
+        return out;
+    }
+
+    pub fn set(self: *SortProfileField, value: []const u8) void {
+        const value_len = @min(value.len, self.bytes.len);
+        if (value_len > 0) @memcpy(self.bytes[0..value_len], value[0..value_len]);
+        self.len = @intCast(value_len);
+    }
+
+    pub fn slice(self: *const SortProfileField) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+pub const SortProfile = struct {
+    plan: []const u8 = "",
+    exactness: []const u8 = "",
+    source: []const u8 = "",
+    cursor_support: []const u8 = "",
+    source_load: []const u8 = "",
+    distributed_behavior: []const u8 = "",
+    require_native: bool = false,
+    native_loader: bool = false,
+    index_sort_match: bool = false,
+    sorted_segment_executor_available: bool = false,
+    sorted_segment_bounds_available: bool = false,
+    candidate_count: u64 = 0,
+    cursor_rejected_count: u64 = 0,
+    admitted_count: u64 = 0,
+    replaced_count: u64 = 0,
+    discarded_count: u64 = 0,
+    selected_count: u64 = 0,
+    decorate_us: u64 = 0,
+    native_doc_value_load_us: u64 = 0,
+    native_doc_value_hit_count: u64 = 0,
+    native_doc_value_miss_count: u64 = 0,
+    stored_json_load_us: u64 = 0,
+    stored_json_load_count: u64 = 0,
+    final_sort_us: u64 = 0,
+    total_us: u64 = 0,
+    window_capacity: usize = 0,
+    window_len: usize = 0,
+    collector_heap_peak: usize = 0,
+    distributed_shard_count: usize = 0,
+    distributed_shard_window: usize = 0,
+    budget_rejection_reason: []const u8 = "",
+    sort_rejection_reason: []const u8 = "",
+    sort_rejection_detail: []const u8 = "",
+    sort_rejection_field: SortProfileField = .{},
+};
+
 pub const SearchResult = struct {
     alloc: Allocator,
     hits: []SearchHit,
     total_hits: u32,
     total_hits_relation: TotalHitsRelation = .exact,
     identity_read_generation: ?u64 = null,
+    sort_profile: ?SortProfile = null,
     graph_results: []GraphSearchResult = &.{},
 
     pub fn deinit(self: *SearchResult) void {
