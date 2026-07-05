@@ -1832,16 +1832,13 @@ pub const MetadataService = struct {
 
         var local = std.ArrayListUnmanaged(raft_reconciler.PlacementIntent).empty;
         defer {
-            for (local.items) |intent| if (intent.peer_node_ids.len > 0) self.alloc.free(intent.peer_node_ids);
+            for (local.items) |intent| raft_reconciler.freeIntentOwned(self.alloc, intent);
             local.deinit(self.alloc);
         }
 
         for (projected) |intent| {
             if (intent.record.local_node_id != self.raft.host.host.cfg.local_node_id) continue;
-            try local.append(self.alloc, .{
-                .record = intent.record,
-                .peer_node_ids = if (intent.peer_node_ids.len == 0) &.{} else try self.alloc.dupe(u64, intent.peer_node_ids),
-            });
+            try local.append(self.alloc, try raft_reconciler.cloneIntentOwned(self.alloc, intent));
         }
 
         if (!containsLocalIntent(local.items, self.metadata_group_id)) {
@@ -3622,16 +3619,13 @@ pub const MetadataHttpService = struct {
 
         var local = std.ArrayListUnmanaged(raft_reconciler.PlacementIntent).empty;
         defer {
-            for (local.items) |intent| if (intent.peer_node_ids.len > 0) self.alloc.free(intent.peer_node_ids);
+            for (local.items) |intent| raft_reconciler.freeIntentOwned(self.alloc, intent);
             local.deinit(self.alloc);
         }
 
         for (inputs.placement_intents) |intent| {
             if (intent.record.local_node_id != self.raft.host.http_host.host.cfg.local_node_id) continue;
-            try local.append(self.alloc, .{
-                .record = intent.record,
-                .peer_node_ids = if (intent.peer_node_ids.len == 0) &.{} else try self.alloc.dupe(u64, intent.peer_node_ids),
-            });
+            try local.append(self.alloc, try raft_reconciler.cloneIntentOwned(self.alloc, intent));
         }
 
         if (!containsLocalIntent(local.items, self.metadata_group_id)) {

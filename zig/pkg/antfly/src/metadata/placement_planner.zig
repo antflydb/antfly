@@ -45,6 +45,14 @@ pub const PlacementPlanner = struct {
                 .record = intent.record,
                 .store_id = intent.store_id,
                 .peer_node_ids = if (intent.peer_node_ids.len == 0) &.{} else try self.alloc.dupe(u64, intent.peer_node_ids),
+                .serving_state = intent.serving_state,
+                .relocation_generation = intent.relocation_generation,
+                .relocation_source_node_id = intent.relocation_source_node_id,
+                .relocation_source_store_id = intent.relocation_source_store_id,
+                .relocation_doc_count_watermark = intent.relocation_doc_count_watermark,
+                .relocation_disk_bytes_watermark = intent.relocation_disk_bytes_watermark,
+                .relocation_target_sequence = intent.relocation_target_sequence,
+                .relocation_applied_sequence = intent.relocation_applied_sequence,
             });
         }
         return try out.toOwnedSlice(self.alloc);
@@ -154,6 +162,16 @@ pub const PlacementPlanner = struct {
                     .empty
                 else
                     .persisted;
+                const source_intent = if (existing_intent == null and has_current_group)
+                    findRelocationSourceIntent(current_intents, range.group_id)
+                else
+                    null;
+                const serving_state: raft_reconciler.PlacementServingState = if (existing_intent) |existing|
+                    existing.serving_state
+                else if (has_current_group)
+                    .bootstrapping
+                else
+                    .serving;
                 try out.append(self.alloc, .{
                     .record = .{
                         .group_id = range.group_id,
@@ -163,6 +181,14 @@ pub const PlacementPlanner = struct {
                     },
                     .store_id = chooseStoreIdForNode(current_intents, candidate_domains, range.group_id, node_id),
                     .peer_node_ids = if (peers.len == 0) &.{} else try self.alloc.dupe(u64, peers),
+                    .serving_state = serving_state,
+                    .relocation_generation = if (existing_intent) |existing| existing.relocation_generation else 0,
+                    .relocation_source_node_id = if (existing_intent) |existing| existing.relocation_source_node_id else if (source_intent) |source| source.record.local_node_id else 0,
+                    .relocation_source_store_id = if (existing_intent) |existing| existing.relocation_source_store_id else if (source_intent) |source| source.store_id else 0,
+                    .relocation_doc_count_watermark = if (existing_intent) |existing| existing.relocation_doc_count_watermark else 0,
+                    .relocation_disk_bytes_watermark = if (existing_intent) |existing| existing.relocation_disk_bytes_watermark else 0,
+                    .relocation_target_sequence = if (existing_intent) |existing| existing.relocation_target_sequence else 0,
+                    .relocation_applied_sequence = if (existing_intent) |existing| existing.relocation_applied_sequence else 0,
                 });
             }
         }
@@ -212,6 +238,23 @@ fn chooseStoreIdForNode(
         if (candidate.node_id == node_id and candidate.store_id != 0) return candidate.store_id;
     }
     return 0;
+}
+
+fn findRelocationSourceIntent(
+    current_intents: []const raft_reconciler.PlacementIntent,
+    group_id: u64,
+) ?raft_reconciler.PlacementIntent {
+    for (current_intents) |intent| {
+        if (intent.record.group_id != group_id) continue;
+        if (intent.serving_state == .serving) return intent;
+    }
+    for (current_intents) |intent| {
+        if (intent.record.group_id == group_id and intent.serving_state == .draining) return intent;
+    }
+    for (current_intents) |intent| {
+        if (intent.record.group_id == group_id) return intent;
+    }
+    return null;
 }
 
 fn nodeHasStoreCandidate(candidate_domains: []const CandidateDomain, node_id: u64, store_id: u64) bool {

@@ -3149,6 +3149,7 @@ pub const HostedProvisionedTableReadSource = struct {
         };
 
         for (placements) |intent| {
+            if (!placementRefReadableWithPeers(placements, intent)) continue;
             const node_id = intent.record.local_node_id;
             if (node_id == local_node_id) {
                 if (tried_local or self.router.localStatus(group_id) != .active) continue;
@@ -3169,6 +3170,27 @@ pub const HostedProvisionedTableReadSource = struct {
             }
         }
         return null;
+    }
+
+    fn placementRefReadableWithPeers(
+        placements: []const *const raft_reconciler.PlacementIntent,
+        intent: *const raft_reconciler.PlacementIntent,
+    ) bool {
+        switch (intent.serving_state) {
+            .serving => return true,
+            .draining => {
+                for (placements) |peer| {
+                    if (peer.record.group_id == intent.record.group_id and
+                        peer.record.local_node_id != intent.record.local_node_id and
+                        peer.serving_state == .serving)
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            },
+            .planned, .bootstrapping, .replaying, .cutover_ready => return false,
+        }
     }
 
     fn scan(

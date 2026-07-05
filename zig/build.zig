@@ -3880,6 +3880,7 @@ pub fn build(b: *std.Build) void {
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
             "parseRemoteSearchResult preserves fused index scores",
             "provisioned standby read gate permits stale reads and routes non-stale reads to primary",
+            "catalog backed router skips non-serving relocation placements",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
