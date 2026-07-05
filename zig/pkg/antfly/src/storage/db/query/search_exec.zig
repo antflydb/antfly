@@ -2529,7 +2529,7 @@ const SortValue = union(enum) {
 };
 
 const NativeSortValueLoader = struct {
-    ctx: ?*anyopaque,
+    ctx: ?*anyopaque = null,
     require_native: bool = false,
     load: *const fn (
         ctx: ?*anyopaque,
@@ -12838,8 +12838,8 @@ test "match_all rejects invalid sort cursor contract" {
         .{ .array = bad_array_value },
         .{ .string = "doc:b" },
     };
-    var bad_object_value = std.json.ObjectMap.init(alloc);
-    defer bad_object_value.deinit();
+    var bad_object_value = std.json.ObjectMap.empty;
+    defer bad_object_value.deinit(alloc);
     const bad_object_cursor = [_]std.json.Value{
         .{ .object = bad_object_value },
         .{ .string = "doc:b" },
