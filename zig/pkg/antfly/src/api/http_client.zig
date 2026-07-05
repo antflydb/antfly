@@ -2121,6 +2121,42 @@ pub const ApiHttpClient = struct {
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
     }
 
+    pub fn fetchGroupRelationalColumnBackedIndexRepair(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !QueryResponse {
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.relational_column_backed_index_repair_suffix,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        defer self.alloc.free(path);
+        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executor.execute(self.alloc, .{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+        });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200 => {},
+            404 => return error.UnknownGroup,
+            405 => return error.UnsupportedOperation,
+            409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
+            else => return error.UnexpectedHttpStatus,
+        }
+        return .{ .body = try self.alloc.dupe(u8, resp.body) };
+    }
+
     pub fn fetchGroupSchemaRewrite(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -3101,6 +3137,7 @@ test "api http client preserves group doc identity conflicts" {
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupForeignKeyIntegrity(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupUniqueIntegrity(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupSecondaryIndexRebuild(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupRelationalColumnBackedIndexRepair(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupSchemaRewrite(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupTableEmptying(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupGraphMetricMaintenance(base_uri, 7, "docs", "{}"));
@@ -3159,6 +3196,7 @@ test "api http client preserves group doc identity conflicts" {
     try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupForeignKeyIntegrity(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupUniqueIntegrity(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupSecondaryIndexRebuild(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupRelationalColumnBackedIndexRepair(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupSchemaRewrite(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupTableEmptying(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupGraphMetricMaintenance(base_uri, 7, "docs", "{}"));

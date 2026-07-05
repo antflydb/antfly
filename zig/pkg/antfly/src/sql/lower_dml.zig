@@ -41,6 +41,7 @@ const expr_where_condition = @import("expr/where_condition.zig");
 const generated_parser = @import("generated_parser.zig");
 const generated_read_validate = @import("generated_read_validate.zig");
 const grammar = @import("grammar.zig");
+const lexer = @import("lexer.zig");
 const lower_expr = @import("lower_expr.zig");
 const expr_row_parse = @import("expr/row_parse.zig");
 const lowering_context = @import("lowering_context.zig");
@@ -495,6 +496,7 @@ pub const JoinedMutationTailParserOptions = struct {
     returning_qualifiers: []const []const u8,
     string_to_array_predicate_is_containment: bool,
     expression_where_options: lower_expr.JoinedMutationExpressionWhereConditionParserOptions,
+    order_expression_hooks: expr_order.OrderExpressionParserOptions,
     returning_hooks: expr_projection.JoinedMutationReturningProjectionParserOptions,
     realtime_ns: u64,
     generated_dml_ast: ?*const generated_parser.GeneratedSqlDmlAst = null,
@@ -627,6 +629,7 @@ pub const DeleteJoinedMutationSourceParserOptions = struct {
     expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
     expression_where_options: lower_expr.JoinedMutationExpressionWhereConditionParserOptions,
     generated_dml_ast: ?*const generated_parser.GeneratedSqlDmlAst = null,
+    order_expression_hooks: expr_order.OrderExpressionParserOptions,
     returning_hooks: expr_projection.ReturningProjectionParserOptions,
     joined_returning_hooks: expr_projection.JoinedMutationReturningProjectionParserOptions,
     realtime_ns: u64,
@@ -653,6 +656,7 @@ pub const UpdateJoinedMutationSourceParserOptions = struct {
     expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
     expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
     expression_where_options: lower_expr.JoinedMutationExpressionWhereConditionParserOptions,
+    order_expression_hooks: expr_order.OrderExpressionParserOptions,
     returning_hooks: expr_projection.ReturningProjectionParserOptions,
     joined_returning_hooks: expr_projection.JoinedMutationReturningProjectionParserOptions,
     realtime_ns: u64,
@@ -1285,7 +1289,7 @@ fn parseMergeCtesForPlanAlloc(
             var lowered = if (generated_cte) |cte| blk: {
                 const generated_body_dml = cte.body_dml orelse return error.UnsupportedSqlShape;
                 break :blk try parseDataModifyingCteMutationSourceWithGeneratedDmlAstAlloc(alloc, tokens[pos.*..close_index], &inner_pos, parser_options, generated_body_dml);
-            } else try parseDataModifyingCteMutationSourceAlloc(alloc, tokens[pos.*..close_index], &inner_pos, parser_options);
+            } else return error.UnsupportedSqlShape;
             var lowered_transferred = false;
             errdefer if (!lowered_transferred) lowered.deinit(alloc);
             if (!parser.atEnd(tokens[pos.*..close_index], inner_pos)) return error.UnsupportedSqlShape;
@@ -1542,6 +1546,9 @@ fn generatedDmlOptionalExpressionSurfaceEqual(
         !generatedDmlOptionalTokenRangeEqual(a.subquery_select_tokens, b.subquery_select_tokens) or
         !generatedDmlOptionalTokenRangeEqual(a.subquery_projection_tokens, b.subquery_projection_tokens) or
         !generatedDmlOptionalTokenRangeEqual(a.subquery_source_tokens, b.subquery_source_tokens) or
+        !generatedDmlOptionalTokenRangeEqual(a.subquery_source_table_tokens, b.subquery_source_table_tokens) or
+        !generatedDmlOptionalTokenRangeEqual(a.subquery_source_alias_tokens, b.subquery_source_alias_tokens) or
+        !generatedDmlOptionalTokenRangeEqual(a.subquery_source_alias_name_tokens, b.subquery_source_alias_name_tokens) or
         !generatedDmlOptionalTokenRangeEqual(a.subquery_where_tokens, b.subquery_where_tokens) or
         !generatedDmlOptionalTokenRangeEqual(a.subquery_set_operation_tokens, b.subquery_set_operation_tokens) or
         !generatedDmlOptionalTokenRangeEqual(a.function_name_tokens, b.function_name_tokens) or
@@ -2509,21 +2516,6 @@ fn lowerGeneratedDmlGraphTableFunctionCteAlloc(
     }
     const antfly_item = matching_antfly_item orelse return error.UnsupportedSqlShape;
     return try query_function.lowerAntflyGraphTableFunctionGeneratedAstAlloc(alloc, tokens, antfly_item, graph_item);
-}
-
-fn parseDataModifyingCteMutationSourceAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    parser_options: MergeMutationParserOptions,
-) !plan_mod.LoweredMutationSource {
-    var generated = try generated_parser.parseGeneratedGateTokensStrictAlloc(alloc, tokens) orelse return error.UnsupportedSqlShape;
-    defer generated.deinit(alloc);
-    const generated_dml = if (generated.ast) |*generated_ast| switch (generated_ast.*) {
-        .dml => |*dml| dml,
-        else => return error.UnsupportedSqlShape,
-    } else return error.UnsupportedSqlShape;
-    return try parseDataModifyingCteMutationSourceWithGeneratedDmlAstAlloc(alloc, tokens, pos, parser_options, generated_dml);
 }
 
 fn parseDataModifyingCteMutationSourceWithGeneratedDmlAstAlloc(
@@ -4222,15 +4214,40 @@ fn generatedDmlSemijoinSourceTableRange(
     return range;
 }
 
-fn validateGeneratedDmlSemijoinSourceTableAliasAlloc(
+fn generatedDmlSemijoinSourceAliasAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
-    range: generated_parser.GeneratedSqlTokenRange,
-    source_table: plan_mod.TableAlias,
-) !void {
-    const name = try grammar.normalizeSqlObjectIdentifierAlloc(alloc, tokens[range.start].text);
-    defer alloc.free(name);
-    if (!std.mem.eql(u8, source_table.name, name)) return error.UnsupportedSqlShape;
+    pos: *usize,
+    maybe_ast: ?*const generated_parser.GeneratedSqlDmlAst,
+) !?plan_mod.TableAlias {
+    const ast = maybe_ast orelse return null;
+    const dml_source_table = (try generatedDmlSemijoinSourceTableRange(tokens, pos.*, ast)) orelse return null;
+    const subquery = (try generatedDmlSemijoinSubqueryExpression(tokens, &ast.where_expression)) orelse return error.UnsupportedSqlShape;
+    const source_range = subquery.subquery_source_tokens orelse return error.UnsupportedSqlShape;
+    if (source_range.start != pos.* or source_range.start >= source_range.end or source_range.end > tokens.len) return error.UnsupportedSqlShape;
+    const source_table = subquery.subquery_source_table_tokens orelse return error.UnsupportedSqlShape;
+    if (!generatedDmlTokenRangeEql(source_table, dml_source_table)) return error.UnsupportedSqlShape;
+    const alias_end = try generatedDmlReadBodySingleSourceAliasEnd(
+        tokens,
+        source_table,
+        subquery.subquery_source_alias_tokens,
+        subquery.subquery_source_alias_name_tokens,
+    );
+    if (alias_end != source_range.end) return error.UnsupportedSqlShape;
+    const name = try grammar.normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_table.start].text);
+    var name_transferred = false;
+    errdefer if (!name_transferred) alloc.free(name);
+    const alias = if (subquery.subquery_source_alias_name_tokens) |alias_name| alias: {
+        if (alias_name.start >= alias_name.end or alias_name.end != alias_end or alias_name.end != alias_name.start + 1) return error.UnsupportedSqlShape;
+        if (tokens[alias_name.start].kind != .identifier) return error.UnsupportedSqlShape;
+        break :alias try alloc.dupe(u8, tokens[alias_name.start].text);
+    } else try alloc.dupe(u8, name);
+    var alias_transferred = false;
+    errdefer if (!alias_transferred) alloc.free(alias);
+    name_transferred = true;
+    alias_transferred = true;
+    pos.* = alias_end;
+    return .{ .name = name, .alias = alias };
 }
 
 fn generatedDmlSemijoinSubqueryExpression(
@@ -4351,9 +4368,10 @@ fn classifyGeneratedUpdateSelectorFromDmlAstAlloc(
     const where_range = ast.where_tokens orelse return .source;
     if (where_range.start == 0 or where_range.start >= where_range.end or where_range.end > end) return error.UnsupportedSqlShape;
     if (!tokens[where_range.start - 1].matchesKeywordTag(.where)) return error.UnsupportedSqlShape;
+    try validateGeneratedDmlWhereExpressionMetadata(tokens, end, ast);
     const selector_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
     var pos = where_range.start;
-    const where_json = parsePointWhereJsonAlloc(alloc, tokens[0..where_range.end], &pos, params, schema, &selector_qualifiers, 0, null) catch |err| switch (err) {
+    const where_json = parsePointWhereJsonAlloc(alloc, tokens[0..where_range.end], &pos, params, schema, &selector_qualifiers, 0, &ast.where_expression) catch |err| switch (err) {
         error.UnsupportedSqlShape => return .source,
         else => return err,
     };
@@ -4383,9 +4401,10 @@ fn classifyGeneratedDeleteSelectorFromDmlAstAlloc(
     const where_range = ast.where_tokens orelse return .source;
     if (where_range.start == 0 or where_range.start >= where_range.end or where_range.end > end) return error.UnsupportedSqlShape;
     if (!tokens[where_range.start - 1].matchesKeywordTag(.where)) return error.UnsupportedSqlShape;
+    try validateGeneratedDmlWhereExpressionMetadata(tokens, end, ast);
     const selector_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
     var pos = where_range.start;
-    const where_json = parsePointWhereJsonAlloc(alloc, tokens[0..where_range.end], &pos, params, schema, &selector_qualifiers, 0, null) catch |err| switch (err) {
+    const where_json = parsePointWhereJsonAlloc(alloc, tokens[0..where_range.end], &pos, params, schema, &selector_qualifiers, 0, &ast.where_expression) catch |err| switch (err) {
         error.UnsupportedSqlShape => return .source,
         else => return err,
     };
@@ -6532,7 +6551,14 @@ pub fn parseConflictAssignmentExpressionAlloc(
     } else if (column.field_type == .numeric) {
         try options.type_context.validateNumericRowExpression(expression);
     }
-    try expr_generated_validate.validateGeneratedRowExpressionIdentityStrict(tokens, start, pos.*, expression, options.generated_expression_ast);
+    try expr_generated_validate.validateGeneratedRowExpressionIdentityStrictWithContext(
+        .{ .alloc = alloc, .params = options.params },
+        tokens,
+        start,
+        pos.*,
+        expression,
+        options.generated_expression_ast,
+    );
     expression_owned = false;
     return expression;
 }
@@ -10637,12 +10663,11 @@ pub fn parseSemiJoinSourceSubqueryHeaderAlloc(
     if (parsed_source_fields.items.len != target_fields.len) return error.UnsupportedSqlShape;
 
     try parser.expectKeywordTag(tokens, pos, .from);
-    const generated_source_table = try generatedDmlSemijoinSourceTableRange(tokens, pos.*, generated_dml_ast);
-    const source_table = try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
+    const source_table = if (try generatedDmlSemijoinSourceAliasAlloc(alloc, tokens, pos, generated_dml_ast)) |generated_source|
+        generated_source
+    else
+        try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
     errdefer freeTableAlias(alloc, source_table);
-    if (generated_source_table) |range| {
-        try validateGeneratedDmlSemijoinSourceTableAliasAlloc(alloc, tokens, range, source_table);
-    }
 
     const source_qualifiers = [_][]const u8{ source_table.name, source_table.alias };
     var source_fields = std.ArrayListUnmanaged([]const u8).empty;
@@ -10692,12 +10717,11 @@ pub fn parseExistsSemiJoinSourceTableAlloc(
     }
     if (!saw_select_item) return error.UnsupportedSqlShape;
     try parser.expectKeywordTag(tokens, pos, .from);
-    const generated_source_table = try generatedDmlSemijoinSourceTableRange(tokens, pos.*, generated_dml_ast);
-    const source_table = try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
+    const source_table = if (try generatedDmlSemijoinSourceAliasAlloc(alloc, tokens, pos, generated_dml_ast)) |generated_source|
+        generated_source
+    else
+        try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
     errdefer freeTableAlias(alloc, source_table);
-    if (generated_source_table) |range| {
-        try validateGeneratedDmlSemijoinSourceTableAliasAlloc(alloc, tokens, range, source_table);
-    }
     return source_table;
 }
 
@@ -10771,7 +10795,7 @@ pub fn parseExistsSemiJoinMutationTailAlloc(
                 target_query.row_claim.?.wait_policy = generated_claim.wait_policy;
                 target_query.row_claim.?.skip_locked = generated_claim.skip_locked;
             } else {
-                row_claim_mod.setSqlRowClaimClause(&target_query.row_claim.?, try grammar.parseExclusiveForRowClaimClauseAlloc(alloc, tokens, pos, &target_qualifiers));
+                return error.UnsupportedSqlShape;
             }
         } else if (parser.matchKeywordTag(tokens, pos, .returning)) {
             if (saw_returning) return error.UnsupportedSqlShape;
@@ -10911,7 +10935,7 @@ pub fn parseSemiJoinMutationSourceAlloc(
                 target_query.row_claim.?.wait_policy = generated_claim.wait_policy;
                 target_query.row_claim.?.skip_locked = generated_claim.skip_locked;
             } else {
-                row_claim_mod.setSqlRowClaimClause(&target_query.row_claim.?, try grammar.parseExclusiveForRowClaimClauseAlloc(alloc, tokens, pos, &target_qualifiers));
+                return error.UnsupportedSqlShape;
             }
         } else if (parser.matchKeywordTag(tokens, pos, .returning)) {
             if (saw_returning) return error.UnsupportedSqlShape;
@@ -11202,6 +11226,7 @@ pub fn parseUpdateJoinedMutationSourceWithCtesAlloc(
     defer options.context_hooks.set_context(options.context_hooks.ptr, previous_context);
 
     var saw_primary_key_assignment = false;
+    if (options.generated_dml_ast != null and options.generated_assignment_items == null) return error.UnsupportedSqlShape;
     if (options.generated_assignment_items) |generated_assignment_items| {
         const generated_assignments = try validateGeneratedUpdateAssignmentHookRange(tokens, pos.*, options.generated_dml_ast, generated_assignment_items);
         try parseGeneratedJoinedMutationSetAssignmentsAlloc(
@@ -11343,6 +11368,7 @@ pub fn parseUpdateJoinedMutationSourceWithCtesAlloc(
         .returning_qualifiers = &.{ target_table.name, target_table.alias },
         .string_to_array_predicate_is_containment = options.string_to_array_predicate_is_containment,
         .expression_where_options = options.expression_where_options,
+        .order_expression_hooks = options.order_expression_hooks,
         .returning_hooks = options.joined_returning_hooks,
         .realtime_ns = options.realtime_ns,
         .generated_dml_ast = options.generated_dml_ast,
@@ -11476,6 +11502,7 @@ pub fn parseDeleteJoinedMutationSourceWithCtesAlloc(
         .returning_qualifiers = &.{ target_table.name, target_table.alias },
         .string_to_array_predicate_is_containment = options.string_to_array_predicate_is_containment,
         .expression_where_options = options.expression_where_options,
+        .order_expression_hooks = options.order_expression_hooks,
         .returning_hooks = options.joined_returning_hooks,
         .realtime_ns = options.realtime_ns,
         .generated_dml_ast = options.generated_dml_ast,
@@ -12294,17 +12321,49 @@ pub fn parseJoinedMutationTailAlloc(
             }
         } else if (parser.matchKeywordTag(tokens, pos, .order)) {
             if (saw_returning) return error.UnsupportedSqlShape;
+            const order_keyword_index = pos.* - 1;
             try parser.expectKeywordTag(tokens, pos, .by);
-            try expr_order.parseTargetByAlloc(alloc, tokens, pos, options.schema, &order_by, options.target_alias);
+            if (try generatedDmlOrderReadAstForClause(tokens, order_keyword_index, pos.*, options.generated_dml_ast)) |generated_order_read| {
+                const order_by_options = expr_order.ByParserOptions{
+                    .schema = options.schema,
+                    .field_expression_qualifiers = &.{options.target_alias},
+                    .returning_expression_qualifiers = options.returning_qualifiers,
+                    .type_context = .{
+                        .alloc = alloc,
+                        .schema = options.schema,
+                    },
+                    .order_expression_hooks = options.order_expression_hooks,
+                    .generated_read_ast = &generated_order_read,
+                };
+                try expr_order.parseByAlloc(alloc, tokens, pos, &order_by, order_by_options);
+                if (pos.* != generated_order_read.order_tokens.?.end) return error.UnsupportedSqlShape;
+            } else {
+                return error.UnsupportedSqlShape;
+            }
         } else if (parser.matchKeywordTag(tokens, pos, .limit)) {
             if (saw_returning) return error.UnsupportedSqlShape;
-            limit = try sql_value.parseLimitValue(tokens, pos, options.params);
+            const keyword_index = pos.* - 1;
+            if (try parseGeneratedDmlLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_dml_ast)) |generated_limit| {
+                limit = generated_limit;
+            } else {
+                return error.UnsupportedSqlShape;
+            }
         } else if (parser.matchKeywordTag(tokens, pos, .offset)) {
             if (saw_returning) return error.UnsupportedSqlShape;
-            offset = try sql_value.parseOffsetValue(tokens, pos, options.params);
+            const keyword_index = pos.* - 1;
+            if (try parseGeneratedDmlOffsetValueForClause(tokens, keyword_index, pos, options.params, options.generated_dml_ast)) |generated_offset| {
+                offset = generated_offset;
+            } else {
+                return error.UnsupportedSqlShape;
+            }
         } else if (parser.matchKeywordTag(tokens, pos, .fetch)) {
             if (saw_returning) return error.UnsupportedSqlShape;
-            limit = try sql_value.parseFetchLimitValue(tokens, pos, options.params);
+            const keyword_index = pos.* - 1;
+            if (try parseGeneratedDmlFetchLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_dml_ast)) |generated_limit| {
+                limit = generated_limit;
+            } else {
+                return error.UnsupportedSqlShape;
+            }
         } else if (parser.matchKeywordTag(tokens, pos, .@"for")) {
             if (saw_returning) return error.UnsupportedSqlShape;
             const keyword_index = pos.* - 1;
@@ -12313,7 +12372,7 @@ pub fn parseJoinedMutationTailAlloc(
                 row_claim.wait_policy = generated_claim.wait_policy;
                 row_claim.skip_locked = generated_claim.skip_locked;
             } else {
-                row_claim_mod.setSqlRowClaimClause(&row_claim, try grammar.parseExclusiveForRowClaimClauseAlloc(alloc, tokens, pos, options.returning_qualifiers));
+                return error.UnsupportedSqlShape;
             }
         } else if (parser.matchKeywordTag(tokens, pos, .returning)) {
             if (saw_returning) return error.UnsupportedSqlShape;
@@ -12581,18 +12640,16 @@ fn parseGeneratedDmlRowClaimForClauseAlloc(
     const range = ast.mutation_row_lock_tokens orelse return error.UnsupportedSqlShape;
     if (range.start != keyword_index or range.start + 1 != pos.* or range.end > tokens.len) return error.UnsupportedSqlShape;
     try validateGeneratedDmlMutationRowLockClauseLayout(tokens, range, ast.mutation_row_lock_mode, ast.mutation_row_lock_wait_policy);
-    const scoped_tokens = tokens[0..range.end];
-    var generated_pos = pos.*;
-    const clause = try grammar.parseExclusiveForRowClaimClauseAlloc(alloc, scoped_tokens, &generated_pos, allowed_targets);
-    if (generated_pos != range.end) return error.UnsupportedSqlShape;
+    try validateGeneratedDmlMutationRowLockTargets(alloc, tokens, range, allowed_targets);
     pos.* = range.end;
-    const claim = row_claim_mod.sqlRowClaimForClause(clause);
-    if (row_claim_mod.rowClaimModeForGeneratedMode(ast.mutation_row_lock_mode orelse return error.UnsupportedSqlShape) != claim.mode or
-        row_claim_mod.rowClaimWaitPolicyForGeneratedPolicy(ast.mutation_row_lock_wait_policy orelse return error.UnsupportedSqlShape) != claim.wait_policy)
-    {
-        return error.UnsupportedSqlShape;
-    }
-    return claim;
+    const mode = row_claim_mod.rowClaimModeForGeneratedMode(ast.mutation_row_lock_mode orelse return error.UnsupportedSqlShape);
+    if (!mode.isExclusiveWriteClaim()) return error.UnsupportedSqlShape;
+    const wait_policy = row_claim_mod.rowClaimWaitPolicyForGeneratedPolicy(ast.mutation_row_lock_wait_policy orelse return error.UnsupportedSqlShape);
+    return .{
+        .mode = mode,
+        .wait_policy = wait_policy,
+        .skip_locked = wait_policy == .skip_locked,
+    };
 }
 
 pub fn parseMutationSourceQueryTailAlloc(
@@ -12795,7 +12852,7 @@ pub fn parseMutationSourceQueryTailAlloc(
                 try expr_order.parseByAlloc(alloc, tokens, pos, &order_by, order_by_options);
                 if (pos.* != generated_order_read.order_tokens.?.end) return error.UnsupportedSqlShape;
             } else {
-                try expr_order.parseByAlloc(alloc, tokens, pos, &order_by, order_by_options);
+                return error.UnsupportedSqlShape;
             }
         } else if (parser.matchKeywordTag(tokens, pos, .limit)) {
             if (saw_returning) return error.UnsupportedSqlShape;
@@ -12803,7 +12860,7 @@ pub fn parseMutationSourceQueryTailAlloc(
             if (try parseGeneratedDmlLimitValueForClause(tokens, keyword_index, pos, params, generated_dml_ast)) |generated_limit| {
                 limit = generated_limit;
             } else {
-                limit = try sql_value.parseLimitValue(tokens, pos, params);
+                return error.UnsupportedSqlShape;
             }
         } else if (parser.matchKeywordTag(tokens, pos, .offset)) {
             if (saw_returning) return error.UnsupportedSqlShape;
@@ -12811,7 +12868,7 @@ pub fn parseMutationSourceQueryTailAlloc(
             if (try parseGeneratedDmlOffsetValueForClause(tokens, keyword_index, pos, params, generated_dml_ast)) |generated_offset| {
                 offset = generated_offset;
             } else {
-                offset = try sql_value.parseOffsetValue(tokens, pos, params);
+                return error.UnsupportedSqlShape;
             }
         } else if (parser.matchKeywordTag(tokens, pos, .fetch)) {
             if (saw_returning) return error.UnsupportedSqlShape;
@@ -12819,7 +12876,7 @@ pub fn parseMutationSourceQueryTailAlloc(
             if (try parseGeneratedDmlFetchLimitValueForClause(tokens, keyword_index, pos, params, generated_dml_ast)) |generated_limit| {
                 limit = generated_limit;
             } else {
-                limit = try sql_value.parseFetchLimitValue(tokens, pos, params);
+                return error.UnsupportedSqlShape;
             }
         } else if (parser.matchKeywordTag(tokens, pos, .@"for")) {
             if (saw_returning) return error.UnsupportedSqlShape;
@@ -12829,7 +12886,7 @@ pub fn parseMutationSourceQueryTailAlloc(
                 owned_row_claim.wait_policy = generated_claim.wait_policy;
                 owned_row_claim.skip_locked = generated_claim.skip_locked;
             } else {
-                row_claim_mod.setSqlRowClaimClause(&owned_row_claim, try grammar.parseExclusiveForRowClaimClauseAlloc(alloc, tokens, pos, returning_qualifiers));
+                return error.UnsupportedSqlShape;
             }
         } else if (parser.matchKeywordTag(tokens, pos, .returning)) {
             if (saw_returning) return error.UnsupportedSqlShape;
@@ -13807,6 +13864,7 @@ pub fn parseUpdateMutationSourceAlloc(
         .value = options.assignment_value_hooks,
         .primary_key_assignment = .{ .mark_rewrite = &rewrite_identity },
     };
+    if (options.generated_dml_ast != null and options.generated_assignment_items == null) return error.UnsupportedSqlShape;
     if (options.generated_assignment_items) |generated_assignment_items| {
         const generated_assignments = try validateGeneratedUpdateAssignmentHookRange(tokens, pos.*, options.generated_dml_ast, generated_assignment_items);
         try parseGeneratedMutationSourceUpdateSetAssignmentsAlloc(
@@ -13997,8 +14055,17 @@ pub fn parseTruncateMutationSourceAlloc(
     pos: *usize,
     schema: runtime_schema.TableSchema,
     row_claim: db_mod.types.RowClaimRequest,
+    generated_dml_ast: ?*const generated_parser.GeneratedSqlDmlAst,
 ) !plan_mod.LoweredMutationSource {
-    var syntax = try grammar.parseTruncateMutationSourceSqlAlloc(alloc, tokens, pos);
+    var syntax = if (generated_dml_ast) |ast| blk: {
+        const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+        var generated_syntax = try truncateSyntaxFromGeneratedDmlAstAlloc(alloc, tokens, ast.*);
+        errdefer generated_syntax.deinit(alloc);
+        pos.* = end;
+        _ = parser.matchToken(tokens, pos, .semicolon);
+        if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
+        break :blk generated_syntax;
+    } else try grammar.parseTruncateMutationSourceSqlAlloc(alloc, tokens, pos);
     return try truncateMutationSourceFromSyntaxAlloc(alloc, &syntax, schema, row_claim);
 }
 
@@ -15446,15 +15513,65 @@ fn requireGeneratedDmlWriteFamily(
     allowed_kinds: []const sql_statement_kind.SqlWriteStatementKind,
     expected_recursive: ?bool,
 ) !void {
-    if (parsed_sql.generatedStatementKind() != .dml) return;
+    _ = try generatedDmlAstForRequiredWriteFamily(parsed_sql, allowed_kinds, expected_recursive);
+}
+
+fn generatedDmlAstForRequiredWriteFamily(
+    parsed_sql: *const tokenized.ParsedSql,
+    allowed_kinds: []const sql_statement_kind.SqlWriteStatementKind,
+    expected_recursive: ?bool,
+) !?*const generated_parser.GeneratedSqlDmlAst {
+    if (parsed_sql.generatedStatementKind() != .dml) return null;
     const published = parsed_sql.writeStatementIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
     if (expected_recursive) |recursive| {
         if (published.recursive != recursive) return error.UnsupportedSqlShape;
     }
+    var allowed_match = false;
     for (allowed_kinds) |allowed| {
-        if (published.kind == allowed) return;
+        if (published.kind == allowed) {
+            allowed_match = true;
+            break;
+        }
+    }
+    if (!allowed_match) return error.UnsupportedSqlShape;
+    switch (parsed_sql.statement) {
+        .write => |statement| {
+            if (statement.kind != published.kind or statement.recursive != published.recursive) return error.UnsupportedSqlShape;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            return switch (generated_ast.*) {
+                .dml => |*dml| blk: {
+                    if (dml.cte_recursive != published.recursive) return error.UnsupportedSqlShape;
+                    if (!generatedDmlAstMatchesWriteKind(dml.kind, published.kind)) return error.UnsupportedSqlShape;
+                    break :blk dml;
+                },
+                else => error.UnsupportedSqlShape,
+            };
+        }
     }
     return error.UnsupportedSqlShape;
+}
+
+fn insertValuesLoweredInsertFromGeneratedDmlAstAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    dml_ast: generated_parser.GeneratedSqlDmlAst,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+) !plan_mod.LoweredInsert {
+    if ((try generatedDmlListExpressionsContainSubquery(&dml_ast.insert_value_rows)) or
+        (try generatedDmlListExpressionsContainSubquery(&dml_ast.conflict_assignment_items)))
+    {
+        return error.UnsupportedSqlShape;
+    }
+    return insertValuesFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast, schema, params, options) catch |err| switch (err) {
+        error.InvalidRowsRequest => error.UnsupportedSqlShape,
+        else => err,
+    };
 }
 
 pub fn buildMergeMutationBatchAlloc(
@@ -16866,23 +16983,21 @@ fn lowerRecursiveInsertSourceWithSchemasParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !plan_mod.LoweredRecursiveInsertSource {
-    const parser_context = @import("parser_context.zig");
-
-    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = parsed_sql.items(),
-        .schema = target_schema,
-        .joined_source_schema = source_schema,
-        .insert_source_allows_different_table = true,
-        .params = params,
-        .unique_resolver = unique_resolver,
-    };
-    return parser_context.ParserState.ContextAccessors.parseRecursiveInsertSource(&parser_state) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        else => return err,
-    };
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{.insert_source}, true)) |dml_ast| {
+        var lowered = try lowerWritePlanFromGeneratedDmlAstDirectAlloc(alloc, parsed_sql, dml_ast.*, target_schema, params, .{
+            .unique_resolver = unique_resolver,
+            .insert_source_schema = source_schema,
+        });
+        errdefer lowered.deinit(alloc);
+        return switch (lowered) {
+            .recursive_insert_source => |plan| blk: {
+                lowered = undefined;
+                break :blk plan;
+            },
+            else => error.UnsupportedSqlShape,
+        };
+    }
+    return error.UnsupportedSqlShape;
 }
 
 fn lowerInsertWithResolverParsedSqlForDmlTestAlloc(
@@ -16892,20 +17007,12 @@ fn lowerInsertWithResolverParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !plan_mod.LoweredInsert {
-    const parser_context = @import("parser_context.zig");
-
-    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = parsed_sql.items(),
-        .schema = schema,
-        .params = params,
-        .unique_resolver = unique_resolver,
-    };
-    return parser_context.ParserState.ContextAccessors.parseInsert(&parser_state) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        else => return err,
-    };
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{.insert}, false)) |dml_ast| {
+        return try insertValuesLoweredInsertFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast.*, schema, params, .{
+            .unique_resolver = unique_resolver,
+        });
+    }
+    return error.UnsupportedSqlShape;
 }
 
 fn lowerInsertParsedSqlForDmlTestAlloc(
@@ -16914,19 +17021,10 @@ fn lowerInsertParsedSqlForDmlTestAlloc(
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
 ) !plan_mod.LoweredInsert {
-    const parser_context = @import("parser_context.zig");
-
-    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = parsed_sql.items(),
-        .schema = schema,
-        .params = params,
-    };
-    return parser_context.ParserState.ContextAccessors.parseInsert(&parser_state) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        else => return err,
-    };
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{.insert}, false)) |dml_ast| {
+        return try insertValuesLoweredInsertFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast.*, schema, params, .{});
+    }
+    return error.UnsupportedSqlShape;
 }
 
 fn lowerInsertSourceWithResolverParsedSqlForDmlTestAlloc(
@@ -16936,26 +17034,12 @@ fn lowerInsertSourceWithResolverParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !plan_mod.LoweredInsertSource {
-    const parser_context = @import("parser_context.zig");
-
-    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = parsed_sql.items(),
-        .schema = schema,
-        .params = params,
-        .unique_resolver = unique_resolver,
-    };
-    return parseInsertSourceAlloc(
-        alloc,
-        parsed_sql.items(),
-        &parser_state.pos,
-        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
-        parser_context.ParserState.ContextAccessors.insertSourceParserHooks(&parser_state),
-    ) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        else => return err,
-    };
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{.insert_source}, false)) |dml_ast| {
+        return try insertSourceFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast.*, schema, params, .{
+            .unique_resolver = unique_resolver,
+        });
+    }
+    return error.UnsupportedSqlShape;
 }
 
 fn lowerInsertSourceWithSchemasParsedSqlForDmlTestAlloc(
@@ -16966,29 +17050,13 @@ fn lowerInsertSourceWithSchemasParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !plan_mod.LoweredInsertSource {
-    const parser_context = @import("parser_context.zig");
-
-    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = parsed_sql.items(),
-        .schema = target_schema,
-        .joined_source_schema = source_schema,
-        .insert_source_allows_different_table = true,
-        .params = params,
-        .unique_resolver = unique_resolver,
-    };
-    return parseInsertSourceAlloc(
-        alloc,
-        parsed_sql.items(),
-        &parser_state.pos,
-        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
-        parser_context.ParserState.ContextAccessors.insertSourceParserHooks(&parser_state),
-    ) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        else => return err,
-    };
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{.insert_source}, false)) |dml_ast| {
+        return try insertSourceFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast.*, target_schema, params, .{
+            .unique_resolver = unique_resolver,
+            .insert_source_schema = source_schema,
+        });
+    }
+    return error.UnsupportedSqlShape;
 }
 
 fn lowerUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(
@@ -16999,29 +17067,13 @@ fn lowerUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredJoinedMutationSource {
-    const parser_context = @import("parser_context.zig");
-
-    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = parsed_sql.items(),
-        .schema = target_schema,
-        .joined_source_schema = source_schema,
-        .params = params,
-        .mutation_claim = row_claim,
-    };
-    return parseJoinedMutationSourceAlloc(
-        alloc,
-        parsed_sql.items(),
-        &parser_state.pos,
-        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
-        parser_context.ParserState.ContextAccessors.updateJoinedMutationSourceParserHooks(&parser_state),
-    ) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
-        else => return err,
-    };
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{.update_joined_source}, false)) |dml_ast| {
+        return try updateJoinedSourceFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast.*, target_schema, params, .{
+            .joined_source_schema = source_schema,
+            .row_claim = row_claim,
+        });
+    }
+    return error.UnsupportedSqlShape;
 }
 
 fn lowerUpdateParsedSqlForDmlTestAlloc(
@@ -17031,20 +17083,18 @@ fn lowerUpdateParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !plan_mod.LoweredMutation {
-    const parser_context = @import("parser_context.zig");
-
-    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = parsed_sql.items(),
-        .schema = schema,
-        .params = params,
-        .unique_resolver = unique_resolver,
-    };
-    return parser_context.ParserState.ContextAccessors.parseUpdate(&parser_state) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        else => return err,
-    };
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{.update}, false)) |dml_ast| {
+        if (try classifyGeneratedUpdateSelectorFromDmlAstAlloc(alloc, parsed_sql.items(), dml_ast.*, schema, params, unique_resolver) != .point) {
+            return error.UnsupportedSqlShape;
+        }
+        return updatePointFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast.*, schema, params, .{
+            .unique_resolver = unique_resolver,
+        }) catch |err| switch (err) {
+            error.InvalidRowsRequest => error.UnsupportedSqlShape,
+            else => err,
+        };
+    }
+    return error.UnsupportedSqlShape;
 }
 
 fn lowerUpdateMutationSourceParsedSqlForDmlTestAlloc(
@@ -17054,20 +17104,13 @@ fn lowerUpdateMutationSourceParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredMutationSource {
-    const parser_context = @import("parser_context.zig");
-
-    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = parsed_sql.items(),
-        .schema = schema,
-        .params = params,
-        .mutation_claim = row_claim,
-    };
-    return parser_context.ParserState.ContextAccessors.parseUpdateMutationSource(&parser_state) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
-        else => return err,
-    };
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{ .update, .update_source }, false)) |dml_ast| {
+        const write_kind = (parsed_sql.writeStatementIncludingGeneratedAst() orelse return error.UnsupportedSqlShape).kind;
+        return try updateSourceFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast.*, schema, params, .{
+            .row_claim = row_claim,
+        }, write_kind);
+    }
+    return error.UnsupportedSqlShape;
 }
 
 fn lowerDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(
@@ -17078,29 +17121,13 @@ fn lowerDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredJoinedMutationSource {
-    const parser_context = @import("parser_context.zig");
-
-    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = parsed_sql.items(),
-        .schema = target_schema,
-        .joined_source_schema = source_schema,
-        .params = params,
-        .mutation_claim = row_claim,
-    };
-    return parseJoinedMutationSourceAlloc(
-        alloc,
-        parsed_sql.items(),
-        &parser_state.pos,
-        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
-        parser_context.ParserState.ContextAccessors.deleteJoinedMutationSourceParserHooks(&parser_state),
-    ) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
-        else => return err,
-    };
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{.delete_joined_source}, false)) |dml_ast| {
+        return try deleteJoinedSourceFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast.*, target_schema, params, .{
+            .joined_source_schema = source_schema,
+            .row_claim = row_claim,
+        });
+    }
+    return error.UnsupportedSqlShape;
 }
 
 fn lowerDeleteParsedSqlForDmlTestAlloc(
@@ -17110,20 +17137,15 @@ fn lowerDeleteParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !plan_mod.LoweredMutation {
-    const parser_context = @import("parser_context.zig");
-
-    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = parsed_sql.items(),
-        .schema = schema,
-        .params = params,
-        .unique_resolver = unique_resolver,
-    };
-    return parser_context.ParserState.ContextAccessors.parseDelete(&parser_state) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        else => return err,
-    };
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{.delete}, false)) |dml_ast| {
+        if (try classifyGeneratedDeleteSelectorFromDmlAstAlloc(alloc, parsed_sql.items(), dml_ast.*, schema, params, unique_resolver) != .point) {
+            return error.UnsupportedSqlShape;
+        }
+        return try deletePointFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast.*, schema, params, .{
+            .unique_resolver = unique_resolver,
+        });
+    }
+    return error.UnsupportedSqlShape;
 }
 
 fn lowerDeleteMutationSourceParsedSqlForDmlTestAlloc(
@@ -17133,20 +17155,13 @@ fn lowerDeleteMutationSourceParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredMutationSource {
-    const parser_context = @import("parser_context.zig");
-
-    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = parsed_sql.items(),
-        .schema = schema,
-        .params = params,
-        .mutation_claim = row_claim,
-    };
-    return parser_context.ParserState.ContextAccessors.parseDeleteMutationSource(&parser_state) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
-        else => return err,
-    };
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{ .delete, .delete_source }, false)) |dml_ast| {
+        const write_kind = (parsed_sql.writeStatementIncludingGeneratedAst() orelse return error.UnsupportedSqlShape).kind;
+        return try deleteSourceFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast.*, schema, params, .{
+            .row_claim = row_claim,
+        }, write_kind);
+    }
+    return error.UnsupportedSqlShape;
 }
 
 fn lowerTruncateMutationSourceParsedSqlForDmlTestAlloc(
@@ -17155,20 +17170,20 @@ fn lowerTruncateMutationSourceParsedSqlForDmlTestAlloc(
     schema: runtime_schema.TableSchema,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredMutationSource {
-    const parser_context = @import("parser_context.zig");
-
-    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = parsed_sql.items(),
-        .schema = schema,
-        .mutation_claim = row_claim,
-    };
-    return parser_context.ParserState.ContextAccessors.parseTruncateMutationSource(&parser_state) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        else => return err,
-    };
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{.truncate}, false)) |dml_ast| {
+        var lowered = try lowerWritePlanFromGeneratedDmlAstDirectAlloc(alloc, parsed_sql, dml_ast.*, schema, &.{}, .{
+            .row_claim = row_claim,
+        });
+        errdefer lowered.deinit(alloc);
+        return switch (lowered) {
+            .truncate_source => |plan| blk: {
+                lowered = undefined;
+                break :blk plan;
+            },
+            else => error.UnsupportedSqlShape,
+        };
+    }
+    return error.UnsupportedSqlShape;
 }
 
 fn lowerMergeMutationPlanParsedSqlForDmlTestAlloc(
@@ -17178,24 +17193,12 @@ fn lowerMergeMutationPlanParsedSqlForDmlTestAlloc(
     source_schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
 ) !plan_mod.LoweredMergeMutationPlan {
-    const parser_context = @import("parser_context.zig");
-
-    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = parsed_sql.items(),
-        .schema = target_schema,
-        .joined_source_schema = source_schema,
-        .params = params,
-    };
-    return try parseMergeMutationPlanAlloc(
-        alloc,
-        parsed_sql.items(),
-        &parser_state.pos,
-        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
-        parser_context.ParserState.ContextAccessors.mergeMutationParserOptions(&parser_state),
-    );
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{.merge}, false)) |dml_ast| {
+        return try mergeMutationFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast.*, target_schema, params, .{
+            .joined_source_schema = source_schema,
+        });
+    }
+    return error.UnsupportedSqlShape;
 }
 
 fn lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(
@@ -17206,23 +17209,21 @@ fn lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredRecursiveJoinedMutationSource {
-    const parser_context = @import("parser_context.zig");
-
-    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = parsed_sql.items(),
-        .schema = target_schema,
-        .joined_source_schema = source_schema,
-        .params = params,
-        .mutation_claim = row_claim,
-    };
-    return parser_context.ParserState.ContextAccessors.parseRecursiveUpdateJoinedMutationSource(&parser_state) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        else => return err,
-    };
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{.update_joined_source}, true)) |dml_ast| {
+        var lowered = try lowerWritePlanFromGeneratedDmlAstDirectAlloc(alloc, parsed_sql, dml_ast.*, target_schema, params, .{
+            .joined_source_schema = source_schema,
+            .row_claim = row_claim,
+        });
+        errdefer lowered.deinit(alloc);
+        return switch (lowered) {
+            .recursive_update_joined_source => |plan| blk: {
+                lowered = undefined;
+                break :blk plan;
+            },
+            else => error.UnsupportedSqlShape,
+        };
+    }
+    return error.UnsupportedSqlShape;
 }
 
 fn lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(
@@ -17233,23 +17234,21 @@ fn lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredRecursiveJoinedMutationSource {
-    const parser_context = @import("parser_context.zig");
-
-    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = parsed_sql.items(),
-        .schema = target_schema,
-        .joined_source_schema = source_schema,
-        .params = params,
-        .mutation_claim = row_claim,
-    };
-    return parser_context.ParserState.ContextAccessors.parseRecursiveDeleteJoinedMutationSource(&parser_state) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        else => return err,
-    };
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{.delete_joined_source}, true)) |dml_ast| {
+        var lowered = try lowerWritePlanFromGeneratedDmlAstDirectAlloc(alloc, parsed_sql, dml_ast.*, target_schema, params, .{
+            .joined_source_schema = source_schema,
+            .row_claim = row_claim,
+        });
+        errdefer lowered.deinit(alloc);
+        return switch (lowered) {
+            .recursive_delete_joined_source => |plan| blk: {
+                lowered = undefined;
+                break :blk plan;
+            },
+            else => error.UnsupportedSqlShape,
+        };
+    }
+    return error.UnsupportedSqlShape;
 }
 
 fn lowerRecursiveMergeMutationWithSchemasParsedSqlForDmlTestAlloc(
@@ -17259,21 +17258,20 @@ fn lowerRecursiveMergeMutationWithSchemasParsedSqlForDmlTestAlloc(
     source_schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
 ) !plan_mod.LoweredRecursiveMergeMutation {
-    const parser_context = @import("parser_context.zig");
-
-    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = parsed_sql.items(),
-        .schema = target_schema,
-        .joined_source_schema = source_schema,
-        .params = params,
-    };
-    return parser_context.ParserState.ContextAccessors.parseRecursiveMergeMutation(&parser_state) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        else => return err,
-    };
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{.merge}, true)) |dml_ast| {
+        var lowered = try lowerWritePlanFromGeneratedDmlAstDirectAlloc(alloc, parsed_sql, dml_ast.*, target_schema, params, .{
+            .joined_source_schema = source_schema,
+        });
+        errdefer lowered.deinit(alloc);
+        return switch (lowered) {
+            .recursive_merge_mutation => |plan| blk: {
+                lowered = undefined;
+                break :blk plan;
+            },
+            else => error.UnsupportedSqlShape,
+        };
+    }
+    return error.UnsupportedSqlShape;
 }
 
 fn lowerWritePlanForDmlTestAlloc(
@@ -17286,6 +17284,18 @@ fn lowerWritePlanForDmlTestAlloc(
     var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
     return try lowerWritePlanParsedSqlForDmlTestAlloc(alloc, &parsed_sql, schema, params, options);
+}
+
+pub fn lowerWritePlanAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+) !plan_mod.LoweredWritePlan {
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerWritePlanParsedSqlAlloc(alloc, &parsed_sql, schema, params, options);
 }
 
 fn lowerGeneratedDmlWritePlanForDmlTestAlloc(
@@ -17380,10 +17390,20 @@ fn lowerWritePlanParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     options: plan_mod.LowerWritePlanOptions,
 ) !plan_mod.LoweredWritePlan {
-    return try lowerWritePlanParsedSqlWithFunctionBindingsForDmlTestAlloc(alloc, parsed_sql, schema, params, options, .{});
+    return try lowerWritePlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, schema, params, options, .{});
 }
 
-fn lowerWritePlanParsedSqlWithFunctionBindingsForDmlTestAlloc(
+pub fn lowerWritePlanParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+) !plan_mod.LoweredWritePlan {
+    return try lowerWritePlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, schema, params, options, .{});
+}
+
+fn lowerWritePlanParsedSqlWithFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
     schema: runtime_schema.TableSchema,
@@ -17401,200 +17421,9 @@ fn lowerWritePlanParsedSqlWithFunctionBindingsForDmlTestAlloc(
         .function_bindings = function_bindings,
         .callbacks = .{
             .lower_generated_dml = lowerWritePlanFromGeneratedDmlAstDirectWithFunctionBindingsAlloc,
-            .lower_recursive_insert_source_with_schemas = lowerRecursiveInsertSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc,
-            .lower_recursive_update_joined_source_with_schemas = lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc,
-            .lower_recursive_delete_joined_source_with_schemas = lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc,
-            .lower_recursive_merge_mutation_with_schemas = lowerRecursiveMergeMutationWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc,
-            .lower_insert_with_resolver = lowerInsertWithResolverParsedSqlForDmlTestWithFunctionBindingsAlloc,
-            .lower_insert_source_with_resolver = lowerInsertSourceWithResolverParsedSqlForDmlTestWithFunctionBindingsAlloc,
-            .lower_insert_source_with_schemas = lowerInsertSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc,
-            .lower_update_joined_source_with_schemas = lowerUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc,
-            .classify_update_selector = classifyUpdateSelectorParsedSqlAlloc,
-            .lower_update_with_resolver = lowerUpdateParsedSqlForDmlTestWithFunctionBindingsAlloc,
-            .lower_update_source = lowerUpdateMutationSourceParsedSqlForDmlTestWithFunctionBindingsAlloc,
-            .lower_delete_joined_source_with_schemas = lowerDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc,
-            .classify_delete_selector = classifyDeleteSelectorParsedSqlAlloc,
-            .lower_delete_with_resolver = lowerDeleteParsedSqlForDmlTestWithFunctionBindingsAlloc,
-            .lower_delete_source = lowerDeleteMutationSourceParsedSqlForDmlTestWithFunctionBindingsAlloc,
-            .lower_truncate_source = lowerTruncateMutationSourceParsedSqlForDmlTestAlloc,
-            .lower_merge_mutation_with_schemas = lowerMergeMutationPlanParsedSqlForDmlTestWithFunctionBindingsAlloc,
         },
     };
     return try context.lowerParsed(parsed_sql, options);
-}
-
-fn lowerRecursiveInsertSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc(
-    alloc: std.mem.Allocator,
-    parsed_sql: *const tokenized.ParsedSql,
-    target_schema: runtime_schema.TableSchema,
-    source_schema: runtime_schema.TableSchema,
-    params: []const sql_value.SqlValue,
-    unique_resolver: relational_rows.UniqueSelectorResolver,
-    function_bindings: expr_row_parse.SqlFunctionBindings,
-) !plan_mod.LoweredRecursiveInsertSource {
-    _ = function_bindings;
-    return try lowerRecursiveInsertSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params, unique_resolver);
-}
-
-fn lowerInsertWithResolverParsedSqlForDmlTestWithFunctionBindingsAlloc(
-    alloc: std.mem.Allocator,
-    parsed_sql: *const tokenized.ParsedSql,
-    schema: runtime_schema.TableSchema,
-    params: []const sql_value.SqlValue,
-    unique_resolver: relational_rows.UniqueSelectorResolver,
-    function_bindings: expr_row_parse.SqlFunctionBindings,
-) !plan_mod.LoweredInsert {
-    _ = function_bindings;
-    return try lowerInsertWithResolverParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, unique_resolver);
-}
-
-fn lowerInsertSourceWithResolverParsedSqlForDmlTestWithFunctionBindingsAlloc(
-    alloc: std.mem.Allocator,
-    parsed_sql: *const tokenized.ParsedSql,
-    schema: runtime_schema.TableSchema,
-    params: []const sql_value.SqlValue,
-    unique_resolver: relational_rows.UniqueSelectorResolver,
-    function_bindings: expr_row_parse.SqlFunctionBindings,
-) !plan_mod.LoweredInsertSource {
-    _ = function_bindings;
-    return try lowerInsertSourceWithResolverParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, unique_resolver);
-}
-
-fn lowerInsertSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc(
-    alloc: std.mem.Allocator,
-    parsed_sql: *const tokenized.ParsedSql,
-    target_schema: runtime_schema.TableSchema,
-    source_schema: runtime_schema.TableSchema,
-    params: []const sql_value.SqlValue,
-    unique_resolver: relational_rows.UniqueSelectorResolver,
-    function_bindings: expr_row_parse.SqlFunctionBindings,
-) !plan_mod.LoweredInsertSource {
-    _ = function_bindings;
-    return try lowerInsertSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params, unique_resolver);
-}
-
-fn lowerUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc(
-    alloc: std.mem.Allocator,
-    parsed_sql: *const tokenized.ParsedSql,
-    target_schema: runtime_schema.TableSchema,
-    source_schema: runtime_schema.TableSchema,
-    params: []const sql_value.SqlValue,
-    row_claim: db_mod.types.RowClaimRequest,
-    function_bindings: expr_row_parse.SqlFunctionBindings,
-) !plan_mod.LoweredJoinedMutationSource {
-    _ = function_bindings;
-    return try lowerUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params, row_claim);
-}
-
-fn lowerUpdateParsedSqlForDmlTestWithFunctionBindingsAlloc(
-    alloc: std.mem.Allocator,
-    parsed_sql: *const tokenized.ParsedSql,
-    schema: runtime_schema.TableSchema,
-    params: []const sql_value.SqlValue,
-    unique_resolver: relational_rows.UniqueSelectorResolver,
-    function_bindings: expr_row_parse.SqlFunctionBindings,
-) !plan_mod.LoweredMutation {
-    _ = function_bindings;
-    return try lowerUpdateParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, unique_resolver);
-}
-
-fn lowerUpdateMutationSourceParsedSqlForDmlTestWithFunctionBindingsAlloc(
-    alloc: std.mem.Allocator,
-    parsed_sql: *const tokenized.ParsedSql,
-    schema: runtime_schema.TableSchema,
-    params: []const sql_value.SqlValue,
-    row_claim: db_mod.types.RowClaimRequest,
-    function_bindings: expr_row_parse.SqlFunctionBindings,
-) !plan_mod.LoweredMutationSource {
-    _ = function_bindings;
-    return try lowerUpdateMutationSourceParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, row_claim);
-}
-
-fn lowerDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc(
-    alloc: std.mem.Allocator,
-    parsed_sql: *const tokenized.ParsedSql,
-    target_schema: runtime_schema.TableSchema,
-    source_schema: runtime_schema.TableSchema,
-    params: []const sql_value.SqlValue,
-    row_claim: db_mod.types.RowClaimRequest,
-    function_bindings: expr_row_parse.SqlFunctionBindings,
-) !plan_mod.LoweredJoinedMutationSource {
-    _ = function_bindings;
-    return try lowerDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params, row_claim);
-}
-
-fn lowerDeleteParsedSqlForDmlTestWithFunctionBindingsAlloc(
-    alloc: std.mem.Allocator,
-    parsed_sql: *const tokenized.ParsedSql,
-    schema: runtime_schema.TableSchema,
-    params: []const sql_value.SqlValue,
-    unique_resolver: relational_rows.UniqueSelectorResolver,
-    function_bindings: expr_row_parse.SqlFunctionBindings,
-) !plan_mod.LoweredMutation {
-    _ = function_bindings;
-    return try lowerDeleteParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, unique_resolver);
-}
-
-fn lowerDeleteMutationSourceParsedSqlForDmlTestWithFunctionBindingsAlloc(
-    alloc: std.mem.Allocator,
-    parsed_sql: *const tokenized.ParsedSql,
-    schema: runtime_schema.TableSchema,
-    params: []const sql_value.SqlValue,
-    row_claim: db_mod.types.RowClaimRequest,
-    function_bindings: expr_row_parse.SqlFunctionBindings,
-) !plan_mod.LoweredMutationSource {
-    _ = function_bindings;
-    return try lowerDeleteMutationSourceParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, row_claim);
-}
-
-fn lowerMergeMutationPlanParsedSqlForDmlTestWithFunctionBindingsAlloc(
-    alloc: std.mem.Allocator,
-    parsed_sql: *const tokenized.ParsedSql,
-    target_schema: runtime_schema.TableSchema,
-    source_schema: runtime_schema.TableSchema,
-    params: []const sql_value.SqlValue,
-    function_bindings: expr_row_parse.SqlFunctionBindings,
-) !plan_mod.LoweredMergeMutationPlan {
-    _ = function_bindings;
-    return try lowerMergeMutationPlanParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params);
-}
-
-fn lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc(
-    alloc: std.mem.Allocator,
-    parsed_sql: *const tokenized.ParsedSql,
-    target_schema: runtime_schema.TableSchema,
-    source_schema: runtime_schema.TableSchema,
-    params: []const sql_value.SqlValue,
-    row_claim: db_mod.types.RowClaimRequest,
-    function_bindings: expr_row_parse.SqlFunctionBindings,
-) !plan_mod.LoweredRecursiveJoinedMutationSource {
-    _ = function_bindings;
-    return try lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params, row_claim);
-}
-
-fn lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc(
-    alloc: std.mem.Allocator,
-    parsed_sql: *const tokenized.ParsedSql,
-    target_schema: runtime_schema.TableSchema,
-    source_schema: runtime_schema.TableSchema,
-    params: []const sql_value.SqlValue,
-    row_claim: db_mod.types.RowClaimRequest,
-    function_bindings: expr_row_parse.SqlFunctionBindings,
-) !plan_mod.LoweredRecursiveJoinedMutationSource {
-    _ = function_bindings;
-    return try lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params, row_claim);
-}
-
-fn lowerRecursiveMergeMutationWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc(
-    alloc: std.mem.Allocator,
-    parsed_sql: *const tokenized.ParsedSql,
-    target_schema: runtime_schema.TableSchema,
-    source_schema: runtime_schema.TableSchema,
-    params: []const sql_value.SqlValue,
-    function_bindings: expr_row_parse.SqlFunctionBindings,
-) !plan_mod.LoweredRecursiveMergeMutation {
-    _ = function_bindings;
-    return try lowerRecursiveMergeMutationWithSchemasParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params);
 }
 
 pub fn lowerWritePlanFromGeneratedDmlAstDirectAlloc(
@@ -20020,7 +19849,7 @@ fn updateSourceFromGeneratedDmlAstAlloc(
         .generated_dml_ast = &ast,
     };
     var lowered = parser_context.ParserState.ContextAccessors.parseUpdateMutationSource(&parser_state) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
         else => return err,
     };
     errdefer lowered.deinit(alloc);
@@ -20060,7 +19889,7 @@ fn deleteSourceFromGeneratedDmlAstAlloc(
         .generated_returning_items = generatedDmlTopLevelReturningItems(&ast),
     };
     var lowered = parser_context.ParserState.ContextAccessors.parseDeleteMutationSource(&parser_state) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
         else => return err,
     };
     errdefer lowered.deinit(alloc);
@@ -20319,6 +20148,80 @@ fn generatedDmlMutationRowLockStart(tokens: []const Token, start: usize, end: us
         if (generatedDmlMutationRowLockModeStartsAt(tokens, index + 1, end)) return index;
     }
     return null;
+}
+
+fn generatedDmlMutationRowLockModeEnd(tokens: []const Token, index: usize, end: usize) !usize {
+    if (index >= end) return error.UnsupportedSqlShape;
+    if (tokens[index].matchesKeywordTag(.update) or tokens[index].matchesKeywordTag(.share)) return index + 1;
+    if (index + 2 < end and
+        tokens[index].matchesKeywordTag(.no) and
+        tokens[index + 1].matchesKeywordTag(.key) and
+        tokens[index + 2].matchesKeywordTag(.update))
+    {
+        return index + 3;
+    }
+    if (index + 1 < end and
+        tokens[index].matchesKeywordTag(.key) and
+        tokens[index + 1].matchesKeywordTag(.share))
+    {
+        return index + 2;
+    }
+    return error.UnsupportedSqlShape;
+}
+
+fn generatedDmlMutationRowLockWaitPolicyStartsAt(tokens: []const Token, index: usize, end: usize) bool {
+    if (index >= end) return false;
+    if (tokens[index].matchesKeywordTag(.nowait)) return true;
+    return index + 1 < end and tokens[index].matchesKeywordTag(.skip) and tokens[index + 1].matchesKeywordTag(.locked);
+}
+
+fn generatedDmlMutationRowLockWaitPolicyEnd(tokens: []const Token, index: usize, end: usize) !usize {
+    if (index >= end) return index;
+    if (tokens[index].matchesKeywordTag(.nowait)) return index + 1;
+    if (index + 1 < end and tokens[index].matchesKeywordTag(.skip) and tokens[index + 1].matchesKeywordTag(.locked)) return index + 2;
+    return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedDmlMutationRowLockTargets(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    lock_tokens: generated_parser.GeneratedSqlTokenRange,
+    allowed_targets: []const []const u8,
+) !void {
+    if (lock_tokens.start >= lock_tokens.end or lock_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    if (!tokens[lock_tokens.start].matchesKeywordTag(.@"for")) return error.UnsupportedSqlShape;
+    var cursor = try generatedDmlMutationRowLockModeEnd(tokens, lock_tokens.start + 1, lock_tokens.end);
+
+    if (cursor < lock_tokens.end and tokens[cursor].matchesKeywordTag(.of)) {
+        cursor += 1;
+        var saw_target = false;
+        var expect_target = true;
+        while (cursor < lock_tokens.end and
+            !generatedDmlMutationRowLockWaitPolicyStartsAt(tokens, cursor, lock_tokens.end))
+        {
+            if (!expect_target) {
+                if (tokens[cursor].kind != .comma) return error.UnsupportedSqlShape;
+                expect_target = true;
+                cursor += 1;
+                continue;
+            }
+            if (tokens[cursor].matchesKeywordTag(.only)) cursor += 1;
+            if (cursor >= lock_tokens.end or
+                generatedDmlMutationRowLockWaitPolicyStartsAt(tokens, cursor, lock_tokens.end) or
+                tokens[cursor].kind != .identifier)
+            {
+                return error.UnsupportedSqlShape;
+            }
+            if (!grammar.rowClaimTargetAllowed(alloc, tokens[cursor].text, allowed_targets)) return error.UnsupportedSqlShape;
+            saw_target = true;
+            expect_target = false;
+            cursor += 1;
+        }
+        if (!saw_target or expect_target) return error.UnsupportedSqlShape;
+    }
+
+    cursor = try generatedDmlMutationRowLockWaitPolicyEnd(tokens, cursor, lock_tokens.end);
+    if (cursor != lock_tokens.end) return error.UnsupportedSqlShape;
 }
 
 fn firstOptionalIndex(indexes: []const ?usize) ?usize {
@@ -21693,7 +21596,18 @@ fn lowerWritePlanWithCatalogForDmlTestAlloc(
     options: plan_mod.LowerWritePlanOptions,
     catalog: table_catalog.CatalogSource,
 ) !plan_mod.LoweredWritePlan {
-    return try lowerWritePlanWithCatalogSessionForDmlTestAlloc(alloc, sql, schema, params, options, catalog, catalog_resources.SqlCatalogSession.default());
+    return try lowerWritePlanWithCatalogAlloc(alloc, sql, schema, params, options, catalog);
+}
+
+pub fn lowerWritePlanWithCatalogAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+) !plan_mod.LoweredWritePlan {
+    return try lowerWritePlanWithCatalogSessionAlloc(alloc, sql, schema, params, options, catalog, catalog_resources.SqlCatalogSession.default());
 }
 
 fn lowerWritePlanWithCatalogSessionForDmlTestAlloc(
@@ -21705,9 +21619,21 @@ fn lowerWritePlanWithCatalogSessionForDmlTestAlloc(
     catalog: table_catalog.CatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !plan_mod.LoweredWritePlan {
+    return try lowerWritePlanWithCatalogSessionAlloc(alloc, sql, schema, params, options, catalog, session);
+}
+
+pub fn lowerWritePlanWithCatalogSessionAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+) !plan_mod.LoweredWritePlan {
     var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
-    return try lowerWritePlanWithCatalogSessionParsedSqlForDmlTestAlloc(alloc, &parsed_sql, schema, params, options, catalog, session);
+    return try lowerWritePlanWithCatalogSessionParsedSqlAlloc(alloc, &parsed_sql, schema, params, options, catalog, session);
 }
 
 fn lowerWritePlanWithCatalogParsedSqlForDmlTestAlloc(
@@ -21718,10 +21644,33 @@ fn lowerWritePlanWithCatalogParsedSqlForDmlTestAlloc(
     options: plan_mod.LowerWritePlanOptions,
     catalog: table_catalog.CatalogSource,
 ) !plan_mod.LoweredWritePlan {
-    return try lowerWritePlanWithCatalogSessionParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, options, catalog, catalog_resources.SqlCatalogSession.default());
+    return try lowerWritePlanWithCatalogParsedSqlAlloc(alloc, parsed_sql, schema, params, options, catalog);
+}
+
+pub fn lowerWritePlanWithCatalogParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+) !plan_mod.LoweredWritePlan {
+    return try lowerWritePlanWithCatalogSessionParsedSqlAlloc(alloc, parsed_sql, schema, params, options, catalog, catalog_resources.SqlCatalogSession.default());
 }
 
 fn lowerWritePlanWithCatalogSessionParsedSqlForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+) !plan_mod.LoweredWritePlan {
+    return try lowerWritePlanWithCatalogSessionParsedSqlAlloc(alloc, parsed_sql, schema, params, options, catalog, session);
+}
+
+pub fn lowerWritePlanWithCatalogSessionParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
     schema: runtime_schema.TableSchema,
@@ -21738,7 +21687,7 @@ fn lowerWritePlanWithCatalogSessionParsedSqlForDmlTestAlloc(
         .schema = schema,
         .params = params,
         .callbacks = .{
-            .lower_with_options = lowerWritePlanParsedSqlWithFunctionBindingsForDmlTestAlloc,
+            .lower_with_options = lowerWritePlanParsedSqlWithFunctionBindingsAlloc,
         },
     };
     return try context.lowerParsedWithSession(parsed_sql, options, catalog, session);
@@ -21763,7 +21712,7 @@ pub fn lowerWritePlanWithCatalogSessionAndFunctionBindingsParsedSqlAlloc(
         .params = params,
         .function_bindings = function_bindings,
         .callbacks = .{
-            .lower_with_options = lowerWritePlanParsedSqlWithFunctionBindingsForDmlTestAlloc,
+            .lower_with_options = lowerWritePlanParsedSqlWithFunctionBindingsAlloc,
         },
     };
     return try context.lowerParsedWithSession(parsed_sql, options, catalog, session);
@@ -21786,7 +21735,7 @@ pub fn lowerWritePlanWithBoundStatementAndFunctionBindingsAlloc(
         .params = params,
         .function_bindings = function_bindings,
         .callbacks = .{
-            .lower_with_options = lowerWritePlanParsedSqlWithFunctionBindingsForDmlTestAlloc,
+            .lower_with_options = lowerWritePlanParsedSqlWithFunctionBindingsAlloc,
         },
     };
     return try context.lowerBoundParsed(parsed_sql, bound);
@@ -21809,7 +21758,7 @@ pub fn lowerWritePlanWithLogicalPlanAndFunctionBindingsAlloc(
         .params = params,
         .function_bindings = function_bindings,
         .callbacks = .{
-            .lower_with_options = lowerWritePlanParsedSqlWithFunctionBindingsForDmlTestAlloc,
+            .lower_with_options = lowerWritePlanParsedSqlWithFunctionBindingsAlloc,
         },
     };
     return try context.lowerLogicalParsed(parsed_sql, logical);
@@ -21823,8 +21772,9 @@ fn lowerDocumentWritePlanParsedSqlAlloc(
     options: plan_mod.LowerWritePlanOptions,
 ) !plan_mod.LoweredWritePlan {
     if (schema.storage_mode != .document) return error.InvalidSqlCatalog;
-    const statement_kind = parsed_sql.writeStatementKindIncludingGeneratedAst() orelse parsed_sql.writeStatementKind() orelse .update;
-    const operation = documentWriteOperationForParsedSql(parsed_sql);
+    const dml_ast = (try generatedDmlAstForDocumentWriteParsedSql(parsed_sql)) orelse return error.UnsupportedSqlShape;
+    const statement_kind = documentWriteStatementKindFromGeneratedDmlAst(dml_ast.*);
+    const operation = try documentWriteOperationFromGeneratedDmlAst(parsed_sql.items(), dml_ast);
     var preflight = options.document_preflight orelse document_write.DocumentWritePreflight{
         .surface = .sql_adapter,
         .operation = operation,
@@ -22284,13 +22234,13 @@ fn parseDocumentSourceProjectionInsertAlloc(
     }
     var has_identity = false;
     for (columns, source_fields.items) |target_column, raw_source_field| {
-        var parsed_source_field = try tokenized.ParsedSql.initAlloc(alloc, raw_source_field);
-        defer parsed_source_field.deinit(alloc);
+        var parsed_source_field = try lexer.tokenizeAlloc(alloc, raw_source_field);
+        defer lexer.freeTokens(alloc, &parsed_source_field);
         var source_pos: usize = 0;
-        const source_field = try parseDocumentSourceInsertSelectFieldAlloc(alloc, parsed_source_field.items(), &source_pos, source_table);
+        const source_field = try parseDocumentSourceInsertSelectFieldAlloc(alloc, parsed_source_field.items, &source_pos, source_table);
         var source_field_transferred = false;
         errdefer if (!source_field_transferred) alloc.free(source_field);
-        if (!parser.atEnd(parsed_source_field.items(), source_pos)) return error.DocumentSqlWriteUnsupported;
+        if (!parser.atEnd(parsed_source_field.items, source_pos)) return error.DocumentSqlWriteUnsupported;
 
         if (documentIdentityFieldMatches(target_column, target_table)) {
             if (!std.ascii.eqlIgnoreCase(source_field, "_id")) return error.DocumentSqlWriteUnsupported;
@@ -25729,32 +25679,279 @@ fn tokensContainIdentifier(tokens: []const Token, start: usize, end: usize, iden
     return false;
 }
 
-fn parsedSqlContainsIdentifier(parsed_sql: *const tokenized.ParsedSql, identifier: []const u8) bool {
-    for (parsed_sql.tokenized_sql.items()) |token| {
-        if (tokenIdentifierMatches(token, identifier)) return true;
-    }
-    return false;
+fn documentWriteOperationForParsedSql(parsed_sql: *const tokenized.ParsedSql) !document_write.DocumentWriteOperation {
+    const dml_ast = (try generatedDmlAstForDocumentWriteParsedSql(parsed_sql)) orelse return error.UnsupportedSqlShape;
+    return try documentWriteOperationFromGeneratedDmlAst(parsed_sql.items(), dml_ast);
 }
 
-fn parsedSqlContainsKeywordTag(parsed_sql: *const tokenized.ParsedSql, keyword: parser.TokenKeyword) bool {
-    for (parsed_sql.tokenized_sql.items()) |token| {
-        if (token.matchesKeywordTag(keyword)) return true;
-    }
-    return false;
+fn documentWriteStatementKindFromGeneratedDmlAst(
+    ast: generated_parser.GeneratedSqlDmlAst,
+) sql_statement_kind.SqlWriteStatementKind {
+    return switch (ast.kind) {
+        .insert_values => .insert,
+        .insert_select => .insert_source,
+        .update => if (ast.mutation_join_source)
+            .update_joined_source
+        else if (ast.mutation_source_tail)
+            .update_source
+        else
+            .update,
+        .delete => if (ast.mutation_join_source)
+            .delete_joined_source
+        else if (ast.mutation_source_tail)
+            .delete_source
+        else
+            .delete,
+        .truncate => .truncate,
+        .merge => .merge,
+    };
 }
 
-fn documentWriteOperationForParsedSql(parsed_sql: *const tokenized.ParsedSql) document_write.DocumentWriteOperation {
-    const has_doc = parsedSqlContainsIdentifier(parsed_sql, "_doc");
-    const has_id = parsedSqlContainsIdentifier(parsed_sql, "_id");
-    const has_using = parsedSqlContainsKeywordTag(parsed_sql, .using);
-    return switch (parsed_sql.writeStatementKindIncludingGeneratedAst() orelse parsed_sql.writeStatementKind() orelse .update) {
-        .insert, .insert_source => if (has_id) .full_document_insert else .generated_id_insert,
-        .update, .update_source, .update_joined_source => if (has_doc) .document_patch else .projection_write,
-        .delete_joined_source => .non_identity_delete,
-        .delete, .delete_source => if (!has_using and has_id) .exact_id_delete else .non_identity_delete,
+fn generatedDmlAstForDocumentWriteParsedSql(parsed_sql: *const tokenized.ParsedSql) !?*const generated_parser.GeneratedSqlDmlAst {
+    if (parsed_sql.generatedStatementKind() != .dml) return null;
+    const published = parsed_sql.writeStatementIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
+    switch (parsed_sql.statement) {
+        .write => |statement| {
+            if (statement.kind != published.kind or statement.recursive != published.recursive) return error.UnsupportedSqlShape;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            return switch (generated_ast.*) {
+                .dml => |*dml| blk: {
+                    if (dml.cte_recursive != published.recursive) return error.UnsupportedSqlShape;
+                    if (!generatedDmlAstMatchesWriteKind(dml.kind, published.kind)) return error.UnsupportedSqlShape;
+                    break :blk dml;
+                },
+                else => error.UnsupportedSqlShape,
+            };
+        }
+    }
+    return error.UnsupportedSqlShape;
+}
+
+fn documentWriteOperationFromGeneratedDmlAst(
+    tokens: []const Token,
+    ast: *const generated_parser.GeneratedSqlDmlAst,
+) !document_write.DocumentWriteOperation {
+    return switch (ast.kind) {
+        .insert_values, .insert_select => if (try generatedDmlListContainsSimpleIdentifier(tokens, &ast.insert_column_items, "_id"))
+            .full_document_insert
+        else
+            .generated_id_insert,
+        .update => if (try generatedDmlAssignmentListTargetsIdentifier(tokens, &ast.assignment_items, "_doc"))
+            .document_patch
+        else
+            .projection_write,
+        .delete => if (ast.source_tokens == null and try generatedDmlOptionalRangeContainsIdentifier(tokens, ast.where_tokens, "_id"))
+            .exact_id_delete
+        else
+            .non_identity_delete,
         .truncate => .truncate_table,
         .merge => .merge,
     };
+}
+
+fn generatedDmlListContainsSimpleIdentifier(
+    tokens: []const Token,
+    list: *const generated_parser.GeneratedSqlListAst,
+    identifier: []const u8,
+) !bool {
+    try validateGeneratedDocumentWriteListAst(list);
+    for (list.items) |item| {
+        if (item.start + 1 != item.end or item.end > tokens.len) return error.UnsupportedSqlShape;
+        if (tokenIdentifierMatches(tokens[item.start], identifier)) return true;
+    }
+    return false;
+}
+
+fn generatedDmlAssignmentListTargetsIdentifier(
+    tokens: []const Token,
+    list: *const generated_parser.GeneratedSqlListAst,
+    identifier: []const u8,
+) !bool {
+    try validateGeneratedDocumentWriteListAst(list);
+    for (list.items) |item| {
+        if (item.start >= item.end or item.end > tokens.len) return error.UnsupportedSqlShape;
+        const eq_index = generatedDmlAssignmentEqIndex(tokens, item) orelse return error.UnsupportedSqlShape;
+        if (eq_index == item.start or eq_index >= item.end) return error.UnsupportedSqlShape;
+        if (eq_index == item.start + 1 and tokenIdentifierMatches(tokens[item.start], identifier)) return true;
+        if (eq_index == item.start + 3 and
+            tokens[item.start].kind == .identifier and
+            tokens[item.start + 1].matchesKeywordTag(.period) and
+            tokenIdentifierMatches(tokens[item.start + 2], identifier))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn generatedDmlAssignmentEqIndex(tokens: []const Token, item: generated_parser.GeneratedSqlTokenRange) ?usize {
+    var depth: usize = 0;
+    for (item.start..item.end) |index| {
+        switch (tokens[index].kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth > 0) depth -= 1;
+            },
+            .eq => if (depth == 0) return index,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn generatedDmlOptionalRangeContainsIdentifier(
+    tokens: []const Token,
+    maybe_range: ?generated_parser.GeneratedSqlTokenRange,
+    identifier: []const u8,
+) !bool {
+    const range = maybe_range orelse return false;
+    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    return tokensContainIdentifier(tokens, range.start, range.end, identifier);
+}
+
+fn validateGeneratedDocumentWriteListAst(list: *const generated_parser.GeneratedSqlListAst) !void {
+    if (list.count != list.items.len) return error.UnsupportedSqlShape;
+    const item_count = list.items.len;
+    if (list.expression_items.len != 0 and list.expression_items.len != item_count) return error.UnsupportedSqlShape;
+    if (list.expressions.len != 0 and list.expressions.len != item_count) return error.UnsupportedSqlShape;
+    if (list.alias_items.len != 0) {
+        if (list.alias_items.len != item_count) return error.UnsupportedSqlShape;
+        for (list.alias_items) |alias_tokens| if (alias_tokens != null) return error.UnsupportedSqlShape;
+    }
+    if (list.alias_name_items.len != 0) {
+        if (list.alias_name_items.len != item_count) return error.UnsupportedSqlShape;
+        for (list.alias_name_items) |alias_tokens| if (alias_tokens != null) return error.UnsupportedSqlShape;
+    }
+    if (list.direction_items.len != 0) {
+        if (list.direction_items.len != item_count) return error.UnsupportedSqlShape;
+        for (list.direction_items) |direction_tokens| if (direction_tokens != null) return error.UnsupportedSqlShape;
+    }
+    if (list.directions.len != 0) {
+        if (list.directions.len != item_count) return error.UnsupportedSqlShape;
+        for (list.directions) |direction| if (direction != null) return error.UnsupportedSqlShape;
+    }
+    if (list.order_using_operator_items.len != 0) {
+        if (list.order_using_operator_items.len != item_count) return error.UnsupportedSqlShape;
+        for (list.order_using_operator_items) |operator_tokens| if (operator_tokens != null) return error.UnsupportedSqlShape;
+    }
+    if (list.nulls_order_items.len != 0) {
+        if (list.nulls_order_items.len != item_count) return error.UnsupportedSqlShape;
+        for (list.nulls_order_items) |nulls_tokens| if (nulls_tokens != null) return error.UnsupportedSqlShape;
+    }
+    if (list.nulls_orders.len != 0) {
+        if (list.nulls_orders.len != item_count) return error.UnsupportedSqlShape;
+        for (list.nulls_orders) |nulls_order| if (nulls_order != null) return error.UnsupportedSqlShape;
+    }
+}
+
+test "sql adapter document write operation classifier uses retained generated DML metadata" {
+    const alloc = std.testing.allocator;
+
+    var full_insert = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO docs (_id, _doc) VALUES ('doc:a', '{}')");
+    defer full_insert.deinit(alloc);
+    try std.testing.expectEqual(document_write.DocumentWriteOperation.full_document_insert, try documentWriteOperationForParsedSql(&full_insert));
+
+    var generated_id_insert = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO docs (_doc) VALUES ('{}')");
+    defer generated_id_insert.deinit(alloc);
+    try std.testing.expectEqual(document_write.DocumentWriteOperation.generated_id_insert, try documentWriteOperationForParsedSql(&generated_id_insert));
+
+    var document_patch = try tokenized.ParsedSql.initAlloc(alloc, "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Launch\"}]}') WHERE _id = 'doc:a'");
+    defer document_patch.deinit(alloc);
+    try std.testing.expectEqual(document_write.DocumentWriteOperation.document_patch, try documentWriteOperationForParsedSql(&document_patch));
+
+    var projection_write = try tokenized.ParsedSql.initAlloc(alloc, "UPDATE docs SET title = 'Launch' WHERE _id = 'doc:a'");
+    defer projection_write.deinit(alloc);
+    try std.testing.expectEqual(document_write.DocumentWriteOperation.projection_write, try documentWriteOperationForParsedSql(&projection_write));
+
+    var exact_delete = try tokenized.ParsedSql.initAlloc(alloc, "DELETE FROM docs WHERE _id = 'doc:a'");
+    defer exact_delete.deinit(alloc);
+    try std.testing.expectEqual(document_write.DocumentWriteOperation.exact_id_delete, try documentWriteOperationForParsedSql(&exact_delete));
+
+    var joined_delete = try tokenized.ParsedSql.initAlloc(alloc, "DELETE FROM docs USING docs AS source WHERE docs._id = source._id");
+    defer joined_delete.deinit(alloc);
+    try std.testing.expectEqual(document_write.DocumentWriteOperation.non_identity_delete, try documentWriteOperationForParsedSql(&joined_delete));
+}
+
+test "sql adapter document write operation classifier rejects stale retained generated DML metadata" {
+    const alloc = std.testing.allocator;
+
+    var stale_insert_columns = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO docs (_id, _doc) VALUES ('doc:a', '{}')");
+    defer stale_insert_columns.deinit(alloc);
+    if (stale_insert_columns.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| dml.insert_column_items.count += 1,
+                else => return error.TestUnexpectedResult,
+            }
+        } else {
+            return error.TestUnexpectedResult;
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, documentWriteOperationForParsedSql(&stale_insert_columns));
+
+    var stale_assignment = try tokenized.ParsedSql.initAlloc(alloc, "UPDATE docs SET _doc = '{}' WHERE _id = 'doc:a'");
+    defer stale_assignment.deinit(alloc);
+    if (stale_assignment.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| dml.assignment_items.items[0].start += 1,
+                else => return error.TestUnexpectedResult,
+            }
+        } else {
+            return error.TestUnexpectedResult;
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, documentWriteOperationForParsedSql(&stale_assignment));
+
+    var stale_delete_where = try tokenized.ParsedSql.initAlloc(alloc, "DELETE FROM docs WHERE _id = 'doc:a'");
+    defer stale_delete_where.deinit(alloc);
+    if (stale_delete_where.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| dml.where_tokens = .{ .start = stale_delete_where.items().len, .end = stale_delete_where.items().len + 1 },
+                else => return error.TestUnexpectedResult,
+            }
+        } else {
+            return error.TestUnexpectedResult;
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, documentWriteOperationForParsedSql(&stale_delete_where));
+
+    var stale_published = try tokenized.ParsedSql.initAlloc(alloc, "UPDATE docs SET title = 'Launch' WHERE _id = 'doc:a'");
+    defer stale_published.deinit(alloc);
+    stale_published.statement = .{ .unknown = stale_published.raw_statement };
+    try std.testing.expectError(error.UnsupportedSqlShape, documentWriteOperationForParsedSql(&stale_published));
+
+    var missing_ast = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO docs (_id, _doc) VALUES ('doc:a', '{}')");
+    defer missing_ast.deinit(alloc);
+    if (missing_ast.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            generated_ast.deinit(alloc);
+            generated_statement.ast = null;
+        } else {
+            return error.TestUnexpectedResult;
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, documentWriteOperationForParsedSql(&missing_ast));
+
+    var missing_generated_statement = try tokenized.ParsedSql.initAlloc(alloc, "DELETE FROM docs WHERE _id = 'doc:a'");
+    defer missing_generated_statement.deinit(alloc);
+    var detached_generated_statement = missing_generated_statement.generated_statement orelse return error.TestUnexpectedResult;
+    defer detached_generated_statement.deinit(alloc);
+    missing_generated_statement.generated_statement = null;
+    try std.testing.expectError(error.UnsupportedSqlShape, documentWriteOperationForParsedSql(&missing_generated_statement));
 }
 
 pub fn lowerInsertWithResolverParsedSqlAlloc(
@@ -25764,8 +25961,17 @@ pub fn lowerInsertWithResolverParsedSqlAlloc(
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !plan_mod.LoweredInsert {
-    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.insert}, false);
-    return try lowerInsertWithResolverParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, unique_resolver);
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{.insert}, false)) |dml_ast| {
+        if ((try generatedDmlListExpressionsContainSubquery(&dml_ast.insert_value_rows)) or
+            (try generatedDmlListExpressionsContainSubquery(&dml_ast.conflict_assignment_items)))
+        {
+            return error.UnsupportedSqlShape;
+        }
+        return try insertValuesFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast.*, schema, params, .{
+            .unique_resolver = unique_resolver,
+        });
+    }
+    return error.UnsupportedSqlShape;
 }
 
 pub fn lowerInsertWithResolverStrictParsedSqlAlloc(
@@ -25775,18 +25981,17 @@ pub fn lowerInsertWithResolverStrictParsedSqlAlloc(
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !plan_mod.LoweredInsert {
-    const parser_context = @import("parser_context.zig");
-
-    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.insert}, false);
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = parsed_sql.items(),
-        .schema = schema,
-        .params = params,
-        .unique_resolver = unique_resolver,
-    };
-    return try parser_context.ParserState.ContextAccessors.parseInsert(&parser_state);
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{.insert}, false)) |dml_ast| {
+        if ((try generatedDmlListExpressionsContainSubquery(&dml_ast.insert_value_rows)) or
+            (try generatedDmlListExpressionsContainSubquery(&dml_ast.conflict_assignment_items)))
+        {
+            return error.UnsupportedSqlShape;
+        }
+        return try insertValuesFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast.*, schema, params, .{
+            .unique_resolver = unique_resolver,
+        });
+    }
+    return error.UnsupportedSqlShape;
 }
 
 pub fn lowerUpdateParsedSqlAlloc(
@@ -25796,8 +26001,15 @@ pub fn lowerUpdateParsedSqlAlloc(
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !plan_mod.LoweredMutation {
-    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.update}, false);
-    return try lowerUpdateParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, unique_resolver);
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{.update}, false)) |dml_ast| {
+        if (try classifyGeneratedUpdateSelectorFromDmlAstAlloc(alloc, parsed_sql.items(), dml_ast.*, schema, params, unique_resolver) != .point) {
+            return error.UnsupportedSqlShape;
+        }
+        return try updatePointFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast.*, schema, params, .{
+            .unique_resolver = unique_resolver,
+        });
+    }
+    return error.UnsupportedSqlShape;
 }
 
 pub fn lowerUpdateStrictParsedSqlAlloc(
@@ -25807,18 +26019,15 @@ pub fn lowerUpdateStrictParsedSqlAlloc(
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !plan_mod.LoweredMutation {
-    const parser_context = @import("parser_context.zig");
-
-    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.update}, false);
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = parsed_sql.items(),
-        .schema = schema,
-        .params = params,
-        .unique_resolver = unique_resolver,
-    };
-    return try parser_context.ParserState.ContextAccessors.parseUpdate(&parser_state);
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{.update}, false)) |dml_ast| {
+        if (try classifyGeneratedUpdateSelectorFromDmlAstAlloc(alloc, parsed_sql.items(), dml_ast.*, schema, params, unique_resolver) != .point) {
+            return error.UnsupportedSqlShape;
+        }
+        return try updatePointFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast.*, schema, params, .{
+            .unique_resolver = unique_resolver,
+        });
+    }
+    return error.UnsupportedSqlShape;
 }
 
 pub fn lowerDeleteParsedSqlAlloc(
@@ -25828,8 +26037,15 @@ pub fn lowerDeleteParsedSqlAlloc(
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !plan_mod.LoweredMutation {
-    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.delete}, false);
-    return try lowerDeleteParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, unique_resolver);
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{.delete}, false)) |dml_ast| {
+        if (try classifyGeneratedDeleteSelectorFromDmlAstAlloc(alloc, parsed_sql.items(), dml_ast.*, schema, params, unique_resolver) != .point) {
+            return error.UnsupportedSqlShape;
+        }
+        return try deletePointFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast.*, schema, params, .{
+            .unique_resolver = unique_resolver,
+        });
+    }
+    return error.UnsupportedSqlShape;
 }
 
 pub fn lowerUpdateMutationSourceParsedSqlAlloc(
@@ -25839,8 +26055,12 @@ pub fn lowerUpdateMutationSourceParsedSqlAlloc(
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredMutationSource {
-    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.update_source}, false);
-    return try lowerUpdateMutationSourceParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, row_claim);
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{.update_source}, false)) |dml_ast| {
+        return try updateSourceFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast.*, schema, params, .{
+            .row_claim = row_claim,
+        }, .update_source);
+    }
+    return error.UnsupportedSqlShape;
 }
 
 pub fn lowerUpdateJoinedMutationSourceWithSchemasAlloc(
@@ -25864,8 +26084,13 @@ pub fn lowerUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc(
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredJoinedMutationSource {
-    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.update_joined_source}, false);
-    return try lowerUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params, row_claim);
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{.update_joined_source}, false)) |dml_ast| {
+        return try updateJoinedSourceFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast.*, target_schema, params, .{
+            .joined_source_schema = source_schema,
+            .row_claim = row_claim,
+        });
+    }
+    return error.UnsupportedSqlShape;
 }
 
 pub fn lowerDeleteJoinedMutationSourceWithSchemasAlloc(
@@ -25889,8 +26114,13 @@ pub fn lowerDeleteJoinedMutationSourceWithSchemasParsedSqlAlloc(
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredJoinedMutationSource {
-    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.delete_joined_source}, false);
-    return try lowerDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params, row_claim);
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{.delete_joined_source}, false)) |dml_ast| {
+        return try deleteJoinedSourceFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast.*, target_schema, params, .{
+            .joined_source_schema = source_schema,
+            .row_claim = row_claim,
+        });
+    }
+    return error.UnsupportedSqlShape;
 }
 
 pub fn lowerMergeMutationPlanParsedSqlAlloc(
@@ -25900,16 +26130,181 @@ pub fn lowerMergeMutationPlanParsedSqlAlloc(
     source_schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
 ) !plan_mod.LoweredMergeMutationPlan {
-    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.merge}, false);
-    return try lowerMergeMutationPlanParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params);
+    if (try generatedDmlAstForRequiredWriteFamily(parsed_sql, &.{.merge}, false)) |dml_ast| {
+        return try mergeMutationFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast.*, target_schema, params, .{
+            .joined_source_schema = source_schema,
+        });
+    }
+    return error.UnsupportedSqlShape;
 }
 
-pub const lowerWritePlanAlloc = lowerWritePlanForDmlTestAlloc;
-pub const lowerWritePlanParsedSqlAlloc = lowerWritePlanParsedSqlForDmlTestAlloc;
-pub const lowerWritePlanWithCatalogAlloc = lowerWritePlanWithCatalogForDmlTestAlloc;
-pub const lowerWritePlanWithCatalogParsedSqlAlloc = lowerWritePlanWithCatalogParsedSqlForDmlTestAlloc;
-pub const lowerWritePlanWithCatalogSessionAlloc = lowerWritePlanWithCatalogSessionForDmlTestAlloc;
-pub const lowerWritePlanWithCatalogSessionParsedSqlAlloc = lowerWritePlanWithCatalogSessionParsedSqlForDmlTestAlloc;
+test "sql adapter exported dml wrappers reject corrupted retained generated AST" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = MergeBatchResolverContext{
+        .table_name = "usage_records",
+        .schema = schema,
+        .rows = &.{},
+    };
+
+    var stale_insert = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id, status) VALUES ('u1', 'new')");
+    defer stale_insert.deinit(alloc);
+    if (stale_insert.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| dml.insert_column_items.count += 1,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertWithResolverParsedSqlAlloc(
+        alloc,
+        &stale_insert,
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    ));
+
+    var stale_update = try tokenized.ParsedSql.initAlloc(alloc, "UPDATE usage_records SET status = 'done' WHERE id = 'u1'");
+    defer stale_update.deinit(alloc);
+    if (stale_update.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| dml.assignment_items.count += 1,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerUpdateParsedSqlAlloc(
+        alloc,
+        &stale_update,
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    ));
+
+    var missing_insert_generated_statement = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id, status) VALUES ('u1', 'new')");
+    defer missing_insert_generated_statement.deinit(alloc);
+    var detached_insert_generated_statement = missing_insert_generated_statement.generated_statement orelse return error.TestUnexpectedResult;
+    defer detached_insert_generated_statement.deinit(alloc);
+    missing_insert_generated_statement.generated_statement = null;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertWithResolverParsedSqlAlloc(
+        alloc,
+        &missing_insert_generated_statement,
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertWithResolverStrictParsedSqlAlloc(
+        alloc,
+        &missing_insert_generated_statement,
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    ));
+
+    var missing_update_generated_statement = try tokenized.ParsedSql.initAlloc(alloc, "UPDATE usage_records SET status = 'done' WHERE id = 'u1'");
+    defer missing_update_generated_statement.deinit(alloc);
+    var detached_update_generated_statement = missing_update_generated_statement.generated_statement orelse return error.TestUnexpectedResult;
+    defer detached_update_generated_statement.deinit(alloc);
+    missing_update_generated_statement.generated_statement = null;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerUpdateParsedSqlAlloc(
+        alloc,
+        &missing_update_generated_statement,
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerUpdateStrictParsedSqlAlloc(
+        alloc,
+        &missing_update_generated_statement,
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    ));
+
+    var missing_delete_generated_statement = try tokenized.ParsedSql.initAlloc(alloc, "DELETE FROM usage_records WHERE id = 'u1'");
+    defer missing_delete_generated_statement.deinit(alloc);
+    var detached_delete_generated_statement = missing_delete_generated_statement.generated_statement orelse return error.TestUnexpectedResult;
+    defer detached_delete_generated_statement.deinit(alloc);
+    missing_delete_generated_statement.generated_statement = null;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDeleteParsedSqlAlloc(
+        alloc,
+        &missing_delete_generated_statement,
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    ));
+}
+
+test "sql adapter internal dml entrypoints reject corrupted retained generated AST" {
+    const alloc = std.testing.allocator;
+    const target_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const source_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"source_id":{"type":"keyword"},"source_status":{"type":"keyword"}},"required":["source_id"],"additionalProperties":false}}},"primary_key":{"columns":["source_id"]}}
+    ;
+    const target_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, target_schema_json);
+    defer runtime_schema.freeSchema(alloc, target_schema);
+    const source_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, source_schema_json);
+    defer runtime_schema.freeSchema(alloc, source_schema);
+    var resolver_ctx = MergeBatchResolverContext{
+        .table_name = "usage_records",
+        .schema = target_schema,
+        .rows = &.{},
+    };
+    const row_claim = db_mod.types.RowClaimRequest{
+        .mode = .for_update,
+        .owner_id = "sql-generated-dml-internal",
+        .txn_id = [_]u8{0x31} ** 16,
+    };
+
+    var stale_insert_source = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id, status) SELECT source_id, source_status FROM source_records");
+    defer stale_insert_source.deinit(alloc);
+    if (stale_insert_source.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| dml.insert_column_items.count += 1,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertSourceWithSchemasParsedSqlForDmlTestAlloc(
+        alloc,
+        &stale_insert_source,
+        target_schema,
+        source_schema,
+        &.{},
+        resolver_ctx.resolver(),
+    ));
+
+    var stale_joined_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET status = source.source_status FROM source_records AS source WHERE usage_records.id = source.source_id FOR UPDATE RETURNING id",
+    );
+    defer stale_joined_update.deinit(alloc);
+    if (stale_joined_update.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| dml.assignment_items.count += 1,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(
+        alloc,
+        &stale_joined_update,
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    ));
+}
 
 fn unsupportedRecursiveJoinedMutationSourceForDmlTestAlloc(
     _: std.mem.Allocator,
@@ -26042,17 +26437,19 @@ test "sql adapter lower dml validates generated child read payloads" {
                 .dml => |*dml| {
                     const item = &dml.source_read.?.source_antfly_function_items[0];
                     if (item.argument_items.len < 2) return error.TestUnexpectedResult;
+                    const original_argument_items = item.argument_items;
                     item.argument_items = item.argument_items[1..];
                     item.argument_count = item.argument_items.len;
+                    defer {
+                        item.argument_items = original_argument_items;
+                        item.argument_count = original_argument_items.len;
+                    }
+                    try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedDmlReadSourceBodyAst(insert_source_stale_function_argument_gap.items(), dml.*));
                 },
                 else => return error.TestUnexpectedResult,
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    switch (insert_source_stale_function_argument_gap.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
-        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedDmlReadSourceBodyAst(insert_source_stale_function_argument_gap.items(), dml)),
-        else => return error.TestUnexpectedResult,
-    }
     var insert_source_duplicate_graph_semantic_argument = try tokenized.ParsedSql.initAlloc(
         alloc,
         "INSERT INTO usage_records (id) SELECT id FROM antfly.graph_metric(table_name => 'usage_records', table => 'usage_records_v2', index => 'docs_edge_graph', metric => 'pagerank', top_k => 5) AS gm",
@@ -28933,6 +29330,17 @@ test "sql adapter lower dml rejects stale generated DML insert-source write-plan
     stale_update_where_expression_ast.where_expression.kind = .function_call;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
+        classifyGeneratedUpdateSelectorFromDmlAstAlloc(
+            alloc,
+            parsed_generated_update.items(),
+            stale_update_where_expression_ast,
+            schema,
+            &.{},
+            resolver_ctx.resolver(),
+        ),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
         updatePointFromGeneratedDmlAstAlloc(
             alloc,
             parsed_generated_update.items(),
@@ -28940,6 +29348,26 @@ test "sql adapter lower dml rejects stale generated DML insert-source write-plan
             schema,
             &.{},
             options,
+        ),
+    );
+    var parsed_generated_source_selector_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'ready' WHERE status = 'active' RETURNING id",
+    );
+    defer parsed_generated_source_selector_update.deinit(alloc);
+    const generated_source_selector_update_ast = switch ((parsed_generated_source_selector_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(
+        plan_mod.MutationSelectorKind.source,
+        try classifyGeneratedUpdateSelectorFromDmlAstAlloc(
+            alloc,
+            parsed_generated_source_selector_update.items(),
+            generated_source_selector_update_ast,
+            schema,
+            &.{},
+            resolver_ctx.resolver(),
         ),
     );
     var stale_update_returning_expression_ast = generated_update_ast;
@@ -29146,6 +29574,17 @@ test "sql adapter lower dml rejects stale generated DML insert-source write-plan
     stale_delete_where_expression_ast.where_expression.kind = .function_call;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
+        classifyGeneratedDeleteSelectorFromDmlAstAlloc(
+            alloc,
+            parsed_generated_delete.items(),
+            stale_delete_where_expression_ast,
+            schema,
+            &.{},
+            resolver_ctx.resolver(),
+        ),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
         deletePointFromGeneratedDmlAstAlloc(
             alloc,
             parsed_generated_delete.items(),
@@ -29153,6 +29592,26 @@ test "sql adapter lower dml rejects stale generated DML insert-source write-plan
             schema,
             &.{},
             options,
+        ),
+    );
+    var parsed_generated_source_selector_delete = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE status = 'active' RETURNING id",
+    );
+    defer parsed_generated_source_selector_delete.deinit(alloc);
+    const generated_source_selector_delete_ast = switch ((parsed_generated_source_selector_delete.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(
+        plan_mod.MutationSelectorKind.source,
+        try classifyGeneratedDeleteSelectorFromDmlAstAlloc(
+            alloc,
+            parsed_generated_source_selector_delete.items(),
+            generated_source_selector_delete_ast,
+            schema,
+            &.{},
+            resolver_ctx.resolver(),
         ),
     );
 
@@ -32257,6 +32716,21 @@ test "sql adapter lower dml rejects stale generated point update assignment hook
     defer lowered.deinit(alloc);
     try std.testing.expectEqual(parsed.items().len, parser_state.pos);
 
+    var missing_items_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = parsed.items(),
+        .schema = schema,
+        .mutation_claim = .{
+            .mode = .for_update,
+            .wait_policy = .wait,
+            .owner_id = "__antfly_sql_test_claim__",
+            .txn_id = [_]u8{0} ** 16,
+        },
+        .generated_returning_items = generatedDmlTopLevelReturningItems(&ast),
+        .generated_dml_ast = &ast,
+    };
+    try std.testing.expectError(error.UnsupportedSqlShape, parser_context.ParserState.ContextAccessors.parseUpdateMutationSource(&missing_items_state));
+
     var stale_ast = ast;
     stale_ast.assignments_tokens = null;
     var stale_parser_state = parser_context.ParserState{
@@ -32321,6 +32795,28 @@ test "sql adapter lower dml rejects stale generated joined update assignment hoo
     );
     defer lowered.deinit(alloc);
     try std.testing.expectEqual(parsed.items().len, parser_state.pos);
+
+    var missing_items_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = parsed.items(),
+        .schema = schema,
+        .joined_source_schema = schema,
+        .mutation_claim = .{
+            .mode = .for_update,
+            .wait_policy = .wait,
+            .owner_id = "__antfly_sql_test_claim__",
+            .txn_id = [_]u8{0} ** 16,
+        },
+        .generated_returning_items = generatedDmlTopLevelReturningItems(&ast),
+        .generated_dml_ast = &ast,
+    };
+    try std.testing.expectError(error.UnsupportedSqlShape, parseJoinedMutationSourceAlloc(
+        alloc,
+        parsed.items(),
+        &missing_items_state.pos,
+        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&missing_items_state),
+        parser_context.ParserState.ContextAccessors.updateJoinedMutationSourceParserHooks(&missing_items_state),
+    ));
 
     var stale_ast = ast;
     stale_ast.assignments_tokens = null;
@@ -32701,6 +33197,33 @@ test "sql adapter lower dml rejects stale generated semijoin returning hook rang
             &stale_parser_state.pos,
             parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&stale_parser_state),
             parser_context.ParserState.ContextAccessors.updateJoinedMutationSourceParserHooks(&stale_parser_state),
+        ));
+
+        var stale_alias_ast = ast;
+        const stale_alias_subquery = stale_alias_ast.where_expression.right_expression orelse return error.TestUnexpectedResult;
+        _ = stale_alias_subquery.subquery_source_alias_name_tokens orelse return error.TestUnexpectedResult;
+        stale_alias_subquery.subquery_source_alias_name_tokens = stale_alias_subquery.subquery_source_table_tokens;
+        var stale_alias_parser_state = parser_context.ParserState{
+            .alloc = alloc,
+            .tokens = parsed.items(),
+            .schema = schema,
+            .joined_source_schema = schema,
+            .mutation_claim = .{
+                .mode = .for_update,
+                .wait_policy = .wait,
+                .owner_id = "__antfly_sql_test_claim__",
+                .txn_id = [_]u8{0} ** 16,
+            },
+            .generated_assignment_items = &stale_alias_ast.assignment_items,
+            .generated_returning_items = &stale_alias_ast.returning_items,
+            .generated_dml_ast = &stale_alias_ast,
+        };
+        try std.testing.expectError(error.UnsupportedSqlShape, parseJoinedMutationSourceAlloc(
+            alloc,
+            parsed.items(),
+            &stale_alias_parser_state.pos,
+            parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&stale_alias_parser_state),
+            parser_context.ParserState.ContextAccessors.updateJoinedMutationSourceParserHooks(&stale_alias_parser_state),
         ));
     }
 }
@@ -36121,23 +36644,22 @@ test "sql adapter lower dml rejects catalog writes to document tables" {
         else => return error.TestUnexpectedResult,
     }
 
-    const unsupported_insert_tails = [_][]const u8{
-        "INSERT INTO docs (_id, _doc) VALUES ('doc:a', '{}') RETURNING _id",
-        "INSERT INTO docs (_id, _doc) VALUES ('doc:a', '{}') ON CONFLICT (_id) DO NOTHING",
-        "INSERT INTO docs (_id, _doc) VALUES ('doc:a', '{}') ON CONFLICT (_id) DO UPDATE SET _doc = excluded._doc",
-        "INSERT INTO docs (_doc) VALUES ('{}') RETURNING _id",
+    const unsupported_insert_tails = [_]struct {
+        sql: []const u8,
+        operation: document_write.DocumentWriteOperation,
+    }{
+        .{ .sql = "INSERT INTO docs (_id, _doc) VALUES ('doc:a', '{}') RETURNING _id", .operation = .full_document_insert },
+        .{ .sql = "INSERT INTO docs (_id, _doc) VALUES ('doc:a', '{}') ON CONFLICT (_id) DO NOTHING", .operation = .full_document_insert },
+        .{ .sql = "INSERT INTO docs (_id, _doc) VALUES ('doc:a', '{}') ON CONFLICT (_id) DO UPDATE SET _doc = excluded._doc", .operation = .full_document_insert },
+        .{ .sql = "INSERT INTO docs (_doc) VALUES ('{}') RETURNING _id", .operation = .generated_id_insert },
     };
-    for (unsupported_insert_tails) |sql| {
-        var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    for (unsupported_insert_tails) |case| {
+        var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, case.sql);
         defer parsed_sql.deinit(alloc);
-        const expected_operation: document_write.DocumentWriteOperation = if (parsedSqlContainsIdentifier(&parsed_sql, "_id"))
-            .full_document_insert
-        else
-            .generated_id_insert;
-        try std.testing.expectEqual(expected_operation, documentWriteOperationForParsedSql(&parsed_sql));
+        try std.testing.expectEqual(case.operation, try documentWriteOperationForParsedSql(&parsed_sql));
         try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
             alloc,
-            sql,
+            case.sql,
             schema,
             &.{},
             .{},
@@ -36225,7 +36747,7 @@ test "sql adapter lower dml rejects catalog writes to document tables" {
     for (valid_patch_cases) |case| {
         var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, case.sql);
         defer parsed_sql.deinit(alloc);
-        try std.testing.expectEqual(document_write.DocumentWriteOperation.document_patch, documentWriteOperationForParsedSql(&parsed_sql));
+        try std.testing.expectEqual(document_write.DocumentWriteOperation.document_patch, try documentWriteOperationForParsedSql(&parsed_sql));
         var lowered = try lowerWritePlanWithCatalogForDmlTestAlloc(
             alloc,
             case.sql,
@@ -36389,7 +36911,7 @@ test "sql adapter lower dml rejects catalog writes to document tables" {
     for (valid_projection_update_cases) |case| {
         var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, case.sql);
         defer parsed_sql.deinit(alloc);
-        try std.testing.expectEqual(document_write.DocumentWriteOperation.projection_write, documentWriteOperationForParsedSql(&parsed_sql));
+        try std.testing.expectEqual(document_write.DocumentWriteOperation.projection_write, try documentWriteOperationForParsedSql(&parsed_sql));
         var lowered = try lowerWritePlanWithCatalogForDmlTestAlloc(
             alloc,
             case.sql,
@@ -37631,7 +38153,7 @@ test "sql adapter lower dml rejects catalog writes to document tables" {
     for (indexed_document_delete_cases) |case| {
         var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, case.sql);
         defer parsed_sql.deinit(alloc);
-        try std.testing.expectEqual(document_write.DocumentWriteOperation.non_identity_delete, documentWriteOperationForParsedSql(&parsed_sql));
+        try std.testing.expectEqual(document_write.DocumentWriteOperation.non_identity_delete, try documentWriteOperationForParsedSql(&parsed_sql));
         var lowered = try lowerWritePlanWithCatalogForDmlTestAlloc(
             alloc,
             case.sql,
@@ -37851,7 +38373,7 @@ test "sql adapter lower dml rejects catalog writes to document tables" {
     for (projection_in_update_cases) |case| {
         var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, case.sql);
         defer parsed_sql.deinit(alloc);
-        try std.testing.expectEqual(document_write.DocumentWriteOperation.projection_write, documentWriteOperationForParsedSql(&parsed_sql));
+        try std.testing.expectEqual(document_write.DocumentWriteOperation.projection_write, try documentWriteOperationForParsedSql(&parsed_sql));
         var lowered = try lowerWritePlanWithCatalogForDmlTestAlloc(
             alloc,
             case.sql,
@@ -37906,7 +38428,7 @@ test "sql adapter lower dml rejects catalog writes to document tables" {
     for (cases) |case| {
         var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, case.sql);
         defer parsed_sql.deinit(alloc);
-        try std.testing.expectEqual(case.operation, documentWriteOperationForParsedSql(&parsed_sql));
+        try std.testing.expectEqual(case.operation, try documentWriteOperationForParsedSql(&parsed_sql));
         if (lowerWritePlanWithCatalogForDmlTestAlloc(
             alloc,
             case.sql,
@@ -43050,6 +43572,46 @@ test "sql adapter lower dml lowers truncate into claimed table-emptying mutation
     defer cascade.deinit(alloc);
     try std.testing.expectEqualStrings("usage_records", cascade.table_name);
     try std.testing.expect(cascade.truncate_cascade);
+
+    var stale_target = try tokenized.ParsedSql.initAlloc(alloc, "TRUNCATE usage_records CASCADE");
+    defer stale_target.deinit(alloc);
+    if (stale_target.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| dml.target_table_tokens = null,
+                else => return error.TestUnexpectedResult,
+            }
+        } else {
+            return error.TestUnexpectedResult;
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerTruncateMutationSourceParsedSqlForDmlTestAlloc(
+        alloc,
+        &stale_target,
+        schema,
+        claim,
+    ));
+
+    var missing_ast = try tokenized.ParsedSql.initAlloc(alloc, "TRUNCATE usage_records CASCADE");
+    defer missing_ast.deinit(alloc);
+    if (missing_ast.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            generated_ast.deinit(alloc);
+            generated_statement.ast = null;
+        } else {
+            return error.TestUnexpectedResult;
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerTruncateMutationSourceParsedSqlForDmlTestAlloc(
+        alloc,
+        &missing_ast,
+        schema,
+        claim,
+    ));
 }
 
 test "sql adapter lower dml lowers mutation source pagination fetch forms" {
@@ -43959,6 +44521,70 @@ test "sql adapter lower dml lowers joined mutation source with separate target a
     try std.testing.expectEqualStrings("source_quantity", lowered.mutation.req.source_assignments[0].source_field);
     try std.testing.expectEqual(@as(usize, 1), lowered.mutation.req.operations.len);
     try std.testing.expectEqual(@as(usize, 2), lowered.mutation.req.returning.len);
+
+    var generated_tail_update = try lowerGeneratedUpdateJoinedSourceForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET quantity = source.source_quantity FROM source_records AS source WHERE usage_records.source_id = source.source_pk ORDER BY id DESC LIMIT +2 OFFSET +1 ROWS FETCH NEXT +1 ROWS ONLY FOR UPDATE SKIP LOCKED RETURNING id",
+        target_schema,
+        &.{},
+        .{
+            .joined_source_schema = source_schema,
+            .row_claim = row_claim,
+        },
+    );
+    defer generated_tail_update.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), generated_tail_update.mutation.req.join.order_by.len);
+    try std.testing.expectEqualStrings("id", generated_tail_update.mutation.req.join.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, generated_tail_update.mutation.req.join.order_by[0].direction);
+    try std.testing.expectEqual(@as(u32, 1), generated_tail_update.mutation.req.join.limit.?);
+    try std.testing.expectEqual(@as(u32, 1), generated_tail_update.mutation.req.join.offset);
+    try std.testing.expect(generated_tail_update.mutation.req.join.left.row_claim.?.skip_locked);
+    try std.testing.expectEqual(@as(usize, 1), generated_tail_update.mutation.req.returning.len);
+
+    var generated_tail_delete = try lowerGeneratedDeleteJoinedSourceForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records USING source_records AS source WHERE usage_records.source_id = source.source_pk ORDER BY id ASC LIMIT +3 OFFSET +2 ROWS FETCH NEXT +1 ROWS ONLY FOR UPDATE RETURNING id",
+        target_schema,
+        &.{},
+        .{
+            .joined_source_schema = source_schema,
+            .row_claim = row_claim,
+        },
+    );
+    defer generated_tail_delete.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), generated_tail_delete.mutation.req.join.order_by.len);
+    try std.testing.expectEqualStrings("id", generated_tail_delete.mutation.req.join.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, generated_tail_delete.mutation.req.join.order_by[0].direction);
+    try std.testing.expectEqual(@as(u32, 1), generated_tail_delete.mutation.req.join.limit.?);
+    try std.testing.expectEqual(@as(u32, 2), generated_tail_delete.mutation.req.join.offset);
+
+    var stale_generated_tail_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET quantity = source.source_quantity FROM source_records AS source WHERE usage_records.source_id = source.source_pk ORDER BY id DESC LIMIT +2 OFFSET +1 ROWS FETCH NEXT +1 ROWS ONLY FOR UPDATE RETURNING id",
+    );
+    defer stale_generated_tail_update.deinit(alloc);
+    if (stale_generated_tail_update.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.mutation_limit_tokens == null or dml.mutation_limit_expression.tokens == null) return error.TestUnexpectedResult;
+                    dml.mutation_limit_expression.kind = .function_call;
+                    try std.testing.expectError(error.UnsupportedSqlShape, updateJoinedSourceFromGeneratedDmlAstAlloc(
+                        alloc,
+                        &stale_generated_tail_update,
+                        dml.*,
+                        target_schema,
+                        &.{},
+                        .{
+                            .joined_source_schema = source_schema,
+                            .row_claim = row_claim,
+                        },
+                    ));
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
 
     var cte_update = try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
         alloc,

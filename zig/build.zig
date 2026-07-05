@@ -1326,6 +1326,8 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_lite_native_tests = b.addRunArtifact(lite_native_tests);
+    const lite_native_test_step = b.step("lite-native-test", "Run Antfly Lite native tests");
+    lite_native_test_step.dependOn(&run_lite_native_tests.step);
 
     const lite_cli_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lite_cli_test.zig"),

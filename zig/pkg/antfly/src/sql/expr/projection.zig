@@ -734,6 +734,7 @@ pub fn buildBooleanExpressionProjectionFromOwnedExpressionAlloc(
 }
 
 fn validateGeneratedExpressionProjectionIdentity(
+    alloc: std.mem.Allocator,
     tokens: []const Token,
     start: usize,
     end: usize,
@@ -741,7 +742,14 @@ fn validateGeneratedExpressionProjectionIdentity(
     options: ExpressionProjectionParserOptions,
 ) !void {
     if (options.require_exact_generated_expression) {
-        try expr_generated_validate.validateGeneratedRowExpressionIdentityStrict(tokens, start, end, expression, options.generated_expression_ast);
+        try expr_generated_validate.validateGeneratedRowExpressionIdentityStrictWithContext(
+            .{ .alloc = alloc },
+            tokens,
+            start,
+            end,
+            expression,
+            options.generated_expression_ast,
+        );
     } else {
         try expr_generated_validate.validateGeneratedRowExpressionIdentity(tokens, start, end, expression, options.generated_expression_ast);
     }
@@ -757,7 +765,7 @@ pub fn parseTextExpressionProjectionAlloc(
     const start = pos.*;
     const expression = try expr_row_parse.parseRowExpressionAlloc(alloc, tokens, pos, options.type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
     errdefer freeExpression(alloc, expression);
-    try validateGeneratedExpressionProjectionIdentity(tokens, start, pos.*, expression, options);
+    try validateGeneratedExpressionProjectionIdentity(alloc, tokens, start, pos.*, expression, options);
     return try buildTextExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, type_context, expression);
 }
 
@@ -771,7 +779,7 @@ pub fn parseGenericExpressionProjectionAlloc(
     const start = pos.*;
     const expression = try expr_row_parse.parseRowExpressionAlloc(alloc, tokens, pos, options.type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
     errdefer freeExpression(alloc, expression);
-    try validateGeneratedExpressionProjectionIdentity(tokens, start, pos.*, expression, options);
+    try validateGeneratedExpressionProjectionIdentity(alloc, tokens, start, pos.*, expression, options);
     return try buildNumericExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, type_context, expression);
 }
 
@@ -785,7 +793,7 @@ pub fn parseBooleanExpressionProjectionAlloc(
     const start = pos.*;
     const expression = try expr_row_parse.parseBooleanRowExpressionAlloc(alloc, tokens, pos, options.type_context, options.boolean_hooks);
     errdefer freeExpression(alloc, expression);
-    try validateGeneratedExpressionProjectionIdentity(tokens, start, pos.*, expression, options);
+    try validateGeneratedExpressionProjectionIdentity(alloc, tokens, start, pos.*, expression, options);
     return try buildBooleanExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, type_context, expression);
 }
 
@@ -848,7 +856,7 @@ pub fn parseFixedOutputExpressionProjectionAlloc(
     const start = pos.*;
     const expression = try expr_row_parse.parseRowExpressionAlloc(alloc, tokens, pos, options.type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
     errdefer freeExpression(alloc, expression);
-    try validateGeneratedExpressionProjectionIdentity(tokens, start, pos.*, expression, options);
+    try validateGeneratedExpressionProjectionIdentity(alloc, tokens, start, pos.*, expression, options);
     return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, default_output);
 }
 
@@ -861,7 +869,7 @@ pub fn parseOpOutputExpressionProjectionAlloc(
     const start = pos.*;
     const expression = try expr_row_parse.parseRowExpressionAlloc(alloc, tokens, pos, options.type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
     errdefer freeExpression(alloc, expression);
-    try validateGeneratedExpressionProjectionIdentity(tokens, start, pos.*, expression, options);
+    try validateGeneratedExpressionProjectionIdentity(alloc, tokens, start, pos.*, expression, options);
     return try buildOpExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression);
 }
 
@@ -874,7 +882,7 @@ pub fn parseDefaultOutputExpressionProjectionAlloc(
     const start = pos.*;
     const expression = try expr_row_parse.parseRowExpressionAlloc(alloc, tokens, pos, options.type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
     errdefer freeExpression(alloc, expression);
-    try validateGeneratedExpressionProjectionIdentity(tokens, start, pos.*, expression, options);
+    try validateGeneratedExpressionProjectionIdentity(alloc, tokens, start, pos.*, expression, options);
     return try buildDefaultExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression);
 }
 
@@ -888,7 +896,7 @@ pub fn parseRegexpMatchExpressionProjectionAlloc(
     const start = pos.*;
     const expression = try expr_row_parse.parseRowExpressionAlloc(alloc, tokens, pos, options.type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
     errdefer freeExpression(alloc, expression);
-    try validateGeneratedExpressionProjectionIdentity(tokens, start, pos.*, expression, options);
+    try validateGeneratedExpressionProjectionIdentity(alloc, tokens, start, pos.*, expression, options);
     return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, default_output);
 }
 
@@ -901,7 +909,7 @@ pub fn parseJsonExtractPathExpressionProjectionAlloc(
     const start = pos.*;
     const expression = try expr_row_parse.parseRowExpressionAlloc(alloc, tokens, pos, options.type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
     errdefer freeExpression(alloc, expression);
-    try validateGeneratedExpressionProjectionIdentity(tokens, start, pos.*, expression, options);
+    try validateGeneratedExpressionProjectionIdentity(alloc, tokens, start, pos.*, expression, options);
     const default_output = if (expression.json_as_text) "json_extract_path_text" else "json_extract_path";
     return try buildExpressionProjectionFromOwnedExpressionAlloc(
         alloc,
@@ -2804,6 +2812,7 @@ pub fn parseSelectListAlloc(
         const generated_expression = if (generated_item) |item| item.expression else null;
         var select_item_options = options.select_item_options;
         select_item_options.generated_expression_ast = generated_expression;
+        select_item_options.require_exact_generated_expression = generated_item != null;
         var item = try parseSelectItemAlloc(
             alloc,
             tokens,

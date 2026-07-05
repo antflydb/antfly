@@ -3459,6 +3459,168 @@ test "api schema rewrite catalog catch-up dedupes in-flight table wakes" {
     try std.testing.expectEqual(@as(u32, 1), source.compare_count.load(.monotonic));
 }
 
+test "api catalog maintenance wake registry bounds one in-flight job per table" {
+    const alloc = std.testing.allocator;
+
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+
+    const FakeSource = struct {
+        snapshot_count: std.atomic.Value(u32) = .init(0),
+        compare_count: std.atomic.Value(u32) = .init(0),
+        table: metadata_table_manager.TableRecord = .{
+            .table_id = 88,
+            .name = "audit_log",
+            .database_name = catalog_resources.default_database_name,
+            .namespace_name = catalog_resources.default_namespace_name,
+            .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}",
+            .read_schema_json = "{\"version\":1,\"storage_mode\":\"relational\"}",
+            .indexes_json = "{}",
+            .replication_sources_json = "[]",
+            .placement_role = "data",
+        },
+        schema_job: metadata_table_manager.SchemaRewriteJobRecord = .{
+            .job_id = 1,
+            .table_id = 88,
+            .group_id = 100,
+            .schema_generation = 2,
+            .action = "rewrite",
+            .reason = "row_images",
+            .start_row_key = "",
+            .state = metadata_table_manager.schema_rewrite_ready,
+        },
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .compare_and_swap_table_schema = compareAndSwapTableSchema,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.snapshot_count.fetchAdd(1, .monotonic);
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = &.{},
+                .schema_rewrite_jobs = @as([*]metadata_table_manager.SchemaRewriteJobRecord, @ptrCast(&self.schema_job))[0..1],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn compareAndSwapTableSchema(
+            ptr: *anyopaque,
+            request: metadata_table_manager.TableSchemaCompareAndSwapRequest,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.compare_count.fetchAdd(1, .monotonic);
+            try std.testing.expectEqual(@as(u64, 88), request.table_id);
+        }
+    };
+
+    const FakeWrites = struct {
+        allow_schema_finish: std.atomic.Value(bool) = .init(false),
+        schema_pass_count: std.atomic.Value(u32) = .init(0),
+        table_emptying_pass_count: std.atomic.Value(u32) = .init(0),
+
+        fn iface(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .schema_rewrite_worker_pass = schemaRewriteWorkerPass,
+                    .table_emptying_worker_pass_for_table_id = tableEmptyingWorkerPassForTableId,
+                },
+            };
+        }
+
+        fn batch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) !?void {
+            return error.TestUnexpectedResult;
+        }
+
+        fn schemaRewriteWorkerPass(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) !?table_writes.SchemaRewriteWorkerPassResult {
+            try std.testing.expectEqualStrings("audit_log", table_name);
+            try std.testing.expectEqualStrings("api-schema-rewrite", worker_id);
+            if (lease_ms == 0 or max_work_units == 0) return error.TestUnexpectedResult;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.schema_pass_count.fetchAdd(1, .monotonic);
+            while (!self.allow_schema_finish.load(.acquire)) {
+                std.atomic.spinLoopHint();
+            }
+            return .{ .complete = true, .jobs_scanned = 1, .jobs_completed = 1 };
+        }
+
+        fn tableEmptyingWorkerPassForTableId(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_id: u64,
+            table_name: []const u8,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) !?table_writes.TableEmptyingWorkerPassResult {
+            try std.testing.expectEqual(@as(u64, 88), table_id);
+            try std.testing.expectEqualStrings("audit_log", table_name);
+            try std.testing.expectEqualStrings("api-table-emptying", worker_id);
+            if (lease_ms == 0 or max_work_units == 0) return error.TestUnexpectedResult;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.table_emptying_pass_count.fetchAdd(1, .monotonic);
+            return .{ .complete = false, .jobs_scanned = 1, .jobs_busy = 1 };
+        }
+    };
+
+    var source = FakeSource{};
+    var writes = FakeWrites{};
+    var server = try ApiHttpServer.initWithConfig(
+        alloc,
+        .{ .backend_runtime = runtime.ptr() },
+        source.iface(),
+        null,
+        writes.iface(),
+    );
+    defer server.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), try server.runSchemaRewriteCatalogCatchupOnce());
+    try std.testing.expect(!try server.submitTableEmptyingWakeForTable(runtime.ptr(), writes.iface(), source.table));
+    try std.testing.expectEqual(@as(u32, 0), writes.table_emptying_pass_count.load(.monotonic));
+
+    writes.allow_schema_finish.store(true, .release);
+    runtime.ptr().durable_jobs.drainOwner(server.schema_rewrite_wake_owner_id);
+
+    try std.testing.expect(try server.submitTableEmptyingWakeForTable(runtime.ptr(), writes.iface(), source.table));
+    runtime.ptr().durable_jobs.drainOwner(server.table_emptying_wake_owner_id);
+
+    try std.testing.expectEqual(@as(u32, 1), writes.schema_pass_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), source.compare_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), writes.table_emptying_pass_count.load(.monotonic));
+}
+
 test "api http server applies SQL ALTER COLUMN USING through durable schema rewrite jobs" {
     const alloc = std.testing.allocator;
     const initial_schema_json =
@@ -4034,9 +4196,8 @@ pub const ApiHttpServer = struct {
     sql_routine_runtime: sql_adapter.SqlRoutineRuntime = .{ .alloc = undefined },
     sql_savepoint_runtime: sql_adapter.SqlSavepointRuntime = .{ .alloc = undefined },
     schema_rewrite_wake_owner_id: u64 = 0,
-    schema_rewrite_wake_registry: SchemaRewriteWakeRegistry = .{},
     table_emptying_wake_owner_id: u64 = 0,
-    table_emptying_wake_registry: SchemaRewriteWakeRegistry = .{},
+    maintenance_wake_registry: SchemaRewriteWakeRegistry = .{},
     mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
     connections_cache: connections_api.Cache = .{ .alloc = undefined },
@@ -4240,8 +4401,7 @@ pub const ApiHttpServer = struct {
                 runtime.durable_jobs.closeOwner(self.table_emptying_wake_owner_id);
             }
         }
-        self.schema_rewrite_wake_registry.deinit(self.alloc);
-        self.table_emptying_wake_registry.deinit(self.alloc);
+        self.maintenance_wake_registry.deinit(self.alloc);
         self.mcp_sessions.deinit(self.alloc);
         self.a2a_tasks.deinit(self.alloc);
         self.txn_sessions.deinit(self.alloc);
@@ -6106,9 +6266,25 @@ pub const ApiHttpServer = struct {
         rows_batch: *relational_rows_api.OwnedRowsBatchRequest,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !?http_common.HttpResponse {
+        const target = catalog_resources.TableTarget{
+            .database_name = tables_api.default_database_name,
+            .namespace_name = catalog_resources.default_namespace_name,
+            .table_name = table_name,
+        };
+        return try self.applyLoweredPublicSqlRowsBatchForTarget(target, table_name, schema, rows_batch, authenticated_identity);
+    }
+
+    fn applyLoweredPublicSqlRowsBatchForTarget(
+        self: *ApiHttpServer,
+        target: catalog_resources.TableTarget,
+        native_table_name: []const u8,
+        schema: runtime_schema_mod.TableSchema,
+        rows_batch: *relational_rows_api.OwnedRowsBatchRequest,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !?http_common.HttpResponse {
         const source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
 
-        self.applyLoweredPublicSqlRowsBatchBeforeTriggers(table_name, schema, rows_batch) catch |err| switch (err) {
+        self.applyLoweredPublicSqlRowsBatchBeforeTriggers(target.table_name, schema, rows_batch) catch |err| switch (err) {
             error.InvalidRowsRequest, error.RoutineBodyNotExecutable, error.RoutineNotFound => return try textResponse(self.alloc, 400, "invalid sql write"),
             error.UnsupportedOperation => return try textResponse(self.alloc, 501, "unsupported sql statement"),
             else => return err,
@@ -6116,7 +6292,9 @@ pub const ApiHttpServer = struct {
 
         if (rows_batch.writes.len == 0 and rows_batch.deletes.len == 0 and rows_batch.transforms.len == 0 and rows_batch.predicates.len == 0) return null;
 
-        self.requireRowsBatchSatisfiesEffectiveFilterForDatabase(tables_api.default_database_name, table_name, null, rows_batch.*, authenticated_identity) catch |err| switch (err) {
+        const resource_name = try catalog_resources.tableResourceNameAlloc(self.alloc, target.database_name, target.namespace_name, target.table_name);
+        defer self.alloc.free(resource_name);
+        self.requireRowsBatchSatisfiesEffectiveFilterForDatabase(target.database_name, resource_name, target, rows_batch.*, authenticated_identity) catch |err| switch (err) {
             error.PermissionDenied => return try textResponse(self.alloc, 403, "row filter rejected sql write"),
             else => return err,
         };
@@ -6129,7 +6307,7 @@ pub const ApiHttpServer = struct {
                 txn_writes[i] = .{ .key = write.key, .value = write.value };
             }
             const txn_tables = [_]distributed_txn.TableCommitRequest{.{
-                .table_name = table_name,
+                .table_name = native_table_name,
                 .writes = txn_writes,
                 .deletes = rows_batch.deletes,
                 .transforms = rows_batch.transforms,
@@ -6141,14 +6319,14 @@ pub const ApiHttpServer = struct {
                 error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
                 error.LeaderUnavailable, error.WriteUnavailable => return try textResponse(self.alloc, 503, "write unavailable"),
                 error.TableNotFound, error.UnknownGroup => {
-                    std.log.err("public sql write transaction not found table={s} err={}", .{ table_name, err });
+                    std.log.err("public sql write transaction not found table={s} target={s}.{s}.{s} err={}", .{ native_table_name, target.database_name, target.namespace_name, target.table_name, err });
                     return try textResponse(self.alloc, 404, "not found");
                 },
                 error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
                 error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
                 error.UnsupportedOperation => null,
                 else => {
-                    std.log.err("public sql write transaction failed table={s} err={}", .{ table_name, err });
+                    std.log.err("public sql write transaction failed table={s} target={s}.{s}.{s} err={}", .{ native_table_name, target.database_name, target.namespace_name, target.table_name, err });
                     return try textResponse(self.alloc, 500, "sql write failed");
                 },
             }) |outcome| {
@@ -6160,18 +6338,18 @@ pub const ApiHttpServer = struct {
         }
 
         if (!committed_via_txn) {
-            _ = (source.batch(self.alloc, table_name, rows_batch.req) catch |err| switch (err) {
+            _ = (source.batch(self.alloc, native_table_name, rows_batch.req) catch |err| switch (err) {
                 error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid sql write"),
                 error.VersionConflict, error.IntentConflict => return try textResponse(self.alloc, 409, "version conflict"),
                 error.LeaderUnavailable, error.WriteUnavailable => return try textResponse(self.alloc, 503, "write unavailable"),
                 error.TableNotFound => {
-                    std.log.err("public sql write batch not found table={s} err={}", .{ table_name, err });
+                    std.log.err("public sql write batch not found table={s} target={s}.{s}.{s} err={}", .{ native_table_name, target.database_name, target.namespace_name, target.table_name, err });
                     return try textResponse(self.alloc, 404, "not found");
                 },
                 error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
                 error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
                 else => {
-                    std.log.err("public sql write batch failed table={s} err={}", .{ table_name, err });
+                    std.log.err("public sql write batch failed table={s} target={s}.{s}.{s} err={}", .{ native_table_name, target.database_name, target.namespace_name, target.table_name, err });
                     return try textResponse(self.alloc, 500, "sql write failed");
                 },
             }) orelse return try textResponse(self.alloc, 404, "not found");
@@ -6198,7 +6376,9 @@ pub const ApiHttpServer = struct {
         rows_batch: *relational_rows_api.OwnedRowsBatchRequest,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !?http_common.HttpResponse {
-        if (try self.applyLoweredPublicSqlRowsBatch(target.table_name, schema, rows_batch, authenticated_identity)) |failure| {
+        const native_table_name = try catalog_resources.storageTableNameForTargetAlloc(self.alloc, target);
+        defer self.alloc.free(native_table_name);
+        if (try self.applyLoweredPublicSqlRowsBatchForTarget(target, native_table_name, schema, rows_batch, authenticated_identity)) |failure| {
             const outcome: PublicSqlAuditOutcome = if (failure.status == 403) .denied else .failed;
             self.recordPublicSqlAuditOutcome(
                 .merge,
@@ -6422,9 +6602,11 @@ pub const ApiHttpServer = struct {
 
     fn applyLoweredPublicSqlInsertSource(
         self: *ApiHttpServer,
-        target_table_name: []const u8,
+        target: catalog_resources.TableTarget,
+        native_target_table: []const u8,
         target_schema: runtime_schema_mod.TableSchema,
         lowered: *sql_adapter.LoweredInsertSource,
+        session: catalog_resources.SqlCatalogSession,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !union(enum) {
         failure: http_common.HttpResponse,
@@ -6432,19 +6614,25 @@ pub const ApiHttpServer = struct {
     } {
         const read_source = self.effectivePublicTableReads() orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
 
-        const source_table_name = rowsPlanEffectiveSideTable(target_table_name, lowered.insert_source.req.source_table);
-        ensureRowsPlanTableReadable(authenticated_identity, source_table_name) catch |err| switch (err) {
+        var source_target = try self.publicSqlSideTableTargetForWriteAlloc(target, lowered.insert_source.req.source_table, session);
+        defer source_target.deinit(self.alloc);
+        const source = source_target.target();
+        const native_source_table = try catalog_resources.storageTableNameForTargetAlloc(self.alloc, source);
+        defer self.alloc.free(native_source_table);
+
+        self.enforceAuthenticatedIdentitySqlTablePermission(authenticated_identity, source, .read) catch |err| switch (err) {
             error.PermissionDenied => return .{ .failure = try textResponse(self.alloc, 403, "forbidden") },
+            else => return err,
         };
 
-        const source_schema = self.runtimeSchemaForPublicRows(source_table_name) catch |err| switch (err) {
+        const source_schema = self.runtimeSchemaForCatalogRows(source) catch |err| switch (err) {
             error.TableNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
             error.InvalidRowsRequest => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
             else => return err,
         };
         defer runtime_schema_mod.freeSchema(self.alloc, source_schema);
 
-        var filter = self.rowsAuthFilterPlanForIdentity(source_table_name, authenticated_identity, source_schema) catch |err| switch (err) {
+        var filter = self.rowsAuthFilterPlanForTarget(source, authenticated_identity, source_schema) catch |err| switch (err) {
             error.UnsupportedRowsFilter, error.InvalidRowsFilter => return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") },
             else => return err,
         };
@@ -6480,9 +6668,9 @@ pub const ApiHttpServer = struct {
             matched_len = lowered.literal_source_rows.len;
             break :literal_blk self.buildPublicSqlLiteralInsertSourceRowsBatchAlloc(
                 read_source,
-                target_table_name,
+                native_target_table,
                 target_schema,
-                source_table_name,
+                native_source_table,
                 effective_source_schema,
                 lowered.insert_source.req,
                 lowered.literal_source_rows,
@@ -6499,20 +6687,17 @@ pub const ApiHttpServer = struct {
                 error.TableNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
                 error.LeaderUnavailable, error.ReadUnavailable => return .{ .failure = try textResponse(self.alloc, 503, "read unavailable") },
                 else => {
-                    std.log.err("public sql literal insert source plan failed table={s} source={s} err={}", .{ target_table_name, source_table_name, err });
+                    std.log.err("public sql literal insert source plan failed table={s}.{s}.{s} source={s}.{s}.{s} err={}", .{ target.database_name, target.namespace_name, target.table_name, source.database_name, source.namespace_name, source.table_name, err });
                     return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
                 },
             };
         } else table_blk: {
-            var source_result = (read_source.rowsQueryPlan(
-                self.alloc,
-                source_table_name,
+            var source_result = (self.publicSqlRowsQueryPlanForTargetAlloc(
+                read_source,
+                source,
+                native_source_table,
                 source_schema,
-                .{
-                    .ctes = lowered.ctes,
-                    .query = lowered.insert_source.req.source,
-                },
-                .read_index,
+                .{ .ctes = lowered.ctes, .query = lowered.insert_source.req.source },
             ) catch |err| switch (err) {
                 error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
                 error.RelationalRowsCteSpillRequired => return .{ .failure = try textResponse(self.alloc, 429, "sql write backpressured") },
@@ -6521,7 +6706,7 @@ pub const ApiHttpServer = struct {
                 error.TopologyChanged => return .{ .failure = try textResponse(self.alloc, 503, "topology changed") },
                 error.LeaderUnavailable, error.ReadUnavailable => return .{ .failure = try textResponse(self.alloc, 503, "read unavailable") },
                 else => {
-                    std.log.err("public sql insert source read failed table={s} source={s} err={}", .{ target_table_name, source_table_name, err });
+                    std.log.err("public sql insert source read failed table={s}.{s}.{s} source={s}.{s}.{s} err={}", .{ target.database_name, target.namespace_name, target.table_name, source.database_name, source.namespace_name, source.table_name, err });
                     return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
                 },
             }) orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
@@ -6529,7 +6714,7 @@ pub const ApiHttpServer = struct {
             matched_len = source_result.rows.len;
             break :table_blk relational_rows_api.buildRowsInsertSourceBatchWithSchemasAndDefaultContextAlloc(
                 self.alloc,
-                target_table_name,
+                native_target_table,
                 target_schema,
                 effective_source_schema,
                 lowered.insert_source.req,
@@ -6542,7 +6727,7 @@ pub const ApiHttpServer = struct {
                 error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return .{ .failure = try textResponse(self.alloc, 503, "unique owner unavailable") },
                 error.InvalidRowsRequest, error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation, error.SequenceNotFound => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
                 else => {
-                    std.log.err("public sql insert source plan failed table={s} source={s} err={}", .{ target_table_name, source_table_name, err });
+                    std.log.err("public sql insert source plan failed table={s}.{s}.{s} source={s}.{s}.{s} err={}", .{ target.database_name, target.namespace_name, target.table_name, source.database_name, source.namespace_name, source.table_name, err });
                     return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
                 },
             };
@@ -6550,7 +6735,7 @@ pub const ApiHttpServer = struct {
         defer rows_batch.deinit(self.alloc);
         rows_batch.req.sync_level = lowered.sync_level;
 
-        if (try self.applyLoweredPublicSqlRowsBatch(target_table_name, target_schema, &rows_batch, authenticated_identity)) |failure| return .{ .failure = failure };
+        if (try self.applyLoweredPublicSqlRowsBatchForTarget(target, native_target_table, target_schema, &rows_batch, authenticated_identity)) |failure| return .{ .failure = failure };
         return .{ .result = try rowsInsertSourceMutationResultAlloc(self.alloc, matched_len, rows_batch) };
     }
 
@@ -6871,6 +7056,121 @@ pub const ApiHttpServer = struct {
         return true;
     }
 
+    const OwnedPublicSqlTableTarget = struct {
+        database_name: []u8,
+        namespace_name: []u8,
+        table_name: []u8,
+
+        fn target(self: OwnedPublicSqlTableTarget) catalog_resources.TableTarget {
+            return .{
+                .database_name = self.database_name,
+                .namespace_name = self.namespace_name,
+                .table_name = self.table_name,
+            };
+        }
+
+        fn deinit(self: *OwnedPublicSqlTableTarget, alloc: std.mem.Allocator) void {
+            alloc.free(self.database_name);
+            alloc.free(self.namespace_name);
+            alloc.free(self.table_name);
+            self.* = .{
+                .database_name = &.{},
+                .namespace_name = &.{},
+                .table_name = &.{},
+            };
+        }
+    };
+
+    fn publicSqlOwnedTargetFromCatalogRecordAlloc(
+        self: *ApiHttpServer,
+        table: *const metadata_table_manager.TableRecord,
+    ) !OwnedPublicSqlTableTarget {
+        const database_name = try self.alloc.dupe(u8, table.database_name);
+        errdefer self.alloc.free(database_name);
+        const namespace_name = try self.alloc.dupe(u8, table.namespace_name);
+        errdefer self.alloc.free(namespace_name);
+        const table_name = try self.alloc.dupe(u8, table.name);
+        errdefer self.alloc.free(table_name);
+        return .{
+            .database_name = database_name,
+            .namespace_name = namespace_name,
+            .table_name = table_name,
+        };
+    }
+
+    fn publicSqlOwnedTargetFromTargetAlloc(
+        self: *ApiHttpServer,
+        target: catalog_resources.TableTarget,
+    ) !OwnedPublicSqlTableTarget {
+        const database_name = try self.alloc.dupe(u8, target.database_name);
+        errdefer self.alloc.free(database_name);
+        const namespace_name = try self.alloc.dupe(u8, target.namespace_name);
+        errdefer self.alloc.free(namespace_name);
+        const table_name = try self.alloc.dupe(u8, target.table_name);
+        errdefer self.alloc.free(table_name);
+        return .{
+            .database_name = database_name,
+            .namespace_name = namespace_name,
+            .table_name = table_name,
+        };
+    }
+
+    fn publicSqlExistingTableTargetForSessionAlloc(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        session: catalog_resources.SqlCatalogSession,
+    ) !OwnedPublicSqlTableTarget {
+        var snapshot = (try self.source.adminSnapshot()) orelse return error.TableNotFound;
+        defer self.source.freeAdminSnapshot(&snapshot);
+
+        const parsed_target = try session.tableTargetFromObjectName(table_name);
+        if (std.mem.indexOfScalar(u8, table_name, '.') != null) {
+            const table = tables_api.findTableByQualifiedName(&snapshot, parsed_target.database_name, parsed_target.namespace_name, parsed_target.table_name) orelse return error.TableNotFound;
+            return try self.publicSqlOwnedTargetFromCatalogRecordAlloc(table);
+        }
+
+        const default_search_path: []const []const u8 = &.{catalog_resources.default_namespace_name};
+        const search_path = if (session.search_path.len == 0) default_search_path else session.search_path;
+        for (search_path) |namespace_name| {
+            const table = tables_api.findTableByQualifiedName(&snapshot, session.currentDatabase(), namespace_name, table_name) orelse continue;
+            return try self.publicSqlOwnedTargetFromCatalogRecordAlloc(table);
+        }
+        return error.TableNotFound;
+    }
+
+    fn publicSqlSideTableTargetForWriteAlloc(
+        self: *ApiHttpServer,
+        target: catalog_resources.TableTarget,
+        source_table_name: []const u8,
+        session: catalog_resources.SqlCatalogSession,
+    ) !OwnedPublicSqlTableTarget {
+        if (source_table_name.len == 0) return try self.publicSqlOwnedTargetFromTargetAlloc(target);
+        return try self.publicSqlExistingTableTargetForSessionAlloc(source_table_name, session);
+    }
+
+    fn publicSqlTableTargetsEqual(a: catalog_resources.TableTarget, b: catalog_resources.TableTarget) bool {
+        return std.mem.eql(u8, a.database_name, b.database_name) and
+            std.mem.eql(u8, a.namespace_name, b.namespace_name) and
+            std.mem.eql(u8, a.table_name, b.table_name);
+    }
+
+    fn publicSqlRowsQueryPlanForTargetAlloc(
+        self: *ApiHttpServer,
+        read_source: table_reads.TableReadSource,
+        target: catalog_resources.TableTarget,
+        native_table_name: []const u8,
+        schema: runtime_schema_mod.TableSchema,
+        plan: db_mod.types.RelationalRowsQueryPlan,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        if (read_source.rowsQueryPlanCatalog(self.alloc, target, schema, plan, .read_index)) |result| {
+            return result;
+        } else |err| switch (err) {
+            error.UnsupportedOperation => {},
+            else => return err,
+        }
+        return try read_source.rowsQueryPlan(self.alloc, native_table_name, schema, plan, .read_index);
+    }
+
     fn publicSqlAuditTargetForSession(session: catalog_resources.SqlCatalogSession, table_name: []const u8) catalog_resources.TableTarget {
         return .{
             .database_name = session.currentDatabase(),
@@ -7042,25 +7342,24 @@ pub const ApiHttpServer = struct {
         parsed_sql: *const sql_adapter.ParsedSql,
     ) ?[]const u8 {
         const tokens = parsed_sql.items();
-        const token_fallback = publicSqlTokenReadRowClaimMissingNativeModel(tokens);
-        const generated_statement = parsed_sql.generated_statement orelse return token_fallback;
+        const generated_statement = parsed_sql.generated_statement orelse return publicSqlTokenReadRowClaimMissingNativeModel(tokens);
         const generated_ast = generated_statement.ast orelse {
             if (generated_statement.kind() == .read) return null;
-            return token_fallback;
+            return publicSqlTokenReadRowClaimMissingNativeModel(tokens);
         };
         const read = switch (generated_ast) {
             .read => |read| read,
-            else => if (generated_statement.kind() == .read) return null else return token_fallback,
+            else => if (generated_statement.kind() == .read) return null else return publicSqlTokenReadRowClaimMissingNativeModel(tokens),
         };
         for (read.cte_items) |cte| {
             if (cte.body_row_lock_tokens != null) return "lockable base-row source for materialized CTE row claim";
         }
-        if (read.row_lock_tokens == null and token_fallback == null) return null;
+        if (read.row_lock_tokens == null) return null;
         const inferred_kind = publicSqlGeneratedReadKindForRowClaimDiagnostic(tokens, read);
         const parsed_kind = parsed_sql.readStatementKindIncludingGeneratedAst() orelse return null;
         const diagnostic_kind = if (parsed_kind == .query and inferred_kind != .query) inferred_kind else parsed_kind;
         return switch (diagnostic_kind) {
-            .query => token_fallback,
+            .query => null,
             .aggregate => "lockable base-row source for aggregate row claim",
             .join => "lockable base-row source for join row claim",
             .lateral => "lockable base-row source for lateral row claim",
@@ -7551,7 +7850,8 @@ pub const ApiHttpServer = struct {
 
     fn applyLoweredPublicSqlMutationSource(
         self: *ApiHttpServer,
-        target_table_name: []const u8,
+        target: catalog_resources.TableTarget,
+        native_target_table: []const u8,
         target_schema: runtime_schema_mod.TableSchema,
         lowered: *sql_adapter.LoweredMutationSource,
         authenticated_identity: ?AuthenticatedIdentity,
@@ -7560,13 +7860,13 @@ pub const ApiHttpServer = struct {
         result: db_mod.types.RelationalRowsMutationSourceResult,
     } {
         const source = self.table_writes orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
-        self.ensureNoPublicSqlMutationSourceTrigger(target_table_name, lowered.mutation.req.kind) catch |err| switch (err) {
+        self.ensureNoPublicSqlMutationSourceTrigger(target.table_name, lowered.mutation.req.kind) catch |err| switch (err) {
             error.RoutineNotFound => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
             error.UnsupportedOperation => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
             else => return err,
         };
 
-        var filter = self.rowsAuthFilterPlanForIdentity(target_table_name, authenticated_identity, target_schema) catch |err| switch (err) {
+        var filter = self.rowsAuthFilterPlanForTarget(target, authenticated_identity, target_schema) catch |err| switch (err) {
             error.UnsupportedRowsFilter, error.InvalidRowsFilter => return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") },
             else => return err,
         };
@@ -7577,7 +7877,7 @@ pub const ApiHttpServer = struct {
 
         const result = (source.mutateRowsFromSourceAutocommit(
             self.alloc,
-            target_table_name,
+            native_target_table,
             target_schema,
             lowered.mutation.req,
             lowered.sync_level,
@@ -7591,7 +7891,7 @@ pub const ApiHttpServer = struct {
             error.DocIdentityNamespaceMismatch => return .{ .failure = try textResponse(self.alloc, 503, "doc identity unavailable") },
             error.EnrichmentRetryInProgress => return .{ .failure = try textResponse(self.alloc, 429, "table backpressured") },
             else => {
-                std.log.err("public sql mutation source failed table={s} err={}", .{ target_table_name, err });
+                std.log.err("public sql mutation source failed table={s}.{s}.{s} err={}", .{ target.database_name, target.namespace_name, target.table_name, err });
                 return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
             },
         }) orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
@@ -7600,7 +7900,8 @@ pub const ApiHttpServer = struct {
 
     fn applyLoweredPublicSqlTableEmptying(
         self: *ApiHttpServer,
-        target_table_name: []const u8,
+        target: catalog_resources.TableTarget,
+        native_target_table: []const u8,
         target_schema: runtime_schema_mod.TableSchema,
         lowered: *sql_adapter.LoweredMutationSource,
         session: catalog_resources.SqlCatalogSession,
@@ -7611,11 +7912,11 @@ pub const ApiHttpServer = struct {
         result: db_mod.types.RelationalRowsMutationSourceResult,
         accepted: tables_api.AppliedRelationalSqlDdlRecord,
     } {
-        const audit_target = publicSqlAuditTargetForSession(session, target_table_name);
+        const audit_target = target;
         const needs_catalog_barrier = publicSqlTableEmptyingRequiresCatalogBarrier(lowered.*);
         const audit_route: PublicSqlNativeRoute = if (needs_catalog_barrier) .table_emptying_barrier else .mutation_source;
 
-        self.ensureNoPublicSqlMutationSourceTrigger(target_table_name, lowered.mutation.req.kind) catch |err| switch (err) {
+        self.ensureNoPublicSqlMutationSourceTrigger(target.table_name, lowered.mutation.req.kind) catch |err| switch (err) {
             error.RoutineNotFound => {
                 self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .failed, @errorName(err));
                 return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") };
@@ -7627,7 +7928,7 @@ pub const ApiHttpServer = struct {
             else => return err,
         };
 
-        var filter = self.rowsAuthFilterPlanForIdentity(target_table_name, authenticated_identity, target_schema) catch |err| switch (err) {
+        var filter = self.rowsAuthFilterPlanForTarget(target, authenticated_identity, target_schema) catch |err| switch (err) {
             error.UnsupportedRowsFilter, error.InvalidRowsFilter => {
                 self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .denied, @errorName(err));
                 return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") };
@@ -7644,7 +7945,7 @@ pub const ApiHttpServer = struct {
         }
 
         if (needs_catalog_barrier) {
-            const admission = self.schedulePublicSqlTableEmptyingJobsWithSession(target_table_name, lowered.*, session) catch |err| switch (err) {
+            const admission = self.schedulePublicSqlTableEmptyingJobsWithSession(target.table_name, lowered.*, session) catch |err| switch (err) {
                 error.UnsupportedOperation => {
                     self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .failed, @errorName(err));
                     return .{ .failure = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, publicSqlUnsupportedTruncateSourceDiagnostic(lowered.*)) };
@@ -7659,7 +7960,7 @@ pub const ApiHttpServer = struct {
                 },
                 else => {
                     self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .failed, @errorName(err));
-                    std.log.err("public sql table emptying admission failed table={s} err={}", .{ target_table_name, err });
+                    std.log.err("public sql table emptying admission failed table={s}.{s}.{s} err={}", .{ target.database_name, target.namespace_name, target.table_name, err });
                     return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
                 },
             };
@@ -7672,7 +7973,7 @@ pub const ApiHttpServer = struct {
             return .{ .failure = try textResponse(self.alloc, 404, "not found") };
         };
         const result = (source.tableEmptying(self.alloc, .{
-            .primary_table_name = target_table_name,
+            .primary_table_name = native_target_table,
             .additional_table_names = lowered.additional_table_names,
             .schema = target_schema,
             .mutation = lowered.mutation.req,
@@ -7714,7 +8015,7 @@ pub const ApiHttpServer = struct {
             },
             else => {
                 self.recordPublicSqlAuditOutcome(.truncate, audit_route, audit_target, 0, authenticated_identity, .failed, @errorName(err));
-                std.log.err("public sql table emptying failed table={s} err={}", .{ target_table_name, err });
+                std.log.err("public sql table emptying failed table={s}.{s}.{s} err={}", .{ target.database_name, target.namespace_name, target.table_name, err });
                 return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
             },
         }) orelse {
@@ -7741,7 +8042,8 @@ pub const ApiHttpServer = struct {
 
     fn applyLoweredPublicSqlJoinedMutationSource(
         self: *ApiHttpServer,
-        target_table_name: []const u8,
+        target: catalog_resources.TableTarget,
+        native_target_table: []const u8,
         target_schema: runtime_schema_mod.TableSchema,
         lowered: *sql_adapter.LoweredJoinedMutationSource,
         session: catalog_resources.SqlCatalogSession,
@@ -7752,32 +8054,34 @@ pub const ApiHttpServer = struct {
     } {
         const read_source = self.effectivePublicTableReads() orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
         const write_source = self.table_writes orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
-        self.ensureNoPublicSqlMutationSourceTrigger(target_table_name, lowered.mutation.req.kind) catch |err| switch (err) {
+        self.ensureNoPublicSqlMutationSourceTrigger(target.table_name, lowered.mutation.req.kind) catch |err| switch (err) {
             error.RoutineNotFound => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
             error.UnsupportedOperation => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
             else => return err,
         };
 
-        const source_table_name = rowsPlanEffectiveSideTable(target_table_name, lowered.source_table_name);
-        ensureRowsPlanTableReadable(authenticated_identity, source_table_name) catch |err| switch (err) {
+        var source_target = try self.publicSqlSideTableTargetForWriteAlloc(target, lowered.source_table_name, session);
+        defer source_target.deinit(self.alloc);
+        const source = source_target.target();
+        const native_source_table = try catalog_resources.storageTableNameForTargetAlloc(self.alloc, source);
+        defer self.alloc.free(native_source_table);
+
+        self.enforceAuthenticatedIdentitySqlTablePermission(authenticated_identity, source, .read) catch |err| switch (err) {
             error.PermissionDenied => return .{ .failure = try textResponse(self.alloc, 403, "forbidden") },
+            else => return err,
         };
 
-        const source_schema = if (std.mem.eql(u8, source_table_name, target_table_name))
+        const same_source_target = publicSqlTableTargetsEqual(source, target);
+        const source_schema = if (same_source_target)
             target_schema
         else
-            sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(
-                self.alloc,
-                self.catalogSource(),
-                source_table_name,
-                session,
-            ) catch |err| switch (err) {
-                error.InvalidSqlCatalog, error.TableNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
+            self.runtimeSchemaForCatalogRows(source) catch |err| switch (err) {
+                error.InvalidRowsRequest, error.TableNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
                 else => return err,
             };
-        defer if (!std.mem.eql(u8, source_table_name, target_table_name)) runtime_schema_mod.freeSchema(self.alloc, source_schema);
+        defer if (!same_source_target) runtime_schema_mod.freeSchema(self.alloc, source_schema);
 
-        var target_filter = self.rowsAuthFilterPlanForIdentity(target_table_name, authenticated_identity, target_schema) catch |err| switch (err) {
+        var target_filter = self.rowsAuthFilterPlanForTarget(target, authenticated_identity, target_schema) catch |err| switch (err) {
             error.UnsupportedRowsFilter, error.InvalidRowsFilter => return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") },
             else => return err,
         };
@@ -7786,7 +8090,7 @@ pub const ApiHttpServer = struct {
             try self.applyRowsAuthFilterToQuery(target_schema, active, joinedMutationTargetQuery(&lowered.mutation.req));
         }
 
-        var source_filter = self.rowsAuthFilterPlanForIdentity(source_table_name, authenticated_identity, source_schema) catch |err| switch (err) {
+        var source_filter = self.rowsAuthFilterPlanForTarget(source, authenticated_identity, source_schema) catch |err| switch (err) {
             error.UnsupportedRowsFilter, error.InvalidRowsFilter => return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") },
             else => return err,
         };
@@ -7796,15 +8100,12 @@ pub const ApiHttpServer = struct {
             try self.applyRowsAuthFilterToQuery(source_schema, active, joinedMutationSourceQuery(&lowered.mutation.req));
         }
 
-        var source_result = (read_source.rowsQueryPlan(
-            self.alloc,
-            source_table_name,
+        var source_result = (self.publicSqlRowsQueryPlanForTargetAlloc(
+            read_source,
+            source,
+            native_source_table,
             source_schema,
-            .{
-                .ctes = lowered.mutation.req.ctes,
-                .query = joinedMutationSourceQuery(&lowered.mutation.req).*,
-            },
-            .read_index,
+            .{ .ctes = lowered.mutation.req.ctes, .query = joinedMutationSourceQuery(&lowered.mutation.req).* },
         ) catch |err| switch (err) {
             error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
             error.RelationalRowsCteSpillRequired => return .{ .failure = try textResponse(self.alloc, 429, "sql write backpressured") },
@@ -7813,7 +8114,7 @@ pub const ApiHttpServer = struct {
             error.TopologyChanged => return .{ .failure = try textResponse(self.alloc, 503, "topology changed") },
             error.LeaderUnavailable, error.ReadUnavailable => return .{ .failure = try textResponse(self.alloc, 503, "read unavailable") },
             else => {
-                std.log.err("public sql joined mutation source read failed table={s} source={s} err={}", .{ target_table_name, source_table_name, err });
+                std.log.err("public sql joined mutation source read failed table={s}.{s}.{s} source={s}.{s}.{s} err={}", .{ target.database_name, target.namespace_name, target.table_name, source.database_name, source.namespace_name, source.table_name, err });
                 return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
             },
         }) orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
@@ -7821,7 +8122,7 @@ pub const ApiHttpServer = struct {
 
         const result = (write_source.mutateRowsJoinedFromSourceRowsAutocommit(
             self.alloc,
-            target_table_name,
+            native_target_table,
             target_schema,
             source_schema,
             lowered.mutation.req,
@@ -7837,7 +8138,7 @@ pub const ApiHttpServer = struct {
             error.DocIdentityNamespaceMismatch => return .{ .failure = try textResponse(self.alloc, 503, "doc identity unavailable") },
             error.EnrichmentRetryInProgress => return .{ .failure = try textResponse(self.alloc, 429, "table backpressured") },
             else => {
-                std.log.err("public sql joined mutation source failed table={s} source={s} err={}", .{ target_table_name, source_table_name, err });
+                std.log.err("public sql joined mutation source failed table={s}.{s}.{s} source={s}.{s}.{s} err={}", .{ target.database_name, target.namespace_name, target.table_name, source.database_name, source.namespace_name, source.table_name, err });
                 return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
             },
         }) orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
@@ -7846,7 +8147,8 @@ pub const ApiHttpServer = struct {
 
     fn applyLoweredPublicSqlRecursiveJoinedMutationSource(
         self: *ApiHttpServer,
-        target_table_name: []const u8,
+        target: catalog_resources.TableTarget,
+        native_target_table: []const u8,
         target_schema: runtime_schema_mod.TableSchema,
         lowered: sql_adapter.LoweredRecursiveJoinedMutationSource,
         session: catalog_resources.SqlCatalogSession,
@@ -7857,29 +8159,31 @@ pub const ApiHttpServer = struct {
     } {
         const read_source = self.effectivePublicTableReads() orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
         const write_source = self.table_writes orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
-        self.ensureNoPublicSqlMutationSourceTrigger(target_table_name, lowered.mutation.mutation.req.kind) catch |err| switch (err) {
+        self.ensureNoPublicSqlMutationSourceTrigger(target.table_name, lowered.mutation.mutation.req.kind) catch |err| switch (err) {
             error.RoutineNotFound => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
             error.UnsupportedOperation => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
             else => return err,
         };
 
-        var target_filter = self.rowsAuthFilterPlanForIdentity(target_table_name, authenticated_identity, target_schema) catch |err| switch (err) {
+        var target_filter = self.rowsAuthFilterPlanForTarget(target, authenticated_identity, target_schema) catch |err| switch (err) {
             error.UnsupportedRowsFilter, error.InvalidRowsFilter => return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") },
             else => return err,
         };
         defer if (target_filter) |*value| value.deinit(self.alloc);
         if (target_filter != null) return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") };
 
+        var routed_lowered = lowered;
+        routed_lowered.mutation.target_table_name = native_target_table;
         const result = (table_writes.mutateRowsJoinedFromRecursiveCtePlanAutocommitWithSessionAlloc(
             self.alloc,
             read_source,
             write_source,
             self.catalogSource(),
             session,
-            target_table_name,
+            target.table_name,
             target_schema,
             target_schema,
-            lowered,
+            routed_lowered,
             .read_index,
         ) catch |err| switch (err) {
             error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
@@ -7892,7 +8196,7 @@ pub const ApiHttpServer = struct {
             error.DocIdentityNamespaceMismatch => return .{ .failure = try textResponse(self.alloc, 503, "doc identity unavailable") },
             error.EnrichmentRetryInProgress => return .{ .failure = try textResponse(self.alloc, 429, "table backpressured") },
             else => {
-                std.log.err("public sql recursive joined mutation source failed table={s} cte={s} err={}", .{ target_table_name, lowered.recursive.cte_name, err });
+                std.log.err("public sql recursive joined mutation source failed table={s}.{s}.{s} cte={s} err={}", .{ target.database_name, target.namespace_name, target.table_name, lowered.recursive.cte_name, err });
                 return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
             },
         }) orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
@@ -7901,7 +8205,8 @@ pub const ApiHttpServer = struct {
 
     fn applyLoweredPublicSqlMergeMutation(
         self: *ApiHttpServer,
-        target_table_name: []const u8,
+        target: catalog_resources.TableTarget,
+        native_target_table: []const u8,
         target_schema: runtime_schema_mod.TableSchema,
         lowered: *sql_adapter.LoweredMergeMutationPlan,
         session: catalog_resources.SqlCatalogSession,
@@ -7915,28 +8220,30 @@ pub const ApiHttpServer = struct {
             return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") };
         }
 
-        const source_table_name = rowsPlanEffectiveSideTable(target_table_name, lowered.source_table_name);
-        ensureRowsPlanTableReadable(authenticated_identity, source_table_name) catch |err| switch (err) {
+        var source_target = try self.publicSqlSideTableTargetForWriteAlloc(target, lowered.source_table_name, session);
+        defer source_target.deinit(self.alloc);
+        const source = source_target.target();
+        const native_source_table = try catalog_resources.storageTableNameForTargetAlloc(self.alloc, source);
+        defer self.alloc.free(native_source_table);
+
+        self.enforceAuthenticatedIdentitySqlTablePermission(authenticated_identity, source, .read) catch |err| switch (err) {
             error.PermissionDenied => return .{ .failure = try textResponse(self.alloc, 403, "forbidden") },
+            else => return err,
         };
 
-        const source_schema = if (std.mem.eql(u8, source_table_name, target_table_name))
+        const same_source_target = publicSqlTableTargetsEqual(source, target);
+        const source_schema = if (same_source_target)
             target_schema
         else
-            sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(
-                self.alloc,
-                self.catalogSource(),
-                source_table_name,
-                session,
-            ) catch |err| switch (err) {
-                error.InvalidSqlCatalog, error.TableNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
+            self.runtimeSchemaForCatalogRows(source) catch |err| switch (err) {
+                error.InvalidRowsRequest, error.TableNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
                 else => return err,
             };
-        defer if (!std.mem.eql(u8, source_table_name, target_table_name)) runtime_schema_mod.freeSchema(self.alloc, source_schema);
+        defer if (!same_source_target) runtime_schema_mod.freeSchema(self.alloc, source_schema);
 
         var target_query: relational_rows_api.OwnedRowsQueryRequest = .{ .select_all = true };
         defer self.deinitRowsAuthFilterQueryAdditions(&target_query);
-        var target_filter = self.rowsAuthFilterPlanForIdentity(target_table_name, authenticated_identity, target_schema) catch |err| switch (err) {
+        var target_filter = self.rowsAuthFilterPlanForTarget(target, authenticated_identity, target_schema) catch |err| switch (err) {
             error.UnsupportedRowsFilter, error.InvalidRowsFilter => return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") },
             else => return err,
         };
@@ -7945,7 +8252,7 @@ pub const ApiHttpServer = struct {
             try self.applyRowsAuthFilterToQuery(target_schema, active, &target_query);
         }
 
-        var source_filter = self.rowsAuthFilterPlanForIdentity(source_table_name, authenticated_identity, source_schema) catch |err| switch (err) {
+        var source_filter = self.rowsAuthFilterPlanForTarget(source, authenticated_identity, source_schema) catch |err| switch (err) {
             error.UnsupportedRowsFilter, error.InvalidRowsFilter => return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") },
             else => return err,
         };
@@ -7964,8 +8271,8 @@ pub const ApiHttpServer = struct {
         var batch = (table_reads.rowsMergeMutationBatchFromRoutedScansWithSchemasAndDefaultContextAlloc(
             self.alloc,
             read_source,
-            target_table_name,
-            source_table_name,
+            native_target_table,
+            native_source_table,
             target_schema,
             source_schema,
             lowered.*,
@@ -7987,19 +8294,20 @@ pub const ApiHttpServer = struct {
             error.TopologyChanged => return .{ .failure = try textResponse(self.alloc, 503, "topology changed") },
             error.LeaderUnavailable, error.ReadUnavailable => return .{ .failure = try textResponse(self.alloc, 503, "read unavailable") },
             else => {
-                std.log.err("public sql merge plan failed table={s} source={s} err={}", .{ target_table_name, source_table_name, err });
+                std.log.err("public sql merge plan failed table={s}.{s}.{s} source={s}.{s}.{s} err={}", .{ target.database_name, target.namespace_name, target.table_name, source.database_name, source.namespace_name, source.table_name, err });
                 return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
             },
         }) orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
         errdefer batch.deinit(self.alloc);
 
-        if (try self.applyLoweredPublicSqlRowsBatch(target_table_name, target_schema, &batch, authenticated_identity)) |failure| return .{ .failure = failure };
+        if (try self.applyLoweredPublicSqlRowsBatchForTarget(target, native_target_table, target_schema, &batch, authenticated_identity)) |failure| return .{ .failure = failure };
         return .{ .batch = batch };
     }
 
     fn applyLoweredPublicSqlRecursiveMergeMutation(
         self: *ApiHttpServer,
-        target_table_name: []const u8,
+        target: catalog_resources.TableTarget,
+        native_target_table: []const u8,
         target_schema: runtime_schema_mod.TableSchema,
         lowered: sql_adapter.LoweredRecursiveMergeMutation,
         session: catalog_resources.SqlCatalogSession,
@@ -8010,7 +8318,7 @@ pub const ApiHttpServer = struct {
     } {
         const read_source = self.effectivePublicTableReads() orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
 
-        var target_filter = self.rowsAuthFilterPlanForIdentity(target_table_name, authenticated_identity, target_schema) catch |err| switch (err) {
+        var target_filter = self.rowsAuthFilterPlanForTarget(target, authenticated_identity, target_schema) catch |err| switch (err) {
             error.UnsupportedRowsFilter, error.InvalidRowsFilter => return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") },
             else => return err,
         };
@@ -8019,16 +8327,18 @@ pub const ApiHttpServer = struct {
 
         var sequence_resolver_ctx = RowsSequenceDefaultResolverContext{ .source = self.source };
         var scalar_default_resolver_ctx = RowsScalarSubqueryDefaultResolverContext{ .source = self.source, .table_reads = read_source };
+        var routed_lowered = lowered;
+        routed_lowered.merge.target_table_name = native_target_table;
         var batch = (table_reads.rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAndSessionAndDefaultContextAlloc(
             self.alloc,
             read_source,
             self.catalogSource(),
             session,
-            target_table_name,
-            target_table_name,
+            target.table_name,
+            target.table_name,
             target_schema,
             target_schema,
-            lowered,
+            routed_lowered,
             .{ .select_all = true },
             &.{},
             .read_index,
@@ -8044,13 +8354,13 @@ pub const ApiHttpServer = struct {
             error.TopologyChanged => return .{ .failure = try textResponse(self.alloc, 503, "topology changed") },
             error.LeaderUnavailable, error.ReadUnavailable => return .{ .failure = try textResponse(self.alloc, 503, "read unavailable") },
             else => {
-                std.log.err("public sql recursive merge plan failed table={s} cte={s} err={}", .{ target_table_name, lowered.recursive.cte_name, err });
+                std.log.err("public sql recursive merge plan failed table={s}.{s}.{s} cte={s} err={}", .{ target.database_name, target.namespace_name, target.table_name, lowered.recursive.cte_name, err });
                 return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
             },
         }) orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
         errdefer batch.deinit(self.alloc);
 
-        if (try self.applyLoweredPublicSqlRowsBatch(target_table_name, target_schema, &batch, authenticated_identity)) |failure| return .{ .failure = failure };
+        if (try self.applyLoweredPublicSqlRowsBatchForTarget(target, native_target_table, target_schema, &batch, authenticated_identity)) |failure| return .{ .failure = failure };
         return .{ .batch = batch };
     }
 
@@ -8084,6 +8394,8 @@ pub const ApiHttpServer = struct {
             .namespace_name = target.namespace_name,
             .table_name = target.table_name,
         };
+        const native_target_table = try catalog_resources.storageTableNameForTargetAlloc(self.alloc, audit_target);
+        defer self.alloc.free(native_target_table);
         const target_table = try self.alloc.dupe(u8, target.table_name);
         defer self.alloc.free(target_table);
         const schema = try clonePublicSqlRuntimeSchemaAlloc(self.alloc, target_binding.schema());
@@ -8148,7 +8460,7 @@ pub const ApiHttpServer = struct {
             };
             var returning_columns_owned = true;
             defer if (returning_columns_owned) relational_rows_api.freeRowsOutputColumns(self.alloc, returning_columns);
-            const insert_source_result = switch (try self.applyLoweredPublicSqlInsertSource(target_table, schema, &lowered.insert_source, authenticated_identity)) {
+            const insert_source_result = switch (try self.applyLoweredPublicSqlInsertSource(audit_target, native_target_table, schema, &lowered.insert_source, session.session(), authenticated_identity)) {
                 .failure => |failure| return .{ .response = failure },
                 .result => |result| result,
             };
@@ -8177,7 +8489,7 @@ pub const ApiHttpServer = struct {
             };
             var returning_columns_owned = true;
             defer if (returning_columns_owned) relational_rows_api.freeRowsOutputColumns(self.alloc, returning_columns);
-            const mutation_source_result = switch (try self.applyLoweredPublicSqlMutationSource(target_table, schema, mutation_source, authenticated_identity)) {
+            const mutation_source_result = switch (try self.applyLoweredPublicSqlMutationSource(audit_target, native_target_table, schema, mutation_source, authenticated_identity)) {
                 .failure => |failure| return .{ .response = failure },
                 .result => |result| result,
             };
@@ -8196,7 +8508,7 @@ pub const ApiHttpServer = struct {
 
         if (lowered == .truncate_source) {
             var accepted_applied: ?tables_api.AppliedRelationalSqlDdlRecord = null;
-            const truncate_result = switch (try self.applyLoweredPublicSqlTableEmptying(target_table, schema, &lowered.truncate_source, session.session(), authenticated_identity, parsed_sql)) {
+            const truncate_result = switch (try self.applyLoweredPublicSqlTableEmptying(audit_target, native_target_table, schema, &lowered.truncate_source, session.session(), authenticated_identity, parsed_sql)) {
                 .failure => |failure| return .{ .response = failure },
                 .result => |result| result,
                 .accepted => |applied| blk: {
@@ -8243,7 +8555,7 @@ pub const ApiHttpServer = struct {
             };
             var returning_columns_owned = true;
             defer if (returning_columns_owned) relational_rows_api.freeRowsOutputColumns(self.alloc, returning_columns);
-            const joined_mutation_result = switch (try self.applyLoweredPublicSqlJoinedMutationSource(target_table, schema, joined_mutation_source, session.session(), authenticated_identity)) {
+            const joined_mutation_result = switch (try self.applyLoweredPublicSqlJoinedMutationSource(audit_target, native_target_table, schema, joined_mutation_source, session.session(), authenticated_identity)) {
                 .failure => |failure| return .{ .response = failure },
                 .result => |result| result,
             };
@@ -8274,7 +8586,7 @@ pub const ApiHttpServer = struct {
             };
             var returning_columns_owned = true;
             defer if (returning_columns_owned) relational_rows_api.freeRowsOutputColumns(self.alloc, returning_columns);
-            const recursive_joined_mutation_result = switch (try self.applyLoweredPublicSqlRecursiveJoinedMutationSource(target_table, schema, recursive_joined_mutation_source, session.session(), authenticated_identity)) {
+            const recursive_joined_mutation_result = switch (try self.applyLoweredPublicSqlRecursiveJoinedMutationSource(audit_target, native_target_table, schema, recursive_joined_mutation_source, session.session(), authenticated_identity)) {
                 .failure => |failure| return .{ .response = failure },
                 .result => |result| result,
             };
@@ -8304,7 +8616,7 @@ pub const ApiHttpServer = struct {
             };
             var returning_columns_owned = true;
             defer if (returning_columns_owned) relational_rows_api.freeRowsOutputColumns(self.alloc, returning_columns);
-            const merge_batch = switch (try self.applyLoweredPublicSqlMergeMutation(target_table, schema, &lowered.merge_mutation, session.session(), authenticated_identity)) {
+            const merge_batch = switch (try self.applyLoweredPublicSqlMergeMutation(audit_target, native_target_table, schema, &lowered.merge_mutation, session.session(), authenticated_identity)) {
                 .failure => |failure| return .{ .response = failure },
                 .batch => |batch| batch,
             };
@@ -8330,7 +8642,7 @@ pub const ApiHttpServer = struct {
             };
             var returning_columns_owned = true;
             defer if (returning_columns_owned) relational_rows_api.freeRowsOutputColumns(self.alloc, returning_columns);
-            const merge_batch = switch (try self.applyLoweredPublicSqlRecursiveMergeMutation(target_table, schema, lowered.recursive_merge_mutation, session.session(), authenticated_identity)) {
+            const merge_batch = switch (try self.applyLoweredPublicSqlRecursiveMergeMutation(audit_target, native_target_table, schema, lowered.recursive_merge_mutation, session.session(), authenticated_identity)) {
                 .failure => |failure| return .{ .response = failure },
                 .batch => |batch| batch,
             };
@@ -8433,7 +8745,7 @@ pub const ApiHttpServer = struct {
             defer if (rows_batch_owned) rows_batch.deinit(self.alloc);
             if (lowered == .document_merge_mutation) {
                 if (try self.applyLoweredPublicSqlDocumentMergeRowsBatchWithAudit(audit_target, schema, &rows_batch, authenticated_identity)) |failure| return .{ .response = failure };
-            } else if (try self.applyLoweredPublicSqlRowsBatch(target_table, schema, &rows_batch, authenticated_identity)) |failure| return .{ .response = failure };
+            } else if (try self.applyLoweredPublicSqlRowsBatchForTarget(audit_target, native_target_table, schema, &rows_batch, authenticated_identity)) |failure| return .{ .response = failure };
             self.finalizePublicSqlDocumentReturningVersions(audit_target, &rows_batch) catch |err| switch (err) {
                 error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.execute, .invalid_sql_request)) },
                 error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.execute, .table_not_found)) },
@@ -8472,7 +8784,7 @@ pub const ApiHttpServer = struct {
             .delete => |*delete| &delete.batch,
             else => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) },
         };
-        if (try self.applyLoweredPublicSqlRowsBatch(target_table, schema, rows_batch, authenticated_identity)) |failure| return .{ .response = failure };
+        if (try self.applyLoweredPublicSqlRowsBatchForTarget(audit_target, native_target_table, schema, rows_batch, authenticated_identity)) |failure| return .{ .response = failure };
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
 
         const owned_rows_batch = rows_batch.*;
@@ -11208,10 +11520,7 @@ pub const ApiHttpServer = struct {
         session: *sql_adapter.OwnedSqlCatalogSession,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !PublicSqlPlannedExecutionOrResponse {
-        const write_statement_kind: ?sql_adapter.SqlWriteStatementKind = switch (parsed_sql.statement) {
-            .write => |statement| statement.kind,
-            else => null,
-        };
+        const write_statement_kind = parsed_sql.writeStatementKindIncludingGeneratedAst();
         const is_read_statement = switch (parsed_sql.statement) {
             .read => true,
             else => false,
@@ -11221,8 +11530,7 @@ pub const ApiHttpServer = struct {
         }
         var unique_resolver_ctx = RowsUniqueSelectorResolverContext{ .source = self.table_reads };
         var sequence_resolver_ctx = RowsSequenceDefaultResolverContext{ .source = self.source };
-        const default_read_source = self.effectivePublicTableReads() orelse return .{ .response = try self.publicSqlParsedDiagnosticResponse(404, parsed_sql, .init(.bind, .table_not_found)) };
-        var scalar_default_resolver_ctx = RowsScalarSubqueryDefaultResolverContext{ .source = self.source, .table_reads = default_read_source };
+        var scalar_default_resolver_ctx: RowsScalarSubqueryDefaultResolverContext = undefined;
         var write_options: sql_adapter.LowerWritePlanOptions = .{};
         var row_claim_owner_id: ?[]const u8 = null;
         defer if (row_claim_owner_id) |owner_id| self.alloc.free(@constCast(owner_id));
@@ -11237,6 +11545,8 @@ pub const ApiHttpServer = struct {
             const sync_level = sql_adapter.sqlSyncLevelFromSession(session.session()) catch |err| switch (err) {
                 error.InvalidRoleSetting => return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.bind, .invalid_role_setting)) },
             };
+            const default_read_source = self.effectivePublicTableReads() orelse return .{ .response = try self.publicSqlParsedDiagnosticResponse(404, parsed_sql, .init(.bind, .table_not_found)) };
+            scalar_default_resolver_ctx = .{ .source = self.source, .table_reads = default_read_source };
             const row_claim: ?db_mod.types.RowClaimRequest = switch (statement_kind) {
                 .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source, .truncate => try self.sqlMutationRowClaimAlloc(session),
                 else => null,
@@ -11738,9 +12048,9 @@ pub const ApiHttpServer = struct {
         write_source: table_writes.TableWriteSource,
         table: metadata_table_manager.TableRecord,
     ) !bool {
-        if (!try self.schema_rewrite_wake_registry.tryAcquire(self.alloc, table.table_id)) return false;
+        if (!try self.maintenance_wake_registry.tryAcquire(self.alloc, table.table_id)) return false;
         var acquired = true;
-        errdefer if (acquired) self.schema_rewrite_wake_registry.release(table.table_id);
+        errdefer if (acquired) self.maintenance_wake_registry.release(table.table_id);
         try SchemaRewriteWakeJob.submitWithPromotionAndRegistry(
             runtime,
             self.schemaRewriteWakeOwnerId(runtime),
@@ -11748,7 +12058,7 @@ pub const ApiHttpServer = struct {
             table.name,
             self.catalogSource(),
             table,
-            &self.schema_rewrite_wake_registry,
+            &self.maintenance_wake_registry,
             table.table_id,
         );
         acquired = false;
@@ -11761,16 +12071,16 @@ pub const ApiHttpServer = struct {
         write_source: table_writes.TableWriteSource,
         table: metadata_table_manager.TableRecord,
     ) !bool {
-        if (!try self.table_emptying_wake_registry.tryAcquire(self.alloc, table.table_id)) return false;
+        if (!try self.maintenance_wake_registry.tryAcquire(self.alloc, table.table_id)) return false;
         var acquired = true;
-        errdefer if (acquired) self.table_emptying_wake_registry.release(table.table_id);
+        errdefer if (acquired) self.maintenance_wake_registry.release(table.table_id);
         try TableEmptyingWakeJob.submitWithCatalogAndRegistry(
             runtime,
             self.tableEmptyingWakeOwnerId(runtime),
             write_source,
             self.catalogSource(),
             table.name,
-            &self.table_emptying_wake_registry,
+            &self.maintenance_wake_registry,
             table.table_id,
         );
         acquired = false;
@@ -15167,6 +15477,18 @@ pub const ApiHttpServer = struct {
             if (req.method != .POST) return try textResponse(self.alloc, 405, "method not allowed");
             return try self.handlePublicCatalogTableRowsBatch(target, req.body, authenticated_identity);
         }
+        if (std.mem.eql(u8, suffix, "relational-column-backed-index-repair")) {
+            if (req.method != .POST) return try textResponse(self.alloc, 405, "method not allowed");
+            return try self.handlePublicCatalogTableRelationalColumnBackedIndexRepair(target, req.body);
+        }
+        if (std.mem.startsWith(u8, suffix, relational_index_repair_job_status_suffix_prefix)) {
+            if (req.method != .GET) return try textResponse(self.alloc, 405, "method not allowed");
+            const encoded_job_id = suffix[relational_index_repair_job_status_suffix_prefix.len..];
+            if (encoded_job_id.len == 0 or std.mem.indexOfScalar(u8, encoded_job_id, '/') != null) return try textResponse(self.alloc, 404, "not found");
+            const job_id = try decodeRequestPathParamAlloc(self.alloc, encoded_job_id);
+            defer self.alloc.free(job_id);
+            return try self.handlePublicCatalogTableRelationalIndexRepairJobStatus(target, job_id);
+        }
         if (std.mem.eql(u8, suffix, "indexes")) {
             if (req.method != .GET) return try textResponse(self.alloc, 405, "method not allowed");
             return try self.handlePublicCatalogTableListIndexes(target);
@@ -15205,11 +15527,14 @@ pub const ApiHttpServer = struct {
         const table = tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return try textResponse(self.alloc, 404, "not found");
         var local_statuses = self.localCatalogTableRuntimeStatusesWithSnapshot(target, &snapshot) catch return try textResponse(self.alloc, 500, "index lookup failed");
         defer if (local_statuses) |*status| status.deinit(self.alloc);
-        const body = indexes_api.encodeIndexListForTable(
+        const repair_records = self.relationalIndexRepairRecordsForStatus(self.alloc, target) catch return try textResponse(self.alloc, 500, "index lookup failed");
+        defer if (repair_records) |records| table_writes.freeRelationalIndexRepairJobRecords(self.alloc, records);
+        const body = indexes_api.encodeIndexListForTableWithRepairRecords(
             self.alloc,
             &snapshot,
             table,
             if (local_statuses) |*status| status else null,
+            repair_records orelse &.{},
         ) catch return try textResponse(self.alloc, 500, "index lookup failed");
         defer self.alloc.free(body);
         return try jsonBodyResponseWithStatus(self.alloc, 200, body);
@@ -15225,12 +15550,15 @@ pub const ApiHttpServer = struct {
         const table = tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return try textResponse(self.alloc, 404, "not found");
         var local_statuses = self.localCatalogTableRuntimeStatusesWithSnapshot(target, &snapshot) catch return try textResponse(self.alloc, 500, "index lookup failed");
         defer if (local_statuses) |*status| status.deinit(self.alloc);
-        const body = (indexes_api.encodeSingleIndexForTableWithSnapshot(
+        const repair_records = self.relationalIndexRepairRecordsForStatus(self.alloc, target) catch return try textResponse(self.alloc, 500, "index lookup failed");
+        defer if (repair_records) |records| table_writes.freeRelationalIndexRepairJobRecords(self.alloc, records);
+        const body = (indexes_api.encodeSingleIndexForTableWithSnapshotAndRepairRecords(
             self.alloc,
             &snapshot,
             table,
             index_name,
             if (local_statuses) |*status| status else null,
+            repair_records orelse &.{},
         ) catch return try textResponse(self.alloc, 500, "index lookup failed")) orelse return try textResponse(self.alloc, 404, "not found");
         defer self.alloc.free(body);
         return try jsonBodyResponseWithStatus(self.alloc, 200, body);
@@ -15684,6 +16012,13 @@ pub const ApiHttpServer = struct {
             return try jsonResponse(self.alloc, response);
         }
         if (req.method == .GET) {
+            if (routes.Routes.matchTableRelationalColumnBackedIndexRepairJob(uri_parts.path)) |repair_job| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, repair_job.table_name);
+                defer self.alloc.free(table_name);
+                const job_id = try decodeRequestPathParamAlloc(self.alloc, repair_job.job_id);
+                defer self.alloc.free(job_id);
+                return try self.handlePublicTableRelationalIndexRepairJobStatus(table_name, job_id);
+            }
             if (routes.Routes.matchTableIndexes(uri_parts.path)) |table_indexes| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, table_indexes.table_name);
                 defer self.alloc.free(table_name);
@@ -15780,6 +16115,11 @@ pub const ApiHttpServer = struct {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, unique_integrity.table_name);
                 defer self.alloc.free(table_name);
                 return try self.handlePublicTableUniqueIntegrity(table_name, req.body);
+            }
+            if (routes.Routes.matchTableRelationalColumnBackedIndexRepair(uri_parts.path)) |repair| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, repair.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicTableRelationalColumnBackedIndexRepair(table_name, req.body);
             }
             if (routes.Routes.matchTableGraphMetric(uri_parts.path)) |graph_metric| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, graph_metric.table_name);
@@ -18740,6 +19080,22 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    fn relationalIndexRepairRecordsForStatus(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+    ) !?[]table_writes.RelationalIndexRepairJobRecord {
+        const source = self.table_writes orelse return null;
+        return (source.relationalIndexRepairJobListCatalog(alloc, target) catch |err| switch (err) {
+            error.UnsupportedOperation => return null,
+            error.TableNotFound => return null,
+            error.UnknownGroup => return null,
+            error.ReadOnly => return null,
+            error.HAReadOnlyStandby => return null,
+            else => return err,
+        }) orelse null;
+    }
+
     fn mapExecuteRestoreError(err: anyerror) public_table_http.TableApi.ExecuteRestoreError {
         return switch (err) {
             error.TableAlreadyExists => error.TableAlreadyExists,
@@ -18760,12 +19116,21 @@ pub const ApiHttpServer = struct {
         defer self.source.freeAdminSnapshot(&snapshot);
         var local_statuses = self.localTableRuntimeStatusesWithSnapshot(table_name, &snapshot) catch return error.InternalFailure;
         defer if (local_statuses) |*status| status.deinit(self.alloc);
-        return (indexes_api.encodeIndexList(
+        const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.NotFound;
+        const target: catalog_resources.TableTarget = .{
+            .database_name = table.database_name,
+            .namespace_name = table.namespace_name,
+            .table_name = table.name,
+        };
+        const repair_records = self.relationalIndexRepairRecordsForStatus(alloc, target) catch return error.InternalFailure;
+        defer if (repair_records) |records| table_writes.freeRelationalIndexRepairJobRecords(alloc, records);
+        return indexes_api.encodeIndexListForTableWithRepairRecords(
             alloc,
             &snapshot,
-            table_name,
+            table,
             if (local_statuses) |*status| status else null,
-        ) catch return error.InternalFailure) orelse error.NotFound;
+            repair_records orelse &.{},
+        ) catch return error.InternalFailure;
     }
 
     fn executePublicTableGetIndex(
@@ -18778,16 +19143,23 @@ pub const ApiHttpServer = struct {
         var snapshot = (self.statusAdminSnapshot() catch return error.InternalFailure) orelse return error.NotFound;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.NotFound;
-        var lookup = (indexes_api.lookupSingleIndexConfig(alloc, table.indexes_json, index_name) catch return error.InternalFailure) orelse return error.NotFound;
-        defer lookup.deinit();
         var local_statuses = self.localTableRuntimeStatusesWithSnapshot(table_name, &snapshot) catch return error.InternalFailure;
         defer if (local_statuses) |*status| status.deinit(self.alloc);
-        return indexes_api.encodeSingleIndexLookup(
+        const target: catalog_resources.TableTarget = .{
+            .database_name = table.database_name,
+            .namespace_name = table.namespace_name,
+            .table_name = table.name,
+        };
+        const repair_records = self.relationalIndexRepairRecordsForStatus(alloc, target) catch return error.InternalFailure;
+        defer if (repair_records) |records| table_writes.freeRelationalIndexRepairJobRecords(alloc, records);
+        return (indexes_api.encodeSingleIndexForTableWithSnapshotAndRepairRecords(
             alloc,
+            &snapshot,
+            table,
             index_name,
-            lookup.config,
             if (local_statuses) |*status| status else null,
-        ) catch return error.InternalFailure;
+            repair_records orelse &.{},
+        ) catch return error.InternalFailure) orelse error.NotFound;
     }
 
     fn executePublicListArtifactEnrichments(
@@ -21709,6 +22081,17 @@ pub const ApiHttpServer = struct {
         return try self.rowsAuthFilterPlanForIdentityInDatabase(tables_api.default_database_name, table_name, authenticated_identity, schema);
     }
 
+    fn rowsAuthFilterPlanForTarget(
+        self: *ApiHttpServer,
+        target: catalog_resources.TableTarget,
+        authenticated_identity: ?AuthenticatedIdentity,
+        schema: runtime_schema_mod.TableSchema,
+    ) !?RowsAuthFilterPlan {
+        const resource_name = try catalog_resources.tableResourceNameAlloc(self.alloc, target.database_name, target.namespace_name, target.table_name);
+        defer self.alloc.free(resource_name);
+        return try self.rowsAuthFilterPlanForIdentityInDatabase(target.database_name, resource_name, authenticated_identity, schema);
+    }
+
     fn rowsAuthFilterPlanForIdentityInDatabase(
         self: *ApiHttpServer,
         database_name: []const u8,
@@ -23420,6 +23803,16 @@ pub const ApiHttpServer = struct {
         upper_doc_key: ?[]const u8 = null,
     };
 
+    const max_public_relational_index_repair_work_units: usize = 1024;
+    const relational_index_repair_job_status_suffix_prefix = "relational-column-backed-index-repair/jobs/";
+
+    const RelationalColumnBackedIndexRepairRequest = struct {
+        worker_id: ?[]const u8 = null,
+        job_id: ?[]const u8 = null,
+        lease_ms: ?u64 = null,
+        max_work_units: ?usize = null,
+    };
+
     fn parseUniqueIntegrityAction(value: ?[]const u8) !table_writes.UniqueConstraintIntegrityAction {
         const text = value orelse "validate";
         if (enumTokenEql(text, "validate")) return .validate;
@@ -23427,6 +23820,12 @@ pub const ApiHttpServer = struct {
         if (enumTokenEql(text, "repair")) return .repair;
         if (enumTokenEql(text, "progress")) return .progress;
         return error.InvalidUniqueIntegrityRequest;
+    }
+
+    fn publicRelationalColumnBackedIndexRepairMaxWorkUnits(value: ?usize) !usize {
+        const raw = value orelse 1;
+        if (raw == 0) return error.InvalidRelationalColumnBackedIndexRepairRequest;
+        return @min(raw, max_public_relational_index_repair_work_units);
     }
 
     fn enumTokenEql(actual: []const u8, expected: []const u8) bool {
@@ -23656,6 +24055,129 @@ pub const ApiHttpServer = struct {
             else => return err,
         }) orelse return try textResponse(self.alloc, 404, "not found");
         defer result.deinit(self.alloc);
+        return try jsonResponse(self.alloc, result);
+    }
+
+    pub fn handlePublicTableRelationalColumnBackedIndexRepair(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+    ) !http_common.HttpResponse {
+        return try self.handlePublicCatalogTableRelationalColumnBackedIndexRepair(.{
+            .database_name = catalog_resources.default_database_name,
+            .namespace_name = catalog_resources.default_namespace_name,
+            .table_name = table_name,
+        }, body);
+    }
+
+    pub fn handlePublicTableRelationalIndexRepairJobStatus(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        job_id: []const u8,
+    ) !http_common.HttpResponse {
+        return try self.handlePublicCatalogTableRelationalIndexRepairJobStatus(.{
+            .database_name = catalog_resources.default_database_name,
+            .namespace_name = catalog_resources.default_namespace_name,
+            .table_name = table_name,
+        }, job_id);
+    }
+
+    pub fn handlePublicCatalogTableRelationalIndexRepairJobStatus(
+        self: *ApiHttpServer,
+        target: catalog_resources.TableTarget,
+        job_id: []const u8,
+    ) !http_common.HttpResponse {
+        if (job_id.len == 0) return try textResponse(self.alloc, 400, "invalid relational index repair job request");
+        const source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
+        const record = (source.relationalIndexRepairJobLoadCatalog(self.alloc, target, job_id) catch |err| switch (err) {
+            error.InvalidRelationalIndexRepairJob => return try textResponse(self.alloc, 400, "invalid relational index repair job request"),
+            error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
+            error.ReadOnly => return try textResponse(self.alloc, 405, "method not allowed"),
+            else => return err,
+        }) orelse return try textResponse(self.alloc, 404, "relational index repair job not found");
+        defer table_writes.freeRelationalIndexRepairJobRecord(self.alloc, record);
+        if (!std.mem.eql(u8, record.database_name, target.database_name) or
+            !std.mem.eql(u8, record.namespace_name, target.namespace_name) or
+            !std.mem.eql(u8, record.table_name, target.table_name))
+        {
+            return try textResponse(self.alloc, 404, "relational index repair job not found");
+        }
+        return try jsonResponse(self.alloc, record);
+    }
+
+    pub fn handlePublicCatalogTableRelationalColumnBackedIndexRepair(
+        self: *ApiHttpServer,
+        target: catalog_resources.TableTarget,
+        body: []const u8,
+    ) !http_common.HttpResponse {
+        const source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
+        var parsed = std.json.parseFromSlice(
+            RelationalColumnBackedIndexRepairRequest,
+            self.alloc,
+            if (body.len == 0) "{}" else body,
+            .{ .ignore_unknown_fields = true },
+        ) catch return try textResponse(self.alloc, 400, "invalid relational index repair request");
+        defer parsed.deinit();
+
+        const worker_id = parsed.value.worker_id orelse return try textResponse(self.alloc, 400, "invalid relational index repair request");
+        const job_id = parsed.value.job_id;
+        const lease_ms = parsed.value.lease_ms orelse 60_000;
+        const max_work_units = publicRelationalColumnBackedIndexRepairMaxWorkUnits(parsed.value.max_work_units) catch {
+            return try textResponse(self.alloc, 400, "invalid relational index repair request");
+        };
+        if (worker_id.len == 0 or lease_ms == 0) return try textResponse(self.alloc, 400, "invalid relational index repair request");
+        if (job_id) |id| {
+            if (id.len == 0) return try textResponse(self.alloc, 400, "invalid relational index repair request");
+            (source.relationalIndexRepairJobBeginCatalog(
+                self.alloc,
+                target,
+                id,
+                worker_id,
+                lease_ms,
+                max_work_units,
+            ) catch |err| switch (err) {
+                error.InvalidRelationalIndexRepairJob, error.InvalidRelationalColumnBackedIndexRepairRequest => return try textResponse(self.alloc, 400, "invalid relational index repair request"),
+                error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
+                error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
+                error.ReadOnly => return try textResponse(self.alloc, 405, "method not allowed"),
+                else => return err,
+            }) orelse return try textResponse(self.alloc, 405, "method not allowed");
+        }
+
+        var result = (source.relationalColumnBackedIndexRepairWorkerPassCatalog(
+            self.alloc,
+            target,
+            worker_id,
+            lease_ms,
+            max_work_units,
+        ) catch |err| switch (err) {
+            error.InvalidRelationalColumnBackedIndexRepairRequest => return try textResponse(self.alloc, 400, "invalid relational index repair request"),
+            error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
+            error.ReadOnly => return try textResponse(self.alloc, 405, "method not allowed"),
+            else => return err,
+        }) orelse return try textResponse(self.alloc, 404, "not found");
+        defer result.deinit(self.alloc);
+        if (job_id) |id| {
+            (source.relationalIndexRepairJobRecordPassCatalog(
+                self.alloc,
+                target,
+                id,
+                result,
+            ) catch |err| switch (err) {
+                error.InvalidRelationalIndexRepairJob, error.InvalidRelationalColumnBackedIndexRepairRequest => return try textResponse(self.alloc, 400, "invalid relational index repair request"),
+                error.RelationalIndexRepairJobNotFound => return try textResponse(self.alloc, 404, "relational index repair job not found"),
+                error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
+                error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
+                error.ReadOnly => return try textResponse(self.alloc, 405, "method not allowed"),
+                else => return err,
+            }) orelse return try textResponse(self.alloc, 405, "method not allowed");
+        }
         return try jsonResponse(self.alloc, result);
     }
 
@@ -24923,6 +25445,8 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
     if (routes.Routes.matchTableRestore(path)) |table_restore| return try tablePermission(alloc, table_restore.table_name, .admin);
     if (routes.Routes.matchTableForeignKeyIntegrity(path)) |fk_integrity| return try tablePermission(alloc, fk_integrity.table_name, .admin);
     if (routes.Routes.matchTableUniqueIntegrity(path)) |unique_integrity| return try tablePermission(alloc, unique_integrity.table_name, .admin);
+    if (routes.Routes.matchTableRelationalColumnBackedIndexRepairJob(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, .admin);
+    if (routes.Routes.matchTableRelationalColumnBackedIndexRepair(path)) |repair| return try tablePermission(alloc, repair.table_name, .admin);
     if (routes.Routes.matchTableGraphMetric(path)) |graph_metric| return try tablePermission(alloc, graph_metric.table_name, .admin);
     if (tableNameForGraphPath(path)) |table_name| return try tablePermission(alloc, table_name, .read);
     return null;
@@ -24960,6 +25484,8 @@ fn explicitCatalogTablePermissionType(method: http_common.Method, suffix: ?[]con
     if (std.mem.eql(u8, value, "query")) return if (method == .POST) .read else null;
     if (std.mem.eql(u8, value, "batch") or std.mem.eql(u8, value, "rows/batch")) return if (method == .POST) .write else null;
     if (std.mem.eql(u8, value, "backup") or std.mem.eql(u8, value, "restore")) return if (method == .POST) .admin else null;
+    if (std.mem.eql(u8, value, "relational-column-backed-index-repair")) return if (method == .POST) .admin else null;
+    if (std.mem.startsWith(u8, value, "relational-column-backed-index-repair/jobs/")) return if (method == .GET) .admin else null;
     if (std.mem.eql(u8, value, "indexes")) return if (method == .GET) .read else null;
     if (std.mem.startsWith(u8, value, "indexes/")) return switch (method) {
         .GET => .read,
@@ -25144,6 +25670,16 @@ test "explicit catalog routes declare qualified namespace and table permissions"
         defer alloc.free(resource);
         try std.testing.expectEqualStrings("tenant_ops.analytics.events", resource);
     }
+    {
+        const required = (try requiredPermissionForRequest(alloc, .POST, "/databases/tenant_ops/namespaces/analytics/tables/events/relational-column-backed-index-repair")).?;
+        defer required.deinit(alloc);
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+        const resource = try required.resourceNameAlloc(alloc);
+        defer alloc.free(resource);
+        try std.testing.expectEqualStrings("tenant_ops.analytics.events", resource);
+    }
+    try std.testing.expect((try requiredPermissionForRequest(alloc, .GET, "/databases/tenant_ops/namespaces/analytics/tables/events/relational-column-backed-index-repair")) == null);
 }
 
 test "document artifact routes declare read and admin permissions" {
@@ -25218,6 +25754,20 @@ test "document artifact routes declare read and admin permissions" {
         try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
     }
     try std.testing.expect((try requiredPermissionForRequest(std.testing.allocator, .GET, "/tables/docs/artifacts/document_units_v1/reprocess")) == null);
+}
+
+test "relational repair route declares admin table permission" {
+    const alloc = std.testing.allocator;
+
+    const required = (try requiredPermissionForRequest(alloc, .POST, "/tables/docs/relational-column-backed-index-repair")).?;
+    defer required.deinit(alloc);
+    try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+    try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    const resource = try required.resourceNameAlloc(alloc);
+    defer alloc.free(resource);
+    try std.testing.expectEqualStrings("docs", resource);
+
+    try std.testing.expect((try requiredPermissionForRequest(alloc, .GET, "/tables/docs/relational-column-backed-index-repair")) == null);
 }
 
 test "required permissions decode table path resources" {
@@ -30883,6 +31433,9 @@ test "api http server applies SQL DDL with explicit catalog session" {
     ;
     const FakeSource = struct {
         saw_session_create: bool = false,
+        saw_schema_create: bool = false,
+        saw_schema_rename: bool = false,
+        saw_schema_drop: bool = false,
         tables: [1]metadata_table_manager.TableRecord = .{.{
             .table_id = 10,
             .name = "events",
@@ -30935,6 +31488,40 @@ test "api http server applies SQL DDL with explicit catalog session" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const table_plan = switch (plan.*) {
                 .table_ddl => |table| table,
+                .catalog_ddl => |catalog| switch (catalog) {
+                    .schema_namespace_catalog => |schema_plan| {
+                        var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(alloc_arg);
+                        errdefer applied.deinit(alloc_arg);
+                        switch (schema_plan) {
+                            .create => |create| {
+                                const target = try session.namespaceTargetFromSchemaName(create.schema_name);
+                                try std.testing.expectEqualStrings("tenant_ops", target.database_name);
+                                try std.testing.expect(std.mem.eql(u8, target.namespace_name, "analytics") or std.mem.eql(u8, target.namespace_name, "reporting"));
+                                self.saw_schema_create = true;
+                                applied.created_namespace = true;
+                            },
+                            .rename => |rename| {
+                                const old_target = try session.namespaceTargetFromSchemaName(rename.schema_name);
+                                const new_target = try session.namespaceTargetFromSchemaName(rename.new_schema_name);
+                                try std.testing.expectEqualStrings("tenant_ops", old_target.database_name);
+                                try std.testing.expectEqualStrings("reporting", old_target.namespace_name);
+                                try std.testing.expectEqualStrings("tenant_ops", new_target.database_name);
+                                try std.testing.expectEqualStrings("archive", new_target.namespace_name);
+                                self.saw_schema_rename = true;
+                                applied.renamed_namespace = true;
+                            },
+                            .drop => |drop| {
+                                const target = try session.namespaceTargetFromSchemaName(drop.schema_name);
+                                try std.testing.expectEqualStrings("tenant_ops", target.database_name);
+                                try std.testing.expectEqualStrings("archive", target.namespace_name);
+                                self.saw_schema_drop = true;
+                                applied.dropped_namespace = true;
+                            },
+                        }
+                        return applied;
+                    },
+                    else => return error.TestUnexpectedResult,
+                },
                 else => return error.TestUnexpectedResult,
             };
             var target = try tables_api.relationalSqlDdlTargetForTablePlanWithSessionAlloc(alloc_arg, table_plan, session);
@@ -30977,6 +31564,25 @@ test "api http server applies SQL DDL with explicit catalog session" {
         .search_path = &.{"public"},
     });
     defer session.deinit(alloc);
+
+    var created_schema = try server.applyRelationalSqlDdlWithSession("CREATE SCHEMA analytics;", &session);
+    defer created_schema.deinit(alloc);
+    try std.testing.expect(created_schema.created_namespace);
+    try std.testing.expect(source.saw_schema_create);
+
+    var created_reporting_schema = try server.applyRelationalSqlDdlWithSession("CREATE SCHEMA reporting;", &session);
+    defer created_reporting_schema.deinit(alloc);
+    try std.testing.expect(created_reporting_schema.created_namespace);
+
+    var renamed_schema = try server.applyRelationalSqlDdlWithSession("ALTER SCHEMA reporting RENAME TO archive;", &session);
+    defer renamed_schema.deinit(alloc);
+    try std.testing.expect(renamed_schema.renamed_namespace);
+    try std.testing.expect(source.saw_schema_rename);
+
+    var dropped_schema = try server.applyRelationalSqlDdlWithSession("DROP SCHEMA archive;", &session);
+    defer dropped_schema.deinit(alloc);
+    try std.testing.expect(dropped_schema.dropped_namespace);
+    try std.testing.expect(source.saw_schema_drop);
 
     var created_role = try server.applyRelationalSqlDdlWithSession("CREATE ROLE app_reader;", &session);
     defer created_role.deinit(alloc);
@@ -31553,6 +32159,44 @@ test "api http server surfaces public SQL parse diagnostics for generated malfor
         },
         .result => return error.TestUnexpectedResult,
     }
+}
+
+test "api http server generated read row claim diagnostics use retained AST metadata" {
+    const alloc = std.testing.allocator;
+
+    var aggregate_read = try sql_adapter.ParsedSql.initAlloc(alloc, "SELECT count(*) FROM usage_records FOR UPDATE");
+    defer aggregate_read.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "lockable base-row source for aggregate row claim",
+        ApiHttpServer.publicSqlGeneratedReadRowClaimMissingNativeModel(&aggregate_read) orelse return error.TestUnexpectedResult,
+    );
+
+    if (aggregate_read.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read_ast| read_ast.row_lock_tokens = null,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(ApiHttpServer.publicSqlGeneratedReadRowClaimMissingNativeModel(&aggregate_read) == null);
+
+    var cte_body_read = try sql_adapter.ParsedSql.initAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records FOR UPDATE) SELECT id FROM source_rows");
+    defer cte_body_read.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "lockable base-row source for materialized CTE row claim",
+        ApiHttpServer.publicSqlGeneratedReadRowClaimMissingNativeModel(&cte_body_read) orelse return error.TestUnexpectedResult,
+    );
+
+    if (cte_body_read.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read_ast| read_ast.cte_items[0].body_row_lock_tokens = null,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(ApiHttpServer.publicSqlGeneratedReadRowClaimMissingNativeModel(&cte_body_read) == null);
 }
 
 test "api http server binds public sql authorization to resolved statement targets" {
@@ -38301,6 +38945,328 @@ test "api http server exposes relational unique integrity repair" {
     defer invalid_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
     try std.testing.expectEqualStrings("invalid unique integrity request", invalid_resp.body);
+}
+
+test "api http server exposes relational column backed index repair worker pass" {
+    const alloc = std.testing.allocator;
+
+    const FakeStatus = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    const FakeWrites = struct {
+        calls: usize = 0,
+        begin_calls: usize = 0,
+        record_calls: usize = 0,
+        database_name: []const u8 = "",
+        namespace_name: []const u8 = "",
+        table_name: []const u8 = "",
+        worker_id: []const u8 = "",
+        job_id: []const u8 = "",
+        recorded_complete: bool = false,
+        recorded_next_upper_doc_key: []const u8 = "",
+        lease_ms: u64 = 0,
+        max_work_units: usize = 0,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .relational_column_backed_index_repair_worker_pass_catalog = repairWorkerPassCatalog,
+                    .relational_index_repair_job_begin_catalog = repairJobBeginCatalog,
+                    .relational_index_repair_job_record_pass_catalog = repairJobRecordPassCatalog,
+                    .relational_index_repair_job_load_catalog = repairJobLoadCatalog,
+                },
+            };
+        }
+
+        fn batch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) anyerror!?void {
+            return error.UnsupportedOperation;
+        }
+
+        fn repairJobBeginCatalog(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            job_id: []const u8,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.begin_calls += 1;
+            self.database_name = target.database_name;
+            self.namespace_name = target.namespace_name;
+            self.table_name = target.table_name;
+            self.job_id = job_id;
+            self.worker_id = worker_id;
+            self.lease_ms = lease_ms;
+            self.max_work_units = max_work_units;
+            return {};
+        }
+
+        fn repairJobRecordPassCatalog(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            job_id: []const u8,
+            result: table_writes.RelationalColumnBackedIndexRepairWorkerPassResult,
+        ) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.record_calls += 1;
+            self.database_name = target.database_name;
+            self.namespace_name = target.namespace_name;
+            self.table_name = target.table_name;
+            self.job_id = job_id;
+            self.recorded_complete = result.complete;
+            self.recorded_next_upper_doc_key = if (result.groups.len == 0) "" else result.groups[result.groups.len - 1].upper_doc_key;
+            return {};
+        }
+
+        fn repairJobLoadCatalog(
+            ptr: *anyopaque,
+            alloc_inner: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            job_id: []const u8,
+        ) anyerror!?table_writes.RelationalIndexRepairJobRecord {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.database_name = target.database_name;
+            self.namespace_name = target.namespace_name;
+            self.table_name = target.table_name;
+            self.job_id = job_id;
+            const record_table_name = if (std.mem.eql(u8, job_id, "repair:other")) "other" else target.table_name;
+            return .{
+                .job_id = try alloc_inner.dupe(u8, job_id),
+                .database_name = try alloc_inner.dupe(u8, target.database_name),
+                .namespace_name = try alloc_inner.dupe(u8, target.namespace_name),
+                .table_name = try alloc_inner.dupe(u8, record_table_name),
+                .worker_id = try alloc_inner.dupe(u8, "worker:repair"),
+                .lease_ms = 60_000,
+                .max_work_units = 1024,
+                .status = try alloc_inner.dupe(u8, "running"),
+                .created_at_ns = 1,
+                .updated_at_ns = 2,
+                .attempts = 1,
+                .completed = false,
+                .next_lower_doc_key = try alloc_inner.dupe(u8, "row:m"),
+                .last_ranges_scanned = 2,
+                .last_ranges_repaired = 1,
+                .last_ranges_missing = 0,
+                .total_ranges_scanned = 2,
+                .total_ranges_repaired = 1,
+                .total_ranges_missing = 0,
+                .last_report = .{
+                    .scanned_rows = 3,
+                    .indexed_rows = 2,
+                    .deleted_orphan_entries = 1,
+                    .written_entries = 2,
+                },
+                .aggregate_report = .{
+                    .scanned_rows = 3,
+                    .indexed_rows = 2,
+                    .deleted_orphan_entries = 1,
+                    .written_entries = 2,
+                },
+            };
+        }
+
+        fn repairWorkerPassCatalog(
+            ptr: *anyopaque,
+            alloc_inner: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) anyerror!?table_writes.RelationalColumnBackedIndexRepairWorkerPassResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.database_name = target.database_name;
+            self.namespace_name = target.namespace_name;
+            self.table_name = target.table_name;
+            self.worker_id = worker_id;
+            self.lease_ms = lease_ms;
+            self.max_work_units = max_work_units;
+
+            const groups = try alloc_inner.alloc(table_writes.RelationalColumnBackedIndexRepairWorkerResult, 1);
+            errdefer alloc_inner.free(groups);
+            groups[0] = .{
+                .group_id = 7001,
+                .table_id = 7,
+                .range_id = 7101,
+                .lower_doc_key = "",
+                .upper_doc_key = try alloc_inner.dupe(u8, "row:m"),
+                .repaired = true,
+                .report = .{
+                    .scanned_rows = 3,
+                    .indexed_rows = 2,
+                    .deleted_orphan_entries = 1,
+                    .written_entries = 2,
+                },
+            };
+            return .{
+                .complete = false,
+                .ranges_scanned = 2,
+                .ranges_repaired = 1,
+                .ranges_missing = 0,
+                .report = groups[0].report,
+                .groups = groups,
+            };
+        }
+    };
+
+    const RepairResponse = struct {
+        complete: bool,
+        ranges_scanned: u64,
+        ranges_repaired: u64,
+        ranges_missing: u64,
+        report: struct {
+            scanned_rows: u64,
+            indexed_rows: u64,
+            deleted_orphan_entries: u64,
+            written_entries: u64,
+        },
+        groups: []const struct {
+            group_id: u64,
+            table_id: u64,
+            range_id: u64,
+            lower_doc_key: []const u8,
+            upper_doc_key: []const u8,
+            repaired: bool,
+            report: struct {
+                scanned_rows: u64,
+                indexed_rows: u64,
+                deleted_orphan_entries: u64,
+                written_entries: u64,
+            },
+        },
+    };
+
+    const RepairJobResponse = struct {
+        job_id: []const u8,
+        database_name: []const u8,
+        namespace_name: []const u8,
+        table_name: []const u8,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+        status: []const u8,
+        attempts: u32,
+        completed: bool,
+        next_lower_doc_key: []const u8,
+        last_ranges_scanned: u64,
+        total_ranges_scanned: u64,
+        aggregate_report: struct {
+            scanned_rows: u64,
+            indexed_rows: u64,
+            deleted_orphan_entries: u64,
+            written_entries: u64,
+        },
+    };
+
+    var status = FakeStatus{};
+    var writes = FakeWrites{};
+    var server = ApiHttpServer.init(alloc, .{}, status.iface(), null, writes.source());
+
+    var resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/relational-column-backed-index-repair",
+        .content_type = "application/json",
+        .body = "{\"worker_id\":\"worker:repair\",\"job_id\":\"repair:docs:1\",\"lease_ms\":60000,\"max_work_units\":9999}",
+    });
+    defer resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqual(@as(usize, 1), writes.calls);
+    try std.testing.expectEqual(@as(usize, 1), writes.begin_calls);
+    try std.testing.expectEqual(@as(usize, 1), writes.record_calls);
+    try std.testing.expectEqualStrings(catalog_resources.default_database_name, writes.database_name);
+    try std.testing.expectEqualStrings(catalog_resources.default_namespace_name, writes.namespace_name);
+    try std.testing.expectEqualStrings("docs", writes.table_name);
+    try std.testing.expectEqualStrings("worker:repair", writes.worker_id);
+    try std.testing.expectEqualStrings("repair:docs:1", writes.job_id);
+    try std.testing.expect(!writes.recorded_complete);
+    try std.testing.expectEqualStrings("row:m", writes.recorded_next_upper_doc_key);
+    try std.testing.expectEqual(@as(u64, 60_000), writes.lease_ms);
+    try std.testing.expectEqual(@as(usize, 1024), writes.max_work_units);
+
+    var parsed = try std.json.parseFromSlice(RepairResponse, alloc, resp.body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.value.complete);
+    try std.testing.expectEqual(@as(u64, 2), parsed.value.ranges_scanned);
+    try std.testing.expectEqual(@as(u64, 1), parsed.value.ranges_repaired);
+    try std.testing.expectEqual(@as(u64, 0), parsed.value.ranges_missing);
+    try std.testing.expectEqual(@as(u64, 3), parsed.value.report.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 1), parsed.value.report.deleted_orphan_entries);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.groups.len);
+    try std.testing.expectEqual(@as(u64, 7001), parsed.value.groups[0].group_id);
+    try std.testing.expectEqualStrings("row:m", parsed.value.groups[0].upper_doc_key);
+    try std.testing.expect(parsed.value.groups[0].repaired);
+
+    var job_resp = try server.handle(.{
+        .method = .GET,
+        .uri = "/tables/docs/relational-column-backed-index-repair/jobs/repair:docs:1",
+    });
+    defer job_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), job_resp.status);
+    var parsed_job = try std.json.parseFromSlice(RepairJobResponse, alloc, job_resp.body, .{ .ignore_unknown_fields = true });
+    defer parsed_job.deinit();
+    try std.testing.expectEqualStrings("repair:docs:1", parsed_job.value.job_id);
+    try std.testing.expectEqualStrings(catalog_resources.default_database_name, parsed_job.value.database_name);
+    try std.testing.expectEqualStrings(catalog_resources.default_namespace_name, parsed_job.value.namespace_name);
+    try std.testing.expectEqualStrings("docs", parsed_job.value.table_name);
+    try std.testing.expectEqualStrings("worker:repair", parsed_job.value.worker_id);
+    try std.testing.expectEqualStrings("running", parsed_job.value.status);
+    try std.testing.expectEqual(@as(u32, 1), parsed_job.value.attempts);
+    try std.testing.expect(!parsed_job.value.completed);
+    try std.testing.expectEqualStrings("row:m", parsed_job.value.next_lower_doc_key);
+    try std.testing.expectEqual(@as(u64, 2), parsed_job.value.total_ranges_scanned);
+    try std.testing.expectEqual(@as(u64, 3), parsed_job.value.aggregate_report.scanned_rows);
+    var wrong_table_job_resp = try server.handle(.{
+        .method = .GET,
+        .uri = "/tables/docs/relational-column-backed-index-repair/jobs/repair:other",
+    });
+    defer wrong_table_job_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 404), wrong_table_job_resp.status);
+    try std.testing.expectEqualStrings("relational index repair job not found", wrong_table_job_resp.body);
+
+    var namespace_resp = try server.handlePublicCatalogTableRelationalColumnBackedIndexRepair(.{
+        .database_name = "tenant_ops",
+        .namespace_name = "analytics",
+        .table_name = "docs",
+    }, "{\"worker_id\":\"worker:tenant\",\"lease_ms\":70000,\"max_work_units\":2}");
+    defer namespace_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), namespace_resp.status);
+    try std.testing.expectEqual(@as(usize, 2), writes.calls);
+    try std.testing.expectEqualStrings("tenant_ops", writes.database_name);
+    try std.testing.expectEqualStrings("analytics", writes.namespace_name);
+    try std.testing.expectEqualStrings("docs", writes.table_name);
+    try std.testing.expectEqualStrings("worker:tenant", writes.worker_id);
+    try std.testing.expectEqual(@as(u64, 70_000), writes.lease_ms);
+    try std.testing.expectEqual(@as(usize, 2), writes.max_work_units);
+
+    var invalid_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/relational-column-backed-index-repair",
+        .content_type = "application/json",
+        .body = "{\"worker_id\":\"worker:repair\",\"max_work_units\":0}",
+    });
+    defer invalid_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
+    try std.testing.expectEqualStrings("invalid relational index repair request", invalid_resp.body);
 }
 
 test "api http server serves table batch transforms" {

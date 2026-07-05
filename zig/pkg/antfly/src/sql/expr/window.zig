@@ -2119,9 +2119,7 @@ pub fn parseSelectListAlloc(
             try windows.append(alloc, spec);
             spec_transferred = true;
         } else {
-            if (generated_expression) |expression| {
-                if (expression.kind != .token_range) return error.UnsupportedSqlShape;
-            }
+            try validateGeneratedSimpleGroupExpression(tokens, generated_expression);
             const parsed_field = try expr_generated.parseRowExpressionFieldOwnedAlloc(
                 alloc,
                 tokens,
@@ -2144,6 +2142,13 @@ pub fn parseSelectListAlloc(
             errdefer if (!field_transferred) alloc.free(field);
             if (expr_projection.peekUnsupportedSimpleFieldTail(tokens, pos.*)) return error.UnsupportedSqlShape;
             if (binder.relationalColumnForField(options.schema, field, null) == null) return error.InvalidSqlCatalog;
+            try expr_generated_validate.validateGeneratedRowExpressionIdentityStrict(
+                tokens,
+                item_start,
+                pos.*,
+                .{ .kind = .field, .field = field },
+                generated_expression,
+            );
             try grammar.consumeProjectionAlias(alloc, tokens, pos, field);
             try generated_read_validate.validateGeneratedExpressionItemEnd(generated_item, pos.*);
             try outputs.append(alloc, .{ .kind = .field, .index = fields.items.len });

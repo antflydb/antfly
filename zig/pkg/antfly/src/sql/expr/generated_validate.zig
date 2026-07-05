@@ -1332,6 +1332,29 @@ fn generatedArithmeticOperatorKindMayRepresentRowExpressionKind(
     };
 }
 
+fn generatedFunctionCallUsesStructuredArgumentSyntax(
+    tokens: []const Token,
+    generated_expression: generated_parser.GeneratedSqlExpressionAst,
+    parsed_kind: db_mod.types.RelationalRowsExpressionKind,
+) !bool {
+    if (generated_expression.kind != .function_call) return false;
+    const token = try generatedExpressionFunctionNameToken(tokens, generated_expression);
+    return switch (parsed_kind) {
+        .substring => expr_token.sqlTokenIsSubstringFunction(token),
+        .overlay => expr_token.sqlTokenIsOverlayFunction(token),
+        else => false,
+    };
+}
+
+fn validateGeneratedNullPredicateRightTokens(
+    tokens: []const Token,
+    generated_expression: generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const rhs_tokens = generated_expression.right_tokens orelse return;
+    if (rhs_tokens.start >= rhs_tokens.end or rhs_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    if (rhs_tokens.end != rhs_tokens.start + 1 or !tokens[rhs_tokens.start].matchesKeywordTag(.null)) return error.UnsupportedSqlShape;
+}
+
 fn generatedLeafKindMayRepresentRowExpression(
     generated_kind: generated_parser.GeneratedSqlExpressionKind,
     parsed_expression: db_mod.types.RelationalRowsExpression,
@@ -1487,6 +1510,79 @@ fn validateGeneratedJsonExtractPathFunctionOperandsStrict(
     for (generated_expression.argument_items.items[1..], 1..) |path_tokens, index| {
         try validateGeneratedOptionalExpression(tokens, path_tokens, generated_expression.argument_items.expressions[index]);
     }
+    return true;
+}
+
+fn validateGeneratedJsonAccessExpressionOperandsStrict(
+    context: StrictValidationContext,
+    tokens: []const Token,
+    parsed_expression: db_mod.types.RelationalRowsExpression,
+    generated_expression: *const generated_parser.GeneratedSqlExpressionAst,
+) anyerror!bool {
+    const generated_as_text = switch (generated_expression.kind) {
+        .json_access, .json_path_access => false,
+        .json_text_access, .json_path_text_access => true,
+        else => return false,
+    };
+    if (parsed_expression.kind != .json_extract) return false;
+    if (parsed_expression.json_as_text != generated_as_text) return error.UnsupportedSqlShape;
+    if (parsed_expression.operands.len != 1) return error.UnsupportedSqlShape;
+
+    const left_tokens = generated_expression.left_tokens orelse return error.UnsupportedSqlShape;
+    const left_expression = generated_expression.left_expression orelse return error.UnsupportedSqlShape;
+    try validateGeneratedRowExpressionIdentityStrictWithContext(
+        context,
+        tokens,
+        left_tokens.start,
+        left_tokens.end,
+        parsed_expression.operands[0],
+        left_expression,
+    );
+
+    const operator_tokens = generated_expression.operator_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedExpressionOperatorTokens(tokens, generated_expression.kind, operator_tokens);
+    if (operator_tokens.end != operator_tokens.start + 1) return error.UnsupportedSqlShape;
+    const right_tokens = generated_expression.right_tokens orelse return error.UnsupportedSqlShape;
+    const alloc = context.alloc orelse return error.UnsupportedSqlShape;
+    var path_pos = right_tokens.start;
+    const generated_path = try value_mod.parseJsonExtractOperatorPathOwnedAlloc(
+        alloc,
+        tokens,
+        &path_pos,
+        context.params,
+        tokens[operator_tokens.start].kind,
+    );
+    defer alloc.free(generated_path);
+    if (path_pos != right_tokens.end) return error.UnsupportedSqlShape;
+    if (!std.mem.eql(u8, parsed_expression.json_path, generated_path)) return error.UnsupportedSqlShape;
+    return true;
+}
+
+fn validateGeneratedUnaryNegativeExpressionOperandsStrict(
+    context: StrictValidationContext,
+    tokens: []const Token,
+    parsed_expression: db_mod.types.RelationalRowsExpression,
+    generated_expression: *const generated_parser.GeneratedSqlExpressionAst,
+) anyerror!bool {
+    if (generated_expression.kind != .unary_negative) return false;
+    const operator_tokens = generated_expression.operator_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedExpressionOperatorTokens(tokens, generated_expression.kind, operator_tokens);
+    if (parsed_expression.kind == .value) {
+        if (!std.mem.startsWith(u8, parsed_expression.value_json, "-")) return error.UnsupportedSqlShape;
+        return true;
+    }
+    if (parsed_expression.kind != .mul or parsed_expression.operands.len != 2) return error.UnsupportedSqlShape;
+    if (parsed_expression.operands[0].kind != .value or !std.mem.eql(u8, parsed_expression.operands[0].value_json, "-1")) return error.UnsupportedSqlShape;
+    const operand_tokens = generated_expression.right_tokens orelse generated_expression.left_tokens orelse return error.UnsupportedSqlShape;
+    const operand_expression = generated_expression.right_expression orelse generated_expression.left_expression orelse return error.UnsupportedSqlShape;
+    try validateGeneratedRowExpressionIdentityStrictWithContext(
+        context,
+        tokens,
+        operand_tokens.start,
+        operand_tokens.end,
+        parsed_expression.operands[1],
+        operand_expression,
+    );
     return true;
 }
 
@@ -2058,6 +2154,7 @@ fn validateGeneratedRowExpressionOperandsStrict(
     if (try validateGeneratedCaseExpressionOperandsStrict(context, tokens, parsed_expression, generated_expression)) return;
     if (try validateGeneratedArrayConstructorExpressionStrict(context, tokens, parsed_expression, generated_expression)) return;
     if (try validateGeneratedTemporalLeafExpressionStrict(context, tokens, parsed_expression, generated_expression)) return;
+    if (try validateGeneratedUnaryNegativeExpressionOperandsStrict(context, tokens, parsed_expression, generated_expression)) return;
     if (parsed_expression.operands.len == 0) return;
     if (parsed_expression.kind == .concat and generated_expression.kind == .string_concat) {
         try validateGeneratedConcatExpressionOperandsStrict(context, tokens, parsed_expression, generated_expression);
@@ -2065,37 +2162,44 @@ fn validateGeneratedRowExpressionOperandsStrict(
     }
     if (try validateGeneratedPositionFunctionOperandsStrict(context, tokens, parsed_expression, generated_expression)) return;
     if (try validateGeneratedJsonExtractPathFunctionOperandsStrict(context, tokens, parsed_expression, generated_expression)) return;
+    if (try validateGeneratedJsonAccessExpressionOperandsStrict(context, tokens, parsed_expression, generated_expression)) return;
     if (try validateGeneratedJsonKeySetExpressionOperandsStrict(context, tokens, parsed_expression, generated_expression)) return;
     if (try validateGeneratedCastExpressionOperandsStrict(context, tokens, parsed_expression, generated_expression)) return;
     if (try validateGeneratedExtractExpressionOperandsStrict(context, tokens, parsed_expression, generated_expression)) return;
     var expected_operand_count: usize = 0;
     if (generated_expression.left_tokens) |left_tokens| {
         if (parsed_expression.operands.len <= expected_operand_count) return error.UnsupportedSqlShape;
+        const left_expression = generated_expression.left_expression orelse return error.UnsupportedSqlShape;
         try validateGeneratedRowExpressionIdentityStrictWithContext(
             context,
             tokens,
             left_tokens.start,
             left_tokens.end,
             parsed_expression.operands[expected_operand_count],
-            generated_expression,
+            left_expression,
         );
         expected_operand_count += 1;
     }
     if (generated_expression.right_tokens) |right_tokens| {
         if (parsed_expression.operands.len <= expected_operand_count) return error.UnsupportedSqlShape;
+        const right_expression = generated_expression.right_expression orelse return error.UnsupportedSqlShape;
         try validateGeneratedRowExpressionIdentityStrictWithContext(
             context,
             tokens,
             right_tokens.start,
             right_tokens.end,
             parsed_expression.operands[expected_operand_count],
-            generated_expression,
+            right_expression,
         );
         expected_operand_count += 1;
     }
     if (generated_expression.kind == .function_call and generated_expression.argument_items.count != 0) {
         if (expected_operand_count != 0) return error.UnsupportedSqlShape;
-        if (generated_expression.argument_items.count != parsed_expression.operands.len) return error.UnsupportedSqlShape;
+        if (generated_expression.argument_items.count != parsed_expression.operands.len) {
+            if (try generatedFunctionCallUsesStructuredArgumentSyntax(tokens, generated_expression.*, parsed_expression.kind)) return;
+            return error.UnsupportedSqlShape;
+        }
+        if (!generatedExpressionListHasConsistentExpressions(generated_expression.argument_items)) return error.UnsupportedSqlShape;
         for (generated_expression.argument_items.items, 0..) |argument_tokens, index| {
             try validateGeneratedRowExpressionIdentityStrictWithContext(
                 context,
@@ -2103,7 +2207,7 @@ fn validateGeneratedRowExpressionOperandsStrict(
                 argument_tokens.start,
                 argument_tokens.end,
                 parsed_expression.operands[index],
-                generated_expression,
+                &generated_expression.argument_items.expressions[index],
             );
         }
         return;
@@ -2174,9 +2278,11 @@ fn validateGeneratedRowExpressionIdentityWithMode(
         },
         else => {
             if (generatedOperatorKindMatchesRowExpressionKind(generated_expression.kind, parsed_expression)) |matches| {
-                if (!matches and !generatedArithmeticOperatorKindMayRepresentRowExpressionKind(generated_expression.kind, parsed_expression.kind)) return error.UnsupportedSqlShape;
+                const arithmetic_shape_equivalent = !matches and generatedArithmeticOperatorKindMayRepresentRowExpressionKind(generated_expression.kind, parsed_expression.kind);
+                if (!matches and !arithmetic_shape_equivalent) return error.UnsupportedSqlShape;
                 const operator_tokens = generated_expression.operator_tokens orelse return error.UnsupportedSqlShape;
                 try validateGeneratedExpressionOperatorTokens(tokens, generated_expression.kind, operator_tokens);
+                if (arithmetic_shape_equivalent) return;
             } else if (require_exact_expression and !generatedLeafKindMayRepresentRowExpression(generated_expression.kind, parsed_expression)) {
                 return error.UnsupportedSqlShape;
             }
@@ -2244,7 +2350,8 @@ fn validateGeneratedExpressionConditionIdentityWithMode(
     }
     switch (parsed_condition.op) {
         .is_null, .is_not_null => {
-            if (parsed_condition.rhs.len != 0 or generated_expression.right_tokens != null) return error.UnsupportedSqlShape;
+            if (parsed_condition.rhs.len != 0) return error.UnsupportedSqlShape;
+            try validateGeneratedNullPredicateRightTokens(tokens, generated_expression.*);
         },
         else => {
             if (boolean_literal_tail != null) {

@@ -121,6 +121,7 @@ const Config = struct {
     matrix_max_ordered_vs_single_residual_rechecks: f64 = std.math.inf(f64),
     matrix_max_ordered_vs_single_store_mutations: f64 = std.math.inf(f64),
     matrix_max_ordered_vs_single_relational_mutations: f64 = std.math.inf(f64),
+    matrix_max_ordered_tuple_candidate_gate_exceeded_count: u64 = 0,
     matrix_all_query_shapes: bool = true,
     matrix_write_scenario: MatrixWriteScenario = .current,
     matrix_all_write_scenarios: bool = false,
@@ -154,10 +155,12 @@ const QueryStats = struct {
     candidate_rows: u64 = 0,
     candidate_gate_limit: u64 = 0,
     candidate_gate_observed: u64 = 0,
+    candidate_gate_exceeded_count: u64 = 0,
     iterator_seeks: u64 = 0,
     hydrated_rows: u64 = 0,
     residual_rechecks: u64 = 0,
     covering_payload_rows: u64 = 0,
+    covering_payload_rechecked_rows: u64 = 0,
     projected_rows: u64 = 0,
     ordered_tuple_plan_queries: u64 = 0,
     ordered_tuple_max_key_count: u32 = 0,
@@ -237,6 +240,7 @@ const MatrixComparison = struct {
     ordered_tuple_resolved_doc_set_queries: u64,
     ordered_tuple_doc_set_queries: u64,
     ordered_tuple_stream_queries: u64,
+    ordered_tuple_candidate_gate_exceeded_count: u64,
     ordered_tuple_access_missing_flag: bool,
     ordered_tuple_fallback_flag: bool,
 };
@@ -423,6 +427,8 @@ fn parseArgs(args_in: std.process.Args) !Config {
             cfg.matrix_max_ordered_vs_single_store_mutations = try parseNextF64(&args, "--matrix-max-ordered-vs-single-store-mutations");
         } else if (std.mem.eql(u8, arg, "--matrix-max-ordered-vs-single-relational-mutations")) {
             cfg.matrix_max_ordered_vs_single_relational_mutations = try parseNextF64(&args, "--matrix-max-ordered-vs-single-relational-mutations");
+        } else if (std.mem.eql(u8, arg, "--matrix-max-ordered-tuple-candidate-gate-exceeded-count")) {
+            cfg.matrix_max_ordered_tuple_candidate_gate_exceeded_count = try parseNextU64(&args, "--matrix-max-ordered-tuple-candidate-gate-exceeded-count");
         } else if (std.mem.eql(u8, arg, "--matrix-write-scenario")) {
             const raw = args.next() orelse return error.InvalidArgument;
             cfg.matrix_write_scenario = parseMatrixWriteScenario(raw) orelse return error.InvalidArgument;
@@ -640,7 +646,7 @@ fn runMatrix(alloc: std.mem.Allocator, counting: *CountingAllocator, base_cfg: C
     var regression_failures: usize = 0;
 
     std.debug.print(
-        "batch_bench_matrix_start preset={s} docs={s} write_scenarios={s} constraint_probes={s} overwrite_passes={d} overwrite_shape={s} query_shapes={s} batch_size={d} query_repeats={d} query_limit={d} primary={s} sync={s} fail_on_regression={any} max_ordered_vs_single_writes={d:.3} max_ordered_vs_single_write_bytes={d:.3} max_ordered_vs_single_stage_time={d:.3} max_ordered_vs_single_total_time={d:.3} max_ordered_vs_single_predicate={d:.3} max_ordered_vs_single_stage_allocations={d:.3} max_ordered_vs_single_stage_allocated_bytes={d:.3} max_ordered_vs_single_query_allocations={d:.3} max_ordered_vs_single_iterator_seeks={d:.3} max_ordered_vs_single_residual_rechecks={d:.3} max_ordered_vs_single_store_mutations={d:.3} max_ordered_vs_single_relational_mutations={d:.3}\n",
+        "batch_bench_matrix_start preset={s} docs={s} write_scenarios={s} constraint_probes={s} overwrite_passes={d} overwrite_shape={s} query_shapes={s} batch_size={d} query_repeats={d} query_limit={d} primary={s} sync={s} fail_on_regression={any} max_ordered_vs_single_writes={d:.3} max_ordered_vs_single_write_bytes={d:.3} max_ordered_vs_single_stage_time={d:.3} max_ordered_vs_single_total_time={d:.3} max_ordered_vs_single_predicate={d:.3} max_ordered_vs_single_stage_allocations={d:.3} max_ordered_vs_single_stage_allocated_bytes={d:.3} max_ordered_vs_single_query_allocations={d:.3} max_ordered_vs_single_iterator_seeks={d:.3} max_ordered_vs_single_residual_rechecks={d:.3} max_ordered_vs_single_store_mutations={d:.3} max_ordered_vs_single_relational_mutations={d:.3} max_ordered_tuple_candidate_gate_exceeded_count={d}\n",
         .{
             @tagName(base_cfg.matrix_preset),
             if (base_cfg.matrix_docs_len == 0) @tagName(base_cfg.matrix_preset) else "custom",
@@ -667,6 +673,7 @@ fn runMatrix(alloc: std.mem.Allocator, counting: *CountingAllocator, base_cfg: C
             base_cfg.matrix_max_ordered_vs_single_residual_rechecks,
             base_cfg.matrix_max_ordered_vs_single_store_mutations,
             base_cfg.matrix_max_ordered_vs_single_relational_mutations,
+            base_cfg.matrix_max_ordered_tuple_candidate_gate_exceeded_count,
         },
     );
 
@@ -1338,10 +1345,12 @@ fn runQueryProbes(alloc: std.mem.Allocator, db: *db_mod.DB, cfg: Config) !QueryS
                 stats.candidate_rows += result.profile.candidate_rows;
                 stats.candidate_gate_limit = @max(stats.candidate_gate_limit, result.profile.candidate_gate_limit);
                 stats.candidate_gate_observed = @max(stats.candidate_gate_observed, result.profile.candidate_gate_observed);
+                if (result.profile.candidate_gate_exceeded) stats.candidate_gate_exceeded_count += 1;
                 stats.iterator_seeks += result.profile.iterator_seeks;
                 stats.hydrated_rows += result.profile.hydrated_rows;
                 stats.residual_rechecks += result.profile.residual_rechecks;
                 stats.covering_payload_rows += result.profile.covering_payload_rows;
+                stats.covering_payload_rechecked_rows += result.profile.covering_payload_rechecked_rows;
                 stats.projected_rows += result.profile.projected_rows;
                 if (result.profile.ordered_tuple_plan_selected) {
                     stats.ordered_tuple_plan_queries += 1;
@@ -1642,7 +1651,7 @@ fn printSummary(cfg: Config, summary: Summary) void {
     );
     if (cfg.query_repeats > 0) {
         std.debug.print(
-            "batch_bench_query lookup_repeats={d} lookup_hits={d} lookup_ms={d:.3} predicate_repeats={d} predicate_hits={d} predicate_exact_totals={d} predicate_ms={d:.3} query_alloc_events={d} query_alloc_bytes={d} query_peak_live_bytes={d} index_entries_scanned={d} candidate_rows={d} candidate_gate_limit={d} candidate_gate_observed={d} iterator_seeks={d} hydrated_rows={d} residual_rechecks={d} covering_payload_rows={d} projected_rows={d} unknown_access_queries={d} base_scan_queries={d} resolved_doc_set_queries={d} ordered_tuple_doc_set_queries={d} ordered_tuple_stream_queries={d} ordered_tuple_candidate_gate_fallbacks={d} ordered_tuple_materialization_cap_fallbacks={d} ordered_tuple_exact_paged_total_fallbacks={d} ordered_tuple_ordering_not_covered_fallbacks={d} ordered_tuple_index_not_ready_fallbacks={d} ordered_tuple_stale_generation_fallbacks={d} ordered_tuple_predicate_not_proven_fallbacks={d} ordered_tuple_no_usable_bounds_fallbacks={d}\n",
+            "batch_bench_query lookup_repeats={d} lookup_hits={d} lookup_ms={d:.3} predicate_repeats={d} predicate_hits={d} predicate_exact_totals={d} predicate_ms={d:.3} query_alloc_events={d} query_alloc_bytes={d} query_peak_live_bytes={d} index_entries_scanned={d} candidate_rows={d} candidate_gate_limit={d} candidate_gate_observed={d} iterator_seeks={d} hydrated_rows={d} residual_rechecks={d} covering_payload_rows={d} covering_payload_rechecked_rows={d} projected_rows={d} unknown_access_queries={d} base_scan_queries={d} resolved_doc_set_queries={d} ordered_tuple_doc_set_queries={d} ordered_tuple_stream_queries={d}\n",
             .{
                 summary.query.lookup_repeats,
                 summary.query.lookup_hits,
@@ -1662,12 +1671,18 @@ fn printSummary(cfg: Config, summary: Summary) void {
                 summary.query.hydrated_rows,
                 summary.query.residual_rechecks,
                 summary.query.covering_payload_rows,
+                summary.query.covering_payload_rechecked_rows,
                 summary.query.projected_rows,
                 summary.query.unknown_access_queries,
                 summary.query.base_scan_queries,
                 summary.query.resolved_doc_set_queries,
                 summary.query.ordered_tuple_doc_set_queries,
                 summary.query.ordered_tuple_stream_queries,
+            },
+        );
+        std.debug.print(
+            "batch_bench_query_fallbacks ordered_tuple_candidate_gate_fallbacks={d} ordered_tuple_materialization_cap_fallbacks={d} ordered_tuple_exact_paged_total_fallbacks={d} ordered_tuple_ordering_not_covered_fallbacks={d} ordered_tuple_index_not_ready_fallbacks={d} ordered_tuple_stale_generation_fallbacks={d} ordered_tuple_predicate_not_proven_fallbacks={d} ordered_tuple_no_usable_bounds_fallbacks={d}\n",
+            .{
                 summary.query.ordered_tuple_candidate_gate_fallbacks,
                 summary.query.ordered_tuple_materialization_cap_fallbacks,
                 summary.query.ordered_tuple_exact_paged_total_fallbacks,
@@ -1677,6 +1692,10 @@ fn printSummary(cfg: Config, summary: Summary) void {
                 summary.query.ordered_tuple_predicate_not_proven_fallbacks,
                 summary.query.ordered_tuple_no_usable_bounds_fallbacks,
             },
+        );
+        std.debug.print(
+            "batch_bench_query_gate candidate_gate_exceeded_count={d}\n",
+            .{summary.query.candidate_gate_exceeded_count},
         );
         std.debug.print(
             "batch_bench_query_plan ordered_tuple_plan_queries={d} ordered_tuple_max_key_count={d} ordered_tuple_max_equality_prefix_len={d} ordered_tuple_max_filter_predicates={d} ordered_tuple_max_proven_predicates={d} ordered_tuple_max_residual_predicates={d} ordered_tuple_range_plan_queries={d} ordered_tuple_prefix_scan_queries={d}\n",
@@ -1743,7 +1762,7 @@ fn printMatrixResult(cfg: Config, selectivity: []const u8, summary: Summary) voi
         },
     );
     std.debug.print(
-        " predicate_ms={d:.3} predicate_hits={d} exact_totals={d} query_alloc_events={d} query_alloc_bytes={d} query_peak_live_bytes={d} index_entries_scanned={d} candidate_rows={d} candidate_gate_limit={d} candidate_gate_observed={d} iterator_seeks={d} hydrated_rows={d} residual_rechecks={d} covering_payload_rows={d} projected_rows={d} unknown_access_queries={d} base_scan_queries={d} resolved_doc_set_queries={d} ordered_tuple_doc_set_queries={d} ordered_tuple_stream_queries={d} candidate_gate_fallbacks={d} materialization_cap_fallbacks={d} exact_paged_total_fallbacks={d} ordering_not_covered_fallbacks={d} index_not_ready_fallbacks={d} stale_generation_fallbacks={d} predicate_not_proven_fallbacks={d} no_usable_bounds_fallbacks={d}\n",
+        " predicate_ms={d:.3} predicate_hits={d} exact_totals={d} query_alloc_events={d} query_alloc_bytes={d} query_peak_live_bytes={d} index_entries_scanned={d} candidate_rows={d} candidate_gate_limit={d} candidate_gate_observed={d} iterator_seeks={d} hydrated_rows={d} residual_rechecks={d} covering_payload_rows={d} covering_payload_rechecked_rows={d} projected_rows={d} unknown_access_queries={d} base_scan_queries={d} resolved_doc_set_queries={d} ordered_tuple_doc_set_queries={d} ordered_tuple_stream_queries={d} candidate_gate_fallbacks={d} materialization_cap_fallbacks={d} exact_paged_total_fallbacks={d} ordering_not_covered_fallbacks={d} index_not_ready_fallbacks={d} stale_generation_fallbacks={d} predicate_not_proven_fallbacks={d} no_usable_bounds_fallbacks={d}",
         .{
             nsToMsFloat(summary.query.predicate_ns),
             summary.query.predicate_hits,
@@ -1759,6 +1778,7 @@ fn printMatrixResult(cfg: Config, selectivity: []const u8, summary: Summary) voi
             summary.query.hydrated_rows,
             summary.query.residual_rechecks,
             summary.query.covering_payload_rows,
+            summary.query.covering_payload_rechecked_rows,
             summary.query.projected_rows,
             summary.query.unknown_access_queries,
             summary.query.base_scan_queries,
@@ -1774,6 +1794,10 @@ fn printMatrixResult(cfg: Config, selectivity: []const u8, summary: Summary) voi
             summary.query.ordered_tuple_predicate_not_proven_fallbacks,
             summary.query.ordered_tuple_no_usable_bounds_fallbacks,
         },
+    );
+    std.debug.print(
+        " candidate_gate_exceeded_count={d}\n",
+        .{summary.query.candidate_gate_exceeded_count},
     );
     std.debug.print(
         "batch_bench_matrix_plan workload={s} write_scenario={s} constraint_probe={s} query_shape={s} relational_index_mode={s} docs={d} selectivity={s} total_mode={s} ordered_tuple_plan_queries={d} ordered_tuple_max_key_count={d} ordered_tuple_max_equality_prefix_len={d} ordered_tuple_max_filter_predicates={d} ordered_tuple_max_proven_predicates={d} ordered_tuple_max_residual_predicates={d} ordered_tuple_range_plan_queries={d} ordered_tuple_prefix_scan_queries={d}\n",
@@ -1885,6 +1909,7 @@ fn matrixRelationalComparison(
         .ordered_tuple_resolved_doc_set_queries = ordered_tuple.query.resolved_doc_set_queries,
         .ordered_tuple_doc_set_queries = ordered_tuple.query.ordered_tuple_doc_set_queries,
         .ordered_tuple_stream_queries = ordered_tuple.query.ordered_tuple_stream_queries,
+        .ordered_tuple_candidate_gate_exceeded_count = ordered_tuple.query.candidate_gate_exceeded_count,
         .ordered_tuple_access_missing_flag = ordered_tuple_access_missing,
         .ordered_tuple_fallback_flag = ordered_tuple_flagged,
     };
@@ -1906,7 +1931,7 @@ fn printMatrixRelationalComparison(comparison: MatrixComparison) void {
         },
     );
     std.debug.print(
-        " ordered_vs_no_index_writes={d:.3} ordered_vs_single_writes={d:.3} ordered_vs_no_index_write_bytes={d:.3} ordered_vs_single_write_bytes={d:.3} ordered_vs_no_index_stage_time={d:.3} ordered_vs_single_stage_time={d:.3} ordered_vs_no_index_total_time={d:.3} ordered_vs_single_total_time={d:.3} ordered_vs_no_index_store_mutations={d:.3} ordered_vs_single_store_mutations={d:.3} ordered_vs_no_index_relational_mutations={d:.3} ordered_vs_single_relational_mutations={d:.3} ordered_vs_no_index_stage_allocations={d:.3} ordered_vs_single_stage_allocations={d:.3} ordered_vs_no_index_stage_allocated_bytes={d:.3} ordered_vs_single_stage_allocated_bytes={d:.3} ordered_vs_no_index_query_allocations={d:.3} ordered_vs_single_query_allocations={d:.3} ordered_vs_no_index_iterator_seeks={d:.3} ordered_vs_single_iterator_seeks={d:.3} ordered_vs_no_index_residual_rechecks={d:.3} ordered_vs_single_residual_rechecks={d:.3} ordered_vs_no_index_predicate={d:.3} ordered_vs_single_predicate={d:.3} ordered_tuple_base_scan_queries={d} ordered_tuple_resolved_doc_set_queries={d} ordered_tuple_doc_set_queries={d} ordered_tuple_stream_queries={d} ordered_tuple_access_missing_flag={any} ordered_tuple_fallback_flag={any}\n",
+        " ordered_vs_no_index_writes={d:.3} ordered_vs_single_writes={d:.3} ordered_vs_no_index_write_bytes={d:.3} ordered_vs_single_write_bytes={d:.3} ordered_vs_no_index_stage_time={d:.3} ordered_vs_single_stage_time={d:.3} ordered_vs_no_index_total_time={d:.3} ordered_vs_single_total_time={d:.3} ordered_vs_no_index_store_mutations={d:.3} ordered_vs_single_store_mutations={d:.3} ordered_vs_no_index_relational_mutations={d:.3} ordered_vs_single_relational_mutations={d:.3} ordered_vs_no_index_stage_allocations={d:.3} ordered_vs_single_stage_allocations={d:.3} ordered_vs_no_index_stage_allocated_bytes={d:.3} ordered_vs_single_stage_allocated_bytes={d:.3} ordered_vs_no_index_query_allocations={d:.3} ordered_vs_single_query_allocations={d:.3} ordered_vs_no_index_iterator_seeks={d:.3} ordered_vs_single_iterator_seeks={d:.3} ordered_vs_no_index_residual_rechecks={d:.3} ordered_vs_single_residual_rechecks={d:.3} ordered_vs_no_index_predicate={d:.3} ordered_vs_single_predicate={d:.3} ordered_tuple_base_scan_queries={d} ordered_tuple_resolved_doc_set_queries={d} ordered_tuple_doc_set_queries={d} ordered_tuple_stream_queries={d} ordered_tuple_candidate_gate_exceeded_count={d} ordered_tuple_access_missing_flag={any} ordered_tuple_fallback_flag={any}\n",
         .{
             comparison.ordered_vs_no_index_writes,
             comparison.ordered_vs_single_writes,
@@ -1936,6 +1961,7 @@ fn printMatrixRelationalComparison(comparison: MatrixComparison) void {
             comparison.ordered_tuple_resolved_doc_set_queries,
             comparison.ordered_tuple_doc_set_queries,
             comparison.ordered_tuple_stream_queries,
+            comparison.ordered_tuple_candidate_gate_exceeded_count,
             comparison.ordered_tuple_access_missing_flag,
             comparison.ordered_tuple_fallback_flag,
         },
@@ -1945,6 +1971,7 @@ fn printMatrixRelationalComparison(comparison: MatrixComparison) void {
 fn matrixComparisonFailsGuardrail(cfg: Config, comparison: MatrixComparison) bool {
     if (comparison.ordered_tuple_access_missing_flag) return true;
     if (comparison.ordered_tuple_fallback_flag) return true;
+    if (comparison.ordered_tuple_candidate_gate_exceeded_count > cfg.matrix_max_ordered_tuple_candidate_gate_exceeded_count) return true;
     if (comparison.ordered_vs_single_writes > cfg.matrix_max_ordered_vs_single_writes) return true;
     if (comparison.ordered_vs_single_write_bytes > cfg.matrix_max_ordered_vs_single_write_bytes) return true;
     if (comparison.ordered_vs_single_stage_time > cfg.matrix_max_ordered_vs_single_stage_time) return true;
@@ -1962,7 +1989,7 @@ fn matrixComparisonFailsGuardrail(cfg: Config, comparison: MatrixComparison) boo
 
 fn printMatrixRegressionFailure(cfg: Config, comparison: MatrixComparison) void {
     std.debug.print(
-        "batch_bench_matrix_regression docs={d} write_scenario={s} constraint_probe={s} mutation_mode={s} overwrite_shape={s} query_shape={s} selectivity={s} predicate_min_amount={d} total_mode={s} ordered_tuple_access_missing_flag={any} ordered_tuple_fallback_flag={any}",
+        "batch_bench_matrix_regression docs={d} write_scenario={s} constraint_probe={s} mutation_mode={s} overwrite_shape={s} query_shape={s} selectivity={s} predicate_min_amount={d} total_mode={s} ordered_tuple_candidate_gate_exceeded_count={d} max_ordered_tuple_candidate_gate_exceeded_count={d} ordered_tuple_access_missing_flag={any} ordered_tuple_fallback_flag={any}",
         .{
             comparison.docs,
             @tagName(comparison.write_scenario),
@@ -1973,6 +2000,8 @@ fn printMatrixRegressionFailure(cfg: Config, comparison: MatrixComparison) void 
             comparison.selectivity,
             comparison.predicate_min_amount,
             @tagName(comparison.total_mode),
+            comparison.ordered_tuple_candidate_gate_exceeded_count,
+            cfg.matrix_max_ordered_tuple_candidate_gate_exceeded_count,
             comparison.ordered_tuple_access_missing_flag,
             comparison.ordered_tuple_fallback_flag,
         },

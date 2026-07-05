@@ -107,7 +107,7 @@ fn planLogicalDdlParsedForAppParityAlloc(
     parsed_sql: *const sql_adapter.ParsedSql,
 ) !sql_adapter.LogicalSqlPlan {
     if (parsedSqlLooksLikeAdvisoryLockDdl(parsed_sql)) {
-        return try sql_adapter.lower_ddl.parseLogicalDdlPlanAlloc(alloc, parsed_sql, .{});
+        return try sql_adapter.lower_ddl.logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, .{});
     }
     return try sql_adapter.planParsedSqlWithSessionAlloc(alloc, parsed_sql, .{
         .catalog = table_catalog.unavailableCatalogSource(),
@@ -121,7 +121,7 @@ fn planLogicalDdlEntryForAppParityAlloc(
     parsed_sql: *const sql_adapter.ParsedSql,
 ) !sql_adapter.LogicalSqlPlan {
     if (entry.summary.ddl_tag == .advisory_lock and parsedSqlLooksLikeAdvisoryLockDdl(parsed_sql)) {
-        return try sql_adapter.lower_ddl.parseLogicalDdlPlanAlloc(alloc, parsed_sql, .{});
+        return try sql_adapter.lower_ddl.logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, .{});
     }
     var catalog_opt = try sql_adapter.appParityCatalogForEntryParsedSqlAlloc(alloc, entry, parsed_sql);
     if (catalog_opt) |*catalog| {
@@ -131,7 +131,7 @@ fn planLogicalDdlEntryForAppParityAlloc(
             .function_bindings = .{},
         });
     }
-    return try sql_adapter.lower_ddl.parseLogicalDdlPlanAlloc(alloc, parsed_sql, .{});
+    return try sql_adapter.lower_ddl.logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, .{});
 }
 
 fn expectAdapterNoopLogicalPlan(
@@ -1595,7 +1595,7 @@ fn expectAppParityCorpusEntry(
         .merge_mutation,
         => return error.TestUnexpectedResult,
         .adapter_noop_ddl => {
-            if (sql_adapter.lower_ddl.parseLogicalDdlPlanAlloc(alloc, &parsed_sql, .{})) |logical_value| {
+            if (sql_adapter.lower_ddl.logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{})) |logical_value| {
                 var logical = logical_value;
                 defer logical.deinit(alloc);
                 try expectAdapterNoopLogicalPlan(entry, logical);
@@ -1757,7 +1757,7 @@ test "postgres sql adapter validates app parity fixture metadata with applied sc
         .sql = "CREATE UNIQUE INDEX usage_records_expr_idx ON usage_records (status, lower(id))",
         .family = .ddl,
         .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records", .select = 2 },
-        .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=true:if_not_exists=false",
+        .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=true:if_not_exists=false:method=ordered_tuple",
         .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
     }, &seen, alloc));
 
@@ -1766,7 +1766,7 @@ test "postgres sql adapter validates app parity fixture metadata with applied sc
         .sql = "CREATE UNIQUE INDEX usage_records_expr_idx ON usage_records (status, lower(id))",
         .family = .ddl,
         .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records", .select = 2 },
-        .plan = "ddl:create_index:table=usage_records:columns=1:expr=1:generated_expr=0:where=0:unique=true:if_not_exists=false",
+        .plan = "ddl:create_index:table=usage_records:columns=1:expr=1:generated_expr=0:where=0:unique=true:if_not_exists=false:method=ordered_tuple",
         .apply_setup_sql = &.{"CREATE TABLE usage_records (id text PRIMARY KEY, status text);"},
         .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
     }, &seen, alloc);
@@ -2703,12 +2703,12 @@ test "postgres sql adapter validates app parity fixture metadata with applied sc
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
-        .name = "adapter noop summary",
+        .name = "unsupported ddl summary",
         .sql = "SET client_encoding = 'UTF8'",
-        .family = .adapter_noop_ddl,
+        .family = .unsupported_ddl,
         .summary = .{ .table_name = "client_encoding" },
         .classification_reason = "session_setting",
-        .plan = "adapter_noop:ddl:reason=session_setting",
+        .plan = "unsupported:ddl:requires=session_setting",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
@@ -2721,19 +2721,19 @@ test "postgres sql adapter validates app parity fixture metadata with applied sc
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
-        .name = "adapter noop reason mismatch",
+        .name = "unsupported ddl reason mismatch",
         .sql = "SET client_encoding = 'UTF8'",
-        .family = .adapter_noop_ddl,
+        .family = .unsupported_ddl,
         .classification_reason = "session_setting",
-        .plan = "adapter_noop:ddl:reason=transaction_control",
+        .plan = "unsupported:ddl:requires=transaction_control",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
-        .name = "adapter noop reason prefix mismatch",
-        .sql = "SET client_encoding = 'UTF8'",
-        .family = .adapter_noop_ddl,
-        .classification_reason = "session_setting",
-        .plan = "adapter_noop:ddl:reason=session_setting_extra",
+        .name = "unsupported ddl reason prefix mismatch",
+        .sql = "COPY usage_records TO STDIN",
+        .family = .unsupported_ddl,
+        .classification_reason = "bulk_io_plan",
+        .plan = "unsupported:ddl:requires=bulk_io_plan_extra",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
@@ -2749,7 +2749,7 @@ test "postgres sql adapter validates app parity fixture metadata with applied sc
         .sql = "CREATE INDEX usage_records_status_idx ON usage_records (status)",
         .family = .ddl,
         .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records" },
-        .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false",
+        .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false:method=ordered_tuple",
         .applied_plan = "applied:rebuild=true:rewrite=false",
     }, &seen, alloc));
 
@@ -2758,7 +2758,7 @@ test "postgres sql adapter validates app parity fixture metadata with applied sc
         .sql = "CREATE INDEX usage_records_status_idx ON usage_records (status)",
         .family = .ddl,
         .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records" },
-        .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false",
+        .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false:method=ordered_tuple",
         .apply_setup_sql = &.{"CREATE TABLE usage_records (id text PRIMARY KEY, status text)"},
         .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
     }, &seen, alloc));
@@ -2809,11 +2809,11 @@ test "postgres sql adapter validates app parity fixture metadata with applied sc
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
-        .name = "adapter noop setup sql",
+        .name = "unsupported session setup sql",
         .sql = "SET client_encoding = 'UTF8'",
-        .family = .adapter_noop_ddl,
+        .family = .unsupported_ddl,
         .classification_reason = "session_setting",
-        .plan = "adapter_noop:ddl:reason=session_setting",
+        .plan = "unsupported:ddl:requires=session_setting",
         .apply_setup_sql = &.{"CREATE TABLE usage_records (id text PRIMARY KEY)"},
     }, &seen, alloc));
 
@@ -3099,7 +3099,7 @@ test "postgres sql adapter validates app parity fixture metadata with applied sc
     }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
-        .name = "unsupported with adapter noop reason",
+        .name = "unsupported write with ddl session reason",
         .sql = "TRUNCATE usage_records CASCADE",
         .family = .unsupported_write,
         .classification_reason = "session_setting",
@@ -3107,19 +3107,19 @@ test "postgres sql adapter validates app parity fixture metadata with applied sc
     }, &seen, alloc));
 
     try validateAppParityFixtureMetadata(.{
-        .name = "valid adapter noop reason",
+        .name = "valid unsupported session setting reason",
         .sql = "SET client_encoding = 'UTF8'",
-        .family = .adapter_noop_ddl,
+        .family = .unsupported_ddl,
         .classification_reason = "session_setting",
-        .plan = "adapter_noop:ddl:reason=session_setting",
+        .plan = "unsupported:ddl:requires=session_setting",
     }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
-        .name = "adapter noop with required feature reason",
-        .sql = "SET client_encoding = 'UTF8'",
-        .family = .adapter_noop_ddl,
-        .classification_reason = "set_operation_plan",
-        .plan = "adapter_noop:ddl:reason=set_operation_plan",
+        .name = "unsupported ddl rejects supported schema namespace reason",
+        .sql = "CREATE SCHEMA tenant_ops",
+        .family = .unsupported_ddl,
+        .classification_reason = "schema_namespace",
+        .plan = "unsupported:ddl:requires=schema_namespace",
     }, &seen, alloc));
 
     try validateAppParityFixtureMetadata(.{
@@ -3151,7 +3151,7 @@ test "postgres sql adapter validates app parity fixture metadata with applied sc
         .sql = "CREATE INDEX usage_records_status_idx ON usage_records (status)",
         .family = .ddl,
         .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records" },
-        .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false",
+        .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false:method=ordered_tuple",
         .apply_setup_sql = &.{"CREATE TABLE usage_records (id text PRIMARY KEY, status text)"},
         .applied_plan = "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
     }, &seen, alloc);

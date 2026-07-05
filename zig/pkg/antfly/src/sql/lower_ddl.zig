@@ -22,15 +22,15 @@ const expr_row_parse = @import("expr/row_parse.zig");
 const table_catalog = @import("../metadata/catalog/source.zig");
 const tokenized = @import("tokenized.zig");
 
-pub fn planLogicalDdlPlanParsedSqlWithFunctionBindingsAlloc(
+pub fn logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
     function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !binder.LogicalSqlPlan {
-    return try ddl_plan.parseLogicalDdlPlanAlloc(alloc, parsed_sql, function_bindings);
+    return try ddl_plan.logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
 }
 
-pub fn planLogicalDdlPlanBoundStatementWithFunctionBindingsAlloc(
+pub fn logicalDdlPlanBoundStatementWithFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     bound: *binder.BoundSqlStatement,
     function_bindings: expr_row_parse.SqlFunctionBindings,
@@ -40,7 +40,6 @@ pub fn planLogicalDdlPlanBoundStatementWithFunctionBindingsAlloc(
     return try bound.takeDdlLogicalPlan();
 }
 
-pub const parseLogicalDdlPlanAlloc = ddl_plan.parseLogicalDdlPlanAlloc;
 pub const planGeneratedLogicalDdlAstAlloc = ddl_plan.planGeneratedLogicalDdlAstAlloc;
 
 test "bound ddl planner consumes binder-owned logical plan without parsed fallback" {
@@ -56,8 +55,8 @@ test "bound ddl planner consumes binder-owned logical plan without parsed fallba
     );
     defer bound.deinit(alloc);
 
-    var logical = try planLogicalDdlPlanBoundStatementWithFunctionBindingsAlloc(alloc, &bound, .{});
+    var logical = try logicalDdlPlanBoundStatementWithFunctionBindingsAlloc(alloc, &bound, .{});
     defer logical.deinit(alloc);
     try std.testing.expectEqualStrings("table_ddl", logical.statementKindName());
-    try std.testing.expectError(error.UnsupportedSqlShape, planLogicalDdlPlanBoundStatementWithFunctionBindingsAlloc(alloc, &bound, .{}));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanBoundStatementWithFunctionBindingsAlloc(alloc, &bound, .{}));
 }

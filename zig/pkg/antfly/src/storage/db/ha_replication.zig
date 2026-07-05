@@ -1641,6 +1641,10 @@ test "storage.ha db write gate rejects client writes on standby but allows repli
     try std.testing.expectError(error.HAReadOnlyStandby, db.claimForeignKeyIntegrityWorkUnitAt("claim-at", "worker-a", 1, "scan", "repair", null, "doc:a", "doc:z", 1000, 1));
     try std.testing.expectError(error.HAReadOnlyStandby, db.upsertForeignKeyIntegrityJobRecord("job-a", "child", "repair", "worker-a", null, "doc:a", "doc:z", 1000, 10, "running"));
     try std.testing.expectError(error.HAReadOnlyStandby, db.upsertForeignKeyIntegrityJobRecordAt("job-at", "child", "repair", "worker-a", null, "doc:a", "doc:z", 1000, 10, "running", 1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.upsertRelationalIndexRepairJobRecord("repair-a", "default", "public", "docs", "worker-a", "doc:a", "doc:z", 1000, 10, "running"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.upsertRelationalIndexRepairJobRecordAt("repair-at", "default", "public", "docs", "worker-a", "doc:a", "doc:z", 1000, 10, "running", 1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.recordRelationalIndexRepairJobPass("repair-a", "running", false, 1, 1, 0, "doc:m", .{}, null));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.recordRelationalIndexRepairJobPassAt("repair-at", "complete", true, 1, 1, 0, "", .{}, null, 1));
     try std.testing.expectError(error.HAReadOnlyStandby, db.completeForeignKeyIntegrityJobRecord("job-a", "complete", true, .{}));
     try std.testing.expectError(error.HAReadOnlyStandby, db.completeForeignKeyIntegrityJobRecordWithDiagnostics("job-a", "complete", true, .{}, "[]", 0, false));
     try std.testing.expectError(error.HAReadOnlyStandby, db.completeForeignKeyIntegrityJobRecordAt("job-at", "complete", true, .{}, 1));

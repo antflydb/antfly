@@ -2731,6 +2731,7 @@ pub fn parseGroupByAlloc(
         } else {
             var item_options = select_item_options;
             item_options.generated_expression_ast = generated_expression;
+            item_options.require_exact_generated_expression = generated_item != null;
             const item = try expr_projection.parseSelectItemAlloc(
                 alloc,
                 tokens,
@@ -2850,6 +2851,7 @@ pub fn parseSelectListAlloc(
         } else {
             var item_options = select_item_options;
             item_options.generated_expression_ast = generated_expression;
+            item_options.require_exact_generated_expression = generated_item != null;
             const item = try expr_projection.parseSelectItemAlloc(
                 alloc,
                 tokens,

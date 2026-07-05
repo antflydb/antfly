@@ -116,7 +116,7 @@ pub fn planDurableSqlPlanBoundStatementWithFunctionBindingsAlloc(
     bound: *binder.BoundSqlStatement,
     function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !DurableSqlPlan {
-    var logical_plan = try lower_ddl.planLogicalDdlPlanBoundStatementWithFunctionBindingsAlloc(alloc, bound, function_bindings);
+    var logical_plan = try lower_ddl.logicalDdlPlanBoundStatementWithFunctionBindingsAlloc(alloc, bound, function_bindings);
     errdefer logical_plan.deinit(alloc);
     return try DurableSqlPlan.fromLogical(&logical_plan);
 }

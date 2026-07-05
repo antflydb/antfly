@@ -121,6 +121,9 @@ pub const ReadPlanLoweringContext = struct {
     }
 
     fn lowerNativeGraphParsed(self: *@This(), parsed_sql: *const tokenized.ParsedSql) !?plan.LoweredReadPlan {
+        if (parsed_sql.generatedStatementKind() != .unsupported) return null;
+        const unsupported_kind = parsed_sql.unsupportedStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
+        if (unsupported_kind != .graph_query) return null;
         const unsupported = nativeGraphUnsupportedAst(parsed_sql) orelse return null;
         if (unsupported.graph_source_binding_tokens == null) return null;
         return .{ .query = try nativeGraphLoweredQueryPlanAlloc(self.alloc, parsed_sql.sql(), parsed_sql.items(), self.params, unsupported) };
@@ -6161,6 +6164,60 @@ test "sql adapter lowering context lowers native graph match through graph table
     }
 }
 
+test "sql adapter lowering context rejects stale native graph retained metadata" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"body":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"datetime"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLoweringContextTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var stale_projection = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "MATCH (doc)-[:cites]->(target) WITH GRAPH docs_edge_graph ON usage_records START 'doc:root' RETURN doc.key AS source_id, target.key AS target_id ORDER BY target.depth ASC LIMIT 5",
+    );
+    defer stale_projection.deinit(alloc);
+    if (stale_projection.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.graph_query, unsupported.kind);
+                    try std.testing.expectEqual(@as(usize, 2), unsupported.graph_return_projection_items.count);
+                    unsupported.graph_return_projection_items.count += 1;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(stale_projection.unsupportedStatementKindIncludingGeneratedAst() == null);
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanParsedSqlForLoweringContextTestAlloc(alloc, &stale_projection, schema, &.{}, .{}),
+    );
+
+    var stale_source_binding = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "MATCH (doc)-[:cites]->(target) WITH GRAPH docs_edge_graph ON usage_records START 'doc:root' RETURN doc.key AS source_id",
+    );
+    defer stale_source_binding.deinit(alloc);
+    if (stale_source_binding.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| {
+                    _ = unsupported.graph_source_binding_tokens orelse return error.TestUnexpectedResult;
+                    unsupported.graph_source_binding_tokens = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(stale_source_binding.unsupportedStatementKindIncludingGeneratedAst() == null);
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanParsedSqlForLoweringContextTestAlloc(alloc, &stale_source_binding, schema, &.{}, .{}),
+    );
+}
+
 test "sql adapter lowering context rejects malformed generated read AST ranges" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -10064,144 +10121,6 @@ pub const WritePlanLoweringCallbacks = struct {
         plan.LowerWritePlanOptions,
         expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredWritePlan,
-    lower_recursive_insert_source_with_schemas: *const fn (
-        std.mem.Allocator,
-        *const tokenized.ParsedSql,
-        runtime_schema.TableSchema,
-        runtime_schema.TableSchema,
-        []const value_mod.SqlValue,
-        relational_rows.UniqueSelectorResolver,
-        expr_row_parse.SqlFunctionBindings,
-    ) anyerror!plan.LoweredRecursiveInsertSource,
-    lower_recursive_update_joined_source_with_schemas: *const fn (
-        std.mem.Allocator,
-        *const tokenized.ParsedSql,
-        runtime_schema.TableSchema,
-        runtime_schema.TableSchema,
-        []const value_mod.SqlValue,
-        db_mod.types.RowClaimRequest,
-        expr_row_parse.SqlFunctionBindings,
-    ) anyerror!plan.LoweredRecursiveJoinedMutationSource,
-    lower_recursive_delete_joined_source_with_schemas: *const fn (
-        std.mem.Allocator,
-        *const tokenized.ParsedSql,
-        runtime_schema.TableSchema,
-        runtime_schema.TableSchema,
-        []const value_mod.SqlValue,
-        db_mod.types.RowClaimRequest,
-        expr_row_parse.SqlFunctionBindings,
-    ) anyerror!plan.LoweredRecursiveJoinedMutationSource,
-    lower_recursive_merge_mutation_with_schemas: *const fn (
-        std.mem.Allocator,
-        *const tokenized.ParsedSql,
-        runtime_schema.TableSchema,
-        runtime_schema.TableSchema,
-        []const value_mod.SqlValue,
-        expr_row_parse.SqlFunctionBindings,
-    ) anyerror!plan.LoweredRecursiveMergeMutation,
-    lower_insert_with_resolver: *const fn (
-        std.mem.Allocator,
-        *const tokenized.ParsedSql,
-        runtime_schema.TableSchema,
-        []const value_mod.SqlValue,
-        relational_rows.UniqueSelectorResolver,
-        expr_row_parse.SqlFunctionBindings,
-    ) anyerror!plan.LoweredInsert,
-    lower_insert_source_with_resolver: *const fn (
-        std.mem.Allocator,
-        *const tokenized.ParsedSql,
-        runtime_schema.TableSchema,
-        []const value_mod.SqlValue,
-        relational_rows.UniqueSelectorResolver,
-        expr_row_parse.SqlFunctionBindings,
-    ) anyerror!plan.LoweredInsertSource,
-    lower_insert_source_with_schemas: *const fn (
-        std.mem.Allocator,
-        *const tokenized.ParsedSql,
-        runtime_schema.TableSchema,
-        runtime_schema.TableSchema,
-        []const value_mod.SqlValue,
-        relational_rows.UniqueSelectorResolver,
-        expr_row_parse.SqlFunctionBindings,
-    ) anyerror!plan.LoweredInsertSource,
-    lower_update_joined_source_with_schemas: *const fn (
-        std.mem.Allocator,
-        *const tokenized.ParsedSql,
-        runtime_schema.TableSchema,
-        runtime_schema.TableSchema,
-        []const value_mod.SqlValue,
-        db_mod.types.RowClaimRequest,
-        expr_row_parse.SqlFunctionBindings,
-    ) anyerror!plan.LoweredJoinedMutationSource,
-    classify_update_selector: *const fn (
-        std.mem.Allocator,
-        *const tokenized.ParsedSql,
-        runtime_schema.TableSchema,
-        []const value_mod.SqlValue,
-        ?relational_rows.UniqueSelectorResolver,
-    ) anyerror!plan.MutationSelectorKind,
-    lower_update_with_resolver: *const fn (
-        std.mem.Allocator,
-        *const tokenized.ParsedSql,
-        runtime_schema.TableSchema,
-        []const value_mod.SqlValue,
-        relational_rows.UniqueSelectorResolver,
-        expr_row_parse.SqlFunctionBindings,
-    ) anyerror!plan.LoweredMutation,
-    lower_update_source: *const fn (
-        std.mem.Allocator,
-        *const tokenized.ParsedSql,
-        runtime_schema.TableSchema,
-        []const value_mod.SqlValue,
-        db_mod.types.RowClaimRequest,
-        expr_row_parse.SqlFunctionBindings,
-    ) anyerror!plan.LoweredMutationSource,
-    lower_delete_joined_source_with_schemas: *const fn (
-        std.mem.Allocator,
-        *const tokenized.ParsedSql,
-        runtime_schema.TableSchema,
-        runtime_schema.TableSchema,
-        []const value_mod.SqlValue,
-        db_mod.types.RowClaimRequest,
-        expr_row_parse.SqlFunctionBindings,
-    ) anyerror!plan.LoweredJoinedMutationSource,
-    classify_delete_selector: *const fn (
-        std.mem.Allocator,
-        *const tokenized.ParsedSql,
-        runtime_schema.TableSchema,
-        []const value_mod.SqlValue,
-        ?relational_rows.UniqueSelectorResolver,
-    ) anyerror!plan.MutationSelectorKind,
-    lower_delete_with_resolver: *const fn (
-        std.mem.Allocator,
-        *const tokenized.ParsedSql,
-        runtime_schema.TableSchema,
-        []const value_mod.SqlValue,
-        relational_rows.UniqueSelectorResolver,
-        expr_row_parse.SqlFunctionBindings,
-    ) anyerror!plan.LoweredMutation,
-    lower_delete_source: *const fn (
-        std.mem.Allocator,
-        *const tokenized.ParsedSql,
-        runtime_schema.TableSchema,
-        []const value_mod.SqlValue,
-        db_mod.types.RowClaimRequest,
-        expr_row_parse.SqlFunctionBindings,
-    ) anyerror!plan.LoweredMutationSource,
-    lower_truncate_source: *const fn (
-        std.mem.Allocator,
-        *const tokenized.ParsedSql,
-        runtime_schema.TableSchema,
-        db_mod.types.RowClaimRequest,
-    ) anyerror!plan.LoweredMutationSource,
-    lower_merge_mutation_with_schemas: *const fn (
-        std.mem.Allocator,
-        *const tokenized.ParsedSql,
-        runtime_schema.TableSchema,
-        runtime_schema.TableSchema,
-        []const value_mod.SqlValue,
-        expr_row_parse.SqlFunctionBindings,
-    ) anyerror!plan.LoweredMergeMutationPlan,
 };
 
 pub const WritePlanLoweringContext = struct {
@@ -10234,120 +10153,7 @@ pub const WritePlanLoweringContext = struct {
                 return err;
             };
         }
-        std.log.debug("write lowering using handwritten dml", .{});
-        return try plan.lowerWritePlanWithParsedSqlAlloc(parsed_sql, self.schema, options, self.hooks());
-    }
-
-    fn hooks(self: *@This()) plan.WritePlanLoweringHooks {
-        return .{
-            .ptr = self,
-            .lower_recursive_insert_source = lowerRecursiveInsertSource,
-            .lower_recursive_update_joined_source = lowerRecursiveUpdateJoinedSource,
-            .lower_recursive_delete_joined_source = lowerRecursiveDeleteJoinedSource,
-            .lower_recursive_merge_mutation = lowerRecursiveMergeMutation,
-            .lower_insert = lowerInsert,
-            .lower_insert_source = lowerInsertSource,
-            .lower_insert_source_with_schema = lowerInsertSourceWithSchema,
-            .lower_update_joined_source = lowerUpdateJoinedSource,
-            .classify_update_selector = classifyUpdateSelector,
-            .lower_update = lowerUpdate,
-            .lower_update_source = lowerUpdateSource,
-            .lower_delete_joined_source = lowerDeleteJoinedSource,
-            .classify_delete_selector = classifyDeleteSelector,
-            .lower_delete = lowerDelete,
-            .lower_delete_source = lowerDeleteSource,
-            .lower_truncate_source = lowerTruncateSource,
-            .lower_merge_mutation = lowerMergeMutation,
-        };
-    }
-
-    fn fromPtr(ptr: *anyopaque) *@This() {
-        return @ptrCast(@alignCast(ptr));
-    }
-
-    fn lowerRecursiveInsertSource(ptr: *anyopaque, source_schema: runtime_schema.TableSchema, resolver: relational_rows.UniqueSelectorResolver) anyerror!plan.LoweredRecursiveInsertSource {
-        const self = fromPtr(ptr);
-        return try self.callbacks.lower_recursive_insert_source_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params, resolver, self.function_bindings);
-    }
-
-    fn lowerRecursiveUpdateJoinedSource(ptr: *anyopaque, source_schema: runtime_schema.TableSchema, row_claim: db_mod.types.RowClaimRequest) anyerror!plan.LoweredRecursiveJoinedMutationSource {
-        const self = fromPtr(ptr);
-        return try self.callbacks.lower_recursive_update_joined_source_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params, row_claim, self.function_bindings);
-    }
-
-    fn lowerRecursiveDeleteJoinedSource(ptr: *anyopaque, source_schema: runtime_schema.TableSchema, row_claim: db_mod.types.RowClaimRequest) anyerror!plan.LoweredRecursiveJoinedMutationSource {
-        const self = fromPtr(ptr);
-        return try self.callbacks.lower_recursive_delete_joined_source_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params, row_claim, self.function_bindings);
-    }
-
-    fn lowerRecursiveMergeMutation(ptr: *anyopaque, source_schema: runtime_schema.TableSchema) anyerror!plan.LoweredRecursiveMergeMutation {
-        const self = fromPtr(ptr);
-        return try self.callbacks.lower_recursive_merge_mutation_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params, self.function_bindings);
-    }
-
-    fn lowerInsert(ptr: *anyopaque, resolver: relational_rows.UniqueSelectorResolver) anyerror!plan.LoweredInsert {
-        const self = fromPtr(ptr);
-        return try self.callbacks.lower_insert_with_resolver(self.alloc, self.parsed_sql.?, self.schema, self.params, resolver, self.function_bindings);
-    }
-
-    fn lowerInsertSource(ptr: *anyopaque, resolver: relational_rows.UniqueSelectorResolver) anyerror!plan.LoweredInsertSource {
-        const self = fromPtr(ptr);
-        return try self.callbacks.lower_insert_source_with_resolver(self.alloc, self.parsed_sql.?, self.schema, self.params, resolver, self.function_bindings);
-    }
-
-    fn lowerInsertSourceWithSchema(ptr: *anyopaque, source_schema: runtime_schema.TableSchema, resolver: relational_rows.UniqueSelectorResolver) anyerror!plan.LoweredInsertSource {
-        const self = fromPtr(ptr);
-        return try self.callbacks.lower_insert_source_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params, resolver, self.function_bindings);
-    }
-
-    fn lowerUpdateJoinedSource(ptr: *anyopaque, source_schema: runtime_schema.TableSchema, row_claim: db_mod.types.RowClaimRequest) anyerror!plan.LoweredJoinedMutationSource {
-        const self = fromPtr(ptr);
-        return try self.callbacks.lower_update_joined_source_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params, row_claim, self.function_bindings);
-    }
-
-    fn classifyUpdateSelector(ptr: *anyopaque, resolver: ?relational_rows.UniqueSelectorResolver) anyerror!plan.MutationSelectorKind {
-        const self = fromPtr(ptr);
-        return try self.callbacks.classify_update_selector(self.alloc, self.parsed_sql.?, self.schema, self.params, resolver);
-    }
-
-    fn lowerUpdate(ptr: *anyopaque, resolver: relational_rows.UniqueSelectorResolver) anyerror!plan.LoweredMutation {
-        const self = fromPtr(ptr);
-        return try self.callbacks.lower_update_with_resolver(self.alloc, self.parsed_sql.?, self.schema, self.params, resolver, self.function_bindings);
-    }
-
-    fn lowerUpdateSource(ptr: *anyopaque, row_claim: db_mod.types.RowClaimRequest) anyerror!plan.LoweredMutationSource {
-        const self = fromPtr(ptr);
-        return try self.callbacks.lower_update_source(self.alloc, self.parsed_sql.?, self.schema, self.params, row_claim, self.function_bindings);
-    }
-
-    fn lowerDeleteJoinedSource(ptr: *anyopaque, source_schema: runtime_schema.TableSchema, row_claim: db_mod.types.RowClaimRequest) anyerror!plan.LoweredJoinedMutationSource {
-        const self = fromPtr(ptr);
-        return try self.callbacks.lower_delete_joined_source_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params, row_claim, self.function_bindings);
-    }
-
-    fn classifyDeleteSelector(ptr: *anyopaque, resolver: ?relational_rows.UniqueSelectorResolver) anyerror!plan.MutationSelectorKind {
-        const self = fromPtr(ptr);
-        return try self.callbacks.classify_delete_selector(self.alloc, self.parsed_sql.?, self.schema, self.params, resolver);
-    }
-
-    fn lowerDelete(ptr: *anyopaque, resolver: relational_rows.UniqueSelectorResolver) anyerror!plan.LoweredMutation {
-        const self = fromPtr(ptr);
-        return try self.callbacks.lower_delete_with_resolver(self.alloc, self.parsed_sql.?, self.schema, self.params, resolver, self.function_bindings);
-    }
-
-    fn lowerDeleteSource(ptr: *anyopaque, row_claim: db_mod.types.RowClaimRequest) anyerror!plan.LoweredMutationSource {
-        const self = fromPtr(ptr);
-        return try self.callbacks.lower_delete_source(self.alloc, self.parsed_sql.?, self.schema, self.params, row_claim, self.function_bindings);
-    }
-
-    fn lowerTruncateSource(ptr: *anyopaque, row_claim: db_mod.types.RowClaimRequest) anyerror!plan.LoweredMutationSource {
-        const self = fromPtr(ptr);
-        return try self.callbacks.lower_truncate_source(self.alloc, self.parsed_sql.?, self.schema, row_claim);
-    }
-
-    fn lowerMergeMutation(ptr: *anyopaque, source_schema: runtime_schema.TableSchema) anyerror!plan.LoweredMergeMutationPlan {
-        const self = fromPtr(ptr);
-        return try self.callbacks.lower_merge_mutation_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params, self.function_bindings);
+        return error.UnsupportedSqlShape;
     }
 };
 
@@ -10381,6 +10187,54 @@ test "write lowering generated dml accessor validates published statement family
 
     parsed_sql.statement = .{ .unknown = parsed_sql.raw_statement };
     try std.testing.expectError(error.UnsupportedSqlShape, generatedDmlAstForParsedSql(&parsed_sql));
+}
+
+const GeneratedDmlUnsupportedProbe = struct {
+    fn lowerGeneratedDml(
+        alloc: std.mem.Allocator,
+        parsed_sql: *const tokenized.ParsedSql,
+        dml_ast: generated_parser.GeneratedSqlDmlAst,
+        schema: runtime_schema.TableSchema,
+        params: []const value_mod.SqlValue,
+        options: plan.LowerWritePlanOptions,
+        function_bindings: expr_row_parse.SqlFunctionBindings,
+    ) anyerror!plan.LoweredWritePlan {
+        _ = alloc;
+        _ = parsed_sql;
+        _ = dml_ast;
+        _ = schema;
+        _ = params;
+        _ = options;
+        _ = function_bindings;
+        return error.UnsupportedSqlShape;
+    }
+
+    fn callbacks() WritePlanLoweringCallbacks {
+        return .{
+            .lower_generated_dml = lowerGeneratedDml,
+        };
+    }
+};
+
+test "write lowering generated dml unsupported fails through generated callback" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLoweringContextTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, "UPDATE usage_records SET status = 'done' WHERE id = 'u1'");
+    defer parsed_sql.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, parsed_sql.generatedStatementKind().?);
+
+    var context = WritePlanLoweringContext{
+        .alloc = alloc,
+        .schema = schema,
+        .params = &.{},
+        .callbacks = GeneratedDmlUnsupportedProbe.callbacks(),
+    };
+    try std.testing.expectError(error.UnsupportedSqlShape, context.lowerParsed(&parsed_sql, .{}));
 }
 
 pub const ExplainPlanLoweringCallbacks = struct {

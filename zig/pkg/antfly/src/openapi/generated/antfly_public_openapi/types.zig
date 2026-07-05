@@ -1096,6 +1096,24 @@ pub const RowsUniquePredicate = struct {
     value: ?std.json.Value = null,
 };
 
+pub const RelationalColumnBackedIndexRepairRequest = struct {
+    /// Stable worker identifier used to claim bounded repair ranges.
+    worker_id: []const u8,
+    /// Optional durable repair job identifier used to persist pass progress and resume metadata.
+    job_id: ?[]const u8 = null,
+    /// Lease duration for claimed repair ranges in milliseconds.
+    lease_ms: ?i64 = null,
+    /// Maximum number of bounded repair ranges to claim and process in one pass.
+    max_work_units: ?i64 = null,
+};
+
+pub const RelationalColumnBackedIndexRepairReport = struct {
+    scanned_rows: i64,
+    indexed_rows: i64,
+    deleted_orphan_entries: i64,
+    written_entries: i64,
+};
+
 /// Application-time temporal slice for update/delete mutation-source plans.
 pub const RowsTemporalPortion = struct {
     /// Period name declared on the relational table schema.
@@ -2508,6 +2526,45 @@ pub const RowsUniquePredicateGroup = struct {
     all: []const RowsUniquePredicate,
 };
 
+pub const RelationalColumnBackedIndexRepairRangeResult = struct {
+    group_id: i64,
+    table_id: i64,
+    range_id: i64,
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+    repaired: bool,
+    report: RelationalColumnBackedIndexRepairReport,
+};
+
+pub const RelationalIndexRepairJobRecord = struct {
+    version: i32,
+    job_id: []const u8,
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    worker_id: []const u8,
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+    lease_ms: i64,
+    max_work_units: i64,
+    status: []const u8,
+    created_at_ns: i64,
+    updated_at_ns: i64,
+    attempts: i32,
+    completed: bool,
+    complete: ?bool = null,
+    next_lower_doc_key: []const u8,
+    last_ranges_scanned: i64,
+    last_ranges_repaired: i64,
+    last_ranges_missing: i64,
+    total_ranges_scanned: i64,
+    total_ranges_repaired: i64,
+    total_ranges_missing: i64,
+    last_report: RelationalColumnBackedIndexRepairReport,
+    aggregate_report: RelationalColumnBackedIndexRepairReport,
+    last_error: ?[]const u8 = null,
+};
+
 /// Compact COALESCE operand. Exactly one of `field` or `value` is accepted by the server.
 pub const RowsCoalesceOperand = union(enum) {
     rows_coalesce_field_operand: *RowsCoalesceFieldOperand,
@@ -2949,6 +3006,15 @@ pub const RowsGetResult = struct {
     version: ?i64 = null,
     /// Diagnostic storage-owned physical key. Null when a unique selector did not resolve. Do not persist as public row identity.
     physical_key: ?[]const u8 = null,
+};
+
+pub const RelationalColumnBackedIndexRepairResponse = struct {
+    complete: bool,
+    ranges_scanned: i64,
+    ranges_repaired: i64,
+    ranges_missing: i64,
+    report: RelationalColumnBackedIndexRepairReport,
+    groups: []const RelationalColumnBackedIndexRepairRangeResult,
 };
 
 /// Compact COALESCE projection.

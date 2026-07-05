@@ -806,6 +806,40 @@ pub const Client = struct {
         return ApiResponse(types.BatchResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Repair relational column-backed index entries for an explicit namespace table
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/relational-column-backed-index-repair
+    pub fn repairNamespaceTableRelationalColumnBackedIndex(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.RelationalColumnBackedIndexRepairRequest) !ApiResponse(types.RelationalColumnBackedIndexRepairResponse) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/relational-column-backed-index-repair", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.RelationalColumnBackedIndexRepairResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Get relational index repair job status for an explicit namespace table
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/relational-column-backed-index-repair/jobs/{jobId}
+    pub fn getNamespaceTableRelationalIndexRepairJob(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, job_id: []const u8) !ApiResponse(types.RelationalIndexRepairJobRecord) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/relational-column-backed-index-repair/jobs/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.RelationalIndexRepairJobRecord).fromResponse(self.allocator, &resp);
+    }
+
     /// Backup an explicit namespace table
     /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/backup
     pub fn backupNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.BackupRequest) !ApiResponse(std.json.Value) {
@@ -1040,6 +1074,32 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.BatchResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Repair relational column-backed index entries
+    /// POST /db/v1/tables/{tableName}/relational-column-backed-index-repair
+    pub fn repairRelationalColumnBackedIndex(self: *@This(), table_name: []const u8, body: types.RelationalColumnBackedIndexRepairRequest) !ApiResponse(types.RelationalColumnBackedIndexRepairResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/relational-column-backed-index-repair", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.RelationalColumnBackedIndexRepairResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Get relational index repair job status
+    /// GET /db/v1/tables/{tableName}/relational-column-backed-index-repair/jobs/{jobId}
+    pub fn getRelationalIndexRepairJob(self: *@This(), table_name: []const u8, job_id: []const u8) !ApiResponse(types.RelationalIndexRepairJobRecord) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/relational-column-backed-index-repair/jobs/{s}", .{ self.base_url, encoded_table_name, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.RelationalIndexRepairJobRecord).fromResponse(self.allocator, &resp);
     }
 
     /// Stage typed relational update/delete operations from a claimed row source

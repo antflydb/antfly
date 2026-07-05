@@ -127,6 +127,41 @@ pub const RelationalSqlDdlTarget = struct {
     }
 };
 
+pub const RelationalSqlSchemaNamespaceDdlAction = enum {
+    create_namespace,
+    rename_namespace,
+    drop_namespace,
+};
+
+pub const RelationalSqlSchemaNamespaceDdlTarget = struct {
+    database_name: []u8,
+    namespace_name: []u8,
+    new_namespace_name: ?[]u8 = null,
+    action: RelationalSqlSchemaNamespaceDdlAction,
+    if_not_exists: bool = false,
+    if_exists: bool = false,
+    cascade: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.database_name);
+        alloc.free(self.namespace_name);
+        if (self.new_namespace_name) |new_namespace_name| alloc.free(new_namespace_name);
+        self.* = undefined;
+    }
+
+    pub fn createsNamespace(self: @This()) bool {
+        return self.action == .create_namespace;
+    }
+
+    pub fn renamesNamespace(self: @This()) bool {
+        return self.action == .rename_namespace;
+    }
+
+    pub fn dropsNamespace(self: @This()) bool {
+        return self.action == .drop_namespace;
+    }
+};
+
 const RelationalSqlDdlTableRef = struct {
     database_name: []u8,
     namespace_name: []u8,
@@ -1640,7 +1675,7 @@ fn durableRelationalSqlDdlPlanFromParsedSqlAlloc(
     parsed_sql: *const sql_adapter.ParsedSql,
     function_bindings: sql_adapter.SqlFunctionBindings,
 ) !sql_adapter.DurableSqlPlan {
-    var logical_plan = try sql_adapter.lower_ddl.planLogicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
+    var logical_plan = try sql_adapter.lower_ddl.logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
     errdefer logical_plan.deinit(alloc);
     return try sql_adapter.takeDurableSqlPlanFromLogical(&logical_plan);
 }
@@ -2077,6 +2112,66 @@ pub fn relationalSqlDdlTargetParsedSqlWithSessionAndFunctionBindingsAlloc(
     };
 }
 
+pub fn relationalSqlSchemaNamespaceDdlTargetWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+) !RelationalSqlSchemaNamespaceDdlTarget {
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try relationalSqlSchemaNamespaceDdlTargetParsedSqlWithSessionAlloc(alloc, &parsed_sql, session);
+}
+
+pub fn relationalSqlSchemaNamespaceDdlTargetParsedSqlWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    session: catalog_resources.SqlCatalogSession,
+) !RelationalSqlSchemaNamespaceDdlTarget {
+    var durable_plan = try durableRelationalSqlDdlPlanFromParsedSqlAlloc(alloc, parsed_sql, .{});
+    defer durable_plan.deinit(alloc);
+    return switch (durable_plan) {
+        .catalog_ddl => |catalog_plan| switch (catalog_plan) {
+            .schema_namespace_catalog => |namespace_plan| try relationalSqlSchemaNamespaceDdlTargetForPlanWithSessionAlloc(alloc, namespace_plan, session),
+            else => error.UnsupportedSqlShape,
+        },
+        else => error.UnsupportedSqlShape,
+    };
+}
+
+pub fn relationalSqlSchemaNamespaceDdlTargetForPlanWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    plan: sql_adapter.SchemaNamespaceCatalogPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !RelationalSqlSchemaNamespaceDdlTarget {
+    return switch (plan) {
+        .create => |create| blk: {
+            var target = try ownedRelationalSqlSchemaNamespaceDdlTargetAlloc(alloc, try session.namespaceTargetFromSchemaName(create.schema_name));
+            errdefer target.deinit(alloc);
+            target.action = .create_namespace;
+            target.if_not_exists = create.if_not_exists;
+            break :blk target;
+        },
+        .rename => |rename| blk: {
+            const old_target = try session.namespaceTargetFromSchemaName(rename.schema_name);
+            const new_target = try session.namespaceTargetFromSchemaName(rename.new_schema_name);
+            if (!std.mem.eql(u8, old_target.database_name, new_target.database_name)) return error.UnsupportedSqlShape;
+            var target = try ownedRelationalSqlSchemaNamespaceDdlTargetAlloc(alloc, old_target);
+            errdefer target.deinit(alloc);
+            target.action = .rename_namespace;
+            target.new_namespace_name = try alloc.dupe(u8, new_target.namespace_name);
+            break :blk target;
+        },
+        .drop => |drop| blk: {
+            var target = try ownedRelationalSqlSchemaNamespaceDdlTargetAlloc(alloc, try session.namespaceTargetFromSchemaName(drop.schema_name));
+            errdefer target.deinit(alloc);
+            target.action = .drop_namespace;
+            target.if_exists = drop.if_exists;
+            target.cascade = drop.cascade;
+            break :blk target;
+        },
+    };
+}
+
 pub fn relationalSqlDdlTargetForTablePlanWithSessionAlloc(
     alloc: std.mem.Allocator,
     plan: sql_adapter.TableDdlLogicalPlan,
@@ -2102,6 +2197,21 @@ pub fn relationalSqlDdlTargetForTablePlanWithSessionAlloc(
             .drop_table => |drop_table| drop_table.cascade,
             else => false,
         },
+    };
+}
+
+fn ownedRelationalSqlSchemaNamespaceDdlTargetAlloc(
+    alloc: std.mem.Allocator,
+    target: catalog_resources.NamespaceTarget,
+) !RelationalSqlSchemaNamespaceDdlTarget {
+    const owned_database_name = try alloc.dupe(u8, target.database_name);
+    errdefer alloc.free(owned_database_name);
+    const owned_namespace_name = try alloc.dupe(u8, target.namespace_name);
+    errdefer alloc.free(owned_namespace_name);
+    return .{
+        .database_name = owned_database_name,
+        .namespace_name = owned_namespace_name,
+        .action = .create_namespace,
     };
 }
 
@@ -2330,6 +2440,8 @@ fn relationalColumnDefinitionsEqualIgnoringSecondaryIndexLifecycle(
     var normalized_next = next;
     normalized_next.index_lifecycle = current.index_lifecycle;
     normalized_next.index_generation = current.index_generation;
+    normalized_next.index_access_method = current.index_access_method;
+    normalized_next.index_schema_fingerprint = current.index_schema_fingerprint;
     return runtime_schema_mod.relationalColumnDefinitionsEqual(current, normalized_next);
 }
 
@@ -2487,6 +2599,20 @@ pub fn schemaWithSecondaryIndexBuildingAlloc(
     } else {
         const key = try json_alloc.dupe(u8, "x-antfly-index-generation");
         try property.object.put(json_alloc, key, .{ .integer = generation_integer });
+    }
+    if (property.object.getPtr("x-antfly-index-access-method")) |value| {
+        if (value.* != .string or value.string.len == 0) value.* = .{ .string = "scalar_column" };
+    } else {
+        const key = try json_alloc.dupe(u8, "x-antfly-index-access-method");
+        try property.object.put(json_alloc, key, .{ .string = "scalar_column" });
+    }
+    if (property.object.getPtr("x-antfly-index-schema-fingerprint")) |value| {
+        if (value.* != .string or value.string.len == 0) {
+            value.* = .{ .string = try std.fmt.allocPrint(json_alloc, "secondary-index-v1:{s}", .{index_name}) };
+        }
+    } else {
+        const key = try json_alloc.dupe(u8, "x-antfly-index-schema-fingerprint");
+        try property.object.put(json_alloc, key, .{ .string = try std.fmt.allocPrint(json_alloc, "secondary-index-v1:{s}", .{index_name}) });
     }
 
     const updated = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
@@ -4193,11 +4319,10 @@ fn applyNamespaceCatalogPlanOnServiceAlloc(
 ) !AppliedRelationalSqlDdlRecord {
     var applied = try emptyAppliedRelationalSqlDdlRecordAlloc(alloc);
     errdefer applied.deinit(alloc);
-    const database_name = session.currentDatabase();
-    const database_id = metadata_table_manager.deriveDatabaseId(database_name);
     switch (plan) {
         .create => |create| {
             const target = try session.namespaceTargetFromSchemaName(create.schema_name);
+            const database = findDatabaseByName(snapshot, target.database_name) orelse return error.DatabaseNotFound;
             if (findNamespaceByName(snapshot, target.database_name, target.namespace_name) != null) {
                 if (create.if_not_exists) {
                     applied.noop = true;
@@ -4205,15 +4330,9 @@ fn applyNamespaceCatalogPlanOnServiceAlloc(
                 }
                 return error.NamespaceAlreadyExists;
             }
-            if (findDatabaseByName(snapshot, target.database_name) == null) {
-                try svc.upsertDatabase(.{
-                    .database_id = database_id,
-                    .name = target.database_name,
-                });
-            }
             try svc.upsertNamespace(.{
-                .namespace_id = metadata_table_manager.deriveNamespaceId(database_id, target.namespace_name),
-                .database_id = database_id,
+                .namespace_id = metadata_table_manager.deriveNamespaceId(database.database_id, target.namespace_name),
+                .database_id = database.database_id,
                 .name = target.namespace_name,
             });
             applied.created_namespace = true;
@@ -4221,11 +4340,12 @@ fn applyNamespaceCatalogPlanOnServiceAlloc(
         .rename => |rename| {
             const existing_target = try session.namespaceTargetFromSchemaName(rename.schema_name);
             const new_target = try session.namespaceTargetFromSchemaName(rename.new_schema_name);
+            if (!std.mem.eql(u8, existing_target.database_name, new_target.database_name)) return error.UnsupportedSqlShape;
             const existing = findNamespaceByName(snapshot, existing_target.database_name, existing_target.namespace_name) orelse return error.NamespaceNotFound;
             if (findNamespaceByName(snapshot, new_target.database_name, new_target.namespace_name) != null) return error.NamespaceAlreadyExists;
             try svc.upsertNamespace(.{
-                .namespace_id = metadata_table_manager.deriveNamespaceId(database_id, new_target.namespace_name),
-                .database_id = database_id,
+                .namespace_id = metadata_table_manager.deriveNamespaceId(existing.database_id, new_target.namespace_name),
+                .database_id = existing.database_id,
                 .name = new_target.namespace_name,
             });
             for (snapshot.tables) |table| {
@@ -4247,8 +4367,13 @@ fn applyNamespaceCatalogPlanOnServiceAlloc(
                 }
                 return error.NamespaceNotFound;
             };
-            if (namespaceHasTables(snapshot, database_id, target.namespace_name)) {
-                if (drop.cascade) return error.UnsupportedSqlShape;
+            if (namespaceHasTables(snapshot, existing.database_id, target.namespace_name)) {
+                if (drop.cascade) {
+                    try dropNamespaceCatalogObjectsCascadeOnServiceAlloc(alloc, svc, snapshot, target);
+                    try svc.removeNamespace(existing.namespace_id);
+                    applied.dropped_namespace = true;
+                    return applied;
+                }
                 return error.NamespaceNotEmpty;
             }
             try svc.removeNamespace(existing.namespace_id);
@@ -4256,6 +4381,113 @@ fn applyNamespaceCatalogPlanOnServiceAlloc(
         },
     }
     return applied;
+}
+
+fn dropNamespaceCatalogObjectsCascadeOnServiceAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    snapshot: *const metadata_api.AdminSnapshot,
+    target: catalog_resources.NamespaceTarget,
+) !void {
+    const ServiceType = @TypeOf(svc);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (comptime !(@hasDecl(ServiceDeclType, "applyTableCatalogBatchUpdateWithSchemaRewriteJobs") and
+        @hasDecl(ServiceDeclType, "applyTableCatalogDropWithSchemaRewriteJobs") and
+        @hasDecl(ServiceDeclType, "removeSequence")))
+    {
+        return error.UnsupportedOperation;
+    }
+
+    var namespace_table_ids = std.AutoHashMapUnmanaged(u64, void).empty;
+    defer namespace_table_ids.deinit(alloc);
+    var namespace_table_names = std.ArrayListUnmanaged([]const u8).empty;
+    defer namespace_table_names.deinit(alloc);
+
+    for (snapshot.tables) |table| {
+        if (!std.mem.eql(u8, table.database_name, target.database_name)) continue;
+        if (!std.mem.eql(u8, table.namespace_name, target.namespace_name)) continue;
+        try namespace_table_ids.put(alloc, table.table_id, {});
+        try namespace_table_names.append(alloc, table.name);
+    }
+
+    if (namespace_table_names.items.len > 0) {
+        var table_updates = std.ArrayListUnmanaged(metadata_table_manager.TableRecord).empty;
+        defer {
+            for (table_updates.items) |table| metadata_table_manager.freeTable(alloc, table);
+            table_updates.deinit(alloc);
+        }
+
+        for (snapshot.tables) |candidate_table| {
+            if (namespace_table_ids.contains(candidate_table.table_id)) continue;
+            if (candidate_table.schema_json.len == 0) continue;
+            var current_schema_json = try alloc.dupe(u8, candidate_table.schema_json);
+            defer alloc.free(current_schema_json);
+            var changed = false;
+
+            for (namespace_table_names.items) |table_name| {
+                const next_schema_json = (try schemaWithoutForeignKeysReferencingTableAlloc(
+                    alloc,
+                    current_schema_json,
+                    table_name,
+                )) orelse continue;
+                alloc.free(current_schema_json);
+                current_schema_json = next_schema_json;
+                changed = true;
+            }
+
+            if (!changed) continue;
+            const updated = try applySchemaUpdateRecord(alloc, &candidate_table, current_schema_json);
+            errdefer metadata_table_manager.freeTable(alloc, updated);
+            try table_updates.append(alloc, updated);
+        }
+
+        if (table_updates.items.len > 0) {
+            try svc.applyTableCatalogBatchUpdateWithSchemaRewriteJobs(.{
+                .tables = table_updates.items,
+            });
+        }
+
+        for (snapshot.tables) |table| {
+            if (!namespace_table_ids.contains(table.table_id)) continue;
+            var range_group_ids = std.ArrayListUnmanaged(u64).empty;
+            defer range_group_ids.deinit(alloc);
+            for (snapshot.ranges) |range| {
+                if (range.table_id != table.table_id) continue;
+                try range_group_ids.append(alloc, range.group_id);
+            }
+            const sequence_ids = try ownedSequenceIdsForTableAlloc(alloc, snapshot, table);
+            defer alloc.free(sequence_ids);
+            try svc.applyTableCatalogDropWithSchemaRewriteJobs(.{
+                .table_id = table.table_id,
+                .sequence_ids = sequence_ids,
+                .range_group_ids = range_group_ids.items,
+            });
+        }
+    }
+
+    for (snapshot.sequences) |sequence| {
+        if (!std.mem.eql(u8, sequence.database_name, target.database_name)) continue;
+        if (!std.mem.eql(u8, sequence.namespace_name, target.namespace_name)) continue;
+        if (try sequenceOwnedByNamespaceTableAlloc(alloc, snapshot, target, sequence)) continue;
+        try svc.removeSequence(sequence.sequence_id);
+    }
+}
+
+fn sequenceOwnedByNamespaceTableAlloc(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    target: catalog_resources.NamespaceTarget,
+    sequence: metadata_table_manager.SequenceRecord,
+) !bool {
+    for (snapshot.tables) |table| {
+        if (!std.mem.eql(u8, table.database_name, target.database_name)) continue;
+        if (!std.mem.eql(u8, table.namespace_name, target.namespace_name)) continue;
+        if (try sequenceOwnedByTableColumnAlloc(alloc, sequence, table)) return true;
+    }
+    return false;
 }
 
 pub fn applyTablespaceCatalogPlanOnServiceAlloc(
@@ -5725,6 +5957,9 @@ test "table catalog identity applies SQL database and namespace catalog lifecycl
 
     var service = CatalogService.init(std.testing.allocator);
     defer service.deinit();
+    try service.manager.ensureDefaultCatalog();
+
+    try std.testing.expectError(error.DatabaseNotFound, service.apply(std.testing.allocator, "CREATE SCHEMA missing_db.analytics;"));
 
     var created_database = try service.apply(std.testing.allocator, "CREATE DATABASE tenant_ops;");
     defer created_database.deinit(std.testing.allocator);
@@ -5734,9 +5969,14 @@ test "table catalog identity applies SQL database and namespace catalog lifecycl
     {
         const databases = try service.manager.listDatabases(std.testing.allocator);
         defer service.manager.freeDatabases(std.testing.allocator, databases);
-        try std.testing.expectEqual(@as(usize, 1), databases.len);
-        try std.testing.expectEqual(tenant_database_id, databases[0].database_id);
-        try std.testing.expectEqualStrings("tenant_ops", databases[0].name);
+        try std.testing.expectEqual(@as(usize, 2), databases.len);
+        var found_tenant_database = false;
+        for (databases) |database| {
+            if (!std.mem.eql(u8, database.name, "tenant_ops")) continue;
+            found_tenant_database = true;
+            try std.testing.expectEqual(tenant_database_id, database.database_id);
+        }
+        try std.testing.expect(found_tenant_database);
     }
 
     var altered_database = try service.apply(std.testing.allocator, "ALTER DATABASE tenant_ops SET app.tenant_id TO 'tenant-a';");
@@ -5744,7 +5984,10 @@ test "table catalog identity applies SQL database and namespace catalog lifecycl
     {
         const databases = try service.manager.listDatabases(std.testing.allocator);
         defer service.manager.freeDatabases(std.testing.allocator, databases);
-        var parsed_settings = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, databases[0].settings_json, .{});
+        const tenant_database = for (databases) |database| {
+            if (std.mem.eql(u8, database.name, "tenant_ops")) break database;
+        } else return error.TestUnexpectedResult;
+        var parsed_settings = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, tenant_database.settings_json, .{});
         defer parsed_settings.deinit();
         try std.testing.expectEqualStrings("tenant-a", parsed_settings.value.object.get("app.tenant_id").?.string);
     }
@@ -5753,7 +5996,10 @@ test "table catalog identity applies SQL database and namespace catalog lifecycl
     {
         const databases = try service.manager.listDatabases(std.testing.allocator);
         defer service.manager.freeDatabases(std.testing.allocator, databases);
-        var parsed_settings = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, databases[0].settings_json, .{});
+        const tenant_database = for (databases) |database| {
+            if (std.mem.eql(u8, database.name, "tenant_ops")) break database;
+        } else return error.TestUnexpectedResult;
+        var parsed_settings = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, tenant_database.settings_json, .{});
         defer parsed_settings.deinit();
         try std.testing.expectEqualStrings("5s", parsed_settings.value.object.get("statement_timeout").?.string);
     }
@@ -5888,11 +6134,47 @@ test "table catalog identity applies SQL database and namespace catalog lifecycl
     var tenant_namespace = try service.applyWithSession(std.testing.allocator, "CREATE SCHEMA private;", .{ .current_database_name = "tenant_ops" });
     defer tenant_namespace.deinit(std.testing.allocator);
     try std.testing.expect(tenant_namespace.created_namespace);
+    try std.testing.expectError(error.NamespaceAlreadyExists, service.applyWithSession(std.testing.allocator, "CREATE SCHEMA private;", .{ .current_database_name = "tenant_ops" }));
+    var duplicate_tenant_namespace = try service.applyWithSession(std.testing.allocator, "CREATE SCHEMA IF NOT EXISTS private;", .{ .current_database_name = "tenant_ops" });
+    defer duplicate_tenant_namespace.deinit(std.testing.allocator);
+    try std.testing.expect(duplicate_tenant_namespace.noop);
+    var duplicate_qualified_tenant_namespace = try service.applyWithSession(std.testing.allocator, "CREATE SCHEMA IF NOT EXISTS tenant_ops.private;", .{ .current_database_name = "default" });
+    defer duplicate_qualified_tenant_namespace.deinit(std.testing.allocator);
+    try std.testing.expect(duplicate_qualified_tenant_namespace.noop);
+    var qualified_tenant_namespace = try service.applyWithSession(std.testing.allocator, "CREATE SCHEMA tenant_ops.reporting;", .{ .current_database_name = "default" });
+    defer qualified_tenant_namespace.deinit(std.testing.allocator);
+    try std.testing.expect(qualified_tenant_namespace.created_namespace);
+    var create_private_namespace_target = try relationalSqlSchemaNamespaceDdlTargetWithSessionAlloc(std.testing.allocator, "CREATE SCHEMA IF NOT EXISTS private;", .{ .current_database_name = "tenant_ops" });
+    defer create_private_namespace_target.deinit(std.testing.allocator);
+    try std.testing.expect(create_private_namespace_target.createsNamespace());
+    try std.testing.expect(create_private_namespace_target.if_not_exists);
+    try std.testing.expectEqualStrings("tenant_ops", create_private_namespace_target.database_name);
+    try std.testing.expectEqualStrings("private", create_private_namespace_target.namespace_name);
+    var rename_reporting_namespace_target = try relationalSqlSchemaNamespaceDdlTargetWithSessionAlloc(std.testing.allocator, "ALTER SCHEMA tenant_ops.reporting RENAME TO tenant_ops.archive;", .{ .current_database_name = "default" });
+    defer rename_reporting_namespace_target.deinit(std.testing.allocator);
+    try std.testing.expect(rename_reporting_namespace_target.renamesNamespace());
+    try std.testing.expectEqualStrings("tenant_ops", rename_reporting_namespace_target.database_name);
+    try std.testing.expectEqualStrings("reporting", rename_reporting_namespace_target.namespace_name);
+    try std.testing.expectEqualStrings("archive", rename_reporting_namespace_target.new_namespace_name orelse return error.TestUnexpectedResult);
+    var drop_reporting_namespace_target = try relationalSqlSchemaNamespaceDdlTargetWithSessionAlloc(std.testing.allocator, "DROP SCHEMA IF EXISTS tenant_ops.reporting CASCADE;", .{ .current_database_name = "default" });
+    defer drop_reporting_namespace_target.deinit(std.testing.allocator);
+    try std.testing.expect(drop_reporting_namespace_target.dropsNamespace());
+    try std.testing.expect(drop_reporting_namespace_target.if_exists);
+    try std.testing.expect(drop_reporting_namespace_target.cascade);
+    try std.testing.expectEqualStrings("tenant_ops", drop_reporting_namespace_target.database_name);
+    try std.testing.expectEqualStrings("reporting", drop_reporting_namespace_target.namespace_name);
+    try std.testing.expectError(error.UnsupportedSqlShape, relationalSqlSchemaNamespaceDdlTargetWithSessionAlloc(std.testing.allocator, "ALTER SCHEMA tenant_ops.reporting RENAME TO default.reporting;", .{ .current_database_name = "default" }));
+    try std.testing.expectError(error.UnsupportedSqlShape, service.applyWithSession(std.testing.allocator, "ALTER SCHEMA tenant_ops.reporting RENAME TO default.reporting;", .{ .current_database_name = "default" }));
     {
         var snapshot_value = try service.snapshot(std.testing.allocator);
         defer service.freeSnapshot(std.testing.allocator, &snapshot_value);
         try std.testing.expect(findNamespaceByName(&snapshot_value, "tenant_ops", "private") != null);
+        try std.testing.expect(findNamespaceByName(&snapshot_value, "tenant_ops", "reporting") != null);
     }
+    try std.testing.expectError(error.NamespaceNotFound, service.applyWithSession(std.testing.allocator, "DROP SCHEMA missing;", .{ .current_database_name = "tenant_ops" }));
+    var missing_tenant_namespace = try service.applyWithSession(std.testing.allocator, "DROP SCHEMA IF EXISTS missing;", .{ .current_database_name = "tenant_ops" });
+    defer missing_tenant_namespace.deinit(std.testing.allocator);
+    try std.testing.expect(missing_tenant_namespace.noop);
     {
         var snapshot_value = try service.snapshot(std.testing.allocator);
         defer service.freeSnapshot(std.testing.allocator, &snapshot_value);
@@ -5913,7 +6195,21 @@ test "table catalog identity applies SQL database and namespace catalog lifecycl
     });
 
     try std.testing.expectError(error.NamespaceNotEmpty, service.apply(std.testing.allocator, "DROP SCHEMA analytics;"));
-    try std.testing.expectError(error.UnsupportedSqlShape, service.apply(std.testing.allocator, "DROP SCHEMA analytics CASCADE;"));
+
+    var cascade_namespace = try service.apply(std.testing.allocator, "CREATE SCHEMA scratch;");
+    defer cascade_namespace.deinit(std.testing.allocator);
+    try std.testing.expect(cascade_namespace.created_namespace);
+    try service.manager.upsertTable(.{
+        .table_id = deriveQualifiedTableId(default_database_name, "scratch", "events"),
+        .name = "events",
+        .database_name = default_database_name,
+        .namespace_name = "scratch",
+    });
+    try std.testing.expectError(error.NamespaceNotEmpty, service.apply(std.testing.allocator, "DROP SCHEMA scratch;"));
+    var dropped_cascade_namespace = try service.apply(std.testing.allocator, "DROP SCHEMA scratch CASCADE;");
+    defer dropped_cascade_namespace.deinit(std.testing.allocator);
+    try std.testing.expect(dropped_cascade_namespace.dropped_namespace);
+    try std.testing.expect(service.manager.tables.get(deriveQualifiedTableId(default_database_name, "scratch", "events")) == null);
 
     var renamed_namespace = try service.apply(std.testing.allocator, "ALTER SCHEMA analytics RENAME TO reporting;");
     defer renamed_namespace.deinit(std.testing.allocator);
@@ -5930,6 +6226,9 @@ test "table catalog identity applies SQL database and namespace catalog lifecycl
     var dropped_tenant_namespace = try service.applyWithSession(std.testing.allocator, "DROP SCHEMA private;", .{ .current_database_name = "tenant_ops" });
     defer dropped_tenant_namespace.deinit(std.testing.allocator);
     try std.testing.expect(dropped_tenant_namespace.dropped_namespace);
+    var dropped_qualified_tenant_namespace = try service.applyWithSession(std.testing.allocator, "DROP SCHEMA tenant_ops.reporting;", .{ .current_database_name = "default" });
+    defer dropped_qualified_tenant_namespace.deinit(std.testing.allocator);
+    try std.testing.expect(dropped_qualified_tenant_namespace.dropped_namespace);
 
     var dropped_database = try service.apply(std.testing.allocator, "DROP DATABASE tenant_ops;");
     defer dropped_database.deinit(std.testing.allocator);
@@ -6231,9 +6530,25 @@ test "metadata.schema update sql ddl applies Antfly derived indexes to table met
     try std.testing.expect(std.mem.indexOf(u8, full_text.table.indexes_json, "\"type\":\"full_text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, full_text.table.schema_json, "\"docs_body_fts\"") == null);
 
-    var semantic = try applyRelationalSqlDdlToTableRecordAlloc(
+    var text_search = try applyRelationalSqlDdlToTableRecordAlloc(
         std.testing.allocator,
         &full_text.table,
+        "CREATE TEXT SEARCH docs_body_fts_v2 ON docs (body) WITH (analyzer = 'standard', scoring = 'bm25', highlight = true, snippet = true, segment_lifecycle = 'merge_on_commit');",
+    );
+    defer text_search.deinit(std.testing.allocator);
+    try std.testing.expect(text_search.requires_rebuild);
+    try std.testing.expectEqual(@as(usize, 1), text_search.work_items.len);
+    try std.testing.expect(std.mem.indexOf(u8, text_search.table.indexes_json, "\"docs_body_fts_v2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_search.table.indexes_json, "\"type\":\"full_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_search.table.indexes_json, "\"analyzer\":\"standard\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_search.table.indexes_json, "\"scoring\":\"bm25\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_search.table.indexes_json, "\"highlight\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_search.table.indexes_json, "\"snippet\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_search.table.indexes_json, "\"segment_lifecycle\":\"merge_on_commit\"") != null);
+
+    var semantic = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &text_search.table,
         "CREATE INDEX docs_body_semantic ON docs USING antfly_aknn (body) WITH (embedding_name = 'body_embedding_v1', model = 'local-model', dimension = 384);",
     );
     defer semantic.deinit(std.testing.allocator);
@@ -6444,8 +6759,6 @@ test "metadata.schema update sql ddl exposes catalog target and create intent" {
     try std.testing.expect(drop_cascade_target.dropsTable());
     try std.testing.expect(!drop_cascade_target.if_exists);
     try std.testing.expect(drop_cascade_target.cascade);
-
-    try std.testing.expectError(error.UnsupportedSqlShape, relationalSqlDdlTargetAlloc(std.testing.allocator, "CREATE TABLE tenant_ops.analytics.users (id uuid PRIMARY KEY);"));
 }
 
 test "metadata.schema update sql ddl applies relational catalog changes through table record path" {

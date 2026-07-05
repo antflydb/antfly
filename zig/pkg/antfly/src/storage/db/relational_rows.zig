@@ -2704,7 +2704,9 @@ fn expressionValueJsonWithSourcesAndColumnSetsAlloc(
             defer parsed.deinit();
             if (parsed.value == .null) break :blk try alloc.dupe(u8, "null");
             if (parsed.value != .string) return error.InvalidQueryRequest;
-            var trim_set: []const u8 = &std.ascii.whitespace;
+            var trim_set: []const u8 = std.ascii.whitespace[0..];
+            var trim_set_owned: ?[]u8 = null;
+            defer if (trim_set_owned) |owned| alloc.free(owned);
             if (expression.operands.len == 2) {
                 const trim_json = try expressionValueJsonWithSourcesAndColumnSetsAlloc(alloc, row, proposed_row, source_row, expression.operands[1], row_columns, source_columns, now_ns);
                 defer alloc.free(trim_json);
@@ -2712,7 +2714,8 @@ fn expressionValueJsonWithSourcesAndColumnSetsAlloc(
                 defer parsed_trim.deinit();
                 if (parsed_trim.value == .null) break :blk try alloc.dupe(u8, "null");
                 if (parsed_trim.value != .string) return error.InvalidQueryRequest;
-                trim_set = parsed_trim.value.string;
+                trim_set_owned = try alloc.dupe(u8, parsed_trim.value.string);
+                trim_set = trim_set_owned.?;
             }
             const transformed = try trimTextAlloc(alloc, parsed.value.string, trim_set, expression.kind != .rtrim, expression.kind != .ltrim);
             defer alloc.free(transformed);
@@ -5121,7 +5124,8 @@ fn orderedTupleIndexEqualityKeyPlannerUsable(
 }
 
 fn orderedTupleIndexRangeKeyPlannerUsable(key: schema_mod.RelationalIndexKey) bool {
-    return orderedTupleIndexKeyNullsFirst(key) == (key.direction == .desc);
+    _ = key;
+    return true;
 }
 
 fn orderedTupleIndexKeyCollationsSupported(
@@ -5301,6 +5305,7 @@ fn addRelationalRowsOrderedTupleScanStats(
     stats: relational_store_mod.OrderedTupleDocKeyScanStats,
 ) void {
     if (profile) |out| {
+        out.estimated_candidate_rows += stats.candidate_rows;
         out.index_entries_scanned += stats.index_entries_scanned;
         out.candidate_rows += stats.candidate_rows;
         out.iterator_seeks += stats.iterator_seeks;
@@ -5394,10 +5399,13 @@ fn setRelationalRowsProfileCandidateGate(
     profile: ?*types.RelationalRowsQueryResult.Profile,
     limit: usize,
     observed: usize,
+    exceeded: bool,
 ) void {
     if (profile) |out| {
         out.candidate_gate_limit = @intCast(limit);
         out.candidate_gate_observed = @intCast(observed);
+        out.candidate_gate_exceeded = out.candidate_gate_exceeded or exceeded;
+        out.estimated_candidate_rows = @max(out.estimated_candidate_rows, @as(u64, @intCast(observed)));
     }
 }
 
@@ -5405,20 +5413,93 @@ fn setRelationalRowsProfileOrderedTupleProbeGate(
     profile: ?*types.RelationalRowsQueryResult.Profile,
     req: types.RelationalRowsQueryRequest,
     observed: usize,
+    exceeded: bool,
 ) void {
     const limit = orderedTupleCandidateSetProbeLimit(req) orelse return;
-    setRelationalRowsProfileCandidateGate(profile, limit, observed);
+    setRelationalRowsProfileCandidateGate(profile, limit, observed, exceeded);
 }
 
 fn orderedTupleSchemaHasActiveIndex(runtime_schema: schema_mod.TableSchema) bool {
     for (runtime_schema.relational_columns) |column| {
-        if (column.indexed and
-            column.index_access_method != null and
-            column.index_access_method.? == .ordered_tuple and
-            column.index_lifecycle == .ready and
-            column.index_keys.len >= 2) return true;
+        const index_column = effectiveOrderedTupleColumnForQuery(runtime_schema, column);
+        if (index_column.indexed and
+            index_column.index_access_method != null and
+            index_column.index_access_method.? == .ordered_tuple and
+            index_column.index_lifecycle == .ready and
+            index_column.index_keys.len >= 2) return true;
     }
     return false;
+}
+
+fn relationalIndexOwnerMatchesColumn(index: schema_mod.RelationalIndex, column: schema_mod.RelationalColumn) bool {
+    return index.owner_kind == .relational_column and
+        (std.mem.eql(u8, index.owner_name, column.name) or std.mem.eql(u8, index.owner_name, column.path));
+}
+
+fn relationalIndexForColumn(
+    runtime_schema: schema_mod.TableSchema,
+    column: schema_mod.RelationalColumn,
+    access_method: ?schema_mod.RelationalIndexAccessMethod,
+) ?schema_mod.RelationalIndex {
+    for (runtime_schema.relational_indexes) |index| {
+        if (!relationalIndexOwnerMatchesColumn(index, column)) continue;
+        if (access_method != null and index.access_method != access_method.?) continue;
+        return index;
+    }
+    return null;
+}
+
+fn relationalColumnWithCatalogIndex(column: schema_mod.RelationalColumn, index: schema_mod.RelationalIndex) schema_mod.RelationalColumn {
+    var out = column;
+    out.indexed = true;
+    out.index_name = index.name;
+    out.index_access_method = index.access_method;
+    out.index_lifecycle = index.lifecycle;
+    out.index_generation = index.generation;
+    out.index_schema_fingerprint = index.schema_fingerprint;
+    out.index_keys = index.keys;
+    out.index_include_columns = index.include_columns;
+    out.index_where = index.where;
+    out.index_where_expressions = index.where_expressions;
+    return out;
+}
+
+fn effectiveOrderedTupleColumnForQuery(
+    runtime_schema: schema_mod.TableSchema,
+    column: schema_mod.RelationalColumn,
+) schema_mod.RelationalColumn {
+    if (relationalIndexForColumn(runtime_schema, column, .ordered_tuple)) |index| {
+        return relationalColumnWithCatalogIndex(column, index);
+    }
+    if (runtime_schema.relational_indexes.len != 0) {
+        var out = column;
+        out.indexed = false;
+        out.index_access_method = null;
+        out.index_keys = &.{};
+        return out;
+    }
+    return column;
+}
+
+fn orderedTupleUniqueConstraintOwnerLookupSupported(
+    runtime_schema: schema_mod.TableSchema,
+    constraint: schema_mod.UniqueConstraint,
+    predicates: []const schema_mod.RelationalCheck,
+    generation_usable: bool,
+) bool {
+    if (!generation_usable) return false;
+    if (constraint.validation_state != .enforced) return false;
+    if (constraint.without_overlaps_period != null) return false;
+    if (constraint.expressions.len != 0) return false;
+    if (constraint.index_access_method == null or constraint.index_access_method.? != .ordered_tuple) return false;
+    if (constraint.index_lifecycle != .ready) return false;
+    if (constraint.index_keys.len == 0) return false;
+    if (!orderedTupleIndexKeyCollationsSupported(runtime_schema, constraint.index_keys)) return false;
+    if (orderedTupleIndexPrefixLen(runtime_schema, predicates, constraint.index_keys) != constraint.index_keys.len) return false;
+    for (constraint.columns) |column_name| {
+        if (equalityPredicateForColumn(runtime_schema, predicates, column_name) == null) return false;
+    }
+    return true;
 }
 
 fn orderedTupleCanPlanForQueryShape(req: types.RelationalRowsQueryRequest) bool {
@@ -5479,6 +5560,19 @@ fn orderedTupleIndexKeyDirectionMatchesOrder(index_key: schema_mod.RelationalInd
     };
 }
 
+fn orderedTupleOrderFieldFallbackReason(
+    runtime_schema: schema_mod.TableSchema,
+    index_key: schema_mod.RelationalIndexKey,
+    order: types.RelationalRowsQueryOrder,
+) ?types.RelationalRowsQueryResult.FallbackReason {
+    if (order.expression != null or order.field.len == 0) return .ordered_tuple_order_field_not_covered;
+    const order_column = columnForField(runtime_schema, order.field) orelse return .ordered_tuple_order_field_not_covered;
+    const index_column = columnForField(runtime_schema, index_key.column) orelse return .ordered_tuple_order_field_not_covered;
+    if (!std.mem.eql(u8, order_column.name, index_column.name) and !std.mem.eql(u8, order_column.path, index_column.path)) return .ordered_tuple_order_field_not_covered;
+    if (!optionalBytesEqual(order.collation, index_column.collation)) return .ordered_tuple_order_collation_not_covered;
+    return null;
+}
+
 fn orderedTuplePlanOrderFallbackReason(
     runtime_schema: schema_mod.TableSchema,
     req: types.RelationalRowsQueryRequest,
@@ -5491,18 +5585,32 @@ fn orderedTuplePlanOrderFallbackReason(
     if (orderedTupleFoldedEqualityPrefixIndex(runtime_schema, req.predicates, plan.column.index_keys[0..prefix_len])) |index| {
         prefix_len = index + 1;
     }
-    if (prefix_len + req.order_by.len > plan.column.index_keys.len) return .ordered_tuple_order_field_not_covered;
 
-    for (req.order_by, 0..) |order, i| {
-        if (order.expression != null or order.null_test != null or order.field.len == 0) return .ordered_tuple_order_field_not_covered;
-        const index_key = plan.column.index_keys[prefix_len + i];
+    var key_index = prefix_len;
+    var order_index: usize = 0;
+    while (order_index < req.order_by.len) {
+        if (key_index >= plan.column.index_keys.len) return .ordered_tuple_order_field_not_covered;
+        const index_key = plan.column.index_keys[key_index];
+
+        var explicit_nulls_first: ?bool = null;
+        const possible_null_order = req.order_by[order_index];
+        if (possible_null_order.null_test) |null_test| {
+            if (null_test != .is_null) return .ordered_tuple_order_field_not_covered;
+            if (orderedTupleOrderFieldFallbackReason(runtime_schema, index_key, possible_null_order)) |reason| return reason;
+            explicit_nulls_first = possible_null_order.direction == .desc;
+            order_index += 1;
+            if (order_index >= req.order_by.len) return .ordered_tuple_order_field_not_covered;
+        }
+
+        const order = req.order_by[order_index];
+        if (order.null_test != null) return .ordered_tuple_order_field_not_covered;
+        if (orderedTupleOrderFieldFallbackReason(runtime_schema, index_key, order)) |reason| return reason;
         if (!orderedTupleIndexKeyDirectionMatchesOrder(index_key, order)) return .ordered_tuple_order_direction_not_covered;
-        if (orderedTupleIndexKeyNullsFirst(index_key) != orderedTupleQueryOrderNullsFirst(order)) return .ordered_tuple_order_nulls_not_covered;
+        const query_nulls_first = explicit_nulls_first orelse orderedTupleQueryOrderNullsFirst(order);
+        if (orderedTupleIndexKeyNullsFirst(index_key) != query_nulls_first) return .ordered_tuple_order_nulls_not_covered;
 
-        const order_column = columnForField(runtime_schema, order.field) orelse return .ordered_tuple_order_field_not_covered;
-        const index_column = columnForField(runtime_schema, index_key.column) orelse return .ordered_tuple_order_field_not_covered;
-        if (!std.mem.eql(u8, order_column.name, index_column.name) and !std.mem.eql(u8, order_column.path, index_column.path)) return .ordered_tuple_order_field_not_covered;
-        if (!optionalBytesEqual(order.collation, index_column.collation)) return .ordered_tuple_order_collation_not_covered;
+        order_index += 1;
+        key_index += 1;
     }
     return null;
 }
@@ -5598,6 +5706,9 @@ fn orderedTupleIndexCapabilityForQueryAlloc(
     if (column.index_lifecycle != .ready) return .{ .rejected = .not_ready };
     if (column.index_keys.len < 2) return .{ .rejected = .no_ordered_keys };
     if (column.index_access_method == null or column.index_access_method.? != .ordered_tuple) return .{ .rejected = .access_method_mismatch };
+    if (column.index_generation == 0) return .{ .rejected = .generation_not_current };
+    const fingerprint = column.index_schema_fingerprint orelse return .{ .rejected = .generation_not_current };
+    if (fingerprint.len == 0) return .{ .rejected = .generation_not_current };
     if (!orderedTupleIndexKeyCollationsSupported(runtime_schema, column.index_keys)) return .{ .rejected = .unsupported_collation };
     if (!(try relational_store_mod.predicatesImplyUniqueWhereWithColumns(alloc, implications.predicates, column.index_where, runtime_schema.relational_columns))) {
         return .{ .rejected = .partial_predicate_not_proven };
@@ -5735,6 +5846,20 @@ fn orderedTupleEqualityScanPrefixAlloc(
         return try out.toOwnedSlice(alloc);
     }
     return orderedTupleExactEqualityPrefixAlloc(alloc, runtime_schema, predicates, index_keys);
+}
+
+fn orderedTupleNonNullComponentDomainPrefixAlloc(
+    alloc: Allocator,
+    tuple_prefix: []const u8,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, tuple_prefix);
+    const component_prefix = [_]u8{0x10};
+    const start = out.items.len;
+    try out.resize(alloc, start + internal_keys.encodedBodyLen(&component_prefix));
+    _ = internal_keys.encodeBody(out.items[start..], &component_prefix);
+    return try out.toOwnedSlice(alloc);
 }
 
 fn orderedTupleRangeBoundObjectJsonAlloc(
@@ -15092,6 +15217,7 @@ pub fn Impl(comptime DB: type) type {
             const raw_row = try relational_store_mod.getRawAlloc(alloc, self.core.store, doc_key) orelse return true;
             defer alloc.free(raw_row);
             acc.profile.hydrated_rows += 1;
+            acc.profile.covering_payload_rechecked_rows += 1;
             switch (try relational_store_mod.orderedTupleEntryRowMatchAlloc(alloc, entry_key, payload, raw_row, plan.column, runtime_schema.relational_columns)) {
                 .none => return true,
                 .tuple => {
@@ -15243,6 +15369,7 @@ pub fn Impl(comptime DB: type) type {
                 &scan_ctx,
                 DirectUnorderedOrderedTupleScanContext.append,
             );
+            acc.profile.estimated_candidate_rows += stats.candidate_rows;
             acc.profile.index_entries_scanned += stats.index_entries_scanned;
             acc.profile.candidate_rows += stats.candidate_rows;
             acc.profile.iterator_seeks += stats.iterator_seeks;
@@ -15955,7 +16082,7 @@ pub fn Impl(comptime DB: type) type {
             generation: ?u64,
             profile: ?*types.RelationalRowsQueryResult.Profile,
         ) !?doc_set.ResolvedDocSet {
-            if (try @This().resolveRelationalRowsUniqueOwnerCandidateSetAlloc(self, alloc, runtime_schema, req, generation)) |owner_set| {
+            if (try @This().resolveRelationalRowsUniqueOwnerCandidateSetAlloc(self, alloc, runtime_schema, req, generation, profile)) |owner_set| {
                 return owner_set;
             }
             const implications = PredicateImplications{
@@ -15980,20 +16107,20 @@ pub fn Impl(comptime DB: type) type {
                             if (orderedTupleCandidateSetUsableForQuery(req, &ordered)) {
                                 setRelationalRowsProfileAccessMethod(profile, .ordered_tuple_doc_set);
                                 addRelationalRowsOrderedTupleScanStats(profile, ordered_stats);
-                                setRelationalRowsProfileOrderedTupleProbeGate(profile, req, relationalRowsSaturatingUsize(ordered_stats.candidate_rows));
+                                setRelationalRowsProfileOrderedTupleProbeGate(profile, req, relationalRowsSaturatingUsize(ordered_stats.candidate_rows), false);
                                 try appendPlannedCandidateSetAlloc(alloc, &planned_sets, &ordered, plan_ordinal);
                                 ordered = .none;
                                 plan_ordinal += 1;
                             } else {
                                 addRelationalRowsOrderedTupleScanStats(profile, ordered_stats);
-                                setRelationalRowsProfileOrderedTupleProbeGate(profile, req, relationalRowsSaturatingUsize(ordered_stats.candidate_rows));
+                                setRelationalRowsProfileOrderedTupleProbeGate(profile, req, relationalRowsSaturatingUsize(ordered_stats.candidate_rows), false);
                                 setRelationalRowsProfileFallback(profile, .ordered_tuple_candidate_gate);
                                 ordered.deinit(alloc);
                             }
                         },
                         .exceeded_gate => |observed_count| {
                             addRelationalRowsOrderedTupleScanStats(profile, ordered_stats);
-                            setRelationalRowsProfileOrderedTupleProbeGate(profile, req, observed_count);
+                            setRelationalRowsProfileOrderedTupleProbeGate(profile, req, observed_count, true);
                             setRelationalRowsProfileFallback(profile, .ordered_tuple_materialization_cap);
                         },
                     }
@@ -16279,6 +16406,7 @@ pub fn Impl(comptime DB: type) type {
             runtime_schema: schema_mod.TableSchema,
             req: types.RelationalRowsQueryRequest,
             generation: ?u64,
+            profile: ?*types.RelationalRowsQueryResult.Profile,
         ) !?doc_set.ResolvedDocSet {
             const equality_json = try equalityPredicateObjectJsonAlloc(alloc, req.predicates);
             defer if (equality_json) |json| alloc.free(json);
@@ -16295,6 +16423,9 @@ pub fn Impl(comptime DB: type) type {
                 }
             }
             for (runtime_schema.unique_constraints) |constraint| {
+                if (try @This().resolveRelationalRowsOrderedTupleUniqueConstraintCandidateSetAlloc(self, alloc, runtime_schema, constraint, req.predicates, json, generation, implications, profile)) |set| {
+                    return set;
+                }
                 if (try @This().resolveRelationalRowsUniqueConstraintCandidateSetAlloc(self, alloc, runtime_schema, constraint, json, generation, implications)) |set| {
                     return set;
                 }
@@ -16330,6 +16461,42 @@ pub fn Impl(comptime DB: type) type {
             return try self.searchRuntimeResolveDocIdsToDocSet(alloc, &.{owner}, generation);
         }
 
+        pub fn resolveRelationalRowsOrderedTupleUniqueConstraintCandidateSetAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            constraint: schema_mod.UniqueConstraint,
+            predicates: []const schema_mod.RelationalCheck,
+            equality_json: []const u8,
+            generation: ?u64,
+            implications: PredicateImplications,
+            profile: ?*types.RelationalRowsQueryResult.Profile,
+        ) !?doc_set.ResolvedDocSet {
+            if (!orderedTupleUniqueConstraintOwnerLookupSupported(runtime_schema, constraint, predicates, self.searchRuntimeRelationalFilterGenerationCanUseCurrentRows(generation))) return null;
+            if (!(try relational_store_mod.predicatesImplyUniqueWhereWithColumns(alloc, implications.predicates, constraint.where, runtime_schema.relational_columns))) return null;
+            if (!(try expressionPredicatesImplyWithColumns(alloc, implications, constraint.where_expressions, runtime_schema.relational_columns, currentTimeNs()))) return null;
+
+            const columns = try uniqueConstraintColumnsAlloc(alloc, runtime_schema, constraint);
+            defer alloc.free(columns);
+            const row_value = mapper.buildRelationalRowValueAlloc(alloc, equality_json, columns) catch return null;
+            defer alloc.free(row_value);
+            const owner_tuple = (relational_store_mod.uniqueConstraintTupleValueWithColumnsAlloc(alloc, row_value, constraint, runtime_schema.relational_columns) catch return null) orelse return null;
+            alloc.free(owner_tuple);
+
+            const ordered_tuple = orderedTupleExactEqualityPrefixAlloc(alloc, runtime_schema, predicates, constraint.index_keys) catch return null;
+            defer alloc.free(ordered_tuple);
+            var stats = relational_store_mod.OrderedTupleDocKeyScanStats{};
+            const doc_keys = try relational_store_mod.scanOrderedTupleDocKeysAlloc(alloc, self.core.store, constraint.name, ordered_tuple, "", "");
+            defer relational_store_mod.freeDocKeys(alloc, doc_keys);
+            stats.iterator_seeks = 1;
+            stats.index_entries_scanned = doc_keys.len;
+            stats.candidate_rows = doc_keys.len;
+            setRelationalRowsProfileAccessMethod(profile, .ordered_tuple_doc_set);
+            addRelationalRowsOrderedTupleScanStats(profile, stats);
+            if (doc_keys.len == 0) return doc_set.ResolvedDocSet.none;
+            return try self.searchRuntimeResolveDocIdsToDocSet(alloc, doc_keys, generation);
+        }
+
         fn orderedTupleScanPlanForPredicatesAlloc(
             self: *DB,
             alloc: Allocator,
@@ -16363,8 +16530,10 @@ pub fn Impl(comptime DB: type) type {
             errdefer alloc.free(tuple_prefix);
 
             if (candidate.range_key_index) |range_key_index| {
-                var lower_tuple = tuple_prefix;
-                var upper_tuple = try internal_keys.nextPrefixAlloc(alloc, tuple_prefix);
+                var lower_tuple = try orderedTupleNonNullComponentDomainPrefixAlloc(alloc, tuple_prefix);
+                alloc.free(tuple_prefix);
+                errdefer alloc.free(lower_tuple);
+                var upper_tuple = try internal_keys.nextPrefixAlloc(alloc, lower_tuple);
                 errdefer if (upper_tuple) |buf| alloc.free(buf);
 
                 const range_key = column.index_keys[range_key_index];
@@ -24923,7 +25092,7 @@ test "relational rows cte materialization uses ordered tuple prefilters" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_cte_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_cte_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false},"status":{"type":"keyword","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_cte_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_cte_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false},"status":{"type":"keyword","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -25714,7 +25883,7 @@ test "relational rows query does not maintain scalar entries for ordered seconda
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","x-antfly-index-name":"email_rank_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:email_rank_idx","x-antfly-index-keys":[{"column":"email","direction":"desc","nulls":"last"},{"column":"rank","direction":"asc","nulls":"first"}]},"username":{"type":"keyword","x-antfly-index-name":"username_ordered_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:username_ordered_idx","x-antfly-index-keys":[{"column":"username","direction":"desc","nulls":"last"}]},"rank":{"type":"numeric"}},"required":["id","email","username","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","x-antfly-index-name":"email_rank_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:email_rank_idx","x-antfly-index-keys":[{"column":"email","direction":"desc","nulls":"last"},{"column":"rank","direction":"asc","nulls":"first"}]},"username":{"type":"keyword","x-antfly-index-name":"username_ordered_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:username_ordered_idx","x-antfly-index-keys":[{"column":"username","direction":"desc","nulls":"last"}]},"rank":{"type":"numeric"}},"required":["id","email","username","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -25803,7 +25972,7 @@ test "relational rows query resolves compound ordered tuple equality prefixes" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_status_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_status_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"status"}]},"status":{"type":"keyword","x-antfly-index":false},"rank":{"type":"numeric"}},"required":["id","tenant","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_status_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_status_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"status"}]},"status":{"type":"keyword","x-antfly-index":false},"rank":{"type":"numeric"}},"required":["id","tenant","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -25861,6 +26030,7 @@ test "relational rows query resolves compound ordered tuple equality prefixes" {
     try std.testing.expect(result.profile.ordered_tuple_prefix_scan);
     try std.testing.expect(result.profile.ordered_tuple_lower_tuple_bytes > 0);
     try std.testing.expectEqual(@as(u64, 0), result.profile.ordered_tuple_upper_tuple_bytes);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.estimated_candidate_rows);
     try std.testing.expectEqual(@as(u64, 2), result.profile.index_entries_scanned);
     try std.testing.expectEqual(@as(u64, 2), result.profile.candidate_rows);
     try std.testing.expectEqual(@as(u64, 1), result.profile.iterator_seeks);
@@ -25883,6 +26053,8 @@ test "relational ordered tuple capability matcher gates readiness and bounds" {
             .indexed = true,
             .index_name = "tenant_rank_idx",
             .index_access_method = .ordered_tuple,
+            .index_generation = 7,
+            .index_schema_fingerprint = "secondary-index-v1:tenant_rank_idx",
             .index_keys = &.{
                 .{ .column = "tenant" },
                 .{ .column = "rank" },
@@ -25914,6 +26086,16 @@ test "relational ordered tuple capability matcher gates readiness and bounds" {
     try std.testing.expectEqual(OrderedTupleIndexCapability{ .rejected = .generation_not_current }, stale);
     try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_stale_generation, orderedTupleCapabilityFallbackReason(.generation_not_current));
 
+    var missing_generation_column = columns[0];
+    missing_generation_column.index_generation = 0;
+    const missing_generation = try orderedTupleIndexCapabilityForQueryAlloc(alloc, runtime_schema, missing_generation_column, 0, predicates[0..], implications, true);
+    try std.testing.expectEqual(OrderedTupleIndexCapability{ .rejected = .generation_not_current }, missing_generation);
+
+    var missing_fingerprint_column = columns[0];
+    missing_fingerprint_column.index_schema_fingerprint = null;
+    const missing_fingerprint = try orderedTupleIndexCapabilityForQueryAlloc(alloc, runtime_schema, missing_fingerprint_column, 0, predicates[0..], implications, true);
+    try std.testing.expectEqual(OrderedTupleIndexCapability{ .rejected = .generation_not_current }, missing_fingerprint);
+
     var scalar_method_column = columns[0];
     scalar_method_column.index_access_method = .scalar_column;
     const scalar_method = try orderedTupleIndexCapabilityForQueryAlloc(alloc, runtime_schema, scalar_method_column, 0, predicates[0..], implications, true);
@@ -25943,6 +26125,8 @@ test "relational ordered tuple capability matcher gates readiness and bounds" {
             .indexed = true,
             .collation = "antfly.case_insensitive",
             .index_access_method = .ordered_tuple,
+            .index_generation = 7,
+            .index_schema_fingerprint = "secondary-index-v1:email_rank_ci_idx",
             .index_keys = &.{
                 .{ .column = "email" },
                 .{ .column = "rank" },
@@ -25976,6 +26160,8 @@ test "relational ordered tuple capability matcher gates readiness and bounds" {
             .indexed = true,
             .collation = "und-x-icu",
             .index_access_method = .ordered_tuple,
+            .index_generation = 7,
+            .index_schema_fingerprint = "secondary-index-v1:email_rank_unsupported_collation_idx",
             .index_keys = &.{
                 .{ .column = "email" },
                 .{ .column = "rank" },
@@ -26008,7 +26194,7 @@ test "relational ordered tuple fallback profile names capability rejections" {
         defer db.close();
 
         const schema_json =
-            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_active_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_active_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}],"x-antfly-index-where":{"all":[{"field":"status","op":"eq","value":"active"}]}},"rank":{"type":"numeric","x-antfly-index":false},"status":{"type":"keyword","x-antfly-index":false}},"required":["id","tenant","rank","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_active_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_active_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}],"x-antfly-index-where":{"all":[{"field":"status","op":"eq","value":"active"}]}},"rank":{"type":"numeric","x-antfly-index":false},"status":{"type":"keyword","x-antfly-index":false}},"required":["id","tenant","rank","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
         ;
         var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
         defer parsed_schema.deinit(alloc);
@@ -26052,7 +26238,7 @@ test "relational ordered tuple fallback profile names capability rejections" {
         defer db.close();
 
         const schema_json =
-            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_stale_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_stale_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_stale_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_stale_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
         ;
         var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
         defer parsed_schema.deinit(alloc);
@@ -26094,7 +26280,7 @@ test "relational ordered tuple fallback profile names capability rejections" {
         defer db.close();
 
         const schema_json =
-            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","collation":"und-x-icu","x-antfly-index-name":"email_rank_unsupported_collation_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:email_rank_unsupported_collation_idx","x-antfly-index-keys":[{"column":"email"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","email","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","collation":"und-x-icu","x-antfly-index-name":"email_rank_unsupported_collation_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:email_rank_unsupported_collation_idx","x-antfly-index-keys":[{"column":"email"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","email","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
         ;
         var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
         defer parsed_schema.deinit(alloc);
@@ -26138,7 +26324,7 @@ test "relational ordered tuple fallback profile names capability rejections" {
         defer db.close();
 
         const schema_json =
-            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
         ;
         var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
         defer parsed_schema.deinit(alloc);
@@ -26184,7 +26370,7 @@ test "relational ordered tuple fallback profile names capability rejections" {
         defer db.close();
 
         const schema_json =
-            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_building_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_building_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}],"x-antfly-index-lifecycle":"building"},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_building_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_building_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}],"x-antfly-index-lifecycle":"building"},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
         ;
         var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
         defer parsed_schema.deinit(alloc);
@@ -26250,25 +26436,40 @@ test "relational ordered tuple candidate gate is total-mode aware" {
     try std.testing.expect(!orderedTupleCandidateSetUsableForQuery(.{ .limit = 1, .total_mode = .exact }, &over_cap_set));
 
     var finite_profile = types.RelationalRowsQueryResult.Profile{};
-    setRelationalRowsProfileOrderedTupleProbeGate(&finite_profile, .{ .limit = 1, .total_mode = .exact }, 5);
+    setRelationalRowsProfileOrderedTupleProbeGate(&finite_profile, .{ .limit = 1, .total_mode = .exact }, 5, false);
     try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate), finite_profile.candidate_gate_limit);
     try std.testing.expectEqual(@as(u64, 5), finite_profile.candidate_gate_observed);
+    try std.testing.expect(!finite_profile.candidate_gate_exceeded);
+    try std.testing.expectEqual(@as(u64, 5), finite_profile.estimated_candidate_rows);
 
     var wider_profile = types.RelationalRowsQueryResult.Profile{};
-    setRelationalRowsProfileOrderedTupleProbeGate(&wider_profile, .{ .limit = 100, .total_mode = .exact }, 33);
+    setRelationalRowsProfileOrderedTupleProbeGate(&wider_profile, .{ .limit = 100, .total_mode = .exact }, 33, false);
     try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate), wider_profile.candidate_gate_limit);
     try std.testing.expectEqual(@as(u64, 33), wider_profile.candidate_gate_observed);
+    try std.testing.expect(!wider_profile.candidate_gate_exceeded);
+    try std.testing.expectEqual(@as(u64, 33), wider_profile.estimated_candidate_rows);
 
     var unpaged_profile = types.RelationalRowsQueryResult.Profile{};
-    setRelationalRowsProfileOrderedTupleProbeGate(&unpaged_profile, .{ .total_mode = .exact }, 33);
+    setRelationalRowsProfileOrderedTupleProbeGate(&unpaged_profile, .{ .total_mode = .exact }, 33, false);
     try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate), unpaged_profile.candidate_gate_limit);
     try std.testing.expectEqual(@as(u64, 33), unpaged_profile.candidate_gate_observed);
+    try std.testing.expect(!unpaged_profile.candidate_gate_exceeded);
+    try std.testing.expectEqual(@as(u64, 33), unpaged_profile.estimated_candidate_rows);
 
     const order_by = [_]types.RelationalRowsQueryOrder{.{ .field = "rank", .direction = .asc }};
     var ungated_profile = types.RelationalRowsQueryResult.Profile{};
-    setRelationalRowsProfileOrderedTupleProbeGate(&ungated_profile, .{ .order_by = order_by[0..], .limit = 100, .total_mode = .exact }, 33);
+    setRelationalRowsProfileOrderedTupleProbeGate(&ungated_profile, .{ .order_by = order_by[0..], .limit = 100, .total_mode = .exact }, 33, true);
     try std.testing.expectEqual(@as(u64, 0), ungated_profile.candidate_gate_limit);
     try std.testing.expectEqual(@as(u64, 0), ungated_profile.candidate_gate_observed);
+    try std.testing.expect(!ungated_profile.candidate_gate_exceeded);
+    try std.testing.expectEqual(@as(u64, 0), ungated_profile.estimated_candidate_rows);
+
+    var exceeded_profile = types.RelationalRowsQueryResult.Profile{};
+    setRelationalRowsProfileOrderedTupleProbeGate(&exceeded_profile, .{ .limit = 1, .total_mode = .exact }, ordered_tuple_bounded_unordered_candidate_gate + 1, true);
+    try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate), exceeded_profile.candidate_gate_limit);
+    try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate + 1), exceeded_profile.candidate_gate_observed);
+    try std.testing.expect(exceeded_profile.candidate_gate_exceeded);
+    try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate + 1), exceeded_profile.estimated_candidate_rows);
 }
 
 test "relational ordered tuple candidate probe uses measured candidates past old page gate" {
@@ -26284,7 +26485,7 @@ test "relational ordered tuple candidate probe uses measured candidates past old
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_gate_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_gate_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_gate_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_gate_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -26338,6 +26539,7 @@ test "relational ordered tuple candidate probe uses measured candidates past old
     try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.none, result.profile.fallback_reason);
     try std.testing.expectEqual(@as(u64, 0), result.profile.candidate_gate_limit);
     try std.testing.expectEqual(@as(u64, 0), result.profile.candidate_gate_observed);
+    try std.testing.expectEqual(@as(u64, 5), result.profile.estimated_candidate_rows);
     try std.testing.expectEqual(@as(u64, 5), result.profile.index_entries_scanned);
     try std.testing.expectEqual(@as(u64, 5), result.profile.candidate_rows);
     try std.testing.expectEqual(@as(u64, 5), result.profile.hydrated_rows);
@@ -26393,7 +26595,7 @@ test "relational ordered tuple candidate probe reports materialization cap fallb
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_cap_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_cap_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}],"x-antfly-index-where":{"all":[{"field":"tenant","op":"is_not_null"}]}},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_cap_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_cap_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}],"x-antfly-index-where":{"all":[{"field":"tenant","op":"is_not_null"}]}},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -26454,6 +26656,8 @@ test "relational ordered tuple candidate probe reports materialization cap fallb
     try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_materialization_cap, result.profile.fallback_reason);
     try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate), result.profile.candidate_gate_limit);
     try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate + 1), result.profile.candidate_gate_observed);
+    try std.testing.expect(result.profile.candidate_gate_exceeded);
+    try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate + 1), result.profile.estimated_candidate_rows);
     try std.testing.expect(result.profile.index_entries_scanned >= result.profile.candidate_gate_observed);
     try std.testing.expectEqual(@as(u32, @intCast(row_count)), result.total);
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
@@ -26472,7 +26676,7 @@ test "relational rows query resolves ordered tuple equality prefixes with desc a
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","x-antfly-index-name":"email_status_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:email_status_idx","x-antfly-index-keys":[{"column":"email","direction":"desc","nulls":"last"},{"column":"status","direction":"asc","nulls":"first"}]},"status":{"type":"keyword","x-antfly-index":false},"rank":{"type":"numeric"}},"required":["id","email","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","x-antfly-index-name":"email_status_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:email_status_idx","x-antfly-index-keys":[{"column":"email","direction":"desc","nulls":"last"},{"column":"status","direction":"asc","nulls":"first"}]},"status":{"type":"keyword","x-antfly-index":false},"rank":{"type":"numeric"}},"required":["id","email","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -26549,7 +26753,7 @@ test "relational rows query resolves ordered tuple folded collation equality pre
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","collation":"antfly.case_insensitive","x-antfly-index-name":"email_status_ci_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:email_status_ci_idx","x-antfly-index-keys":[{"column":"email"},{"column":"status"}]},"status":{"type":"keyword","x-antfly-index":false},"rank":{"type":"numeric"}},"required":["id","email","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","collation":"antfly.case_insensitive","x-antfly-index-name":"email_status_ci_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:email_status_ci_idx","x-antfly-index-keys":[{"column":"email"},{"column":"status"}]},"status":{"type":"keyword","x-antfly-index":false},"rank":{"type":"numeric"}},"required":["id","email","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -26624,7 +26828,7 @@ test "relational rows query resolves compound ordered tuple equality prefix rang
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false},"status":{"type":"keyword"}},"required":["id","tenant","rank","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false},"status":{"type":"keyword"}},"required":["id","tenant","rank","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -26691,7 +26895,7 @@ test "relational rows direct ordered tuple scan honors total modes" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_page_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_page_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}],"x-antfly-index-include":["id"]},"rank":{"type":"numeric","x-antfly-index":false},"status":{"type":"keyword","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_page_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_page_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}],"x-antfly-index-include":["id"]},"rank":{"type":"numeric","x-antfly-index":false},"status":{"type":"keyword","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -26740,6 +26944,7 @@ test "relational rows direct ordered tuple scan honors total modes" {
     try std.testing.expectEqual(@as(usize, 2), bounded.rows.len);
     try std.testing.expect(!bounded.total_exact);
     try std.testing.expectEqual(@as(u32, 2), bounded.total);
+    try std.testing.expectEqual(@as(u64, 2), bounded.profile.estimated_candidate_rows);
     try std.testing.expectEqual(@as(u64, 2), bounded.profile.index_entries_scanned);
     try std.testing.expectEqual(@as(u64, 2), bounded.profile.hydrated_rows);
     try std.testing.expectEqual(@as(u64, 0), bounded.profile.residual_rechecks);
@@ -26797,6 +27002,7 @@ test "relational rows direct ordered tuple scan honors total modes" {
     try std.testing.expectEqualStrings("{\"id\":\"b\"}", residual.rows[0]);
     try std.testing.expect(!residual.total_exact);
     try std.testing.expectEqual(@as(u32, 1), residual.total);
+    try std.testing.expectEqual(@as(u64, 2), residual.profile.estimated_candidate_rows);
     try std.testing.expectEqual(@as(u64, 2), residual.profile.index_entries_scanned);
     try std.testing.expectEqual(@as(u64, 2), residual.profile.hydrated_rows);
     try std.testing.expectEqual(@as(u64, 2), residual.profile.residual_rechecks);
@@ -26817,7 +27023,7 @@ test "relational rows ordered tuple scan streams order-satisfying pagination" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_amount_cover_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:status_amount_cover_idx","x-antfly-index-keys":[{"column":"status"},{"column":"amount"}],"x-antfly-index-include":["id","amount"]},"amount":{"type":"numeric","x-antfly-index":false}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_amount_cover_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:status_amount_cover_idx","x-antfly-index-keys":[{"column":"status"},{"column":"amount"}],"x-antfly-index-include":["id","amount"]},"amount":{"type":"numeric","x-antfly-index":false}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -26871,6 +27077,217 @@ test "relational rows ordered tuple scan streams order-satisfying pagination" {
     try std.testing.expectEqual(@as(u64, 2), result.profile.projected_rows);
 }
 
+test "relational rows ordered tuple scan reports order direction mismatch" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_amount_desc_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:status_amount_desc_idx","x-antfly-index-keys":[{"column":"status"},{"column":"amount","direction":"desc"}],"x-antfly-index-include":["id","amount"]},"amount":{"type":"numeric","x-antfly-index":false}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"open\",\"amount\":3}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"status\":\"open\",\"amount\":1}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"status\":\"open\",\"amount\":2}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"status\":\"closed\",\"amount\":0}" },
+        },
+        .sync_level = .write,
+    });
+
+    const predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "status",
+        .op = .eq,
+        .value_json = "\"open\"",
+    }};
+    const select = [_][]const u8{ "id", "amount" };
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "amount",
+        .direction = .asc,
+    }};
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+        .limit = 2,
+        .total_mode = .none,
+        .profile = true,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expect(result.include_profile);
+    try std.testing.expect(result.profile.access_method != .ordered_tuple_stream);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_order_direction_not_covered, result.profile.fallback_reason);
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expect(!result.total_exact);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"amount\":1}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\",\"amount\":2}", result.rows[1]);
+}
+
+test "relational rows ordered tuple scan streams descending order-satisfying pagination" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_amount_desc_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:status_amount_desc_idx","x-antfly-index-keys":[{"column":"status"},{"column":"amount","direction":"desc"}],"x-antfly-index-include":["id","amount"]},"amount":{"type":"numeric","x-antfly-index":false}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"open\",\"amount\":3}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"status\":\"open\",\"amount\":1}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"status\":\"open\",\"amount\":2}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"status\":\"closed\",\"amount\":0}" },
+        },
+        .sync_level = .write,
+    });
+
+    const predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "status",
+        .op = .eq,
+        .value_json = "\"open\"",
+    }};
+    const select = [_][]const u8{ "id", "amount" };
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "amount",
+        .direction = .desc,
+    }};
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+        .limit = 2,
+        .total_mode = .none,
+        .profile = true,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expect(result.include_profile);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, result.profile.access_method);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.none, result.profile.fallback_reason);
+    try std.testing.expect(result.profile.ordered_tuple_plan_selected);
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expect(!result.total_exact);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"amount\":3}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\",\"amount\":2}", result.rows[1]);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.index_entries_scanned);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.iterator_seeks);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 0), result.profile.residual_rechecks);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.covering_payload_rows);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.projected_rows);
+}
+
+test "relational rows ordered tuple scan streams explicit null order" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_amount_nulls_first_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:status_amount_nulls_first_idx","x-antfly-index-keys":[{"column":"status"},{"column":"amount","direction":"asc","nulls":"first"}],"x-antfly-index-include":["id","amount"]},"amount":{"type":"numeric","x-antfly-index":false}},"required":["id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"open\",\"amount\":null}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"status\":\"open\",\"amount\":1}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"status\":\"open\",\"amount\":2}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"status\":\"closed\",\"amount\":0}" },
+        },
+        .sync_level = .write,
+    });
+
+    const predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "status",
+        .op = .eq,
+        .value_json = "\"open\"",
+    }};
+    const select = [_][]const u8{ "id", "amount" };
+    const order_by = [_]types.RelationalRowsQueryOrder{
+        .{
+            .field = "amount",
+            .direction = .desc,
+            .null_test = .is_null,
+        },
+        .{
+            .field = "amount",
+            .direction = .asc,
+        },
+    };
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+        .limit = 2,
+        .total_mode = .none,
+        .profile = true,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expect(result.include_profile);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, result.profile.access_method);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.none, result.profile.fallback_reason);
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expect(!result.total_exact);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"amount\":null}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"amount\":1}", result.rows[1]);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.index_entries_scanned);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.iterator_seeks);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 0), result.profile.residual_rechecks);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.covering_payload_rows);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.projected_rows);
+}
+
 test "relational rows ordered tuple scan does not stream non-default null order" {
     const DB = @import("mod.zig").DB;
     const table_schema_api = @import("../../schema/mod.zig");
@@ -26884,7 +27301,7 @@ test "relational rows ordered tuple scan does not stream non-default null order"
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_amount_nulls_first_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:status_amount_nulls_first_idx","x-antfly-index-keys":[{"column":"status"},{"column":"amount","direction":"asc","nulls":"first"}],"x-antfly-index-include":["id","amount"]},"amount":{"type":"numeric","x-antfly-index":false}},"required":["id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_amount_nulls_first_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:status_amount_nulls_first_idx","x-antfly-index-keys":[{"column":"status"},{"column":"amount","direction":"asc","nulls":"first"}],"x-antfly-index-include":["id","amount"]},"amount":{"type":"numeric","x-antfly-index":false}},"required":["id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -26943,7 +27360,7 @@ test "relational rows ordered tuple scan reports order collation mismatch" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_status_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_status_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"status"}]},"status":{"type":"keyword","x-antfly-index":false}},"required":["id","tenant","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_status_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_status_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"status"}]},"status":{"type":"keyword","x-antfly-index":false}},"required":["id","tenant","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27006,7 +27423,7 @@ test "relational rows ordered tuple covering payload rechecks packed row before 
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_cover_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_cover_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}],"x-antfly-index-include":["id"]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_cover_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_cover_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}],"x-antfly-index-include":["id"]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27057,6 +27474,7 @@ test "relational rows ordered tuple covering payload rechecks packed row before 
     try std.testing.expectEqual(@as(u64, 2), result.profile.hydrated_rows);
     try std.testing.expectEqual(@as(u64, 1), result.profile.residual_rechecks);
     try std.testing.expectEqual(@as(u64, 1), result.profile.covering_payload_rows);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.covering_payload_rechecked_rows);
     try std.testing.expectEqual(@as(u64, 2), result.profile.projected_rows);
 }
 
@@ -27073,7 +27491,7 @@ test "relational rows ordered tuple stream skips stale tuple entries for moved r
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_cover_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_cover_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}],"x-antfly-index-include":["id"]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_cover_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_cover_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}],"x-antfly-index-include":["id"]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27123,6 +27541,7 @@ test "relational rows ordered tuple stream skips stale tuple entries for moved r
     try std.testing.expectEqual(@as(u64, 2), result.profile.hydrated_rows);
     try std.testing.expectEqual(@as(u64, 0), result.profile.residual_rechecks);
     try std.testing.expectEqual(@as(u64, 1), result.profile.covering_payload_rows);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.covering_payload_rechecked_rows);
     try std.testing.expectEqual(@as(u64, 1), result.profile.projected_rows);
 }
 
@@ -27139,7 +27558,7 @@ test "relational rows query tightens compound ordered tuple range bounds" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_tight_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_tight_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_tight_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_tight_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27193,7 +27612,7 @@ test "relational rows query resolves ordered tuple first-key ranges" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index":false},"rank":{"type":"numeric","x-antfly-index-name":"rank_tenant_range_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:rank_tenant_range_idx","x-antfly-index-keys":[{"column":"rank"},{"column":"tenant"}]}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index":false},"rank":{"type":"numeric","x-antfly-index-name":"rank_tenant_range_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:rank_tenant_range_idx","x-antfly-index-keys":[{"column":"rank"},{"column":"tenant"}]}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27244,7 +27663,7 @@ test "relational rows query resolves explicit default-null ordered tuple ranges"
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index":false},"rank":{"type":"numeric","x-antfly-index-name":"rank_nulls_last_range_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:rank_nulls_last_range_idx","x-antfly-index-keys":[{"column":"rank","direction":"asc","nulls":"last"},{"column":"tenant"}]}},"required":["id","tenant"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index":false},"rank":{"type":"numeric","x-antfly-index-name":"rank_nulls_last_range_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:rank_nulls_last_range_idx","x-antfly-index-keys":[{"column":"rank","direction":"asc","nulls":"last"},{"column":"tenant"}]}},"required":["id","tenant"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27298,6 +27717,71 @@ test "relational rows query resolves explicit default-null ordered tuple ranges"
     try std.testing.expectEqualStrings("{\"id\":\"d\"}", result.rows[2]);
 }
 
+test "relational rows query resolves non-default null ordered tuple ranges without null candidates" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index":false},"rank":{"type":"numeric","x-antfly-index-name":"rank_nulls_first_range_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:rank_nulls_first_range_idx","x-antfly-index-keys":[{"column":"rank","direction":"asc","nulls":"first"},{"column":"tenant"}]}},"required":["id","tenant"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"rank\":null}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"tenant\":\"t1\",\"rank\":1}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"tenant\":\"t2\",\"rank\":2}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"tenant\":\"t1\",\"rank\":3}" },
+        },
+        .sync_level = .write,
+    });
+
+    for ([_][]const u8{ "row:a", "row:b", "row:c", "row:d" }) |doc_key| {
+        const rank_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "rank", doc_key);
+        defer alloc.free(rank_index_key);
+        db.core.store.delete(rank_index_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    const predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "rank", .op = .lt, .value_json = "3" },
+    };
+    const select = [_][]const u8{"id"};
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "id",
+        .direction = .asc,
+    }};
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_doc_set, result.profile.access_method);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.index_entries_scanned);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", result.rows[1]);
+}
+
 test "relational rows query resolves descending ordered tuple first-key ranges" {
     const DB = @import("mod.zig").DB;
     const table_schema_api = @import("../../schema/mod.zig");
@@ -27311,7 +27795,7 @@ test "relational rows query resolves descending ordered tuple first-key ranges" 
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index":false},"rank":{"type":"numeric","x-antfly-index-name":"rank_desc_tenant_range_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:rank_desc_tenant_range_idx","x-antfly-index-keys":[{"column":"rank","direction":"desc"},{"column":"tenant"}]}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index":false},"rank":{"type":"numeric","x-antfly-index-name":"rank_desc_tenant_range_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:rank_desc_tenant_range_idx","x-antfly-index-keys":[{"column":"rank","direction":"desc"},{"column":"tenant"}]}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27366,6 +27850,71 @@ test "relational rows query resolves descending ordered tuple first-key ranges" 
     try std.testing.expectEqualStrings("{\"id\":\"d\"}", result.rows[2]);
 }
 
+test "relational rows query resolves descending nulls-last ordered tuple ranges without null candidates" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index":false},"rank":{"type":"numeric","x-antfly-index-name":"rank_desc_nulls_last_range_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:rank_desc_nulls_last_range_idx","x-antfly-index-keys":[{"column":"rank","direction":"desc","nulls":"last"},{"column":"tenant"}]}},"required":["id","tenant"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"rank\":null}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"tenant\":\"t1\",\"rank\":1}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"tenant\":\"t2\",\"rank\":2}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"tenant\":\"t1\",\"rank\":3}" },
+        },
+        .sync_level = .write,
+    });
+
+    for ([_][]const u8{ "row:a", "row:b", "row:c", "row:d" }) |doc_key| {
+        const rank_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "rank", doc_key);
+        defer alloc.free(rank_index_key);
+        db.core.store.delete(rank_index_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    const predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "rank", .op = .gt, .value_json = "1" },
+    };
+    const select = [_][]const u8{"id"};
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "id",
+        .direction = .asc,
+    }};
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_doc_set, result.profile.access_method);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.index_entries_scanned);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"d\"}", result.rows[1]);
+}
+
 test "relational rows across ranges uses ordered tuple candidate scans" {
     const DB = @import("mod.zig").DB;
     const table_schema_api = @import("../../schema/mod.zig");
@@ -27379,7 +27928,7 @@ test "relational rows across ranges uses ordered tuple candidate scans" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_routed_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_routed_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_routed_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_routed_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27452,7 +28001,7 @@ test "relational rows OR branches use compound ordered tuple candidate scans" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_rank_or_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:status_rank_or_idx","x-antfly-index-keys":[{"column":"status"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_rank_or_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:status_rank_or_idx","x-antfly-index-keys":[{"column":"status"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27543,7 +28092,7 @@ test "relational rows access OR branches use ranged compound ordered tuple candi
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_rank_access_or_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:status_rank_access_or_idx","x-antfly-index-keys":[{"column":"status"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_rank_access_or_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:status_rank_access_or_idx","x-antfly-index-keys":[{"column":"status"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false}},"required":["id","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27632,7 +28181,7 @@ test "relational aggregate and join sources use ordered tuple prefilters" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"kind":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_prefilter_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_prefilter_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false},"customer_id":{"type":"keyword"},"name":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","kind","tenant"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"kind":{"type":"keyword"},"tenant":{"type":"keyword","x-antfly-index-name":"tenant_rank_prefilter_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_rank_prefilter_idx","x-antfly-index-keys":[{"column":"tenant"},{"column":"rank"}]},"rank":{"type":"numeric","x-antfly-index":false},"customer_id":{"type":"keyword"},"name":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","kind","tenant"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27912,6 +28461,73 @@ test "relational rows query resolves unique owner before column indexes" {
     try std.testing.expectEqual(@as(u32, 1), result.total);
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
     try std.testing.expectEqualStrings("{\"id\":\"u1\",\"name\":\"Ada\"}", result.rows[0]);
+}
+
+test "relational rows query routes compound unique owner through ordered tuple metadata" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","tenant","email","status","name"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_tenant_email_key","columns":["tenant","email"],"index_keys":[{"column":"tenant"},{"column":"email"}],"index_lifecycle":"ready","index_generation":7,"index_access_method":"ordered_tuple","index_schema_fingerprint":"secondary-index-v1:users_tenant_email_key"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:ada", .value = "{\"id\":\"u1\",\"tenant\":\"t1\",\"email\":\"ada@example.test\",\"status\":\"active\",\"name\":\"Ada\"}" },
+            .{ .key = "user:grace", .value = "{\"id\":\"u2\",\"tenant\":\"t1\",\"email\":\"grace@example.test\",\"status\":\"active\",\"name\":\"Grace\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const row_value = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:ada") orelse return error.TestExpectedEqual;
+    defer alloc.free(row_value);
+    const tuple = (try relational_store_mod.uniqueConstraintTupleValueWithColumnsAlloc(alloc, row_value, runtime_schema.unique_constraints[0], runtime_schema.relational_columns)) orelse return error.TestExpectedEqual;
+    defer alloc.free(tuple);
+    const owner_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_tenant_email_key", tuple);
+    defer alloc.free(owner_key);
+    try db.core.store.delete(owner_key);
+
+    for ([_][]const u8{ "tenant", "email", "status" }) |field| {
+        const index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, field, "user:ada");
+        defer alloc.free(index_key);
+        db.core.store.delete(index_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    const predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+        .{ .name = "", .field = "email", .op = .eq, .value_json = "\"ada@example.test\"" },
+        .{ .name = "", .field = "status", .op = .eq, .value_json = "\"active\"" },
+    };
+    const select = [_][]const u8{ "id", "name" };
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .profile = true,
+    });
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), result.total);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"name\":\"Ada\"}", result.rows[0]);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_doc_set, result.profile.access_method);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.iterator_seeks);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.candidate_rows);
 }
 
 test "relational rows unique owner lookup honors case-insensitive collation" {

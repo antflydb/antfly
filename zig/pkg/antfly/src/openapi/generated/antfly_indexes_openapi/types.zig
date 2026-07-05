@@ -176,6 +176,28 @@ pub const EmbeddingsIndexStats = struct {
     backfill_items_processed: ?i64 = null,
 };
 
+/// Counters from relational column-backed index repair. These counters describe disposable derived-index artifacts rebuilt from authoritative packed rows.
+pub const RelationalIndexRepairReport = struct {
+    scanned_rows: ?i64 = null,
+    indexed_rows: ?i64 = null,
+    deleted_orphan_entries: ?i64 = null,
+    written_entries: ?i64 = null,
+};
+
+/// Aggregate secondary-index rebuild progress projected from authoritative metadata ranges.
+pub const RelationalIndexRebuildStatus = struct {
+    range_count: ?i64 = null,
+    matching_generation_range_count: ?i64 = null,
+    stale_generation_range_count: ?i64 = null,
+    declared_range_count: ?i64 = null,
+    building_range_count: ?i64 = null,
+    ready_range_count: ?i64 = null,
+    invalid_range_count: ?i64 = null,
+    completed_row_count: ?i64 = null,
+    progress_row_key: ?[]const u8 = null,
+    last_error: ?[]const u8 = null,
+};
+
 /// Discriminator for the index stats variant.
 pub const AlgebraicIndexStatsIndexType = enum {
     algebraic,
@@ -687,6 +709,17 @@ pub const EnrichmentConfig = struct {
     producer_json: ?[]const u8 = null,
 };
 
+/// Most recently updated durable relational index repair job for this table.
+pub const RelationalIndexRepairLatest = struct {
+    job_id: ?[]const u8 = null,
+    status: ?[]const u8 = null,
+    worker_id: ?[]const u8 = null,
+    updated_at_ns: ?i64 = null,
+    next_lower_doc_key: ?[]const u8 = null,
+    last_error: ?[]const u8 = null,
+    last_report: ?RelationalIndexRepairReport = null,
+};
+
 /// Configuration for result fusion when combining multiple search indexes.
 pub const MergeConfig = struct {
     strategy: ?MergeStrategy = null,
@@ -975,6 +1008,19 @@ pub const GraphMetricStatus = struct {
     recent_events: ?[]const GraphMetricEvent = null,
 };
 
+/// Aggregate durable repair-job evidence for schema-backed relational indexes on this table.
+pub const RelationalIndexRepairStatus = struct {
+    job_count: ?i64 = null,
+    active_job_count: ?i64 = null,
+    completed_job_count: ?i64 = null,
+    failed_job_count: ?i64 = null,
+    total_ranges_scanned: ?i64 = null,
+    total_ranges_repaired: ?i64 = null,
+    total_ranges_missing: ?i64 = null,
+    aggregate_report: ?RelationalIndexRepairReport = null,
+    latest: ?RelationalIndexRepairLatest = null,
+};
+
 /// Configuration for an index
 pub const IndexConfig = struct {
     /// Name of the index
@@ -1116,50 +1162,6 @@ pub const IndexConfig = struct {
     }
 };
 
-/// Statistics for an index
-pub const IndexStats = union(enum) {
-    full_text_index_stats: FullTextIndexStats,
-    embeddings_index_stats: EmbeddingsIndexStats,
-    graph_index_stats: GraphIndexStats,
-    algebraic_index_stats: AlgebraicIndexStats,
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("index_type") orelse return error.MissingField;
-        const disc_str = switch (disc_val) {
-            .string => |s| s,
-            else => return error.UnexpectedToken,
-        };
-        if (std.mem.eql(u8, disc_str, "full_text")) {
-            return .{ .full_text_index_stats = try std.json.parseFromValueLeaky(FullTextIndexStats, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "embeddings")) {
-            return .{ .embeddings_index_stats = try std.json.parseFromValueLeaky(EmbeddingsIndexStats, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "graph")) {
-            return .{ .graph_index_stats = try std.json.parseFromValueLeaky(GraphIndexStats, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "algebraic")) {
-            return .{ .algebraic_index_stats = try std.json.parseFromValueLeaky(AlgebraicIndexStats, allocator, source, options) };
-        }
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        const value = try std.json.Value.jsonParse(allocator, source, options);
-        return try jsonParseFromValue(allocator, value, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        switch (self) {
-            .full_text_index_stats => |v| try jw.write(v),
-            .embeddings_index_stats => |v| try jw.write(v),
-            .graph_index_stats => |v| try jw.write(v),
-            .algebraic_index_stats => |v| try jw.write(v),
-        }
-    }
-};
-
 /// A step in a graph pattern query
 pub const PatternStep = struct {
     /// Name for this node (reuse alias for cycle detection)
@@ -1192,6 +1194,42 @@ pub const GraphMetricResult = struct {
     metric: []const u8,
     scores: []const GraphMetricScore,
     status: GraphMetricStatus,
+};
+
+/// Discriminator for the index stats variant.
+pub const RelationalIndexStatsIndexType = enum {
+    relational,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .relational => "relational",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "relational", .relational },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Public status for schema-backed relational indexes.
+pub const RelationalIndexStats = struct {
+    /// Discriminator for the index stats variant.
+    index_type: RelationalIndexStatsIndexType,
+    access_method: ?[]const u8 = null,
+    lifecycle: ?[]const u8 = null,
+    ready: ?bool = null,
+    generation: ?i64 = null,
+    schema_fingerprint: ?[]const u8 = null,
+    rebuild: ?RelationalIndexRebuildStatus = null,
+    repair: ?RelationalIndexRepairStatus = null,
 };
 
 /// Declarative graph query to execute after full-text/vector searches
@@ -1242,4 +1280,53 @@ pub const GraphQueryResult = struct {
     took: ?i64 = null,
     /// Graph metric status metadata keyed by metric name
     metric_status: ?std.json.ArrayHashMap(GraphMetricStatus) = null,
+};
+
+/// Statistics for an index
+pub const IndexStats = union(enum) {
+    full_text_index_stats: FullTextIndexStats,
+    embeddings_index_stats: EmbeddingsIndexStats,
+    graph_index_stats: GraphIndexStats,
+    algebraic_index_stats: AlgebraicIndexStats,
+    relational_index_stats: RelationalIndexStats,
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("index_type") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "full_text")) {
+            return .{ .full_text_index_stats = try std.json.parseFromValueLeaky(FullTextIndexStats, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "embeddings")) {
+            return .{ .embeddings_index_stats = try std.json.parseFromValueLeaky(EmbeddingsIndexStats, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph")) {
+            return .{ .graph_index_stats = try std.json.parseFromValueLeaky(GraphIndexStats, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "algebraic")) {
+            return .{ .algebraic_index_stats = try std.json.parseFromValueLeaky(AlgebraicIndexStats, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "relational")) {
+            return .{ .relational_index_stats = try std.json.parseFromValueLeaky(RelationalIndexStats, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .full_text_index_stats => |v| try jw.write(v),
+            .embeddings_index_stats => |v| try jw.write(v),
+            .graph_index_stats => |v| try jw.write(v),
+            .algebraic_index_stats => |v| try jw.write(v),
+            .relational_index_stats => |v| try jw.write(v),
+        }
+    }
 };

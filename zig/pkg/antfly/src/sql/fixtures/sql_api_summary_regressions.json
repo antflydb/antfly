@@ -215,7 +215,7 @@
           "select": 2,
           "predicates": 1
         },
-        "plan": "ddl:create_index:table=usage_records:columns=1:expr=1:generated_expr=0:where=1:unique=false:if_not_exists=false"
+        "plan": "ddl:create_index:table=usage_records:columns=1:expr=1:generated_expr=0:where=1:unique=false:if_not_exists=false:method=ordered_tuple"
       },
       "expect_true": [
         "ddl_predicate_matches",
@@ -233,7 +233,7 @@
           "select": 2,
           "predicates": 1
         },
-        "plan": "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=1:unique=false:if_not_exists=false"
+        "plan": "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=1:unique=false:if_not_exists=false:method=ordered_tuple"
       },
       "expect_true": [
         "ddl_predicate_matches"
@@ -253,7 +253,7 @@
           "select": 2,
           "predicates": 1
         },
-        "plan": "ddl:create_index:table=usage_records:columns=1:expr=1:generated_expr=0:where=0:unique=false:if_not_exists=false"
+        "plan": "ddl:create_index:table=usage_records:columns=1:expr=1:generated_expr=0:where=0:unique=false:if_not_exists=false:method=ordered_tuple"
       },
       "expect_true": [
         "ddl_select_matches"

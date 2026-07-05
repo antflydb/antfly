@@ -3393,6 +3393,14 @@ fn validateRelationalPartialIndexProperty(schema: TableSchema, property: Documen
     if (property.index_access_method != null or property.index_schema_fingerprint != null) {
         if (property.index_name == null) return error.InvalidSchemaUpdateRequest;
     }
+    if (property.index_access_method) |access_method| switch (access_method) {
+        .scalar_column, .algebraic_filter, .text_search => if (property.index_keys.len != 0) return error.InvalidSchemaUpdateRequest,
+        .ordered_tuple => if (property.index_keys.len == 0) return error.InvalidSchemaUpdateRequest,
+    };
+    if (property.generated != null and property.index_name != null) {
+        if (property.index_access_method == null or property.index_access_method.? != .ordered_tuple) return error.InvalidSchemaUpdateRequest;
+        if (property.index_keys.len == 0) return error.InvalidSchemaUpdateRequest;
+    }
     if (property.index_include_columns.len > 0) {
         if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
         if (property.antfly_index != null and !property.antfly_index.?) return error.InvalidSchemaUpdateRequest;
@@ -8177,6 +8185,32 @@ test "parse relational secondary index lifecycle states" {
 
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-lifecycle":"paused","x-antfly-index-generation":1,"x-antfly-index-name":"status_idx","x-antfly-index-access-method":"scalar_column","x-antfly-index-schema-fingerprint":"secondary-index-v1:status"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ));
+}
+
+test "relational generated index metadata must be ordered tuple" {
+    const alloc = std.testing.allocator;
+
+    var valid = try parseSchema(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"email_lc":{"type":"keyword","generated":{"op":"lower","field":"email"},"x-antfly-index-name":"email_lc_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:email_lc_idx","x-antfly-index-keys":[{"column":"email_lc","direction":"desc","nulls":"last"}]}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    );
+    defer valid.deinit(alloc);
+    const generated = valid.document_schemas[0].properties[2];
+    try std.testing.expect(generated.generated != null);
+    try std.testing.expectEqual(storage_schema.RelationalIndexAccessMethod.ordered_tuple, generated.index_access_method.?);
+    try std.testing.expectEqual(@as(usize, 1), generated.index_keys.len);
+    try std.testing.expectEqualStrings("email_lc", generated.index_keys[0].column);
+    try std.testing.expectEqual(storage_schema.RelationalIndexKeyDirection.desc, generated.index_keys[0].direction);
+    try std.testing.expectEqual(storage_schema.RelationalIndexKeyNulls.last, generated.index_keys[0].nulls);
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"email_lc":{"type":"keyword","generated":{"op":"lower","field":"email"},"x-antfly-index-name":"email_lc_idx","x-antfly-index-access-method":"scalar_column","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:email_lc_idx"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"email_lc":{"type":"keyword","generated":{"op":"lower","field":"email"},"x-antfly-index-name":"email_lc_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:email_lc_idx"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"email_lc":{"type":"keyword","generated":{"op":"lower","field":"email"},"x-antfly-index-name":"email_lc_idx","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:email_lc_idx"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ));
 }
 

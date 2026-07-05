@@ -4278,6 +4278,7 @@ test "db lifecycle open query_readonly lsm primary opens physical backend read-o
         error.ReadOnly,
         readonly.rebuildRelationalSecondaryIndexInRange("missing", 0, "doc:a", "doc:z"),
     );
+    try std.testing.expectError(error.ReadOnly, readonly.repairRelationalColumnBackedIndexesInRange("doc:a", "doc:z"));
     try std.testing.expectError(error.ReadOnly, readonly.repairForeignKeyRefsInRange("doc:a", "doc:z"));
     try std.testing.expectError(error.ReadOnly, readonly.repairForeignKeyRefsInRangeForConstraint("fk_parent", "doc:a", "doc:z"));
     try std.testing.expectError(error.ReadOnly, readonly.repairUniqueConstraintRowsInRange("doc:a", "doc:z"));
@@ -4287,6 +4288,10 @@ test "db lifecycle open query_readonly lsm primary opens physical backend read-o
     try std.testing.expectError(error.ReadOnly, readonly.claimForeignKeyIntegrityWorkUnitAt("claim-at", "worker-a", 1, "scan", "repair", null, "doc:a", "doc:z", 1000, 1));
     try std.testing.expectError(error.ReadOnly, readonly.upsertForeignKeyIntegrityJobRecord("job-a", "child", "repair", "worker-a", null, "doc:a", "doc:z", 1000, 10, "running"));
     try std.testing.expectError(error.ReadOnly, readonly.upsertForeignKeyIntegrityJobRecordAt("job-at", "child", "repair", "worker-a", null, "doc:a", "doc:z", 1000, 10, "running", 1));
+    try std.testing.expectError(error.ReadOnly, readonly.upsertRelationalIndexRepairJobRecord("repair-a", "default", "public", "docs", "worker-a", "doc:a", "doc:z", 1000, 10, "running"));
+    try std.testing.expectError(error.ReadOnly, readonly.upsertRelationalIndexRepairJobRecordAt("repair-at", "default", "public", "docs", "worker-a", "doc:a", "doc:z", 1000, 10, "running", 1));
+    try std.testing.expectError(error.ReadOnly, readonly.recordRelationalIndexRepairJobPass("repair-a", "running", false, 1, 1, 0, "doc:m", .{}, null));
+    try std.testing.expectError(error.ReadOnly, readonly.recordRelationalIndexRepairJobPassAt("repair-at", "complete", true, 1, 1, 0, "", .{}, null, 1));
     try std.testing.expectError(error.ReadOnly, readonly.completeForeignKeyIntegrityJobRecord("job-a", "complete", true, .{}));
     try std.testing.expectError(error.ReadOnly, readonly.completeForeignKeyIntegrityJobRecordWithDiagnostics("job-a", "complete", true, .{}, "[]", 0, false));
     try std.testing.expectError(error.ReadOnly, readonly.completeForeignKeyIntegrityJobRecordAt("job-at", "complete", true, .{}, 1));

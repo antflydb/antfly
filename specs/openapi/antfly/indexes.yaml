@@ -324,6 +324,132 @@ components:
           type: integer
           format: uint64
           description: "Total items processed during backfill"
+    RelationalIndexRepairReport:
+      type: object
+      description: "Counters from relational column-backed index repair. These counters describe disposable derived-index artifacts rebuilt from authoritative packed rows."
+      properties:
+        scanned_rows:
+          type: integer
+          format: uint64
+        indexed_rows:
+          type: integer
+          format: uint64
+        deleted_orphan_entries:
+          type: integer
+          format: uint64
+        written_entries:
+          type: integer
+          format: uint64
+    RelationalIndexRepairLatest:
+      type: object
+      description: "Most recently updated durable relational index repair job for this table."
+      properties:
+        job_id:
+          type: string
+        status:
+          type: string
+        worker_id:
+          type: string
+        updated_at_ns:
+          type: integer
+          format: uint64
+        next_lower_doc_key:
+          type: string
+        last_error:
+          type: string
+          nullable: true
+        last_report:
+          $ref: "#/components/schemas/RelationalIndexRepairReport"
+    RelationalIndexRepairStatus:
+      type: object
+      description: "Aggregate durable repair-job evidence for schema-backed relational indexes on this table."
+      properties:
+        job_count:
+          type: integer
+          format: uint64
+        active_job_count:
+          type: integer
+          format: uint64
+        completed_job_count:
+          type: integer
+          format: uint64
+        failed_job_count:
+          type: integer
+          format: uint64
+        total_ranges_scanned:
+          type: integer
+          format: uint64
+        total_ranges_repaired:
+          type: integer
+          format: uint64
+        total_ranges_missing:
+          type: integer
+          format: uint64
+        aggregate_report:
+          $ref: "#/components/schemas/RelationalIndexRepairReport"
+        latest:
+          nullable: true
+          $ref: "#/components/schemas/RelationalIndexRepairLatest"
+    RelationalIndexRebuildStatus:
+      type: object
+      description: "Aggregate secondary-index rebuild progress projected from authoritative metadata ranges."
+      properties:
+        range_count:
+          type: integer
+          format: uint64
+        matching_generation_range_count:
+          type: integer
+          format: uint64
+        stale_generation_range_count:
+          type: integer
+          format: uint64
+        declared_range_count:
+          type: integer
+          format: uint64
+        building_range_count:
+          type: integer
+          format: uint64
+        ready_range_count:
+          type: integer
+          format: uint64
+        invalid_range_count:
+          type: integer
+          format: uint64
+        completed_row_count:
+          type: integer
+          format: uint64
+        progress_row_key:
+          type: string
+        last_error:
+          type: string
+    RelationalIndexStats:
+      type: object
+      description: "Public status for schema-backed relational indexes."
+      required:
+        - index_type
+      properties:
+        index_type:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - relational
+          description: "Discriminator for the index stats variant."
+        access_method:
+          type: string
+        lifecycle:
+          type: string
+        ready:
+          type: boolean
+        generation:
+          type: integer
+          format: uint64
+        schema_fingerprint:
+          type: string
+          nullable: true
+        rebuild:
+          $ref: "#/components/schemas/RelationalIndexRebuildStatus"
+        repair:
+          $ref: "#/components/schemas/RelationalIndexRepairStatus"
     IndexStats:
       type: object
       description: "Statistics for an index"
@@ -334,11 +460,13 @@ components:
           embeddings: "#/components/schemas/EmbeddingsIndexStats"
           graph: "#/components/schemas/GraphIndexStats"
           algebraic: "#/components/schemas/AlgebraicIndexStats"
+          relational: "#/components/schemas/RelationalIndexStats"
       oneOf:
         - $ref: "#/components/schemas/FullTextIndexStats"
         - $ref: "#/components/schemas/EmbeddingsIndexStats"
         - $ref: "#/components/schemas/GraphIndexStats"
         - $ref: "#/components/schemas/AlgebraicIndexStats"
+        - $ref: "#/components/schemas/RelationalIndexStats"
     AlgebraicIndexStats:
       type: object
       description: "Compact public statistics for an algebraic sidecar index. Detailed runtime, adaptive, and materialization records remain internal diagnostics."

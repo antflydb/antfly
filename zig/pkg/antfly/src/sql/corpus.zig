@@ -1632,9 +1632,9 @@ fn appParityBindingCoverageTableNamesAlloc(
     parsed_sql: *const tokenized.ParsedSql,
 ) !?AppParityBindingCoverageTableNames {
     if (appParityPreparedInnerStatementRange(parsed_sql)) |inner| {
-        var inner_parsed = try tokenized.ParsedSql.initChildStatementAlloc(alloc, parsed_sql, inner.start, inner.end);
+        var inner_parsed = (try appParityPreparedInnerParsedSqlAlloc(alloc, parsed_sql, inner)) orelse return null;
         defer inner_parsed.deinit(alloc);
-        return try appParityBindingCoverageTableNamesAlloc(alloc, entry, &inner_parsed);
+        return try appParityBindingCoverageTableNamesAlloc(alloc, entry, &inner_parsed.parsed);
     }
 
     switch (entry.family) {
@@ -1701,6 +1701,43 @@ fn appParityPreparedInnerStatementRange(parsed_sql: *const tokenized.ParsedSql) 
     if (prepared.kind != .prepare) return null;
     const inner = prepared.inner_statement_tokens orelse return null;
     return .{ .start = inner.start, .end = inner.end };
+}
+
+fn appParityPreparedInnerParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    inner: AppParityPreparedInnerStatementRange,
+) !?tokenized.OwnedParsedSql {
+    if (inner.start >= inner.end or inner.end > parsed_sql.items().len) return error.UnsupportedSqlShape;
+    const generated_raw = parsed_sql.generated_statement orelse return null;
+    const ast = generated_raw.ast orelse return null;
+    const prepared = switch (ast) {
+        .prepared => |prepared_ast| prepared_ast,
+        else => return null,
+    };
+    if (prepared.kind != .prepare) return null;
+    const prepared_inner = prepared.inner_statement_tokens orelse return null;
+    if (prepared_inner.start != inner.start or prepared_inner.end != inner.end) return error.UnsupportedSqlShape;
+    const inner_ast = prepared.inner_statement_ast orelse {
+        const tokens = parsed_sql.items()[inner.start..inner.end];
+        if (tokens.len > 0 and
+            (tokens[0].matchesKeywordTag(.select) or
+                tokens[0].matchesKeywordTag(.with) or
+                tokens[0].matchesKeywordTag(.insert) or
+                tokens[0].matchesKeywordTag(.update) or
+                tokens[0].matchesKeywordTag(.delete) or
+                tokens[0].matchesKeywordTag(.truncate) or
+                tokens[0].matchesKeywordTag(.merge)))
+        {
+            return error.UnsupportedSqlShape;
+        }
+        return null;
+    };
+    return switch (inner_ast.*) {
+        .read => |read_ast| try tokenized.OwnedParsedSql.initChildStatementWithGeneratedReadAstAlloc(alloc, parsed_sql, inner.start, inner.end, read_ast),
+        .dml => |*dml_ast| try tokenized.OwnedParsedSql.initChildStatementWithGeneratedDmlAstAlloc(alloc, parsed_sql, inner.start, inner.end, dml_ast),
+        else => null,
+    };
 }
 
 fn appParityBindingCoverageWriteSourceTableNameAlloc(
@@ -2030,7 +2067,6 @@ pub const SqlParserMigrationRemovalEvidence = struct {
     api_native_parity_fixtures: []const []const u8,
     unsupported_shape_fixtures: []const []const u8,
     stale_metadata_tests: []const []const u8,
-    deleted_compatibility_paths: []const []const u8,
 };
 
 pub const SqlParserMigrationTableRoot = struct {
@@ -3448,29 +3484,6 @@ fn sqlParserMigrationFamilyMinimumRawAstFixtures(family: []const u8) usize {
     return 1;
 }
 
-fn sqlParserMigrationFamilyUsesLogicalDdlCompatibilityPath(family: []const u8) bool {
-    return std.mem.eql(u8, family, "backups") or
-        std.mem.eql(u8, family, "ddl") or
-        std.mem.eql(u8, family, "extensions") or
-        std.mem.eql(u8, family, "functions") or
-        std.mem.eql(u8, family, "maintenance") or
-        std.mem.eql(u8, family, "roles");
-}
-
-fn sqlParserMigrationDeletedCompatibilityPathKnown(family: []const u8, path: []const u8) bool {
-    if (sqlParserMigrationFamilyUsesLogicalDdlCompatibilityPath(family)) {
-        return std.mem.eql(u8, path, "ddl_plan.parseLogicalDdlPlanAlloc missing-generated fallback") or
-            std.mem.eql(u8, path, "ddl_plan.parseLogicalDdlPlanTokensAlloc");
-    }
-    if (std.mem.eql(u8, family, "dml")) {
-        return std.mem.eql(u8, path, "tokenized.ParsedSql.writeStatementIncludingGeneratedAst missing-generated fallback");
-    }
-    if (std.mem.eql(u8, family, "lakes") or std.mem.eql(u8, family, "query")) {
-        return std.mem.eql(u8, path, "tokenized.ParsedSql.readStatementKindIncludingGeneratedAst missing-generated fallback");
-    }
-    return false;
-}
-
 fn validateSqlParserMigrationEvidenceNames(
     evidence: SqlParserMigrationRemovalEvidence,
     family: []const u8,
@@ -3501,9 +3514,6 @@ fn validateSqlParserMigrationEvidenceNames(
         for (list) |name| {
             if (!appParitySourceCorpusContainsName(source, name)) return error.TestUnexpectedResult;
         }
-    }
-    for (evidence.deleted_compatibility_paths) |path| {
-        if (!sqlParserMigrationDeletedCompatibilityPathKnown(family, path)) return error.TestUnexpectedResult;
     }
 }
 
@@ -3536,7 +3546,6 @@ fn parseSqlParserMigrationRemovalEvidenceAlloc(
         "api_native_parity_fixtures",
         "unsupported_shape_fixtures",
         "stale_metadata_tests",
-        "deleted_compatibility_paths",
     });
     return .{
         .raw_ast_fixtures = try parseFixtureStringListAlloc(alloc, object, "raw_ast_fixtures"),
@@ -3546,7 +3555,6 @@ fn parseSqlParserMigrationRemovalEvidenceAlloc(
         .api_native_parity_fixtures = try parseFixtureStringListAlloc(alloc, object, "api_native_parity_fixtures"),
         .unsupported_shape_fixtures = try parseFixtureStringListAlloc(alloc, object, "unsupported_shape_fixtures"),
         .stale_metadata_tests = try parseFixtureStringListAlloc(alloc, object, "stale_metadata_tests"),
-        .deleted_compatibility_paths = try parseFixtureStringListAlloc(alloc, object, "deleted_compatibility_paths"),
     };
 }
 
@@ -3558,7 +3566,6 @@ fn freeSqlParserMigrationRemovalEvidence(alloc: std.mem.Allocator, evidence: Sql
     if (evidence.api_native_parity_fixtures.len > 0) alloc.free(evidence.api_native_parity_fixtures);
     if (evidence.unsupported_shape_fixtures.len > 0) alloc.free(evidence.unsupported_shape_fixtures);
     if (evidence.stale_metadata_tests.len > 0) alloc.free(evidence.stale_metadata_tests);
-    if (evidence.deleted_compatibility_paths.len > 0) alloc.free(evidence.deleted_compatibility_paths);
 }
 
 pub fn parseSqlParserMigrationTableRootAlloc(
@@ -9179,6 +9186,9 @@ fn validateCorpusMetadataCoreParsedSql(
     if (entry.classification_reason.len > 0 and !corpusReasonHasNativeRequirement(entry.classification_reason)) {
         return error.TestUnexpectedResult;
     }
+    if (entry.classification_reason.len > 0 and !corpusClassificationReasonMatchesFamily(entry.family, entry.classification_reason)) {
+        return error.TestUnexpectedResult;
+    }
     if (corpusFixtureFamilyNeedsReason(entry.family) and
         !corpusPlanMatchesReason(entry.family, entry.plan, entry.classification_reason))
     {
@@ -9407,6 +9417,17 @@ pub fn validateFixtureMetadataCore(alloc: std.mem.Allocator, entry: AppParityCor
 
 pub fn validateFixtureMetadataCoreParsedSql(entry: AppParityCorpusEntry, parsed_sql: *const tokenized.ParsedSql) !void {
     return validateCorpusMetadataCoreParsedSql(entry, .generated_fixture, parsed_sql);
+}
+
+fn corpusClassificationReasonMatchesFamily(
+    family: AppParityCorpusPlanFamily,
+    reason: []const u8,
+) bool {
+    const parsed_reason = diagnostics.classificationReasonFromToken(reason) orelse return false;
+    return switch (parsed_reason) {
+        .session_setting => family == .unsupported_ddl,
+        else => true,
+    };
 }
 
 fn corpusParsedSqlHasOnConflictTokens(parsed_sql: *const tokenized.ParsedSql) bool {
@@ -12952,15 +12973,6 @@ test "sql adapter corpus validates parser migration table manifest" {
     try std.testing.expectEqual(@as(usize, 16), table.root.families[6].removal_evidence.raw_ast_fixtures.len);
     try std.testing.expectEqual(@as(usize, 9), table.root.families[7].removal_evidence.raw_ast_fixtures.len);
     try std.testing.expectEqual(@as(usize, 17), table.root.families[table.root.families.len - 1].removal_evidence.raw_ast_fixtures.len);
-    try std.testing.expectEqual(@as(usize, 2), table.root.families[0].removal_evidence.deleted_compatibility_paths.len);
-    try std.testing.expectEqual(@as(usize, 2), table.root.families[1].removal_evidence.deleted_compatibility_paths.len);
-    try std.testing.expectEqual(@as(usize, 1), table.root.families[2].removal_evidence.deleted_compatibility_paths.len);
-    try std.testing.expectEqual(@as(usize, 2), table.root.families[3].removal_evidence.deleted_compatibility_paths.len);
-    try std.testing.expectEqual(@as(usize, 2), table.root.families[4].removal_evidence.deleted_compatibility_paths.len);
-    try std.testing.expectEqual(@as(usize, 1), table.root.families[5].removal_evidence.deleted_compatibility_paths.len);
-    try std.testing.expectEqual(@as(usize, 2), table.root.families[6].removal_evidence.deleted_compatibility_paths.len);
-    try std.testing.expectEqual(@as(usize, 1), table.root.families[7].removal_evidence.deleted_compatibility_paths.len);
-    try std.testing.expectEqual(@as(usize, 2), table.root.families[table.root.families.len - 1].removal_evidence.deleted_compatibility_paths.len);
     try std.testing.expect(table.root.families[0].removal_evidence.stale_metadata_tests.len > 0);
 
     const unknown_json =
@@ -14949,17 +14961,17 @@ test "sql adapter corpus validates resolved native requirement manifest" {
     defer parsed_unknown_reason.deinit();
     try std.testing.expectError(error.TestUnexpectedResult, parseResolvedRequirementRootAlloc(alloc, parsed_unknown_reason.value));
 
-    const noop_reason_json =
+    const catalog_reason_json =
         \\{
         \\  "resolution_format": 1,
         \\  "resolved": [
-        \\    {"reason": "session_setting", "coverage": ["read_recursive_cte_stream_plan"]}
+        \\    {"reason": "schema_namespace", "coverage": ["read_recursive_cte_stream_plan"]}
         \\  ]
         \\}
     ;
-    var parsed_noop_reason = try std.json.parseFromSlice(std.json.Value, alloc, noop_reason_json, .{});
-    defer parsed_noop_reason.deinit();
-    try std.testing.expectError(error.TestUnexpectedResult, parseResolvedRequirementRootAlloc(alloc, parsed_noop_reason.value));
+    var parsed_catalog_reason = try std.json.parseFromSlice(std.json.Value, alloc, catalog_reason_json, .{});
+    defer parsed_catalog_reason.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseResolvedRequirementRootAlloc(alloc, parsed_catalog_reason.value));
 
     const unknown_coverage_json =
         \\{
@@ -15297,7 +15309,6 @@ test "sql adapter corpus owns fixture family policies" {
     try std.testing.expect(!corpusReasonHasNativeRequirement("future_unknown_reason"));
     try std.testing.expect(corpusPlanMatchesReason(.unsupported_write, "unsupported:write:requires=multi_table_generation_barrier", "multi_table_generation_barrier"));
     try std.testing.expect(corpusPlanMatchesReason(.unsupported_ddl, "unsupported:ddl:requires=session_setting", "session_setting"));
-    try std.testing.expect(!corpusPlanMatchesReason(.adapter_noop_ddl, "adapter_noop:ddl:reason=session_setting", "session_setting"));
     try std.testing.expect(corpusPlanMatchesFamily(.insert_source, "insert_source:table=usage_records"));
     try std.testing.expect(!corpusPlanMatchesFamily(.insert_source, "insert:table=usage_records"));
     try std.testing.expect(corpusPlanMatchesFamily(.read, "document_query"));
@@ -15517,7 +15528,7 @@ test "sql adapter corpus fingerprints unsupported reasons and rejects removed ad
     try std.testing.expect(unsupportedPlanMatchesReason(unsupported_session, .ddl, .session_setting));
 
     try std.testing.expectError(error.UnsupportedSqlShape, adapterNoopFingerprintAlloc(alloc, "ddl", .session_setting));
-    try std.testing.expect(!adapterNoopPlanMatchesReason("adapter_noop:ddl:reason=session_setting_extra", "ddl", .session_setting));
+    try std.testing.expect(!adapterNoopPlanMatchesReason("adapter_noop:ddl:reason=set_operation_plan_extra", "ddl", .set_operation_plan));
 
     try std.testing.expectError(error.UnsupportedSqlShape, adapterNoopFingerprintAlloc(alloc, "ddl", .set_operation_plan));
 }
@@ -16434,7 +16445,7 @@ fn appParitySetupSqlSummaryAlloc(alloc: std.mem.Allocator, setup_sql: []const []
     for (setup_sql) |sql| {
         var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
         defer parsed_sql.deinit(alloc);
-        var plan = try lower_ddl.parseLogicalDdlPlanAlloc(alloc, &parsed_sql, .{});
+        var plan = try lower_ddl.logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
         defer plan.deinit(alloc);
         summary.observePlan(plan);
     }
@@ -17037,7 +17048,6 @@ pub const AppParityCorpusCoverage = struct {
     document_query_view_mapping_unnest_pattern_native_equivalence: bool = false,
     document_query_view_mapping_unnest_range_native_equivalence: bool = false,
     document_query_view_mapping_between_predicate_native_equivalence: bool = false,
-    adapter_noop_ddl: bool = false,
     unsupported_read: bool = false,
     unsupported_ddl: bool = false,
     unsupported_ddl_backup_database_sql_unavailable: bool = false,
@@ -17510,7 +17520,8 @@ pub const AppParityCorpusCoverage = struct {
     ddl_create_index: bool = false,
     ddl_create_covering_index: bool = false,
     ddl_create_covering_generated_index: bool = false,
-    ddl_create_covering_gin_index: bool = false,
+    ddl_create_covering_algebraic_filter_index: bool = false,
+    ddl_create_text_search_index: bool = false,
     ddl_drop_index: bool = false,
     ddl_drop_table: bool = false,
     ddl_drop_table_cascade: bool = false,
@@ -17534,13 +17545,6 @@ pub const AppParityCorpusCoverage = struct {
     ddl_alter_column_rewrite_expression: bool = false,
     ddl_rename_column: bool = false,
     ddl_rename_constraint: bool = false,
-    adapter_noop_transaction: bool = false,
-    adapter_noop_transaction_commit: bool = false,
-    adapter_noop_transaction_rollback: bool = false,
-    adapter_noop_session: bool = false,
-    adapter_noop_session_probe: bool = false,
-    adapter_noop_schema_namespace: bool = false,
-    adapter_noop_extension: bool = false,
     session_set_search_path: bool = false,
     session_set_search_path_local: bool = false,
     session_set_search_path_multi_namespace: bool = false,
@@ -19676,7 +19680,7 @@ pub const AppParityCorpusCoverage = struct {
                         sql_adapter.planHasExactUsizeToken(entry.plan, ":data_cte_update=", 1) and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":data_cte_returning=");
             },
-            .adapter_noop_ddl => self.adapter_noop_ddl = true,
+            .adapter_noop_ddl => {},
             .invalid_read => {
                 self.invalid_read_row_lock_target = self.invalid_read_row_lock_target or
                     (structured_summary.hasReason("row_lock_mode_plan") and
@@ -21537,9 +21541,11 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_create_covering_generated_index = self.ddl_create_covering_generated_index or
                         sql_adapter.planHasNonZeroToken(entry.plan, ":generated_expr=") and
                             sql_adapter.planHasNonZeroToken(entry.plan, ":include=");
-                    self.ddl_create_covering_gin_index = self.ddl_create_covering_gin_index or
-                        sql_adapter.planHasExactStringToken(entry.plan, ":method=", "gin") and
+                    self.ddl_create_covering_algebraic_filter_index = self.ddl_create_covering_algebraic_filter_index or
+                        sql_adapter.planHasExactStringToken(entry.plan, ":method=", "algebraic_filter") and
                             sql_adapter.planHasNonZeroToken(entry.plan, ":include=");
+                    self.ddl_create_text_search_index = self.ddl_create_text_search_index or
+                        sql_adapter.planHasExactStringToken(entry.plan, ":method=", "text_search");
                 },
                 .drop_index => self.ddl_drop_index = true,
                 .drop_table => {
@@ -21593,23 +21599,6 @@ pub const AppParityCorpusCoverage = struct {
                 },
                 .create_update_policy => self.ddl_create_update_policy = true,
             }
-        } else if (entry.family == .adapter_noop_ddl) {
-            self.adapter_noop_transaction = self.adapter_noop_transaction or structured_summary.hasReason("transaction_control");
-            self.adapter_noop_transaction_commit = self.adapter_noop_transaction_commit or
-                structured_summary.hasReason("transaction_control") and
-                    structured_summary.parser.starts_with_commit;
-            self.adapter_noop_transaction_rollback = self.adapter_noop_transaction_rollback or
-                structured_summary.hasReason("transaction_control") and
-                    structured_summary.parser.starts_with_rollback;
-            self.adapter_noop_session = self.adapter_noop_session or structured_summary.hasReason("session_setting");
-            self.adapter_noop_session_probe = self.adapter_noop_session_probe or
-                structured_summary.hasReason("session_setting") and
-                    (structured_summary.parser.starts_with_reset or structured_summary.parser.starts_with_show);
-            self.adapter_noop_schema_namespace = self.adapter_noop_schema_namespace or structured_summary.hasReason("schema_namespace");
-            self.adapter_noop_extension = self.adapter_noop_extension or structured_summary.hasReason("extension");
-            self.session_discard = self.session_discard or
-                structured_summary.hasReason("session_setting") and
-                    structured_summary.parser.starts_with_discard;
         }
 
         self.scalar_membership = self.scalar_membership or sql_adapter.planHasAnyNonZeroToken(entry.plan, &.{
@@ -23999,7 +23988,7 @@ test "sql adapter corpus owns ddl applied-plan fixture policy" {
         .sql = "CREATE INDEX usage_records_status_idx ON usage_records (status)",
         .family = .ddl,
         .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records" },
-        .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false",
+        .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false:method=ordered_tuple",
         .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
     }));
     try std.testing.expect(!try corpusDdlFixtureRequiresAppliedPlan(.{

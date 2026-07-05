@@ -12590,6 +12590,77 @@ test "metadata.table record decoder round-trips read schema metadata" {
     try std.testing.expectEqualStrings("{\"default\":{}}", decoded.indexes_json);
 }
 
+test "metadata.table record decoder round-trips relational index access method metadata" {
+    const schema_api = @import("../../schema/mod.zig");
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_scalar_idx","x-antfly-index-access-method":"scalar_column","x-antfly-index-generation":3,"x-antfly-index-schema-fingerprint":"secondary-index-v1:status"},"tenant_id":{"type":"keyword","x-antfly-index-name":"tenant_status_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":4,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_status","x-antfly-index-keys":[{"column":"tenant_id"},{"column":"status"}],"x-antfly-index-include":["id"]},"attrs":{"type":"json","x-antfly-index-name":"attrs_algebraic_idx","x-antfly-index-access-method":"algebraic_filter","x-antfly-index-generation":5,"x-antfly-index-schema-fingerprint":"secondary-index-v1:attrs"},"body":{"type":"text","x-antfly-index-name":"body_text_idx","x-antfly-index-access-method":"text_search","x-antfly-index-generation":6,"x-antfly-index-schema-fingerprint":"secondary-index-v1:body"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const indexes_json =
+        \\{"attrs_algebraic_idx":{"type":"algebraic","group_fields":["attrs.kind"],"capability_fingerprint":"secondary-index-v1:attrs"},"body_text_idx":{"type":"full_text","field":"body","analyzer":"standard","scoring":"bm25","highlight":true,"snippet":true,"segment_lifecycle":"merge_on_commit"}}
+    ;
+    const encoded = try encodeTableRecord(std.testing.allocator, .{
+        .table_id = 41,
+        .name = "docs",
+        .database_name = "tenant_ops",
+        .namespace_name = "analytics",
+        .schema_json = schema_json,
+        .read_schema_json = "",
+        .foreign_key_validation_json = "{}",
+        .indexes_json = indexes_json,
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+        .data_generation = 7,
+    });
+    defer std.testing.allocator.free(encoded);
+
+    const decoded = try decodeTableRecord(std.testing.allocator, encoded);
+    defer metadata_table_manager.freeTable(std.testing.allocator, decoded);
+
+    try std.testing.expectEqualStrings("tenant_ops", decoded.database_name);
+    try std.testing.expectEqualStrings("analytics", decoded.namespace_name);
+    try std.testing.expectEqualStrings(schema_json, decoded.schema_json);
+    try std.testing.expectEqualStrings(indexes_json, decoded.indexes_json);
+    try std.testing.expect(std.mem.indexOf(u8, decoded.indexes_json, "\"type\":\"algebraic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, decoded.indexes_json, "\"type\":\"full_text\"") != null);
+
+    var parsed = try schema_api.parseValidatedTableSchema(std.testing.allocator, decoded.schema_json);
+    defer parsed.deinit(std.testing.allocator);
+    const runtime = try schema_api.deriveRuntimeTableSchema(std.testing.allocator, parsed);
+    defer runtime_schema.freeSchema(std.testing.allocator, runtime);
+
+    const Find = struct {
+        fn column(schema: runtime_schema.TableSchema, name: []const u8) ?runtime_schema.RelationalColumn {
+            for (schema.relational_columns) |candidate| {
+                if (std.mem.eql(u8, candidate.name, name)) return candidate;
+            }
+            return null;
+        }
+    };
+
+    const status = Find.column(runtime, "status") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema.RelationalIndexAccessMethod.scalar_column, status.index_access_method.?);
+    try std.testing.expectEqual(@as(usize, 0), status.index_keys.len);
+    try std.testing.expectEqualStrings("secondary-index-v1:status", status.index_schema_fingerprint.?);
+
+    const tenant_id = Find.column(runtime, "tenant_id") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema.RelationalIndexAccessMethod.ordered_tuple, tenant_id.index_access_method.?);
+    try std.testing.expectEqual(@as(usize, 2), tenant_id.index_keys.len);
+    try std.testing.expectEqualStrings("tenant_id", tenant_id.index_keys[0].column);
+    try std.testing.expectEqualStrings("status", tenant_id.index_keys[1].column);
+    try std.testing.expectEqual(@as(usize, 1), tenant_id.index_include_columns.len);
+    try std.testing.expectEqualStrings("id", tenant_id.index_include_columns[0]);
+
+    const attrs = Find.column(runtime, "attrs") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema.RelationalIndexAccessMethod.algebraic_filter, attrs.index_access_method.?);
+    try std.testing.expectEqual(@as(usize, 0), attrs.index_keys.len);
+    try std.testing.expectEqualStrings("secondary-index-v1:attrs", attrs.index_schema_fingerprint.?);
+
+    const body = Find.column(runtime, "body") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema.RelationalIndexAccessMethod.text_search, body.index_access_method.?);
+    try std.testing.expectEqual(@as(usize, 0), body.index_keys.len);
+    try std.testing.expectEqualStrings("secondary-index-v1:body", body.index_schema_fingerprint.?);
+}
+
 test "metadata.table record decoder round-trips catalog identity" {
     const encoded = try encodeTableRecord(std.testing.allocator, .{
         .table_id = 41,

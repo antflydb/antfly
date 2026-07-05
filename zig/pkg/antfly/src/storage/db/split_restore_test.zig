@@ -24,6 +24,7 @@ const doc_set = @import("doc_set.zig");
 const embedder_mod = @import("enrichment/embedder.zig");
 const graph_mod = @import("../../graph/graph.zig");
 const internal_keys = @import("../internal_keys.zig");
+const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const relational_store_mod = @import("relational_store.zig");
 const schema_mod = @import("../schema.zig");
 const schema_api_mod = @import("../../schema/mod.zig");
@@ -63,6 +64,78 @@ fn waitForAppliedSequenceAdvance(
     }
     if (applied <= previous) return error.Timeout;
     return applied;
+}
+
+fn orderedTupleIndexColumn(runtime_schema: schema_mod.TableSchema, index_name: []const u8) !schema_mod.RelationalColumn {
+    for (runtime_schema.relational_columns) |column| {
+        if (column.index_name) |candidate| {
+            if (std.mem.eql(u8, candidate, index_name)) return column;
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn orderedTupleValueForDocKeyAlloc(
+    alloc: std.mem.Allocator,
+    store: *docstore_mod.DocStore,
+    runtime_schema: schema_mod.TableSchema,
+    doc_key: []const u8,
+) ![]u8 {
+    const index_column = try orderedTupleIndexColumn(runtime_schema, "status_amount_idx");
+    const row = (try relational_store_mod.getRawAlloc(alloc, store, doc_key)) orelse return error.TestExpectedEqual;
+    defer alloc.free(row);
+    return try relational_store_mod.orderedTupleValueForIndexKeysAlloc(alloc, row, index_column.index_keys, runtime_schema.relational_columns);
+}
+
+fn expectSingleOrderedTupleDocKeyForTuple(
+    alloc: std.mem.Allocator,
+    store: *docstore_mod.DocStore,
+    tuple: []const u8,
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+    expected_doc_key: []const u8,
+) !void {
+    const doc_keys = try relational_store_mod.scanOrderedTupleDocKeysAlloc(alloc, store, "status_amount_idx", tuple, lower_doc_key, upper_doc_key);
+    defer relational_store_mod.freeDocKeys(alloc, doc_keys);
+    try std.testing.expectEqual(@as(usize, 1), doc_keys.len);
+    try std.testing.expectEqualStrings(expected_doc_key, doc_keys[0]);
+}
+
+fn expectSingleOrderedTupleDocKey(
+    alloc: std.mem.Allocator,
+    store: *docstore_mod.DocStore,
+    runtime_schema: schema_mod.TableSchema,
+    doc_key: []const u8,
+) !void {
+    const tuple = try orderedTupleValueForDocKeyAlloc(alloc, store, runtime_schema, doc_key);
+    defer alloc.free(tuple);
+    try expectSingleOrderedTupleDocKeyForTuple(alloc, store, tuple, doc_key, doc_key, doc_key);
+}
+
+fn expectNoOrderedTupleDocKeysForTuple(
+    alloc: std.mem.Allocator,
+    store: *docstore_mod.DocStore,
+    tuple: []const u8,
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+) !void {
+    const doc_keys = try relational_store_mod.scanOrderedTupleDocKeysAlloc(alloc, store, "status_amount_idx", tuple, lower_doc_key, upper_doc_key);
+    defer relational_store_mod.freeDocKeys(alloc, doc_keys);
+    try std.testing.expectEqual(@as(usize, 0), doc_keys.len);
+}
+
+fn expectNoOrderedTupleEntriesForDocKey(
+    alloc: std.mem.Allocator,
+    store: *docstore_mod.DocStore,
+    doc_key: []const u8,
+) !void {
+    const lower = try internal_keys.relationalOrderedTupleIndexByDocRangeLowerAlloc(alloc, doc_key);
+    defer alloc.free(lower);
+    const upper = (try internal_keys.relationalOrderedTupleIndexByDocRangeUpperAlloc(alloc, doc_key)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(upper);
+    const entries = try store.scanRange(alloc, lower, upper);
+    defer docstore_mod.DocStore.freeResults(alloc, entries);
+    try std.testing.expectEqual(@as(usize, 0), entries.len);
 }
 
 test "db split state and split deltas are exposed through public api" {
@@ -372,7 +445,7 @@ test "db split moves relational rows and column entries" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword","x-antfly-index-name":"status_amount_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":1,"x-antfly-index-schema-fingerprint":"secondary-index-v1:status_amount_idx","x-antfly-index-keys":[{"column":"status"},{"column":"amount"}]},"amount":{"type":"numeric"}},"required":["id","title"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -387,11 +460,15 @@ test "db split moves relational rows and column entries" {
     });
     try db.batch(.{
         .writes = &.{
-            .{ .key = "row:a", .value = "{\"title\":\"alpha\",\"status\":\"open\",\"amount\":10}" },
-            .{ .key = "row:z", .value = "{\"title\":\"zeta\",\"status\":\"closed\",\"amount\":90}" },
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"title\":\"alpha\",\"status\":\"open\",\"amount\":10}" },
+            .{ .key = "row:z", .value = "{\"id\":\"z\",\"title\":\"zeta\",\"status\":\"closed\",\"amount\":90}" },
         },
         .sync_level = .full_index,
     });
+    try expectSingleOrderedTupleDocKey(alloc, db.core.store, runtime_schema, "row:a");
+    try expectSingleOrderedTupleDocKey(alloc, db.core.store, runtime_schema, "row:z");
+    const source_row_z_tuple = try orderedTupleValueForDocKeyAlloc(alloc, db.core.store, runtime_schema, "row:z");
+    defer alloc.free(source_row_z_tuple);
 
     try db.split(db.getRange(), "row:m", "", std.mem.span(dest), true);
 
@@ -411,6 +488,7 @@ test "db split moves relational rows and column entries" {
     try std.testing.expectEqualStrings("row:z", split_amounts[0].doc_key);
     try std.testing.expectEqual(.f64_val, split_amounts[0].value_type);
     try std.testing.expectEqual(@as(f64, 90), split_amounts[0].value.f64_val);
+    try expectSingleOrderedTupleDocKey(alloc, split_db.core.store, runtime_schema, "row:z");
 
     var split_filtered = try split_db.search(alloc, .{
         .index_name = "ft_v1",
@@ -431,6 +509,7 @@ test "db split moves relational rows and column entries" {
     try std.testing.expectEqualStrings("row:a", parent_left_amounts[0].doc_key);
     try std.testing.expectEqual(.f64_val, parent_left_amounts[0].value_type);
     try std.testing.expectEqual(@as(f64, 10), parent_left_amounts[0].value.f64_val);
+    try expectSingleOrderedTupleDocKey(alloc, db.core.store, runtime_schema, "row:a");
 
     var parent_filtered = try db.search(alloc, .{
         .index_name = "ft_v1",
@@ -445,6 +524,8 @@ test "db split moves relational rows and column entries" {
     const parent_amounts = try relational_store_mod.scanColumnAlloc(alloc, db.core.store, "amount", "row:z", "row:z");
     defer relational_store_mod.freeColumnValues(alloc, parent_amounts);
     try std.testing.expectEqual(@as(usize, 0), parent_amounts.len);
+    try expectNoOrderedTupleDocKeysForTuple(alloc, db.core.store, source_row_z_tuple, "row:z", "row:z");
+    try expectNoOrderedTupleEntriesForDocKey(alloc, db.core.store, "row:z");
 }
 
 test "db split prepare and finalize work with durable lsm primary backend" {
@@ -2381,7 +2462,7 @@ test "db merge-style cutover routes relational rows and column scans across reop
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword","x-antfly-index-name":"status_amount_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":1,"x-antfly-index-schema-fingerprint":"secondary-index-v1:status_amount_idx","x-antfly-index-keys":[{"column":"status"},{"column":"amount"}]},"amount":{"type":"numeric"}},"required":["id","title"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -2415,14 +2496,14 @@ test "db merge-style cutover routes relational rows and column scans across reop
         try donor.updateRange(.{ .start = "row:m", .end = "row:m" });
 
         try std.testing.expectError(error.KeyOutOfRange, donor.batch(.{
-            .writes = &.{.{ .key = "row:z", .value = "{\"title\":\"donor rejected\",\"status\":\"closed\",\"amount\":99}" }},
+            .writes = &.{.{ .key = "row:z", .value = "{\"id\":\"z\",\"title\":\"donor rejected\",\"status\":\"closed\",\"amount\":99}" }},
             .sync_level = .full_index,
         }));
 
         try receiver.batch(.{
             .writes = &.{
-                .{ .key = "row:b", .value = "{\"title\":\"receiver left\",\"status\":\"open\",\"amount\":10}" },
-                .{ .key = "row:z", .value = "{\"title\":\"receiver merged relational\",\"status\":\"closed\",\"amount\":33}" },
+                .{ .key = "row:b", .value = "{\"id\":\"b\",\"title\":\"receiver left\",\"status\":\"open\",\"amount\":10}" },
+                .{ .key = "row:z", .value = "{\"id\":\"z\",\"title\":\"receiver merged relational\",\"status\":\"closed\",\"amount\":33}" },
             },
             .sync_level = .full_index,
         });
@@ -2441,7 +2522,7 @@ test "db merge-style cutover routes relational rows and column scans across reop
     defer reopened_donor.close();
 
     try std.testing.expectError(error.KeyOutOfRange, reopened_donor.batch(.{
-        .writes = &.{.{ .key = "row:z", .value = "{\"title\":\"donor still fenced\",\"status\":\"closed\",\"amount\":100}" }},
+        .writes = &.{.{ .key = "row:z", .value = "{\"id\":\"z\",\"title\":\"donor still fenced\",\"status\":\"closed\",\"amount\":100}" }},
         .sync_level = .full_index,
     }));
 
@@ -2457,6 +2538,7 @@ test "db merge-style cutover routes relational rows and column scans across reop
     try std.testing.expectEqualStrings("row:z", amounts[0].doc_key);
     try std.testing.expectEqual(.f64_val, amounts[0].value_type);
     try std.testing.expectEqual(@as(f64, 33), amounts[0].value.f64_val);
+    try expectSingleOrderedTupleDocKey(alloc, reopened_receiver.core.store, runtime_schema, "row:z");
 
     var receiver_filtered = try reopened_receiver.search(alloc, .{
         .index_name = "ft_v1",
@@ -2478,6 +2560,7 @@ test "db merge-style cutover routes relational rows and column scans across reop
     });
     defer donor_filtered.deinit();
     try std.testing.expectEqual(@as(u32, 0), donor_filtered.total_hits);
+    try expectNoOrderedTupleEntriesForDocKey(alloc, reopened_donor.core.store, "row:z");
 }
 
 test "db snapshot exports logical store only" {

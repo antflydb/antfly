@@ -52,21 +52,17 @@ const DocumentWhereClauseRange = struct {
 };
 
 fn validatedDocumentReadStatementKind(parsed_sql: *const tokenized.ParsedSql) !sql_statement_kind.SqlReadStatementKind {
-    const generated_kind = parsed_sql.generatedReadStatementKind();
-    const kind = parsed_sql.readStatementKindIncludingGeneratedAst() orelse
-        generated_kind orelse
-        parsed_sql.readStatementKind() orelse
-        return error.UnsupportedSqlShape;
     if (parsed_sql.generatedStatementKind() == .read) {
-        _ = generated_kind orelse return kind;
+        const kind = parsed_sql.readStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
         const generated_statement = parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
         const generated_ast = generated_statement.ast orelse return error.UnsupportedSqlShape;
         switch (generated_ast) {
             .read => |read| try lowering_context.validateGeneratedReadAstForStatement(parsed_sql.items(), read),
             else => return error.UnsupportedSqlShape,
         }
+        return kind;
     }
-    return kind;
+    return parsed_sql.readStatementKind() orelse error.UnsupportedSqlShape;
 }
 
 const DocumentProducerCapabilities = struct {
@@ -9086,6 +9082,19 @@ test "document SQL validates retained generated read ast before token planning" 
 
     try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, parsed.readStatementKindIncludingGeneratedAst().?);
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &parsed, schema));
+
+    var stale_kind = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, title FROM docs WHERE _id = 'doc:a'");
+    defer stale_kind.deinit(alloc);
+    if (stale_kind.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| read.projection_items.count += 1,
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+
+    try std.testing.expect(stale_kind.generatedReadStatementKind() == null);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, stale_kind.readStatementKind().?);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &stale_kind, schema));
 }
 
 test "document SQL expands star projection with document virtual columns" {
@@ -17775,8 +17784,9 @@ test "document SQL lowers explicit array unnest over bounded scan" {
     try std.testing.expect(residual_lowered.producer.indexed_query.max_candidate_rows == null);
     try std.testing.expectEqualStrings(
         "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
-        residual_lowered.producer.indexed_query.residual_filter_json.?,
+        residual_lowered.producer.indexed_query.filter_query_json.?,
     );
+    try std.testing.expect(residual_lowered.producer.indexed_query.residual_filter_json == null);
 
     var lookup = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE d._id = 'doc:a' AND tag = 'urgent' LIMIT 10");
     defer lookup.deinit(alloc);

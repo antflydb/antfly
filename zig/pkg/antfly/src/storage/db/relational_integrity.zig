@@ -36,6 +36,7 @@ const temporal_bound_pos_infinity_tag: u8 = 0xf1;
 const foreign_key_integrity_progress_key_prefix = "\x00\x00__metadata__:foreign_key_integrity_progress";
 const foreign_key_integrity_claim_key_prefix = "\x00\x00__metadata__:foreign_key_integrity_claim";
 const foreign_key_integrity_job_key_prefix = "\x00\x00__metadata__:foreign_key_integrity_job";
+const relational_index_repair_job_key_prefix = "\x00\x00__metadata__:relational_index_repair_job";
 const foreign_key_action_job_key_prefix = "\x00\x00__metadata__:foreign_key_action_job";
 const foreign_key_action_schedule_key_prefix = "\x00\x00__metadata__:foreign_key_action_schedule";
 const unique_constraint_integrity_progress_key_prefix = "\x00\x00__metadata__:unique_constraint_integrity_progress";
@@ -43,6 +44,18 @@ const foreign_key_action_default_cascade_max_depth: u32 = 64;
 
 fn currentTimeNs() u64 {
     return platform_clock.Clock.real().nowRealtimeNs();
+}
+
+fn relationalIndexRepairReportAdd(
+    a: relational_store_mod.ColumnBackedIndexRepairReport,
+    b: relational_store_mod.ColumnBackedIndexRepairReport,
+) relational_store_mod.ColumnBackedIndexRepairReport {
+    return .{
+        .scanned_rows = a.scanned_rows +| b.scanned_rows,
+        .indexed_rows = a.indexed_rows +| b.indexed_rows,
+        .deleted_orphan_entries = a.deleted_orphan_entries +| b.deleted_orphan_entries,
+        .written_entries = a.written_entries +| b.written_entries,
+    };
 }
 
 pub const findUniqueConstraintMutation = relational_store_mod.findUniqueConstraintMutation;
@@ -164,6 +177,35 @@ pub const ForeignKeyIntegrityJobRecord = struct {
     violating_passes: u64 = 0,
     first_violation_at_ns: ?u64 = null,
     last_violation_at_ns: ?u64 = null,
+};
+
+pub const RelationalIndexRepairJobRecord = struct {
+    version: u32 = 1,
+    job_id: []const u8,
+    database_name: []const u8 = "default",
+    namespace_name: []const u8 = "public",
+    table_name: []const u8,
+    worker_id: []const u8,
+    lower_doc_key: []const u8 = "",
+    upper_doc_key: []const u8 = "",
+    lease_ms: u64,
+    max_work_units: usize,
+    status: []const u8,
+    created_at_ns: u64,
+    updated_at_ns: u64,
+    attempts: u32 = 0,
+    completed: bool = false,
+    complete: ?bool = null,
+    next_lower_doc_key: []const u8 = "",
+    last_ranges_scanned: u64 = 0,
+    last_ranges_repaired: u64 = 0,
+    last_ranges_missing: u64 = 0,
+    total_ranges_scanned: u64 = 0,
+    total_ranges_repaired: u64 = 0,
+    total_ranges_missing: u64 = 0,
+    last_report: relational_store_mod.ColumnBackedIndexRepairReport = .{},
+    aggregate_report: relational_store_mod.ColumnBackedIndexRepairReport = .{},
+    last_error: ?[]const u8 = null,
 };
 
 pub const ForeignKeyActionJobRecord = struct {
@@ -1730,7 +1772,7 @@ pub fn Impl(comptime DB: type) type {
         fn relationalColumnIndexPolicyForStore(self: *DB) relational_store_mod.ColumnIndexPolicy {
             const schema = self.core.schema orelse return relational_store_mod.ColumnIndexPolicy.all();
             if (schema.storage_mode != .relational) return relational_store_mod.ColumnIndexPolicy.all();
-            return relational_store_mod.ColumnIndexPolicy.fromColumns(schema.relational_columns);
+            return relational_store_mod.ColumnIndexPolicy.fromSchema(schema);
         }
 
         fn foreignKeyIsEnforcedImmediate(foreign_key: schema_mod.ForeignKey) bool {
@@ -1788,6 +1830,24 @@ pub fn Impl(comptime DB: type) type {
 
         pub fn freeForeignKeyIntegrityJobRecords(self: *DB, records: []ForeignKeyIntegrityJobRecord) void {
             for (records) |record| self.freeForeignKeyIntegrityJobRecord(record);
+            if (records.len > 0) self.alloc.free(records);
+        }
+
+        pub fn freeRelationalIndexRepairJobRecord(self: *DB, record: RelationalIndexRepairJobRecord) void {
+            if (record.job_id.len > 0) self.alloc.free(record.job_id);
+            if (record.database_name.len > 0) self.alloc.free(record.database_name);
+            if (record.namespace_name.len > 0) self.alloc.free(record.namespace_name);
+            if (record.table_name.len > 0) self.alloc.free(record.table_name);
+            if (record.worker_id.len > 0) self.alloc.free(record.worker_id);
+            if (record.lower_doc_key.len > 0) self.alloc.free(record.lower_doc_key);
+            if (record.upper_doc_key.len > 0) self.alloc.free(record.upper_doc_key);
+            if (record.status.len > 0) self.alloc.free(record.status);
+            if (record.next_lower_doc_key.len > 0) self.alloc.free(record.next_lower_doc_key);
+            if (record.last_error) |value| self.alloc.free(value);
+        }
+
+        pub fn freeRelationalIndexRepairJobRecords(self: *DB, records: []RelationalIndexRepairJobRecord) void {
+            for (records) |record| self.freeRelationalIndexRepairJobRecord(record);
             if (records.len > 0) self.alloc.free(records);
         }
 
@@ -1922,6 +1982,28 @@ pub fn Impl(comptime DB: type) type {
             for (scanned) |entry| {
                 const cloned = try cloneForeignKeyIntegrityJobRecordFromJson(self, entry.value);
                 errdefer self.freeForeignKeyIntegrityJobRecord(cloned);
+                try out.append(self.alloc, cloned);
+            }
+            return try out.toOwnedSlice(self.alloc);
+        }
+
+        pub fn listRelationalIndexRepairJobRecords(self: *DB) ![]RelationalIndexRepairJobRecord {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+
+            const upper = try metadataPrefixUpperAlloc(self.alloc, relational_index_repair_job_key_prefix);
+            defer if (upper) |buf| self.alloc.free(buf);
+            const scanned = try self.core.store.scanRange(self.alloc, relational_index_repair_job_key_prefix, if (upper) |buf| buf else "");
+            defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
+
+            var out = std.ArrayListUnmanaged(RelationalIndexRepairJobRecord).empty;
+            errdefer {
+                for (out.items) |record| self.freeRelationalIndexRepairJobRecord(record);
+                out.deinit(self.alloc);
+            }
+            for (scanned) |entry| {
+                const cloned = try cloneRelationalIndexRepairJobRecordFromJson(self, entry.value);
+                errdefer self.freeRelationalIndexRepairJobRecord(cloned);
                 try out.append(self.alloc, cloned);
             }
             return try out.toOwnedSlice(self.alloc);
@@ -2127,6 +2209,23 @@ pub fn Impl(comptime DB: type) type {
             };
             defer self.alloc.free(raw);
             return try cloneForeignKeyIntegrityJobRecordFromJson(self, raw);
+        }
+
+        pub fn loadRelationalIndexRepairJobRecord(
+            self: *DB,
+            job_id: []const u8,
+        ) !?RelationalIndexRepairJobRecord {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+
+            const key = try relationalIndexRepairJobKeyAlloc(self.alloc, job_id);
+            defer self.alloc.free(key);
+            const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            };
+            defer self.alloc.free(raw);
+            return try cloneRelationalIndexRepairJobRecordFromJson(self, raw);
         }
 
         pub fn loadUniqueConstraintIntegrityProgressRecord(
@@ -2425,6 +2524,215 @@ pub fn Impl(comptime DB: type) type {
             defer self.alloc.free(payload);
             try self.core.store.put(key, payload);
             return try cloneForeignKeyIntegrityJobRecordFromJson(self, payload);
+        }
+
+        pub fn upsertRelationalIndexRepairJobRecord(
+            self: *DB,
+            job_id: []const u8,
+            database_name: []const u8,
+            namespace_name: []const u8,
+            table_name: []const u8,
+            worker_id: []const u8,
+            lower_doc_key: []const u8,
+            upper_doc_key: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+            status: []const u8,
+        ) !RelationalIndexRepairJobRecord {
+            return try self.upsertRelationalIndexRepairJobRecordAt(
+                job_id,
+                database_name,
+                namespace_name,
+                table_name,
+                worker_id,
+                lower_doc_key,
+                upper_doc_key,
+                lease_ms,
+                max_work_units,
+                status,
+                currentTimeNs(),
+            );
+        }
+
+        pub fn upsertRelationalIndexRepairJobRecordAt(
+            self: *DB,
+            job_id: []const u8,
+            database_name: []const u8,
+            namespace_name: []const u8,
+            table_name: []const u8,
+            worker_id: []const u8,
+            lower_doc_key: []const u8,
+            upper_doc_key: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+            status: []const u8,
+            now_ns: u64,
+        ) !RelationalIndexRepairJobRecord {
+            if (job_id.len == 0 or database_name.len == 0 or namespace_name.len == 0 or table_name.len == 0 or worker_id.len == 0 or lease_ms == 0 or max_work_units == 0 or status.len == 0) return error.InvalidRelationalIndexRepairJob;
+            self.core.lockApply();
+            defer self.core.unlockApply();
+
+            const key = try relationalIndexRepairJobKeyAlloc(self.alloc, job_id);
+            defer self.alloc.free(key);
+
+            var created_at_ns = now_ns;
+            var attempts: u32 = 1;
+            var next_lower_doc_key: []const u8 = "";
+            var preserved_next_lower_doc_key: ?[]u8 = null;
+            defer if (preserved_next_lower_doc_key) |value| self.alloc.free(value);
+            var last_ranges_scanned: u64 = 0;
+            var last_ranges_repaired: u64 = 0;
+            var last_ranges_missing: u64 = 0;
+            var total_ranges_scanned: u64 = 0;
+            var total_ranges_repaired: u64 = 0;
+            var total_ranges_missing: u64 = 0;
+            var last_report: relational_store_mod.ColumnBackedIndexRepairReport = .{};
+            var aggregate_report: relational_store_mod.ColumnBackedIndexRepairReport = .{};
+            var last_error: ?[]const u8 = null;
+            var preserved_last_error: ?[]u8 = null;
+            defer if (preserved_last_error) |value| self.alloc.free(value);
+            if (self.core.store.get(self.alloc, key)) |raw| {
+                defer self.alloc.free(raw);
+                const existing = try cloneRelationalIndexRepairJobRecordFromJson(self, raw);
+                defer self.freeRelationalIndexRepairJobRecord(existing);
+                created_at_ns = existing.created_at_ns;
+                attempts = existing.attempts +| 1;
+                preserved_next_lower_doc_key = try self.alloc.dupe(u8, existing.next_lower_doc_key);
+                next_lower_doc_key = preserved_next_lower_doc_key.?;
+                last_ranges_scanned = existing.last_ranges_scanned;
+                last_ranges_repaired = existing.last_ranges_repaired;
+                last_ranges_missing = existing.last_ranges_missing;
+                total_ranges_scanned = existing.total_ranges_scanned;
+                total_ranges_repaired = existing.total_ranges_repaired;
+                total_ranges_missing = existing.total_ranges_missing;
+                last_report = existing.last_report;
+                aggregate_report = existing.aggregate_report;
+                if (existing.last_error) |value| {
+                    preserved_last_error = try self.alloc.dupe(u8, value);
+                    last_error = preserved_last_error.?;
+                }
+            } else |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            }
+
+            const record = RelationalIndexRepairJobRecord{
+                .job_id = job_id,
+                .database_name = database_name,
+                .namespace_name = namespace_name,
+                .table_name = table_name,
+                .worker_id = worker_id,
+                .lower_doc_key = lower_doc_key,
+                .upper_doc_key = upper_doc_key,
+                .lease_ms = lease_ms,
+                .max_work_units = max_work_units,
+                .status = status,
+                .created_at_ns = created_at_ns,
+                .updated_at_ns = now_ns,
+                .attempts = attempts,
+                .completed = false,
+                .complete = null,
+                .next_lower_doc_key = next_lower_doc_key,
+                .last_ranges_scanned = last_ranges_scanned,
+                .last_ranges_repaired = last_ranges_repaired,
+                .last_ranges_missing = last_ranges_missing,
+                .total_ranges_scanned = total_ranges_scanned,
+                .total_ranges_repaired = total_ranges_repaired,
+                .total_ranges_missing = total_ranges_missing,
+                .last_report = last_report,
+                .aggregate_report = aggregate_report,
+                .last_error = last_error,
+            };
+            const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
+            defer self.alloc.free(payload);
+            try self.core.store.put(key, payload);
+            return try cloneRelationalIndexRepairJobRecordFromJson(self, payload);
+        }
+
+        pub fn recordRelationalIndexRepairJobPass(
+            self: *DB,
+            job_id: []const u8,
+            status: []const u8,
+            complete: bool,
+            ranges_scanned: u64,
+            ranges_repaired: u64,
+            ranges_missing: u64,
+            next_lower_doc_key: []const u8,
+            report: relational_store_mod.ColumnBackedIndexRepairReport,
+            last_error: ?[]const u8,
+        ) !RelationalIndexRepairJobRecord {
+            return try self.recordRelationalIndexRepairJobPassAt(
+                job_id,
+                status,
+                complete,
+                ranges_scanned,
+                ranges_repaired,
+                ranges_missing,
+                next_lower_doc_key,
+                report,
+                last_error,
+                currentTimeNs(),
+            );
+        }
+
+        pub fn recordRelationalIndexRepairJobPassAt(
+            self: *DB,
+            job_id: []const u8,
+            status: []const u8,
+            complete: bool,
+            ranges_scanned: u64,
+            ranges_repaired: u64,
+            ranges_missing: u64,
+            next_lower_doc_key: []const u8,
+            report: relational_store_mod.ColumnBackedIndexRepairReport,
+            last_error: ?[]const u8,
+            now_ns: u64,
+        ) !RelationalIndexRepairJobRecord {
+            if (job_id.len == 0 or status.len == 0) return error.InvalidRelationalIndexRepairJob;
+            self.core.lockApply();
+            defer self.core.unlockApply();
+
+            const key = try relationalIndexRepairJobKeyAlloc(self.alloc, job_id);
+            defer self.alloc.free(key);
+            const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
+                error.NotFound => return error.RelationalIndexRepairJobNotFound,
+                else => return err,
+            };
+            defer self.alloc.free(raw);
+            const existing = try cloneRelationalIndexRepairJobRecordFromJson(self, raw);
+            defer self.freeRelationalIndexRepairJobRecord(existing);
+
+            const record = RelationalIndexRepairJobRecord{
+                .job_id = existing.job_id,
+                .database_name = existing.database_name,
+                .namespace_name = existing.namespace_name,
+                .table_name = existing.table_name,
+                .worker_id = existing.worker_id,
+                .lower_doc_key = existing.lower_doc_key,
+                .upper_doc_key = existing.upper_doc_key,
+                .lease_ms = existing.lease_ms,
+                .max_work_units = existing.max_work_units,
+                .status = status,
+                .created_at_ns = existing.created_at_ns,
+                .updated_at_ns = now_ns,
+                .attempts = existing.attempts,
+                .completed = complete,
+                .complete = complete,
+                .next_lower_doc_key = next_lower_doc_key,
+                .last_ranges_scanned = ranges_scanned,
+                .last_ranges_repaired = ranges_repaired,
+                .last_ranges_missing = ranges_missing,
+                .total_ranges_scanned = existing.total_ranges_scanned +| ranges_scanned,
+                .total_ranges_repaired = existing.total_ranges_repaired +| ranges_repaired,
+                .total_ranges_missing = existing.total_ranges_missing +| ranges_missing,
+                .last_report = report,
+                .aggregate_report = relationalIndexRepairReportAdd(existing.aggregate_report, report),
+                .last_error = last_error,
+            };
+            const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
+            defer self.alloc.free(payload);
+            try self.core.store.put(key, payload);
+            return try cloneRelationalIndexRepairJobRecordFromJson(self, payload);
         }
 
         pub fn completeForeignKeyIntegrityJobRecord(
@@ -3998,6 +4306,17 @@ pub fn Impl(comptime DB: type) type {
             });
         }
 
+        pub fn relationalIndexRepairJobKeyAlloc(
+            alloc: Allocator,
+            job_id: []const u8,
+        ) ![]u8 {
+            return try std.fmt.allocPrint(alloc, "{s}:{d}:{s}", .{
+                relational_index_repair_job_key_prefix,
+                job_id.len,
+                job_id,
+            });
+        }
+
         pub fn foreignKeyActionJobKeyAlloc(
             alloc: Allocator,
             job_id: []const u8,
@@ -4112,6 +4431,55 @@ pub fn Impl(comptime DB: type) type {
             cloned.upper_doc_key = try self.alloc.dupe(u8, parsed.value.upper_doc_key);
             cloned.status = try self.alloc.dupe(u8, parsed.value.status);
             cloned.violation_samples_json = try self.alloc.dupe(u8, parsed.value.violation_samples_json);
+            return cloned;
+        }
+
+        pub fn cloneRelationalIndexRepairJobRecordFromJson(self: *DB, raw: []const u8) !RelationalIndexRepairJobRecord {
+            var parsed = try std.json.parseFromSlice(RelationalIndexRepairJobRecord, self.alloc, raw, .{
+                .allocate = .alloc_always,
+                .ignore_unknown_fields = true,
+            });
+            defer parsed.deinit();
+
+            var cloned = RelationalIndexRepairJobRecord{
+                .version = parsed.value.version,
+                .job_id = &.{},
+                .database_name = &.{},
+                .namespace_name = &.{},
+                .table_name = &.{},
+                .worker_id = &.{},
+                .lower_doc_key = &.{},
+                .upper_doc_key = &.{},
+                .lease_ms = parsed.value.lease_ms,
+                .max_work_units = parsed.value.max_work_units,
+                .status = &.{},
+                .created_at_ns = parsed.value.created_at_ns,
+                .updated_at_ns = parsed.value.updated_at_ns,
+                .attempts = parsed.value.attempts,
+                .completed = parsed.value.completed,
+                .complete = parsed.value.complete,
+                .next_lower_doc_key = &.{},
+                .last_ranges_scanned = parsed.value.last_ranges_scanned,
+                .last_ranges_repaired = parsed.value.last_ranges_repaired,
+                .last_ranges_missing = parsed.value.last_ranges_missing,
+                .total_ranges_scanned = parsed.value.total_ranges_scanned,
+                .total_ranges_repaired = parsed.value.total_ranges_repaired,
+                .total_ranges_missing = parsed.value.total_ranges_missing,
+                .last_report = parsed.value.last_report,
+                .aggregate_report = parsed.value.aggregate_report,
+                .last_error = null,
+            };
+            errdefer self.freeRelationalIndexRepairJobRecord(cloned);
+            cloned.job_id = try self.alloc.dupe(u8, parsed.value.job_id);
+            cloned.database_name = try self.alloc.dupe(u8, parsed.value.database_name);
+            cloned.namespace_name = try self.alloc.dupe(u8, parsed.value.namespace_name);
+            cloned.table_name = try self.alloc.dupe(u8, parsed.value.table_name);
+            cloned.worker_id = try self.alloc.dupe(u8, parsed.value.worker_id);
+            cloned.lower_doc_key = try self.alloc.dupe(u8, parsed.value.lower_doc_key);
+            cloned.upper_doc_key = try self.alloc.dupe(u8, parsed.value.upper_doc_key);
+            cloned.status = try self.alloc.dupe(u8, parsed.value.status);
+            cloned.next_lower_doc_key = try self.alloc.dupe(u8, parsed.value.next_lower_doc_key);
+            if (parsed.value.last_error) |value| cloned.last_error = try self.alloc.dupe(u8, value);
             return cloned;
         }
 
@@ -4908,6 +5276,152 @@ test "db foreign key maintenance leases use durable realtime clock" {
     defer db.freeForeignKeyActionJobRecord(claimed_action);
     try std.testing.expect(claimed_action.claimed_at_ns >= before_action_claim_ns);
     try std.testing.expect(claimed_action.lease_until_ns > currentTimeNs());
+}
+
+test "db relational index repair job records persist intent progress and resume cursor" {
+    const DB = @import("mod.zig").DB;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const created = try db.upsertRelationalIndexRepairJobRecordAt(
+            "job:index-repair:docs",
+            "tenant_ops",
+            "analytics",
+            "docs",
+            "worker:index-repair",
+            "",
+            "",
+            60_000,
+            2,
+            "running",
+            10_000,
+        );
+        defer db.freeRelationalIndexRepairJobRecord(created);
+        try std.testing.expectEqualStrings("job:index-repair:docs", created.job_id);
+        try std.testing.expectEqualStrings("tenant_ops", created.database_name);
+        try std.testing.expectEqualStrings("analytics", created.namespace_name);
+        try std.testing.expectEqualStrings("docs", created.table_name);
+        try std.testing.expectEqualStrings("worker:index-repair", created.worker_id);
+        try std.testing.expectEqual(@as(u64, 60_000), created.lease_ms);
+        try std.testing.expectEqual(@as(usize, 2), created.max_work_units);
+        try std.testing.expectEqualStrings("running", created.status);
+        try std.testing.expectEqual(@as(u64, 10_000), created.created_at_ns);
+        try std.testing.expectEqual(@as(u64, 10_000), created.updated_at_ns);
+        try std.testing.expectEqual(@as(u32, 1), created.attempts);
+        try std.testing.expect(!created.completed);
+        try std.testing.expect(created.complete == null);
+        try std.testing.expectEqualStrings("", created.next_lower_doc_key);
+
+        const partial = try db.recordRelationalIndexRepairJobPassAt(
+            "job:index-repair:docs",
+            "running",
+            false,
+            2,
+            1,
+            0,
+            "row:m",
+            .{
+                .scanned_rows = 7,
+                .indexed_rows = 6,
+                .deleted_orphan_entries = 1,
+                .written_entries = 9,
+            },
+            null,
+            20_000,
+        );
+        defer db.freeRelationalIndexRepairJobRecord(partial);
+        try std.testing.expect(!partial.completed);
+        try std.testing.expect(!partial.complete.?);
+        try std.testing.expectEqualStrings("row:m", partial.next_lower_doc_key);
+        try std.testing.expectEqual(@as(u64, 2), partial.last_ranges_scanned);
+        try std.testing.expectEqual(@as(u64, 1), partial.last_ranges_repaired);
+        try std.testing.expectEqual(@as(u64, 2), partial.total_ranges_scanned);
+        try std.testing.expectEqual(@as(u64, 1), partial.total_ranges_repaired);
+        try std.testing.expectEqual(@as(u64, 7), partial.last_report.scanned_rows);
+        try std.testing.expectEqual(@as(u64, 7), partial.aggregate_report.scanned_rows);
+
+        const resumed = try db.upsertRelationalIndexRepairJobRecordAt(
+            "job:index-repair:docs",
+            "tenant_ops",
+            "analytics",
+            "docs",
+            "worker:index-repair-2",
+            "",
+            "",
+            120_000,
+            4,
+            "running",
+            30_000,
+        );
+        defer db.freeRelationalIndexRepairJobRecord(resumed);
+        try std.testing.expectEqual(@as(u64, 10_000), resumed.created_at_ns);
+        try std.testing.expectEqual(@as(u64, 30_000), resumed.updated_at_ns);
+        try std.testing.expectEqual(@as(u32, 2), resumed.attempts);
+        try std.testing.expectEqualStrings("worker:index-repair-2", resumed.worker_id);
+        try std.testing.expectEqual(@as(u64, 120_000), resumed.lease_ms);
+        try std.testing.expectEqual(@as(usize, 4), resumed.max_work_units);
+        try std.testing.expectEqualStrings("row:m", resumed.next_lower_doc_key);
+        try std.testing.expectEqual(@as(u64, 7), resumed.aggregate_report.scanned_rows);
+
+        const completed = try db.recordRelationalIndexRepairJobPassAt(
+            "job:index-repair:docs",
+            "complete",
+            true,
+            1,
+            1,
+            0,
+            "",
+            .{
+                .scanned_rows = 5,
+                .indexed_rows = 4,
+                .deleted_orphan_entries = 0,
+                .written_entries = 8,
+            },
+            "last-pass-warning",
+            40_000,
+        );
+        defer db.freeRelationalIndexRepairJobRecord(completed);
+        try std.testing.expect(completed.completed);
+        try std.testing.expect(completed.complete.?);
+        try std.testing.expectEqualStrings("complete", completed.status);
+        try std.testing.expectEqual(@as(u64, 1), completed.last_ranges_scanned);
+        try std.testing.expectEqual(@as(u64, 3), completed.total_ranges_scanned);
+        try std.testing.expectEqual(@as(u64, 2), completed.total_ranges_repaired);
+        try std.testing.expectEqual(@as(u64, 12), completed.aggregate_report.scanned_rows);
+        try std.testing.expectEqual(@as(u64, 10), completed.aggregate_report.indexed_rows);
+        try std.testing.expectEqual(@as(u64, 1), completed.aggregate_report.deleted_orphan_entries);
+        try std.testing.expectEqual(@as(u64, 17), completed.aggregate_report.written_entries);
+        try std.testing.expectEqualStrings("last-pass-warning", completed.last_error.?);
+
+        const all = try db.listRelationalIndexRepairJobRecords();
+        defer db.freeRelationalIndexRepairJobRecords(all);
+        try std.testing.expectEqual(@as(usize, 1), all.len);
+        try std.testing.expectEqualStrings("job:index-repair:docs", all[0].job_id);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+    const persisted = (try reopened.loadRelationalIndexRepairJobRecord("job:index-repair:docs")) orelse return error.TestUnexpectedResult;
+    defer reopened.freeRelationalIndexRepairJobRecord(persisted);
+    try std.testing.expect(persisted.completed);
+    try std.testing.expect(persisted.complete.?);
+    try std.testing.expectEqualStrings("complete", persisted.status);
+    try std.testing.expectEqualStrings("tenant_ops", persisted.database_name);
+    try std.testing.expectEqualStrings("analytics", persisted.namespace_name);
+    try std.testing.expectEqualStrings("docs", persisted.table_name);
+    try std.testing.expectEqual(@as(u32, 2), persisted.attempts);
+    try std.testing.expectEqual(@as(u64, 3), persisted.total_ranges_scanned);
+    try std.testing.expectEqual(@as(u64, 2), persisted.total_ranges_repaired);
+    try std.testing.expectEqual(@as(u64, 12), persisted.aggregate_report.scanned_rows);
+    try std.testing.expectEqualStrings("last-pass-warning", persisted.last_error.?);
 }
 
 test "db foreign key action jobs canonicalize SQL action aliases" {

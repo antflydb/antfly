@@ -7921,18 +7921,27 @@ fn appendRowsQueryProfileJson(
     profile: db_mod.types.RelationalRowsQueryResult.Profile,
 ) !void {
     try writer.print(
-        ",\"profile\":{{\"access_method\":\"{s}\",\"fallback_reason\":\"{s}\",\"index_entries_scanned\":{d},\"candidate_rows\":{d},\"candidate_gate_limit\":{d},\"candidate_gate_observed\":{d},\"iterator_seeks\":{d},\"hydrated_rows\":{d},\"residual_rechecks\":{d},\"covering_payload_rows\":{d},\"projected_rows\":{d}",
+        ",\"profile\":{{\"access_method\":\"{s}\",\"fallback_reason\":\"{s}\"",
         .{
             rowsQueryAccessMethodName(profile.access_method),
             rowsQueryFallbackReasonName(profile.fallback_reason),
+        },
+    );
+    try appendRowsQueryPlanSummaryJson(writer, profile);
+    try writer.print(
+        ",\"index_entries_scanned\":{d},\"candidate_rows\":{d},\"estimated_candidate_rows\":{d},\"candidate_gate_limit\":{d},\"candidate_gate_observed\":{d},\"candidate_gate_exceeded\":{any},\"iterator_seeks\":{d},\"hydrated_rows\":{d},\"residual_rechecks\":{d},\"covering_payload_rows\":{d},\"covering_payload_rechecked_rows\":{d},\"projected_rows\":{d}",
+        .{
             profile.index_entries_scanned,
             profile.candidate_rows,
+            profile.estimated_candidate_rows,
             profile.candidate_gate_limit,
             profile.candidate_gate_observed,
+            profile.candidate_gate_exceeded,
             profile.iterator_seeks,
             profile.hydrated_rows,
             profile.residual_rechecks,
             profile.covering_payload_rows,
+            profile.covering_payload_rechecked_rows,
             profile.projected_rows,
         },
     );
@@ -7964,6 +7973,63 @@ fn appendRowsQueryProfileJson(
         );
     }
     try writer.writeByte('}');
+}
+
+fn appendRowsQueryPlanSummaryJson(
+    writer: *std.Io.Writer,
+    profile: db_mod.types.RelationalRowsQueryResult.Profile,
+) !void {
+    try writer.print(
+        ",\"plan_summary\":\"method={s};fallback={s}",
+        .{
+            rowsQueryAccessMethodName(profile.access_method),
+            rowsQueryFallbackReasonName(profile.fallback_reason),
+        },
+    );
+    if (profile.ordered_tuple_plan_selected) {
+        try writer.print(
+            ";ordered_tuple=selected;generation={d};catalog_ordinal={d};keys={d};equality_prefix={d};range_key=",
+            .{
+                profile.ordered_tuple_index_generation,
+                profile.ordered_tuple_catalog_ordinal,
+                profile.ordered_tuple_key_count,
+                profile.ordered_tuple_equality_prefix_len,
+            },
+        );
+        if (profile.ordered_tuple_range_key_index == std.math.maxInt(u32)) {
+            try writer.writeAll("none");
+        } else {
+            try writer.print("{d}", .{profile.ordered_tuple_range_key_index});
+        }
+        try writer.print(
+            ";predicates=filter:{d},proven:{d},residual:{d};bounds=lower:{d},upper:{d},prefix:{s}",
+            .{
+                profile.ordered_tuple_filter_predicates,
+                profile.ordered_tuple_proven_predicates,
+                profile.ordered_tuple_residual_predicates,
+                profile.ordered_tuple_lower_tuple_bytes,
+                profile.ordered_tuple_upper_tuple_bytes,
+                if (profile.ordered_tuple_prefix_scan) "true" else "false",
+            },
+        );
+    } else if (profile.fallback_reason != .none) {
+        try writer.writeAll(";ordered_tuple=rejected");
+    }
+    try writer.print(
+        ";estimated_candidates={d};candidate_gate={d}/{d}/{s};index_entries={d};candidate_rows={d};hydrated_rows={d};residual_rechecks={d};covering_payload_rechecks={d};projected_rows={d}\"",
+        .{
+            profile.estimated_candidate_rows,
+            profile.candidate_gate_observed,
+            profile.candidate_gate_limit,
+            if (profile.candidate_gate_exceeded) "exceeded" else "measured",
+            profile.index_entries_scanned,
+            profile.candidate_rows,
+            profile.hydrated_rows,
+            profile.residual_rechecks,
+            profile.covering_payload_rechecked_rows,
+            profile.projected_rows,
+        },
+    );
 }
 
 fn rowsQueryAccessMethodName(method: db_mod.types.RelationalRowsQueryResult.AccessMethod) []const u8 {
@@ -16047,7 +16113,9 @@ fn expressionValueJsonWithExplicitSourceAlloc(
             defer parsed.deinit();
             if (parsed.value == .null) break :blk try alloc.dupe(u8, "null");
             if (parsed.value != .string) return error.InvalidRowsRequest;
-            var trim_set: []const u8 = &std.ascii.whitespace;
+            var trim_set: []const u8 = std.ascii.whitespace[0..];
+            var trim_set_owned: ?[]u8 = null;
+            defer if (trim_set_owned) |owned| alloc.free(owned);
             if (expression.operands.len == 2) {
                 const trim_json = try expressionValueJsonWithExplicitSourceAlloc(alloc, row, proposed_row, source_row, expression.operands[1]);
                 defer alloc.free(trim_json);
@@ -16055,7 +16123,8 @@ fn expressionValueJsonWithExplicitSourceAlloc(
                 defer parsed_trim.deinit();
                 if (parsed_trim.value == .null) break :blk try alloc.dupe(u8, "null");
                 if (parsed_trim.value != .string) return error.InvalidRowsRequest;
-                trim_set = parsed_trim.value.string;
+                trim_set_owned = try alloc.dupe(u8, parsed_trim.value.string);
+                trim_set = trim_set_owned.?;
             }
             const transformed = try trimTextAlloc(alloc, parsed.value.string, trim_set, expression.kind != .rtrim, expression.kind != .ltrim);
             defer alloc.free(transformed);
@@ -28203,6 +28272,7 @@ test "relational rows query contract filters orders paginates and projects rows"
     const profiled_response = try encodeRowsQueryResponseAlloc(std.testing.allocator, profiled_result);
     defer std.testing.allocator.free(profiled_response);
     try std.testing.expect(std.mem.indexOf(u8, profiled_response, "\"profile\":{\"access_method\":\"unknown\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, profiled_response, "\"plan_summary\":\"method=unknown;fallback=none") != null);
     try std.testing.expect(std.mem.indexOf(u8, profiled_response, "\"projected_rows\":0") != null);
 
     const fallback_profile_response = try encodeRowsQueryResponseAlloc(std.testing.allocator, .{
@@ -28215,6 +28285,7 @@ test "relational rows query contract filters orders paginates and projects rows"
     });
     defer std.testing.allocator.free(fallback_profile_response);
     try std.testing.expect(std.mem.indexOf(u8, fallback_profile_response, "\"fallback_reason\":\"ordered_tuple_predicate_not_proven\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fallback_profile_response, "\"plan_summary\":\"method=base_scan;fallback=ordered_tuple_predicate_not_proven;ordered_tuple=rejected") != null);
     const fallback_reasons = [_]db_mod.types.RelationalRowsQueryResult.FallbackReason{
         .ordered_tuple_index_not_ready,
         .ordered_tuple_stale_generation,
@@ -28270,11 +28341,21 @@ test "relational rows query contract filters orders paginates and projects rows"
             .ordered_tuple_prefix_scan = false,
             .index_entries_scanned = 10,
             .candidate_rows = 10,
+            .estimated_candidate_rows = 12,
+            .candidate_gate_limit = 20,
+            .candidate_gate_observed = 12,
+            .candidate_gate_exceeded = true,
+            .covering_payload_rows = 2,
+            .covering_payload_rechecked_rows = 3,
             .projected_rows = 2,
         },
     });
     defer std.testing.allocator.free(ordered_tuple_profile_response);
     try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, "\"access_method\":\"ordered_tuple_stream\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, "\"estimated_candidate_rows\":12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, "\"candidate_gate_exceeded\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, "\"covering_payload_rechecked_rows\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, "\"plan_summary\":\"method=ordered_tuple_stream;fallback=none;ordered_tuple=selected;generation=7;catalog_ordinal=1;keys=2;equality_prefix=1;range_key=1;predicates=filter:3,proven:2,residual:1;bounds=lower:12,upper:18,prefix:false;estimated_candidates=12;candidate_gate=12/20/exceeded;index_entries=10;candidate_rows=10;hydrated_rows=0;residual_rechecks=0;covering_payload_rechecks=3") != null);
     try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, "\"ordered_tuple\":{\"catalog_ordinal\":1,\"index_generation\":7,\"key_count\":2,\"equality_prefix_len\":1,\"filter_predicates\":3,\"proven_predicates\":2,\"residual_predicates\":1,\"range_key_index\":1") != null);
 
     var distinct_result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, distinct_request, rows[0..]);

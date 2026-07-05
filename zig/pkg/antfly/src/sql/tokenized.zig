@@ -318,12 +318,38 @@ pub const ParsedSql = struct {
         };
     }
 
+    pub fn initFromOwnedTokenSliceWithGeneratedDdlAstAlloc(
+        alloc: std.mem.Allocator,
+        source_sql: []const u8,
+        source_tokens: []const Token,
+        generated_ddl_ast: *const generated_parser.GeneratedSqlDdlAst,
+        expected_statement_kind: generated_parser.GeneratedSqlStatementKind,
+    ) !ParsedSql {
+        if (expected_statement_kind != .ddl and expected_statement_kind != .extension_index) return error.UnsupportedSqlShape;
+        var parsed = try initFromOwnedTokenSliceAlloc(alloc, source_sql, source_tokens);
+        errdefer parsed.deinit(alloc);
+        if (parsed.generatedStatementKind() != expected_statement_kind) return error.UnsupportedSqlShape;
+        const parsed_generated = parsed.generated_statement orelse return error.UnsupportedSqlShape;
+        const parsed_ast = parsed_generated.ast orelse return error.UnsupportedSqlShape;
+        const parsed_ddl = switch (parsed_ast) {
+            .ddl => |ddl| ddl,
+            .extension_index => |ddl| ddl,
+            else => return error.UnsupportedSqlShape,
+        };
+        if (parsed_ddl.kind != generated_ddl_ast.kind) return error.UnsupportedSqlShape;
+        if (!generatedDdlAstMatchesOwnedTokens(parsed.items(), parsed.raw_statement, generated_ddl_ast.*, expected_statement_kind)) {
+            return error.UnsupportedSqlShape;
+        }
+        return parsed;
+    }
+
     pub fn initChildStatementAlloc(
         alloc: std.mem.Allocator,
         parent: *const ParsedSql,
         token_start: usize,
         token_end: usize,
     ) !ParsedSql {
+        if (parent.generated_statement != null) return error.UnsupportedSqlShape;
         if (token_start >= token_end or token_end > parent.items().len) return error.UnsupportedSqlShape;
         return try initFromTokenSliceAlloc(alloc, parent.sql(), parent.items()[token_start..token_end]);
     }
@@ -333,6 +359,7 @@ pub const ParsedSql = struct {
         parent: *const ParsedSql,
         ranges: []const TokenRange,
     ) !ParsedSql {
+        if (parent.generated_statement != null) return error.UnsupportedSqlShape;
         var tokenized_sql = try TokenizedSql.initFromTokenRangesAlloc(alloc, parent.sql(), parent.items(), ranges);
         errdefer tokenized_sql.deinit(alloc);
         var raw_statement = try parseRawStatementBounds(tokenized_sql.items());
@@ -346,6 +373,21 @@ pub const ParsedSql = struct {
             .generated_statement = generated_statement,
             .statement = statement,
         };
+    }
+
+    pub fn cloneWithOwnedSqlAlloc(self: *const ParsedSql, alloc: std.mem.Allocator) !ParsedSql {
+        const owned_sql = try alloc.dupe(u8, self.sql());
+        errdefer alloc.free(owned_sql);
+        if (self.generated_statement) |generated_statement| {
+            if (generated_statement.ast) |generated_ast| switch (generated_ast) {
+                .read => |read_ast| return try initFromOwnedTokenSliceWithGeneratedReadAstAlloc(alloc, owned_sql, self.items(), read_ast),
+                .dml => |*dml_ast| return try initFromOwnedTokenSliceWithGeneratedDmlAstAlloc(alloc, owned_sql, self.items(), dml_ast),
+                .ddl => |*ddl_ast| return try initFromOwnedTokenSliceWithGeneratedDdlAstAlloc(alloc, owned_sql, self.items(), ddl_ast, .ddl),
+                .extension_index => |*ddl_ast| return try initFromOwnedTokenSliceWithGeneratedDdlAstAlloc(alloc, owned_sql, self.items(), ddl_ast, .extension_index),
+                else => {},
+            };
+        }
+        return try initFromOwnedTokenSliceAlloc(alloc, owned_sql, self.items());
     }
 
     pub fn deinit(self: *ParsedSql, alloc: std.mem.Allocator) void {
@@ -385,7 +427,7 @@ pub const ParsedSql = struct {
     }
 
     pub fn writeStatementKind(self: *const ParsedSql) ?sql_statement_kind.SqlWriteStatementKind {
-        return self.statement.writeKind();
+        return self.writeStatementKindIncludingGeneratedAst();
     }
 
     pub fn writeStatementKindIncludingGeneratedAst(self: *const ParsedSql) ?sql_statement_kind.SqlWriteStatementKind {
@@ -406,12 +448,24 @@ pub const ParsedSql = struct {
     }
 
     pub fn isRecursiveWriteStatement(self: *const ParsedSql) bool {
-        return self.statement.isRecursiveWrite();
+        const write = self.writeStatementIncludingGeneratedAst() orelse return false;
+        return write.recursive;
     }
 
     pub fn generatedStatementKind(self: *const ParsedSql) ?generated_parser.GeneratedSqlStatementKind {
         if (self.generated_statement) |statement| return statement.kind();
         return null;
+    }
+
+    pub fn unsupportedStatementKindIncludingGeneratedAst(self: *const ParsedSql) ?generated_parser.GeneratedSqlUnsupportedKind {
+        const generated_statement = self.generated_statement orelse return null;
+        if (generated_statement.kind() != .unsupported) return null;
+        const kind = generated_statement.statement.unsupported;
+        if (!generatedUnsupportedAstHasValidClassificationPayload(self.items(), generated_statement, kind)) return null;
+        return switch (self.statement) {
+            .unsupported => |statement| if (statement.kind == kind) kind else null,
+            else => null,
+        };
     }
 
     pub fn generatedRelationPopulationSourceReadAst(self: *const ParsedSql) ?*const generated_parser.GeneratedSqlReadAst {
@@ -433,6 +487,7 @@ pub const OwnedParsedSql = struct {
         token_start: usize,
         token_end: usize,
     ) !OwnedParsedSql {
+        if (parent.generated_statement != null) return error.UnsupportedSqlShape;
         if (token_start >= token_end or token_end > parent.items().len) return error.UnsupportedSqlShape;
         const tokens = parent.items()[token_start..token_end];
         const owned_sql = try sqlTextFromTokenSliceAlloc(alloc, tokens);
@@ -467,7 +522,10 @@ pub const OwnedParsedSql = struct {
         const tokens = parent.items()[token_start..token_end];
         const owned_sql = try sqlTextFromTokenSliceAlloc(alloc, tokens);
         errdefer alloc.free(owned_sql);
-        const parsed = try ParsedSql.initFromOwnedTokenSliceWithGeneratedDmlAstAlloc(alloc, owned_sql, tokens, generated_dml_ast);
+        var parsed = try ParsedSql.initFromOwnedTokenSliceAlloc(alloc, owned_sql, tokens);
+        errdefer parsed.deinit(alloc);
+        const parsed_kind = parsed.writeStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
+        if (parsed_kind != generatedDmlAstWriteKind(generated_dml_ast.*)) return error.UnsupportedSqlShape;
         return .{ .parsed = parsed };
     }
 
@@ -476,6 +534,7 @@ pub const OwnedParsedSql = struct {
         parent: *const ParsedSql,
         ranges: []const TokenRange,
     ) !OwnedParsedSql {
+        if (parent.generated_statement != null) return error.UnsupportedSqlShape;
         const tokens = try flattenTokenRangesAlloc(alloc, parent.items(), ranges);
         defer alloc.free(tokens);
         const owned_sql = try sqlTextFromTokenSliceAlloc(alloc, tokens);
@@ -511,19 +570,14 @@ fn parseGeneratedRawStatementAlloc(
     tokens: []const Token,
     raw_statement: RawSqlStatement,
 ) !?GeneratedRawSqlStatement {
-    const legacy_without_generated_metadata = allowsLegacyStatementWithoutGeneratedMetadata(tokens, raw_statement);
-    const result = if (legacy_without_generated_metadata)
-        try generated_parser.parseGeneratedGateTokensAlloc(alloc, tokens)
-    else
-        generated_parser.parseGeneratedGateTokensStrictAlloc(alloc, tokens) catch |err| switch (err) {
-            error.UnsupportedSqlShape, error.UnexpectedToken => return err,
-            else => return err,
-        };
+    const result = generated_parser.parseGeneratedGateTokensStrictAlloc(alloc, tokens) catch |err| switch (err) {
+        error.UnsupportedSqlShape, error.UnexpectedToken => return err,
+        else => return err,
+    };
     if (result) |parsed| {
         return .{ .raw = raw_statement, .statement = parsed.statement, .ast = parsed.ast };
     }
-    if (!legacy_without_generated_metadata) return error.UnexpectedToken;
-    return null;
+    return error.UnexpectedToken;
 }
 
 fn generatedReadRawStatementFromRetainedReadAstAlloc(
@@ -636,492 +690,6 @@ fn normalizeGeneratedDmlReadBodySpansForOwnedChild(
         try normalizeGeneratedReadAstSpansForOwnedChild(tokens[range.start..range.end], read_ast);
     }
 }
-
-fn allowsLegacyStatementWithoutGeneratedMetadata(tokens: []const Token, raw_statement: RawSqlStatement) bool {
-    if (raw_statement.token_start >= raw_statement.token_end or raw_statement.token_end > tokens.len) return false;
-    if (tokens[raw_statement.token_end - 1].kind == .eq or tokens[raw_statement.token_end - 1].kind == .comma) return false;
-    if (tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .to) or tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .as)) return false;
-    if (isGeneratedGraphDdlHead(tokens, raw_statement)) return false;
-    if (isGeneratedCatalogDdlHead(tokens, raw_statement)) return false;
-    if (isGeneratedRelationPopulationHead(tokens, raw_statement)) return false;
-    if (isGeneratedTableOrIndexDdlHead(tokens, raw_statement)) return false;
-    if (isGeneratedUnsupportedHead(tokens, raw_statement)) return false;
-    if (isGeneratedRoleDdlHead(tokens, raw_statement)) return false;
-    if (isGeneratedTypeSystemDdlHead(tokens, raw_statement)) return false;
-    if (isGeneratedExtendedCatalogDdlHead(tokens, raw_statement)) return false;
-    if (isGeneratedCursorStatementHead(tokens, raw_statement)) return false;
-    if (isGeneratedSessionStatementHead(tokens, raw_statement)) return false;
-    if (isGeneratedPreparedStatementHead(tokens, raw_statement)) return false;
-    if (isGeneratedTransactionControlStatement(tokens, raw_statement)) return false;
-    if (isIncompleteGeneratedDdlBoundary(tokens, raw_statement)) return false;
-    if (isIncompleteGeneratedDmlBoundary(tokens, raw_statement)) return false;
-    if (isIncompleteGeneratedReadBoundary(tokens, raw_statement)) return false;
-    if (isIncompleteGeneratedUnsupportedBoundary(tokens, raw_statement)) return false;
-
-    const first = tokens[raw_statement.token_start];
-    if (tokenMatchesKeyword(first, .set)) return raw_statement.token_end > raw_statement.token_start + 2;
-    if (tokenMatchesKeyword(first, .reset) or tokenMatchesKeyword(first, .show) or tokenMatchesKeyword(first, .discard)) return raw_statement.token_end > raw_statement.token_start + 1;
-    if (tokenMatchesKeyword(first, .prepare)) return raw_statement.token_end > raw_statement.token_start + 2;
-    if (tokenMatchesKeyword(first, .execute) or tokenMatchesKeyword(first, .deallocate)) return raw_statement.token_end > raw_statement.token_start + 1;
-    if (tokenMatchesKeyword(first, .commit) or tokenMatchesKeyword(first, .end) or tokenMatchesKeyword(first, .rollback)) return raw_statement.token_end > raw_statement.token_start + 1;
-    if (tokenMatchesText(first, "start") or tokenMatchesText(first, "lock")) return raw_statement.token_end > raw_statement.token_start + 1;
-    if (tokenMatchesKeyword(first, .begin)) return true;
-    if (tokenMatchesKeyword(first, .savepoint)) return raw_statement.token_end > raw_statement.token_start + 1;
-    if (tokenMatchesText(first, "release")) return raw_statement.token_end > raw_statement.token_start + 1;
-    if (tokenMatchesText(first, "declare") or tokenMatchesText(first, "close") or tokenMatchesText(first, "fetch") or tokenMatchesText(first, "move")) {
-        return raw_statement.token_end > raw_statement.token_start + 1;
-    }
-    if (tokenMatchesKeyword(first, .select) or
-        tokenMatchesKeyword(first, .with) or
-        tokenMatchesKeyword(first, .insert) or
-        tokenMatchesKeyword(first, .update) or
-        tokenMatchesKeyword(first, .delete) or
-        tokenMatchesKeyword(first, .truncate) or
-        tokenMatchesKeyword(first, .merge))
-    {
-        return false;
-    }
-    return first.kind == .identifier or first.keyword != null;
-}
-
-fn isGeneratedTransactionControlStatement(tokens: []const Token, raw_statement: RawSqlStatement) bool {
-    const start = raw_statement.token_start;
-    const end = raw_statement.token_end;
-    if (start >= end or end > tokens.len) return false;
-    const first = tokens[start];
-    if (isPreparedTransactionStatement(tokens, raw_statement)) return true;
-    if (tokenMatchesKeyword(first, .set)) {
-        if (start + 1 < end and tokenMatchesText(tokens[start + 1], "transaction")) return true;
-        return start + 4 < end and
-            tokenMatchesText(tokens[start + 1], "session") and
-            tokenMatchesText(tokens[start + 2], "characteristics") and
-            tokenMatchesKeyword(tokens[start + 3], .as) and
-            tokenMatchesText(tokens[start + 4], "transaction");
-    }
-    if (tokenMatchesText(first, "start")) return true;
-    if (tokenMatchesKeyword(first, .begin)) return true;
-    if (tokenMatchesKeyword(first, .savepoint)) return true;
-    if (tokenMatchesText(first, "release")) {
-        if (end <= start + 1) return true;
-        if (end == start + 2) return tokens[start + 1].kind == .identifier;
-        return end == start + 3 and
-            tokenMatchesKeyword(tokens[start + 1], .savepoint) and
-            tokens[start + 2].kind == .identifier;
-    }
-    if (tokenMatchesKeyword(first, .rollback) and start + 1 < end and tokenMatchesKeyword(tokens[start + 1], .to)) {
-        if (end <= start + 2) return true;
-        if (end == start + 3) return tokens[start + 2].kind == .identifier;
-        return end == start + 4 and
-            tokenMatchesKeyword(tokens[start + 2], .savepoint) and
-            tokens[start + 3].kind == .identifier;
-    }
-    return tokenMatchesKeyword(first, .commit) or tokenMatchesKeyword(first, .end) or tokenMatchesKeyword(first, .rollback);
-}
-
-fn isGeneratedGraphDdlHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
-    const start = raw_statement.token_start;
-    if (start + 1 >= raw_statement.token_end or raw_statement.token_end > tokens.len) return false;
-    return (tokenMatchesKeyword(tokens[start], .create) or tokenMatchesKeyword(tokens[start], .alter)) and
-        tokenMatchesKeyword(tokens[start + 1], .graph);
-}
-
-fn isGeneratedCatalogDdlHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
-    const start = raw_statement.token_start;
-    if (start + 1 >= raw_statement.token_end or raw_statement.token_end > tokens.len) return false;
-    const first = tokens[start];
-    const second = tokens[start + 1];
-    if (tokenMatchesKeyword(first, .create) or tokenMatchesKeyword(first, .drop)) {
-        return tokenMatchesKeyword(second, .database) or
-            tokenMatchesKeyword(second, .schema) or
-            tokenMatchesKeyword(second, .extension);
-    }
-    if (tokenMatchesKeyword(first, .alter)) {
-        return tokenMatchesKeyword(second, .database) or
-            tokenMatchesKeyword(second, .extension);
-    }
-    return false;
-}
-
-fn isGeneratedRelationPopulationHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
-    const start = raw_statement.token_start;
-    const end = raw_statement.token_end;
-    if (start >= end or end > tokens.len) return false;
-    if (tokenMatchesKeyword(tokens[start], .select)) {
-        return findTopLevelKeyword(tokens, start + 1, end, .into) != null;
-    }
-    if (!tokenMatchesKeyword(tokens[start], .create)) return false;
-    var index = start + 1;
-    consumeRelationLifetime(tokens, &index, end);
-    if (index >= end or !tokenMatchesKeyword(tokens[index], .table)) return false;
-    return findTopLevelKeyword(tokens, index + 1, end, .as) != null;
-}
-
-fn isGeneratedTableOrIndexDdlHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
-    const start = raw_statement.token_start;
-    const end = raw_statement.token_end;
-    if (start + 1 >= end or end > tokens.len) return false;
-    const first = tokens[start];
-    const second = tokens[start + 1];
-    if (tokenMatchesKeyword(first, .create)) {
-        var object_index = start + 1;
-        if (object_index + 2 < end and
-            tokenMatchesKeyword(tokens[object_index], .@"or") and
-            tokenMatchesKeyword(tokens[object_index + 1], .replace))
-        {
-            object_index += 2;
-        }
-        consumeRelationLifetime(tokens, &object_index, end);
-        if (object_index >= end) return false;
-        const object = tokens[object_index];
-        return tokenMatchesKeyword(object, .table) or
-            tokenMatchesKeyword(object, .index) or
-            (tokenMatchesKeyword(object, .materialized) and object_index + 1 < end and tokenMatchesKeyword(tokens[object_index + 1], .view)) or
-            (tokenMatchesKeyword(object, .unique) and object_index + 1 < end and tokenMatchesKeyword(tokens[object_index + 1], .index));
-    }
-    if (tokenMatchesKeyword(first, .alter)) {
-        return tokenMatchesKeyword(second, .table);
-    }
-    if (tokenMatchesKeyword(first, .drop)) {
-        return tokenMatchesKeyword(second, .table) or tokenMatchesKeyword(second, .index);
-    }
-    return false;
-}
-
-fn isGeneratedUnsupportedHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
-    const start = raw_statement.token_start;
-    const end = raw_statement.token_end;
-    if (start >= end or end > tokens.len) return false;
-    const first = tokens[start];
-    if (tokenMatchesKeyword(first, .analyze) or
-        tokenMatchesKeyword(first, .call) or
-        tokenMatchesKeyword(first, .checkpoint) or
-        tokenMatchesKeyword(first, .cluster) or
-        tokenMatchesKeyword(first, .comment) or
-        tokenMatchesKeyword(first, .copy) or
-        tokenMatchesText(first, "do") or
-        tokenMatchesKeyword(first, .explain) or
-        tokenMatchesKeyword(first, .grant) or
-        tokenMatchesKeyword(first, .listen) or
-        tokenMatchesText(first, "load") or
-        tokenMatchesText(first, "lock") or
-        tokenMatchesKeyword(first, .match) or
-        tokenMatchesKeyword(first, .notify) or
-        tokenMatchesKeyword(first, .reindex) or
-        tokenMatchesKeyword(first, .revoke) or
-        tokenMatchesKeyword(first, .security) or
-        tokenMatchesKeyword(first, .unlisten) or
-        tokenMatchesKeyword(first, .vacuum))
-    {
-        return true;
-    }
-    if (tokenMatchesKeyword(first, .import)) {
-        return start + 2 < end and
-            tokenMatchesKeyword(tokens[start + 1], .foreign) and
-            tokenMatchesKeyword(tokens[start + 2], .schema);
-    }
-    if (tokenMatchesKeyword(first, .reassign)) {
-        return start + 1 < end and tokenMatchesKeyword(tokens[start + 1], .owned);
-    }
-    if (tokenMatchesKeyword(first, .alter)) return isGeneratedUnsupportedAlterHead(tokens, start, end);
-    if (tokenMatchesKeyword(first, .create)) return isGeneratedUnsupportedCreateHead(tokens, start, end);
-    if (tokenMatchesKeyword(first, .drop)) return isGeneratedUnsupportedDropHead(tokens, start, end);
-    return false;
-}
-
-fn isGeneratedRoleDdlHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
-    const start = raw_statement.token_start;
-    const end = raw_statement.token_end;
-    if (start + 1 >= end or end > tokens.len) return false;
-    const first = tokens[start];
-    if (!tokenMatchesKeyword(first, .create) and
-        !tokenMatchesKeyword(first, .alter) and
-        !tokenMatchesKeyword(first, .drop))
-    {
-        return false;
-    }
-    const second = tokens[start + 1];
-    return tokenMatchesKeyword(second, .role) or
-        tokenMatchesText(second, "user") or
-        tokenMatchesKeyword(second, .group);
-}
-
-fn isGeneratedTypeSystemDdlHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
-    const start = raw_statement.token_start;
-    const end = raw_statement.token_end;
-    if (start + 1 >= end or end > tokens.len) return false;
-    const first = tokens[start];
-    const second = tokens[start + 1];
-    if (tokenMatchesKeyword(first, .create)) {
-        return tokenMatchesKeyword(second, .collation) or
-            tokenMatchesKeyword(second, .operator) or
-            tokenMatchesKeyword(second, .aggregate) or
-            tokenMatchesKeyword(second, .cast);
-    }
-    if (tokenMatchesKeyword(first, .alter)) {
-        return tokenMatchesKeyword(second, .collation);
-    }
-    if (tokenMatchesKeyword(first, .drop)) {
-        return tokenMatchesKeyword(second, .collation) or
-            tokenMatchesKeyword(second, .operator) or
-            tokenMatchesKeyword(second, .aggregate) or
-            tokenMatchesKeyword(second, .cast);
-    }
-    return false;
-}
-
-fn isGeneratedExtendedCatalogDdlHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
-    const start = raw_statement.token_start;
-    const end = raw_statement.token_end;
-    if (start + 1 >= end or end > tokens.len) return false;
-    const first = tokens[start];
-    if (tokenMatchesKeyword(first, .create)) {
-        if (tokenMatchesKeyword(tokens[start + 1], .@"or")) {
-            return start + 3 < end and
-                tokenMatchesKeyword(tokens[start + 2], .replace) and
-                (tokenMatchesKeyword(tokens[start + 3], .view) or
-                    tokenMatchesKeyword(tokens[start + 3], .function) or
-                    tokenMatchesKeyword(tokens[start + 3], .procedure));
-        }
-        return isGeneratedExtendedCatalogObject(tokens, start + 1, end, .create);
-    }
-    if (tokenMatchesKeyword(first, .alter)) {
-        return isGeneratedExtendedCatalogObject(tokens, start + 1, end, .alter);
-    }
-    if (tokenMatchesKeyword(first, .drop)) {
-        return isGeneratedExtendedCatalogObject(tokens, start + 1, end, .drop);
-    }
-    if (tokenMatchesKeyword(first, .refresh)) {
-        return start + 2 < end and
-            tokenMatchesKeyword(tokens[start + 1], .materialized) and
-            tokenMatchesKeyword(tokens[start + 2], .view);
-    }
-    return false;
-}
-
-const GeneratedExtendedCatalogOperation = enum { create, alter, drop };
-
-fn isGeneratedExtendedCatalogObject(tokens: []const Token, object_index: usize, end: usize, operation: GeneratedExtendedCatalogOperation) bool {
-    if (object_index >= end or end > tokens.len) return false;
-    const object = tokens[object_index];
-    if (tokenMatchesKeyword(object, .materialized)) {
-        return object_index + 1 < end and tokenMatchesKeyword(tokens[object_index + 1], .view);
-    }
-    if (tokenMatchesKeyword(object, .view) or
-        tokenMatchesKeyword(object, .domain) or
-        tokenMatchesKeyword(object, .sequence) or
-        tokenMatchesKeyword(object, .type) or
-        tokenMatchesKeyword(object, .tablespace) or
-        tokenMatchesKeyword(object, .publication) or
-        tokenMatchesKeyword(object, .subscription) or
-        tokenMatchesKeyword(object, .policy))
-    {
-        return true;
-    }
-    return switch (operation) {
-        .create, .drop => tokenMatchesKeyword(object, .function) or tokenMatchesKeyword(object, .procedure),
-        .alter => false,
-    };
-}
-
-fn isGeneratedCursorStatementHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
-    const start = raw_statement.token_start;
-    const end = raw_statement.token_end;
-    if (start >= end or end > tokens.len) return false;
-    const first = tokens[start];
-    return tokenMatchesText(first, "declare") or
-        tokenMatchesKeyword(first, .fetch) or
-        tokenMatchesText(first, "move") or
-        tokenMatchesKeyword(first, .close);
-}
-
-fn isGeneratedSessionStatementHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
-    const start = raw_statement.token_start;
-    const end = raw_statement.token_end;
-    if (start >= end or end > tokens.len) return false;
-    const first = tokens[start];
-    return tokenMatchesKeyword(first, .set) or
-        tokenMatchesKeyword(first, .reset) or
-        tokenMatchesKeyword(first, .show) or
-        tokenMatchesKeyword(first, .discard);
-}
-
-fn isGeneratedPreparedStatementHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
-    const start = raw_statement.token_start;
-    const end = raw_statement.token_end;
-    if (start >= end or end > tokens.len) return false;
-    if (isPreparedTransactionStatement(tokens, raw_statement)) return true;
-    const first = tokens[start];
-    return tokenMatchesKeyword(first, .prepare) or
-        tokenMatchesKeyword(first, .execute) or
-        tokenMatchesKeyword(first, .deallocate);
-}
-
-fn isPreparedTransactionStatement(tokens: []const Token, raw_statement: RawSqlStatement) bool {
-    const start = raw_statement.token_start;
-    const end = raw_statement.token_end;
-    if (start + 1 >= end or end > tokens.len) return false;
-    const first = tokens[start];
-    const second = tokens[start + 1];
-    return (tokenMatchesKeyword(first, .prepare) and tokenMatchesText(second, "transaction")) or
-        (tokenMatchesKeyword(first, .commit) and tokenMatchesText(second, "prepared")) or
-        (tokenMatchesKeyword(first, .rollback) and tokenMatchesText(second, "prepared"));
-}
-
-fn isGeneratedUnsupportedAlterHead(tokens: []const Token, start: usize, end: usize) bool {
-    if (start + 1 >= end) return false;
-    const second = tokens[start + 1];
-    if (tokenMatchesKeyword(second, .aggregate) or
-        tokenMatchesText(second, "conversion") or
-        tokenMatchesKeyword(second, .function) or
-        tokenMatchesKeyword(second, .index) or
-        tokenMatchesText(second, "language") or
-        tokenMatchesKeyword(second, .operator) or
-        tokenMatchesKeyword(second, .procedure) or
-        tokenMatchesText(second, "routine") or
-        tokenMatchesKeyword(second, .rule) or
-        tokenMatchesKeyword(second, .server) or
-        tokenMatchesKeyword(second, .system) or
-        tokenMatchesText(second, "statistics") or
-        tokenMatchesKeyword(second, .trigger) or
-        tokenMatchesText(second, "transform"))
-    {
-        return true;
-    }
-    if (tokenMatchesKeyword(second, .default)) {
-        return start + 2 < end and tokenMatchesKeyword(tokens[start + 2], .privileges);
-    }
-    if (tokenMatchesText(second, "event")) {
-        return start + 2 < end and tokenMatchesKeyword(tokens[start + 2], .trigger);
-    }
-    if (tokenMatchesKeyword(second, .foreign)) {
-        return start + 2 < end and
-            (tokenMatchesKeyword(tokens[start + 2], .table) or
-                (start + 3 < end and tokenMatchesKeyword(tokens[start + 2], .data) and tokenMatchesText(tokens[start + 3], "wrapper")));
-    }
-    if (tokenMatchesText(second, "large")) {
-        return start + 2 < end and tokenMatchesText(tokens[start + 2], "object");
-    }
-    if (tokenMatchesKeyword(second, .materialized)) {
-        return start + 2 < end and tokenMatchesKeyword(tokens[start + 2], .view);
-    }
-    if (tokenMatchesKeyword(second, .text)) {
-        if (start + 2 >= end or !tokenMatchesText(tokens[start + 2], "search")) return false;
-        return start + 3 >= end or
-            (tokenMatchesText(tokens[start + 3], "configuration") or
-                tokenMatchesText(tokens[start + 3], "dictionary") or
-                tokenMatchesText(tokens[start + 3], "parser") or
-                tokenMatchesText(tokens[start + 3], "template"));
-    }
-    if (tokenMatchesText(second, "user")) {
-        return start + 2 < end and tokenMatchesText(tokens[start + 2], "mapping");
-    }
-    return false;
-}
-
-fn isGeneratedUnsupportedCreateHead(tokens: []const Token, start: usize, end: usize) bool {
-    if (start + 1 >= end) return false;
-    const second = tokens[start + 1];
-    if (tokenMatchesKeyword(second, .@"or")) {
-        return start + 3 < end and
-            tokenMatchesKeyword(tokens[start + 2], .replace) and
-            tokenMatchesKeyword(tokens[start + 3], .trigger);
-    }
-    if (tokenMatchesText(second, "conversion") or
-        tokenMatchesText(second, "language") or
-        tokenMatchesKeyword(second, .rule) or
-        tokenMatchesKeyword(second, .server) or
-        tokenMatchesText(second, "statistics") or
-        tokenMatchesText(second, "transform") or
-        tokenMatchesKeyword(second, .trigger))
-    {
-        return true;
-    }
-    if (tokenMatchesKeyword(second, .access)) {
-        return start + 2 < end and tokenMatchesKeyword(tokens[start + 2], .method);
-    }
-    if (tokenMatchesText(second, "event")) {
-        return start + 2 < end and tokenMatchesKeyword(tokens[start + 2], .trigger);
-    }
-    if (tokenMatchesKeyword(second, .foreign)) {
-        return start + 2 < end and
-            (tokenMatchesKeyword(tokens[start + 2], .table) or
-                (start + 3 < end and tokenMatchesKeyword(tokens[start + 2], .data) and tokenMatchesText(tokens[start + 3], "wrapper")));
-    }
-    if (tokenMatchesKeyword(second, .operator)) {
-        return start + 2 < end and
-            (tokenMatchesText(tokens[start + 2], "class") or tokenMatchesText(tokens[start + 2], "family"));
-    }
-    if (tokenMatchesKeyword(second, .text)) {
-        if (start + 2 >= end or !tokenMatchesText(tokens[start + 2], "search")) return false;
-        return start + 3 >= end or
-            (tokenMatchesText(tokens[start + 3], "configuration") or
-                tokenMatchesText(tokens[start + 3], "dictionary") or
-                tokenMatchesText(tokens[start + 3], "parser") or
-                tokenMatchesText(tokens[start + 3], "template"));
-    }
-    if (tokenMatchesText(second, "user")) {
-        return start + 2 < end and tokenMatchesText(tokens[start + 2], "mapping");
-    }
-    return false;
-}
-
-fn isGeneratedUnsupportedDropHead(tokens: []const Token, start: usize, end: usize) bool {
-    if (start + 1 >= end) return false;
-    const second = tokens[start + 1];
-    if (tokenMatchesText(second, "conversion") or
-        tokenMatchesText(second, "language") or
-        tokenMatchesKeyword(second, .owned) or
-        tokenMatchesText(second, "routine") or
-        tokenMatchesKeyword(second, .rule) or
-        tokenMatchesKeyword(second, .server) or
-        tokenMatchesText(second, "statistics") or
-        tokenMatchesText(second, "transform") or
-        tokenMatchesKeyword(second, .trigger))
-    {
-        return true;
-    }
-    if (tokenMatchesKeyword(second, .access)) {
-        return start + 2 < end and tokenMatchesKeyword(tokens[start + 2], .method);
-    }
-    if (tokenMatchesText(second, "event")) {
-        return start + 2 < end and tokenMatchesKeyword(tokens[start + 2], .trigger);
-    }
-    if (tokenMatchesKeyword(second, .foreign)) {
-        return start + 2 < end and
-            (tokenMatchesKeyword(tokens[start + 2], .table) or
-                (start + 3 < end and tokenMatchesKeyword(tokens[start + 2], .data) and tokenMatchesText(tokens[start + 3], "wrapper")));
-    }
-    if (tokenMatchesKeyword(second, .operator)) {
-        return start + 2 < end and
-            (tokenMatchesText(tokens[start + 2], "class") or tokenMatchesText(tokens[start + 2], "family"));
-    }
-    if (tokenMatchesKeyword(second, .text)) {
-        if (start + 2 >= end or !tokenMatchesText(tokens[start + 2], "search")) return false;
-        return start + 3 >= end or
-            (tokenMatchesText(tokens[start + 3], "configuration") or
-                tokenMatchesText(tokens[start + 3], "dictionary") or
-                tokenMatchesText(tokens[start + 3], "parser") or
-                tokenMatchesText(tokens[start + 3], "template"));
-    }
-    if (tokenMatchesText(second, "user")) {
-        return start + 2 < end and tokenMatchesText(tokens[start + 2], "mapping");
-    }
-    return false;
-}
-
-fn consumeRelationLifetime(tokens: []const Token, index: *usize, end: usize) void {
-    if (index.* >= end) return;
-    if (tokenMatchesRelationLifetime(tokens[index.*])) {
-        index.* += 1;
-    }
-}
-
-fn tokenMatchesRelationLifetime(token: Token) bool {
-    return tokenMatchesKeyword(token, .temp) or
-        tokenMatchesKeyword(token, .temporary) or
-        tokenMatchesKeyword(token, .unlogged);
-}
-
 fn findTopLevelKeyword(tokens: []const Token, start: usize, end: usize, keyword: token_mod.TokenKeyword) ?usize {
     var depth: usize = 0;
     var index = start;
@@ -1137,602 +705,6 @@ fn findTopLevelKeyword(tokens: []const Token, start: usize, end: usize, keyword:
     }
     return null;
 }
-
-fn isIncompleteGeneratedDdlBoundary(tokens: []const Token, raw_statement: RawSqlStatement) bool {
-    const start = raw_statement.token_start;
-    const end = raw_statement.token_end;
-    if (start >= end or end > tokens.len) return false;
-    const first = tokens[start];
-    const last = tokens[end - 1];
-    if (end == start + 1) {
-        return tokenMatchesKeyword(first, .create) or
-            tokenMatchesKeyword(first, .alter) or
-            tokenMatchesKeyword(first, .drop);
-    }
-    if (tokenMatchesKeyword(first, .create)) {
-        if (tokenMatchesKeyword(tokens[start + 1], .@"or")) {
-            if (end <= start + 3) return true;
-            if (tokenMatchesKeyword(tokens[start + 2], .replace) and tokenMatchesKeyword(tokens[start + 3], .view)) {
-                if (end <= start + 5) return true;
-                return isGeneratedDdlTrailingBoundary(last);
-            }
-        }
-        var table_index = start + 1;
-        if (table_index < end and tokenMatchesRelationLifetime(tokens[table_index])) {
-            table_index += 1;
-            if (table_index >= end) return true;
-            if (tokenMatchesKeyword(tokens[table_index], .table)) {
-                if (end <= table_index + 2) return true;
-                return isGeneratedDdlTrailingBoundary(last);
-            }
-        }
-        if (tokenMatchesKeyword(tokens[start + 1], .unique)) {
-            if (end <= start + 2) return true;
-            if (tokenMatchesKeyword(tokens[start + 2], .index) and end <= start + 4) return true;
-            return isGeneratedDdlTrailingBoundary(last);
-        }
-        if (tokenMatchesKeyword(tokens[start + 1], .table)) {
-            if (end <= start + 3) return true;
-            return isGeneratedDdlTrailingBoundary(last);
-        }
-        if (tokenMatchesKeyword(tokens[start + 1], .view)) {
-            if (end <= start + 3) return true;
-            return isGeneratedDdlTrailingBoundary(last);
-        }
-        if (tokenMatchesKeyword(tokens[start + 1], .materialized)) {
-            if (end <= start + 3) return true;
-            if (tokenMatchesKeyword(tokens[start + 2], .view)) {
-                if (end <= start + 4) return true;
-                return isGeneratedDdlTrailingBoundary(last);
-            }
-        }
-        if (tokenMatchesKeyword(tokens[start + 1], .domain)) {
-            if (end <= start + 3) return true;
-            return isGeneratedDdlTrailingBoundary(last);
-        }
-        if (tokenMatchesKeyword(tokens[start + 1], .sequence)) {
-            if (end <= start + 3) return true;
-            return isGeneratedDdlTrailingBoundary(last);
-        }
-        if (tokenMatchesKeyword(tokens[start + 1], .type)) {
-            if (end <= start + 3) return true;
-            return isGeneratedDdlTrailingBoundary(last);
-        }
-        if (tokenMatchesKeyword(tokens[start + 1], .tablespace)) {
-            if (end <= start + 3) return true;
-            return isGeneratedDdlTrailingBoundary(last);
-        }
-        if (tokenMatchesKeyword(tokens[start + 1], .publication) or
-            tokenMatchesKeyword(tokens[start + 1], .subscription))
-        {
-            if (end <= start + 3) return true;
-            return isGeneratedDdlTrailingBoundary(last);
-        }
-        if (tokenMatchesKeyword(tokens[start + 1], .index)) {
-            if (end <= start + 3) return true;
-            return isGeneratedDdlTrailingBoundary(last);
-        }
-        if (tokenMatchesKeyword(tokens[start + 1], .database) or
-            tokenMatchesKeyword(tokens[start + 1], .schema) or
-            tokenMatchesKeyword(tokens[start + 1], .extension))
-        {
-            if (end <= start + 2) return true;
-            return isGeneratedDdlTrailingBoundary(last);
-        }
-        if (tokenMatchesText(tokens[start + 1], "transform")) {
-            if (end <= start + 3) return true;
-            return isGeneratedDdlTrailingBoundary(last);
-        }
-    }
-    if (tokenMatchesKeyword(first, .alter) and tokenMatchesKeyword(tokens[start + 1], .table)) {
-        if (end <= start + 3) return true;
-        return isGeneratedDdlTrailingBoundary(last);
-    }
-    if (tokenMatchesKeyword(first, .alter) and tokenMatchesKeyword(tokens[start + 1], .schema)) {
-        if (end <= start + 3) return true;
-        return isGeneratedDdlTrailingBoundary(last);
-    }
-    if (tokenMatchesKeyword(first, .alter) and tokenMatchesKeyword(tokens[start + 1], .tablespace)) {
-        if (end <= start + 3) return true;
-        return isGeneratedDdlTrailingBoundary(last);
-    }
-    if (tokenMatchesKeyword(first, .alter) and tokenMatchesKeyword(tokens[start + 1], .view)) {
-        if (end <= start + 3) return true;
-        return isGeneratedDdlTrailingBoundary(last);
-    }
-    if (tokenMatchesKeyword(first, .alter) and tokenMatchesKeyword(tokens[start + 1], .domain)) {
-        if (end <= start + 3) return true;
-        return isGeneratedDdlTrailingBoundary(last);
-    }
-    if (tokenMatchesKeyword(first, .alter) and tokenMatchesKeyword(tokens[start + 1], .sequence)) {
-        if (end <= start + 3) return true;
-        return isGeneratedDdlTrailingBoundary(last);
-    }
-    if (tokenMatchesKeyword(first, .alter) and tokenMatchesKeyword(tokens[start + 1], .type)) {
-        if (end <= start + 3) return true;
-        return isGeneratedDdlTrailingBoundary(last);
-    }
-    if (tokenMatchesKeyword(first, .alter) and
-        (tokenMatchesKeyword(tokens[start + 1], .publication) or tokenMatchesKeyword(tokens[start + 1], .subscription)))
-    {
-        if (end <= start + 3) return true;
-        return isGeneratedDdlTrailingBoundary(last);
-    }
-    if (tokenMatchesKeyword(first, .alter) and tokenMatchesText(tokens[start + 1], "transform")) {
-        if (end <= start + 3) return true;
-        return isGeneratedDdlTrailingBoundary(last);
-    }
-    if (tokenMatchesKeyword(first, .drop)) {
-        if (tokenMatchesKeyword(tokens[start + 1], .materialized)) {
-            if (end <= start + 3) return true;
-            if (tokenMatchesKeyword(tokens[start + 2], .view)) {
-                if (end <= start + 3) return true;
-                return isGeneratedDdlTrailingBoundary(last);
-            }
-        }
-        if (tokenMatchesKeyword(tokens[start + 1], .table) or
-            tokenMatchesKeyword(tokens[start + 1], .view) or
-            tokenMatchesKeyword(tokens[start + 1], .domain) or
-            tokenMatchesKeyword(tokens[start + 1], .sequence) or
-            tokenMatchesKeyword(tokens[start + 1], .type) or
-            tokenMatchesKeyword(tokens[start + 1], .tablespace) or
-            tokenMatchesKeyword(tokens[start + 1], .publication) or
-            tokenMatchesKeyword(tokens[start + 1], .subscription) or
-            tokenMatchesKeyword(tokens[start + 1], .index) or
-            tokenMatchesKeyword(tokens[start + 1], .database) or
-            tokenMatchesKeyword(tokens[start + 1], .schema) or
-            tokenMatchesKeyword(tokens[start + 1], .extension))
-        {
-            if (end <= start + 2) return true;
-            return isGeneratedDdlTrailingBoundary(last);
-        }
-        if (tokenMatchesText(tokens[start + 1], "transform")) {
-            if (end <= start + 2) return true;
-            return isGeneratedDdlTrailingBoundary(last);
-        }
-    }
-    if (tokenMatchesKeyword(first, .refresh)) {
-        if (end <= start + 3) return true;
-        if (tokenMatchesKeyword(tokens[start + 1], .materialized) and tokenMatchesKeyword(tokens[start + 2], .view)) {
-            if (end <= start + 4) return true;
-            return isGeneratedDdlTrailingBoundary(last);
-        }
-    }
-    return false;
-}
-
-fn isGeneratedDdlTrailingBoundary(token: Token) bool {
-    if (token.kind == .comma or token.kind == .lparen or token.kind == .eq) return true;
-    return tokenMatchesKeyword(token, .@"if") or
-        tokenMatchesKeyword(token, .not) or
-        tokenMatchesKeyword(token, .exists) or
-        tokenMatchesKeyword(token, .only) or
-        tokenMatchesKeyword(token, .on) or
-        tokenMatchesKeyword(token, .using) or
-        tokenMatchesKeyword(token, .@"for") or
-        tokenMatchesKeyword(token, .with) or
-        tokenMatchesKeyword(token, .where) or
-        tokenMatchesKeyword(token, .include) or
-        tokenMatchesKeyword(token, .add) or
-        tokenMatchesKeyword(token, .before) or
-        tokenMatchesKeyword(token, .drop) or
-        tokenMatchesKeyword(token, .rename) or
-        tokenMatchesKeyword(token, .validate) or
-        tokenMatchesKeyword(token, .column) or
-        tokenMatchesKeyword(token, .constraint) or
-        tokenMatchesKeyword(token, .set) or
-        tokenMatchesKeyword(token, .default) or
-        tokenMatchesKeyword(token, .null) or
-        tokenMatchesKeyword(token, .to) or
-        tokenMatchesKeyword(token, .table) or
-        tokenMatchesKeyword(token, .publication) or
-        tokenMatchesKeyword(token, .as) or
-        tokenMatchesKeyword(token, .restart) or
-        tokenMatchesKeyword(token, .by) or
-        tokenMatchesKeyword(token, .no) or
-        tokenMatchesKeyword(token, .data) or
-        tokenMatchesText(token, "connection") or
-        tokenMatchesText(token, "concurrently") or
-        tokenMatchesText(token, "enable") or
-        tokenMatchesText(token, "disable");
-}
-
-fn isIncompleteGeneratedReadBoundary(tokens: []const Token, raw_statement: RawSqlStatement) bool {
-    const start = raw_statement.token_start;
-    const end = raw_statement.token_end;
-    if (start >= end or end > tokens.len) return false;
-    const first = tokens[start];
-    if (!tokenMatchesKeyword(first, .select) and !tokenMatchesKeyword(first, .with)) return false;
-    const last = tokens[end - 1];
-    if (end == start + 1) {
-        return tokenMatchesKeyword(first, .select) or tokenMatchesKeyword(first, .with);
-    }
-    if (tokenMatchesKeyword(first, .select) and tokenMatchesKeyword(last, .distinct)) return true;
-    if (last.kind == .lparen and end > start + 1 and tokenMatchesKeyword(tokens[end - 2], .on)) return true;
-    if (last.kind == .lparen or isGeneratedSqlTrailingOperatorToken(last)) return true;
-    if (isGeneratedReadTrailingQuantifier(tokens, start, end)) return true;
-    if (generatedReadHasCompleteSourceBefore(tokens, start, end - 1) and
-        (tokenMatchesKeyword(last, .@"union") or
-            tokenMatchesKeyword(last, .intersect) or
-            tokenMatchesKeyword(last, .except)))
-    {
-        return true;
-    }
-    if (isIncompleteGeneratedReadRowLockTail(tokens, start, end)) return true;
-    if (isIncompleteGeneratedReadWindowClauseTail(tokens, start, end)) return true;
-    if (tokenMatchesKeyword(last, .all) and end > start + 1 and tokenMatchesKeyword(tokens[end - 2], .@"union")) return true;
-    if (tokenMatchesKeyword(last, .select) or
-        tokenMatchesKeyword(last, .from) or
-        tokenMatchesKeyword(last, .where) or
-        tokenMatchesKeyword(last, .having) or
-        tokenMatchesKeyword(last, .join) or
-        tokenMatchesKeyword(last, .lateral) or
-        tokenMatchesKeyword(last, .on) or
-        tokenMatchesKeyword(last, .using))
-    {
-        return true;
-    }
-    if ((tokenMatchesKeyword(last, .limit) or
-        tokenMatchesKeyword(last, .offset) or
-        tokenMatchesKeyword(last, .fetch) or
-        tokenMatchesKeyword(last, .first) or
-        tokenMatchesKeyword(last, .next)) and
-        generatedReadHasPriorResultTail(tokens, start, end - 1))
-    {
-        return true;
-    }
-    if (tokenMatchesKeyword(last, .by) and end > start + 1) {
-        const previous = tokens[end - 2];
-        return tokenMatchesKeyword(previous, .group) or tokenMatchesKeyword(previous, .order);
-    }
-    if (generatedReadHasPriorResultTail(tokens, start, end - 1) and
-        (tokenMatchesKeyword(last, .window) or
-            tokenMatchesKeyword(last, .@"and") or
-            tokenMatchesKeyword(last, .@"or") or
-            tokenMatchesKeyword(last, .is) or
-            tokenMatchesKeyword(last, .not) or
-            tokenMatchesKeyword(last, .in) or
-            tokenMatchesKeyword(last, .exists) or
-            tokenMatchesKeyword(last, .like) or
-            tokenMatchesKeyword(last, .ilike) or
-            tokenMatchesKeyword(last, .nulls) or
-            tokenMatchesKeyword(last, .between) or
-            tokenMatchesKeyword(last, .preceding) or
-            tokenMatchesKeyword(last, .following)))
-    {
-        return true;
-    }
-    if (tokenMatchesKeyword(first, .with)) {
-        return last.kind == .lparen or
-            tokenMatchesKeyword(last, .as) or
-            tokenMatchesKeyword(last, .recursive) or
-            tokenMatchesKeyword(last, .materialized) or
-            tokenMatchesKeyword(last, .not);
-    }
-    return false;
-}
-
-fn isGeneratedReadStatementHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
-    const start = raw_statement.token_start;
-    if (start >= raw_statement.token_end or raw_statement.token_end > tokens.len) return false;
-    const first = tokens[start];
-    return tokenMatchesKeyword(first, .select) or tokenMatchesKeyword(first, .with);
-}
-
-fn isIncompleteGeneratedReadWindowClauseTail(tokens: []const Token, start: usize, end: usize) bool {
-    if (end <= start + 1 or end > tokens.len) return false;
-    const last = tokens[end - 1];
-    if (last.kind != .identifier) return false;
-
-    var depth: usize = 0;
-    var index = start;
-    var window_index: ?usize = null;
-    while (index < end and index < tokens.len) : (index += 1) {
-        switch (tokens[index].kind) {
-            .lparen, .lbracket => depth += 1,
-            .rparen, .rbracket => {
-                if (depth > 0) depth -= 1;
-            },
-            else => {},
-        }
-        if (depth != 0 or !tokenMatchesKeyword(tokens[index], .window)) continue;
-        if (generatedReadHasCompleteSourceBefore(tokens, start, index)) window_index = index;
-    }
-    const found_window = window_index orelse return false;
-    if (end <= found_window + 1) return false;
-    const previous = tokens[end - 2];
-    return tokenMatchesKeyword(previous, .window) or previous.kind == .comma;
-}
-
-fn isGeneratedSqlTrailingOperatorToken(token: Token) bool {
-    return switch (token.kind) {
-        .eq,
-        .neq,
-        .gt,
-        .gte,
-        .lt,
-        .lte,
-        .plus,
-        .minus,
-        .slash,
-        .percent,
-        .at_contains,
-        .range_overlap,
-        .pipe_concat,
-        .question,
-        .question_any,
-        .question_all,
-        .arrow_json,
-        .arrow_text,
-        .path_arrow_json,
-        .path_arrow_text,
-        .regex_match,
-        .regex_imatch,
-        .regex_not_match,
-        .regex_not_imatch,
-        => true,
-        else => false,
-    };
-}
-
-fn isGeneratedReadTrailingQuantifier(tokens: []const Token, start: usize, end: usize) bool {
-    if (end <= start + 1 or end > tokens.len) return false;
-    const last = tokens[end - 1];
-    if (!tokenMatchesKeyword(last, .any) and !tokenMatchesKeyword(last, .some) and !tokenMatchesKeyword(last, .all)) return false;
-    const previous = tokens[end - 2];
-    return isGeneratedSqlTrailingOperatorToken(previous) or
-        tokenMatchesKeyword(previous, .like) or
-        tokenMatchesKeyword(previous, .ilike);
-}
-
-fn isIncompleteGeneratedReadRowLockTail(tokens: []const Token, start: usize, end: usize) bool {
-    if (start >= end or end > tokens.len) return false;
-    const lock_start = generatedReadRowLockStart(tokens, start, end) orelse return false;
-    const lock_len = end - lock_start;
-    if (lock_len == 1) return true;
-    const last = tokens[end - 1];
-    if (tokenMatchesKeyword(last, .of)) {
-        return generatedReadLockModeEndsBefore(tokens, lock_start + 1, end - 1);
-    }
-    if (tokenMatchesText(last, "skip")) {
-        return generatedReadLockModeEndsBefore(tokens, lock_start + 1, end - 1);
-    }
-    if (lock_len == 2 and
-        (tokenMatchesKeyword(last, .no) or tokenMatchesKeyword(last, .key)))
-    {
-        return true;
-    }
-    if (lock_len == 3 and
-        tokenMatchesKeyword(tokens[lock_start + 1], .no) and
-        tokenMatchesKeyword(last, .key))
-    {
-        return true;
-    }
-    return false;
-}
-
-fn generatedReadRowLockStart(tokens: []const Token, start: usize, end: usize) ?usize {
-    var depth: usize = 0;
-    var index = start;
-    var candidate: ?usize = null;
-    while (index < end and index < tokens.len) : (index += 1) {
-        switch (tokens[index].kind) {
-            .lparen, .lbracket => depth += 1,
-            .rparen, .rbracket => {
-                if (depth > 0) depth -= 1;
-            },
-            else => {},
-        }
-        if (depth != 0 or !tokenMatchesKeyword(tokens[index], .@"for")) continue;
-        if (generatedReadHasCompleteSourceBefore(tokens, start, index)) candidate = index;
-    }
-    return candidate;
-}
-
-fn generatedReadLockModeEndsBefore(tokens: []const Token, start: usize, end: usize) bool {
-    if (start >= end or end > tokens.len) return false;
-    const len = end - start;
-    if (len == 1) {
-        return tokenMatchesKeyword(tokens[start], .update) or
-            tokenMatchesKeyword(tokens[start], .share);
-    }
-    if (len == 2 and
-        tokenMatchesKeyword(tokens[start], .key) and
-        tokenMatchesKeyword(tokens[start + 1], .share))
-    {
-        return true;
-    }
-    if (len == 3 and
-        tokenMatchesKeyword(tokens[start], .no) and
-        tokenMatchesKeyword(tokens[start + 1], .key) and
-        tokenMatchesKeyword(tokens[start + 2], .update))
-    {
-        return true;
-    }
-    return false;
-}
-
-fn generatedReadHasCompleteSourceBefore(tokens: []const Token, start: usize, end: usize) bool {
-    var depth: usize = 0;
-    var index = start;
-    while (index < end and index < tokens.len) : (index += 1) {
-        switch (tokens[index].kind) {
-            .lparen, .lbracket => depth += 1,
-            .rparen, .rbracket => {
-                if (depth > 0) depth -= 1;
-            },
-            else => {},
-        }
-        if (depth == 0 and tokenMatchesKeyword(tokens[index], .from) and index + 1 < end) {
-            return true;
-        }
-    }
-    return false;
-}
-
-fn generatedReadHasPriorResultTail(tokens: []const Token, start: usize, end: usize) bool {
-    var depth: usize = 0;
-    var index = start;
-    while (index < end and index < tokens.len) : (index += 1) {
-        switch (tokens[index].kind) {
-            .lparen, .lbracket => depth += 1,
-            .rparen, .rbracket => {
-                if (depth > 0) depth -= 1;
-            },
-            else => {},
-        }
-        if (depth != 0) continue;
-        if (tokenMatchesKeyword(tokens[index], .where) or
-            tokenMatchesKeyword(tokens[index], .having) or
-            tokenMatchesKeyword(tokens[index], .limit) or
-            tokenMatchesKeyword(tokens[index], .offset) or
-            tokenMatchesKeyword(tokens[index], .fetch))
-        {
-            return true;
-        }
-        if ((tokenMatchesKeyword(tokens[index], .group) or tokenMatchesKeyword(tokens[index], .order)) and
-            index + 1 < end and
-            tokenMatchesKeyword(tokens[index + 1], .by))
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
-fn isIncompleteGeneratedDmlBoundary(tokens: []const Token, raw_statement: RawSqlStatement) bool {
-    const start = raw_statement.token_start;
-    const end = raw_statement.token_end;
-    if (start >= end or end > tokens.len) return false;
-    const first = tokens[start];
-    const last = tokens[end - 1];
-    if (end == start + 1) {
-        return tokenMatchesKeyword(first, .insert) or
-            tokenMatchesKeyword(first, .update) or
-            tokenMatchesKeyword(first, .delete) or
-            tokenMatchesKeyword(first, .truncate) or
-            tokenMatchesKeyword(first, .merge);
-    }
-    if (last.kind == .lparen or isGeneratedSqlTrailingOperatorToken(last)) return true;
-    if (isGeneratedDmlTrailingQuantifier(tokens, start, end)) return true;
-    if (tokenMatchesKeyword(first, .insert)) {
-        return tokenMatchesKeyword(last, .into) or
-            tokenMatchesKeyword(last, .default) or
-            tokenMatchesKeyword(last, .values) or
-            tokenMatchesKeyword(last, .select) or
-            tokenMatchesKeyword(last, .on) or
-            tokenMatchesKeyword(last, .conflict) or
-            tokenMatchesText(last, "do") or
-            tokenMatchesKeyword(last, .returning);
-    }
-    if (tokenMatchesKeyword(first, .update)) {
-        return tokenMatchesKeyword(last, .set) or
-            tokenMatchesKeyword(last, .from) or
-            tokenMatchesKeyword(last, .where) or
-            tokenMatchesKeyword(last, .returning);
-    }
-    if (tokenMatchesKeyword(first, .delete)) {
-        return tokenMatchesKeyword(last, .from) or
-            tokenMatchesKeyword(last, .using) or
-            tokenMatchesKeyword(last, .where) or
-            tokenMatchesKeyword(last, .returning);
-    }
-    if (tokenMatchesKeyword(first, .truncate)) {
-        return tokenMatchesKeyword(last, .table) or
-            tokenMatchesKeyword(last, .restart) or
-            tokenMatchesKeyword(last, .@"continue");
-    }
-    if (tokenMatchesKeyword(first, .merge)) {
-        return tokenMatchesKeyword(last, .into) or
-            tokenMatchesKeyword(last, .using) or
-            tokenMatchesKeyword(last, .on) or
-            tokenMatchesKeyword(last, .when) or
-            tokenMatchesKeyword(last, .matched) or
-            tokenMatchesKeyword(last, .then) or
-            tokenMatchesKeyword(last, .update) or
-            tokenMatchesKeyword(last, .insert) or
-            tokenMatchesKeyword(last, .set) or
-            tokenMatchesKeyword(last, .values);
-    }
-    return false;
-}
-
-fn isGeneratedDmlStatementHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
-    const start = raw_statement.token_start;
-    if (start >= raw_statement.token_end or raw_statement.token_end > tokens.len) return false;
-    const first = tokens[start];
-    return tokenMatchesKeyword(first, .insert) or
-        tokenMatchesKeyword(first, .update) or
-        tokenMatchesKeyword(first, .delete) or
-        tokenMatchesKeyword(first, .truncate) or
-        tokenMatchesKeyword(first, .merge);
-}
-
-fn isGeneratedDmlTrailingQuantifier(tokens: []const Token, start: usize, end: usize) bool {
-    if (end <= start + 1 or end > tokens.len) return false;
-    const last = tokens[end - 1];
-    if (!tokenMatchesKeyword(last, .any) and !tokenMatchesKeyword(last, .some) and !tokenMatchesKeyword(last, .all)) return false;
-    const previous = tokens[end - 2];
-    return isGeneratedSqlTrailingOperatorToken(previous) or
-        tokenMatchesKeyword(previous, .like) or
-        tokenMatchesKeyword(previous, .ilike);
-}
-
-fn isIncompleteGeneratedUnsupportedBoundary(tokens: []const Token, raw_statement: RawSqlStatement) bool {
-    const start = raw_statement.token_start;
-    const end = raw_statement.token_end;
-    if (start >= end or end > tokens.len) return false;
-    if (isIncompleteGeneratedUnsupportedRequiredTailBoundary(tokens, start, end)) return true;
-    if (isIncompleteImportForeignSchemaBoundary(tokens, start, end)) return true;
-    if (end != start + 1) return false;
-    const first = tokens[start];
-    return tokenMatchesKeyword(first, .call) or
-        tokenMatchesKeyword(first, .cluster) or
-        tokenMatchesKeyword(first, .comment) or
-        tokenMatchesKeyword(first, .copy) or
-        tokenMatchesText(first, "do") or
-        tokenMatchesKeyword(first, .grant) or
-        tokenMatchesKeyword(first, .listen) or
-        tokenMatchesText(first, "load") or
-        tokenMatchesText(first, "lock") or
-        tokenMatchesKeyword(first, .match) or
-        tokenMatchesKeyword(first, .notify) or
-        tokenMatchesKeyword(first, .reindex) or
-        tokenMatchesKeyword(first, .revoke) or
-        tokenMatchesKeyword(first, .security) or
-        tokenMatchesKeyword(first, .unlisten);
-}
-
-fn isIncompleteGeneratedUnsupportedRequiredTailBoundary(tokens: []const Token, start: usize, end: usize) bool {
-    if (start >= end or end > tokens.len) return false;
-    if (tokenMatchesKeyword(tokens[start], .alter) and end == start + 2) {
-        return tokenMatchesKeyword(tokens[start + 1], .aggregate) or
-            tokenMatchesKeyword(tokens[start + 1], .operator);
-    }
-    return false;
-}
-
-fn isIncompleteImportForeignSchemaBoundary(tokens: []const Token, start: usize, end: usize) bool {
-    if (start >= end or end > tokens.len) return false;
-    if (!tokenMatchesKeyword(tokens[start], .import)) return false;
-    if (end == start + 1) return true;
-    if (!tokenMatchesKeyword(tokens[start + 1], .foreign)) return false;
-    if (end == start + 2) return true;
-    if (!tokenMatchesKeyword(tokens[start + 2], .schema)) return false;
-    if (end == start + 3) return true;
-    if (tokens[start + 3].kind != .identifier) return false;
-    if (end == start + 4) return true;
-    if (!tokenMatchesKeyword(tokens[start + 4], .from)) return false;
-    if (end == start + 5) return true;
-    if (!tokenMatchesKeyword(tokens[start + 5], .server)) return false;
-    if (end == start + 6) return true;
-    if (tokens[start + 6].kind != .identifier) return false;
-    if (end == start + 7) return true;
-    if (!tokenMatchesKeyword(tokens[start + 7], .into)) return false;
-    if (end == start + 8) return true;
-    return false;
-}
-
 fn parseStatement(
     raw_statement: RawSqlStatement,
     generated_statement: ?GeneratedRawSqlStatement,
@@ -1923,6 +895,40 @@ fn generatedDdlKindFromExtensionIndexKind(kind: generated_parser.GeneratedSqlExt
         .create_extension => .create_extension,
         .drop_extension => .drop_extension,
     };
+}
+
+fn generatedExtensionIndexKindFromDdlKind(kind: generated_parser.GeneratedSqlDdlKind) ?generated_parser.GeneratedSqlExtensionIndexKind {
+    return switch (kind) {
+        .create_index => .create_index,
+        .drop_index => .drop_index,
+        .create_extension => .create_extension,
+        .drop_extension => .drop_extension,
+        else => null,
+    };
+}
+
+fn generatedDdlAstMatchesOwnedTokens(
+    tokens: []const Token,
+    raw_statement: RawSqlStatement,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+    expected_statement_kind: generated_parser.GeneratedSqlStatementKind,
+) bool {
+    const statement: generated_parser.GeneratedSqlStatement = switch (expected_statement_kind) {
+        .ddl => .{ .ddl = ddl_ast.kind },
+        .extension_index => .{ .extension_index = generatedExtensionIndexKindFromDdlKind(ddl_ast.kind) orelse return false },
+        else => return false,
+    };
+    const ast: generated_parser.GeneratedSqlAst = switch (expected_statement_kind) {
+        .ddl => .{ .ddl = ddl_ast },
+        .extension_index => .{ .extension_index = ddl_ast },
+        else => return false,
+    };
+    const generated_raw = GeneratedRawSqlStatement{
+        .raw = raw_statement,
+        .statement = statement,
+        .ast = ast,
+    };
+    return generatedDdlAstHasValidClassificationPayload(tokens, generated_raw, ddl_ast.kind);
 }
 
 fn generatedDdlAstHasValidClassificationPayload(
@@ -2137,8 +1143,14 @@ fn generatedDdlViewPayloadIsValid(
     end: usize,
     view: *const generated_parser.GeneratedSqlViewAst,
 ) bool {
-    return generatedDdlOptionalTokenRangeIsValid(tokens, end, view.query_tokens) and
-        generatedDdlListPayloadIsValid(tokens, end, &view.column_items);
+    if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, view.query_tokens)) return false;
+    if (!generatedDdlListPayloadIsValid(tokens, end, &view.column_items)) return false;
+    if (view.query_tokens) |query| {
+        const read = view.query_read orelse return false;
+        if (query.start >= query.end or query.end > tokens.len) return false;
+        if (!generatedReadAstHasValidClassificationPayload(tokens[query.start..query.end], read)) return false;
+    } else if (view.query_read != null) return false;
+    return true;
 }
 
 fn generatedDdlListPayloadIsValid(
@@ -7735,11 +6747,6 @@ fn rawStatementFamilyFromHead(tokens: []const Token) ?sql_statement_kind.SqlStat
     if (first.keyword) |keyword| {
         return switch (keyword) {
             .select => .select,
-            .insert => .insert,
-            .update => .update,
-            .delete => .delete,
-            .truncate => .truncate,
-            .merge => .merge,
             .with => .with,
             else => .ddl,
         };
@@ -7798,6 +6805,24 @@ test "sql adapter parsed sql derives raw family from generated statements first"
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, parsed_write.generatedStatementKind().?);
     try std.testing.expectEqual(sql_statement_kind.SqlStatementFamily.with, parsed_write.raw_statement.family.?);
     try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.update, parsed_write.writeStatementKind().?);
+}
+
+test "sql adapter raw statement family does not classify DML heads without generated metadata" {
+    const alloc = std.testing.allocator;
+
+    const cases = [_][]const u8{
+        "INSERT INTO usage_records (id) VALUES ('u1')",
+        "UPDATE usage_records SET status = 'done' WHERE id = 'u1'",
+        "DELETE FROM usage_records WHERE id = 'u1'",
+        "TRUNCATE usage_records",
+        "MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN DELETE",
+    };
+
+    for (cases) |sql| {
+        var tokenized_sql = try TokenizedSql.initAlloc(alloc, sql);
+        defer tokenized_sql.deinit(alloc);
+        try std.testing.expect(rawStatementFamilyFromHead(tokenized_sql.items()) == null);
+    }
 }
 
 test "sql adapter parsed sql exposes raw statement source spans" {
@@ -8122,7 +7147,7 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .ddl), std.meta.activeTag(generated_lifetime_table.statement));
 }
 
-test "sql adapter parsed sql builds non-contiguous child statements from parent tokens" {
+test "sql adapter parsed sql generic child token ranges require legacy parent" {
     const alloc = std.testing.allocator;
 
     var parent = try ParsedSql.initAlloc(
@@ -8135,6 +7160,14 @@ test "sql adapter parsed sql builds non-contiguous child statements from parent 
         .{ .start = 0, .end = 4 },
         .{ .start = 6, .end = parent.items().len },
     };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        ParsedSql.initChildStatementFromTokenRangesAlloc(alloc, &parent, &ranges),
+    );
+
+    var generated_statement = parent.generated_statement orelse return error.TestUnexpectedResult;
+    defer generated_statement.deinit(alloc);
+    parent.generated_statement = null;
     var child = try ParsedSql.initChildStatementFromTokenRangesAlloc(alloc, &parent, &ranges);
     defer child.deinit(alloc);
 
@@ -8170,7 +7203,7 @@ test "sql adapter parsed sql builds relation population child statements from re
     try std.testing.expectEqualStrings("FROM", child.parsed.items()[4].text);
 }
 
-test "sql adapter owned parsed sql builds non-contiguous child statements from token ranges" {
+test "sql adapter owned parsed sql generic child token ranges require legacy parent" {
     const alloc = std.testing.allocator;
 
     var parent = try ParsedSql.initAlloc(
@@ -8183,6 +7216,14 @@ test "sql adapter owned parsed sql builds non-contiguous child statements from t
         .{ .start = 0, .end = 4 },
         .{ .start = 6, .end = parent.items().len },
     };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        OwnedParsedSql.initChildStatementFromTokenRangesAlloc(alloc, &parent, &ranges),
+    );
+
+    var generated_statement = parent.generated_statement orelse return error.TestUnexpectedResult;
+    defer generated_statement.deinit(alloc);
+    parent.generated_statement = null;
     var child = try OwnedParsedSql.initChildStatementFromTokenRangesAlloc(alloc, &parent, &ranges);
     defer child.deinit(alloc);
 
@@ -8222,7 +7263,7 @@ test "sql adapter parsed sql builds owned child statements from existing tokens"
     try std.testing.expectEqualStrings("$1", child.items()[child.items().len - 1].text);
 }
 
-test "sql adapter owned parsed sql wraps rebased child statement lifetime" {
+test "sql adapter owned parsed sql generic child token slice requires legacy parent" {
     const alloc = std.testing.allocator;
 
     var parent = try ParsedSql.initAlloc(
@@ -8231,6 +7272,14 @@ test "sql adapter owned parsed sql wraps rebased child statement lifetime" {
     );
     defer parent.deinit(alloc);
 
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        OwnedParsedSql.initChildStatementAlloc(alloc, &parent, 1, parent.items().len - 1),
+    );
+
+    var generated_statement = parent.generated_statement orelse return error.TestUnexpectedResult;
+    defer generated_statement.deinit(alloc);
+    parent.generated_statement = null;
     var child = try OwnedParsedSql.initChildStatementAlloc(alloc, &parent, 1, parent.items().len - 1);
     defer child.deinit(alloc);
 
@@ -8239,6 +7288,43 @@ test "sql adapter owned parsed sql wraps rebased child statement lifetime" {
     try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, child.parsed.readStatementKind().?);
     try std.testing.expectEqual(@as(usize, 0), child.parsed.items()[0].source_start);
     try std.testing.expectEqual(@as(usize, child.parsed.sql().len), child.parsed.items()[child.parsed.items().len - 1].source_end);
+}
+
+test "sql adapter owned parsed sql generated dml child uses retained ast" {
+    const alloc = std.testing.allocator;
+
+    var parent = try ParsedSql.initAlloc(
+        alloc,
+        "EXPLAIN UPDATE usage_records SET status = 'done' WHERE id = 'u1';",
+    );
+    defer parent.deinit(alloc);
+
+    const explain = switch (parent.statement) {
+        .explain => |statement| statement,
+        else => return error.TestUnexpectedResult,
+    };
+    const start = explain.inner_token_start orelse return error.TestUnexpectedResult;
+    const end = explain.inner_token_end orelse return error.TestUnexpectedResult;
+    const generated_statement = parent.generated_statement orelse return error.TestUnexpectedResult;
+    const generated_ast = generated_statement.ast orelse return error.TestUnexpectedResult;
+    const unsupported = switch (generated_ast) {
+        .unsupported => |unsupported| unsupported,
+        else => return error.TestUnexpectedResult,
+    };
+    const dml_ast = unsupported.explain_subject_dml_ast orelse return error.TestUnexpectedResult;
+
+    var child = try OwnedParsedSql.initChildStatementWithGeneratedDmlAstAlloc(alloc, &parent, start, end, dml_ast);
+    defer child.deinit(alloc);
+    try std.testing.expectEqualStrings("UPDATE usage_records SET status = 'done' WHERE id = 'u1'", child.parsed.sql());
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, child.parsed.generatedStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.update, child.parsed.writeStatementKindIncludingGeneratedAst().?);
+
+    var stale_dml_ast = dml_ast.*;
+    stale_dml_ast.kind = .delete;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        OwnedParsedSql.initChildStatementWithGeneratedDmlAstAlloc(alloc, &parent, start, end, &stale_dml_ast),
+    );
 }
 
 test "sql adapter parsed sql owns typed statement variants" {
@@ -8321,10 +7407,10 @@ test "sql adapter parsed sql owns typed statement variants" {
 
     var missing_generated_write = try ParsedSql.initAlloc(alloc, "UPDATE usage_records SET status = 'done' WHERE id = 'u1'");
     defer missing_generated_write.deinit(alloc);
-    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.update, missing_generated_write.writeStatementKind().?);
     var missing_generated_write_metadata = missing_generated_write.generated_statement.?;
     defer missing_generated_write_metadata.deinit(alloc);
     missing_generated_write.generated_statement = null;
+    try std.testing.expect(missing_generated_write.writeStatementKind() == null);
     try std.testing.expect(missing_generated_write.writeStatementKindIncludingGeneratedAst() == null);
     try std.testing.expect(missing_generated_write.writeStatementIncludingGeneratedAst() == null);
 
@@ -8371,7 +7457,7 @@ test "sql adapter parsed sql owns typed statement variants" {
             else => return error.TestUnexpectedResult,
         };
     }
-    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.insert_source, generated_alias_write.writeStatementKind().?);
+    try std.testing.expect(generated_alias_write.writeStatementKind() == null);
     try std.testing.expect(generated_alias_write.writeStatementKindIncludingGeneratedAst() == null);
     try std.testing.expect(generated_alias_write.writeStatementIncludingGeneratedAst() == null);
 
@@ -8395,8 +7481,8 @@ test "sql adapter parsed sql owns typed statement variants" {
             else => return error.TestUnexpectedResult,
         };
     }
-    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.insert_source, recursive_write.writeStatementKind().?);
-    try std.testing.expect(recursive_write.isRecursiveWriteStatement());
+    try std.testing.expect(recursive_write.writeStatementKind() == null);
+    try std.testing.expect(!recursive_write.isRecursiveWriteStatement());
     try std.testing.expect(recursive_write.writeStatementKindIncludingGeneratedAst() == null);
     try std.testing.expect(recursive_write.writeStatementIncludingGeneratedAst() == null);
 
@@ -14472,4 +13558,42 @@ test "sql adapter parsed sql retains generated graph nodes as DDL" {
     }
     malformed.statement = parseStatement(malformed.raw_statement, malformed_generated, &malformed.tokenized_sql);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(malformed.statement));
+}
+
+test "sql adapter parsed sql clone rejects stale retained generated DML metadata" {
+    const alloc = std.testing.allocator;
+
+    var parsed = try ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id, status) VALUES ('u1', 'ready')");
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, parsed.generatedStatementKind().?);
+
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| dml.insert_column_items.count += 1,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+
+    try std.testing.expectError(error.UnsupportedSqlShape, parsed.cloneWithOwnedSqlAlloc(alloc));
+}
+
+test "sql adapter parsed sql clone rejects stale retained generated DDL metadata" {
+    const alloc = std.testing.allocator;
+
+    var parsed = try ParsedSql.initAlloc(alloc, "CREATE TABLE prepared_usage_records (id uuid)");
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, parsed.generatedStatementKind().?);
+
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.object_name_tokens = .{ .start = parsed.items().len, .end = parsed.items().len + 1 },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+
+    try std.testing.expectError(error.UnsupportedSqlShape, parsed.cloneWithOwnedSqlAlloc(alloc));
 }

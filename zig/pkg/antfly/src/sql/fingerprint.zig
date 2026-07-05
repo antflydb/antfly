@@ -77,6 +77,20 @@ pub fn createIndexPlanGeneratedExpressionCount(plan: CreateIndexPlan) usize {
     return if (plan.generated_expression != null) 1 else 0;
 }
 
+fn createIndexPlanNativeAccessMethod(plan: CreateIndexPlan) ?[]const u8 {
+    if (plan.generated_expression != null) return "scalar_column";
+    return switch (plan.method) {
+        .gin => "algebraic_filter",
+        .btree => "ordered_tuple",
+        .antfly_full_text => "text_search",
+        .antfly_algebraic => "algebraic_filter",
+        .hnsw, .antfly_aknn => "embeddings",
+        .antfly_graph => "graph",
+        .antfly_graph_metric => "graph_metric",
+        .antfly_hybrid => "hybrid",
+    };
+}
+
 fn createIndexPlanGeneratedExpressionOp(plan: CreateIndexPlan) ?[]const u8 {
     const generated = plan.generated_expression orelse return null;
     return @tagName(generated.op);
@@ -1366,11 +1380,11 @@ fn ddlPayloadFingerprintAlloc(alloc: std.mem.Allocator, payload: FingerprintDdlP
             ),
         },
         .create_index => |plan| blk: {
-            const base = if (plan.method == .gin)
+            const base = if (createIndexPlanNativeAccessMethod(plan)) |method|
                 try std.fmt.allocPrint(
                     alloc,
-                    "ddl:create_index:table={s}:columns={d}:expr={d}:generated_expr={d}:where={d}:unique={}:if_not_exists={}:method=gin",
-                    .{ plan.table_name, plan.columns.len, plan.expressions.len, createIndexPlanGeneratedExpressionCount(plan), plan.where.len, plan.unique, plan.if_not_exists },
+                    "ddl:create_index:table={s}:columns={d}:expr={d}:generated_expr={d}:where={d}:unique={}:if_not_exists={}:method={s}",
+                    .{ plan.table_name, plan.columns.len, plan.expressions.len, createIndexPlanGeneratedExpressionCount(plan), plan.where.len, plan.unique, plan.if_not_exists, method },
                 )
             else
                 try std.fmt.allocPrint(
@@ -2111,7 +2125,7 @@ fn logicalDdlPlanParsedSqlForFingerprintTestAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
 ) !binder.LogicalSqlPlan {
-    return try ddl_plan.parseLogicalDdlPlanAlloc(alloc, parsed_sql, .{});
+    return try ddl_plan.logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, .{});
 }
 
 test "sql adapter ddl fingerprint owns catalog-only ddl surfaces" {

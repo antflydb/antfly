@@ -1162,6 +1162,20 @@ metadata apply path enforces the same owner-range readiness gate for direct
 promotion commands, so stale or incomplete rebuild evidence cannot bypass the
 worker's promotion checks.
 
+The durable runtime schema carries this through `TableSchema.relational_indexes`.
+Each entry records stable index identity, owner kind (`relational_column` or
+`unique_constraint`), owner name, access method, uniqueness, indexed columns,
+expression keys, include columns, ordered key parts, lifecycle, generation,
+schema fingerprint, field predicates, and expression predicates. Existing
+column-backed and unique-constraint-backed fields remain schema inputs while
+write maintenance, planning, rebuild, repair, and SQL catalog surfaces migrate
+to the first-class index catalog. Planner code should consume the catalog entry
+as the capability boundary instead of inferring access method behavior from
+column key shape. Runtime consumers that still iterate owner columns must first
+synthesize the effective index metadata from `TableSchema.relational_indexes`;
+duplicating access-method, lifecycle, predicate, key, or include metadata onto
+the owner column is a compatibility projection, not the durable source of truth.
+
 Rebuild progress is durable owner-range state, not local worker memory. Each
 secondary-index rebuild range records the access identity, row-key span, group
 owner, lifecycle state, lease owner/expiry, attempts, completed row count,
@@ -2951,11 +2965,13 @@ Non-unique expression access paths use stored generated columns as the canonical
 model-level representation. For example, a SQL adapter lowers
 `CREATE INDEX users_lower_email_idx ON users (lower(email))` into a generated
 relational column such as `"email_lc": { "type": "keyword", "generated": {
-"op": "lower", "field": "email" } }`; because generated columns are ordinary
-packed-row columns, their column-major side rows are rebuilt, moved, repaired,
-and queried through the same path as hand-authored indexed columns. Predicate
-queries then target `email_lc = "ada@example.test"` in the typed request rather
-than carrying the SQL expression string through storage. Schema validation
+"op": "lower", "field": "email" }, "x-antfly-index-access-method":
+"ordered_tuple", "x-antfly-index-keys": [{ "column": "email_lc" }] }`;
+because generated columns are ordinary packed-row columns, their ordered-tuple
+side rows are rebuilt, moved, repaired, and queried through the same lifecycle
+as hand-authored indexed columns. Predicate queries then target
+`email_lc = "ada@example.test"` in the typed request rather than carrying the
+SQL expression string through storage. Schema validation
 checks each expression, dependency tracking records the base columns it reads,
 writes evaluate expression values from the committed row, and
 index/unique-owner maintenance uses those computed values in the same 2PC path
@@ -5250,24 +5266,32 @@ production hardening is durable cross-node fan-out, transaction commit ordering,
 wakeup delivery APIs, backpressure, retry, and authorization policy around those
 native channel events.
 
-Schema namespace syntax is only adapter-only when it is proven boilerplate for
-the default `public` namespace, such as `CREATE SCHEMA IF NOT EXISTS public`.
-Non-public `CREATE SCHEMA`, `ALTER SCHEMA ... RENAME TO`, and `DROP SCHEMA`
-tails parse in `sql/grammar.zig` and lower to typed
-schema-namespace catalog intents that record the namespace name, idempotence
-flag, rename target, and cascade/drop metadata. Metadata has
-first-class database and namespace records, table records carry
-`database_name` and `namespace_name`, default table APIs resolve through
+Schema namespace syntax is not adapter-only. `CREATE SCHEMA`, `ALTER SCHEMA ...
+RENAME TO`, and `DROP SCHEMA` tails parse in `sql/grammar.zig` and lower to
+typed schema-namespace catalog intents that record the namespace name,
+idempotence flag, rename target, and cascade/drop metadata. Metadata has
+first-class database and namespace records, table records carry `database_name`
+and `namespace_name`, default table APIs resolve through
 `default/public/<table>`, and non-default table identity derives separate table
-and range ids instead of flattening namespaces into table-name strings. Basic
-schema-namespace DDL application creates, renames, and drops default-database
-namespace records through typed catalog operations, rewrites table namespace
-identity on namespace rename, rejects non-empty restrict drops, and fails closed
-for cascade drops until dependent-object cleanup is durable. Richer object-name
-resolution rules, dependency tracking, authorization boundaries, and catalog
-promotion behavior remain production work. `public.` qualification can keep
-lowering away at the adapter boundary, but non-public namespaces must not be
-flattened into table-name strings. The durable
+and range ids instead of flattening namespaces into table-name strings. Durable
+schema-namespace DDL application creates, renames, and drops existing-database
+namespace records through typed metadata catalog operations, treats idempotent
+default `public` creates as catalog no-ops when the namespace already exists,
+rewrites table namespace identity on namespace rename, rejects missing target
+databases, rejects non-empty restrict drops, and applies cascade drops through
+durable cleanup of namespace-owned tables, table-owned sequences, standalone
+namespace sequences, and foreign keys in surviving tables that reference the
+dropped namespace's tables. The older per-table schema JSON applicator still
+rejects schema-namespace DDL because namespace lifecycle is global catalog
+state, not a table-schema mutation. Catalog-backed SQL binding
+resolves explicit `schema.table` references exactly and resolves unqualified
+existing table/view references by walking the typed session `search_path` in
+order, returning the concrete `database / namespace / table` identity for
+schema lookup, read/write binding, DDL binding, authorization resource
+collection, and document-SQL view mapping. Dependency tracking, schema-wide
+authorization boundaries, and catalog promotion behavior remain production work.
+`public.` qualification can keep lowering away at the adapter boundary, but
+non-public namespaces must not be flattened into table-name strings. The durable
 product/catalog model is described in `DATABASES.md`: Antfly uses
 `database / namespace / table`, with existing `/tables/{table}` APIs resolving
 to the current/default database, the `public` namespace, and the requested
@@ -5596,8 +5620,8 @@ permissions, so future tables are not accidentally granted without an explicit
 catalog event. Multi-permission SQL grants and revokes are staged as one native
 auth-policy change batch and rollback on application failure, so expanded
 privileges do not leave partially-applied policy state. Non-public schema-wide
-targets fail closed until schema namespaces have first-class authorization
-semantics. A grant target that is
+authorization targets remain a separate authorization-policy slice even though
+schema-namespace catalog DDL itself is durable. A grant target that is
 already an Antfly user is applied directly to that user; otherwise SQL
 principals must resolve to a SQL-created `role:<name>` subject instead of being
 created implicitly by `GRANT`. `ALTER ROLE ... SET app.<key> = 'value'`

@@ -678,14 +678,14 @@ pub fn runtimeSchemaForCatalogTableWithSessionAlloc(
     table_name: []const u8,
     session: catalog_resources.SqlCatalogSession,
 ) !runtime_schema.TableSchema {
-    const target = try session.tableTargetFromObjectName(table_name);
-    return try runtimeSchemaForQualifiedCatalogTableAlloc(
-        alloc,
-        catalog,
-        target.database_name,
-        target.namespace_name,
-        target.table_name,
-    );
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const resolved = try resolvedExistingCatalogTableForObjectNameAlloc(alloc, &snapshot, table_name, session) orelse return error.InvalidSqlCatalog;
+    defer deinitCatalogTableRef(alloc, resolved.target);
+    if (resolved.table.schema_json.len == 0) return error.InvalidSqlCatalog;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, resolved.table.schema_json);
+    defer parsed.deinit(alloc);
+    return try schema_api.deriveRuntimeTableSchema(alloc, parsed);
 }
 
 fn ownedCatalogTableRefForObjectNameAlloc(
@@ -711,6 +711,38 @@ fn deinitCatalogTableRef(alloc: std.mem.Allocator, target: source_binding.Catalo
     alloc.free(@constCast(target.database_name));
     alloc.free(@constCast(target.namespace_name));
     alloc.free(@constCast(target.table_name));
+}
+
+const ResolvedCatalogTable = struct {
+    target: source_binding.CatalogTableRef,
+    table: metadata_table_manager.TableRecord,
+};
+
+fn resolvedExistingCatalogTableForObjectNameAlloc(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    table_name: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+) !?ResolvedCatalogTable {
+    const parsed_target = try session.tableTargetFromObjectName(table_name);
+    if (std.mem.indexOfScalar(u8, table_name, '.') != null) {
+        const table = qualifiedTableRecord(snapshot, parsed_target.database_name, parsed_target.namespace_name, parsed_target.table_name) orelse return null;
+        return .{
+            .target = try catalogTableRefForTableRecordAlloc(alloc, table),
+            .table = table,
+        };
+    }
+
+    const default_search_path: []const []const u8 = &.{catalog_resources.default_namespace_name};
+    const search_path = if (session.search_path.len == 0) default_search_path else session.search_path;
+    for (search_path) |namespace_name| {
+        const table = qualifiedTableRecord(snapshot, session.currentDatabase(), namespace_name, table_name) orelse continue;
+        return .{
+            .target = try catalogTableRefForTableRecordAlloc(alloc, table),
+            .table = table,
+        };
+    }
+    return null;
 }
 
 fn cloneCatalogTableRefAlloc(alloc: std.mem.Allocator, target: source_binding.CatalogTableRef) !source_binding.CatalogTableRef {
@@ -914,23 +946,22 @@ fn boundCatalogObjectForCatalogTableAlloc(
     table_name: []const u8,
     session: catalog_resources.SqlCatalogSession,
 ) !BoundCatalogObject {
-    const target = try ownedCatalogTableRefForObjectNameAlloc(alloc, table_name, session);
-    errdefer deinitCatalogTableRef(alloc, target);
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
-    const table = qualifiedTableRecord(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.TableNotFound;
-    if (table.schema_json.len == 0) return error.InvalidSqlCatalog;
-    var parsed = try schema_api.parseValidatedTableSchema(alloc, table.schema_json);
+    const resolved = try resolvedExistingCatalogTableForObjectNameAlloc(alloc, &snapshot, table_name, session) orelse return error.TableNotFound;
+    errdefer deinitCatalogTableRef(alloc, resolved.target);
+    if (resolved.table.schema_json.len == 0) return error.InvalidSqlCatalog;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, resolved.table.schema_json);
     defer parsed.deinit(alloc);
     const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
     defer runtime_schema.freeSchema(alloc, schema);
     return .{
         .role = role,
-        .target = target,
+        .target = resolved.target,
         .family = source_binding.familyForRuntimeSchema(schema),
         .schema_version = schema.version,
-        .table_id = table.table_id,
-        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json),
+        .table_id = resolved.table.table_id,
+        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(resolved.table.schema_json),
     };
 }
 
@@ -1157,20 +1188,17 @@ fn sourceBindingForCatalogTableWithSessionAlloc(
     session: catalog_resources.SqlCatalogSession,
     allow_document_view: bool,
 ) !source_binding.SqlSourceBinding {
-    const requested_target = try ownedCatalogTableRefForObjectNameAlloc(alloc, table_name, session);
-    errdefer deinitCatalogTableRef(alloc, requested_target);
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
-    if (qualifiedTableRecord(&snapshot, requested_target.database_name, requested_target.namespace_name, requested_target.table_name)) |table| {
-        return try sourceBindingForCatalogTableRecordAlloc(alloc, requested_target, table);
+    if (try resolvedExistingCatalogTableForObjectNameAlloc(alloc, &snapshot, table_name, session)) |resolved| {
+        errdefer deinitCatalogTableRef(alloc, resolved.target);
+        return try sourceBindingForCatalogTableRecordAlloc(alloc, resolved.target, resolved.table);
     }
     if (!allow_document_view) return error.InvalidSqlCatalog;
-    const source_table = try documentSqlViewSourceTableRecordAlloc(alloc, &snapshot, requested_target) orelse return error.InvalidSqlCatalog;
+    const source_table = try documentSqlViewSourceTableRecordForObjectNameAlloc(alloc, &snapshot, table_name, session) orelse return error.InvalidSqlCatalog;
     const source_target = try catalogTableRefForTableRecordAlloc(alloc, source_table);
     errdefer deinitCatalogTableRef(alloc, source_target);
-    const binding = try sourceBindingForCatalogTableRecordAlloc(alloc, source_target, source_table);
-    deinitCatalogTableRef(alloc, requested_target);
-    return binding;
+    return try sourceBindingForCatalogTableRecordAlloc(alloc, source_target, source_table);
 }
 
 fn sourceBindingForCatalogTableRecordAlloc(
@@ -1224,18 +1252,47 @@ fn documentSqlViewSourceTableRecordAlloc(
     return null;
 }
 
+fn documentSqlViewSourceTableRecordForObjectNameAlloc(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    table_name: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+) !?metadata_table_manager.TableRecord {
+    const parsed_target = try session.tableTargetFromObjectName(table_name);
+    if (std.mem.indexOfScalar(u8, table_name, '.') != null) {
+        return try documentSqlViewSourceTableRecordAlloc(alloc, snapshot, .{
+            .database_name = parsed_target.database_name,
+            .namespace_name = parsed_target.namespace_name,
+            .table_name = parsed_target.table_name,
+        });
+    }
+
+    const default_search_path: []const []const u8 = &.{catalog_resources.default_namespace_name};
+    const search_path = if (session.search_path.len == 0) default_search_path else session.search_path;
+    for (search_path) |namespace_name| {
+        const source_table = try documentSqlViewSourceTableRecordAlloc(alloc, snapshot, .{
+            .database_name = session.currentDatabase(),
+            .namespace_name = namespace_name,
+            .table_name = table_name,
+        }) orelse continue;
+        return source_table;
+    }
+    return null;
+}
+
 fn rejectDocumentSqlViewWriteTargetAlloc(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
     table_name: []const u8,
     session: catalog_resources.SqlCatalogSession,
 ) !void {
-    const requested_target = try ownedCatalogTableRefForObjectNameAlloc(alloc, table_name, session);
-    defer deinitCatalogTableRef(alloc, requested_target);
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
-    if (qualifiedTableRecord(&snapshot, requested_target.database_name, requested_target.namespace_name, requested_target.table_name) != null) return;
-    if (try documentSqlViewSourceTableRecordAlloc(alloc, &snapshot, requested_target) != null) return error.DocumentSqlWriteUnsupported;
+    if (try resolvedExistingCatalogTableForObjectNameAlloc(alloc, &snapshot, table_name, session)) |resolved| {
+        deinitCatalogTableRef(alloc, resolved.target);
+        return;
+    }
+    if (try documentSqlViewSourceTableRecordForObjectNameAlloc(alloc, &snapshot, table_name, session) != null) return error.DocumentSqlWriteUnsupported;
 }
 
 fn catalogTableRefForTableRecordAlloc(alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord) !source_binding.CatalogTableRef {
@@ -1571,11 +1628,9 @@ fn requireParsedCatalogReadStatement(statement: tokenized.ParsedStatement) !void
 }
 
 fn requireParsedCatalogReadStatementIncludingGeneratedAst(parsed_sql: *const tokenized.ParsedSql) !void {
-    if (parsed_sql.generatedStatementKind() == .read) {
-        _ = parsed_sql.generatedReadStatementKind() orelse return error.UnsupportedSqlShape;
-        return;
-    }
     try requireParsedCatalogReadStatement(parsed_sql.statement);
+    if (parsed_sql.generatedStatementKind() != .read) return error.UnsupportedSqlShape;
+    _ = parsed_sql.generatedReadStatementKind() orelse return error.UnsupportedSqlShape;
 }
 
 fn requireParsedCatalogWriteStatement(statement: tokenized.ParsedStatement) !void {
@@ -1583,6 +1638,12 @@ fn requireParsedCatalogWriteStatement(statement: tokenized.ParsedStatement) !voi
         .write => {},
         else => return error.UnsupportedSqlShape,
     }
+}
+
+fn requireParsedCatalogWriteStatementIncludingGeneratedAst(parsed_sql: *const tokenized.ParsedSql) !void {
+    try requireParsedCatalogWriteStatement(parsed_sql.statement);
+    if (parsed_sql.generatedStatementKind() != .dml) return error.UnsupportedSqlShape;
+    _ = parsed_sql.writeStatementIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
 }
 
 fn requireParsedDdlStatement(statement: tokenized.ParsedStatement) !void {
@@ -1966,10 +2027,8 @@ pub fn insertSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed
         },
         else => return error.UnsupportedSqlShape,
     }
-    if (try generatedDmlAstForParsedSql(parsed_sql)) |dml_ast| {
-        return try insertSourceTableNamesFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast);
-    }
-    return try insertSourceTableNamesFromTokensAlloc(alloc, parsed_sql.items());
+    const dml_ast = (try generatedDmlAstForParsedSql(parsed_sql)) orelse return error.UnsupportedSqlShape;
+    return try insertSourceTableNamesFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast);
 }
 
 fn generatedDmlAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) !?*const generated_parser.GeneratedSqlDmlAst {
@@ -2150,13 +2209,6 @@ fn normalizeGeneratedDmlCteBodyTargetNameAlloc(
     return try normalizeGeneratedSingleIdentifierAlloc(alloc, tokens, rebased);
 }
 
-fn insertSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?InsertSourceTableNames {
-    if (tokens.len == 0 or tokens[0].kind != .identifier) return null;
-    if (tokens[0].matchesKeywordTag(.with)) return try insertSourceTableNamesFromWithAlloc(alloc, tokens);
-    if (!tokens[0].matchesKeywordTag(.insert)) return null;
-    return try insertSourceTableNamesFromInsertAlloc(alloc, tokens, 0);
-}
-
 pub fn recursiveInsertSourceTableNamesFromParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
@@ -2167,10 +2219,8 @@ pub fn recursiveInsertSourceTableNamesFromParsedSqlAlloc(
         },
         else => return error.UnsupportedSqlShape,
     }
-    if (try generatedDmlAstForParsedSql(parsed_sql)) |dml_ast| {
-        return try recursiveInsertSourceTableNamesFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast);
-    }
-    return try recursiveInsertSourceTableNamesFromTokensAlloc(alloc, parsed_sql.items());
+    const dml_ast = (try generatedDmlAstForParsedSql(parsed_sql)) orelse return error.UnsupportedSqlShape;
+    return try recursiveInsertSourceTableNamesFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast);
 }
 
 fn recursiveInsertSourceTableNamesFromGeneratedDmlAstAlloc(
@@ -2226,58 +2276,11 @@ fn recursiveInsertSourceTableNamesFromGeneratedDmlAstAlloc(
     };
 }
 
-fn recursiveInsertSourceTableNamesFromTokensAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-) !?InsertSourceTableNames {
-    if (tokens.len == 0 or tokens[0].kind != .identifier) return null;
-    if (!tokens[0].matchesKeywordTag(.with)) return null;
-    var index: usize = 1;
-    if (!consumeKeyword(tokens, &index, .recursive)) return null;
-    if (index >= tokens.len or tokens[index].kind != .identifier) return null;
-    index += 1;
-    if (index < tokens.len and tokens[index].kind == .lparen) {
-        index = (findMatchingRParenIndex(tokens, index) orelse return null) + 1;
-    }
-    if (!consumeKeyword(tokens, &index, .as)) return null;
-    parser.consumeCteMaterializationHint(tokens, &index) catch return null;
-    if (index >= tokens.len or tokens[index].kind != .lparen) return null;
-
-    const body_start = index + 1;
-    const body_end = findMatchingRParenIndex(tokens, index) orelse return null;
-    const body = tokens[body_start..body_end];
-    const from_index = findTopLevelKeyword(body, .from) orelse return null;
-    var source_index = body_start + from_index + 1;
-    _ = consumeKeyword(tokens, &source_index, .only);
-    if (source_index >= body_end or tokens[source_index].kind != .identifier) return null;
-    const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_index].text);
-    var source_transferred = false;
-    defer if (!source_transferred) alloc.free(source);
-
-    index = body_end + 1;
-    if (!consumeKeyword(tokens, &index, .insert)) return null;
-    if (!consumeKeyword(tokens, &index, .into)) return null;
-    _ = consumeKeyword(tokens, &index, .only);
-    if (index >= tokens.len or tokens[index].kind != .identifier) return null;
-    const target = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[index].text);
-    errdefer alloc.free(target);
-
-    source_transferred = true;
-    return .{
-        .target = target,
-        .source = source,
-    };
-}
-
 pub fn joinedWriteSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_sql: *const tokenized.ParsedSql) !?InsertSourceTableNames {
     const tokens = parsed_sql.items();
-    const raw = parsed_sql.statement.raw();
-    if (raw.token_start >= raw.token_end or raw.token_end > tokens.len) return error.UnsupportedSqlShape;
-    const statement_tokens = tokens[raw.token_start..raw.token_end];
-    const final_statement_index = writeFinalStatementIndex(statement_tokens) orelse return error.UnsupportedSqlShape;
     const statement_kind = switch (parsed_sql.statement) {
         .write => |statement| statement.kind,
-        else => writeStatementKindFromFinalStatementTokens(statement_tokens, final_statement_index) orelse return error.UnsupportedSqlShape,
+        else => return error.UnsupportedSqlShape,
     };
     switch (statement_kind) {
         .update,
@@ -2293,10 +2296,8 @@ pub fn joinedWriteSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, p
         .truncate,
         => return null,
     }
-    if (try generatedDmlAstForParsedSql(parsed_sql)) |dml_ast| {
-        return try joinedWriteSourceTableNamesFromGeneratedDmlAstAlloc(alloc, tokens, dml_ast);
-    }
-    return try joinedWriteSourceTableNamesFromTokensAlloc(alloc, statement_tokens);
+    const dml_ast = (try generatedDmlAstForParsedSql(parsed_sql)) orelse return error.UnsupportedSqlShape;
+    return try joinedWriteSourceTableNamesFromGeneratedDmlAstAlloc(alloc, tokens, dml_ast);
 }
 
 fn joinedWriteSourceTableNamesFromGeneratedDmlAstAlloc(
@@ -2370,12 +2371,8 @@ fn joinedWriteSourceTableNamesFromGeneratedDmlCteAstAlloc(
 
 pub fn writeTargetTableNameFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_sql: *const tokenized.ParsedSql) ![]const u8 {
     const tokens = parsed_sql.items();
-    const raw = parsed_sql.statement.raw();
-    if (raw.token_start >= raw.token_end or raw.token_end > tokens.len) return error.UnsupportedSqlShape;
-    if (try generatedDmlAstForParsedSql(parsed_sql)) |dml_ast| {
-        return try writeTargetTableNameFromGeneratedDmlAstAlloc(alloc, tokens, dml_ast);
-    }
-    return try writeTargetTableNameFromTokensAlloc(alloc, tokens[raw.token_start..raw.token_end]);
+    const dml_ast = (try generatedDmlAstForParsedSql(parsed_sql)) orelse return error.UnsupportedSqlShape;
+    return try writeTargetTableNameFromGeneratedDmlAstAlloc(alloc, tokens, dml_ast);
 }
 
 fn writeTargetTableNameFromGeneratedDmlAstAlloc(
@@ -2441,85 +2438,6 @@ fn generatedDmlCommandTokenMatchesKind(token: Token, kind: generated_parser.Gene
     };
 }
 
-fn writeTargetTableNameFromTokensAlloc(alloc: std.mem.Allocator, statement_tokens: []const Token) ![]const u8 {
-    var pos = writeFinalStatementIndex(statement_tokens) orelse return error.UnsupportedSqlShape;
-    const statement_kind = writeStatementKindFromFinalStatementTokens(statement_tokens, pos) orelse return error.UnsupportedSqlShape;
-    switch (statement_kind) {
-        .insert, .insert_source => {
-            if (!consumeKeyword(statement_tokens, &pos, .insert)) return error.UnsupportedSqlShape;
-            if (!consumeKeyword(statement_tokens, &pos, .into)) return error.UnsupportedSqlShape;
-            _ = consumeKeyword(statement_tokens, &pos, .only);
-        },
-        .update, .update_source, .update_joined_source => {
-            if (!consumeKeyword(statement_tokens, &pos, .update)) return error.UnsupportedSqlShape;
-            _ = consumeKeyword(statement_tokens, &pos, .only);
-        },
-        .delete, .delete_source, .delete_joined_source => {
-            if (!consumeKeyword(statement_tokens, &pos, .delete)) return error.UnsupportedSqlShape;
-            if (!consumeKeyword(statement_tokens, &pos, .from)) return error.UnsupportedSqlShape;
-            _ = consumeKeyword(statement_tokens, &pos, .only);
-        },
-        .truncate => {
-            if (!consumeKeyword(statement_tokens, &pos, .truncate)) return error.UnsupportedSqlShape;
-            _ = consumeKeyword(statement_tokens, &pos, .table);
-            _ = consumeKeyword(statement_tokens, &pos, .only);
-        },
-        .merge => {
-            if (!consumeKeyword(statement_tokens, &pos, .merge)) return error.UnsupportedSqlShape;
-            _ = consumeKeyword(statement_tokens, &pos, .into);
-            _ = consumeKeyword(statement_tokens, &pos, .only);
-        },
-    }
-    if (pos >= statement_tokens.len or statement_tokens[pos].kind != .identifier) return error.UnsupportedSqlShape;
-    return try normalizeSqlObjectIdentifierAlloc(alloc, statement_tokens[pos].text);
-}
-
-fn writeStatementKindFromFinalStatementTokens(tokens: []const Token, pos: usize) ?sql_statement_kind.SqlWriteStatementKind {
-    if (pos >= tokens.len or tokens[pos].kind != .identifier) return null;
-    if (tokens[pos].matchesKeywordTag(.insert)) return .insert_source;
-    if (tokens[pos].matchesKeywordTag(.update)) return .update_joined_source;
-    if (tokens[pos].matchesKeywordTag(.delete)) return .delete_joined_source;
-    if (tokens[pos].matchesKeywordTag(.truncate)) return .truncate;
-    if (tokens[pos].matchesKeywordTag(.merge)) return .merge;
-    return null;
-}
-
-fn writeFinalStatementIndex(tokens: []const Token) ?usize {
-    if (tokens.len == 0 or tokens[0].kind != .identifier) return null;
-    if (!tokens[0].matchesKeywordTag(.with)) return 0;
-
-    var index: usize = 1;
-    _ = consumeKeyword(tokens, &index, .recursive);
-    while (true) {
-        if (index >= tokens.len or tokens[index].kind != .identifier) return null;
-        index += 1;
-        if (index < tokens.len and tokens[index].kind == .lparen) {
-            index = (findMatchingRParenIndex(tokens, index) orelse return null) + 1;
-        }
-        if (!consumeKeyword(tokens, &index, .as)) return null;
-        if (consumeKeyword(tokens, &index, .not)) {
-            if (!consumeKeyword(tokens, &index, .materialized)) return null;
-        } else {
-            _ = consumeKeyword(tokens, &index, .materialized);
-        }
-        if (index >= tokens.len or tokens[index].kind != .lparen) return null;
-        index = (findMatchingRParenIndex(tokens, index) orelse return null) + 1;
-        if (index < tokens.len and tokens[index].kind == .comma) {
-            index += 1;
-            continue;
-        }
-        break;
-    }
-    if (index >= tokens.len or tokens[index].kind != .identifier) return null;
-    return index;
-}
-
-fn joinedWriteSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?InsertSourceTableNames {
-    if (tokens.len == 0 or tokens[0].kind != .identifier) return null;
-    if (tokens[0].matchesKeywordTag(.with)) return try joinedWriteSourceTableNamesFromWithAlloc(alloc, tokens);
-    return try joinedWriteSourceTableNamesFromStatementAlloc(alloc, tokens, 0);
-}
-
 pub fn bindWritePlanCatalogStatementAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
@@ -2547,7 +2465,7 @@ pub fn bindWritePlanCatalogStatementWithSessionAndAuthorizationAlloc(
     session: catalog_resources.SqlCatalogSession,
     authorization_options: BoundSqlAuthorizationOptions,
 ) !BoundSqlStatement {
-    try requireParsedCatalogWriteStatement(parsed_sql.statement);
+    try requireParsedCatalogWriteStatementIncludingGeneratedAst(parsed_sql);
     var bound_session = try BoundSqlSession.fromSessionAlloc(alloc, session);
     errdefer bound_session.deinit(alloc);
     var resolved = try resolveWritePlanCatalogOptionsFromParsedSqlWithSessionAndAuthorizationAlloc(alloc, parsed_sql, options, catalog, session, authorization_options);
@@ -2576,7 +2494,7 @@ fn resolveWritePlanCatalogOptionsParsedSqlWithSessionAlloc(
     catalog: table_catalog.CatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !CatalogBoundWritePlanOptions {
-    try requireParsedCatalogWriteStatement(parsed_sql.statement);
+    try requireParsedCatalogWriteStatementIncludingGeneratedAst(parsed_sql);
     return try resolveWritePlanCatalogOptionsFromParsedSqlWithSessionAlloc(alloc, parsed_sql, options, catalog, session);
 }
 
@@ -3058,11 +2976,11 @@ fn validateMaintenanceClusterIndexAlloc(
     session: catalog_resources.SqlCatalogSession,
 ) !void {
     const index_name = cluster.index_name orelse return;
-    const target = try ownedCatalogTableRefForObjectNameAlloc(alloc, cluster.table_name, session);
-    defer deinitCatalogTableRef(alloc, target);
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
-    const table = qualifiedTableRecord(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.InvalidSqlCatalog;
+    const resolved = try resolvedExistingCatalogTableForObjectNameAlloc(alloc, &snapshot, cluster.table_name, session) orelse return error.InvalidSqlCatalog;
+    defer deinitCatalogTableRef(alloc, resolved.target);
+    const table = resolved.table;
     const index_table = try catalogTableForIndexNameAlloc(alloc, &snapshot, index_name, session);
     if (table.table_id != index_table.table_id or
         !std.mem.eql(u8, table.database_name, index_table.database_name) or
@@ -3128,7 +3046,7 @@ fn resolveDdlCatalogFactsFromParsedSqlWithSessionAndAuthorizationAlloc(
     function_bindings: expr_row_parse.SqlFunctionBindings,
     authorization_options: BoundSqlAuthorizationOptions,
 ) !CatalogBoundDdlPlanFacts {
-    var logical_plan = try ddl_plan.parseLogicalDdlPlanAlloc(alloc, parsed_sql, function_bindings);
+    var logical_plan = try ddl_plan.logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
     errdefer logical_plan.deinit(alloc);
     var out = CatalogBoundDdlPlanFacts{
         .bound_objects = try collectDdlBoundCatalogObjectsAlloc(alloc, catalog, logical_plan, session),
@@ -3249,206 +3167,10 @@ pub fn bindDdlStatementAlloc(
     return try bindDdlStatementWithSessionAlloc(alloc, parsed_sql, catalog_resources.SqlCatalogSession.default());
 }
 
-fn joinedWriteSourceTableNamesFromStatementAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    statement_index: usize,
-) !?InsertSourceTableNames {
-    if (statement_index >= tokens.len or tokens[statement_index].kind != .identifier) return null;
-    if (tokens[statement_index].matchesKeywordTag(.update)) {
-        var target_index: usize = statement_index + 1;
-        _ = consumeKeyword(tokens, &target_index, .only);
-        if (target_index >= tokens.len or tokens[target_index].kind != .identifier) return error.UnsupportedSqlShape;
-        const target = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[target_index].text);
-        var target_transferred = false;
-        errdefer if (!target_transferred) alloc.free(target);
-
-        const from_index = findTopLevelKeyword(tokens[target_index + 1 ..], .from) orelse {
-            const where_index = findTopLevelKeyword(tokens[target_index + 1 ..], .where) orelse {
-                alloc.free(target);
-                return null;
-            };
-            const source = try joinedWriteSemiJoinSourceTableAlloc(alloc, tokens[target_index + 1 + where_index + 1 ..]) orelse {
-                alloc.free(target);
-                return null;
-            };
-            errdefer alloc.free(source);
-
-            target_transferred = true;
-            return .{ .target = target, .source = source };
-        };
-        var source_index = target_index + 1 + from_index + 1;
-        _ = consumeKeyword(tokens, &source_index, .only);
-        if (source_index >= tokens.len or tokens[source_index].kind != .identifier) return error.UnsupportedSqlShape;
-        const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_index].text);
-        errdefer alloc.free(source);
-
-        target_transferred = true;
-        return .{ .target = target, .source = source };
-    }
-
-    if (tokens[statement_index].matchesKeywordTag(.delete)) {
-        var target_index: usize = statement_index + 1;
-        if (!consumeKeyword(tokens, &target_index, .from)) return null;
-        _ = consumeKeyword(tokens, &target_index, .only);
-        if (target_index >= tokens.len or tokens[target_index].kind != .identifier) return error.UnsupportedSqlShape;
-        const target = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[target_index].text);
-        var target_transferred = false;
-        errdefer if (!target_transferred) alloc.free(target);
-
-        const using_index = findTopLevelKeyword(tokens[target_index + 1 ..], .using) orelse {
-            const where_index = findTopLevelKeyword(tokens[target_index + 1 ..], .where) orelse {
-                alloc.free(target);
-                return null;
-            };
-            const source = try joinedWriteSemiJoinSourceTableAlloc(alloc, tokens[target_index + 1 + where_index + 1 ..]) orelse {
-                alloc.free(target);
-                return null;
-            };
-            errdefer alloc.free(source);
-
-            target_transferred = true;
-            return .{ .target = target, .source = source };
-        };
-        var source_index = target_index + 1 + using_index + 1;
-        _ = consumeKeyword(tokens, &source_index, .only);
-        if (source_index >= tokens.len or tokens[source_index].kind != .identifier) return error.UnsupportedSqlShape;
-        const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_index].text);
-        errdefer alloc.free(source);
-
-        target_transferred = true;
-        return .{ .target = target, .source = source };
-    }
-
-    if (tokens[statement_index].matchesKeywordTag(.merge)) {
-        var target_index: usize = statement_index + 1;
-        if (!consumeKeyword(tokens, &target_index, .into)) return null;
-        _ = consumeKeyword(tokens, &target_index, .only);
-        if (target_index >= tokens.len or tokens[target_index].kind != .identifier) return error.UnsupportedSqlShape;
-        const target = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[target_index].text);
-        var target_transferred = false;
-        errdefer if (!target_transferred) alloc.free(target);
-
-        const using_index = findTopLevelKeyword(tokens[target_index + 1 ..], .using) orelse {
-            alloc.free(target);
-            return null;
-        };
-        var source_index = target_index + 1 + using_index + 1;
-        _ = consumeKeyword(tokens, &source_index, .only);
-        if (source_index >= tokens.len or tokens[source_index].kind != .identifier) return error.UnsupportedSqlShape;
-        const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_index].text);
-        errdefer alloc.free(source);
-
-        target_transferred = true;
-        return .{ .target = target, .source = source };
-    }
-
-    return null;
-}
-
-fn joinedWriteSemiJoinSourceTableAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-) !?[]const u8 {
-    var index: usize = 0;
-    while (index < tokens.len) : (index += 1) {
-        const token = tokens[index];
-        if (token.kind == .semicolon) return null;
-        if (token.kind != .lparen) continue;
-
-        const close_index = findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape;
-        const is_exists = index > 0 and tokens[index - 1].matchesKeywordTag(.exists);
-        const is_in = index > 0 and tokens[index - 1].matchesKeywordTag(.in);
-        if (is_exists or is_in) {
-            const body = tokens[index + 1 .. close_index];
-            if (body.len > 0 and body[0].matchesKeywordTag(.select)) {
-                const from_index = findTopLevelKeyword(body, .from) orelse return error.UnsupportedSqlShape;
-                var source_index = from_index + 1;
-                _ = consumeKeyword(body, &source_index, .only);
-                if (source_index >= body.len or body[source_index].kind != .identifier) return error.UnsupportedSqlShape;
-                return try normalizeSqlObjectIdentifierAlloc(alloc, body[source_index].text);
-            }
-        }
-
-        index = close_index;
-    }
-    return null;
-}
-
-fn joinedWriteSourceTableNamesFromWithAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-) !?InsertSourceTableNames {
-    var index: usize = 1;
-    _ = consumeKeyword(tokens, &index, .recursive);
-
-    var cte_bindings = std.ArrayListUnmanaged(CteSourceBinding).empty;
-    defer {
-        for (cte_bindings.items) |*binding| binding.deinit(alloc);
-        cte_bindings.deinit(alloc);
-    }
-
-    while (true) {
-        if (index >= tokens.len or tokens[index].kind != .identifier) return error.UnsupportedSqlShape;
-        const cte_name = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[index].text);
-        var cte_name_transferred = false;
-        errdefer if (!cte_name_transferred) alloc.free(cte_name);
-        if (cteBindingIndex(cte_bindings.items, cte_name) != null) return error.UnsupportedSqlShape;
-        index += 1;
-
-        if (index < tokens.len and tokens[index].kind == .lparen) {
-            index = (findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape) + 1;
-        }
-        if (!consumeKeyword(tokens, &index, .as)) return error.UnsupportedSqlShape;
-        try parser.consumeCteMaterializationHint(tokens, &index);
-        if (index >= tokens.len or tokens[index].kind != .lparen) return error.UnsupportedSqlShape;
-        const close_index = findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape;
-        if (index + 1 >= close_index) return error.UnsupportedSqlShape;
-
-        const cte_source = cte_source: {
-            var cte_tables = selectReadTableNamesAlloc(alloc, tokens[index + 1 .. close_index], 0) catch |err| switch (err) {
-                error.UnsupportedSqlShape => null,
-                else => return err,
-            };
-            if (cte_tables) |*tables| {
-                defer tables.deinit(alloc);
-                try resolveSelectReadTablesAgainstCtes(alloc, cte_bindings.items, tables);
-                if (tables.source) |source| {
-                    if (!std.mem.eql(u8, tables.left, source) and !std.mem.eql(u8, cte_name, source)) return error.UnsupportedSqlShape;
-                }
-                break :cte_source try alloc.dupe(u8, tables.left);
-            }
-            break :cte_source try writeTargetTableNameFromTokensAlloc(alloc, tokens[index + 1 .. close_index]);
-        };
-        errdefer alloc.free(cte_source);
-
-        try cte_bindings.append(alloc, .{
-            .name = cte_name,
-            .source = cte_source,
-        });
-        cte_name_transferred = true;
-
-        index = close_index + 1;
-        if (index < tokens.len and tokens[index].kind == .comma) {
-            index += 1;
-            continue;
-        }
-        break;
-    }
-
-    var final = (try joinedWriteSourceTableNamesFromStatementAlloc(alloc, tokens, index)) orelse return null;
-    errdefer final.deinit(alloc);
-    final.target = try resolveTableNameAgainstCtesAlloc(alloc, cte_bindings.items, final.target);
-    final.source = try resolveTableNameAgainstCtesAlloc(alloc, cte_bindings.items, final.source);
-    return final;
-}
-
 pub fn readSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_sql: *const tokenized.ParsedSql) !?ReadSourceTableNames {
     try requireParsedCatalogReadStatementIncludingGeneratedAst(parsed_sql);
-    if (try generatedReadAstForParsedSql(parsed_sql)) |read_ast| {
-        return try readSourceTableNamesFromGeneratedReadAstAlloc(alloc, parsed_sql.items(), read_ast);
-    }
-    return try readSourceTableNamesFromTokensAlloc(alloc, parsed_sql.items());
+    const read_ast = (try generatedReadAstForParsedSql(parsed_sql)) orelse return error.UnsupportedSqlShape;
+    return try readSourceTableNamesFromGeneratedReadAstAlloc(alloc, parsed_sql.items(), read_ast);
 }
 
 fn generatedReadAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) !?*const generated_parser.GeneratedSqlReadAst {
@@ -3883,334 +3605,8 @@ fn normalizeGeneratedSingleIdentifierAlloc(
     return try normalizeSqlObjectIdentifierAlloc(alloc, tokens[range.start].text);
 }
 
-fn readSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?ReadSourceTableNames {
-    if (tokens.len == 0 or tokens[0].kind != .identifier) return null;
-    if (tokens[0].matchesKeywordTag(.with)) return try readSourceTableNamesFromWithAlloc(alloc, tokens);
-    if (!tokens[0].matchesKeywordTag(.select)) return null;
-    return try readSourceTableNamesFromSelectAlloc(alloc, tokens, 0);
-}
-
-fn readSourceTableNamesFromSelectAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    select_index: usize,
-) !?ReadSourceTableNames {
-    var tables = (try selectReadTableNamesAlloc(alloc, tokens, select_index)) orelse return null;
-    errdefer tables.deinit(alloc);
-    const source = tables.source orelse {
-        tables.deinit(alloc);
-        return null;
-    };
-    tables.source = null;
-    return .{ .left = tables.left, .source = source };
-}
-
-fn selectReadTableNamesAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    select_index: usize,
-) !?SelectReadTableNames {
-    if (select_index >= tokens.len or !tokens[select_index].matchesKeywordTag(.select)) return null;
-
-    const from_index = if (findTopLevelKeyword(tokens[select_index..], .from)) |relative|
-        select_index + relative
-    else
-        return null;
-    var left_index = from_index + 1;
-    _ = consumeKeyword(tokens, &left_index, .only);
-    if (left_index >= tokens.len or tokens[left_index].kind != .identifier) return error.UnsupportedSqlShape;
-    const left = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[left_index].text);
-    var left_transferred = false;
-    errdefer if (!left_transferred) alloc.free(left);
-
-    const join_index = if (findTopLevelKeyword(tokens[left_index + 1 ..], .join)) |relative|
-        left_index + 1 + relative
-    else {
-        if (try selectSetOperationSourceTableNameAlloc(alloc, tokens, left_index + 1)) |source| {
-            left_transferred = true;
-            return .{ .left = left, .source = source };
-        }
-        const source = try alloc.dupe(u8, left);
-        errdefer alloc.free(source);
-        left_transferred = true;
-        return .{ .left = left, .source = source };
-    };
-    var source_index = join_index + 1;
-    if (consumeKeyword(tokens, &source_index, .lateral)) {
-        if (source_index >= tokens.len or tokens[source_index].kind != .lparen) return error.UnsupportedSqlShape;
-        const close_index = findMatchingRParenIndex(tokens, source_index) orelse return error.UnsupportedSqlShape;
-        const inner_from = findTopLevelKeyword(tokens[source_index + 1 .. close_index], .from) orelse return error.UnsupportedSqlShape;
-        source_index = source_index + 1 + inner_from + 1;
-    }
-    _ = consumeKeyword(tokens, &source_index, .only);
-    if (source_index >= tokens.len or tokens[source_index].kind != .identifier) return error.UnsupportedSqlShape;
-    const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_index].text);
-    errdefer alloc.free(source);
-
-    left_transferred = true;
-    return .{ .left = left, .source = source };
-}
-
-fn selectSetOperationSourceTableNameAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    start_index: usize,
-) !?[]const u8 {
-    var depth: usize = 0;
-    var i = start_index;
-    while (i < tokens.len) : (i += 1) {
-        const token = tokens[i];
-        switch (token.kind) {
-            .lparen => depth += 1,
-            .rparen => {
-                if (depth == 0) return null;
-                depth -= 1;
-            },
-            .identifier => {
-                if (depth != 0 or !selectSetOperationKeyword(token)) continue;
-                var select_index = i + 1;
-                if (token.matchesKeywordTag(.@"union")) {
-                    _ = consumeKeyword(tokens, &select_index, .all) or consumeKeyword(tokens, &select_index, .distinct);
-                } else {
-                    _ = consumeKeyword(tokens, &select_index, .distinct);
-                }
-                if (select_index >= tokens.len or !tokens[select_index].matchesKeywordTag(.select)) {
-                    return error.UnsupportedSqlShape;
-                }
-                const from_relative = findTopLevelKeyword(tokens[select_index + 1 ..], .from) orelse return error.UnsupportedSqlShape;
-                var source_index = select_index + 1 + from_relative + 1;
-                _ = consumeKeyword(tokens, &source_index, .only);
-                if (source_index >= tokens.len or tokens[source_index].kind != .identifier) return error.UnsupportedSqlShape;
-                return try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_index].text);
-            },
-            else => {},
-        }
-    }
-    return null;
-}
-
-fn selectSetOperationKeyword(token: Token) bool {
-    return token.matchesKeywordTag(.@"union") or
-        token.matchesKeywordTag(.intersect) or
-        token.matchesKeywordTag(.except);
-}
-
-fn readSourceTableNamesFromWithAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-) !?ReadSourceTableNames {
-    var index: usize = 1;
-    const recursive = consumeKeyword(tokens, &index, .recursive);
-
-    var cte_bindings = std.ArrayListUnmanaged(CteSourceBinding).empty;
-    defer {
-        for (cte_bindings.items) |*binding| binding.deinit(alloc);
-        cte_bindings.deinit(alloc);
-    }
-
-    while (true) {
-        if (index >= tokens.len or tokens[index].kind != .identifier) return error.UnsupportedSqlShape;
-        const cte_name = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[index].text);
-        var cte_name_transferred = false;
-        errdefer if (!cte_name_transferred) alloc.free(cte_name);
-        if (cteBindingIndex(cte_bindings.items, cte_name) != null) return error.UnsupportedSqlShape;
-        index += 1;
-
-        if (index < tokens.len and tokens[index].kind == .lparen) {
-            index = (findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape) + 1;
-        }
-        if (!consumeKeyword(tokens, &index, .as)) return error.UnsupportedSqlShape;
-        try parser.consumeCteMaterializationHint(tokens, &index);
-        if (index >= tokens.len or tokens[index].kind != .lparen) return error.UnsupportedSqlShape;
-        const close_index = findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape;
-        if (index + 1 >= close_index) return error.UnsupportedSqlShape;
-
-        const cte_source = try readCteSourceTableNameAlloc(
-            alloc,
-            cte_bindings.items,
-            cte_name,
-            tokens[index + 1 .. close_index],
-            recursive,
-        );
-        errdefer alloc.free(cte_source);
-
-        try cte_bindings.append(alloc, .{
-            .name = cte_name,
-            .source = cte_source,
-        });
-        cte_name_transferred = true;
-
-        index = close_index + 1;
-        if (index < tokens.len and tokens[index].kind == .comma) {
-            index += 1;
-            continue;
-        }
-        break;
-    }
-
-    var final_tables = (try selectReadTableNamesAlloc(alloc, tokens, index)) orelse return null;
-    errdefer final_tables.deinit(alloc);
-    try resolveSelectReadTablesAgainstCtes(alloc, cte_bindings.items, &final_tables);
-    const source = final_tables.source orelse {
-        final_tables.deinit(alloc);
-        return null;
-    };
-    final_tables.source = null;
-    return .{ .left = final_tables.left, .source = source };
-}
-
-fn readCteSourceTableNameAlloc(
-    alloc: std.mem.Allocator,
-    bindings: []const CteSourceBinding,
-    cte_name: []const u8,
-    body_tokens: []const Token,
-    recursive: bool,
-) ![]const u8 {
-    const source_tokens = if (recursive) recursiveReadCteAnchorTokens(body_tokens) orelse body_tokens else body_tokens;
-    var cte_tables = (try selectReadTableNamesAlloc(alloc, source_tokens, 0)) orelse return error.UnsupportedSqlShape;
-    defer cte_tables.deinit(alloc);
-    try resolveSelectReadTablesAgainstCtes(alloc, bindings, &cte_tables);
-    if (cte_tables.source) |source| {
-        if (!std.mem.eql(u8, cte_tables.left, source)) return error.UnsupportedSqlShape;
-    }
-    if (recursive and std.mem.eql(u8, cte_tables.left, cte_name)) return error.UnsupportedSqlShape;
-    return try alloc.dupe(u8, cte_tables.left);
-}
-
-fn recursiveReadCteAnchorTokens(tokens: []const Token) ?[]const Token {
-    var depth: usize = 0;
-    for (tokens, 0..) |token, index| {
-        switch (token.kind) {
-            .lparen => depth += 1,
-            .rparen => {
-                if (depth == 0) return null;
-                depth -= 1;
-            },
-            .identifier => {
-                if (depth == 0 and selectSetOperationKeyword(token)) {
-                    if (index == 0) return null;
-                    return tokens[0..index];
-                }
-            },
-            else => {},
-        }
-    }
-    return null;
-}
-
 fn normalizeSqlObjectIdentifierAlloc(alloc: std.mem.Allocator, identifier: []const u8) ![]const u8 {
     return try grammar.normalizeSqlObjectIdentifierAlloc(alloc, identifier);
-}
-
-fn insertSourceTableNamesFromInsertAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    insert_index: usize,
-) !?InsertSourceTableNames {
-    if (insert_index >= tokens.len or !tokens[insert_index].matchesKeywordTag(.insert)) return null;
-    var index: usize = insert_index + 1;
-    if (!consumeKeyword(tokens, &index, .into)) return null;
-    _ = consumeKeyword(tokens, &index, .only);
-    if (index >= tokens.len or tokens[index].kind != .identifier) return error.UnsupportedSqlShape;
-    const target = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[index].text);
-    var target_transferred = false;
-    errdefer if (!target_transferred) alloc.free(target);
-    index += 1;
-
-    const select_index = findTopLevelKeyword(tokens[index..], .select) orelse {
-        alloc.free(target);
-        return null;
-    };
-    const absolute_select = index + select_index;
-    const from_index = findTopLevelKeyword(tokens[absolute_select + 1 ..], .from) orelse return error.UnsupportedSqlShape;
-    var source_index = absolute_select + 1 + from_index + 1;
-    _ = consumeKeyword(tokens, &source_index, .only);
-    if (source_index >= tokens.len or tokens[source_index].kind != .identifier) return error.UnsupportedSqlShape;
-    const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_index].text);
-    errdefer alloc.free(source);
-
-    target_transferred = true;
-    return .{ .target = target, .source = source };
-}
-
-fn insertSourceTableNamesFromWithAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-) !?InsertSourceTableNames {
-    var index: usize = 1;
-    if (consumeKeyword(tokens, &index, .recursive)) return error.UnsupportedSqlShape;
-
-    var cte_names = std.ArrayListUnmanaged([]const u8).empty;
-    defer {
-        for (cte_names.items) |name| alloc.free(name);
-        cte_names.deinit(alloc);
-    }
-    var base_source: ?[]const u8 = null;
-    errdefer if (base_source) |source| alloc.free(source);
-
-    while (true) {
-        if (index >= tokens.len or tokens[index].kind != .identifier) return error.UnsupportedSqlShape;
-        const cte_name = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[index].text);
-        var cte_name_transferred = false;
-        errdefer if (!cte_name_transferred) alloc.free(cte_name);
-        if (sqlStringSliceContains(cte_names.items, cte_name)) return error.UnsupportedSqlShape;
-        try cte_names.append(alloc, cte_name);
-        cte_name_transferred = true;
-        index += 1;
-
-        if (index < tokens.len and tokens[index].kind == .lparen) {
-            index = (findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape) + 1;
-        }
-        if (!consumeKeyword(tokens, &index, .as)) return error.UnsupportedSqlShape;
-        try parser.consumeCteMaterializationHint(tokens, &index);
-        if (index >= tokens.len or tokens[index].kind != .lparen) return error.UnsupportedSqlShape;
-        const close_index = findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape;
-        const from_index = findTopLevelKeyword(tokens[index + 1 .. close_index], .from) orelse return error.UnsupportedSqlShape;
-        var source_index = index + 1 + from_index + 1;
-        _ = consumeKeyword(tokens, &source_index, .only);
-        if (source_index >= close_index or tokens[source_index].kind != .identifier) return error.UnsupportedSqlShape;
-        const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_index].text);
-        var source_transferred = false;
-        errdefer if (!source_transferred) alloc.free(source);
-        if (!sqlStringSliceContains(cte_names.items, source)) {
-            if (base_source) |existing| {
-                if (!std.mem.eql(u8, existing, source)) return error.UnsupportedSqlShape;
-                alloc.free(source);
-            } else {
-                base_source = source;
-                source_transferred = true;
-            }
-        } else {
-            alloc.free(source);
-        }
-
-        index = close_index + 1;
-        if (index < tokens.len and tokens[index].kind == .comma) {
-            index += 1;
-            continue;
-        }
-        break;
-    }
-
-    var final = (try insertSourceTableNamesFromInsertAlloc(alloc, tokens, index)) orelse {
-        if (base_source) |source| alloc.free(source);
-        base_source = null;
-        return null;
-    };
-    errdefer final.deinit(alloc);
-    if (sqlStringSliceContains(cte_names.items, final.source)) {
-        const resolved_source = base_source orelse return error.UnsupportedSqlShape;
-        const target = final.target;
-        alloc.free(@constCast(final.source));
-        base_source = null;
-        return .{
-            .target = target,
-            .source = resolved_source,
-        };
-    }
-    if (base_source) |source| alloc.free(source);
-    base_source = null;
-    return final;
 }
 
 fn resolveSelectReadTablesAgainstCtes(
@@ -4258,13 +3654,6 @@ fn findMatchingRParenIndex(tokens: []const Token, lparen_index: usize) ?usize {
     return parser.findMatchingRParenIndex(tokens, lparen_index);
 }
 
-fn sqlStringSliceContains(items: []const []const u8, needle: []const u8) bool {
-    for (items) |item| {
-        if (std.mem.eql(u8, item, needle)) return true;
-    }
-    return false;
-}
-
 test "sql adapter binder resolves runtime schema from catalog table name" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -4284,6 +3673,15 @@ test "sql adapter binder resolves runtime schema from catalog table name" {
     defer runtime_schema.freeSchema(alloc, tenant_runtime);
     try std.testing.expectEqual(runtime_schema.StorageMode.relational, tenant_runtime.storage_mode);
     try std.testing.expectEqual(@as(usize, 1), tenant_runtime.relational_columns.len);
+
+    const fallback_search_path = [_][]const u8{ "tenant_missing", "public" };
+    const fallback_runtime = try runtimeSchemaForCatalogTableWithSessionAlloc(alloc, catalog.iface(), "usage_records", .{
+        .search_path = fallback_search_path[0..],
+    });
+    defer runtime_schema.freeSchema(alloc, fallback_runtime);
+    try std.testing.expectEqual(runtime_schema.StorageMode.relational, fallback_runtime.storage_mode);
+    try std.testing.expectEqual(@as(usize, 2), fallback_runtime.relational_columns.len);
+
     try std.testing.expectError(error.InvalidSqlCatalog, runtimeSchemaForCatalogTableAlloc(alloc, catalog.iface(), "missing_records"));
 }
 
@@ -4478,40 +3876,6 @@ test "sql adapter binder resolves read source tables through non recursive ctes"
     try std.testing.expectError(error.UnsupportedSqlShape, readSourceTableNamesFromParsedSqlAlloc(alloc, &graph_function_sql));
 }
 
-test "sql adapter binder resolves catalog prebind table names from shared tokens" {
-    const alloc = std.testing.allocator;
-
-    var read_tokens = try lexer.tokenizeAlloc(
-        alloc,
-        "WITH open_orders AS (SELECT id, tenant, customer_id FROM usage_records), active_customers AS (SELECT id, tenant, name FROM customer_records) SELECT o.id, c.name FROM open_orders AS o LEFT JOIN active_customers AS c ON o.tenant = c.tenant",
-    );
-    defer lexer.freeTokens(alloc, &read_tokens);
-    var read = (try readSourceTableNamesFromTokensAlloc(alloc, read_tokens.items)).?;
-    defer read.deinit(alloc);
-    try std.testing.expectEqualStrings("usage_records", read.left);
-    try std.testing.expectEqualStrings("customer_records", read.source);
-
-    var insert_tokens = try lexer.tokenizeAlloc(
-        alloc,
-        "WITH source_rows AS (SELECT id, status FROM incoming_usage) INSERT INTO usage_records (id, status) SELECT id, status FROM source_rows",
-    );
-    defer lexer.freeTokens(alloc, &insert_tokens);
-    var insert_source = (try insertSourceTableNamesFromTokensAlloc(alloc, insert_tokens.items)).?;
-    defer insert_source.deinit(alloc);
-    try std.testing.expectEqualStrings("usage_records", insert_source.target);
-    try std.testing.expectEqualStrings("incoming_usage", insert_source.source);
-
-    var update_tokens = try lexer.tokenizeAlloc(
-        alloc,
-        "UPDATE usage_records SET status = source.status FROM incoming_usage AS source WHERE source.id = usage_records.id",
-    );
-    defer lexer.freeTokens(alloc, &update_tokens);
-    var joined_write = (try joinedWriteSourceTableNamesFromTokensAlloc(alloc, update_tokens.items)).?;
-    defer joined_write.deinit(alloc);
-    try std.testing.expectEqualStrings("usage_records", joined_write.target);
-    try std.testing.expectEqualStrings("incoming_usage", joined_write.source);
-}
-
 test "sql adapter binder resolves write target tables from parsed statements" {
     const alloc = std.testing.allocator;
 
@@ -4564,6 +3928,31 @@ test "sql adapter binder resolves write target tables from parsed statements" {
     var read_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records");
     defer read_sql.deinit(alloc);
     try std.testing.expectError(error.UnsupportedSqlShape, writeTargetTableNameFromParsedSqlAlloc(alloc, &read_sql));
+}
+
+test "sql adapter binder catalog write admission requires retained generated DML metadata" {
+    const alloc = std.testing.allocator;
+
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) VALUES ('u1')");
+    defer parsed_sql.deinit(alloc);
+    try requireParsedCatalogWriteStatementIncludingGeneratedAst(&parsed_sql);
+
+    var missing_generated = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) VALUES ('u1')");
+    defer missing_generated.deinit(alloc);
+    var detached_generated = missing_generated.generated_statement orelse return error.TestUnexpectedResult;
+    defer detached_generated.deinit(alloc);
+    missing_generated.generated_statement = null;
+    try std.testing.expectError(error.UnsupportedSqlShape, requireParsedCatalogWriteStatementIncludingGeneratedAst(&missing_generated));
+
+    var stale_list = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) VALUES ('u1')");
+    defer stale_list.deinit(alloc);
+    if (stale_list.generated_statement) |*generated_statement| {
+        switch (generated_statement.ast orelse return error.TestUnexpectedResult) {
+            .dml => |*dml| dml.insert_column_items.count += 1,
+            else => return error.TestUnexpectedResult,
+        }
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, requireParsedCatalogWriteStatementIncludingGeneratedAst(&stale_list));
 }
 
 test "sql adapter binder source table helpers validate parsed statement family" {
@@ -5354,6 +4743,28 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     try std.testing.expectEqualStrings("tenant_ops", tenant_bound_read.session.current_database_name);
     try std.testing.expectEqualStrings("analytics", tenant_bound_read.session.search_path[0]);
     try std.testing.expect((try tenant_bound_read.readCatalog()).source_schema != null);
+
+    const fallback_path = [_][]const u8{ "tenant_missing", "public" };
+    const fallback_session: catalog_resources.SqlCatalogSession = .{
+        .search_path = fallback_path[0..],
+    };
+    var fallback_read_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records",
+    );
+    defer fallback_read_sql.deinit(alloc);
+    var fallback_bound_read = try bindReadPlanCatalogStatementWithSessionAlloc(alloc, &fallback_read_sql, catalog.iface(), fallback_session);
+    defer fallback_bound_read.deinit(alloc);
+    const fallback_read = try fallback_bound_read.readCatalog();
+    try std.testing.expect(fallback_read.target_binding != null);
+    switch (fallback_read.target_binding.?) {
+        .relational => |binding| {
+            try std.testing.expectEqualStrings("default", binding.target.database_name);
+            try std.testing.expectEqualStrings("public", binding.target.namespace_name);
+            try std.testing.expectEqualStrings("usage_records", binding.target.table_name);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 
     var tenant_write_sql = try tokenized.ParsedSql.initAlloc(
         alloc,

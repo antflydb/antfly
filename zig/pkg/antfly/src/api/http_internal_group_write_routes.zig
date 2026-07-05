@@ -460,6 +460,26 @@ fn handleImpl(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         return try http_route_helpers.jsonResponse(ctx.alloc, result);
     }
+    if (routes.Routes.matchGroupRelationalColumnBackedIndexRepair(path)) |repair_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        var parsed = std.json.parseFromSlice(table_writes.RelationalColumnBackedIndexRepairGroupRequest, ctx.alloc, if (req.body.len == 0) "{}" else req.body, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid relational index repair request");
+        defer parsed.deinit();
+        const result = (writes.relationalColumnBackedIndexRepairGroupLocal(
+            ctx.alloc,
+            repair_route.group_id,
+            repair_route.table_name,
+            parsed.value.lower_doc_key,
+            parsed.value.upper_doc_key,
+        ) catch |err| switch (err) {
+            error.UnsupportedOperation, error.ReadOnly => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        return try http_route_helpers.jsonResponse(ctx.alloc, result);
+    }
     if (routes.Routes.matchGroupSchemaRewrite(path)) |rewrite_route| {
         const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         var parsed = std.json.parseFromSlice(table_writes.SchemaRewriteGroupRequest, ctx.alloc, req.body, .{
@@ -1530,6 +1550,33 @@ test "internal group write routes expose unique integrity" {
     }
 }
 
+test "internal group write routes expose relational column backed index repair" {
+    const alloc = std.testing.allocator;
+
+    var resp = (try handle(.{
+        .alloc = alloc,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/relational-column-backed-index-repair",
+        .body = "{\"lower_doc_key\":\"doc:a\",\"upper_doc_key\":\"doc:z\"}",
+    }, "/internal/v1/groups/7/tables/docs/relational-column-backed-index-repair")).?;
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    var parsed = try std.json.parseFromSlice(db_mod.relational_store.ColumnBackedIndexRepairReport, alloc, resp.body, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 5), parsed.value.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 4), parsed.value.indexed_rows);
+    try std.testing.expectEqual(@as(u64, 3), parsed.value.deleted_orphan_entries);
+    try std.testing.expectEqual(@as(u64, 2), parsed.value.written_entries);
+}
+
 test "internal group write routes expose table emptying" {
     const alloc = std.testing.allocator;
 
@@ -2334,6 +2381,7 @@ const TestWriteSource = struct {
                 .foreign_key_action_job_group_local_schedule = foreignKeyActionJobGroupLocalSchedule,
                 .foreign_key_action_job_group_local_requeue = foreignKeyActionJobGroupLocalRequeue,
                 .unique_constraint_integrity_group_local = uniqueConstraintIntegrityGroupLocal,
+                .relational_column_backed_index_repair_group_local = relationalColumnBackedIndexRepairGroupLocal,
                 .table_emptying_group_local = tableEmptyingGroupLocal,
             },
         };
@@ -2591,6 +2639,26 @@ const TestWriteSource = struct {
             .complete = true,
             .report = .{},
             .groups = groups,
+        };
+    }
+
+    fn relationalColumnBackedIndexRepairGroupLocal(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+    ) !?db_mod.relational_store.ColumnBackedIndexRepairReport {
+        try std.testing.expectEqual(@as(u64, 7), group_id);
+        try std.testing.expectEqualStrings("docs", table_name);
+        try std.testing.expectEqualStrings("doc:a", lower_doc_key);
+        try std.testing.expectEqualStrings("doc:z", upper_doc_key);
+        return .{
+            .scanned_rows = 5,
+            .indexed_rows = 4,
+            .deleted_orphan_entries = 3,
+            .written_entries = 2,
         };
     }
 

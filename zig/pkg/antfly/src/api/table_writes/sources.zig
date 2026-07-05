@@ -177,6 +177,8 @@ const collectForeignKeyActionJobProgressGroupIds = table_write_integrity.collect
 const stableForeignKeyActionPageTxnId = table_write_integrity.stableForeignKeyActionPageTxnId;
 const runSecondaryIndexRebuildRangeGroupLocal = table_write_schema_jobs.runSecondaryIndexRebuildRangeGroupLocal;
 const runSecondaryIndexRebuildWorkerPassForCatalog = table_write_schema_jobs.runSecondaryIndexRebuildWorkerPassForCatalog;
+const runRelationalColumnBackedIndexRepairWorkerPassForCatalog = table_write_schema_jobs.runRelationalColumnBackedIndexRepairWorkerPassForCatalog;
+const runRelationalColumnBackedIndexRepairWorkerPassForCatalogTarget = table_write_schema_jobs.runRelationalColumnBackedIndexRepairWorkerPassForCatalogTarget;
 const runSchemaRewriteJobGroupLocal = table_write_schema_jobs.runSchemaRewriteJobGroupLocal;
 const runSchemaRewriteWorkerPassForCatalog = table_write_schema_jobs.runSchemaRewriteWorkerPassForCatalog;
 const runTableEmptyingJobGroupLocal = table_write_schema_jobs.runTableEmptyingJobGroupLocal;
@@ -185,6 +187,9 @@ const runTableEmptyingWorkerPassForCatalogTableId = table_write_schema_jobs.runT
 const SecondaryIndexRebuildWorkerResult = table_write_schema_jobs.SecondaryIndexRebuildWorkerResult;
 const SecondaryIndexRebuildWorkerPassResult = table_write_schema_jobs.SecondaryIndexRebuildWorkerPassResult;
 const SecondaryIndexRebuildGroupRequest = table_write_schema_jobs.SecondaryIndexRebuildGroupRequest;
+const RelationalColumnBackedIndexRepairGroupRequest = table_write_schema_jobs.RelationalColumnBackedIndexRepairGroupRequest;
+const RelationalColumnBackedIndexRepairWorkerResult = table_write_schema_jobs.RelationalColumnBackedIndexRepairWorkerResult;
+const RelationalColumnBackedIndexRepairWorkerPassResult = table_write_schema_jobs.RelationalColumnBackedIndexRepairWorkerPassResult;
 const SchemaRewriteWorkerResult = table_write_schema_jobs.SchemaRewriteWorkerResult;
 const SchemaRewriteWorkerPassResult = table_write_schema_jobs.SchemaRewriteWorkerPassResult;
 const SchemaRewriteGroupRequest = table_write_schema_jobs.SchemaRewriteGroupRequest;
@@ -271,6 +276,26 @@ fn tableEmptyingWorkerTableRecordByIdAlloc(
         if (table.table_id == table_id) return try metadata_table_manager.cloneTable(alloc, table);
     }
     return error.TableNotFound;
+}
+
+fn relationalIndexRepairJobOwnerGroupForTarget(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    target: catalog_resources.TableTarget,
+) !?u64 {
+    _ = alloc;
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.TableNotFound;
+    for (snapshot.ranges) |range| {
+        if (range.table_id == table.table_id) return range.group_id;
+    }
+    return null;
+}
+
+fn relationalIndexRepairNextLowerDocKey(result: RelationalColumnBackedIndexRepairWorkerPassResult) []const u8 {
+    if (result.complete or result.groups.len == 0) return "";
+    return result.groups[result.groups.len - 1].upper_doc_key;
 }
 const foreignKeyIntegrityWorkStatusClaimable = table_write_integrity.foreignKeyIntegrityWorkStatusClaimable;
 const foreignKeyIntegrityWorkStatusesHaveClaimable = table_write_integrity.foreignKeyIntegrityWorkStatusesHaveClaimable;
@@ -3254,6 +3279,13 @@ pub const ProvisionedTableWriteSource = struct {
                 .unique_constraint_integrity_schema_controller_maintenance_pass = uniqueConstraintIntegritySchemaControllerMaintenancePass,
                 .secondary_index_rebuild_worker_pass = secondaryIndexRebuildWorkerPass,
                 .secondary_index_rebuild_group_local = secondaryIndexRebuildGroupLocal,
+                .relational_column_backed_index_repair_group_local = relationalColumnBackedIndexRepairGroupLocal,
+                .relational_column_backed_index_repair_worker_pass = relationalColumnBackedIndexRepairWorkerPass,
+                .relational_column_backed_index_repair_worker_pass_catalog = relationalColumnBackedIndexRepairWorkerPassCatalog,
+                .relational_index_repair_job_begin_catalog = relationalIndexRepairJobBeginCatalog,
+                .relational_index_repair_job_record_pass_catalog = relationalIndexRepairJobRecordPassCatalog,
+                .relational_index_repair_job_load_catalog = relationalIndexRepairJobLoadCatalog,
+                .relational_index_repair_job_list_catalog = relationalIndexRepairJobListCatalog,
                 .schema_rewrite_worker_pass = ProvisionedTableWriteSource.schemaRewriteWorkerPass,
                 .schema_rewrite_group_local = ProvisionedTableWriteSource.schemaRewriteGroupLocal,
                 .table_emptying_worker_pass = ProvisionedTableWriteSource.tableEmptyingWorkerPass,
@@ -4757,6 +4789,209 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?SecondaryIndexRebuildWorkerResult {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         return try runProvisionedSecondaryIndexRebuildGroupLocal(self, alloc, group_id, table_name, record, worker_id, lease_ms);
+    }
+
+    fn relationalColumnBackedIndexRepairGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+    ) !?db_mod.relational_store.ColumnBackedIndexRepairReport {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return try runProvisionedColumnBackedIndexRepairGroupLocal(self, alloc, group_id, table_name, lower_doc_key, upper_doc_key);
+    }
+
+    fn relationalColumnBackedIndexRepairWorkerPass(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+    ) !?RelationalColumnBackedIndexRepairWorkerPassResult {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return try runRelationalColumnBackedIndexRepairWorkerPassForCatalog(alloc, self.source(), self.catalog, table_name, worker_id, lease_ms, max_work_units);
+    }
+
+    fn relationalColumnBackedIndexRepairWorkerPassCatalog(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+    ) !?RelationalColumnBackedIndexRepairWorkerPassResult {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return try runRelationalColumnBackedIndexRepairWorkerPassForCatalogTarget(alloc, self.source(), self.catalog, target, worker_id, lease_ms, max_work_units);
+    }
+
+    fn relationalIndexRepairJobBeginCatalog(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        job_id: []const u8,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+    ) !?void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const group_id = (try relationalIndexRepairJobOwnerGroupForTarget(alloc, self.catalog, target)) orelse return null;
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+
+        self.beginGroupOperation(target.table_name, group_id);
+        defer self.endGroupOperation(target.table_name, group_id);
+
+        var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, target.table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
+        defer db.close();
+        const record = try db.upsertRelationalIndexRepairJobRecordAt(
+            job_id,
+            target.database_name,
+            target.namespace_name,
+            target.table_name,
+            worker_id,
+            "",
+            "",
+            lease_ms,
+            max_work_units,
+            "running",
+            nextTxnTimestamp(),
+        );
+        defer db.freeRelationalIndexRepairJobRecord(record);
+        return {};
+    }
+
+    fn relationalIndexRepairJobRecordPassCatalog(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        job_id: []const u8,
+        result: RelationalColumnBackedIndexRepairWorkerPassResult,
+    ) !?void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const group_id = (try relationalIndexRepairJobOwnerGroupForTarget(alloc, self.catalog, target)) orelse return null;
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+
+        self.beginGroupOperation(target.table_name, group_id);
+        defer self.endGroupOperation(target.table_name, group_id);
+
+        var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, target.table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
+        defer db.close();
+        const record = try db.recordRelationalIndexRepairJobPassAt(
+            job_id,
+            if (result.complete) "complete" else "running",
+            result.complete,
+            result.ranges_scanned,
+            result.ranges_repaired,
+            result.ranges_missing,
+            relationalIndexRepairNextLowerDocKey(result),
+            result.report,
+            null,
+            nextTxnTimestamp(),
+        );
+        defer db.freeRelationalIndexRepairJobRecord(record);
+        return {};
+    }
+
+    fn relationalIndexRepairJobLoadCatalog(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        job_id: []const u8,
+    ) !?table_write_core.RelationalIndexRepairJobRecord {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (job_id.len == 0) return error.InvalidRelationalIndexRepairJob;
+        const group_id = (try relationalIndexRepairJobOwnerGroupForTarget(alloc, self.catalog, target)) orelse return null;
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+
+        self.beginGroupOperation(target.table_name, group_id);
+        defer self.endGroupOperation(target.table_name, group_id);
+
+        var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, target.table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
+        defer db.close();
+        return try db.loadRelationalIndexRepairJobRecord(job_id);
+    }
+
+    fn relationalIndexRepairJobListCatalog(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+    ) !?[]table_write_core.RelationalIndexRepairJobRecord {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const group_id = (try relationalIndexRepairJobOwnerGroupForTarget(alloc, self.catalog, target)) orelse return null;
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+
+        self.beginGroupOperation(target.table_name, group_id);
+        defer self.endGroupOperation(target.table_name, group_id);
+
+        var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, target.table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
+        defer db.close();
+        const all = try db.listRelationalIndexRepairJobRecords();
+        defer db.freeRelationalIndexRepairJobRecords(all);
+
+        var filtered = std.ArrayListUnmanaged(table_write_core.RelationalIndexRepairJobRecord).empty;
+        errdefer table_write_core.freeRelationalIndexRepairJobRecords(alloc, filtered.items);
+        for (all) |record| {
+            if (!std.mem.eql(u8, record.database_name, target.database_name) or
+                !std.mem.eql(u8, record.namespace_name, target.namespace_name) or
+                !std.mem.eql(u8, record.table_name, target.table_name))
+            {
+                continue;
+            }
+            try filtered.append(alloc, try cloneRelationalIndexRepairJobRecord(alloc, record));
+        }
+        return try filtered.toOwnedSlice(alloc);
+    }
+
+    fn cloneRelationalIndexRepairJobRecord(
+        alloc: std.mem.Allocator,
+        record: table_write_core.RelationalIndexRepairJobRecord,
+    ) !table_write_core.RelationalIndexRepairJobRecord {
+        var cloned: table_write_core.RelationalIndexRepairJobRecord = .{
+            .version = record.version,
+            .job_id = "",
+            .database_name = "",
+            .namespace_name = "",
+            .table_name = "",
+            .worker_id = "",
+            .lower_doc_key = "",
+            .upper_doc_key = "",
+            .lease_ms = record.lease_ms,
+            .max_work_units = record.max_work_units,
+            .status = "",
+            .created_at_ns = record.created_at_ns,
+            .updated_at_ns = record.updated_at_ns,
+            .attempts = record.attempts,
+            .completed = record.completed,
+            .complete = record.complete,
+            .next_lower_doc_key = "",
+            .last_ranges_scanned = record.last_ranges_scanned,
+            .last_ranges_repaired = record.last_ranges_repaired,
+            .last_ranges_missing = record.last_ranges_missing,
+            .total_ranges_scanned = record.total_ranges_scanned,
+            .total_ranges_repaired = record.total_ranges_repaired,
+            .total_ranges_missing = record.total_ranges_missing,
+            .last_report = record.last_report,
+            .aggregate_report = record.aggregate_report,
+            .last_error = null,
+        };
+        errdefer table_write_core.freeRelationalIndexRepairJobRecord(alloc, cloned);
+        cloned.job_id = try alloc.dupe(u8, record.job_id);
+        cloned.database_name = try alloc.dupe(u8, record.database_name);
+        cloned.namespace_name = try alloc.dupe(u8, record.namespace_name);
+        cloned.table_name = try alloc.dupe(u8, record.table_name);
+        cloned.worker_id = try alloc.dupe(u8, record.worker_id);
+        cloned.lower_doc_key = try alloc.dupe(u8, record.lower_doc_key);
+        cloned.upper_doc_key = try alloc.dupe(u8, record.upper_doc_key);
+        cloned.status = try alloc.dupe(u8, record.status);
+        cloned.next_lower_doc_key = try alloc.dupe(u8, record.next_lower_doc_key);
+        cloned.last_error = if (record.last_error) |value| try alloc.dupe(u8, value) else null;
+        return cloned;
     }
 
     fn schemaRewriteWorkerPass(
@@ -6428,6 +6663,43 @@ pub const ProvisionedTableWriteSource = struct {
         return result;
     }
 
+    fn runProvisionedColumnBackedIndexRepairGroupLocal(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+    ) !?db_mod.relational_store.ColumnBackedIndexRepairReport {
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+
+        if (self.write_cache) |cache| {
+            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
+            defer cached.deinit(alloc);
+            const report = try cached.db.repairRelationalColumnBackedIndexesInRange(lower_doc_key, upper_doc_key);
+            try drainManagedDbBeforeClose(cached.db);
+            lockAtomic(&self.local_db_mutex);
+            self.markWriteCacheDirty(table_name);
+            self.invalidateReadCache(table_name);
+            self.local_db_mutex.unlock();
+            self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
+            self.notifyLocalChange(table_name, .data);
+            return report;
+        }
+
+        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+        defer db.close();
+        try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
+        const report = try db.repairRelationalColumnBackedIndexesInRange(lower_doc_key, upper_doc_key);
+        self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
+        self.notifyLocalChange(table_name, .data);
+        return report;
+    }
+
     fn runProvisionedSchemaRewriteGroupLocal(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
@@ -7449,6 +7721,9 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .unique_constraint_integrity_schema_controller_maintenance_pass = uniqueConstraintIntegritySchemaControllerMaintenancePass,
                 .secondary_index_rebuild_worker_pass = secondaryIndexRebuildWorkerPass,
                 .secondary_index_rebuild_group_local = secondaryIndexRebuildGroupLocal,
+                .relational_column_backed_index_repair_group_local = relationalColumnBackedIndexRepairGroupLocal,
+                .relational_column_backed_index_repair_worker_pass = relationalColumnBackedIndexRepairWorkerPass,
+                .relational_column_backed_index_repair_worker_pass_catalog = relationalColumnBackedIndexRepairWorkerPassCatalog,
                 .schema_rewrite_worker_pass = HostedProvisionedTableWriteSource.schemaRewriteWorkerPass,
                 .schema_rewrite_group_local = HostedProvisionedTableWriteSource.schemaRewriteGroupLocal,
                 .table_emptying_worker_pass = HostedProvisionedTableWriteSource.tableEmptyingWorkerPass,
@@ -7473,6 +7748,72 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?SecondaryIndexRebuildWorkerPassResult {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         return try runSecondaryIndexRebuildWorkerPassForCatalog(alloc, self.source(), self.catalog, table_name, worker_id, lease_ms, max_work_units);
+    }
+
+    fn relationalColumnBackedIndexRepairGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+    ) !?db_mod.relational_store.ColumnBackedIndexRepairReport {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
+        if (resolved_route) |*route| {
+            defer route.deinit(alloc);
+            switch (route.*) {
+                .local => return try runHostedColumnBackedIndexRepairGroupLocal(self, alloc, group_id, table_name, lower_doc_key, upper_doc_key),
+                .remote => |remote| {
+                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    const body = try std.json.Stringify.valueAlloc(alloc, RelationalColumnBackedIndexRepairGroupRequest{
+                        .lower_doc_key = lower_doc_key,
+                        .upper_doc_key = upper_doc_key,
+                    }, .{});
+                    defer alloc.free(body);
+                    var response = try client.fetchGroupRelationalColumnBackedIndexRepair(remote.base_uri, group_id, table_name, body);
+                    defer response.deinit(alloc);
+                    var parsed = try std.json.parseFromSlice(db_mod.relational_store.ColumnBackedIndexRepairReport, alloc, response.body, .{
+                        .ignore_unknown_fields = true,
+                    });
+                    defer parsed.deinit();
+                    return parsed.value;
+                },
+            }
+        }
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        std.Io.Dir.cwd().access(io_impl.io(), path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        return try runHostedColumnBackedIndexRepairGroupLocal(self, alloc, group_id, table_name, lower_doc_key, upper_doc_key);
+    }
+
+    fn relationalColumnBackedIndexRepairWorkerPass(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+    ) !?RelationalColumnBackedIndexRepairWorkerPassResult {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return try runRelationalColumnBackedIndexRepairWorkerPassForCatalog(alloc, self.source(), self.catalog, table_name, worker_id, lease_ms, max_work_units);
+    }
+
+    fn relationalColumnBackedIndexRepairWorkerPassCatalog(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+    ) !?RelationalColumnBackedIndexRepairWorkerPassResult {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return try runRelationalColumnBackedIndexRepairWorkerPassForCatalogTarget(alloc, self.source(), self.catalog, target, worker_id, lease_ms, max_work_units);
     }
 
     fn secondaryIndexRebuildGroupLocal(
@@ -11333,6 +11674,24 @@ pub const HostedProvisionedTableWriteSource = struct {
         const result = try runSecondaryIndexRebuildRangeGroupLocal(cached.db, self.catalog, record, worker_id, now_ms, lease_ms);
         if (result.claimed) try drainManagedDbBeforeClose(cached.db);
         return result;
+    }
+
+    fn runHostedColumnBackedIndexRepairGroupLocal(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+    ) !?db_mod.relational_store.ColumnBackedIndexRepairReport {
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        const report = try cached.db.repairRelationalColumnBackedIndexesInRange(lower_doc_key, upper_doc_key);
+        try drainManagedDbBeforeClose(cached.db);
+        return report;
     }
 
     fn runHostedSchemaRewriteGroupLocal(
@@ -22472,6 +22831,117 @@ test "api.table_writes.docid provisioned foreign key action page chaos converges
         defer alloc.free(remote);
         try std.testing.expectEqualStrings("{\"status\":\"remote\"}", remote);
     }
+}
+
+test "provisioned relational index repair job ledger persists public pass progress" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/relational-index-repair-ledger", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(db_path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 77,
+                    .database_name = "tenant_ops",
+                    .namespace_name = "analytics",
+                    .name = "orders",
+                    .placement_role = "data",
+                    .indexes_json = "{}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .range_id = 7101,
+                    .table_id = 77,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
+
+    const target: catalog_resources.TableTarget = .{
+        .database_name = "tenant_ops",
+        .namespace_name = "analytics",
+        .table_name = "orders",
+    };
+    _ = try source.source().relationalIndexRepairJobBeginCatalog(
+        alloc,
+        target,
+        "repair:orders:1",
+        "worker:repair",
+        60_000,
+        3,
+    ) orelse return error.TestUnexpectedResult;
+
+    var groups = [_]RelationalColumnBackedIndexRepairWorkerResult{.{
+        .group_id = 7001,
+        .table_id = 77,
+        .range_id = 7101,
+        .lower_doc_key = "",
+        .upper_doc_key = "row:m",
+        .repaired = true,
+        .report = .{
+            .scanned_rows = 5,
+            .indexed_rows = 4,
+            .written_entries = 2,
+        },
+    }};
+    _ = try source.source().relationalIndexRepairJobRecordPassCatalog(
+        alloc,
+        target,
+        "repair:orders:1",
+        .{
+            .complete = false,
+            .ranges_scanned = 1,
+            .ranges_repaired = 1,
+            .ranges_missing = 0,
+            .report = groups[0].report,
+            .groups = groups[0..],
+        },
+    ) orelse return error.TestUnexpectedResult;
+
+    var db = try db_mod.DB.open(alloc, db_path, .{ .start_index_workers = false });
+    defer db.close();
+    const record = (try db.loadRelationalIndexRepairJobRecord("repair:orders:1")) orelse return error.TestUnexpectedResult;
+    defer db.freeRelationalIndexRepairJobRecord(record);
+    try std.testing.expectEqualStrings("tenant_ops", record.database_name);
+    try std.testing.expectEqualStrings("analytics", record.namespace_name);
+    try std.testing.expectEqualStrings("orders", record.table_name);
+    try std.testing.expectEqualStrings("worker:repair", record.worker_id);
+    try std.testing.expectEqualStrings("running", record.status);
+    try std.testing.expect(!record.completed);
+    try std.testing.expectEqual(@as(u64, 1), record.last_ranges_scanned);
+    try std.testing.expectEqual(@as(u64, 1), record.total_ranges_repaired);
+    try std.testing.expectEqualStrings("row:m", record.next_lower_doc_key);
+    try std.testing.expectEqual(@as(u64, 5), record.last_report.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 2), record.aggregate_report.written_entries);
 }
 
 test "managed startup catch-up uses provided indexes json without catalog fetch" {

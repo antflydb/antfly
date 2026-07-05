@@ -134,28 +134,6 @@ pub fn parseAntflyQueryFunctionCall(
     return function;
 }
 
-pub fn parseAntflyQueryFunctionReadCall(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    args: *std.ArrayListUnmanaged(SqlQueryFunctionArg),
-    projection_columns: *std.ArrayListUnmanaged([]const u8),
-) !AntflyQueryFunction {
-    try expectSqlKeyword(tokens, pos, .select);
-    if (matchSqlToken(tokens, pos, .star) == null) {
-        while (true) {
-            const column = try expectSqlToken(tokens, pos, .identifier);
-            try projection_columns.append(alloc, column.text);
-            if (matchSqlToken(tokens, pos, .comma) == null) break;
-        }
-    }
-    try expectSqlKeyword(tokens, pos, .from);
-    const function = try parseAntflyQueryFunctionExpressionAlloc(alloc, tokens, pos, args);
-    _ = matchSqlToken(tokens, pos, .semicolon);
-    if (pos.* != tokens.len) return error.UnsupportedSqlShape;
-    return function;
-}
-
 pub fn parseAntflyQueryFunctionExpressionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -481,31 +459,7 @@ pub fn lowerAntflyQueryFunctionReadParsedSqlAlloc(
     if (try generatedAntflyQueryFunctionReadAst(parsed_sql)) |read_ast| {
         return try lowerGeneratedAntflyQueryFunctionReadAlloc(alloc, semantic_resolver, parsed_sql.items(), read_ast);
     }
-
-    var args = std.ArrayListUnmanaged(SqlQueryFunctionArg).empty;
-    defer {
-        deinitAntflyQueryFunctionArgs(alloc, args.items);
-        args.deinit(alloc);
-    }
-    var projection_columns = std.ArrayListUnmanaged([]const u8).empty;
-    defer projection_columns.deinit(alloc);
-    var pos: usize = 0;
-    const function = try parseAntflyQueryFunctionReadCall(alloc, parsed_sql.items(), &pos, &args, &projection_columns);
-    const table_name = antflyQueryFunctionStringArg(args.items, "table_name") orelse
-        antflyQueryFunctionStringArg(args.items, "table") orelse return error.UnsupportedSqlShape;
-    if (table_name.len == 0) return error.UnsupportedSqlShape;
-
-    const owned_table_name = try alloc.dupe(u8, table_name);
-    errdefer alloc.free(owned_table_name);
-    const owned_projection_columns = try ownAntflyQueryFunctionProjectionColumnsAlloc(alloc, projection_columns.items);
-    errdefer freeAntflyQueryFunctionProjectionColumns(alloc, owned_projection_columns);
-    var request = try lowerParsedAntflyQueryFunctionAlloc(alloc, semantic_resolver, function, args.items);
-    errdefer request.deinit(alloc);
-    return .{
-        .table_name = owned_table_name,
-        .projection_columns = owned_projection_columns,
-        .request = request,
-    };
+    return error.UnsupportedSqlShape;
 }
 
 pub fn antflyQueryFunctionReadTableNameAlloc(
@@ -524,20 +478,7 @@ pub fn antflyQueryFunctionReadTableNameAlloc(
         if (table_name.len == 0) return error.UnsupportedSqlShape;
         return try alloc.dupe(u8, table_name);
     }
-
-    var args = std.ArrayListUnmanaged(SqlQueryFunctionArg).empty;
-    defer {
-        deinitAntflyQueryFunctionArgs(alloc, args.items);
-        args.deinit(alloc);
-    }
-    var projection_columns = std.ArrayListUnmanaged([]const u8).empty;
-    defer projection_columns.deinit(alloc);
-    var pos: usize = 0;
-    _ = try parseAntflyQueryFunctionReadCall(alloc, parsed_sql.items(), &pos, &args, &projection_columns);
-    const table_name = antflyQueryFunctionStringArg(args.items, "table_name") orelse
-        antflyQueryFunctionStringArg(args.items, "table") orelse return error.UnsupportedSqlShape;
-    if (table_name.len == 0) return error.UnsupportedSqlShape;
-    return try alloc.dupe(u8, table_name);
+    return error.UnsupportedSqlShape;
 }
 
 fn generatedAntflyQueryFunctionReadAst(parsed_sql: *const tokenized.ParsedSql) !?*const generated_parser.GeneratedSqlReadAst {
@@ -699,9 +640,17 @@ pub fn lowerAntflyQueryFunctionExpressionSqlAlloc(
     semantic_resolver: ?query_contract.SemanticResolver,
     sql: []const u8,
 ) !query_contract.OwnedQueryRequest {
-    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
-    defer parsed_sql.deinit(alloc);
-    return try lowerAntflyQueryFunctionExpressionParsedSqlAlloc(alloc, semantic_resolver, &parsed_sql);
+    var tokenized_sql = try tokenized.TokenizedSql.initAlloc(alloc, sql);
+    defer tokenized_sql.deinit(alloc);
+    var lowered = try lowerAntflyQueryFunctionExpressionBodyTokensAlloc(alloc, semantic_resolver, tokenized_sql.items());
+    defer lowered.deinit(alloc);
+    var request = try query_contract.parseQueryRequest(alloc, semantic_resolver, lowered.table_name, lowered.body_json);
+    errdefer request.deinit(alloc);
+    if (lowered.primary_text_index_name) |index_name| {
+        if (request.req.primary_text_index_name != null) return error.UnsupportedSqlShape;
+        request.req.primary_text_index_name = try alloc.dupe(u8, index_name);
+    }
+    return request;
 }
 
 pub fn lowerAntflyQueryFunctionExpressionParsedSqlAlloc(
@@ -2652,6 +2601,8 @@ test "sql adapter query function read accepts projected hit columns" {
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     try std.testing.expect(!parsedSqlHasGeneratedAntflyReadSource(&missing_ast));
+    try std.testing.expectError(error.UnsupportedSqlShape, antflyQueryFunctionReadTableNameAlloc(alloc, &missing_ast));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAntflyQueryFunctionReadParsedSqlAlloc(alloc, null, &missing_ast));
 }
 
 test "sql adapter query function read rejects corrupted generated graph table function payloads" {

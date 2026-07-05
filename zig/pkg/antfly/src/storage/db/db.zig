@@ -981,6 +981,15 @@ pub const DB = struct {
         return try schema_runtime_impl.rebuildRelationalSecondaryIndexPageInRange(self, index_name, index_generation, lower_doc_key, upper_doc_key, max_rows);
     }
 
+    pub fn repairRelationalColumnBackedIndexesInRange(
+        self: *DB,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+    ) !relational_store_mod.ColumnBackedIndexRepairReport {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try schema_runtime_impl.repairRelationalColumnBackedIndexesInRange(self, lower_doc_key, upper_doc_key);
+    }
+
     pub fn validateForeignKeyRefsInRange(
         self: *DB,
         lower_doc_key: []const u8,
@@ -2221,6 +2230,7 @@ pub const DB = struct {
     pub const ForeignKeyIntegrityProgressRecord = relational_integrity.ForeignKeyIntegrityProgressRecord;
     pub const ForeignKeyIntegrityClaimRecord = relational_integrity.ForeignKeyIntegrityClaimRecord;
     pub const ForeignKeyIntegrityJobRecord = relational_integrity.ForeignKeyIntegrityJobRecord;
+    pub const RelationalIndexRepairJobRecord = relational_integrity.RelationalIndexRepairJobRecord;
     pub const ForeignKeyActionJobRecord = relational_integrity.ForeignKeyActionJobRecord;
     pub const ForeignKeyActionScheduleRecord = relational_integrity.ForeignKeyActionScheduleRecord;
     pub const UniqueConstraintIntegrityProgressRecord = relational_integrity.UniqueConstraintIntegrityProgressRecord;
@@ -2247,6 +2257,14 @@ pub const DB = struct {
 
     pub fn freeForeignKeyIntegrityJobRecords(self: *DB, records: []ForeignKeyIntegrityJobRecord) void {
         relational_integrity_impl.freeForeignKeyIntegrityJobRecords(self, records);
+    }
+
+    pub fn freeRelationalIndexRepairJobRecord(self: *DB, record: RelationalIndexRepairJobRecord) void {
+        relational_integrity_impl.freeRelationalIndexRepairJobRecord(self, record);
+    }
+
+    pub fn freeRelationalIndexRepairJobRecords(self: *DB, records: []RelationalIndexRepairJobRecord) void {
+        relational_integrity_impl.freeRelationalIndexRepairJobRecords(self, records);
     }
 
     pub fn freeForeignKeyActionJobRecord(self: *DB, record: ForeignKeyActionJobRecord) void {
@@ -2283,6 +2301,10 @@ pub const DB = struct {
 
     pub fn listForeignKeyIntegrityJobRecords(self: *DB) ![]ForeignKeyIntegrityJobRecord {
         return try relational_integrity_impl.listForeignKeyIntegrityJobRecords(self);
+    }
+
+    pub fn listRelationalIndexRepairJobRecords(self: *DB) ![]RelationalIndexRepairJobRecord {
+        return try relational_integrity_impl.listRelationalIndexRepairJobRecords(self);
     }
 
     pub fn loadForeignKeyActionJobRecord(self: *DB, job_id: []const u8) !?ForeignKeyActionJobRecord {
@@ -2338,6 +2360,13 @@ pub const DB = struct {
         job_id: []const u8,
     ) !?ForeignKeyIntegrityJobRecord {
         return try relational_integrity_impl.loadForeignKeyIntegrityJobRecord(self, job_id);
+    }
+
+    pub fn loadRelationalIndexRepairJobRecord(
+        self: *DB,
+        job_id: []const u8,
+    ) !?RelationalIndexRepairJobRecord {
+        return try relational_integrity_impl.loadRelationalIndexRepairJobRecord(self, job_id);
     }
 
     pub fn loadUniqueConstraintIntegrityProgressRecord(
@@ -2515,6 +2544,74 @@ pub const DB = struct {
     ) !ForeignKeyIntegrityJobRecord {
         try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.updateForeignKeyIntegrityJobDiagnosticsWithReportAt(self, job_id, report, violation_samples_json, violation_sample_count, violations_truncated, now_ns);
+    }
+
+    pub fn upsertRelationalIndexRepairJobRecord(
+        self: *DB,
+        job_id: []const u8,
+        database_name: []const u8,
+        namespace_name: []const u8,
+        table_name: []const u8,
+        worker_id: []const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+        status: []const u8,
+    ) !RelationalIndexRepairJobRecord {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try relational_integrity_impl.upsertRelationalIndexRepairJobRecord(self, job_id, database_name, namespace_name, table_name, worker_id, lower_doc_key, upper_doc_key, lease_ms, max_work_units, status);
+    }
+
+    pub fn upsertRelationalIndexRepairJobRecordAt(
+        self: *DB,
+        job_id: []const u8,
+        database_name: []const u8,
+        namespace_name: []const u8,
+        table_name: []const u8,
+        worker_id: []const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+        status: []const u8,
+        now_ns: u64,
+    ) !RelationalIndexRepairJobRecord {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try relational_integrity_impl.upsertRelationalIndexRepairJobRecordAt(self, job_id, database_name, namespace_name, table_name, worker_id, lower_doc_key, upper_doc_key, lease_ms, max_work_units, status, now_ns);
+    }
+
+    pub fn recordRelationalIndexRepairJobPass(
+        self: *DB,
+        job_id: []const u8,
+        status: []const u8,
+        complete: bool,
+        ranges_scanned: u64,
+        ranges_repaired: u64,
+        ranges_missing: u64,
+        next_lower_doc_key: []const u8,
+        report: relational_store_mod.ColumnBackedIndexRepairReport,
+        last_error: ?[]const u8,
+    ) !RelationalIndexRepairJobRecord {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try relational_integrity_impl.recordRelationalIndexRepairJobPass(self, job_id, status, complete, ranges_scanned, ranges_repaired, ranges_missing, next_lower_doc_key, report, last_error);
+    }
+
+    pub fn recordRelationalIndexRepairJobPassAt(
+        self: *DB,
+        job_id: []const u8,
+        status: []const u8,
+        complete: bool,
+        ranges_scanned: u64,
+        ranges_repaired: u64,
+        ranges_missing: u64,
+        next_lower_doc_key: []const u8,
+        report: relational_store_mod.ColumnBackedIndexRepairReport,
+        last_error: ?[]const u8,
+        now_ns: u64,
+    ) !RelationalIndexRepairJobRecord {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try relational_integrity_impl.recordRelationalIndexRepairJobPassAt(self, job_id, status, complete, ranges_scanned, ranges_repaired, ranges_missing, next_lower_doc_key, report, last_error, now_ns);
     }
 
     pub fn claimAndRunForeignKeyActionJobPage(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, lease_ms: u64) !ForeignKeyActionJobRecord {

@@ -704,7 +704,7 @@ pub fn Impl(comptime DB: type) type {
                 });
             }
 
-            const column_index_policy = relational_store_mod.ColumnIndexPolicy.fromColumns(next_schema.relational_columns);
+            const column_index_policy = relational_store_mod.ColumnIndexPolicy.fromSchema(next_schema);
             if (sets.items.len != 0) {
                 _ = try relational_store_mod.rewriteRowsInRangeWithColumnIndexPolicy(
                     alloc,
@@ -815,7 +815,11 @@ pub fn Impl(comptime DB: type) type {
             defer checks_to_validate.deinit(alloc);
 
             for (next_schema.unique_constraints) |constraint| {
-                if (findUniqueConstraintByName(current_schema.unique_constraints, constraint.name) == null) {
+                if (findUniqueConstraintByName(current_schema.unique_constraints, constraint.name)) |current_constraint| {
+                    if (current_constraint.validation_state != .enforced and constraint.validation_state == .enforced) {
+                        try unique_to_build.append(alloc, constraint);
+                    }
+                } else if (constraint.validation_state == .enforced) {
                     try unique_to_build.append(alloc, constraint);
                 }
             }
@@ -1065,7 +1069,7 @@ pub fn Impl(comptime DB: type) type {
 
             const runtime_schema = self.core.schema orelse return error.InvalidSchemaUpdateRequest;
             if (runtime_schema.storage_mode != .relational or runtime_schema.relational_columns.len == 0) return error.InvalidSchemaUpdateRequest;
-            const column_index_policy = relational_store_mod.ColumnIndexPolicy.fromColumns(runtime_schema.relational_columns);
+            const column_index_policy = relational_store_mod.ColumnIndexPolicy.fromSchema(runtime_schema);
 
             if (validate_constraints) {
                 const report = try Self.validateRelationalSchemaConstraintsForJobLocked(self, alloc, runtime_schema, local_range.start, local_range.end);
@@ -1294,8 +1298,9 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn relationalColumnIndexPolicyForStore(self: *DB) relational_store_mod.ColumnIndexPolicy {
-            const columns = Self.relationalColumnsForStore(self) orelse return relational_store_mod.ColumnIndexPolicy.all();
-            return relational_store_mod.ColumnIndexPolicy.fromColumns(columns);
+            const schema = self.core.schema orelse return relational_store_mod.ColumnIndexPolicy.all();
+            if (schema.storage_mode != .relational) return relational_store_mod.ColumnIndexPolicy.all();
+            return relational_store_mod.ColumnIndexPolicy.fromSchema(schema);
         }
 
         pub fn saveIndexStatusSnapshot(self: *DB, index_name: []const u8, sequence: u64) !void {
@@ -1341,6 +1346,22 @@ pub fn Impl(comptime DB: type) type {
                 upper_doc_key,
                 Self.relationalColumnIndexPolicyForStore(self),
                 max_rows,
+            );
+        }
+
+        pub fn repairRelationalColumnBackedIndexesInRange(
+            self: *DB,
+            lower_doc_key: []const u8,
+            upper_doc_key: []const u8,
+        ) !relational_store_mod.ColumnBackedIndexRepairReport {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            return try relational_store_mod.repairColumnBackedIndexesFromRowsInRangeWithColumnIndexPolicy(
+                self.alloc,
+                self.core.store,
+                lower_doc_key,
+                upper_doc_key,
+                Self.relationalColumnIndexPolicyForStore(self),
             );
         }
 
@@ -1561,12 +1582,12 @@ fn validateGeneratedColumnExpressionConditionBackfillSources(
 fn validateConstraintCatalogTransition(current_schema: schema_mod.TableSchema, next_schema: schema_mod.TableSchema) !void {
     for (current_schema.unique_constraints) |constraint| {
         if (findUniqueConstraintByName(next_schema.unique_constraints, constraint.name)) |next_constraint| {
-            if (!uniqueConstraintsEqual(constraint, next_constraint)) return error.InvalidSchemaUpdateRequest;
+            if (!uniqueConstraintsSameDefinition(constraint, next_constraint)) return error.InvalidSchemaUpdateRequest;
         }
     }
     for (next_schema.unique_constraints) |constraint| {
         if (findUniqueConstraintByName(current_schema.unique_constraints, constraint.name)) |current_constraint| {
-            if (!uniqueConstraintsEqual(current_constraint, constraint)) return error.InvalidSchemaUpdateRequest;
+            if (!uniqueConstraintsSameDefinition(current_constraint, constraint)) return error.InvalidSchemaUpdateRequest;
         }
     }
     for (current_schema.foreign_keys) |foreign_key| {
@@ -1676,7 +1697,7 @@ fn findRelationalCheckByName(checks: []const schema_mod.RelationalCheck, name: [
     return null;
 }
 
-fn uniqueConstraintsEqual(a: schema_mod.UniqueConstraint, b: schema_mod.UniqueConstraint) bool {
+fn uniqueConstraintsSameDefinition(a: schema_mod.UniqueConstraint, b: schema_mod.UniqueConstraint) bool {
     return std.mem.eql(u8, a.name, b.name) and
         stringSlicesEqual(a.columns, b.columns) and
         uniqueExpressionSlicesEqual(a.expressions, b.expressions) and
@@ -1691,7 +1712,6 @@ fn uniqueConstraintsEqual(a: schema_mod.UniqueConstraint, b: schema_mod.UniqueCo
         a.deferrable == b.deferrable and
         a.timing == b.timing and
         uniquePredicateSlicesEqual(a.where, b.where) and
-        a.validation_state == b.validation_state and
         relationalRowsExpressionConditionSlicesEqual(a.where_expressions, b.where_expressions);
 }
 
@@ -1970,6 +1990,53 @@ test "db schema apply validates unvalidated check promotion" {
     try std.testing.expectEqual(schema_mod.RelationalCheckValidationState.enforced, enforced_schema.checks[1].validation_state);
 }
 
+test "db schema apply validates unvalidated unique promotion" {
+    const DB = @import("mod.zig").DB;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const schema_unvalidated =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"],"validation_state":"unvalidated"}]}
+    ;
+    const schema_enforced =
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"],"validation_state":"enforced"}]}
+    ;
+
+    try db.applyTableSchemaJson(alloc, schema_v1, .{});
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:ada", .value = "{\"id\":\"user:ada\",\"email\":\"dup@example.test\"}" },
+            .{ .key = "user:grace", .value = "{\"id\":\"user:grace\",\"email\":\"dup@example.test\"}" },
+        },
+    });
+    try db.applyTableSchemaJson(alloc, schema_unvalidated, .{});
+    const unvalidated_schema = db.core.schema orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(schema_mod.UniqueConstraintValidationState.unvalidated, unvalidated_schema.unique_constraints[0].validation_state);
+
+    try std.testing.expectError(error.UniqueConstraintViolation, db.applyTableSchemaJson(alloc, schema_enforced, .{}));
+    const after_failed_enforce = db.core.schema orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(schema_mod.UniqueConstraintValidationState.unvalidated, after_failed_enforce.unique_constraints[0].validation_state);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:grace", .value = "{\"id\":\"user:grace\",\"email\":\"grace@example.test\"}" },
+        },
+    });
+    try db.applyTableSchemaJson(alloc, schema_enforced, .{});
+    const enforced_schema = db.core.schema orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(schema_mod.UniqueConstraintValidationState.enforced, enforced_schema.unique_constraints[0].validation_state);
+}
+
 test "db schema runtime persists lite sql table record with local schema metadata" {
     const DB = @import("mod.zig").DB;
 
@@ -2183,6 +2250,85 @@ test "db direct schema apply rejects generated columns without deterministic bac
     try db.applyTableSchemaJson(alloc, schema_v1, .{});
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.applyTableSchemaJson(alloc, missing_source_schema, .{}));
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.applyTableSchemaJson(alloc, generated_source_schema, .{}));
+}
+
+test "db repairs relational column backed indexes from authoritative packed rows" {
+    const DB = @import("mod.zig").DB;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"orders_status_amount_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-lifecycle":"ready","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:status_amount","x-antfly-index-keys":[{"column":"status"},{"column":"amount"}]},"amount":{"type":"numeric","x-antfly-index-lifecycle":"ready","x-antfly-index-generation":3}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+    try db.batch(.{ .writes = &.{
+        .{ .key = "doc:a", .value = "{\"id\":\"a\",\"status\":\"active\",\"amount\":1}" },
+        .{ .key = "doc:b", .value = "{\"id\":\"b\",\"status\":\"active\",\"amount\":2}" },
+    } });
+
+    var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    const ordered_column = blk: {
+        for (runtime_schema.relational_columns) |column| {
+            if (std.mem.eql(u8, column.name, "status")) break :blk column;
+        }
+        return error.TestUnexpectedResult;
+    };
+
+    const row_b = try relational_store_mod.getRawAlloc(alloc, db.core.store, "doc:b") orelse return error.TestUnexpectedResult;
+    defer alloc.free(row_b);
+    const tuple_b = try relational_store_mod.orderedTupleValueForIndexKeysAlloc(alloc, row_b, ordered_column.index_keys, runtime_schema.relational_columns);
+    defer alloc.free(tuple_b);
+
+    const doc_b_forward = try internal_keys.relationalOrderedTupleIndexKeyAlloc(alloc, "orders_status_amount_idx", tuple_b, "doc:b");
+    defer alloc.free(doc_b_forward);
+    const doc_b_reverse = try internal_keys.relationalOrderedTupleIndexByDocKeyAlloc(alloc, "doc:b", "orders_status_amount_idx", tuple_b);
+    defer alloc.free(doc_b_reverse);
+    const amount_b_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "amount", "doc:b");
+    defer alloc.free(amount_b_index);
+    const amount_b_reverse = try internal_keys.relationalColumnIndexByDocKeyAlloc(alloc, "doc:b", "amount");
+    defer alloc.free(amount_b_reverse);
+
+    const orphan_forward = try internal_keys.relationalOrderedTupleIndexKeyAlloc(alloc, "orders_status_amount_idx", tuple_b, "doc:z");
+    defer alloc.free(orphan_forward);
+    const orphan_reverse = try internal_keys.relationalOrderedTupleIndexByDocKeyAlloc(alloc, "doc:z", "orders_status_amount_idx", tuple_b);
+    defer alloc.free(orphan_reverse);
+    const forward_only_orphan = try internal_keys.relationalOrderedTupleIndexKeyAlloc(alloc, "orders_status_amount_idx", tuple_b, "doc:y");
+    defer alloc.free(forward_only_orphan);
+
+    try db.core.store.putBatch(&.{
+        .{ .key = orphan_forward, .value = "" },
+        .{ .key = orphan_reverse, .value = "" },
+        .{ .key = forward_only_orphan, .value = "" },
+    }, &.{ doc_b_forward, doc_b_reverse, amount_b_index, amount_b_reverse });
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, doc_b_forward));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, amount_b_index));
+
+    const report = try db.repairRelationalColumnBackedIndexesInRange("doc:a", "doc:zz");
+    try std.testing.expectEqual(@as(u64, 2), report.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 2), report.indexed_rows);
+    try std.testing.expect(report.written_entries >= 6);
+
+    const repaired_forward = try db.core.store.get(alloc, doc_b_forward);
+    defer alloc.free(repaired_forward);
+    const repaired_reverse = try db.core.store.get(alloc, doc_b_reverse);
+    defer alloc.free(repaired_reverse);
+    const repaired_amount = try db.core.store.get(alloc, amount_b_index);
+    defer alloc.free(repaired_amount);
+    const repaired_amount_reverse = try db.core.store.get(alloc, amount_b_reverse);
+    defer alloc.free(repaired_amount_reverse);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, orphan_forward));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, orphan_reverse));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, forward_only_orphan));
 }
 
 test "db first relational schema apply rejects existing document rows" {

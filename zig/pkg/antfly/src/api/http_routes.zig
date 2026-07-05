@@ -115,6 +115,7 @@ pub const Routes = struct {
     pub const foreign_key_integrity_suffix = "/foreign-key-integrity";
     pub const unique_integrity_suffix = "/unique-integrity";
     pub const secondary_index_rebuild_suffix = "/secondary-index-rebuild";
+    pub const relational_column_backed_index_repair_suffix = "/relational-column-backed-index-repair";
     pub const schema_rewrite_suffix = "/schema-rewrite";
     pub const table_emptying_suffix = "/table-emptying";
     pub const foreign_key_ref_children_suffix = "/foreign-key-ref-children";
@@ -252,6 +253,15 @@ pub const Routes = struct {
 
     pub const TableSecondaryIndexRebuild = struct {
         table_name: []const u8,
+    };
+
+    pub const TableRelationalColumnBackedIndexRepair = struct {
+        table_name: []const u8,
+    };
+
+    pub const TableRelationalColumnBackedIndexRepairJob = struct {
+        table_name: []const u8,
+        job_id: []const u8,
     };
 
     pub const TableIndexes = struct {
@@ -481,6 +491,11 @@ pub const Routes = struct {
     };
 
     pub const GroupSecondaryIndexRebuild = struct {
+        group_id: u64,
+        table_name: []const u8,
+    };
+
+    pub const GroupRelationalColumnBackedIndexRepair = struct {
         group_id: u64,
         table_name: []const u8,
     };
@@ -830,6 +845,27 @@ pub const Routes = struct {
         const table_name = path[tables_prefix.len .. path.len - secondary_index_rebuild_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .table_name = table_name };
+    }
+
+    pub fn matchTableRelationalColumnBackedIndexRepair(path: []const u8) ?TableRelationalColumnBackedIndexRepair {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, relational_column_backed_index_repair_suffix)) return null;
+        const table_name = path[tables_prefix.len .. path.len - relational_column_backed_index_repair_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .table_name = table_name };
+    }
+
+    pub fn matchTableRelationalColumnBackedIndexRepairJob(path: []const u8) ?TableRelationalColumnBackedIndexRepairJob {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        const rest = path[tables_prefix.len..];
+        const marker = relational_column_backed_index_repair_suffix[1..] ++ "/jobs/";
+        const marker_index = std.mem.indexOf(u8, rest, marker) orelse return null;
+        if (marker_index == 0) return null;
+        const table_name = rest[0 .. marker_index - 1];
+        const job_id = rest[marker_index + marker.len ..];
+        if (table_name.len == 0 or job_id.len == 0) return null;
+        if (std.mem.indexOfScalar(u8, table_name, '/') != null or std.mem.indexOfScalar(u8, job_id, '/') != null) return null;
+        return .{ .table_name = table_name, .job_id = job_id };
     }
 
     pub fn matchTableIndexes(path: []const u8) ?TableIndexes {
@@ -1411,6 +1447,16 @@ pub const Routes = struct {
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
 
+    pub fn matchGroupRelationalColumnBackedIndexRepair(path: []const u8) ?GroupRelationalColumnBackedIndexRepair {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, relational_column_backed_index_repair_suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - relational_column_backed_index_repair_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
     pub fn matchGroupSchemaRewrite(path: []const u8) ?GroupSchemaRewrite {
         const group = parseGroupPrefix(path) orelse return null;
         const rest = group.rest;
@@ -1826,8 +1872,18 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("docs", fk_integrity.table_name);
     const unique_integrity = Routes.matchTableUniqueIntegrity("/tables/docs/unique-integrity").?;
     try std.testing.expectEqualStrings("docs", unique_integrity.table_name);
+    const public_repair = Routes.matchTableRelationalColumnBackedIndexRepair("/tables/docs/relational-column-backed-index-repair").?;
+    try std.testing.expectEqualStrings("docs", public_repair.table_name);
+    const public_repair_job = Routes.matchTableRelationalColumnBackedIndexRepairJob("/tables/docs/relational-column-backed-index-repair/jobs/repair:docs:1").?;
+    try std.testing.expectEqualStrings("docs", public_repair_job.table_name);
+    try std.testing.expectEqualStrings("repair:docs:1", public_repair_job.job_id);
     try std.testing.expect(Routes.matchTablePath("/tables/docs/foreign-key-integrity") == null);
     try std.testing.expect(Routes.matchTablePath("/tables/docs/unique-integrity") == null);
+    try std.testing.expect(Routes.matchTablePath("/tables/docs/relational-column-backed-index-repair") == null);
+    try std.testing.expect(Routes.matchTablePath("/tables/docs/relational-column-backed-index-repair/jobs/repair:docs:1") == null);
+    const repair = Routes.matchGroupRelationalColumnBackedIndexRepair("/internal/v1/groups/7/tables/docs/relational-column-backed-index-repair").?;
+    try std.testing.expectEqual(@as(u64, 7), repair.group_id);
+    try std.testing.expectEqualStrings("docs", repair.table_name);
     const indexes = Routes.matchTableIndexes("/tables/docs/indexes").?;
     try std.testing.expectEqualStrings("docs", indexes.table_name);
     const index = Routes.matchTableIndex("/tables/docs/indexes/search_idx").?;

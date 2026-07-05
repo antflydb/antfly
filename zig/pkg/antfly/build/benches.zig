@@ -1239,6 +1239,8 @@ pub fn addBenchSteps(ctx: anytype) BenchSteps {
         .name = "batch_bench",
         .root_module = batch_bench_mod,
     });
+    const batch_bench_build_step = b.step("batch-bench-build", "Build the relational batch benchmark without running it");
+    batch_bench_build_step.dependOn(&batch_bench.step);
 
     const run_batch_bench = b.addRunArtifact(batch_bench);
     if (b.args) |args| {

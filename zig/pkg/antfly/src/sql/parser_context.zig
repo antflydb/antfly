@@ -1049,6 +1049,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .expression_alternatives_hooks = Accessors.expressionWhereConditionAlternativesParserHooks(ptr),
                 .expression_condition_hooks = Accessors.expressionWhereConditionsParserHooks(ptr),
                 .expression_where_options = Accessors.joinedMutationExpressionWhereOptions(ptr),
+                .order_expression_hooks = Accessors.orderExpressionParserOptions(ptr),
                 .returning_hooks = Accessors.returningProjectionParserOptions(ptr),
                 .joined_returning_hooks = Accessors.joinedMutationReturningProjectionParserOptions(ptr),
                 .realtime_ns = value_mod.currentRealtimeNs(),
@@ -1079,6 +1080,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .expression_alternatives_hooks = Accessors.expressionWhereConditionAlternativesParserHooks(ptr),
                 .expression_condition_hooks = Accessors.expressionWhereConditionsParserHooks(ptr),
                 .expression_where_options = Accessors.joinedMutationExpressionWhereOptions(ptr),
+                .order_expression_hooks = Accessors.orderExpressionParserOptions(ptr),
                 .returning_hooks = Accessors.returningProjectionParserOptions(ptr),
                 .joined_returning_hooks = Accessors.joinedMutationReturningProjectionParserOptions(ptr),
                 .realtime_ns = value_mod.currentRealtimeNs(),
@@ -1181,6 +1183,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 &ptr.pos,
                 ptr.schema,
                 try lower_dml.mutationRowClaimAlloc(ptr.alloc, ptr.mutation_claim, false),
+                ptr.generated_dml_ast,
             );
         }
 

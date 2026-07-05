@@ -404,6 +404,7 @@ pub const SqlAdapterClassificationReason = enum {
     extension,
     foreign_data_catalog_plan,
     graph_query_plan,
+    index_access_method_plan,
     insert_overriding_value_plan,
     invalid_expression_conflict_target,
     invalid_named_conflict_target,
@@ -586,6 +587,7 @@ pub fn nativeExecutionRequirement(reason: SqlAdapterClassificationReason) Native
         .extension,
         .event_trigger_catalog_plan,
         .graph_query_plan,
+        .index_access_method_plan,
         .schema_namespace,
         .foreign_data_catalog_plan,
         .operator_catalog_plan,
@@ -688,6 +690,7 @@ test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expectEqual(SqlAdapterClassificationReason.event_trigger_catalog_plan, classificationReasonFromToken("event_trigger_catalog_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.foreign_data_catalog_plan, classificationReasonFromToken("foreign_data_catalog_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.graph_query_plan, classificationReasonFromToken("graph_query_plan").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.index_access_method_plan, classificationReasonFromToken("index_access_method_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.operator_catalog_plan, classificationReasonFromToken("operator_catalog_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.prepared_transaction_plan, classificationReasonFromToken("prepared_transaction_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.role_setting_plan, classificationReasonFromToken("role_setting_plan").?);

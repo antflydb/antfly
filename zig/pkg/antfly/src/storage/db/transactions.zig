@@ -23,6 +23,7 @@ const internal_keys = @import("../internal_keys.zig");
 const mapper = @import("document_mapper.zig");
 const platform_clock = @import("../../platform/clock.zig");
 const platform_time = @import("../../platform/time.zig");
+const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const relational_store_mod = @import("relational_store.zig");
 const schema_api_mod = @import("../../schema/mod.zig");
 const schema_mod = @import("../schema.zig");
@@ -147,6 +148,16 @@ pub fn Impl(comptime DB: type) type {
             defer {
                 for (owned_row_claim_predicate_keys.items) |key| self.alloc.free(key);
                 owned_row_claim_predicate_keys.deinit(self.alloc);
+            }
+            var owned_relational_prepare_keys = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (owned_relational_prepare_keys.items) |key| self.alloc.free(key);
+                owned_relational_prepare_keys.deinit(self.alloc);
+            }
+            var owned_relational_prepare_values = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (owned_relational_prepare_values.items) |value| self.alloc.free(value);
+                owned_relational_prepare_values.deinit(self.alloc);
             }
 
             for (effective_ops.writes) |write| {
@@ -285,8 +296,105 @@ pub fn Impl(comptime DB: type) type {
                 &owned_metadata_values,
                 req.foreign_key_constraint_timing_overrides,
             );
+            try appendPreparedRelationalRowMutationIntents(
+                self,
+                txn_id,
+                &intents,
+                &owned_relational_prepare_keys,
+                &owned_relational_prepare_values,
+                effective_ops.writes,
+                effective_ops.deletes,
+            );
 
             try self.writeIntents(txn_id, intents.items, predicates.items);
+        }
+
+        fn appendPreparedRelationalRowMutationIntents(
+            self: *DB,
+            txn_id: types.TxnId,
+            intents: *std.ArrayListUnmanaged(transactions_mod.WriteIntent),
+            owned_keys: *std.ArrayListUnmanaged([]u8),
+            owned_values: *std.ArrayListUnmanaged([]u8),
+            writes: []const types.TransactionWrite,
+            deletes: []const []const u8,
+        ) !void {
+            const relational_columns = relationalColumnsForStore(self) orelse return;
+            const runtime_schema = self.core.schema orelse return;
+            if (runtime_schema.foreign_keys.len != 0) return;
+
+            var relational_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
+            defer relational_delete_keys.deinit(self.alloc);
+            for (deletes) |key| {
+                if (isMetadataKey(key) or internal_keys.isInternalPhysicalTableDataKey(key)) continue;
+                try relational_delete_keys.append(self.alloc, key);
+            }
+
+            var relational_prepare_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+            defer relational_prepare_writes.deinit(self.alloc);
+            var relational_prepare_deletes = std.ArrayListUnmanaged([]const u8).empty;
+            defer relational_prepare_deletes.deinit(self.alloc);
+            var relational_participant = relational_store_mod.WriteParticipant.initWithColumnIndexPolicy(
+                self.alloc,
+                self.core.store,
+                &relational_prepare_writes,
+                &relational_prepare_deletes,
+                owned_keys,
+                owned_values,
+                relationalColumnIndexPolicyForStore(self),
+            );
+            relational_participant.configureForeignKeys(runtime_schema.default_type, runtime_schema.foreign_keys, relational_delete_keys.items);
+            relational_participant.configurePrimaryKey(runtime_schema.primary_key);
+            relational_participant.configureUniqueConstraints(runtime_schema.unique_constraints);
+            relational_participant.configurePeriods(runtime_schema.periods, runtime_schema.relational_columns);
+
+            var relational_participant_prepared = false;
+            var relational_participant_closed = false;
+            errdefer if (relational_participant_prepared and !relational_participant_closed)
+                relational_participant.abort(null);
+
+            for (writes) |write| {
+                if (isMetadataKey(write.key) or internal_keys.isInternalPhysicalTableDataKey(write.key)) continue;
+                const row_value = try relational_store_mod.relationalStoreRowValueAlloc(
+                    self.alloc,
+                    write.value,
+                    relational_columns,
+                    owned_values,
+                );
+                relational_participant_prepared = true;
+                relational_participant.prepareUpsert(
+                    runtime_schema.default_type,
+                    write.key,
+                    row_value,
+                    txn_id,
+                ) catch |err| {
+                    if (err == error.ForeignKeyViolation) recordForeignKeyChildWriteReject(self);
+                    return err;
+                };
+            }
+
+            for (deletes) |key| {
+                if (isMetadataKey(key) or internal_keys.isInternalPhysicalTableDataKey(key)) continue;
+                relational_participant_prepared = true;
+                relational_participant.prepareDelete(
+                    runtime_schema.default_type,
+                    key,
+                    txn_id,
+                ) catch |err| {
+                    if (err == error.ForeignKeyViolation) recordForeignKeyParentDeleteReject(self);
+                    return err;
+                };
+            }
+
+            if (relational_participant_prepared) {
+                try relational_participant.closePreparedIntents();
+                relational_participant_closed = true;
+            }
+            for (relational_prepare_writes.items) |write| {
+                try intents.append(self.alloc, .{ .key = write.key, .value = write.value });
+            }
+            for (relational_prepare_deletes.items) |key| {
+                try intents.append(self.alloc, .{ .key = key, .value = null });
+            }
         }
 
         pub fn claimRowsForTransaction(
@@ -982,8 +1090,9 @@ pub fn Impl(comptime DB: type) type {
         }
 
         fn relationalColumnIndexPolicyForStore(self: *DB) relational_store_mod.ColumnIndexPolicy {
-            const columns = relationalColumnsForStore(self) orelse return relational_store_mod.ColumnIndexPolicy.all();
-            return relational_store_mod.ColumnIndexPolicy.fromColumns(columns);
+            const schema = self.core.schema orelse return relational_store_mod.ColumnIndexPolicy.all();
+            if (schema.storage_mode != .relational) return relational_store_mod.ColumnIndexPolicy.all();
+            return relational_store_mod.ColumnIndexPolicy.fromSchema(schema);
         }
 
         fn recordForeignKeyChildWriteReject(self: *DB) void {
@@ -1457,6 +1566,147 @@ test "db transactions unique constraint mutations enforce owner handoff" {
     });
     try db.commitTransaction(delete_txn, 41_401);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, unique_key));
+}
+
+test "db transactions ordered tuple compound unique prepares conflict on owner tuple" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"email":{"type":"keyword"},"display_name":{"type":"keyword"}},"required":["id","tenant_id","email"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_tenant_email_key","columns":["tenant_id","email"],"include_columns":["display_name"],"index_keys":[{"column":"tenant_id"},{"column":"email"}],"index_lifecycle":"ready","index_generation":7,"index_access_method":"ordered_tuple","index_schema_fingerprint":"unique-index-v1:users_tenant_email"}]}
+    ;
+    var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+    try std.testing.expectEqual(schema_mod.RelationalIndexAccessMethod.ordered_tuple, runtime_schema.unique_constraints[0].index_access_method.?);
+
+    const first_txn = try db.beginTransaction(42_000);
+    try db.writeTransaction(first_txn, .{
+        .writes = &.{.{ .key = "user:ada", .value = "{\"id\":\"user:ada\",\"tenant_id\":\"tenant:1\",\"email\":\"ada@example.test\",\"display_name\":\"Ada\"}" }},
+    });
+
+    const conflicting_txn = try db.beginTransaction(42_001);
+    try std.testing.expectError(transactions_mod.TxnError.IntentConflict, db.writeTransaction(conflicting_txn, .{
+        .writes = &.{.{ .key = "user:ada-duplicate", .value = "{\"id\":\"user:ada-duplicate\",\"tenant_id\":\"tenant:1\",\"email\":\"ada@example.test\",\"display_name\":\"Ada Duplicate\"}" }},
+    }));
+    try db.abortTransaction(conflicting_txn, 42_002);
+
+    try db.commitTransaction(first_txn, 42_010);
+
+    const parent_row = try mapper.buildRelationalRowValueAlloc(
+        alloc,
+        "{\"id\":\"user:ada\",\"tenant_id\":\"tenant:1\",\"email\":\"ada@example.test\",\"display_name\":\"Ada\"}",
+        runtime_schema.relational_columns,
+    );
+    defer alloc.free(parent_row);
+    const ordered_tuple = try relational_store_mod.orderedTupleValueForIndexKeysAlloc(
+        alloc,
+        parent_row,
+        runtime_schema.unique_constraints[0].index_keys,
+        runtime_schema.relational_columns,
+    );
+    defer alloc.free(ordered_tuple);
+    const ordered_forward_key = try internal_keys.relationalOrderedTupleIndexKeyAlloc(
+        alloc,
+        runtime_schema.unique_constraints[0].name,
+        ordered_tuple,
+        "user:ada",
+    );
+    defer alloc.free(ordered_forward_key);
+    const ordered_payload = try db.core.store.get(alloc, ordered_forward_key);
+    defer alloc.free(ordered_payload);
+    const ordered_payload_json = try relational_row_codec.reconstructValueAlloc(alloc, ordered_payload);
+    defer alloc.free(ordered_payload_json);
+    try std.testing.expectEqualStrings("{\"display_name\":\"Ada\"}", ordered_payload_json);
+
+    const duplicate_after_commit_txn = try db.beginTransaction(42_020);
+    try std.testing.expectError(error.UniqueConstraintViolation, db.writeTransaction(duplicate_after_commit_txn, .{
+        .writes = &.{.{ .key = "user:ada-duplicate-after-commit", .value = "{\"id\":\"user:ada-duplicate-after-commit\",\"tenant_id\":\"tenant:1\",\"email\":\"ada@example.test\",\"display_name\":\"Ada Duplicate\"}" }},
+    }));
+    try db.abortTransaction(duplicate_after_commit_txn, 42_021);
+}
+
+test "db transactions compound foreign key prepares conflict on parent tuple" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"rows","enforce_types":true,"document_schemas":{"rows":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"email":{"type":"keyword"},"order_tenant_id":{"type":"keyword"},"order_email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_tenant_email_key","columns":["tenant_id","email"],"index_keys":[{"column":"tenant_id"},{"column":"email"}],"index_lifecycle":"ready","index_generation":7,"index_access_method":"ordered_tuple","index_schema_fingerprint":"unique-index-v1:users_tenant_email"}],"foreign_keys":[{"name":"orders_user_email_fkey","columns":["order_tenant_id","order_email"],"references":{"table":"rows","columns":["tenant_id","email"]},"on_delete":"restrict"}]}
+    ;
+    var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const parent_tuple = try relational_store_mod.bytesTupleValueAlloc(alloc, &.{ "tenant:1", "ada@example.test" });
+    defer alloc.free(parent_tuple);
+
+    const child_ref_txn = try db.beginTransaction(42_100);
+    try db.writeTransaction(child_ref_txn, .{
+        .foreign_key_ref_writes = &.{.{
+            .constraint_name = "orders_user_email_fkey",
+            .parent_table = "rows",
+            .parent_key = parent_tuple,
+            .child_table = runtime_schema.default_type,
+            .child_key = "order:ada",
+        }},
+    });
+
+    const parent_delete_txn = try db.beginTransaction(42_101);
+    try std.testing.expectError(transactions_mod.TxnError.IntentConflict, db.writeTransaction(parent_delete_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_user_email_fkey",
+            .parent_table = "rows",
+            .parent_key = parent_tuple,
+        }},
+    }));
+    try db.abortTransaction(parent_delete_txn, 42_102);
+
+    try db.commitTransaction(child_ref_txn, 42_110);
+
+    const ref_key = try internal_keys.relationalForeignKeyRefKeyAlloc(
+        alloc,
+        "orders_user_email_fkey",
+        "rows",
+        parent_tuple,
+        runtime_schema.default_type,
+        "order:ada",
+    );
+    defer alloc.free(ref_key);
+    const ref_value = try db.core.store.get(alloc, ref_key);
+    defer alloc.free(ref_value);
+    try std.testing.expectEqualStrings("", ref_value);
+
+    const delete_after_commit_txn = try db.beginTransaction(42_120);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(delete_after_commit_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_user_email_fkey",
+            .parent_table = "rows",
+            .parent_key = parent_tuple,
+        }},
+    }));
+    try db.abortTransaction(delete_after_commit_txn, 42_121);
 }
 
 test "db transactions doc identity intent writes reject new documents at ordinal exhaustion" {

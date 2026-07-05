@@ -304,7 +304,7 @@ fn putIndexedSplitBatchDirect(
         for (writes) |write| {
             const doc_key = (try internal_keys.decodeRelationalRowKeyAlloc(dest_indexes.alloc, write.key)) orelse continue;
             defer dest_indexes.alloc.free(doc_key);
-            try relational_store_mod.appendColumnIndexWritesForRowWithColumnIndexPolicy(
+            try relational_store_mod.appendColumnBackedIndexWritesForRowWithColumnIndexPolicy(
                 dest_indexes.alloc,
                 &raw_writes,
                 &owned_column_index_keys,
@@ -1089,7 +1089,7 @@ pub fn Impl(comptime DB: type) type {
         fn relationalColumnIndexPolicy(self: *DB) relational_store_mod.ColumnIndexPolicy {
             const schema = self.core.schema orelse return relational_store_mod.ColumnIndexPolicy.all();
             if (schema.storage_mode != .relational) return relational_store_mod.ColumnIndexPolicy.all();
-            return relational_store_mod.ColumnIndexPolicy.fromColumns(schema.relational_columns);
+            return relational_store_mod.ColumnIndexPolicy.fromSchema(schema);
         }
 
         fn rebuildRelationalColumnIndexesInStoreRange(

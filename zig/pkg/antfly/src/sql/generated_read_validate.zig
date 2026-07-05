@@ -1980,7 +1980,38 @@ fn validateGeneratedSubqueryPayloads(
     if (expression.subquery_source_tokens) |source_tokens| {
         if (source_tokens.start < inner_tokens.start or source_tokens.end > inner_tokens.end or source_tokens.start >= source_tokens.end) return error.UnsupportedSqlShape;
         if (previous_end + 1 != source_tokens.start or !tokens[previous_end].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
+        if (expression.subquery_source_table_tokens) |table_tokens| {
+            var table_start = source_tokens.start;
+            if (tokens[table_start].matchesKeywordTag(.only)) table_start += 1;
+            if (table_tokens.start != table_start or table_tokens.end != table_start + 1 or table_tokens.end > source_tokens.end) return error.UnsupportedSqlShape;
+            if (tokens[table_tokens.start].kind != .identifier) return error.UnsupportedSqlShape;
+            const alias_end = if (expression.subquery_source_alias_tokens) |alias_tokens| blk: {
+                const alias_name = expression.subquery_source_alias_name_tokens orelse return error.UnsupportedSqlShape;
+                if (alias_tokens.start != table_tokens.end or alias_tokens.start >= alias_tokens.end or alias_tokens.end > source_tokens.end) return error.UnsupportedSqlShape;
+                if (alias_tokens.end == table_tokens.end + 2) {
+                    if (!tokens[table_tokens.end].matchesKeywordTag(.as)) return error.UnsupportedSqlShape;
+                    if (alias_name.start != table_tokens.end + 1 or alias_name.end != table_tokens.end + 2) return error.UnsupportedSqlShape;
+                } else if (alias_tokens.end == table_tokens.end + 1) {
+                    if (alias_name.start != table_tokens.end or alias_name.end != table_tokens.end + 1) return error.UnsupportedSqlShape;
+                } else return error.UnsupportedSqlShape;
+                if (tokens[alias_name.start].kind != .identifier) return error.UnsupportedSqlShape;
+                break :blk alias_tokens.end;
+            } else blk: {
+                if (expression.subquery_source_alias_name_tokens != null) return error.UnsupportedSqlShape;
+                break :blk table_tokens.end;
+            };
+            if (alias_end != source_tokens.end) return error.UnsupportedSqlShape;
+        } else if (expression.subquery_source_alias_tokens != null or
+            expression.subquery_source_alias_name_tokens != null)
+        {
+            return error.UnsupportedSqlShape;
+        }
         previous_end = source_tokens.end;
+    } else if (expression.subquery_source_table_tokens != null or
+        expression.subquery_source_alias_tokens != null or
+        expression.subquery_source_alias_name_tokens != null)
+    {
+        return error.UnsupportedSqlShape;
     }
     if (expression.subquery_where_tokens) |where_tokens| {
         if (where_tokens.start < inner_tokens.start or where_tokens.end > inner_tokens.end or where_tokens.start >= where_tokens.end) return error.UnsupportedSqlShape;
@@ -3971,7 +4002,7 @@ pub fn generatedSingleJoinPredicateExpression(
     const predicate_tokens = join.predicate_tokens orelse return error.UnsupportedSqlShape;
     const predicate_expression_tokens = join.predicate_expression.tokens orelse return null;
     if (!expr_generated.generatedTokenRangeEqual(predicate_expression_tokens, predicate_tokens)) return error.UnsupportedSqlShape;
-    return &join.predicate_expression;
+    return &read.join_items[0].predicate_expression;
 }
 
 fn validateGeneratedJoinKindForOperator(tokens: []const Token, operator_tokens: generated_parser.GeneratedSqlTokenRange, kind: generated_parser.GeneratedSqlJoinKind) !void {

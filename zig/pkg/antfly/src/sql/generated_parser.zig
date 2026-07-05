@@ -751,6 +751,9 @@ pub const GeneratedSqlExpressionAst = struct {
     subquery_projection_tokens: ?GeneratedSqlTokenRange = null,
     subquery_projection_items: GeneratedSqlListAst = .{},
     subquery_source_tokens: ?GeneratedSqlTokenRange = null,
+    subquery_source_table_tokens: ?GeneratedSqlTokenRange = null,
+    subquery_source_alias_tokens: ?GeneratedSqlTokenRange = null,
+    subquery_source_alias_name_tokens: ?GeneratedSqlTokenRange = null,
     subquery_where_tokens: ?GeneratedSqlTokenRange = null,
     subquery_where_expression_kind: ?GeneratedSqlExpressionKind = null,
     subquery_where_expression: ?*GeneratedSqlExpressionAst = null,
@@ -1233,6 +1236,17 @@ pub const GeneratedSqlPreparedAst = struct {
     parameter_tokens: ?GeneratedSqlTokenRange = null,
     argument_tokens: ?GeneratedSqlTokenRange = null,
     inner_statement_tokens: ?GeneratedSqlTokenRange = null,
+
+    /// For PREPARE, this AST is relative to `inner_statement_tokens`.
+    inner_statement_ast: ?*GeneratedSqlAst = null,
+
+    pub fn deinit(self: *GeneratedSqlPreparedAst, alloc: std.mem.Allocator) void {
+        if (self.inner_statement_ast) |inner_ast| {
+            inner_ast.deinit(alloc);
+            alloc.destroy(inner_ast);
+        }
+        self.* = undefined;
+    }
 };
 
 pub const GeneratedSqlPreparedTransactionAst = struct {
@@ -1247,6 +1261,18 @@ pub const GeneratedSqlCursorAst = struct {
     statement_span: token_mod.SourceSpan,
     command_span: token_mod.SourceSpan,
     tail_tokens: ?GeneratedSqlTokenRange = null,
+    subject_tokens: ?GeneratedSqlTokenRange = null,
+
+    /// For DECLARE CURSOR, this AST is relative to `subject_tokens`.
+    subject_ast: ?*GeneratedSqlAst = null,
+
+    pub fn deinit(self: *GeneratedSqlCursorAst, alloc: std.mem.Allocator) void {
+        if (self.subject_ast) |subject_ast| {
+            subject_ast.deinit(alloc);
+            alloc.destroy(subject_ast);
+        }
+        self.* = undefined;
+    }
 };
 
 pub const GeneratedSqlRoutineAst = struct {
@@ -1300,9 +1326,14 @@ pub const GeneratedSqlAlterTablePartitionAction = enum {
 pub const GeneratedSqlViewAst = struct {
     column_items: GeneratedSqlListAst = .{},
     query_tokens: ?GeneratedSqlTokenRange = null,
+    query_read: ?*GeneratedSqlReadAst = null,
 
     pub fn deinit(self: *GeneratedSqlViewAst, alloc: std.mem.Allocator) void {
         self.column_items.deinit(alloc);
+        if (self.query_read) |read| {
+            read.deinit(alloc);
+            alloc.destroy(read);
+        }
         self.* = undefined;
     }
 };
@@ -1785,6 +1816,9 @@ fn cloneRebasedGeneratedExpressionAlloc(
     cloned.subquery_projection_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.subquery_projection_tokens, base, end);
     cloned.subquery_projection_items = try cloneRebasedGeneratedListAlloc(alloc, expression.subquery_projection_items, base, end);
     cloned.subquery_source_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.subquery_source_tokens, base, end);
+    cloned.subquery_source_table_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.subquery_source_table_tokens, base, end);
+    cloned.subquery_source_alias_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.subquery_source_alias_tokens, base, end);
+    cloned.subquery_source_alias_name_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.subquery_source_alias_name_tokens, base, end);
     cloned.subquery_where_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.subquery_where_tokens, base, end);
     cloned.subquery_where_expression = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, expression.subquery_where_expression, base, end);
     cloned.subquery_set_operation_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.subquery_set_operation_tokens, base, end);
@@ -2658,6 +2692,7 @@ pub const GeneratedSqlAst = union(enum) {
 
     pub fn deinit(self: *GeneratedSqlAst, alloc: std.mem.Allocator) void {
         switch (self.*) {
+            .prepared => |*prepared| prepared.deinit(alloc),
             .ddl => |*ddl| ddl.deinit(alloc),
             .dml => |*dml| dml.deinit(alloc),
             .read => |read| {
@@ -2665,6 +2700,7 @@ pub const GeneratedSqlAst = union(enum) {
                 alloc.destroy(read);
             },
             .extension_index => |*ddl| ddl.deinit(alloc),
+            .cursor => |*cursor| cursor.deinit(alloc),
             .unsupported => |*unsupported| unsupported.deinit(alloc),
             else => {},
         }
@@ -3122,6 +3158,7 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE SERVER usage_server FOREIGN DATA WRAPPER postgres_fdw", .kind = .unsupported },
     .{ .sql = "CREATE STATISTICS usage_stats ON tenant_id, status FROM usage_records", .kind = .unsupported },
     .{ .sql = "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()", .kind = .unsupported },
+    .{ .sql = "CREATE CONSTRAINT TRIGGER usage_audit AFTER INSERT ON usage_records DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION audit_usage()", .kind = .unsupported },
     .{ .sql = "CREATE OR REPLACE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()", .kind = .unsupported },
     .{ .sql = "CREATE TRIGGER usage_when BEFORE UPDATE ON usage_records FOR EACH ROW WHEN (NEW.status IS DISTINCT FROM OLD.status) EXECUTE FUNCTION audit_usage()", .kind = .unsupported },
     .{ .sql = "CREATE TEXT SEARCH CONFIGURATION usage_search (COPY = pg_catalog.english)", .kind = .unsupported },
@@ -3197,13 +3234,13 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "UNLISTEN *", .kind = .unsupported },
 };
 
-pub fn parseSqlAlloc(alloc: std.mem.Allocator, sql: []const u8) !GeneratedSqlParseResult {
+pub fn parseSqlAlloc(alloc: std.mem.Allocator, sql: []const u8) anyerror!GeneratedSqlParseResult {
     var tokens = try lexer.tokenizeAlloc(alloc, sql);
     defer lexer.freeTokens(alloc, &tokens);
     return try parseTokensAlloc(alloc, tokens.items);
 }
 
-pub fn parseTokensAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) !GeneratedSqlParseResult {
+pub fn parseTokensAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) anyerror!GeneratedSqlParseResult {
     return parseTokensAllocWithAstMode(alloc, tokens, .full);
 }
 
@@ -3211,7 +3248,7 @@ pub fn parseTokensAllocWithAstMode(
     alloc: std.mem.Allocator,
     tokens: []const token_mod.Token,
     ast_mode: GeneratedSqlAstMode,
-) !GeneratedSqlParseResult {
+) anyerror!GeneratedSqlParseResult {
     const statement = classifyStatement(tokens);
 
     var grammar_statement_kind: GeneratedSqlStatementKind = undefined;
@@ -3261,6 +3298,7 @@ fn generatedGrammarKindMatchesStatement(
         }
     }
     if (grammar_statement_kind != .unsupported) return false;
+    if (statement == .extension_index and statement.extension_index == .create_index and generatedLooksLikeAntflyCreateTextSearch(tokens)) return true;
     if (statement == .ddl and (statement.ddl == .comment or statement.ddl == .security_label or statement.ddl == .grant or statement.ddl == .revoke or statement.ddl == .alter_default_privileges)) return true;
     return generatedUnsupportedGrammarRoleAliasMatchesDdl(statement, tokens);
 }
@@ -3276,6 +3314,19 @@ fn generatedUnsupportedGrammarRoleAliasMatchesDdl(statement: GeneratedSqlStateme
         },
         else => false,
     };
+}
+
+fn generatedLooksLikeAntflyCreateTextSearch(tokens: []const token_mod.Token) bool {
+    if (tokens.len <= 3) return false;
+    if (!tokens[0].matchesKeywordTag(.create) or !tokens[1].matchesKeyword("text") or !tokens[2].matchesKeyword("search")) return false;
+    return !generatedTextSearchCatalogKind(tokens[3]);
+}
+
+fn generatedTextSearchCatalogKind(token: token_mod.Token) bool {
+    return token.matchesKeyword("configuration") or
+        token.matchesKeyword("dictionary") or
+        token.matchesKeyword("parser") or
+        token.matchesKeyword("template");
 }
 
 fn parseGeneratedTokenIds(alloc: std.mem.Allocator, token_ids: []const u16) !void {
@@ -3419,7 +3470,7 @@ fn buildGeneratedParseResult(
     tokens: []const token_mod.Token,
     statement: GeneratedSqlStatement,
     ast_mode: GeneratedSqlAstMode,
-) !GeneratedSqlParseResult {
+) anyerror!GeneratedSqlParseResult {
     return .{
         .kind = std.meta.activeTag(statement),
         .statement = statement,
@@ -3440,21 +3491,6 @@ pub fn parseFirstFamilyTokensAlloc(alloc: std.mem.Allocator, tokens: []const tok
     };
     if (!generatedStatementKindIsFirstFamily(kind)) return null;
     return try parseTokensAlloc(alloc, tokens);
-}
-
-pub fn parseGeneratedGateTokensAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) !?GeneratedSqlParseResult {
-    return try parseGeneratedGateTokensAllocWithAstMode(alloc, tokens, .full);
-}
-
-pub fn parseGeneratedGateTokensAllocWithAstMode(
-    alloc: std.mem.Allocator,
-    tokens: []const token_mod.Token,
-    ast_mode: GeneratedSqlAstMode,
-) !?GeneratedSqlParseResult {
-    return parseGeneratedGateTokensStrictAllocWithAstMode(alloc, tokens, ast_mode) catch |err| switch (err) {
-        error.UnsupportedSqlShape, error.UnexpectedToken => return null,
-        else => return err,
-    };
 }
 
 pub fn parseGeneratedGateTokensStrictAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) !?GeneratedSqlParseResult {
@@ -4144,14 +4180,16 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .create_rule };
         if (second.matchesKeywordTag(.server)) return .{ .unsupported = .create_server };
         if (second.matchesKeyword("statistics")) return .{ .unsupported = .create_statistics };
-        if (second.matchesKeywordTag(.text) and tokens.len > 3 and tokens[2].matchesKeyword("search")) {
+        if (second.matchesKeyword("text") and tokens.len > 3 and tokens[2].matchesKeyword("search")) {
             const text_search_kind = tokens[3];
             if (text_search_kind.matchesKeyword("configuration")) return .{ .unsupported = .create_text_search_configuration };
             if (text_search_kind.matchesKeyword("dictionary")) return .{ .unsupported = .create_text_search_dictionary };
             if (text_search_kind.matchesKeyword("parser")) return .{ .unsupported = .create_text_search_parser };
             if (text_search_kind.matchesKeyword("template")) return .{ .unsupported = .create_text_search_template };
+            return .{ .extension_index = .create_index };
         }
         if (second.matchesKeyword("transform")) return .{ .unsupported = .create_transform };
+        if (second.matchesKeywordTag(.constraint) and tokens.len > 2 and tokens[2].matchesKeywordTag(.trigger)) return .{ .unsupported = .create_trigger };
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .create_trigger };
         if (second.matchesKeywordTag(.extension)) return .{ .extension_index = .create_extension };
     }
@@ -4231,7 +4269,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.subscription)) return .{ .ddl = .alter_subscription };
         if (second.matchesKeywordTag(.system)) return .{ .unsupported = .alter_system };
         if (second.matchesKeyword("statistics")) return .{ .unsupported = .alter_statistics };
-        if (second.matchesKeywordTag(.text) and tokens.len > 3 and tokens[2].matchesKeyword("search")) {
+        if (second.matchesKeyword("text") and tokens.len > 3 and tokens[2].matchesKeyword("search")) {
             const text_search_kind = tokens[3];
             if (text_search_kind.matchesKeyword("configuration")) return .{ .unsupported = .alter_text_search_configuration };
             if (text_search_kind.matchesKeyword("dictionary")) return .{ .unsupported = .alter_text_search_dictionary };
@@ -4319,7 +4357,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.cast)) return .{ .ddl = .drop_cast };
         if (second.matchesKeywordTag(.server)) return .{ .unsupported = .drop_server };
         if (second.matchesKeyword("statistics")) return .{ .unsupported = .drop_statistics };
-        if (second.matchesKeywordTag(.text) and tokens.len > 3 and tokens[2].matchesKeyword("search")) {
+        if (second.matchesKeyword("text") and tokens.len > 3 and tokens[2].matchesKeyword("search")) {
             const text_search_kind = tokens[3];
             if (text_search_kind.matchesKeyword("configuration")) return .{ .unsupported = .drop_text_search_configuration };
             if (text_search_kind.matchesKeyword("dictionary")) return .{ .unsupported = .drop_text_search_dictionary };
@@ -6108,6 +6146,10 @@ fn generatedUnsupportedSubjectStart(tokens: []const token_mod.Token, kind: Gener
             tokens[2].matchesKeywordTag(.replace) and
             tokens[3].matchesKeywordTag(.trigger))
             4
+        else if (end > 2 and
+            tokens[1].matchesKeywordTag(.constraint) and
+            tokens[2].matchesKeywordTag(.trigger))
+            3
         else
             2,
         .drop_trigger => 2,
@@ -6241,7 +6283,7 @@ fn parseGeneratedExplainOptionalBool(
     return default_value;
 }
 
-fn buildGeneratedAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, statement: GeneratedSqlStatement) !?GeneratedSqlAst {
+fn buildGeneratedAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, statement: GeneratedSqlStatement) anyerror!?GeneratedSqlAst {
     const end = statementTokenEnd(tokens);
     if (end == 0) return null;
     const statement_span = sourceSpanForTokenRange(tokens, .{ .start = 0, .end = end }) orelse return null;
@@ -6250,7 +6292,7 @@ fn buildGeneratedAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, 
     return switch (statement) {
         .session => |kind| .{ .session = buildSessionAst(tokens, end, kind, statement_span, command_span) },
         .transaction => |kind| .{ .transaction = buildTransactionAst(tokens, end, kind, statement_span, command_span) },
-        .prepared => |kind| .{ .prepared = buildPreparedAst(tokens, end, kind, statement_span, command_span) },
+        .prepared => |kind| .{ .prepared = try buildPreparedAstAlloc(alloc, tokens, end, kind, statement_span, command_span) },
         .prepared_transaction => |kind| .{ .prepared_transaction = buildPreparedTransactionAst(end, kind, statement_span, command_span) },
         .ddl => |kind| .{ .ddl = try buildDdlAst(alloc, tokens, end, kind, statement_span, command_span) },
         .dml => |kind| .{ .dml = try buildDmlAst(alloc, tokens, command_start, end, kind, statement_span, command_span) },
@@ -6262,7 +6304,7 @@ fn buildGeneratedAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, 
         },
         .extension_index => |kind| .{ .extension_index = try buildDdlAst(alloc, tokens, end, ddlKindFromExtensionIndexKind(kind), statement_span, command_span) },
         .graph => |kind| .{ .graph = buildGraphAst(tokens, end, kind, statement_span, command_span) },
-        .cursor => |kind| .{ .cursor = buildCursorAst(end, kind, statement_span, command_span) },
+        .cursor => |kind| .{ .cursor = try buildCursorAstAlloc(alloc, tokens, end, kind, statement_span, command_span) },
         .unsupported => |kind| .{ .unsupported = try buildUnsupportedAst(alloc, tokens, end, kind, statement_span, command_span) },
         else => null,
     };
@@ -6318,18 +6360,53 @@ fn generatedSavepointNameRange(tokens: []const token_mod.Token, end: usize, star
     return if (name_start < end) .{ .start = name_start, .end = end } else null;
 }
 
-fn buildCursorAst(
+fn buildCursorAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
     end: usize,
     kind: GeneratedSqlCursorKind,
     statement_span: token_mod.SourceSpan,
     command_span: token_mod.SourceSpan,
-) GeneratedSqlCursorAst {
-    return .{
+) !GeneratedSqlCursorAst {
+    var ast = GeneratedSqlCursorAst{
         .kind = kind,
         .statement_span = statement_span,
         .command_span = command_span,
         .tail_tokens = if (end > 1) .{ .start = 1, .end = end } else null,
     };
+    errdefer ast.deinit(alloc);
+    if (kind == .declare) {
+        const subject = generatedDeclareCursorSubjectRange(tokens, end) orelse return ast;
+        ast.subject_tokens = subject;
+        ast.subject_ast = try buildPreparedInnerAstAlloc(alloc, tokens[subject.start..subject.end]);
+    }
+    return ast;
+}
+
+fn generatedDeclareCursorSubjectRange(tokens: []const token_mod.Token, end: usize) ?GeneratedSqlTokenRange {
+    if (end < 5 or !tokens[0].matchesKeywordTag(.declare)) return null;
+    var index: usize = 1;
+    if (index >= end or tokens[index].kind != .identifier) return null;
+    index += 1;
+    while (index < end) {
+        if (tokens[index].matchesKeyword("binary") or tokens[index].matchesKeyword("scroll")) {
+            index += 1;
+        } else if (index + 1 < end and tokens[index].matchesKeyword("no") and tokens[index + 1].matchesKeyword("scroll")) {
+            index += 2;
+        } else {
+            break;
+        }
+    }
+    if (index >= end or !tokens[index].matchesKeyword("cursor")) return null;
+    index += 1;
+    if (index + 1 < end and (tokens[index].matchesKeyword("with") or tokens[index].matchesKeyword("without"))) {
+        if (!tokens[index + 1].matchesKeyword("hold")) return null;
+        index += 2;
+    }
+    if (index >= end or !tokens[index].matchesKeyword("for")) return null;
+    index += 1;
+    if (index >= end) return null;
+    return .{ .start = index, .end = end };
 }
 
 fn buildGraphAst(
@@ -6657,24 +6734,29 @@ fn findSetValueStart(tokens: []const token_mod.Token, end: usize, name_start: us
     return if (end > name_start + 1) name_start + 1 else null;
 }
 
-fn buildPreparedAst(
+fn buildPreparedAstAlloc(
+    alloc: std.mem.Allocator,
     tokens: []const token_mod.Token,
     end: usize,
     kind: GeneratedSqlPreparedKind,
     statement_span: token_mod.SourceSpan,
     command_span: token_mod.SourceSpan,
-) GeneratedSqlPreparedAst {
+) anyerror!GeneratedSqlPreparedAst {
     var ast = GeneratedSqlPreparedAst{
         .kind = kind,
         .statement_span = statement_span,
         .command_span = command_span,
     };
+    errdefer ast.deinit(alloc);
     switch (kind) {
         .prepare => {
             if (end > 1) ast.name_tokens = .{ .start = 1, .end = 2 };
             if (findKeyword(tokens, 2, end, .as)) |as_index| {
                 if (as_index > 2) ast.parameter_tokens = .{ .start = 2, .end = as_index };
-                if (as_index + 1 < end) ast.inner_statement_tokens = .{ .start = as_index + 1, .end = end };
+                if (as_index + 1 < end) {
+                    ast.inner_statement_tokens = .{ .start = as_index + 1, .end = end };
+                    ast.inner_statement_ast = try buildPreparedInnerAstAlloc(alloc, tokens[as_index + 1 .. end]);
+                }
             }
         },
         .execute => {
@@ -6687,6 +6769,19 @@ fn buildPreparedAst(
         },
     }
     return ast;
+}
+
+fn buildPreparedInnerAstAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) anyerror!?*GeneratedSqlAst {
+    var parsed = parseTokensAlloc(alloc, tokens) catch |err| switch (err) {
+        error.UnsupportedSqlShape => return null,
+        else => return err,
+    };
+    defer parsed.deinit(alloc);
+    const ast = parsed.ast orelse return null;
+    const owned = try alloc.create(GeneratedSqlAst);
+    owned.* = ast;
+    parsed.ast = null;
+    return owned;
 }
 
 fn buildPreparedTransactionAst(
@@ -6823,6 +6918,14 @@ fn buildDdlAst(
                         ast.alter_table_operation_tokens = .{ .start = domain_range.end, .end = end };
                         if (tokens[domain_range.end].matchesKeywordTag(.as)) {
                             ast.domain_type_tokens = generatedQualifiedNameRange(tokens, domain_range.end + 1, end);
+                            if (ast.domain_type_tokens) |type_range| {
+                                if (type_range.end < end) {
+                                    ast.domain_operation_items = try buildGeneratedCreateDomainOptionListAst(alloc, tokens, .{
+                                        .start = type_range.end,
+                                        .end = end,
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -7032,56 +7135,84 @@ fn buildDdlAst(
             }
         },
         .create_index => {
-            if (tokens.len > 2 and tokens[1].matchesKeywordTag(.unique) and tokens[2].matchesKeywordTag(.index)) {
+            if (end > 3 and tokens[1].matchesKeyword("text") and tokens[2].matchesKeyword("search")) {
+                index = 3;
+                ast.if_not_exists = consumeGeneratedIfNotExists(tokens, &index, end);
+                ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
+                if (ast.object_name_tokens) |name_range| index = name_range.end;
+                if (index < end and tokens[index].matchesKeywordTag(.on)) {
+                    index += 1;
+                    ast.index_table_tokens = generatedQualifiedNameRange(tokens, index, end);
+                    if (ast.index_table_tokens) |table_range| index = table_range.end;
+                    if (index < end and tokens[index].kind == .lparen) {
+                        if (findMatchingParen(tokens, index, end)) |close_index| {
+                            ast.index_elements_tokens = .{ .start = index + 1, .end = close_index };
+                            index = close_index + 1;
+                        }
+                    }
+                    if (index < end and tokens[index].matchesKeywordTag(.with)) {
+                        const options_start = index;
+                        if (index + 1 < end and tokens[index + 1].kind == .lparen) {
+                            if (findMatchingParen(tokens, index + 1, end)) |close_index| {
+                                ast.index_options_tokens = .{ .start = options_start, .end = close_index + 1 };
+                            }
+                        } else {
+                            ast.index_options_tokens = .{ .start = index, .end = end };
+                        }
+                    }
+                }
+            } else if (tokens.len > 2 and tokens[1].matchesKeywordTag(.unique) and tokens[2].matchesKeywordTag(.index)) {
                 ast.unique = true;
                 index = 3;
             }
-            if (index < end and tokens[index].matchesKeyword("concurrently")) index += 1;
-            ast.if_not_exists = consumeGeneratedIfNotExists(tokens, &index, end);
-            ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
-            if (ast.object_name_tokens) |name_range| index = name_range.end;
-            if (index < end and tokens[index].matchesKeywordTag(.on)) {
-                index += 1;
-                if (index < end and tokens[index].matchesKeywordTag(.only)) index += 1;
-                ast.index_table_tokens = generatedQualifiedNameRange(tokens, index, end);
-                if (ast.index_table_tokens) |table_range| index = table_range.end;
-                if (index + 1 < end and tokens[index].matchesKeywordTag(.using)) {
-                    ast.index_method_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index + 1, end);
-                    if (ast.index_method_tokens) |method_range| index = method_range.end;
-                }
-                if (index < end and tokens[index].kind == .lparen) {
-                    if (findMatchingParen(tokens, index, end)) |close_index| {
-                        ast.index_elements_tokens = .{ .start = index + 1, .end = close_index };
-                        index = close_index + 1;
-                    }
-                }
-                if (index < end and tokens[index].matchesKeywordTag(.nulls)) {
+            if (!(end > 3 and tokens[1].matchesKeyword("text") and tokens[2].matchesKeyword("search"))) {
+                if (index < end and tokens[index].matchesKeyword("concurrently")) index += 1;
+                ast.if_not_exists = consumeGeneratedIfNotExists(tokens, &index, end);
+                ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
+                if (ast.object_name_tokens) |name_range| index = name_range.end;
+                if (index < end and tokens[index].matchesKeywordTag(.on)) {
                     index += 1;
-                    if (index < end and tokens[index].matchesKeywordTag(.not)) index += 1;
-                    if (index < end and tokens[index].matchesKeywordTag(.distinct)) index += 1;
-                }
-                if (index < end and tokens[index].matchesKeywordTag(.include)) {
-                    const include_open = index + 1;
-                    if (include_open < end and tokens[include_open].kind == .lparen) {
-                        if (findMatchingParen(tokens, include_open, end)) |close_index| {
-                            ast.index_include_tokens = .{ .start = include_open + 1, .end = close_index };
+                    if (index < end and tokens[index].matchesKeywordTag(.only)) index += 1;
+                    ast.index_table_tokens = generatedQualifiedNameRange(tokens, index, end);
+                    if (ast.index_table_tokens) |table_range| index = table_range.end;
+                    if (index + 1 < end and tokens[index].matchesKeywordTag(.using)) {
+                        ast.index_method_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index + 1, end);
+                        if (ast.index_method_tokens) |method_range| index = method_range.end;
+                    }
+                    if (index < end and tokens[index].kind == .lparen) {
+                        if (findMatchingParen(tokens, index, end)) |close_index| {
+                            ast.index_elements_tokens = .{ .start = index + 1, .end = close_index };
                             index = close_index + 1;
                         }
                     }
-                }
-                if (index < end and tokens[index].matchesKeywordTag(.with)) {
-                    const options_start = index;
-                    if (index + 1 < end and tokens[index + 1].kind == .lparen) {
-                        if (findMatchingParen(tokens, index + 1, end)) |close_index| {
-                            ast.index_options_tokens = .{ .start = options_start, .end = close_index + 1 };
-                            index = close_index + 1;
-                        }
-                    } else {
-                        ast.index_options_tokens = .{ .start = index, .end = end };
+                    if (index < end and tokens[index].matchesKeywordTag(.nulls)) {
+                        index += 1;
+                        if (index < end and tokens[index].matchesKeywordTag(.not)) index += 1;
+                        if (index < end and tokens[index].matchesKeywordTag(.distinct)) index += 1;
                     }
-                }
-                if (index < end and tokens[index].matchesKeywordTag(.where)) {
-                    ast.index_where_tokens = .{ .start = index + 1, .end = end };
+                    if (index < end and tokens[index].matchesKeywordTag(.include)) {
+                        const include_open = index + 1;
+                        if (include_open < end and tokens[include_open].kind == .lparen) {
+                            if (findMatchingParen(tokens, include_open, end)) |close_index| {
+                                ast.index_include_tokens = .{ .start = include_open + 1, .end = close_index };
+                                index = close_index + 1;
+                            }
+                        }
+                    }
+                    if (index < end and tokens[index].matchesKeywordTag(.with)) {
+                        const options_start = index;
+                        if (index + 1 < end and tokens[index + 1].kind == .lparen) {
+                            if (findMatchingParen(tokens, index + 1, end)) |close_index| {
+                                ast.index_options_tokens = .{ .start = options_start, .end = close_index + 1 };
+                                index = close_index + 1;
+                            }
+                        } else {
+                            ast.index_options_tokens = .{ .start = index, .end = end };
+                        }
+                    }
+                    if (index < end and tokens[index].matchesKeywordTag(.where)) {
+                        ast.index_where_tokens = .{ .start = index + 1, .end = end };
+                    }
                 }
             }
         },
@@ -8758,7 +8889,10 @@ fn buildGeneratedSubqueryExpressionAst(
     }
     if (from_index) |idx| {
         const source_end = firstOptionalIndex(&[_]?usize{ where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index, row_lock_index }) orelse body_end;
-        if (idx + 1 < source_end) ast.subquery_source_tokens = .{ .start = idx + 1, .end = source_end };
+        if (idx + 1 < source_end) {
+            ast.subquery_source_tokens = .{ .start = idx + 1, .end = source_end };
+            buildGeneratedSubquerySingleSourceAst(tokens, ast);
+        }
     }
     if (where_index) |idx| {
         const where_end = firstOptionalIndex(&[_]?usize{ group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index, row_lock_index }) orelse body_end;
@@ -8770,6 +8904,29 @@ fn buildGeneratedSubqueryExpressionAst(
     }
     const tail_start = set_operation_tail_start orelse projection_start;
     try buildGeneratedSubqueryResultTailAst(alloc, tokens, tail_start, inner_range.end, ast);
+}
+
+fn buildGeneratedSubquerySingleSourceAst(
+    tokens: []const token_mod.Token,
+    ast: *GeneratedSqlExpressionAst,
+) void {
+    const source_tokens = ast.subquery_source_tokens orelse return;
+    if (source_tokens.start >= source_tokens.end or source_tokens.end > tokens.len) return;
+    var table_start = source_tokens.start;
+    if (tokens[table_start].matchesKeywordTag(.only)) table_start += 1;
+    const table_tokens = generatedSingleTokenRangeIfIdentifier(tokens, table_start, source_tokens.end) orelse return;
+    var alias_end = table_tokens.end;
+    if (generatedReadSourceAlias(tokens, table_tokens.end, source_tokens.end)) |alias| {
+        ast.subquery_source_alias_tokens = alias.alias_tokens;
+        ast.subquery_source_alias_name_tokens = alias.alias_name_tokens;
+        alias_end = alias.end;
+    }
+    if (alias_end != source_tokens.end) {
+        ast.subquery_source_alias_tokens = null;
+        ast.subquery_source_alias_name_tokens = null;
+        return;
+    }
+    ast.subquery_source_table_tokens = table_tokens;
 }
 
 fn buildGeneratedSubqueryResultTailAst(
@@ -11502,7 +11659,15 @@ fn buildGeneratedCreateViewAstPtr(
         }
     }
     if (as_index + 1 < operation_range.end) {
-        ptr.query_tokens = .{ .start = as_index + 1, .end = operation_range.end };
+        const query_start = as_index + 1;
+        const query_end = if (generatedRelationPopulationDataClause(tokens, query_start, operation_range.end)) |clause|
+            clause.start
+        else
+            operation_range.end;
+        if (query_start < query_end) {
+            ptr.query_tokens = .{ .start = query_start, .end = query_end };
+            ptr.query_read = try buildGeneratedReadAstForRangeAlloc(alloc, tokens, ptr.query_tokens.?);
+        }
     }
     return ptr;
 }
@@ -11580,6 +11745,76 @@ fn generatedSequenceOperationEnd(tokens: []const token_mod.Token, start: usize, 
         return null;
     }
     return null;
+}
+
+fn buildGeneratedCreateDomainOptionListAst(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    range: GeneratedSqlTokenRange,
+) !GeneratedSqlListAst {
+    var ast = GeneratedSqlListAst{};
+    if (range.start >= range.end or range.end > tokens.len) return ast;
+
+    var items: std.ArrayListUnmanaged(GeneratedSqlTokenRange) = .empty;
+    errdefer items.deinit(alloc);
+    var index = range.start;
+    while (index < range.end) {
+        const option_end = generatedCreateDomainOptionEnd(tokens, index, range.end) orelse {
+            ast.deinit(alloc);
+            items.deinit(alloc);
+            return .{};
+        };
+        try recordGeneratedListItem(alloc, &items, &ast, .{ .start = index, .end = option_end });
+        index = option_end;
+    }
+    ast.items = try items.toOwnedSlice(alloc);
+    return ast;
+}
+
+fn generatedCreateDomainOptionEnd(tokens: []const token_mod.Token, start: usize, end: usize) ?usize {
+    if (start >= end) return null;
+    if (tokens[start].matchesKeyword("not")) {
+        if (start + 2 <= end and tokens[start + 1].matchesKeyword("null")) return start + 2;
+        return null;
+    }
+    if (tokens[start].matchesKeyword("null")) return start + 1;
+    if (tokens[start].matchesKeyword("check")) {
+        if (start + 1 >= end or tokens[start + 1].kind != .lparen) return null;
+        const close_index = findMatchingParen(tokens, start + 1, end) orelse return null;
+        if (close_index + 1 <= end) return close_index + 1;
+        return null;
+    }
+    if (tokens[start].matchesKeyword("constraint")) {
+        if (start + 4 > end or tokens[start + 1].kind != .identifier or !tokens[start + 2].matchesKeyword("check") or tokens[start + 3].kind != .lparen) return null;
+        const close_index = findMatchingParen(tokens, start + 3, end) orelse return null;
+        if (close_index + 1 <= end) return close_index + 1;
+        return null;
+    }
+    if (tokens[start].matchesKeyword("default")) {
+        if (start + 1 >= end) return null;
+        var index = start + 2;
+        var depth: usize = 0;
+        while (index < end) : (index += 1) {
+            switch (tokens[index].kind) {
+                .lparen, .lbracket => depth += 1,
+                .rparen, .rbracket => {
+                    if (depth == 0) return null;
+                    depth -= 1;
+                },
+                else => if (depth == 0 and generatedCreateDomainOptionStarts(tokens, index, end)) return index,
+            }
+        }
+        return end;
+    }
+    return null;
+}
+
+fn generatedCreateDomainOptionStarts(tokens: []const token_mod.Token, index: usize, end: usize) bool {
+    if (index >= end) return false;
+    if (tokens[index].matchesKeyword("default") or tokens[index].matchesKeyword("null") or tokens[index].matchesKeyword("check")) return true;
+    if (tokens[index].matchesKeyword("not")) return index + 1 < end and tokens[index + 1].matchesKeyword("null");
+    if (tokens[index].matchesKeyword("constraint")) return index + 3 < end and tokens[index + 2].matchesKeyword("check") and tokens[index + 3].kind == .lparen;
+    return false;
 }
 
 fn generatedCreatePublicationAllTables(tokens: []const token_mod.Token, operation_start: usize, end: usize) bool {
@@ -13408,6 +13643,8 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .create_index }, (try parseSqlAlloc(alloc, "CREATE UNIQUE INDEX usage_records_email_nulls_key ON usage_records (email) NULLS NOT DISTINCT")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .create_index }, (try parseSqlAlloc(alloc, "CREATE INDEX public.usage_records_status_idx ON public.usage_records (status) WHERE status = 'pending'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .create_index }, (try parseSqlAlloc(alloc, "CREATE INDEX public.usage_records_status_idx ON ONLY public.usage_records (status) WHERE status = 'pending'")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .create_index }, (try parseSqlAlloc(alloc, "CREATE TEXT SEARCH docs_body_fts ON docs (body) WITH (analyzer = 'standard')")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .create_index }, (try parseSqlAlloc(alloc, "CREATE TEXT SEARCH IF NOT EXISTS docs_body_fts ON docs (body)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .drop_index }, (try parseSqlAlloc(alloc, "DROP INDEX usage_status_idx")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .drop_index }, (try parseSqlAlloc(alloc, "DROP INDEX CONCURRENTLY IF EXISTS usage_status_idx")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .create_extension }, (try parseSqlAlloc(alloc, "CREATE EXTENSION vector")).statement);
@@ -13731,6 +13968,11 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, prepared.name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 5 }, prepared.parameter_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 14 }, prepared.inner_statement_tokens.?);
+            const inner_ast = prepared.inner_statement_ast orelse return error.TestUnexpectedResult;
+            switch (inner_ast.*) {
+                .read => |read_ast| try std.testing.expectEqual(GeneratedSqlReadKind.query, read_ast.kind),
+                else => return error.TestUnexpectedResult,
+            }
         },
         else => return error.TestUnexpectedResult,
     }
@@ -13763,6 +14005,24 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expect(prepared.parameter_tokens == null);
             try std.testing.expect(prepared.argument_tokens == null);
             try std.testing.expect(prepared.inner_statement_tokens == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const declare_cursor_sql = "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records";
+    var declare_cursor_tokens = try lexer.tokenizeAlloc(alloc, declare_cursor_sql);
+    defer lexer.freeTokens(alloc, &declare_cursor_tokens);
+    const declare_cursor_result = try parseTokensAlloc(alloc, declare_cursor_tokens.items);
+    switch (declare_cursor_result.ast.?) {
+        .cursor => |cursor| {
+            try std.testing.expectEqual(GeneratedSqlCursorKind.declare, cursor.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 8 }, cursor.tail_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 8 }, cursor.subject_tokens.?);
+            const subject_ast = cursor.subject_ast orelse return error.TestUnexpectedResult;
+            switch (subject_ast.*) {
+                .read => |read_ast| try std.testing.expectEqual(GeneratedSqlReadKind.query, read_ast.kind),
+                else => return error.TestUnexpectedResult,
+            }
         },
         else => return error.TestUnexpectedResult,
     }
@@ -13990,6 +14250,8 @@ test "generated SQL parser facade builds control AST spans" {
             const view_metadata = ddl.view_metadata orelse return error.TestUnexpectedResult;
             try std.testing.expectEqual(@as(usize, 0), view_metadata.column_items.count);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 15 }, view_metadata.query_tokens.?);
+            try std.testing.expect(view_metadata.query_read != null);
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, view_metadata.query_read.?.kind);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -14006,6 +14268,8 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, view_metadata.column_items.items[0]);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, view_metadata.column_items.items[1]);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 15 }, view_metadata.query_tokens.?);
+            try std.testing.expect(view_metadata.query_read != null);
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, view_metadata.query_read.?.kind);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -14020,7 +14284,7 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 15 }, ddl.alter_table_operation_tokens.?);
             const view_metadata = ddl.view_metadata orelse return error.TestUnexpectedResult;
             try std.testing.expectEqual(@as(usize, 0), view_metadata.column_items.count);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 15 }, view_metadata.query_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 12 }, view_metadata.query_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 15 }, ddl.materialized_view_data_clause_tokens.?);
             try std.testing.expectEqual(false, ddl.materialized_view_populate.?);
         },
@@ -14037,7 +14301,7 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 14 }, ddl.alter_table_operation_tokens.?);
             const view_metadata = ddl.view_metadata orelse return error.TestUnexpectedResult;
             try std.testing.expectEqual(@as(usize, 0), view_metadata.column_items.count);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 14 }, view_metadata.query_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 11 }, view_metadata.query_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 14 }, ddl.materialized_view_data_clause_tokens.?);
             try std.testing.expectEqual(false, ddl.materialized_view_populate.?);
         },
@@ -14053,6 +14317,8 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 11 }, ddl.alter_table_operation_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.domain_type_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), ddl.domain_operation_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 11 }, ddl.domain_operation_items.items[0]);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -14688,6 +14954,24 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, ddl.index_elements_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 16 }, ddl.index_options_tokens.?);
             try std.testing.expect(!ddl.unique);
+            try std.testing.expect(ddl.index_include_tokens == null);
+            try std.testing.expect(ddl.index_where_tokens == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const create_text_search_sql = "CREATE TEXT SEARCH IF NOT EXISTS docs_body_fts ON docs (body) WITH (analyzer = 'standard')";
+    const create_text_search_result = try parseSqlAlloc(alloc, create_text_search_sql);
+    switch (create_text_search_result.ast.?) {
+        .extension_index => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.create_index, ddl.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, ddl.index_table_tokens.?);
+            try std.testing.expect(ddl.index_method_tokens == null);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, ddl.index_elements_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 17 }, ddl.index_options_tokens.?);
+            try std.testing.expect(!ddl.unique);
+            try std.testing.expect(ddl.if_not_exists);
             try std.testing.expect(ddl.index_include_tokens == null);
             try std.testing.expect(ddl.index_where_tokens == null);
         },

@@ -1575,16 +1575,7 @@ fn maxSqlParameterOrdinal(sql: []const u8) !usize {
 }
 
 fn readResultRows(read: anytype) []const []const u8 {
-    return switch (read.result) {
-        .query => |query| query.rows,
-        .document_query => |query| query.rows,
-        .set_operation => |query| query.rows,
-        .recursive_cte => |query| query.rows,
-        .aggregate => |aggregate| aggregate.rows,
-        .window => |window| window.rows,
-        .join => |join| join.rows,
-        .lateral => |lateral| lateral.rows,
-    };
+    return read.rows;
 }
 
 fn readResultColumnsAlloc(alloc: std.mem.Allocator, read: anytype) !?[]const PgwireColumn {

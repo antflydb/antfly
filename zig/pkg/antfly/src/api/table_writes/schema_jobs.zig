@@ -24,6 +24,7 @@ const storage_schema = @import("../../storage/schema.zig");
 const table_catalog = @import("../../metadata/catalog/routing.zig");
 const metadata_catalog_jobs = @import("../../metadata/catalog/jobs.zig");
 const tables_api = @import("../../metadata/catalog/table_ddl.zig");
+const catalog_resources = @import("../catalog_resources.zig");
 const table_write_relational_mutation = @import("relational_mutation.zig");
 
 const mutateRowsFromSourceAutocommitOnDb = table_write_relational_mutation.mutateRowsFromSourceAutocommitOnDb;
@@ -60,6 +61,39 @@ pub const SecondaryIndexRebuildGroupRequest = struct {
     record: metadata_table_manager.SecondaryIndexRebuildRangeRecord,
     worker_id: []const u8,
     lease_ms: u64 = 60_000,
+};
+
+pub const RelationalColumnBackedIndexRepairGroupRequest = struct {
+    lower_doc_key: []const u8 = "",
+    upper_doc_key: []const u8 = "",
+};
+
+pub const RelationalColumnBackedIndexRepairWorkerResult = struct {
+    group_id: u64,
+    table_id: u64,
+    range_id: u64 = 0,
+    lower_doc_key: []const u8 = "",
+    upper_doc_key: []const u8 = "",
+    repaired: bool = false,
+    report: db_mod.relational_store.ColumnBackedIndexRepairReport = .{},
+};
+
+pub const RelationalColumnBackedIndexRepairWorkerPassResult = struct {
+    complete: bool = true,
+    ranges_scanned: u64 = 0,
+    ranges_repaired: u64 = 0,
+    ranges_missing: u64 = 0,
+    report: db_mod.relational_store.ColumnBackedIndexRepairReport = .{},
+    groups: []RelationalColumnBackedIndexRepairWorkerResult = &.{},
+
+    pub fn deinit(self: *RelationalColumnBackedIndexRepairWorkerPassResult, alloc: std.mem.Allocator) void {
+        for (self.groups) |group| {
+            if (group.lower_doc_key.len > 0) alloc.free(@constCast(group.lower_doc_key));
+            if (group.upper_doc_key.len > 0) alloc.free(@constCast(group.upper_doc_key));
+        }
+        if (self.groups.len > 0) alloc.free(self.groups);
+        self.* = undefined;
+    }
 };
 
 pub const SchemaRewriteWorkerResult = struct {
@@ -148,6 +182,16 @@ pub fn mergeSecondaryIndexRebuildReport(
     aggregate.scanned_rows += next.scanned_rows;
     aggregate.indexed_rows += next.indexed_rows;
     aggregate.deleted_entries += next.deleted_entries;
+    aggregate.written_entries += next.written_entries;
+}
+
+pub fn mergeColumnBackedIndexRepairReport(
+    aggregate: *db_mod.relational_store.ColumnBackedIndexRepairReport,
+    next: db_mod.relational_store.ColumnBackedIndexRepairReport,
+) void {
+    aggregate.scanned_rows += next.scanned_rows;
+    aggregate.indexed_rows += next.indexed_rows;
+    aggregate.deleted_orphan_entries += next.deleted_orphan_entries;
     aggregate.written_entries += next.written_entries;
 }
 
@@ -377,6 +421,277 @@ pub fn promoteReadySecondaryIndexesForCatalog(
     return promoted;
 }
 
+pub fn runRelationalColumnBackedIndexRepairWorkerPassForCatalog(
+    alloc: std.mem.Allocator,
+    source: anytype,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    worker_id: []const u8,
+    lease_ms: u64,
+    max_work_units: usize,
+) !RelationalColumnBackedIndexRepairWorkerPassResult {
+    return try runRelationalColumnBackedIndexRepairWorkerPassForCatalogWithAdmission(
+        alloc,
+        source,
+        catalog,
+        table_name,
+        worker_id,
+        .{
+            .lease_ms = lease_ms,
+            .max_work_units = max_work_units,
+        },
+    );
+}
+
+pub fn runRelationalColumnBackedIndexRepairWorkerPassForCatalogWithAdmission(
+    alloc: std.mem.Allocator,
+    source: anytype,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    worker_id: []const u8,
+    policy: SchemaJobWorkerAdmissionPolicy,
+) !RelationalColumnBackedIndexRepairWorkerPassResult {
+    return try runRelationalColumnBackedIndexRepairWorkerPassForCatalogTargetWithAdmission(
+        alloc,
+        source,
+        catalog,
+        .{
+            .database_name = catalog_resources.default_database_name,
+            .namespace_name = catalog_resources.default_namespace_name,
+            .table_name = table_name,
+        },
+        worker_id,
+        policy,
+    );
+}
+
+pub fn runRelationalColumnBackedIndexRepairWorkerPassForCatalogTarget(
+    alloc: std.mem.Allocator,
+    source: anytype,
+    catalog: table_catalog.CatalogSource,
+    target: catalog_resources.TableTarget,
+    worker_id: []const u8,
+    lease_ms: u64,
+    max_work_units: usize,
+) !RelationalColumnBackedIndexRepairWorkerPassResult {
+    return try runRelationalColumnBackedIndexRepairWorkerPassForCatalogTargetWithAdmission(
+        alloc,
+        source,
+        catalog,
+        target,
+        worker_id,
+        .{
+            .lease_ms = lease_ms,
+            .max_work_units = max_work_units,
+        },
+    );
+}
+
+pub fn runRelationalColumnBackedIndexRepairWorkerPassForCatalogTargetWithAdmission(
+    alloc: std.mem.Allocator,
+    source: anytype,
+    catalog: table_catalog.CatalogSource,
+    target: catalog_resources.TableTarget,
+    worker_id: []const u8,
+    policy: SchemaJobWorkerAdmissionPolicy,
+) !RelationalColumnBackedIndexRepairWorkerPassResult {
+    policy.validate(worker_id) catch return error.InvalidRelationalColumnBackedIndexRepairRequest;
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return .{};
+
+    var groups = std.ArrayListUnmanaged(RelationalColumnBackedIndexRepairWorkerResult).empty;
+    errdefer {
+        for (groups.items) |group| {
+            if (group.lower_doc_key.len > 0) alloc.free(@constCast(group.lower_doc_key));
+            if (group.upper_doc_key.len > 0) alloc.free(@constCast(group.upper_doc_key));
+        }
+        groups.deinit(alloc);
+    }
+
+    var result: RelationalColumnBackedIndexRepairWorkerPassResult = .{};
+    for (snapshot.ranges) |range| {
+        if (range.table_id != table.table_id) continue;
+        result.ranges_scanned += 1;
+        if (result.ranges_repaired >= policy.max_work_units) {
+            result.complete = false;
+            continue;
+        }
+
+        var one = RelationalColumnBackedIndexRepairWorkerResult{
+            .group_id = range.group_id,
+            .table_id = range.table_id,
+            .range_id = range.range_id,
+            .lower_doc_key = try alloc.dupe(u8, range.start_key),
+            .upper_doc_key = if (range.end_key) |end_key| try alloc.dupe(u8, end_key) else "",
+        };
+        errdefer {
+            if (one.lower_doc_key.len > 0) alloc.free(@constCast(one.lower_doc_key));
+            if (one.upper_doc_key.len > 0) alloc.free(@constCast(one.upper_doc_key));
+        }
+
+        const report = (try source.relationalColumnBackedIndexRepairGroupLocal(
+            alloc,
+            range.group_id,
+            target.table_name,
+            range.start_key,
+            range.end_key orelse "",
+        )) orelse {
+            result.ranges_missing += 1;
+            result.complete = false;
+            try groups.append(alloc, one);
+            one.lower_doc_key = "";
+            one.upper_doc_key = "";
+            continue;
+        };
+
+        one.repaired = true;
+        one.report = report;
+        result.ranges_repaired += 1;
+        mergeColumnBackedIndexRepairReport(&result.report, report);
+        try groups.append(alloc, one);
+        one.lower_doc_key = "";
+        one.upper_doc_key = "";
+    }
+
+    result.groups = try groups.toOwnedSlice(alloc);
+    return result;
+}
+
+test "relational column backed repair worker pass repairs bounded catalog ranges" {
+    const alloc = std.testing.allocator;
+
+    const Catalog = struct {
+        tables: [2]metadata_table_manager.TableRecord = .{
+            .{
+                .table_id = 7,
+                .name = "docs",
+                .database_name = catalog_resources.default_database_name,
+                .namespace_name = catalog_resources.default_namespace_name,
+            },
+            .{
+                .table_id = 8,
+                .name = "docs",
+                .database_name = "tenant_ops",
+                .namespace_name = "analytics",
+            },
+        },
+        ranges: [3]metadata_table_manager.RangeRecord = .{
+            .{ .group_id = 7001, .range_id = 7101, .table_id = 7, .start_key = "", .end_key = "row:m" },
+            .{ .group_id = 7002, .range_id = 7102, .table_id = 7, .start_key = "row:m", .end_key = null },
+            .{ .group_id = 8001, .range_id = 8101, .table_id = 8, .start_key = "", .end_key = null },
+        },
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 0, .metrics = .{} },
+                .tables = self.tables[0..],
+                .ranges = self.ranges[0..],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const Source = struct {
+        calls: usize = 0,
+        groups: [4]u64 = .{ 0, 0, 0, 0 },
+
+        fn relationalColumnBackedIndexRepairGroupLocal(
+            self: *@This(),
+            _: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            lower_doc_key: []const u8,
+            upper_doc_key: []const u8,
+        ) !?db_mod.relational_store.ColumnBackedIndexRepairReport {
+            try std.testing.expectEqualStrings("docs", table_name);
+            self.groups[self.calls] = group_id;
+            self.calls += 1;
+            switch (group_id) {
+                7001 => {
+                    try std.testing.expectEqualStrings("", lower_doc_key);
+                    try std.testing.expectEqualStrings("row:m", upper_doc_key);
+                    return .{
+                        .scanned_rows = 5,
+                        .indexed_rows = 4,
+                        .deleted_orphan_entries = 1,
+                        .written_entries = 8,
+                    };
+                },
+                7002 => {
+                    try std.testing.expectEqualStrings("row:m", lower_doc_key);
+                    try std.testing.expectEqualStrings("", upper_doc_key);
+                    return .{
+                        .scanned_rows = 7,
+                        .indexed_rows = 6,
+                        .deleted_orphan_entries = 2,
+                        .written_entries = 12,
+                    };
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    };
+
+    var catalog = Catalog{};
+    var source = Source{};
+    var first = try runRelationalColumnBackedIndexRepairWorkerPassForCatalog(
+        alloc,
+        &source,
+        catalog.iface(),
+        "docs",
+        "worker-a",
+        60_000,
+        1,
+    );
+    defer first.deinit(alloc);
+    try std.testing.expect(!first.complete);
+    try std.testing.expectEqual(@as(u64, 2), first.ranges_scanned);
+    try std.testing.expectEqual(@as(u64, 1), first.ranges_repaired);
+    try std.testing.expectEqual(@as(usize, 1), first.groups.len);
+    try std.testing.expectEqual(@as(u64, 7001), first.groups[0].group_id);
+    try std.testing.expectEqualStrings("", first.groups[0].lower_doc_key);
+    try std.testing.expectEqualStrings("row:m", first.groups[0].upper_doc_key);
+    try std.testing.expectEqual(@as(u64, 5), first.report.scanned_rows);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+
+    var second = try runRelationalColumnBackedIndexRepairWorkerPassForCatalog(
+        alloc,
+        &source,
+        catalog.iface(),
+        "docs",
+        "worker-a",
+        60_000,
+        4,
+    );
+    defer second.deinit(alloc);
+    try std.testing.expect(second.complete);
+    try std.testing.expectEqual(@as(u64, 2), second.ranges_scanned);
+    try std.testing.expectEqual(@as(u64, 2), second.ranges_repaired);
+    try std.testing.expectEqual(@as(usize, 2), second.groups.len);
+    try std.testing.expectEqual(@as(u64, 12), second.report.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 10), second.report.indexed_rows);
+    try std.testing.expectEqual(@as(u64, 3), second.report.deleted_orphan_entries);
+    try std.testing.expectEqual(@as(u64, 20), second.report.written_entries);
+    try std.testing.expectEqual(@as(usize, 3), source.calls);
+}
+
 pub fn runSecondaryIndexRebuildWorkerPassForCatalog(
     alloc: std.mem.Allocator,
     source: anytype,
@@ -386,7 +701,29 @@ pub fn runSecondaryIndexRebuildWorkerPassForCatalog(
     lease_ms: u64,
     max_work_units: usize,
 ) !SecondaryIndexRebuildWorkerPassResult {
-    if (worker_id.len == 0 or lease_ms == 0 or max_work_units == 0) return error.InvalidSecondaryIndexRebuildRequest;
+    return try runSecondaryIndexRebuildWorkerPassForCatalogWithAdmission(alloc, source, catalog, table_name, worker_id, .{
+        .lease_ms = lease_ms,
+        .max_work_units = max_work_units,
+    });
+}
+
+pub fn secondaryIndexRebuildRecordAdmitted(
+    record: metadata_table_manager.SecondaryIndexRebuildRangeRecord,
+    policy: SchemaJobWorkerAdmissionPolicy,
+) bool {
+    return std.mem.eql(u8, record.state, metadata_table_manager.secondary_index_rebuild_declared) or
+        (policy.allow_stale_lease_takeover and std.mem.eql(u8, record.state, metadata_table_manager.secondary_index_rebuild_building));
+}
+
+pub fn runSecondaryIndexRebuildWorkerPassForCatalogWithAdmission(
+    alloc: std.mem.Allocator,
+    source: anytype,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    worker_id: []const u8,
+    policy: SchemaJobWorkerAdmissionPolicy,
+) !SecondaryIndexRebuildWorkerPassResult {
+    policy.validate(worker_id) catch return error.InvalidSecondaryIndexRebuildRequest;
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return .{};
@@ -397,9 +734,9 @@ pub fn runSecondaryIndexRebuildWorkerPassForCatalog(
     var result: SecondaryIndexRebuildWorkerPassResult = .{};
     for (snapshot.secondary_index_rebuild_ranges) |record| {
         if (record.table_id != table.table_id) continue;
-        if (!secondaryIndexRebuildRecordPending(record)) continue;
+        if (!secondaryIndexRebuildRecordAdmitted(record, policy)) continue;
         result.ranges_scanned += 1;
-        if (result.ranges_claimed >= max_work_units) {
+        if (result.ranges_claimed >= policy.max_work_units) {
             result.complete = false;
             continue;
         }
@@ -410,7 +747,7 @@ pub fn runSecondaryIndexRebuildWorkerPassForCatalog(
             table_name,
             record,
             worker_id,
-            lease_ms,
+            policy.lease_ms,
         )) orelse {
             result.complete = false;
             continue;
@@ -3658,6 +3995,25 @@ test "schema job worker admission policy bounds work and stale takeover" {
             },
             .{ .job_id = 9103, .table_id = 77, .group_id = 8003, .schema_generation = 11, .data_generation = 4, .affected_table_ids = &.{77} },
         },
+        rebuild_ranges: [3]metadata_table_manager.SecondaryIndexRebuildRangeRecord = .{
+            .{ .table_id = 77, .index_name = "events_status_idx", .index_generation = 11, .start_row_key = "", .group_id = 7001 },
+            .{
+                .table_id = 77,
+                .index_name = "events_status_idx",
+                .index_generation = 11,
+                .start_row_key = "",
+                .group_id = 7002,
+                .state = metadata_table_manager.secondary_index_rebuild_building,
+                .lease_owner = "stale-worker",
+                .lease_expires_at_ms = 1,
+            },
+            .{ .table_id = 77, .index_name = "events_status_idx", .index_generation = 11, .start_row_key = "", .group_id = 7003 },
+        },
+        ranges: [3]metadata_table_manager.RangeRecord = .{
+            .{ .group_id = 6001, .range_id = 6101, .table_id = 77, .start_key = "", .end_key = "row:m" },
+            .{ .group_id = 6002, .range_id = 6102, .table_id = 77, .start_key = "row:m", .end_key = null },
+            .{ .group_id = 6601, .range_id = 6601, .table_id = 78, .start_key = "", .end_key = null },
+        },
 
         fn iface(self: *@This()) table_catalog.CatalogSource {
             return .{
@@ -3674,7 +4030,8 @@ test "schema job worker admission policy bounds work and stale takeover" {
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
-                .ranges = &.{},
+                .ranges = self.ranges[0..],
+                .secondary_index_rebuild_ranges = self.rebuild_ranges[0..],
                 .schema_rewrite_jobs = self.schema_jobs[0..],
                 .table_emptying_jobs = self.emptying_jobs[0..],
                 .stores = &.{},
@@ -3692,6 +4049,9 @@ test "schema job worker admission policy bounds work and stale takeover" {
         schema_seen_running: bool = false,
         table_calls: usize = 0,
         table_seen_running: bool = false,
+        rebuild_calls: usize = 0,
+        rebuild_seen_building: bool = false,
+        repair_calls: usize = 0,
 
         fn schemaRewriteGroupLocal(
             self: *@This(),
@@ -3731,6 +4091,50 @@ test "schema job worker admission policy bounds work and stale takeover" {
                 .job_id = record.job_id,
                 .claimed = true,
             };
+        }
+
+        fn secondaryIndexRebuildGroupLocal(
+            self: *@This(),
+            _: std.mem.Allocator,
+            group_id: u64,
+            _: []const u8,
+            record: metadata_table_manager.SecondaryIndexRebuildRangeRecord,
+            _: []const u8,
+            lease_ms: u64,
+        ) !?SecondaryIndexRebuildWorkerResult {
+            try std.testing.expectEqual(@as(u64, 250), lease_ms);
+            self.rebuild_calls += 1;
+            if (std.mem.eql(u8, record.state, metadata_table_manager.secondary_index_rebuild_building)) self.rebuild_seen_building = true;
+            return .{
+                .group_id = group_id,
+                .table_id = record.table_id,
+                .index_generation = record.index_generation,
+                .claimed = true,
+            };
+        }
+
+        fn relationalColumnBackedIndexRepairGroupLocal(
+            self: *@This(),
+            _: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            lower_doc_key: []const u8,
+            upper_doc_key: []const u8,
+        ) !?db_mod.relational_store.ColumnBackedIndexRepairReport {
+            try std.testing.expectEqualStrings("events", table_name);
+            self.repair_calls += 1;
+            switch (group_id) {
+                6001 => {
+                    try std.testing.expectEqualStrings("", lower_doc_key);
+                    try std.testing.expectEqualStrings("row:m", upper_doc_key);
+                },
+                6002 => {
+                    try std.testing.expectEqualStrings("row:m", lower_doc_key);
+                    try std.testing.expectEqualStrings("", upper_doc_key);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+            return .{ .scanned_rows = 1, .indexed_rows = 1, .written_entries = 2 };
         }
     };
 
@@ -3806,6 +4210,82 @@ test "schema job worker admission policy bounds work and stale takeover" {
         try std.testing.expectEqual(@as(u64, 2), pass.jobs_claimed);
         try std.testing.expectEqual(@as(usize, 2), source.table_calls);
         try std.testing.expect(source.table_seen_running);
+    }
+
+    {
+        var source = Source{};
+        var pass = try runSecondaryIndexRebuildWorkerPassForCatalogWithAdmission(
+            alloc,
+            &source,
+            catalog.iface(),
+            "events",
+            "worker-a",
+            .{ .lease_ms = 250, .max_work_units = 1, .allow_stale_lease_takeover = false },
+        );
+        defer pass.deinit(alloc);
+        try std.testing.expect(!pass.complete);
+        try std.testing.expectEqual(@as(u64, 2), pass.ranges_scanned);
+        try std.testing.expectEqual(@as(u64, 1), pass.ranges_claimed);
+        try std.testing.expectEqual(@as(usize, 1), source.rebuild_calls);
+        try std.testing.expect(!source.rebuild_seen_building);
+    }
+
+    {
+        var source = Source{};
+        var pass = try runSecondaryIndexRebuildWorkerPassForCatalogWithAdmission(
+            alloc,
+            &source,
+            catalog.iface(),
+            "events",
+            "worker-a",
+            .{ .lease_ms = 250, .max_work_units = 2, .allow_stale_lease_takeover = true },
+        );
+        defer pass.deinit(alloc);
+        try std.testing.expect(!pass.complete);
+        try std.testing.expectEqual(@as(u64, 3), pass.ranges_scanned);
+        try std.testing.expectEqual(@as(u64, 2), pass.ranges_claimed);
+        try std.testing.expectEqual(@as(usize, 2), source.rebuild_calls);
+        try std.testing.expect(source.rebuild_seen_building);
+    }
+
+    {
+        var source = Source{};
+        var pass = try runRelationalColumnBackedIndexRepairWorkerPassForCatalogWithAdmission(
+            alloc,
+            &source,
+            catalog.iface(),
+            "events",
+            "worker-a",
+            .{ .lease_ms = 250, .max_work_units = 1, .allow_stale_lease_takeover = false },
+        );
+        defer pass.deinit(alloc);
+        try std.testing.expect(!pass.complete);
+        try std.testing.expectEqual(@as(u64, 2), pass.ranges_scanned);
+        try std.testing.expectEqual(@as(u64, 1), pass.ranges_repaired);
+        try std.testing.expectEqual(@as(usize, 1), source.repair_calls);
+    }
+
+    {
+        var source = Source{};
+        try std.testing.expectError(error.InvalidSecondaryIndexRebuildRequest, runSecondaryIndexRebuildWorkerPassForCatalogWithAdmission(
+            alloc,
+            &source,
+            catalog.iface(),
+            "events",
+            "",
+            .{ .lease_ms = 250, .max_work_units = 1 },
+        ));
+    }
+    {
+        var source = Source{};
+        try std.testing.expectError(error.InvalidRelationalColumnBackedIndexRepairRequest, runRelationalColumnBackedIndexRepairWorkerPassForCatalogWithAdmission(
+            alloc,
+            &source,
+            catalog.iface(),
+            "events",
+            "worker-a",
+            .{ .lease_ms = 0, .max_work_units = 1 },
+        ));
     }
 }
 

@@ -4099,6 +4099,121 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/relational-column-backed-index-repair:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Repair relational column-backed index entries for an explicit namespace table
+      description: Claims bounded catalog ranges for a worker and repairs durable relational column-backed
+        index entries for the addressed database, namespace, and table.
+      tags:
+        - index_management
+      operationId: repairNamespaceTableRelationalColumnBackedIndex
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RelationalColumnBackedIndexRepairRequest'
+      responses:
+        '200':
+          description: Relational column-backed index repair pass result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RelationalColumnBackedIndexRepairResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '501':
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/relational-column-backed-index-repair/jobs/{jobId}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+      - name: jobId
+        in: path
+        required: true
+        description: Durable relational index repair job identifier.
+        schema:
+          type: string
+          minLength: 1
+    get:
+      summary: Get relational index repair job status for an explicit namespace table
+      description: Reads durable relational column-backed index repair job progress for the addressed
+        database, namespace, and table.
+      tags:
+        - index_management
+      operationId: getNamespaceTableRelationalIndexRepairJob
+      responses:
+        '200':
+          description: Relational index repair job status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RelationalIndexRepairJobRecord'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '501':
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/backup:
     parameters:
       - name: databaseName
@@ -4762,6 +4877,86 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/relational-column-backed-index-repair:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the relational table
+        schema:
+          type: string
+    post:
+      summary: Repair relational column-backed index entries
+      description: Claims bounded catalog ranges for a worker and repairs durable relational column-backed
+        index entries for the default public table.
+      tags:
+        - index_management
+      operationId: repairRelationalColumnBackedIndex
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RelationalColumnBackedIndexRepairRequest'
+      responses:
+        '200':
+          description: Relational column-backed index repair pass result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RelationalColumnBackedIndexRepairResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/relational-column-backed-index-repair/jobs/{jobId}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the relational table
+        schema:
+          type: string
+      - name: jobId
+        in: path
+        required: true
+        description: Durable relational index repair job identifier.
+        schema:
+          type: string
+          minLength: 1
+    get:
+      summary: Get relational index repair job status
+      description: Reads durable relational column-backed index repair job progress for the default public table.
+      tags:
+        - index_management
+      operationId: getRelationalIndexRepairJob
+      responses:
+        '200':
+          description: Relational index repair job status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RelationalIndexRepairJobRecord'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -11079,6 +11274,232 @@ components:
           $ref: '#/components/schemas/SyncLevel'
       required:
         - operations
+    RelationalColumnBackedIndexRepairRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        worker_id:
+          type: string
+          minLength: 1
+          description: Stable worker identifier used to claim bounded repair ranges.
+        job_id:
+          type: string
+          minLength: 1
+          description: Optional durable repair job identifier used to persist pass progress and resume metadata.
+        lease_ms:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 60000
+          description: Lease duration for claimed repair ranges in milliseconds.
+        max_work_units:
+          type: integer
+          minimum: 1
+          maximum: 1024
+          default: 1
+          description: Maximum number of bounded repair ranges to claim and process in one pass.
+      required:
+        - worker_id
+    RelationalColumnBackedIndexRepairReport:
+      type: object
+      additionalProperties: false
+      properties:
+        scanned_rows:
+          type: integer
+          format: int64
+          minimum: 0
+        indexed_rows:
+          type: integer
+          format: int64
+          minimum: 0
+        deleted_orphan_entries:
+          type: integer
+          format: int64
+          minimum: 0
+        written_entries:
+          type: integer
+          format: int64
+          minimum: 0
+      required:
+        - scanned_rows
+        - indexed_rows
+        - deleted_orphan_entries
+        - written_entries
+    RelationalColumnBackedIndexRepairRangeResult:
+      type: object
+      additionalProperties: false
+      properties:
+        group_id:
+          type: integer
+          format: int64
+          minimum: 0
+        table_id:
+          type: integer
+          format: int64
+          minimum: 0
+        range_id:
+          type: integer
+          format: int64
+          minimum: 0
+        lower_doc_key:
+          type: string
+        upper_doc_key:
+          type: string
+        repaired:
+          type: boolean
+        report:
+          $ref: '#/components/schemas/RelationalColumnBackedIndexRepairReport'
+      required:
+        - group_id
+        - table_id
+        - range_id
+        - lower_doc_key
+        - upper_doc_key
+        - repaired
+        - report
+    RelationalColumnBackedIndexRepairResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        complete:
+          type: boolean
+        ranges_scanned:
+          type: integer
+          format: int64
+          minimum: 0
+        ranges_repaired:
+          type: integer
+          format: int64
+          minimum: 0
+        ranges_missing:
+          type: integer
+          format: int64
+          minimum: 0
+        report:
+          $ref: '#/components/schemas/RelationalColumnBackedIndexRepairReport'
+        groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/RelationalColumnBackedIndexRepairRangeResult'
+      required:
+        - complete
+        - ranges_scanned
+        - ranges_repaired
+        - ranges_missing
+        - report
+        - groups
+    RelationalIndexRepairJobRecord:
+      type: object
+      additionalProperties: false
+      properties:
+        version:
+          type: integer
+          format: int32
+          minimum: 1
+        job_id:
+          type: string
+          minLength: 1
+        database_name:
+          type: string
+          minLength: 1
+        namespace_name:
+          type: string
+          minLength: 1
+        table_name:
+          type: string
+          minLength: 1
+        worker_id:
+          type: string
+          minLength: 1
+        lower_doc_key:
+          type: string
+        upper_doc_key:
+          type: string
+        lease_ms:
+          type: integer
+          format: int64
+          minimum: 1
+        max_work_units:
+          type: integer
+          minimum: 1
+        status:
+          type: string
+          minLength: 1
+        created_at_ns:
+          type: integer
+          format: int64
+          minimum: 0
+        updated_at_ns:
+          type: integer
+          format: int64
+          minimum: 0
+        attempts:
+          type: integer
+          format: int32
+          minimum: 0
+        completed:
+          type: boolean
+        complete:
+          type: boolean
+          nullable: true
+        next_lower_doc_key:
+          type: string
+        last_ranges_scanned:
+          type: integer
+          format: int64
+          minimum: 0
+        last_ranges_repaired:
+          type: integer
+          format: int64
+          minimum: 0
+        last_ranges_missing:
+          type: integer
+          format: int64
+          minimum: 0
+        total_ranges_scanned:
+          type: integer
+          format: int64
+          minimum: 0
+        total_ranges_repaired:
+          type: integer
+          format: int64
+          minimum: 0
+        total_ranges_missing:
+          type: integer
+          format: int64
+          minimum: 0
+        last_report:
+          $ref: '#/components/schemas/RelationalColumnBackedIndexRepairReport'
+        aggregate_report:
+          $ref: '#/components/schemas/RelationalColumnBackedIndexRepairReport'
+        last_error:
+          type: string
+          nullable: true
+      required:
+        - version
+        - job_id
+        - database_name
+        - namespace_name
+        - table_name
+        - worker_id
+        - lower_doc_key
+        - upper_doc_key
+        - lease_ms
+        - max_work_units
+        - status
+        - created_at_ns
+        - updated_at_ns
+        - attempts
+        - completed
+        - next_lower_doc_key
+        - last_ranges_scanned
+        - last_ranges_repaired
+        - last_ranges_missing
+        - total_ranges_scanned
+        - total_ranges_repaired
+        - total_ranges_missing
+        - last_report
+        - aggregate_report
     RowsMutationSourceRequest:
       type: object
       additionalProperties: false
@@ -19655,6 +20076,133 @@ components:
           x-go-type-skip-optional-pointer: true
           type: integer
           format: uint64
+    RelationalIndexRepairReport:
+      type: object
+      description: Counters from relational column-backed index repair. These counters describe
+        disposable derived-index artifacts rebuilt from authoritative packed rows.
+      properties:
+        scanned_rows:
+          type: integer
+          format: uint64
+        indexed_rows:
+          type: integer
+          format: uint64
+        deleted_orphan_entries:
+          type: integer
+          format: uint64
+        written_entries:
+          type: integer
+          format: uint64
+    RelationalIndexRepairLatest:
+      type: object
+      description: Most recently updated durable relational index repair job for this table.
+      properties:
+        job_id:
+          type: string
+        status:
+          type: string
+        worker_id:
+          type: string
+        updated_at_ns:
+          type: integer
+          format: uint64
+        next_lower_doc_key:
+          type: string
+        last_error:
+          type: string
+          nullable: true
+        last_report:
+          $ref: '#/components/schemas/RelationalIndexRepairReport'
+    RelationalIndexRepairStatus:
+      type: object
+      description: Aggregate durable repair-job evidence for schema-backed relational indexes on this table.
+      properties:
+        job_count:
+          type: integer
+          format: uint64
+        active_job_count:
+          type: integer
+          format: uint64
+        completed_job_count:
+          type: integer
+          format: uint64
+        failed_job_count:
+          type: integer
+          format: uint64
+        total_ranges_scanned:
+          type: integer
+          format: uint64
+        total_ranges_repaired:
+          type: integer
+          format: uint64
+        total_ranges_missing:
+          type: integer
+          format: uint64
+        aggregate_report:
+          $ref: '#/components/schemas/RelationalIndexRepairReport'
+        latest:
+          nullable: true
+          $ref: '#/components/schemas/RelationalIndexRepairLatest'
+    RelationalIndexRebuildStatus:
+      type: object
+      description: Aggregate secondary-index rebuild progress projected from authoritative metadata ranges.
+      properties:
+        range_count:
+          type: integer
+          format: uint64
+        matching_generation_range_count:
+          type: integer
+          format: uint64
+        stale_generation_range_count:
+          type: integer
+          format: uint64
+        declared_range_count:
+          type: integer
+          format: uint64
+        building_range_count:
+          type: integer
+          format: uint64
+        ready_range_count:
+          type: integer
+          format: uint64
+        invalid_range_count:
+          type: integer
+          format: uint64
+        completed_row_count:
+          type: integer
+          format: uint64
+        progress_row_key:
+          type: string
+        last_error:
+          type: string
+    RelationalIndexStats:
+      type: object
+      description: Public status for schema-backed relational indexes.
+      required:
+        - index_type
+      properties:
+        index_type:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - relational
+          description: Discriminator for the index stats variant.
+        access_method:
+          type: string
+        lifecycle:
+          type: string
+        ready:
+          type: boolean
+        generation:
+          type: integer
+          format: uint64
+        schema_fingerprint:
+          type: string
+          nullable: true
+        rebuild:
+          $ref: '#/components/schemas/RelationalIndexRebuildStatus'
+        repair:
+          $ref: '#/components/schemas/RelationalIndexRepairStatus'
     IndexStats:
       type: object
       description: Statistics for an index
@@ -19665,11 +20213,13 @@ components:
           embeddings: '#/components/schemas/EmbeddingsIndexStats'
           graph: '#/components/schemas/GraphIndexStats'
           algebraic: '#/components/schemas/AlgebraicIndexStats'
+          relational: '#/components/schemas/RelationalIndexStats'
       oneOf:
         - $ref: '#/components/schemas/FullTextIndexStats'
         - $ref: '#/components/schemas/EmbeddingsIndexStats'
         - $ref: '#/components/schemas/GraphIndexStats'
         - $ref: '#/components/schemas/AlgebraicIndexStats'
+        - $ref: '#/components/schemas/RelationalIndexStats'
     GraphMetricEdgeFilterStatus:
       type: object
       required:

@@ -195,6 +195,12 @@ SQL DDL is a compatibility frontend over typed lifecycle services:
 - Long-running `ALTER` work routes through durable job admission owned by the
   catalog or metadata owner.
 
+Schema namespace support is a real catalog mutation, not a schema-JSON table
+rewrite. `CREATE SCHEMA`, `ALTER SCHEMA ... RENAME TO`, and `DROP SCHEMA`
+operate on durable namespace records scoped by the current database or by an
+explicit qualified schema name. Table and sequence resolution uses the SQL
+catalog session search path, with `public` as the default namespace.
+
 Autocommit metadata DDL is the initial safe shape for lifecycle operations that
 span metadata, derived artifacts, and shard convergence. DDL inside user data
 transactions remains fail-closed until Antfly has one transactional boundary
@@ -649,6 +655,17 @@ repair, retry, or cleanup promotes a matching generation.
 Rebuild work records durable owner-range progress with leases, completed-row
 counts, resume row keys, and error state; SQL DDL never owns a separate backend
 cursor or hidden physical index job.
+
+Lowered SQL index definitions should populate the native
+`TableSchema.relational_indexes` catalog shape: stable index name, owner kind,
+owner name, access method, uniqueness, key columns, expression keys, include
+columns, ordered key parts, lifecycle, generation, schema fingerprint, and
+typed predicates. Column-local and unique-constraint-local metadata can remain
+schema-input projections during migration, but planner-visible SQL catalog
+state should use the first-class index catalog as the source of capability
+truth. Runtime consumers that still walk owner columns must synthesize effective
+index metadata from the catalog entry before enforcing lifecycle, predicate,
+key, include, or access-method behavior.
 
 - `USING antfly_full_text` for full-text indexes.
 - `USING hnsw` or `USING antfly_aknn` for external vector or managed embedding

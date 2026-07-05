@@ -80,6 +80,329 @@ The serverless path may still use namespace-oriented internal APIs while the
 implementation is being proven, but that should be treated as an implementation
 detail of the serving plane rather than the final Antfly product contract.
 
+## Competitive Target: Serverless SQL, Documents, And Lake Storage
+
+The architectural target is not "Antfly with the current stateful runtime moved
+onto object storage." The target is a lake-backed database service where SQL,
+documents, and derived AI/search artifacts share one durable storage substrate.
+
+Neon and Lakebase are useful references because their core architectural move is
+clear:
+
+- compute is ephemeral and replaceable
+- durable writes are externalized out of local compute disks
+- the write log is the source of truth
+- materialized read state is built asynchronously from the log
+- object storage holds long-term immutable history
+- local memory/disk caches keep object storage off the hot read path
+- branch, clone, and restore become metadata operations over versioned history
+
+Antfly should not try to compete by being a general-purpose Postgres clone
+unless the product is willing to inherit the full Postgres compatibility burden.
+The more credible target is:
+
+- serverless SQL over Antfly tables
+- first-class document and AI/search paths over the same table substrate
+- lake-native immutable storage for operational data and derived artifacts
+- explicit freshness modes instead of hidden replica lag semantics
+- open lake interoperability where it matters for analytical reads
+
+That means the serverless storage path must become an authoritative database
+storage contract. It cannot remain only a parallel ingestion/query subsystem or
+an optional artifact publication layer beside the existing stateful table path.
+
+### Current State Summary
+
+The repository already has several important pieces:
+
+- object-backed serverless artifacts, manifests, WAL, progress, and catalog
+  adapters under `pkg/antfly/src/serverless/`
+- role-aware serverless runtime plumbing for combined, API-only, query-only,
+  and maintenance-oriented deployments
+- public table-shaped serverless HTTP routes and internal namespace/debug routes
+- manifest-pinned query sessions and local query cache scaffolding
+- Parquet/Iceberg/external lake scanner and sidecar-index scaffolding
+- row, document, text, vector, sparse, graph, and algebraic serverless artifact
+  families
+- a serious SQL/pgwire surface that already routes parsed SQL through the public
+  SQL backend
+- broad SQL lowering support for relational rows, document SQL, DDL, session
+  state, prepared statements, and transaction boundaries
+
+The gap is integration. SQL compatibility is ahead of the serverless storage
+architecture. Serverless publication exists, but the live SQL and document
+write/read paths still need to converge on the serverless log/materialization
+contract if this is going to compete as a serverless database service.
+
+The older S3 storage design is useful as an interim provisioned-storage mode,
+but it should not be treated as the final serverless architecture. Leader-only
+SST writes to S3 reduce storage cost for the stateful engine; they do not create
+stateless compute, WAL-quorum durability, instant branching, or an LTAP-style
+single-copy lake substrate by themselves.
+
+### Target Architecture
+
+The competitive serverless architecture should be built around these durable
+contracts:
+
+- `LogStore`
+  - append-only committed table/timeline log
+  - segmented, fenced, and replayable
+  - returns commit LSNs or version tokens
+- `TimelineCatalog`
+  - tenant, database, table, branch, and timeline metadata
+  - maps public tables to internal serving timelines
+  - tracks parent/child branch relationships and restore points
+- `MaterializedSnapshotStore`
+  - immutable published generations
+  - manifest heads, artifact references, checksums, and retention metadata
+- `TailReader`
+  - reads recent committed log entries beyond the latest materialized snapshot
+  - supports fresh reads without forcing synchronous full publication
+- `LakeArtifactStore`
+  - immutable artifacts in object storage
+  - byte-range reads and cache-aware fetching
+  - Parquet/Iceberg/Delta-compatible outputs where the product wants lake
+    interoperability
+- `LocalCache`
+  - local memory/NVMe cache for manifests, object ranges, decoded pages,
+    sidecars, and hot row/document fragments
+
+This is the Antfly analogue of a safekeeper/pageserver split, but it should be
+phrased in Antfly terms:
+
+- the log service defines committed state
+- the materializer turns committed log entries into published table generations
+- object storage is the immutable history and artifact substrate
+- query workers attach to table/timeline history and cache what they need
+- API/pgwire compute should be replaceable without owning durable state
+
+### Durable Log Requirements
+
+The current object WAL adapter is a useful scaffold, but production serverless
+cannot rely on rewriting one object per namespace append. The durable log needs
+to become a real segmented log.
+
+Required properties:
+
+- append-only segment files with stable segment indexes
+- table/timeline/branch IDs in the log keyspace
+- monotonic commit LSN allocation
+- writer fencing so stale compute cannot continue committing
+- idempotent append and recovery behavior
+- retention tied to materialization and branch history, not just latest head
+- crash/retry tests proving acknowledged writes survive process and object-store
+  failures
+- a path to quorum durability or a clearly documented equivalent durability
+  service
+
+Object-store CAS can be the first implementation step, but the interface should
+not bake in "single object per namespace log" or "one process-local mutex is
+enough" assumptions.
+
+### SQL And Document Path Convergence
+
+SQL rows and document writes should land in the same committed table timeline.
+The split between relational and document APIs should be a planner/execution
+surface choice, not a separate durability model.
+
+Target behavior:
+
+- SQL DDL mutates table metadata and timeline/catalog state
+- SQL DML appends table mutations to the durable log
+- document ingest appends equivalent table mutations to the durable log
+- generated relational projections, document projections, full-text, dense,
+  sparse, graph, and algebraic artifacts are derived from the same committed
+  log
+- pgwire, public SQL HTTP, document APIs, and table APIs observe the same
+  commit ordering
+- row-level auth, schema validation, defaults, generated columns, and
+  constraints are enforced before commit or encoded as explicit durable
+  validation/repair work
+
+This does not require full stateful transaction parity inside the immutable read
+plane. It does require a single write authority for table state. Stronger
+transactional semantics can live in the write/control plane while the published
+read plane remains immutable and cache-friendly.
+
+### Fresh Reads: Snapshot Plus Tail
+
+Published generation reads are cheap and cache-friendly, but they are not enough
+for database semantics. Serverless needs a fresh-read mode that composes:
+
+- the latest materialized generation at or before a requested LSN
+- the committed WAL tail after that generation
+
+The read flow should be:
+
+1. bind the query to a read LSN
+2. load the newest published generation whose WAL range is covered by that LSN
+3. read most data from immutable artifacts and local cache
+4. read recent unmaterialized mutations from the tail
+5. merge tail rows/documents/deletes with the materialized result
+6. return a result with explicit freshness metadata
+
+This same rule should apply to:
+
+- SQL row reads
+- document reads/search where freshness mode allows it
+- table API reads
+- pgwire reads
+- lake/sidecar reads when a tail overlay is required
+
+The product should keep freshness modes explicit:
+
+- `published`
+  - latest published generation only
+- `latest`
+  - published generation plus bounded committed tail
+- `at_lsn` / point read
+  - read as of a specific committed LSN when available
+- transactional/session reads
+  - served by the write/control plane when stronger semantics exceed the
+    published read plane
+
+### Lake Storage And LTAP Direction
+
+The long-term lake goal is one durable table substrate that operational and
+analytical paths can both read. For Antfly, that should mean:
+
+- native immutable row/document fragments for the serving path
+- open Parquet files for interoperability where table size and workload justify
+  it
+- Iceberg or Delta metadata for snapshot-consistent analytical reads
+- sidecar search/vector/sparse/graph artifacts keyed to lake snapshot IDs
+- delete/update metadata that preserves SQL/document semantics
+- type fidelity rules for Antfly and Postgres-compatible values
+
+Do not force every small table through full Iceberg/Parquet metadata overhead.
+Small tables can stay in native fragments until the table crosses size or
+analytics thresholds. The important invariant is that table state has one
+governed source of truth, not one OLTP copy plus an eventually consistent CDC
+copy.
+
+For analytics freshness, the intended shape is:
+
+1. analytical engine asks for a consistent read LSN or snapshot token
+2. it scans most data from open lake files in object storage
+3. it fetches the recent tail from Antfly's materialization/tail service
+4. it merges the tail without loading transactional compute
+
+That is the LTAP direction: unification at the storage layer, with separate
+engines for transactional serving, Antfly search/AI, and lake analytics.
+
+### Branching, Restore, And Clone Semantics
+
+Serverless should make branch/clone/restore metadata operations over timelines,
+not physical copies.
+
+Required concepts:
+
+- timeline ID
+- branch parent timeline
+- branch start LSN or published generation
+- retained WAL and artifact reachability per branch
+- point-in-time restore target
+- branch-local writes after divergence
+- garbage collection that accounts for all live branches
+
+The first implementation can be narrow:
+
+- branch from current published head
+- branch from explicit LSN only when the log and materialized state can cover it
+- no cross-branch writes or merges initially
+
+The storage interfaces should still include timeline/branch fields early so the
+object key layout and manifest schema do not need a disruptive rewrite later.
+
+### Control Plane And Compute Lifecycle
+
+To compete with serverless Postgres-style products, Antfly needs a control plane
+that treats compute as disposable.
+
+Control-plane responsibilities:
+
+- tenants/projects/databases/tables/branches
+- table-to-serving-timeline binding
+- API/pgwire endpoint routing
+- compute attach/detach and scale-to-zero
+- local cache warmup and eviction policy
+- secrets and external lake credentials
+- auth, quotas, rate limits, audit, and billing hooks
+- materialization job scheduling
+- retention and branch-aware garbage collection
+- operational metrics for publish lag, tail depth, cache hit rate, and
+  materialization debt
+
+Query workers should be able to attach to any table/timeline after cache warmup.
+Maintenance workers should publish, compact, enrich, and prune without owning a
+namespace permanently. API/ingest workers should admit writes through fencing
+and durable log append, not through local durable state.
+
+### Implementation Order For The Competitive Path
+
+The recommended order is:
+
+1. update the architecture stance:
+   - keep leader-only S3 as provisioned/interim storage-cost work
+   - define serverless log/materialized-lake mode as the target
+2. define storage interfaces:
+   - `LogStore`
+   - `TimelineCatalog`
+   - `MaterializedSnapshotStore`
+   - `TailReader`
+   - `LakeArtifactStore`
+   - `LocalCache`
+3. replace the single-object WAL scaffold with segmented append-only WAL
+4. route one narrow SQL table path through serverless WAL and manifest
+   publication
+5. add snapshot-plus-tail reads for that path
+6. route document writes through the same table timeline
+7. make row/document/serverless fragments read from the same committed mutation
+   model
+8. add branch/clone/PITR metadata over timelines
+9. add Parquet/Iceberg publication for tables that need lake analytics
+10. package stateless API/query/maintenance roles with a thin proxy and
+    operator
+
+Each step should have an acceptance test that exercises the public table/SQL
+surface, not only internal namespace routes.
+
+### Near-Term Acceptance Criteria
+
+The next credible serverless database milestone should prove:
+
+- SQL `CREATE TABLE`, `INSERT`, `SELECT`, and one `UPDATE`/`DELETE` path can use
+  serverless WAL-backed storage for a table
+- document ingest and SQL row writes for the same table share commit ordering
+- an acknowledged write receives an LSN
+- `published` reads exclude unmaterialized tail data
+- `latest` reads include bounded committed tail data
+- background materialization publishes a generation covering the committed LSN
+- pgwire and HTTP SQL return the same rows for the same read mode
+- process restart and object-store retry do not lose acknowledged commits
+- cache warm/cold reads return identical results
+
+The first version can be single-writer per table/timeline and narrow in SQL
+coverage. It should be architecturally honest: durable log first, materialized
+generations second, query workers stateless third.
+
+### Claims Not To Make Yet
+
+Do not claim competitive serverless semantics until these are true:
+
+- acknowledged commits are durable outside compute
+- compute can be replaced without replaying local-only state
+- reads do not depend on object storage on the hot path except for cache misses
+- published generations are immutable and atomically visible
+- fresh reads have explicit snapshot/tail semantics
+- table metadata, SQL DDL, SQL DML, and document writes share one commit model
+- branch/restore is metadata over retained history rather than a physical copy
+- object-store failure/retry behavior has crash and idempotency tests
+
+Until then, the honest wording is "serverless serving/runtime scaffold" or
+"object-backed published read plane", not "full serverless database."
+
 ## Sync Level Contract
 
 `sync_level` is part of the shared public write contract, so serverless should

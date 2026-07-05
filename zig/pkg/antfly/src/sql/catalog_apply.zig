@@ -1730,6 +1730,7 @@ fn applyCreateIndexPlanAlloc(
             .index_access_method = index_access_method,
             .index_schema_fingerprint = index_schema_fingerprint,
             .index_include_columns = plan.include_columns,
+            .index_keys = plan.index_keys,
             .generated = generated_expression,
             .index_where = plan.where,
             .index_where_expressions = plan.where_expressions,
@@ -1939,7 +1940,7 @@ fn logicalDdlPlanForCatalogApplyTestAlloc(
 ) !binder.LogicalSqlPlan {
     var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
-    return try ddl_plan.parseLogicalDdlPlanAlloc(alloc, &parsed_sql, .{});
+    return try ddl_plan.logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
 }
 
 fn ddlLogicalFingerprintForCatalogApplyTestAlloc(alloc: std.mem.Allocator, plan: binder.LogicalSqlPlan) ![]u8 {
@@ -3925,6 +3926,11 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expect(generated.index_generation != 0);
     try std.testing.expect(generated.index_name != null);
     try std.testing.expectEqualStrings("users_lower_email_idx", generated.index_name.?);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexAccessMethod.ordered_tuple, generated.index_access_method.?);
+    try std.testing.expectEqual(@as(usize, 1), generated.index_keys.len);
+    try std.testing.expectEqualStrings("users_lower_email_idx", generated.index_keys[0].column);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexKeyDirection.asc, generated.index_keys[0].direction);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexKeyNulls.default, generated.index_keys[0].nulls);
     try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, generated.generated.?.op);
     try std.testing.expectEqualStrings("email", generated.generated.?.field.?);
 
@@ -3937,6 +3943,9 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     defer runtime_schema.freeSchema(alloc, generated_covering_schema);
     const generated_covering = binder.relationalColumnForField(generated_covering_schema, "users_lower_email_cover_idx", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(generated_covering.generated != null);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexAccessMethod.ordered_tuple, generated_covering.index_access_method.?);
+    try std.testing.expectEqual(@as(usize, 1), generated_covering.index_keys.len);
+    try std.testing.expectEqualStrings("users_lower_email_cover_idx", generated_covering.index_keys[0].column);
     try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, generated_covering.generated.?.op);
     try std.testing.expectEqual(@as(usize, 2), generated_covering.index_include_columns.len);
     try std.testing.expectEqualStrings("tenant_id", generated_covering.index_include_columns[0]);
@@ -3957,13 +3966,18 @@ test "catalog apply applies create index ddl plan to runtime schema" {
 
     var wrapped_generated_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
-        "CREATE INDEX users_lower_email_wrapped_idx ON users ((lower(email)));",
+        "CREATE INDEX users_lower_email_wrapped_idx ON users ((lower(email)) DESC NULLS LAST);",
     );
     defer wrapped_generated_index.deinit(alloc);
     const wrapped_generated_schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, generated_schema, wrapped_generated_index);
     defer runtime_schema.freeSchema(alloc, wrapped_generated_schema);
     const wrapped_generated = binder.relationalColumnForField(wrapped_generated_schema, "users_lower_email_wrapped_idx", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(wrapped_generated.generated != null);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexAccessMethod.ordered_tuple, wrapped_generated.index_access_method.?);
+    try std.testing.expectEqual(@as(usize, 1), wrapped_generated.index_keys.len);
+    try std.testing.expectEqualStrings("users_lower_email_wrapped_idx", wrapped_generated.index_keys[0].column);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexKeyDirection.desc, wrapped_generated.index_keys[0].direction);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexKeyNulls.last, wrapped_generated.index_keys[0].nulls);
     try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, wrapped_generated.generated.?.op);
     try std.testing.expectEqualStrings("email", wrapped_generated.generated.?.field.?);
 
@@ -3980,6 +3994,9 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expect(upper_generated.index_generation != 0);
     try std.testing.expect(upper_generated.index_name != null);
     try std.testing.expectEqualStrings("users_upper_email_idx", upper_generated.index_name.?);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexAccessMethod.ordered_tuple, upper_generated.index_access_method.?);
+    try std.testing.expectEqual(@as(usize, 1), upper_generated.index_keys.len);
+    try std.testing.expectEqualStrings("users_upper_email_idx", upper_generated.index_keys[0].column);
     try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.upper, upper_generated.generated.?.op);
     try std.testing.expectEqualStrings("email", upper_generated.generated.?.field.?);
 

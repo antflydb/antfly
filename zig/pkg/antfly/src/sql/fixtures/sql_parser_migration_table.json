@@ -3,7 +3,7 @@
   "families": [
     {
       "family": "backups",
-      "compatibility_entry_point": "ddl_plan.parseLogicalDdlPlanTokensAlloc",
+      "compatibility_entry_point": "removed: retained generated AST required",
       "generated_ast_entry_point": "ddl_plan.planGeneratedLogicalDdlAstAlloc",
       "entrypoints": ["http", "pgwire", "sql_adapter", "tokenized"],
       "parser_status": "generated_gated_unsupported",
@@ -17,16 +17,12 @@
         "runtime_fixtures": ["unsupported backup database sql unavailable", "unsupported restore database sql unavailable"],
         "api_native_parity_fixtures": ["unsupported backup database sql unavailable", "unsupported restore database sql unavailable"],
         "unsupported_shape_fixtures": ["unsupported backup database sql unavailable", "unsupported restore database sql unavailable"],
-        "stale_metadata_tests": ["tokenized parsed sql retained AST corruption rejects generated unsupported DDL"],
-        "deleted_compatibility_paths": [
-          "ddl_plan.parseLogicalDdlPlanAlloc missing-generated fallback",
-          "ddl_plan.parseLogicalDdlPlanTokensAlloc"
-        ]
+        "stale_metadata_tests": ["tokenized parsed sql retained AST corruption rejects generated unsupported DDL"]
       }
     },
     {
       "family": "ddl",
-      "compatibility_entry_point": "ddl_plan.parseLogicalDdlPlanTokensAlloc",
+      "compatibility_entry_point": "removed: retained generated AST required",
       "generated_ast_entry_point": "ddl_plan.planGeneratedLogicalDdlAstAlloc",
       "entrypoints": ["durable_executor", "http", "lite", "pgwire", "sql_adapter", "tokenized"],
       "parser_status": "generated_owned",
@@ -40,16 +36,12 @@
         "runtime_fixtures": ["schema create table", "schema drop table catalog plan"],
         "api_native_parity_fixtures": ["schema create table", "create view catalog ddl"],
         "unsupported_shape_fixtures": ["unsupported document table ddl shorthand"],
-        "stale_metadata_tests": ["sql adapter ddl plan rejects stale generated DDL AST metadata before logical planning"],
-        "deleted_compatibility_paths": [
-          "ddl_plan.parseLogicalDdlPlanAlloc missing-generated fallback",
-          "ddl_plan.parseLogicalDdlPlanTokensAlloc"
-        ]
+        "stale_metadata_tests": ["sql adapter ddl plan rejects stale generated DDL AST metadata before logical planning"]
       }
     },
     {
       "family": "dml",
-      "compatibility_entry_point": "lower_dml token parser paths without generated_dml_ast options",
+      "compatibility_entry_point": "removed: retained generated AST required",
       "generated_ast_entry_point": "tokenized.ParsedSql.writeStatementKindIncludingGeneratedAst plus lower_dml generated_dml_ast parser options",
       "entrypoints": ["durable_executor", "http", "lite", "pgwire", "sql_adapter", "tokenized"],
       "parser_status": "generated_owned",
@@ -63,15 +55,12 @@
         "runtime_fixtures": ["conflict upsert", "joined update from", "joined delete using"],
         "api_native_parity_fixtures": ["conflict upsert", "joined update from", "merge mutation plan"],
         "unsupported_shape_fixtures": ["unsupported document sql full document insert on conflict"],
-        "stale_metadata_tests": ["sql adapter DML lowerer rejects missing and malformed retained generated AST metadata"],
-        "deleted_compatibility_paths": [
-          "tokenized.ParsedSql.writeStatementIncludingGeneratedAst missing-generated fallback"
-        ]
+        "stale_metadata_tests": ["sql adapter DML lowerer rejects missing and malformed retained generated AST metadata"]
       }
     },
     {
       "family": "extensions",
-      "compatibility_entry_point": "ddl_plan.parseLogicalDdlPlanTokensAlloc",
+      "compatibility_entry_point": "removed: retained generated AST required",
       "generated_ast_entry_point": "ddl_plan.planGeneratedLogicalDdlAstAlloc",
       "entrypoints": ["http", "lite", "pgwire", "sql_adapter", "tokenized"],
       "parser_status": "generated_owned",
@@ -85,16 +74,12 @@
         "runtime_fixtures": ["create extension catalog ddl", "drop extension catalog ddl"],
         "api_native_parity_fixtures": ["create versioned extension catalog ddl", "schema rich unique expression index"],
         "unsupported_shape_fixtures": ["unsupported document table ddl invalid antfly extension"],
-        "stale_metadata_tests": ["sql adapter ddl plan rejects stale generated extension AST metadata before logical planning"],
-        "deleted_compatibility_paths": [
-          "ddl_plan.parseLogicalDdlPlanAlloc missing-generated fallback",
-          "ddl_plan.parseLogicalDdlPlanTokensAlloc"
-        ]
+        "stale_metadata_tests": ["sql adapter ddl plan rejects stale generated extension AST metadata before logical planning"]
       }
     },
     {
       "family": "functions",
-      "compatibility_entry_point": "ddl_plan.parseLogicalDdlPlanTokensAlloc",
+      "compatibility_entry_point": "removed: retained generated AST required",
       "generated_ast_entry_point": "ddl_plan.planGeneratedLogicalDdlAstAlloc",
       "entrypoints": ["http", "lite", "pgwire", "sql_adapter", "tokenized"],
       "parser_status": "generated_owned",
@@ -108,16 +93,12 @@
         "runtime_fixtures": ["call noop procedure catalog runtime ddl", "drop function catalog ddl", "drop procedure catalog ddl"],
         "api_native_parity_fixtures": ["create function catalog ddl", "create aggregate catalog ddl", "create cast catalog ddl"],
         "unsupported_shape_fixtures": ["unsupported create trigger variant"],
-        "stale_metadata_tests": ["sql adapter ddl plan rejects stale generated routine and type-system AST metadata"],
-        "deleted_compatibility_paths": [
-          "ddl_plan.parseLogicalDdlPlanAlloc missing-generated fallback",
-          "ddl_plan.parseLogicalDdlPlanTokensAlloc"
-        ]
+        "stale_metadata_tests": ["sql adapter ddl plan rejects stale generated routine and type-system AST metadata"]
       }
     },
     {
       "family": "lakes",
-      "compatibility_entry_point": "tokenized.ParsedSql.readStatementKindIncludingGeneratedAst",
+      "compatibility_entry_point": "removed: retained generated AST required",
       "generated_ast_entry_point": "generated_parser.GeneratedSqlReadAst",
       "entrypoints": ["binder", "document_sql", "http", "lite", "pgwire", "sql_adapter", "tokenized"],
       "parser_status": "generated_owned",
@@ -131,15 +112,12 @@
         "runtime_fixtures": ["query function semantic search request", "query function graph metric request"],
         "api_native_parity_fixtures": ["query function semantic search request", "query function hybrid search request"],
         "unsupported_shape_fixtures": ["unsupported document sql native semantic search missing producer"],
-        "stale_metadata_tests": ["sql adapter parsed sql rejects malformed generated graph and antfly source metadata"],
-        "deleted_compatibility_paths": [
-          "tokenized.ParsedSql.readStatementKindIncludingGeneratedAst missing-generated fallback"
-        ]
+        "stale_metadata_tests": ["sql adapter parsed sql rejects malformed generated graph and antfly source metadata"]
       }
     },
     {
       "family": "maintenance",
-      "compatibility_entry_point": "ddl_plan.parseLogicalDdlPlanTokensAlloc",
+      "compatibility_entry_point": "removed: retained generated AST required",
       "generated_ast_entry_point": "ddl_plan.planGeneratedLogicalDdlAstAlloc",
       "entrypoints": ["http", "pgwire", "sql_adapter", "tokenized"],
       "parser_status": "generated_gated_unsupported",
@@ -203,16 +181,12 @@
           "rollback prepared transaction durable recovery intent"
         ],
         "unsupported_shape_fixtures": ["unsupported alter table cluster on"],
-        "stale_metadata_tests": ["sql adapter logical ddl plan accepts validated generated unsupported maintenance without vacuum analyze wrapper fallback"],
-        "deleted_compatibility_paths": [
-          "ddl_plan.parseLogicalDdlPlanAlloc missing-generated fallback",
-          "ddl_plan.parseLogicalDdlPlanTokensAlloc"
-        ]
+        "stale_metadata_tests": ["sql adapter logical ddl plan accepts validated generated unsupported maintenance without vacuum analyze wrapper fallback"]
       }
     },
     {
       "family": "query",
-      "compatibility_entry_point": "tokenized.ParsedSql.readStatementKindIncludingGeneratedAst",
+      "compatibility_entry_point": "removed: retained generated AST required",
       "generated_ast_entry_point": "generated_parser.GeneratedSqlReadAst",
       "entrypoints": ["binder", "document_sql", "durable_executor", "http", "lite", "pgwire", "sql_adapter", "tokenized"],
       "parser_status": "generated_owned",
@@ -270,15 +244,12 @@
           "row number window"
         ],
         "unsupported_shape_fixtures": ["unsupported read intersect mismatched type set operation"],
-        "stale_metadata_tests": ["sql adapter parsed sql rejects malformed generated classification payloads"],
-        "deleted_compatibility_paths": [
-          "tokenized.ParsedSql.readStatementKindIncludingGeneratedAst missing-generated fallback"
-        ]
+        "stale_metadata_tests": ["sql adapter parsed sql rejects malformed generated classification payloads"]
       }
     },
     {
       "family": "roles",
-      "compatibility_entry_point": "ddl_plan.parseLogicalDdlPlanTokensAlloc",
+      "compatibility_entry_point": "removed: retained generated AST required",
       "generated_ast_entry_point": "ddl_plan.planGeneratedLogicalDdlAstAlloc",
       "entrypoints": ["http", "lite", "pgwire", "sql_adapter", "tokenized"],
       "parser_status": "generated_owned",
@@ -338,11 +309,7 @@
           "adapter-only session setting syntax"
         ],
         "unsupported_shape_fixtures": ["unsupported document table ddl invalid antfly extension"],
-        "stale_metadata_tests": ["sql adapter generated utility unsupported AST rejects stale role privilege and policy metadata"],
-        "deleted_compatibility_paths": [
-          "ddl_plan.parseLogicalDdlPlanAlloc missing-generated fallback",
-          "ddl_plan.parseLogicalDdlPlanTokensAlloc"
-        ]
+        "stale_metadata_tests": ["sql adapter generated utility unsupported AST rejects stale role privilege and policy metadata"]
       }
     }
   ]

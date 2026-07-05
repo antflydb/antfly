@@ -518,7 +518,7 @@ const LocalSwarmMetadata = struct {
         try self.persistLocked();
     }
 
-    pub fn resetIdentityAllocatorsForTableEmptyingBarrier(self: *LocalSwarmMetadata, request: antfly.metadata.TableEmptyingIdentityAllocatorResetRequest) !void {
+    pub fn resetIdentityAllocatorsForTableEmptyingBarrier(self: *LocalSwarmMetadata, request: antfly.metadata.table_manager.TableEmptyingIdentityAllocatorResetRequest) !void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         _ = try self.manager.resetIdentityAllocatorsForTableEmptyingBarrier(self.alloc, request);
@@ -544,7 +544,7 @@ const LocalSwarmMetadata = struct {
         return try self.promoteTableEmptyingBarrier(request);
     }
 
-    fn statusResetIdentityAllocatorsForTableEmptyingBarrier(ptr: *anyopaque, request: antfly.metadata.TableEmptyingIdentityAllocatorResetRequest) !void {
+    fn statusResetIdentityAllocatorsForTableEmptyingBarrier(ptr: *anyopaque, request: antfly.metadata.table_manager.TableEmptyingIdentityAllocatorResetRequest) !void {
         const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
         return try self.resetIdentityAllocatorsForTableEmptyingBarrier(request);
     }

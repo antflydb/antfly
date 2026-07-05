@@ -1276,10 +1276,10 @@ fn buildTransactionRecoveryIdentityExtraBatch(
     var identity_deletes = std.ArrayListUnmanaged([]const u8).empty;
     defer identity_deletes.deinit(alloc);
     for (raw_upserts.items) |key| {
-        if (!transactionIdentityMetadataKey(key)) try identity_upserts.append(alloc, key);
+        if (!transactionIdentityMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key)) try identity_upserts.append(alloc, key);
     }
     for (raw_deletes.items) |key| {
-        if (!transactionIdentityMetadataKey(key)) try identity_deletes.append(alloc, key);
+        if (!transactionIdentityMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key)) try identity_deletes.append(alloc, key);
     }
 
     var extra_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
@@ -1316,7 +1316,7 @@ fn buildTransactionRecoveryIdentityExtraBatch(
             if (mutations.len > 0) alloc.free(mutations);
         }
         for (mutations) |mutation| {
-            if (transactionIdentityMetadataKey(mutation.key) or internal_keys.isInternalUserKey(mutation.key)) continue;
+            if (transactionIdentityMetadataKey(mutation.key) or internal_keys.isInternalPhysicalTableDataKey(mutation.key)) continue;
             const skip_key = try alloc.dupe(u8, mutation.key);
             var skip_key_owned = true;
             errdefer if (skip_key_owned) alloc.free(skip_key);

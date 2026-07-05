@@ -76,6 +76,8 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
     errdefer freeRuntimeForeignKeys(alloc, foreign_keys);
     const unique_constraints = try deriveRuntimeUniqueConstraints(alloc, schema);
     errdefer freeRuntimeUniqueConstraints(alloc, unique_constraints);
+    const relational_indexes = try deriveRuntimeRelationalIndexes(alloc, relational_columns, unique_constraints);
+    errdefer freeRuntimeRelationalIndexes(alloc, relational_indexes);
     const checks = try deriveRuntimeRelationalChecks(alloc, schema);
     errdefer freeRuntimeRelationalChecks(alloc, checks);
     try validateRuntimeRelationalIndexMetadata(relational_columns, unique_constraints);
@@ -110,6 +112,7 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .periods = periods,
         .foreign_keys = foreign_keys,
         .unique_constraints = unique_constraints,
+        .relational_indexes = relational_indexes,
         .checks = checks,
         .external_base_source = external_base_source,
         .system_versioned = schema.system_versioned,
@@ -361,6 +364,120 @@ fn runtimeRelationalColumnForField(columns: []const storage_schema.RelationalCol
     return null;
 }
 
+fn deriveRuntimeRelationalIndexes(
+    alloc: std.mem.Allocator,
+    columns: []const storage_schema.RelationalColumn,
+    unique_constraints: []const storage_schema.UniqueConstraint,
+) ![]const storage_schema.RelationalIndex {
+    var indexes = std.ArrayListUnmanaged(storage_schema.RelationalIndex).empty;
+    errdefer {
+        for (indexes.items) |index| freeRuntimeRelationalIndex(alloc, index);
+        indexes.deinit(alloc);
+    }
+
+    for (columns) |column| {
+        if (!runtimeColumnHasRelationalIndexCatalogEntry(column)) continue;
+        const index_name = column.index_name orelse column.name;
+        const access_method = runtimeRelationalColumnIndexAccessMethod(column);
+        const index_columns = [_][]const u8{column.name};
+        const name = try alloc.dupe(u8, index_name);
+        var name_owned = true;
+        errdefer if (name_owned) alloc.free(name);
+        const owner_name = try alloc.dupe(u8, column.name);
+        var owner_name_owned = true;
+        errdefer if (owner_name_owned) alloc.free(owner_name);
+        const index: storage_schema.RelationalIndex = .{
+            .name = name,
+            .owner_kind = .relational_column,
+            .owner_name = owner_name,
+            .access_method = access_method,
+            .unique = false,
+            .columns = try cloneStringSlice(alloc, index_columns[0..]),
+            .include_columns = try cloneStringSlice(alloc, column.index_include_columns),
+            .keys = try cloneRelationalIndexKeys(alloc, column.index_keys),
+            .lifecycle = column.index_lifecycle,
+            .generation = column.index_generation,
+            .schema_fingerprint = if (column.index_schema_fingerprint) |fingerprint| try alloc.dupe(u8, fingerprint) else null,
+            .where = try cloneStorageUniquePredicates(alloc, column.index_where),
+            .where_expressions = try cloneRelationalRowsExpressionConditionsAlloc(alloc, column.index_where_expressions),
+        };
+        name_owned = false;
+        owner_name_owned = false;
+        var index_owned = true;
+        errdefer if (index_owned) freeRuntimeRelationalIndex(alloc, index);
+        try indexes.append(alloc, index);
+        index_owned = false;
+    }
+
+    for (unique_constraints) |constraint| {
+        const name = try alloc.dupe(u8, constraint.name);
+        var name_owned = true;
+        errdefer if (name_owned) alloc.free(name);
+        const owner_name = try alloc.dupe(u8, constraint.name);
+        var owner_name_owned = true;
+        errdefer if (owner_name_owned) alloc.free(owner_name);
+        const index: storage_schema.RelationalIndex = .{
+            .name = name,
+            .owner_kind = .unique_constraint,
+            .owner_name = owner_name,
+            .access_method = constraint.index_access_method orelse .ordered_tuple,
+            .unique = true,
+            .columns = try cloneStringSlice(alloc, constraint.columns),
+            .expressions = try cloneStorageUniqueExpressions(alloc, constraint.expressions),
+            .include_columns = try cloneStringSlice(alloc, constraint.include_columns),
+            .keys = try cloneRelationalIndexKeys(alloc, constraint.index_keys),
+            .lifecycle = constraint.index_lifecycle,
+            .generation = constraint.index_generation,
+            .schema_fingerprint = if (constraint.index_schema_fingerprint) |fingerprint| try alloc.dupe(u8, fingerprint) else null,
+            .where = try cloneStorageUniquePredicates(alloc, constraint.where),
+            .where_expressions = try cloneRelationalRowsExpressionConditionsAlloc(alloc, constraint.where_expressions),
+        };
+        name_owned = false;
+        owner_name_owned = false;
+        var index_owned = true;
+        errdefer if (index_owned) freeRuntimeRelationalIndex(alloc, index);
+        try indexes.append(alloc, index);
+        index_owned = false;
+    }
+
+    return try indexes.toOwnedSlice(alloc);
+}
+
+fn runtimeColumnHasRelationalIndexCatalogEntry(column: storage_schema.RelationalColumn) bool {
+    return column.indexed or
+        column.index_name != null or
+        column.index_access_method != null or
+        column.index_keys.len != 0 or
+        column.index_include_columns.len != 0 or
+        column.index_where.len != 0 or
+        column.index_where_expressions.len != 0;
+}
+
+fn runtimeRelationalColumnIndexAccessMethod(column: storage_schema.RelationalColumn) storage_schema.RelationalIndexAccessMethod {
+    if (column.index_access_method) |access_method| return access_method;
+    if (column.index_keys.len != 0) return .ordered_tuple;
+    return .scalar_column;
+}
+
+fn freeRuntimeRelationalIndexes(alloc: std.mem.Allocator, indexes: []const storage_schema.RelationalIndex) void {
+    for (indexes) |index| freeRuntimeRelationalIndex(alloc, index);
+    if (indexes.len > 0) alloc.free(indexes);
+}
+
+fn freeRuntimeRelationalIndex(alloc: std.mem.Allocator, index: storage_schema.RelationalIndex) void {
+    alloc.free(index.name);
+    alloc.free(index.owner_name);
+    for (index.columns) |column| alloc.free(column);
+    if (index.columns.len > 0) alloc.free(index.columns);
+    freeStorageUniqueExpressions(alloc, index.expressions);
+    for (index.include_columns) |column| alloc.free(column);
+    if (index.include_columns.len > 0) alloc.free(index.include_columns);
+    storage_schema.freeRelationalIndexKeySlice(alloc, index.keys);
+    if (index.schema_fingerprint) |fingerprint| alloc.free(fingerprint);
+    freeStorageUniquePredicates(alloc, index.where);
+    freeRelationalRowsExpressionConditions(alloc, index.where_expressions);
+}
+
 fn validateRuntimeRelationalIndexMetadata(
     columns: []const storage_schema.RelationalColumn,
     unique_constraints: []const storage_schema.UniqueConstraint,
@@ -402,13 +519,20 @@ fn validateRuntimeRelationalColumnIndexIdentity(
     column: storage_schema.RelationalColumn,
 ) !void {
     const index_name = column.index_name orelse return;
+    const has_access_method_identity = column.index_schema_fingerprint != null or column.index_generation != 0 or column.index_keys.len != 0;
+    if (!has_access_method_identity) return;
+    if (column.index_generation == 0 and column.index_keys.len == 0) {
+        if (column.index_schema_fingerprint) |fingerprint| {
+            if (std.mem.startsWith(u8, fingerprint, "legacy-secondary-index-v1:")) return;
+        }
+    }
+    if (column.index_generation == 0) return error.InvalidSchemaUpdateRequest;
     const access_method = column.index_access_method orelse return error.InvalidSchemaUpdateRequest;
     const fingerprint = column.index_schema_fingerprint orelse return error.InvalidSchemaUpdateRequest;
     if (fingerprint.len == 0) return error.InvalidSchemaUpdateRequest;
     switch (access_method) {
         .ordered_tuple => if (column.index_keys.len == 0) return error.InvalidSchemaUpdateRequest,
-        .scalar_column => if (column.index_keys.len != 0) return error.InvalidSchemaUpdateRequest,
-        .algebraic_filter, .text_search => {},
+        .scalar_column, .algebraic_filter, .text_search => if (column.index_keys.len != 0) return error.InvalidSchemaUpdateRequest,
     }
     for (columns) |candidate| {
         const candidate_index_name = candidate.index_name orelse continue;
@@ -1087,6 +1211,39 @@ fn cloneUniqueExpressions(alloc: std.mem.Allocator, values: []const impl.UniqueE
     return out;
 }
 
+fn cloneStorageUniqueExpressions(
+    alloc: std.mem.Allocator,
+    values: []const storage_schema.UniqueExpression,
+) ![]const storage_schema.UniqueExpression {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(storage_schema.UniqueExpression, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |expression| {
+            alloc.free(expression.field);
+            if (expression.expression) |row_expression| freeRelationalRowsExpression(alloc, row_expression);
+        }
+        alloc.free(out);
+    }
+    for (values) |value| {
+        out[initialized] = .{
+            .op = value.op,
+            .field = try alloc.dupe(u8, value.field),
+            .expression = if (value.expression) |expression| try cloneRelationalRowsExpressionAlloc(alloc, expression) else null,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeStorageUniqueExpressions(alloc: std.mem.Allocator, values: []const storage_schema.UniqueExpression) void {
+    for (values) |expression| {
+        alloc.free(expression.field);
+        if (expression.expression) |row_expression| freeRelationalRowsExpression(alloc, row_expression);
+    }
+    if (values.len > 0) alloc.free(values);
+}
+
 fn cloneUniquePredicates(alloc: std.mem.Allocator, values: []const impl.UniquePredicate) ![]const storage_schema.UniquePredicate {
     if (values.len == 0) return &.{};
     const out = try alloc.alloc(storage_schema.UniquePredicate, values.len);
@@ -1112,6 +1269,39 @@ fn cloneUniquePredicates(alloc: std.mem.Allocator, values: []const impl.UniquePr
         initialized += 1;
     }
     return out;
+}
+
+fn cloneStorageUniquePredicates(
+    alloc: std.mem.Allocator,
+    values: []const storage_schema.UniquePredicate,
+) ![]const storage_schema.UniquePredicate {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(storage_schema.UniquePredicate, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |predicate| {
+            alloc.free(predicate.field);
+            if (predicate.value_json) |value_json| alloc.free(value_json);
+        }
+        alloc.free(out);
+    }
+    for (values) |value| {
+        out[initialized] = .{
+            .field = try alloc.dupe(u8, value.field),
+            .op = value.op,
+            .value_json = if (value.value_json) |value_json| try alloc.dupe(u8, value_json) else null,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeStorageUniquePredicates(alloc: std.mem.Allocator, values: []const storage_schema.UniquePredicate) void {
+    for (values) |predicate| {
+        alloc.free(predicate.field);
+        if (predicate.value_json) |value_json| alloc.free(value_json);
+    }
+    if (values.len > 0) alloc.free(values);
 }
 
 fn cloneStringSlice(alloc: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
@@ -1803,6 +1993,13 @@ fn findRuntimeColumn(schema: storage_schema.TableSchema, name: []const u8) ?stor
     return null;
 }
 
+fn findRuntimeRelationalIndex(schema: storage_schema.TableSchema, name: []const u8) ?storage_schema.RelationalIndex {
+    for (schema.relational_indexes) |index| {
+        if (std.mem.eql(u8, index.name, name)) return index;
+    }
+    return null;
+}
+
 test "deriveRuntimeTableSchema carries nested document SQL column aliases" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -2003,6 +2200,18 @@ test "parseValidatedTableSchema rejects malformed relational index metadata refe
         ,
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_unknown_method_idx","x-antfly-index-access-method":"btree","x-antfly-index-generation":1,"x-antfly-index-schema-fingerprint":"secondary-index-v1:unknown_method","x-antfly-index-keys":[{"column":"status"}]}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
         ,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_missing_generation_idx","x-antfly-index-access-method":"scalar_column","x-antfly-index-schema-fingerprint":"secondary-index-v1:missing_generation"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword","x-antfly-index-name":"tenant_status_half_declared_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":1,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_status_half_declared","x-antfly-index-keys":[{"column":"tenant_id"},{"column":"status"}]},"status":{"type":"keyword","x-antfly-index-name":"tenant_status_half_declared_idx"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_scalar_tuple_idx","x-antfly-index-access-method":"scalar_column","x-antfly-index-generation":1,"x-antfly-index-schema-fingerprint":"secondary-index-v1:scalar_tuple","x-antfly-index-keys":[{"column":"status"}]}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json","x-antfly-index-name":"attrs_algebraic_tuple_idx","x-antfly-index-access-method":"algebraic_filter","x-antfly-index-generation":1,"x-antfly-index-schema-fingerprint":"secondary-index-v1:algebraic_tuple","x-antfly-index-keys":[{"column":"attrs"}]}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"body":{"type":"text","x-antfly-index-name":"body_text_tuple_idx","x-antfly-index-access-method":"text_search","x-antfly-index-generation":1,"x-antfly-index-schema-fingerprint":"secondary-index-v1:text_tuple","x-antfly-index-keys":[{"column":"body"}]}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_tuple_missing_keys_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":1,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tuple_missing_keys"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ,
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_missing_fingerprint_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":1,"x-antfly-index-keys":[{"column":"status"}]}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
         ,
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_missing_key_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":1,"x-antfly-index-schema-fingerprint":"secondary-index-v1:missing_key","x-antfly-index-keys":[{"column":"status"},{"column":"missing"}]}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -2024,6 +2233,64 @@ test "parseValidatedTableSchema rejects malformed relational index metadata refe
     }
 }
 
+test "deriveRuntimeTableSchema carries admitted relational index access methods" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_scalar_idx","x-antfly-index-access-method":"scalar_column","x-antfly-index-generation":3,"x-antfly-index-schema-fingerprint":"secondary-index-v1:status"},"tenant_id":{"type":"keyword","x-antfly-index-name":"tenant_status_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":4,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_status","x-antfly-index-keys":[{"column":"tenant_id"},{"column":"status"}],"x-antfly-index-include":["id"]},"attrs":{"type":"json","x-antfly-index-name":"attrs_algebraic_idx","x-antfly-index-access-method":"algebraic_filter","x-antfly-index-generation":5,"x-antfly-index-schema-fingerprint":"secondary-index-v1:attrs"},"body":{"type":"text","x-antfly-index-name":"body_text_idx","x-antfly-index-access-method":"text_search","x-antfly-index-generation":6,"x-antfly-index-schema-fingerprint":"secondary-index-v1:body"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    const status = findRuntimeColumn(runtime, "status") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.RelationalIndexAccessMethod.scalar_column, status.index_access_method.?);
+    try std.testing.expectEqual(@as(usize, 0), status.index_keys.len);
+    try std.testing.expectEqualStrings("secondary-index-v1:status", status.index_schema_fingerprint.?);
+
+    const tenant_id = findRuntimeColumn(runtime, "tenant_id") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.RelationalIndexAccessMethod.ordered_tuple, tenant_id.index_access_method.?);
+    try std.testing.expectEqual(@as(usize, 2), tenant_id.index_keys.len);
+    try std.testing.expectEqualStrings("tenant_id", tenant_id.index_keys[0].column);
+    try std.testing.expectEqualStrings("status", tenant_id.index_keys[1].column);
+    try std.testing.expectEqual(@as(usize, 1), tenant_id.index_include_columns.len);
+    try std.testing.expectEqualStrings("id", tenant_id.index_include_columns[0]);
+
+    const attrs = findRuntimeColumn(runtime, "attrs") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.RelationalIndexAccessMethod.algebraic_filter, attrs.index_access_method.?);
+    try std.testing.expectEqual(@as(usize, 0), attrs.index_keys.len);
+    try std.testing.expectEqualStrings("secondary-index-v1:attrs", attrs.index_schema_fingerprint.?);
+
+    const body = findRuntimeColumn(runtime, "body") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.RelationalIndexAccessMethod.text_search, body.index_access_method.?);
+    try std.testing.expectEqual(@as(usize, 0), body.index_keys.len);
+    try std.testing.expectEqualStrings("secondary-index-v1:body", body.index_schema_fingerprint.?);
+
+    try std.testing.expectEqual(@as(usize, 5), runtime.relational_indexes.len);
+    const status_idx = findRuntimeRelationalIndex(runtime, "status_scalar_idx") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.RelationalIndexOwnerKind.relational_column, status_idx.owner_kind);
+    try std.testing.expectEqualStrings("status", status_idx.owner_name);
+    try std.testing.expectEqual(storage_schema.RelationalIndexAccessMethod.scalar_column, status_idx.access_method);
+    try std.testing.expect(!status_idx.unique);
+    try std.testing.expectEqualStrings("secondary-index-v1:status", status_idx.schema_fingerprint.?);
+    try std.testing.expectEqual(@as(usize, 1), status_idx.columns.len);
+    try std.testing.expectEqualStrings("status", status_idx.columns[0]);
+
+    const tenant_idx = findRuntimeRelationalIndex(runtime, "tenant_status_idx") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.RelationalIndexAccessMethod.ordered_tuple, tenant_idx.access_method);
+    try std.testing.expectEqual(@as(usize, 2), tenant_idx.keys.len);
+    try std.testing.expectEqualStrings("tenant_id", tenant_idx.keys[0].column);
+    try std.testing.expectEqualStrings("status", tenant_idx.keys[1].column);
+    try std.testing.expectEqual(@as(usize, 1), tenant_idx.include_columns.len);
+    try std.testing.expectEqualStrings("id", tenant_idx.include_columns[0]);
+
+    const attrs_idx = findRuntimeRelationalIndex(runtime, "attrs_algebraic_idx") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.RelationalIndexAccessMethod.algebraic_filter, attrs_idx.access_method);
+
+    const body_idx = findRuntimeRelationalIndex(runtime, "body_text_idx") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.RelationalIndexAccessMethod.text_search, body_idx.access_method);
+}
+
 test "deriveRuntimeTableSchema accepts relational index metadata through aliased runtime columns" {
     const alloc = std.testing.allocator;
     var parsed = try parseValidatedTableSchema(alloc,
@@ -2042,6 +2309,19 @@ test "deriveRuntimeTableSchema accepts relational index metadata through aliased
     try std.testing.expectEqualStrings("tenant_id", status.index_keys[1].column);
     try std.testing.expectEqual(@as(usize, 1), runtime.unique_constraints.len);
     try std.testing.expectEqualStrings("tenant_status_key", runtime.unique_constraints[0].name);
+    const status_index = findRuntimeRelationalIndex(runtime, "status_tenant_idx") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.RelationalIndexOwnerKind.relational_column, status_index.owner_kind);
+    try std.testing.expectEqualStrings("status_key", status_index.owner_name);
+    try std.testing.expectEqual(@as(usize, 1), status_index.where.len);
+    try std.testing.expectEqualStrings("tenant_id", status_index.where[0].field);
+    try std.testing.expectEqual(@as(usize, 1), status_index.where_expressions.len);
+    const unique_index = findRuntimeRelationalIndex(runtime, "tenant_status_key") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.RelationalIndexOwnerKind.unique_constraint, unique_index.owner_kind);
+    try std.testing.expect(unique_index.unique);
+    try std.testing.expectEqual(storage_schema.RelationalIndexAccessMethod.ordered_tuple, unique_index.access_method);
+    try std.testing.expectEqual(@as(usize, 2), unique_index.columns.len);
+    try std.testing.expectEqualStrings("tenant_id", unique_index.columns[0]);
+    try std.testing.expectEqualStrings("status", unique_index.columns[1]);
 }
 
 test "deriveRuntimeTableSchema rejects relational collation on non text columns" {

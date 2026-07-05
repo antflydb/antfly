@@ -258,7 +258,6 @@ pub const ExplainPlanLoweringCallbacks = lowering_context.ExplainPlanLoweringCal
 pub const ExplainPlanLoweringContext = lowering_context.ExplainPlanLoweringContext;
 pub const RelationPopulationLoweringCallbacks = lowering_context.RelationPopulationLoweringCallbacks;
 pub const RelationPopulationLoweringContext = lowering_context.RelationPopulationLoweringContext;
-pub const WritePlanLoweringHooks = plan.WritePlanLoweringHooks;
 pub const SelectParserOptions = lower_expr.SelectParserOptions;
 pub const WindowParserOptions = lower_expr.WindowParserOptions;
 pub const AggregateParserOptions = lower_expr.AggregateParserOptions;
@@ -843,7 +842,6 @@ pub const lowerDocumentAggregatePlanWithOptionalIndexesAndCapabilitiesParsedSqlA
 pub const lowerExplainPlanWithParsedSqlAlloc = plan.lowerExplainPlanWithParsedSqlAlloc;
 pub const lowerRelationPopulationPlanWithParsedSqlAlloc = plan.lowerRelationPopulationPlanWithParsedSqlAlloc;
 pub const lowerReadPlanWithHooks = plan.lowerReadPlanWithHooks;
-pub const lowerWritePlanWithParsedSqlAlloc = plan.lowerWritePlanWithParsedSqlAlloc;
 pub const lowerWritePlanAlloc = lower_dml.lowerWritePlanAlloc;
 pub const lowerWritePlanFromGeneratedDmlAstDirectAlloc = lower_dml.lowerWritePlanFromGeneratedDmlAstDirectAlloc;
 pub const lowerWritePlanFromGeneratedDmlAstDirectWithFunctionBindingsAlloc = lower_dml.lowerWritePlanFromGeneratedDmlAstDirectWithFunctionBindingsAlloc;

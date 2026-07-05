@@ -881,6 +881,7 @@ pub const APITestFilters = struct {
     pub const public_api_graph_metric_e2e = [_][]const u8{
         "public index contract exposes runtime status metadata",
         "indexes openapi parses graph metric runtime summary",
+        "indexes openapi parses relational status as relational stats",
         "client openapi parses graph metric runtime summary",
         "client openapi module resolves shared refs through owner modules",
         "api http server graph metric action endpoint returns updated status",
@@ -1415,6 +1416,7 @@ pub const APITestFilters = struct {
         "api session maintenance runs schema rewrite catalog catch-up",
         "api session maintenance repairs table emptying topology jobs and wakes table",
         "api schema rewrite catalog catch-up dedupes in-flight table wakes",
+        "api catalog maintenance wake registry bounds one in-flight job per table",
         "derive initial ranges",
         "table catalog identity",
         // api/indexes.zig: index status/config encoders and aggregation.
@@ -2916,6 +2918,7 @@ pub const GraphMetricTestFilters = struct {
         "graph metric status encoder exposes active build pages",
         "distributed graph expand request defers worker result limit for metric post processing",
         "indexes openapi parses graph metric runtime summary",
+        "indexes openapi parses relational status as relational stats",
         "client openapi parses graph metric runtime summary",
         "internal group write routes expose graph metric maintenance boundary",
         "internal group write routes graph metric maintenance fences service runtime owners",

@@ -511,6 +511,28 @@ pub const UniqueConstraint = struct {
     validation_state: UniqueConstraintValidationState = .enforced,
 };
 
+pub const RelationalIndexOwnerKind = enum(u8) {
+    relational_column = 0,
+    unique_constraint = 1,
+};
+
+pub const RelationalIndex = struct {
+    name: []const u8,
+    owner_kind: RelationalIndexOwnerKind,
+    owner_name: []const u8,
+    access_method: RelationalIndexAccessMethod,
+    unique: bool = false,
+    columns: []const []const u8 = &.{},
+    expressions: []const UniqueExpression = &.{},
+    include_columns: []const []const u8 = &.{},
+    keys: []const RelationalIndexKey = &.{},
+    lifecycle: RelationalIndexLifecycle = .ready,
+    generation: u64 = 0,
+    schema_fingerprint: ?[]const u8 = null,
+    where: []const UniquePredicate = &.{},
+    where_expressions: []const RelationalRowsExpressionCondition = &.{},
+};
+
 pub const UniqueConstraintValidationState = enum(u8) {
     enforced = 0,
     unvalidated = 1,
@@ -824,6 +846,7 @@ pub const TableSchema = struct {
     periods: []const RelationalPeriod = &.{},
     foreign_keys: []const ForeignKey = &.{},
     unique_constraints: []const UniqueConstraint = &.{},
+    relational_indexes: []const RelationalIndex = &.{},
     checks: []const RelationalCheck = &.{},
     external_base_source: ?ExternalBaseSource = null,
     system_versioned: bool = false,
@@ -847,7 +870,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 48); // format version
+    try appendU32(&buf, alloc, 49); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -1042,6 +1065,25 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         try buf.append(alloc, 0);
     }
 
+    // First-class relational index catalog (format version 49+).
+    try appendU32(&buf, alloc, @intCast(schema.relational_indexes.len));
+    for (schema.relational_indexes) |index| {
+        try appendStr(&buf, alloc, index.name);
+        try buf.append(alloc, @intFromEnum(index.owner_kind));
+        try appendStr(&buf, alloc, index.owner_name);
+        try buf.append(alloc, @intFromEnum(index.access_method));
+        try buf.append(alloc, if (index.unique) 1 else 0);
+        try appendStringSlice(&buf, alloc, index.columns);
+        try appendUniqueExpressionSlice(&buf, alloc, index.expressions);
+        try appendStringSlice(&buf, alloc, index.include_columns);
+        try appendRelationalIndexKeySlice(&buf, alloc, index.keys);
+        try buf.append(alloc, @intFromEnum(index.lifecycle));
+        try appendU64(&buf, alloc, index.generation);
+        try appendOptStr(&buf, alloc, index.schema_fingerprint);
+        try appendUniquePredicateSlice(&buf, alloc, index.where);
+        try appendRelationalRowsExpressionConditionSlice(&buf, alloc, index.where_expressions);
+    }
+
     // Relational check catalog (format version 20+).
     try appendU32(&buf, alloc, @intCast(schema.checks.len));
     for (schema.checks) |check| {
@@ -1121,7 +1163,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 48) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 49) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -1691,6 +1733,64 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
     };
     errdefer if (primary_key) |key| freePrimaryKey(alloc, key);
 
+    const relational_indexes: []RelationalIndex = if (fmt_version >= 49) blk: {
+        const index_count = readU32(data, &pos);
+        const indexes = try alloc.alloc(RelationalIndex, index_count);
+        var indexes_initialized: usize = 0;
+        errdefer {
+            for (indexes[0..indexes_initialized]) |index| freeRelationalIndex(alloc, index);
+            alloc.free(indexes);
+        }
+        for (indexes) |*index| {
+            const name = try alloc.dupe(u8, readStr(data, &pos));
+            errdefer alloc.free(name);
+            const owner_kind: RelationalIndexOwnerKind = @enumFromInt(data[pos]);
+            pos += 1;
+            const owner_name = try alloc.dupe(u8, readStr(data, &pos));
+            errdefer alloc.free(owner_name);
+            const access_method: RelationalIndexAccessMethod = @enumFromInt(data[pos]);
+            pos += 1;
+            const unique = data[pos] == 1;
+            pos += 1;
+            const columns = try readStringSliceAlloc(alloc, data, &pos);
+            errdefer freeStringSlice(alloc, columns);
+            const expressions = try readUniqueExpressionSliceAlloc(alloc, data, &pos, fmt_version);
+            errdefer freeUniqueExpressionSlice(alloc, expressions);
+            const include_columns = try readStringSliceAlloc(alloc, data, &pos);
+            errdefer freeStringSlice(alloc, include_columns);
+            const keys = try readRelationalIndexKeySliceAlloc(alloc, data, &pos);
+            errdefer freeRelationalIndexKeySlice(alloc, keys);
+            const lifecycle: RelationalIndexLifecycle = @enumFromInt(data[pos]);
+            pos += 1;
+            const generation = readU64(data, &pos);
+            const schema_fingerprint = try readOptStrAlloc(alloc, data, &pos);
+            errdefer if (schema_fingerprint) |fingerprint| alloc.free(fingerprint);
+            const where = try readUniquePredicateSliceAlloc(alloc, data, &pos);
+            errdefer freeUniquePredicateSlice(alloc, where);
+            const where_expressions = try readRelationalRowsExpressionConditionSliceAlloc(alloc, data, &pos);
+            errdefer freeRelationalRowsExpressionConditionSlice(alloc, where_expressions);
+            index.* = .{
+                .name = name,
+                .owner_kind = owner_kind,
+                .owner_name = owner_name,
+                .access_method = access_method,
+                .unique = unique,
+                .columns = columns,
+                .expressions = expressions,
+                .include_columns = include_columns,
+                .keys = keys,
+                .lifecycle = lifecycle,
+                .generation = generation,
+                .schema_fingerprint = schema_fingerprint,
+                .where = where,
+                .where_expressions = where_expressions,
+            };
+            indexes_initialized += 1;
+        }
+        break :blk indexes;
+    } else &.{};
+    errdefer freeRelationalIndexesSlice(alloc, relational_indexes);
+
     const checks: []RelationalCheck = if (fmt_version >= 20) blk: {
         const check_count = readU32(data, &pos);
         const checks = try alloc.alloc(RelationalCheck, check_count);
@@ -1792,6 +1892,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         .periods = periods,
         .foreign_keys = foreign_keys,
         .unique_constraints = unique_constraints,
+        .relational_indexes = relational_indexes,
         .checks = checks,
         .external_base_source = external_base_source,
         .system_versioned = system_versioned,
@@ -1818,6 +1919,7 @@ pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
     freeRelationalPeriodsSlice(alloc, s.periods);
     freeForeignKeysSlice(alloc, s.foreign_keys);
     freeUniqueConstraintsSlice(alloc, s.unique_constraints);
+    freeRelationalIndexesSlice(alloc, s.relational_indexes);
     freeRelationalChecksSlice(alloc, s.checks);
     if (s.external_base_source) |source| freeExternalBaseSource(alloc, source);
 }
@@ -1965,6 +2067,23 @@ fn freeUniqueConstraint(alloc: Allocator, constraint: UniqueConstraint) void {
     if (constraint.without_overlaps_period) |period| alloc.free(period);
     freeUniquePredicateSlice(alloc, constraint.where);
     freeRelationalRowsExpressionConditionSlice(alloc, constraint.where_expressions);
+}
+
+fn freeRelationalIndexesSlice(alloc: Allocator, indexes: []const RelationalIndex) void {
+    for (indexes) |index| freeRelationalIndex(alloc, index);
+    if (indexes.len > 0) alloc.free(indexes);
+}
+
+fn freeRelationalIndex(alloc: Allocator, index: RelationalIndex) void {
+    alloc.free(index.name);
+    alloc.free(index.owner_name);
+    freeStringSlice(alloc, index.columns);
+    freeUniqueExpressionSlice(alloc, index.expressions);
+    freeStringSlice(alloc, index.include_columns);
+    freeRelationalIndexKeySlice(alloc, index.keys);
+    if (index.schema_fingerprint) |fingerprint| alloc.free(fingerprint);
+    freeUniquePredicateSlice(alloc, index.where);
+    freeRelationalRowsExpressionConditionSlice(alloc, index.where_expressions);
 }
 
 fn freeUniqueExpressionSlice(alloc: Allocator, expressions: []const UniqueExpression) void {
@@ -2529,6 +2648,37 @@ fn appendRelationalIndexKeySlice(
         try appendStr(buf, alloc, key.column);
         try buf.append(alloc, @intFromEnum(key.direction));
         try buf.append(alloc, @intFromEnum(key.nulls));
+    }
+}
+
+fn appendUniqueExpressionSlice(
+    buf: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    expressions: []const UniqueExpression,
+) !void {
+    try appendU32(buf, alloc, @intCast(expressions.len));
+    for (expressions) |expression| {
+        try buf.append(alloc, @intFromEnum(expression.op));
+        try appendStr(buf, alloc, expression.field);
+        if (expression.expression) |row_expression| {
+            try buf.append(alloc, 1);
+            try appendRelationalRowsExpression(buf, alloc, row_expression);
+        } else {
+            try buf.append(alloc, 0);
+        }
+    }
+}
+
+fn appendUniquePredicateSlice(
+    buf: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    predicates: []const UniquePredicate,
+) !void {
+    try appendU32(buf, alloc, @intCast(predicates.len));
+    for (predicates) |predicate| {
+        try buf.append(alloc, @intFromEnum(predicate.op));
+        try appendStr(buf, alloc, predicate.field);
+        try appendOptStr(buf, alloc, predicate.value_json);
     }
 }
 
@@ -3118,6 +3268,52 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
                 },
             },
         },
+        .relational_indexes = &.{
+            .{
+                .name = "amount_cover_idx",
+                .owner_kind = .relational_column,
+                .owner_name = "amount",
+                .access_method = .ordered_tuple,
+                .columns = &.{"amount"},
+                .include_columns = &.{ "tenant_id", "created_at" },
+                .keys = &.{
+                    .{ .column = "amount", .direction = .desc, .nulls = .last },
+                    .{ .column = "tenant_id", .direction = .asc, .nulls = .first },
+                },
+                .lifecycle = .building,
+                .generation = 12345,
+                .schema_fingerprint = "secondary-index-v1:test",
+                .where = &.{.{ .field = "tenant_id", .op = .is_not_null }},
+                .where_expressions = &.{.{
+                    .lhs = .{ .kind = .lower, .operands = &.{.{ .kind = .field, .field = "tenant_id" }} },
+                    .op = .eq,
+                    .rhs = &.{.{ .kind = .value, .value_json = "\"t1\"" }},
+                }},
+            },
+            .{
+                .name = "users_tenant_email_key",
+                .owner_kind = .unique_constraint,
+                .owner_name = "users_tenant_email_key",
+                .access_method = .ordered_tuple,
+                .unique = true,
+                .columns = &.{ "tenant_id", "email" },
+                .include_columns = &.{ "created_at", "request_id" },
+                .keys = &.{
+                    .{ .column = "tenant_id", .direction = .asc, .nulls = .default },
+                    .{ .column = "email", .direction = .desc, .nulls = .last },
+                },
+                .lifecycle = .building,
+                .generation = 67890,
+                .schema_fingerprint = "secondary-index-v1:users_tenant_email_key",
+                .where = &.{
+                    .{ .field = "email", .op = .is_not_null },
+                },
+                .where_expressions = &.{.{
+                    .lhs = .{ .kind = .lower, .operands = &.{.{ .kind = .field, .field = "email" }} },
+                    .op = .is_not_null,
+                }},
+            },
+        },
         .checks = &.{
             .{ .name = "tenant_case_match", .field = "tenant_id", .op = .eq, .value_json = "\"TENANT\"", .collation = "antfly.case_insensitive" },
             .{ .name = "amount_nonnegative", .field = "amount", .op = .gte, .value_json = "0" },
@@ -3293,6 +3489,32 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expectEqual(@as(usize, 1), loaded.unique_constraints[3].expressions.len);
     try std.testing.expectEqual(UniqueExpressionOp.md5, loaded.unique_constraints[3].expressions[0].op);
     try std.testing.expectEqualStrings("email", loaded.unique_constraints[3].expressions[0].field);
+    try std.testing.expectEqual(@as(usize, 2), loaded.relational_indexes.len);
+    try std.testing.expectEqualStrings("amount_cover_idx", loaded.relational_indexes[0].name);
+    try std.testing.expectEqual(RelationalIndexOwnerKind.relational_column, loaded.relational_indexes[0].owner_kind);
+    try std.testing.expectEqualStrings("amount", loaded.relational_indexes[0].owner_name);
+    try std.testing.expectEqual(RelationalIndexAccessMethod.ordered_tuple, loaded.relational_indexes[0].access_method);
+    try std.testing.expect(!loaded.relational_indexes[0].unique);
+    try std.testing.expectEqual(@as(usize, 1), loaded.relational_indexes[0].columns.len);
+    try std.testing.expectEqualStrings("amount", loaded.relational_indexes[0].columns[0]);
+    try std.testing.expectEqual(@as(usize, 2), loaded.relational_indexes[0].include_columns.len);
+    try std.testing.expectEqualStrings("tenant_id", loaded.relational_indexes[0].include_columns[0]);
+    try std.testing.expectEqual(@as(usize, 2), loaded.relational_indexes[0].keys.len);
+    try std.testing.expectEqualStrings("amount", loaded.relational_indexes[0].keys[0].column);
+    try std.testing.expectEqual(RelationalIndexLifecycle.building, loaded.relational_indexes[0].lifecycle);
+    try std.testing.expectEqual(@as(u64, 12345), loaded.relational_indexes[0].generation);
+    try std.testing.expectEqualStrings("secondary-index-v1:test", loaded.relational_indexes[0].schema_fingerprint.?);
+    try std.testing.expectEqual(@as(usize, 1), loaded.relational_indexes[0].where.len);
+    try std.testing.expectEqualStrings("tenant_id", loaded.relational_indexes[0].where[0].field);
+    try std.testing.expectEqual(@as(usize, 1), loaded.relational_indexes[0].where_expressions.len);
+    try std.testing.expectEqualStrings("users_tenant_email_key", loaded.relational_indexes[1].name);
+    try std.testing.expectEqual(RelationalIndexOwnerKind.unique_constraint, loaded.relational_indexes[1].owner_kind);
+    try std.testing.expectEqualStrings("users_tenant_email_key", loaded.relational_indexes[1].owner_name);
+    try std.testing.expect(loaded.relational_indexes[1].unique);
+    try std.testing.expectEqual(@as(usize, 2), loaded.relational_indexes[1].columns.len);
+    try std.testing.expectEqualStrings("tenant_id", loaded.relational_indexes[1].columns[0]);
+    try std.testing.expectEqualStrings("email", loaded.relational_indexes[1].columns[1]);
+    try std.testing.expectEqual(@as(u64, 67890), loaded.relational_indexes[1].generation);
     try std.testing.expectEqual(@as(usize, 3), loaded.checks.len);
     try std.testing.expectEqualStrings("tenant_case_match", loaded.checks[0].name);
     try std.testing.expectEqual(RelationalCheckOp.eq, loaded.checks[0].op);

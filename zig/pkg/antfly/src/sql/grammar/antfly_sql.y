@@ -24,7 +24,7 @@
 %reference postgres_scan_l https://github.com/postgres/postgres/blob/4cc02b80774ecdc4cf2a2d5df09c07df36d68ca5/src/backend/parser/scan.l
 %reference cockroach_sql_y https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/parser/sql.y
 
-%expect 10719
+%expect 10721
 
 %start statement
 
@@ -830,6 +830,7 @@ unsupported_statement:
   | CREATE OPERATOR IDENT diagnostic_tail_opt
   | CREATE RULE diagnostic_tail_opt
   | CREATE SERVER diagnostic_tail_opt
+  | CREATE CONSTRAINT TRIGGER trigger_diagnostic_tail_opt
   | CREATE OR REPLACE TRIGGER trigger_diagnostic_tail_opt
   | CREATE TRIGGER trigger_diagnostic_tail_opt
   | CREATE USER diagnostic_tail_opt

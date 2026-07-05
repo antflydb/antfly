@@ -44,6 +44,8 @@ const UniqueConstraintIntegritySchemaControllerOptions = table_write_integrity_t
 const UniqueConstraintIntegritySchemaControllerResult = table_write_integrity_types.UniqueConstraintIntegritySchemaControllerResult;
 const SecondaryIndexRebuildWorkerResult = table_write_schema_jobs.SecondaryIndexRebuildWorkerResult;
 const SecondaryIndexRebuildWorkerPassResult = table_write_schema_jobs.SecondaryIndexRebuildWorkerPassResult;
+pub const RelationalIndexRepairJobRecord = db_mod.DB.RelationalIndexRepairJobRecord;
+const RelationalColumnBackedIndexRepairWorkerPassResult = table_write_schema_jobs.RelationalColumnBackedIndexRepairWorkerPassResult;
 const SchemaRewriteWorkerResult = table_write_schema_jobs.SchemaRewriteWorkerResult;
 const SchemaRewriteWorkerPassResult = table_write_schema_jobs.SchemaRewriteWorkerPassResult;
 const TableEmptyingWorkerResult = table_write_schema_jobs.TableEmptyingWorkerResult;
@@ -72,6 +74,24 @@ pub fn nextTxnId() db_mod.types.TxnId {
     std.mem.writeInt(u64, txn_id[0..8], nextTxnTimestamp(), .big);
     std.mem.writeInt(u64, txn_id[8..16], nonce, .big);
     return txn_id;
+}
+
+pub fn freeRelationalIndexRepairJobRecord(alloc: std.mem.Allocator, record: RelationalIndexRepairJobRecord) void {
+    if (record.job_id.len > 0) alloc.free(record.job_id);
+    if (record.database_name.len > 0) alloc.free(record.database_name);
+    if (record.namespace_name.len > 0) alloc.free(record.namespace_name);
+    if (record.table_name.len > 0) alloc.free(record.table_name);
+    if (record.worker_id.len > 0) alloc.free(record.worker_id);
+    if (record.lower_doc_key.len > 0) alloc.free(record.lower_doc_key);
+    if (record.upper_doc_key.len > 0) alloc.free(record.upper_doc_key);
+    if (record.status.len > 0) alloc.free(record.status);
+    if (record.next_lower_doc_key.len > 0) alloc.free(record.next_lower_doc_key);
+    if (record.last_error) |value| alloc.free(value);
+}
+
+pub fn freeRelationalIndexRepairJobRecords(alloc: std.mem.Allocator, records: []RelationalIndexRepairJobRecord) void {
+    for (records) |record| freeRelationalIndexRepairJobRecord(alloc, record);
+    if (records.len > 0) alloc.free(records);
 }
 
 pub fn boundConflict(table: distributed_txn.TableCommitRequest, err: anyerror) distributed_txn.CommitConflict {
@@ -772,6 +792,57 @@ pub const TableWriteSource = struct {
             worker_id: []const u8,
             lease_ms: u64,
         ) anyerror!?SecondaryIndexRebuildWorkerResult = null,
+        relational_column_backed_index_repair_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            lower_doc_key: []const u8,
+            upper_doc_key: []const u8,
+        ) anyerror!?db_mod.relational_store.ColumnBackedIndexRepairReport = null,
+        relational_column_backed_index_repair_worker_pass: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) anyerror!?RelationalColumnBackedIndexRepairWorkerPassResult = null,
+        relational_column_backed_index_repair_worker_pass_catalog: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) anyerror!?RelationalColumnBackedIndexRepairWorkerPassResult = null,
+        relational_index_repair_job_begin_catalog: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            job_id: []const u8,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) anyerror!?void = null,
+        relational_index_repair_job_record_pass_catalog: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            job_id: []const u8,
+            result: RelationalColumnBackedIndexRepairWorkerPassResult,
+        ) anyerror!?void = null,
+        relational_index_repair_job_load_catalog: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            job_id: []const u8,
+        ) anyerror!?RelationalIndexRepairJobRecord = null,
+        relational_index_repair_job_list_catalog: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+        ) anyerror!?[]RelationalIndexRepairJobRecord = null,
         schema_rewrite_worker_pass: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1792,6 +1863,90 @@ pub const TableWriteSource = struct {
         return try fn_ptr(self.ptr, alloc, group_id, table_name, record, worker_id, lease_ms);
     }
 
+    pub fn relationalColumnBackedIndexRepairGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+    ) !?db_mod.relational_store.ColumnBackedIndexRepairReport {
+        const fn_ptr = self.vtable.relational_column_backed_index_repair_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, lower_doc_key, upper_doc_key);
+    }
+
+    pub fn relationalColumnBackedIndexRepairWorkerPass(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+    ) !?RelationalColumnBackedIndexRepairWorkerPassResult {
+        const fn_ptr = self.vtable.relational_column_backed_index_repair_worker_pass orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, worker_id, lease_ms, max_work_units);
+    }
+
+    pub fn relationalColumnBackedIndexRepairWorkerPassCatalog(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+    ) !?RelationalColumnBackedIndexRepairWorkerPassResult {
+        if (self.vtable.relational_column_backed_index_repair_worker_pass_catalog) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, target, worker_id, lease_ms, max_work_units);
+        }
+        if (catalog_resources.tableIsDefaultPublic(target)) {
+            return try self.relationalColumnBackedIndexRepairWorkerPass(alloc, target.table_name, worker_id, lease_ms, max_work_units);
+        }
+        return null;
+    }
+
+    pub fn relationalIndexRepairJobBeginCatalog(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        job_id: []const u8,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+    ) !?void {
+        const fn_ptr = self.vtable.relational_index_repair_job_begin_catalog orelse return null;
+        return try fn_ptr(self.ptr, alloc, target, job_id, worker_id, lease_ms, max_work_units);
+    }
+
+    pub fn relationalIndexRepairJobRecordPassCatalog(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        job_id: []const u8,
+        result: RelationalColumnBackedIndexRepairWorkerPassResult,
+    ) !?void {
+        const fn_ptr = self.vtable.relational_index_repair_job_record_pass_catalog orelse return null;
+        return try fn_ptr(self.ptr, alloc, target, job_id, result);
+    }
+
+    pub fn relationalIndexRepairJobLoadCatalog(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        job_id: []const u8,
+    ) !?RelationalIndexRepairJobRecord {
+        const fn_ptr = self.vtable.relational_index_repair_job_load_catalog orelse return null;
+        return try fn_ptr(self.ptr, alloc, target, job_id);
+    }
+
+    pub fn relationalIndexRepairJobListCatalog(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+    ) !?[]RelationalIndexRepairJobRecord {
+        const fn_ptr = self.vtable.relational_index_repair_job_list_catalog orelse return null;
+        return try fn_ptr(self.ptr, alloc, target);
+    }
+
     pub fn schemaRewriteWorkerPass(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -1906,6 +2061,9 @@ pub fn freeForeignKeyRefChildrenPage(alloc: std.mem.Allocator, page: *db_mod.typ
 test "table write source core forwards required batch and defaults optional capabilities" {
     const Probe = struct {
         batch_calls: usize = 0,
+        repair_calls: usize = 0,
+        repair_worker_calls: usize = 0,
+        repair_catalog_worker_calls: usize = 0,
 
         fn batch(
             ptr: *anyopaque,
@@ -1919,10 +2077,89 @@ test "table write source core forwards required batch and defaults optional capa
             try std.testing.expectEqual(@as(usize, 0), req.writes.len);
             return null;
         }
+
+        fn repair(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            lower_doc_key: []const u8,
+            upper_doc_key: []const u8,
+        ) anyerror!?db_mod.relational_store.ColumnBackedIndexRepairReport {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.repair_calls += 1;
+            try std.testing.expectEqual(@as(u64, 42), group_id);
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("doc:a", lower_doc_key);
+            try std.testing.expectEqualStrings("doc:z", upper_doc_key);
+            return .{
+                .scanned_rows = 3,
+                .indexed_rows = 2,
+                .deleted_orphan_entries = 1,
+                .written_entries = 4,
+            };
+        }
+
+        fn repairWorkerPass(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) anyerror!?RelationalColumnBackedIndexRepairWorkerPassResult {
+            _ = alloc;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.repair_worker_calls += 1;
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("worker-a", worker_id);
+            try std.testing.expectEqual(@as(u64, 5000), lease_ms);
+            try std.testing.expectEqual(@as(usize, 2), max_work_units);
+            return .{
+                .ranges_scanned = 2,
+                .ranges_repaired = 1,
+                .complete = false,
+                .report = .{ .scanned_rows = 3 },
+            };
+        }
+
+        fn repairWorkerPassCatalog(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) anyerror!?RelationalColumnBackedIndexRepairWorkerPassResult {
+            _ = alloc;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.repair_catalog_worker_calls += 1;
+            try std.testing.expectEqualStrings("tenant_ops", target.database_name);
+            try std.testing.expectEqualStrings("analytics", target.namespace_name);
+            try std.testing.expectEqualStrings("docs", target.table_name);
+            try std.testing.expectEqualStrings("worker-b", worker_id);
+            try std.testing.expectEqual(@as(u64, 6000), lease_ms);
+            try std.testing.expectEqual(@as(usize, 3), max_work_units);
+            return .{
+                .ranges_scanned = 4,
+                .ranges_repaired = 2,
+                .complete = false,
+                .report = .{ .scanned_rows = 5 },
+            };
+        }
     };
 
     var probe = Probe{};
     const source = TableWriteSource{
+        .ptr = &probe,
+        .vtable = &.{
+            .batch = Probe.batch,
+            .relational_column_backed_index_repair_group_local = Probe.repair,
+            .relational_column_backed_index_repair_worker_pass = Probe.repairWorkerPass,
+            .relational_column_backed_index_repair_worker_pass_catalog = Probe.repairWorkerPassCatalog,
+        },
+    };
+    const source_without_repair = TableWriteSource{
         .ptr = &probe,
         .vtable = &.{ .batch = Probe.batch },
     };
@@ -1930,6 +2167,72 @@ test "table write source core forwards required batch and defaults optional capa
     try std.testing.expect((try source.beginBulkIngest(std.testing.allocator, "docs")) == null);
     try std.testing.expect((try source.batch(std.testing.allocator, "docs", .{ .writes = &.{} })) == null);
     try std.testing.expectEqual(@as(usize, 1), probe.batch_calls);
+    const repair_report = (try source.relationalColumnBackedIndexRepairGroupLocal(
+        std.testing.allocator,
+        42,
+        "docs",
+        "doc:a",
+        "doc:z",
+    )) orelse return error.MissingRepairReport;
+    try std.testing.expectEqual(@as(u64, 3), repair_report.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 2), repair_report.indexed_rows);
+    try std.testing.expectEqual(@as(u64, 1), repair_report.deleted_orphan_entries);
+    try std.testing.expectEqual(@as(u64, 4), repair_report.written_entries);
+    try std.testing.expectEqual(@as(usize, 1), probe.repair_calls);
+    var repair_pass = (try source.relationalColumnBackedIndexRepairWorkerPass(
+        std.testing.allocator,
+        "docs",
+        "worker-a",
+        5000,
+        2,
+    )) orelse return error.MissingRepairPass;
+    defer repair_pass.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 2), repair_pass.ranges_scanned);
+    try std.testing.expectEqual(@as(u64, 1), repair_pass.ranges_repaired);
+    try std.testing.expectEqual(@as(u64, 3), repair_pass.report.scanned_rows);
+    try std.testing.expect(!repair_pass.complete);
+    try std.testing.expectEqual(@as(usize, 1), probe.repair_worker_calls);
+    var catalog_repair_pass = (try source.relationalColumnBackedIndexRepairWorkerPassCatalog(
+        std.testing.allocator,
+        .{
+            .database_name = "tenant_ops",
+            .namespace_name = "analytics",
+            .table_name = "docs",
+        },
+        "worker-b",
+        6000,
+        3,
+    )) orelse return error.MissingRepairPass;
+    defer catalog_repair_pass.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 4), catalog_repair_pass.ranges_scanned);
+    try std.testing.expectEqual(@as(u64, 2), catalog_repair_pass.ranges_repaired);
+    try std.testing.expectEqual(@as(u64, 5), catalog_repair_pass.report.scanned_rows);
+    try std.testing.expectEqual(@as(usize, 1), probe.repair_catalog_worker_calls);
+    try std.testing.expect((try source_without_repair.relationalColumnBackedIndexRepairGroupLocal(
+        std.testing.allocator,
+        42,
+        "docs",
+        "doc:a",
+        "doc:z",
+    )) == null);
+    try std.testing.expect((try source_without_repair.relationalColumnBackedIndexRepairWorkerPass(
+        std.testing.allocator,
+        "docs",
+        "worker-a",
+        5000,
+        2,
+    )) == null);
+    try std.testing.expect((try source_without_repair.relationalColumnBackedIndexRepairWorkerPassCatalog(
+        std.testing.allocator,
+        .{
+            .database_name = "tenant_ops",
+            .namespace_name = "analytics",
+            .table_name = "docs",
+        },
+        "worker-b",
+        6000,
+        3,
+    )) == null);
     try std.testing.expectError(error.UnsupportedOperation, source.localRuntimeStatusesCatalog(std.testing.allocator, .{
         .database_name = "default",
         .namespace_name = "public",

@@ -1906,14 +1906,17 @@ pub const RelationalRowsQueryResult = struct {
         ordered_tuple_lower_tuple_bytes: u64 = 0,
         ordered_tuple_upper_tuple_bytes: u64 = 0,
         ordered_tuple_prefix_scan: bool = false,
+        estimated_candidate_rows: u64 = 0,
         index_entries_scanned: u64 = 0,
         candidate_rows: u64 = 0,
         candidate_gate_limit: u64 = 0,
         candidate_gate_observed: u64 = 0,
+        candidate_gate_exceeded: bool = false,
         iterator_seeks: u64 = 0,
         hydrated_rows: u64 = 0,
         residual_rechecks: u64 = 0,
         covering_payload_rows: u64 = 0,
+        covering_payload_rechecked_rows: u64 = 0,
         projected_rows: u64 = 0,
     };
 

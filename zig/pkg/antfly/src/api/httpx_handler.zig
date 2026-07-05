@@ -1977,6 +1977,45 @@ pub const AntflyApiHandler = struct {
         return respondWithAllocator(ctx, &resp, self.api_server.alloc);
     }
 
+    pub fn repairNamespaceTableRelationalColumnBackedIndex(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        database_name: []const u8,
+        namespace_name: []const u8,
+        table_name: []const u8,
+    ) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const body_data = (try ctx.body()) orelse {
+            _ = ctx.status(400);
+            return ctx.text("missing body");
+        };
+        var resp = try self.api_server.handlePublicCatalogTableRelationalColumnBackedIndexRepair(
+            catalogTableTarget(database_name, namespace_name, table_name),
+            body_data,
+        );
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn getNamespaceTableRelationalIndexRepairJob(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        database_name: []const u8,
+        namespace_name: []const u8,
+        table_name: []const u8,
+        job_id: []const u8,
+    ) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        var resp = try self.api_server.handlePublicCatalogTableRelationalIndexRepairJobStatus(
+            catalogTableTarget(database_name, namespace_name, table_name),
+            job_id,
+        );
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
     pub fn lookupNamespaceTableDocument(
         self: *AntflyApiHandler,
         ctx: *httpx.Context,
@@ -2072,6 +2111,32 @@ pub const AntflyApiHandler = struct {
             return ctx.text("missing body");
         };
         var resp = try self.api_server.handlePublicTableRowsBatch(decoded_table_name, body_data, authenticated_identity);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn repairRelationalColumnBackedIndex(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
+        defer ctx.allocator.free(decoded_table_name);
+        const body_data = (try ctx.body()) orelse {
+            _ = ctx.status(400);
+            return ctx.text("missing body");
+        };
+        var resp = try self.api_server.handlePublicTableRelationalColumnBackedIndexRepair(decoded_table_name, body_data);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn getRelationalIndexRepairJob(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
+        defer ctx.allocator.free(decoded_table_name);
+        const decoded_job_id = (try decodePathParamOrBadRequest(ctx, job_id)) orelse return ctx.text("invalid path parameter");
+        defer ctx.allocator.free(decoded_job_id);
+        var resp = try self.api_server.handlePublicTableRelationalIndexRepairJobStatus(decoded_table_name, decoded_job_id);
         return respondWithAllocator(ctx, &resp, self.api_server.alloc);
     }
 

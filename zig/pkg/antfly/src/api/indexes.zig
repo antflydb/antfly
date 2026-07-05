@@ -19,6 +19,8 @@ const metadata_transition_state = @import("../metadata/transition_state.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const graph_mod = @import("../graph/graph.zig");
+const schema_api = @import("../schema/mod.zig");
+const storage_schema = @import("../storage/schema.zig");
 const tables_api = @import("../metadata/catalog/table_ddl.zig");
 const runtime_status = @import("runtime_status.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
@@ -467,6 +469,16 @@ pub fn encodeIndexListForTable(
     table: *const metadata_table_manager.TableRecord,
     local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
 ) ![]u8 {
+    return try encodeIndexListForTableWithRepairRecords(alloc, snapshot, table, local_statuses, &.{});
+}
+
+pub fn encodeIndexListForTableWithRepairRecords(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    table: *const metadata_table_manager.TableRecord,
+    local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
+    repair_records: []const db_mod.DB.RelationalIndexRepairJobRecord,
+) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexesJsonSource(table.indexes_json), .{});
     defer parsed.deinit();
     const object = switch (parsed.value) {
@@ -480,13 +492,17 @@ pub fn encodeIndexListForTable(
     defer out.deinit(alloc);
     try out.append(alloc, '[');
     var first = true;
+    var emitted_names = std.StringHashMapUnmanaged(void).empty;
+    defer emitted_names.deinit(alloc);
     var it = object.iterator();
     while (it.next()) |entry| {
         if (isReservedIndexMetadataEntry(entry.key_ptr.*) or isLegacyTypedPathMetadataConfig(entry.value_ptr.*)) continue;
         if (!first) try out.append(alloc, ',');
         first = false;
         try appendIndexStatus(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, expected_group_ids, local_statuses);
+        try emitted_names.put(alloc, entry.key_ptr.*, {});
     }
+    try appendRelationalIndexStatusesForTable(alloc, &out, &first, &emitted_names, snapshot, table, repair_records);
     try out.append(alloc, ']');
     return try out.toOwnedSlice(alloc);
 }
@@ -520,9 +536,21 @@ pub fn encodeSingleIndexForTableWithSnapshot(
     index_name: []const u8,
     local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
 ) !?[]u8 {
+    return try encodeSingleIndexForTableWithSnapshotAndRepairRecords(alloc, snapshot, table, index_name, local_statuses, &.{});
+}
+
+pub fn encodeSingleIndexForTableWithSnapshotAndRepairRecords(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    table: *const metadata_table_manager.TableRecord,
+    index_name: []const u8,
+    local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
+    repair_records: []const db_mod.DB.RelationalIndexRepairJobRecord,
+) !?[]u8 {
     const expected_group_ids = try expectedTableGroupIds(alloc, snapshot, table.table_id);
     defer if (expected_group_ids.len > 0) alloc.free(expected_group_ids);
-    return try encodeSingleIndexForTableWithTopology(alloc, table, index_name, expected_group_ids, local_statuses);
+    if (try encodeSingleIndexForTableWithTopology(alloc, table, index_name, expected_group_ids, local_statuses)) |encoded| return encoded;
+    return try encodeSingleRelationalIndexForTable(alloc, snapshot, table, index_name, repair_records);
 }
 
 fn encodeSingleIndexForTableWithTopology(
@@ -779,6 +807,398 @@ fn appendIndexStatus(
     try out.appendSlice(alloc, ",\"shard_status\":");
     try appendIndexRuntimeStatus(alloc, out, index_name, index_type, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, expected_group_ids, local_statuses, true);
     try out.append(alloc, '}');
+}
+
+fn appendRelationalIndexStatusesForTable(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    emitted_names: *std.StringHashMapUnmanaged(void),
+    snapshot: *const metadata_api.AdminSnapshot,
+    table: *const metadata_table_manager.TableRecord,
+    repair_records: []const db_mod.DB.RelationalIndexRepairJobRecord,
+) !void {
+    if (table.schema_json.len == 0) return;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, table.schema_json);
+    defer parsed.deinit(alloc);
+    const runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    for (runtime.relational_columns) |column| {
+        const access_method = column.index_access_method orelse continue;
+        const index_name = column.index_name orelse column.name;
+        if (emitted_names.contains(index_name)) continue;
+        if (!first.*) try out.append(alloc, ',');
+        first.* = false;
+        try appendRelationalColumnIndexStatus(alloc, out, snapshot, table, column, index_name, access_method, repair_records);
+        try emitted_names.put(alloc, index_name, {});
+    }
+
+    for (runtime.unique_constraints) |constraint| {
+        const access_method = constraint.index_access_method orelse continue;
+        const index_name = constraint.name;
+        if (emitted_names.contains(index_name)) continue;
+        if (!first.*) try out.append(alloc, ',');
+        first.* = false;
+        try appendRelationalUniqueIndexStatus(alloc, out, snapshot, table, constraint, index_name, access_method, repair_records);
+        try emitted_names.put(alloc, index_name, {});
+    }
+}
+
+fn encodeSingleRelationalIndexForTable(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    table: *const metadata_table_manager.TableRecord,
+    index_name: []const u8,
+    repair_records: []const db_mod.DB.RelationalIndexRepairJobRecord,
+) !?[]u8 {
+    if (table.schema_json.len == 0) return null;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, table.schema_json);
+    defer parsed.deinit(alloc);
+    const runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    for (runtime.relational_columns) |column| {
+        const access_method = column.index_access_method orelse continue;
+        const relational_index_name = column.index_name orelse column.name;
+        if (!std.mem.eql(u8, relational_index_name, index_name)) continue;
+        try appendRelationalColumnIndexStatus(alloc, &out, snapshot, table, column, relational_index_name, access_method, repair_records);
+        return try out.toOwnedSlice(alloc);
+    }
+    for (runtime.unique_constraints) |constraint| {
+        const access_method = constraint.index_access_method orelse continue;
+        if (!std.mem.eql(u8, constraint.name, index_name)) continue;
+        try appendRelationalUniqueIndexStatus(alloc, &out, snapshot, table, constraint, index_name, access_method, repair_records);
+        return try out.toOwnedSlice(alloc);
+    }
+    out.deinit(alloc);
+    return null;
+}
+
+fn appendRelationalColumnIndexStatus(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    snapshot: *const metadata_api.AdminSnapshot,
+    table: *const metadata_table_manager.TableRecord,
+    column: storage_schema.RelationalColumn,
+    index_name: []const u8,
+    access_method: storage_schema.RelationalIndexAccessMethod,
+    repair_records: []const db_mod.DB.RelationalIndexRepairJobRecord,
+) !void {
+    try out.appendSlice(alloc, "{\"config\":{");
+    try appendRelationalIndexConfigPrefix(alloc, out, index_name, "column", access_method, column.index_lifecycle, column.index_generation, column.index_schema_fingerprint);
+    try out.appendSlice(alloc, ",\"column\":");
+    try appendJsonString(alloc, out, column.name);
+    try out.appendSlice(alloc, ",\"keys\":");
+    try appendRelationalIndexKeysOrColumns(alloc, out, column.index_keys, &.{column.name});
+    try out.appendSlice(alloc, ",\"include_columns\":");
+    try appendJsonStringArray(alloc, out, column.index_include_columns);
+    try out.appendSlice(alloc, ",\"predicate_count\":");
+    try appendIntValue(alloc, out, @intCast(column.index_where.len));
+    try out.appendSlice(alloc, ",\"expression_predicate_count\":");
+    try appendIntValue(alloc, out, @intCast(column.index_where_expressions.len));
+    try out.appendSlice(alloc, "},\"status\":");
+    try appendRelationalIndexRuntimeStatus(alloc, out, snapshot, table, index_name, access_method, column.index_lifecycle, column.index_generation, column.index_schema_fingerprint, repair_records);
+    try out.appendSlice(alloc, ",\"shard_status\":");
+    try appendRelationalIndexRuntimeStatus(alloc, out, snapshot, table, index_name, access_method, column.index_lifecycle, column.index_generation, column.index_schema_fingerprint, repair_records);
+    try out.append(alloc, '}');
+}
+
+fn appendRelationalUniqueIndexStatus(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    snapshot: *const metadata_api.AdminSnapshot,
+    table: *const metadata_table_manager.TableRecord,
+    constraint: storage_schema.UniqueConstraint,
+    index_name: []const u8,
+    access_method: storage_schema.RelationalIndexAccessMethod,
+    repair_records: []const db_mod.DB.RelationalIndexRepairJobRecord,
+) !void {
+    try out.appendSlice(alloc, "{\"config\":{");
+    try appendRelationalIndexConfigPrefix(alloc, out, index_name, "unique_constraint", access_method, constraint.index_lifecycle, constraint.index_generation, constraint.index_schema_fingerprint);
+    try out.appendSlice(alloc, ",\"columns\":");
+    try appendJsonStringArray(alloc, out, constraint.columns);
+    try out.appendSlice(alloc, ",\"keys\":");
+    try appendRelationalIndexKeysOrColumns(alloc, out, constraint.index_keys, constraint.columns);
+    try out.appendSlice(alloc, ",\"include_columns\":");
+    try appendJsonStringArray(alloc, out, constraint.include_columns);
+    try out.appendSlice(alloc, ",\"predicate_count\":");
+    try appendIntValue(alloc, out, @intCast(constraint.where.len));
+    try out.appendSlice(alloc, ",\"expression_predicate_count\":");
+    try appendIntValue(alloc, out, @intCast(constraint.where_expressions.len));
+    try out.appendSlice(alloc, ",\"unique\":true},\"status\":");
+    try appendRelationalIndexRuntimeStatus(alloc, out, snapshot, table, index_name, access_method, constraint.index_lifecycle, constraint.index_generation, constraint.index_schema_fingerprint, repair_records);
+    try out.appendSlice(alloc, ",\"shard_status\":");
+    try appendRelationalIndexRuntimeStatus(alloc, out, snapshot, table, index_name, access_method, constraint.index_lifecycle, constraint.index_generation, constraint.index_schema_fingerprint, repair_records);
+    try out.append(alloc, '}');
+}
+
+fn appendRelationalIndexConfigPrefix(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    index_name: []const u8,
+    source: []const u8,
+    access_method: storage_schema.RelationalIndexAccessMethod,
+    lifecycle: storage_schema.RelationalIndexLifecycle,
+    generation: u64,
+    schema_fingerprint: ?[]const u8,
+) !void {
+    try appendJsonString(alloc, out, "name");
+    try out.append(alloc, ':');
+    try appendJsonString(alloc, out, index_name);
+    try out.appendSlice(alloc, ",\"type\":\"relational\",\"source\":");
+    try appendJsonString(alloc, out, source);
+    try out.appendSlice(alloc, ",\"access_method\":");
+    try appendJsonString(alloc, out, access_method.name());
+    try out.appendSlice(alloc, ",\"lifecycle\":");
+    try appendJsonString(alloc, out, @tagName(lifecycle));
+    try out.appendSlice(alloc, ",\"generation\":");
+    try appendIntValue(alloc, out, generation);
+    try out.appendSlice(alloc, ",\"schema_fingerprint\":");
+    if (schema_fingerprint) |fingerprint| {
+        try appendJsonString(alloc, out, fingerprint);
+    } else {
+        try out.appendSlice(alloc, "null");
+    }
+}
+
+fn appendRelationalIndexRuntimeStatus(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    snapshot: *const metadata_api.AdminSnapshot,
+    table: *const metadata_table_manager.TableRecord,
+    index_name: []const u8,
+    access_method: storage_schema.RelationalIndexAccessMethod,
+    lifecycle: storage_schema.RelationalIndexLifecycle,
+    generation: u64,
+    schema_fingerprint: ?[]const u8,
+    repair_records: []const db_mod.DB.RelationalIndexRepairJobRecord,
+) !void {
+    var range_count: u64 = 0;
+    var matching_generation_range_count: u64 = 0;
+    var stale_generation_range_count: u64 = 0;
+    var declared_range_count: u64 = 0;
+    var building_range_count: u64 = 0;
+    var ready_range_count: u64 = 0;
+    var invalid_range_count: u64 = 0;
+    var completed_row_count: u64 = 0;
+    var progress_row_key: []const u8 = "";
+    var last_error: []const u8 = "";
+
+    for (snapshot.secondary_index_rebuild_ranges) |range| {
+        if (range.table_id != table.table_id) continue;
+        if (!std.mem.eql(u8, range.index_name, index_name)) continue;
+        range_count += 1;
+        if (range.index_generation == generation) {
+            matching_generation_range_count += 1;
+        } else {
+            stale_generation_range_count += 1;
+        }
+        if (std.mem.eql(u8, range.state, metadata_table_manager.secondary_index_rebuild_declared)) declared_range_count += 1;
+        if (std.mem.eql(u8, range.state, metadata_table_manager.secondary_index_rebuild_building)) building_range_count += 1;
+        if (std.mem.eql(u8, range.state, metadata_table_manager.secondary_index_rebuild_ready)) ready_range_count += 1;
+        if (std.mem.eql(u8, range.state, metadata_table_manager.secondary_index_rebuild_invalid)) invalid_range_count += 1;
+        completed_row_count += range.completed_row_count;
+        if (range.progress_row_key.len > 0) progress_row_key = range.progress_row_key;
+        if (range.last_error.len > 0) last_error = range.last_error;
+    }
+
+    try out.appendSlice(alloc, "{\"index_type\":\"relational\",\"access_method\":");
+    try appendJsonString(alloc, out, access_method.name());
+    try out.appendSlice(alloc, ",\"lifecycle\":");
+    try appendJsonString(alloc, out, @tagName(lifecycle));
+    try out.appendSlice(alloc, ",\"ready\":");
+    try out.appendSlice(alloc, if (lifecycle == .ready and stale_generation_range_count == 0 and invalid_range_count == 0) "true" else "false");
+    try out.appendSlice(alloc, ",\"generation\":");
+    try appendIntValue(alloc, out, generation);
+    try out.appendSlice(alloc, ",\"schema_fingerprint\":");
+    if (schema_fingerprint) |fingerprint| {
+        try appendJsonString(alloc, out, fingerprint);
+    } else {
+        try out.appendSlice(alloc, "null");
+    }
+    try out.appendSlice(alloc, ",\"rebuild\":{\"range_count\":");
+    try appendIntValue(alloc, out, range_count);
+    try out.appendSlice(alloc, ",\"matching_generation_range_count\":");
+    try appendIntValue(alloc, out, matching_generation_range_count);
+    try out.appendSlice(alloc, ",\"stale_generation_range_count\":");
+    try appendIntValue(alloc, out, stale_generation_range_count);
+    try out.appendSlice(alloc, ",\"declared_range_count\":");
+    try appendIntValue(alloc, out, declared_range_count);
+    try out.appendSlice(alloc, ",\"building_range_count\":");
+    try appendIntValue(alloc, out, building_range_count);
+    try out.appendSlice(alloc, ",\"ready_range_count\":");
+    try appendIntValue(alloc, out, ready_range_count);
+    try out.appendSlice(alloc, ",\"invalid_range_count\":");
+    try appendIntValue(alloc, out, invalid_range_count);
+    try out.appendSlice(alloc, ",\"completed_row_count\":");
+    try appendIntValue(alloc, out, completed_row_count);
+    try out.appendSlice(alloc, ",\"progress_row_key\":");
+    try appendJsonString(alloc, out, progress_row_key);
+    try out.appendSlice(alloc, ",\"last_error\":");
+    try appendJsonString(alloc, out, last_error);
+    try out.appendSlice(alloc, ",\"ranges\":[");
+    var first_range = true;
+    for (snapshot.secondary_index_rebuild_ranges) |range| {
+        if (range.table_id != table.table_id) continue;
+        if (!std.mem.eql(u8, range.index_name, index_name)) continue;
+        if (!first_range) try out.append(alloc, ',');
+        first_range = false;
+        try out.appendSlice(alloc, "{\"group_id\":");
+        try appendIntValue(alloc, out, range.group_id);
+        try out.appendSlice(alloc, ",\"range_id\":");
+        try appendIntValue(alloc, out, range.range_id);
+        try out.appendSlice(alloc, ",\"generation\":");
+        try appendIntValue(alloc, out, range.index_generation);
+        try out.appendSlice(alloc, ",\"state\":");
+        try appendJsonString(alloc, out, range.state);
+        try out.appendSlice(alloc, ",\"completed_row_count\":");
+        try appendIntValue(alloc, out, range.completed_row_count);
+        try out.appendSlice(alloc, ",\"progress_row_key\":");
+        try appendJsonString(alloc, out, range.progress_row_key);
+        try out.appendSlice(alloc, ",\"last_error\":");
+        try appendJsonString(alloc, out, range.last_error);
+        try out.append(alloc, '}');
+    }
+    try out.appendSlice(alloc, "]},\"repair\":");
+    try appendRelationalIndexRepairStatus(alloc, out, repair_records);
+    try out.append(alloc, '}');
+}
+
+fn appendRelationalIndexRepairStatus(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    repair_records: []const db_mod.DB.RelationalIndexRepairJobRecord,
+) !void {
+    var job_count: u64 = 0;
+    var active_job_count: u64 = 0;
+    var completed_job_count: u64 = 0;
+    var failed_job_count: u64 = 0;
+    var total_ranges_scanned: u64 = 0;
+    var total_ranges_repaired: u64 = 0;
+    var total_ranges_missing: u64 = 0;
+    var aggregate_report: db_mod.relational_store.ColumnBackedIndexRepairReport = .{};
+    var latest: ?db_mod.DB.RelationalIndexRepairJobRecord = null;
+
+    for (repair_records) |record| {
+        job_count += 1;
+        if (record.completed) {
+            completed_job_count += 1;
+        } else {
+            active_job_count += 1;
+        }
+        if (std.mem.eql(u8, record.status, "failed")) failed_job_count += 1;
+        total_ranges_scanned +|= record.total_ranges_scanned;
+        total_ranges_repaired +|= record.total_ranges_repaired;
+        total_ranges_missing +|= record.total_ranges_missing;
+        aggregate_report.scanned_rows +|= record.aggregate_report.scanned_rows;
+        aggregate_report.indexed_rows +|= record.aggregate_report.indexed_rows;
+        aggregate_report.deleted_orphan_entries +|= record.aggregate_report.deleted_orphan_entries;
+        aggregate_report.written_entries +|= record.aggregate_report.written_entries;
+        if (latest == null or record.updated_at_ns >= latest.?.updated_at_ns) latest = record;
+    }
+
+    try out.appendSlice(alloc, "{\"job_count\":");
+    try appendIntValue(alloc, out, job_count);
+    try out.appendSlice(alloc, ",\"active_job_count\":");
+    try appendIntValue(alloc, out, active_job_count);
+    try out.appendSlice(alloc, ",\"completed_job_count\":");
+    try appendIntValue(alloc, out, completed_job_count);
+    try out.appendSlice(alloc, ",\"failed_job_count\":");
+    try appendIntValue(alloc, out, failed_job_count);
+    try out.appendSlice(alloc, ",\"total_ranges_scanned\":");
+    try appendIntValue(alloc, out, total_ranges_scanned);
+    try out.appendSlice(alloc, ",\"total_ranges_repaired\":");
+    try appendIntValue(alloc, out, total_ranges_repaired);
+    try out.appendSlice(alloc, ",\"total_ranges_missing\":");
+    try appendIntValue(alloc, out, total_ranges_missing);
+    try out.appendSlice(alloc, ",\"aggregate_report\":");
+    try appendRelationalRepairReport(alloc, out, aggregate_report);
+    try out.appendSlice(alloc, ",\"latest\":");
+    if (latest) |record| {
+        try out.appendSlice(alloc, "{\"job_id\":");
+        try appendJsonString(alloc, out, record.job_id);
+        try out.appendSlice(alloc, ",\"status\":");
+        try appendJsonString(alloc, out, record.status);
+        try out.appendSlice(alloc, ",\"worker_id\":");
+        try appendJsonString(alloc, out, record.worker_id);
+        try out.appendSlice(alloc, ",\"updated_at_ns\":");
+        try appendIntValue(alloc, out, record.updated_at_ns);
+        try out.appendSlice(alloc, ",\"next_lower_doc_key\":");
+        try appendJsonString(alloc, out, record.next_lower_doc_key);
+        try out.appendSlice(alloc, ",\"last_error\":");
+        if (record.last_error) |value| {
+            try appendJsonString(alloc, out, value);
+        } else {
+            try out.appendSlice(alloc, "null");
+        }
+        try out.appendSlice(alloc, ",\"last_report\":");
+        try appendRelationalRepairReport(alloc, out, record.last_report);
+        try out.append(alloc, '}');
+    } else {
+        try out.appendSlice(alloc, "null");
+    }
+    try out.append(alloc, '}');
+}
+
+fn appendRelationalRepairReport(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    report: db_mod.relational_store.ColumnBackedIndexRepairReport,
+) !void {
+    try out.appendSlice(alloc, "{\"scanned_rows\":");
+    try appendIntValue(alloc, out, report.scanned_rows);
+    try out.appendSlice(alloc, ",\"indexed_rows\":");
+    try appendIntValue(alloc, out, report.indexed_rows);
+    try out.appendSlice(alloc, ",\"deleted_orphan_entries\":");
+    try appendIntValue(alloc, out, report.deleted_orphan_entries);
+    try out.appendSlice(alloc, ",\"written_entries\":");
+    try appendIntValue(alloc, out, report.written_entries);
+    try out.append(alloc, '}');
+}
+
+fn appendRelationalIndexKeysOrColumns(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    keys: []const storage_schema.RelationalIndexKey,
+    fallback_columns: []const []const u8,
+) !void {
+    try out.append(alloc, '[');
+    if (keys.len > 0) {
+        for (keys, 0..) |key, i| {
+            if (i > 0) try out.append(alloc, ',');
+            try out.appendSlice(alloc, "{\"column\":");
+            try appendJsonString(alloc, out, key.column);
+            try out.appendSlice(alloc, ",\"direction\":");
+            try appendJsonString(alloc, out, @tagName(key.direction));
+            try out.appendSlice(alloc, ",\"nulls\":");
+            try appendJsonString(alloc, out, @tagName(key.nulls));
+            try out.append(alloc, '}');
+        }
+    } else {
+        for (fallback_columns, 0..) |column, i| {
+            if (i > 0) try out.append(alloc, ',');
+            try out.appendSlice(alloc, "{\"column\":");
+            try appendJsonString(alloc, out, column);
+            try out.appendSlice(alloc, ",\"direction\":\"asc\",\"nulls\":\"default\"}");
+        }
+    }
+    try out.append(alloc, ']');
+}
+
+fn appendJsonStringArray(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    values: []const []const u8,
+) !void {
+    try out.append(alloc, '[');
+    for (values, 0..) |value, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try appendJsonString(alloc, out, value);
+    }
+    try out.append(alloc, ']');
 }
 
 fn appendIndexConfig(
@@ -3039,6 +3459,162 @@ test "index encoders expose local shard runtime status" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"current_applied_entries\":768") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"progress_updates\":9") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"shard_status\":{\"7\":{") != null);
+}
+
+test "index encoders expose relational schema index status" {
+    const alloc = std.testing.allocator;
+    const table = metadata_table_manager.TableRecord{
+        .table_id = 42,
+        .name = "orders",
+        .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword","x-antfly-index-name":"tenant_status_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-lifecycle":"building","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_status","x-antfly-index-keys":[{"column":"tenant_id"},{"column":"status","direction":"desc","nulls":"last"}],"x-antfly-index-include":["id"],"x-antfly-index-where":{"all":[{"field":"tenant_id","op":"is_not_null"}]}},"status":{"type":"keyword"},"created_at":{"type":"datetime"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"orders_tenant_status_key","columns":["tenant_id","status"],"index_access_method":"ordered_tuple","index_lifecycle":"ready","index_generation":9,"index_schema_fingerprint":"secondary-index-v1:unique_tenant_status","index_keys":[{"column":"tenant_id"},{"column":"status"}],"include_columns":["created_at"]}]}
+        ,
+        .indexes_json = "{}",
+    };
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{table})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 100, .table_id = 42, .start_key = "", .end_key = null },
+        })[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+        .secondary_index_rebuild_ranges = @constCast((&[_]metadata_table_manager.SecondaryIndexRebuildRangeRecord{
+            .{
+                .table_id = 42,
+                .index_name = "tenant_status_idx",
+                .index_generation = 7,
+                .start_row_key = "",
+                .end_row_key = null,
+                .group_id = 900,
+                .range_id = 901,
+                .state = metadata_table_manager.secondary_index_rebuild_building,
+                .completed_row_count = 12,
+                .progress_row_key = "row:m",
+            },
+            .{
+                .table_id = 42,
+                .index_name = "tenant_status_idx",
+                .index_generation = 6,
+                .start_row_key = "old",
+                .end_row_key = null,
+                .group_id = 902,
+                .range_id = 903,
+                .state = metadata_table_manager.secondary_index_rebuild_invalid,
+                .last_error = "schema generation moved",
+            },
+        })[0..]),
+    };
+
+    const repair_records = [_]db_mod.DB.RelationalIndexRepairJobRecord{
+        .{
+            .job_id = "repair:orders:1",
+            .database_name = "default",
+            .namespace_name = "public",
+            .table_name = "orders",
+            .worker_id = "worker:a",
+            .lease_ms = 60_000,
+            .max_work_units = 3,
+            .status = "running",
+            .created_at_ns = 10,
+            .updated_at_ns = 20,
+            .attempts = 1,
+            .next_lower_doc_key = "row:m",
+            .last_ranges_scanned = 2,
+            .last_ranges_repaired = 1,
+            .total_ranges_scanned = 2,
+            .total_ranges_repaired = 1,
+            .last_report = .{
+                .scanned_rows = 5,
+                .indexed_rows = 4,
+                .deleted_orphan_entries = 1,
+                .written_entries = 2,
+            },
+            .aggregate_report = .{
+                .scanned_rows = 5,
+                .indexed_rows = 4,
+                .deleted_orphan_entries = 1,
+                .written_entries = 2,
+            },
+        },
+        .{
+            .job_id = "repair:orders:2",
+            .database_name = "default",
+            .namespace_name = "public",
+            .table_name = "orders",
+            .worker_id = "worker:b",
+            .lease_ms = 60_000,
+            .max_work_units = 2,
+            .status = "complete",
+            .created_at_ns = 30,
+            .updated_at_ns = 40,
+            .attempts = 1,
+            .completed = true,
+            .complete = true,
+            .last_ranges_scanned = 1,
+            .last_ranges_repaired = 1,
+            .total_ranges_scanned = 1,
+            .total_ranges_repaired = 1,
+            .last_report = .{
+                .scanned_rows = 3,
+                .indexed_rows = 3,
+                .written_entries = 1,
+            },
+            .aggregate_report = .{
+                .scanned_rows = 3,
+                .indexed_rows = 3,
+                .written_entries = 1,
+            },
+        },
+    };
+    const RelationalStatusEnvelope = struct {
+        status: indexes_openapi.IndexStats,
+    };
+
+    const encoded = try encodeIndexListForTableWithRepairRecords(alloc, &snapshot, &snapshot.tables[0], null, repair_records[0..]);
+    defer alloc.free(encoded);
+    var parsed_list = try std.json.parseFromSlice([]RelationalStatusEnvelope, alloc, encoded, .{ .ignore_unknown_fields = true });
+    defer parsed_list.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed_list.value.len);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"type\":\"relational\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"name\":\"tenant_status_idx\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source\":\"column\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"access_method\":\"ordered_tuple\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lifecycle\":\"building\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"generation\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"schema_fingerprint\":\"secondary-index-v1:tenant_status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direction\":\"desc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"nulls\":\"last\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"include_columns\":[\"id\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"predicate_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"index_type\":\"relational\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"ready\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"range_count\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"matching_generation_range_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"stale_generation_range_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"building_range_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"invalid_range_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"completed_row_count\":12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"progress_row_key\":\"row:m\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"last_error\":\"schema generation moved\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"name\":\"orders_tenant_status_key\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source\":\"unique_constraint\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"include_columns\":[\"created_at\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"repair\":{\"job_count\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"active_job_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"completed_job_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"total_ranges_repaired\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"aggregate_report\":{\"scanned_rows\":8,\"indexed_rows\":7,\"deleted_orphan_entries\":1,\"written_entries\":3}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"latest\":{\"job_id\":\"repair:orders:2\"") != null);
+
+    const detail = (try encodeSingleIndexForTableWithSnapshotAndRepairRecords(alloc, &snapshot, &snapshot.tables[0], "tenant_status_idx", null, repair_records[0..])).?;
+    defer alloc.free(detail);
+    var parsed_detail = try std.json.parseFromSlice(RelationalStatusEnvelope, alloc, detail, .{ .ignore_unknown_fields = true });
+    defer parsed_detail.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, detail, "\"name\":\"tenant_status_idx\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "\"repair\":{\"job_count\":2") != null);
 }
 
 test "index encoders expose algebraic graph traversal health" {

@@ -148,10 +148,12 @@ pub const Runtime = struct {
         const key = try self.alloc.dupe(u8, plan.statement_name);
         errdefer self.alloc.free(key);
         const source_subject = plan.subject_parsed_sql orelse return error.UnsupportedSqlShape;
-        const owned_subject_source = try self.alloc.dupe(u8, source_subject.sql());
-        errdefer self.alloc.free(owned_subject_source);
-        var subject_parsed_sql = try sql_adapter.ParsedSql.initFromTokenSliceAlloc(self.alloc, owned_subject_source, source_subject.items());
-        errdefer subject_parsed_sql.deinit(self.alloc);
+        var subject_parsed_sql = try source_subject.cloneWithOwnedSqlAlloc(self.alloc);
+        errdefer {
+            const owned_subject_source = subject_parsed_sql.sql();
+            subject_parsed_sql.deinit(self.alloc);
+            self.alloc.free(@constCast(owned_subject_source));
+        }
         const subject_family = (try preparedStatementFamilyFromParsedSql(&subject_parsed_sql)) orelse return error.UnsupportedSqlShape;
         if (subject_family != plan.statement_family or preparedStatementSubjectKindFromFamily(subject_family) != plan.statement_kind) {
             return error.UnsupportedSqlShape;
@@ -330,6 +332,8 @@ test "sql prepared statement runtime stores session scoped plans" {
     };
     const generated_executable = try runtime.executableForExecute(session_a, generated_execute);
     try std.testing.expectEqual(sql_adapter.PreparedStatementStatementKind.read, generated_executable.statement_family);
+    try std.testing.expect(generated_executable.parsed_sql.generatedStatementKind() == .read);
+    try std.testing.expectEqual(sql_adapter.SqlReadStatementKind.query, generated_executable.parsed_sql.readStatementKindIncludingGeneratedAst().?);
     try std.testing.expectEqualStrings("SELECT id FROM usage_records WHERE status = $1", generated_executable.parsed_sql.sql());
     try std.testing.expectEqualStrings("SELECT id FROM usage_records WHERE status = $1", generated_executable.parsed_sql.statementSql());
     try runtime.apply(.{ .deallocate = .{ .statement_name = "generated_usage_plan" } }, session_a);

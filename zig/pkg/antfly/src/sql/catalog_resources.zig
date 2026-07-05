@@ -155,14 +155,24 @@ pub const SqlCatalogSession = struct {
         if (object_name.len == 0) return error.UnsupportedSqlShape;
         if (std.mem.indexOfScalar(u8, object_name, '.')) |dot| {
             if (dot == 0) return error.UnsupportedSqlShape;
-            const namespace_name = object_name[0..dot];
-            const table_name = object_name[dot + 1 ..];
-            if (namespace_name.len == 0 or table_name.len == 0) return error.UnsupportedSqlShape;
-            if (std.mem.indexOfScalar(u8, table_name, '.') != null) return error.UnsupportedSqlShape;
+            const first_component = object_name[0..dot];
+            const rest = object_name[dot + 1 ..];
+            if (first_component.len == 0 or rest.len == 0) return error.UnsupportedSqlShape;
+            if (std.mem.indexOfScalar(u8, rest, '.')) |second_dot| {
+                const namespace_name = rest[0..second_dot];
+                const table_name = rest[second_dot + 1 ..];
+                if (namespace_name.len == 0 or table_name.len == 0) return error.UnsupportedSqlShape;
+                if (std.mem.indexOfScalar(u8, table_name, '.') != null) return error.UnsupportedSqlShape;
+                return .{
+                    .database_name = first_component,
+                    .namespace_name = namespace_name,
+                    .table_name = table_name,
+                };
+            }
             return .{
                 .database_name = self.currentDatabase(),
-                .namespace_name = namespace_name,
-                .table_name = table_name,
+                .namespace_name = first_component,
+                .table_name = rest,
             };
         }
         return .{
@@ -173,7 +183,18 @@ pub const SqlCatalogSession = struct {
     }
 
     pub fn namespaceTargetFromSchemaName(self: SqlCatalogSession, schema_name: []const u8) !NamespaceTarget {
-        if (schema_name.len == 0 or std.mem.indexOfScalar(u8, schema_name, '.') != null) return error.UnsupportedSqlShape;
+        if (schema_name.len == 0) return error.UnsupportedSqlShape;
+        if (std.mem.indexOfScalar(u8, schema_name, '.')) |dot| {
+            if (dot == 0) return error.UnsupportedSqlShape;
+            const database_name = schema_name[0..dot];
+            const namespace_name = schema_name[dot + 1 ..];
+            if (database_name.len == 0 or namespace_name.len == 0) return error.UnsupportedSqlShape;
+            if (std.mem.indexOfScalar(u8, namespace_name, '.') != null) return error.UnsupportedSqlShape;
+            return .{
+                .database_name = database_name,
+                .namespace_name = namespace_name,
+            };
+        }
         return .{
             .database_name = self.currentDatabase(),
             .namespace_name = schema_name,
@@ -297,5 +318,31 @@ test "sql catalog session maps current database and search path" {
     try std.testing.expectEqualStrings("public", explicit_namespace_target.namespace_name);
     try std.testing.expectEqualStrings("events", explicit_namespace_target.table_name);
 
-    try std.testing.expectError(error.UnsupportedSqlShape, tenant_session.tableTargetFromObjectName("tenant_ops.analytics.events"));
+    const explicit_database_target = try tenant_session.tableTargetFromObjectName("archive.analytics.events");
+    try std.testing.expectEqualStrings("archive", explicit_database_target.database_name);
+    try std.testing.expectEqualStrings("analytics", explicit_database_target.namespace_name);
+    try std.testing.expectEqualStrings("events", explicit_database_target.table_name);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, tenant_session.tableTargetFromObjectName("archive.analytics.events.extra"));
+    try std.testing.expectError(error.UnsupportedSqlShape, tenant_session.tableTargetFromObjectName("archive..events"));
+    try std.testing.expectError(error.UnsupportedSqlShape, tenant_session.tableTargetFromObjectName(".analytics.events"));
+
+    const local_schema_namespace = try tenant_session.namespaceTargetFromSchemaName("analytics");
+    try std.testing.expectEqualStrings("tenant_ops", local_schema_namespace.database_name);
+    try std.testing.expectEqualStrings("analytics", local_schema_namespace.namespace_name);
+
+    const database_qualified_namespace = try tenant_session.namespaceTargetFromSchemaName("tenant_ops.analytics");
+    try std.testing.expectEqualStrings("tenant_ops", database_qualified_namespace.database_name);
+    try std.testing.expectEqualStrings("analytics", database_qualified_namespace.namespace_name);
+
+    const public_database_namespace = try tenant_session.namespaceTargetFromSchemaName("public.analytics");
+    try std.testing.expectEqualStrings("public", public_database_namespace.database_name);
+    try std.testing.expectEqualStrings("analytics", public_database_namespace.namespace_name);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, tenant_session.namespaceTargetFromSchemaName("public.analytics.events"));
+
+    const tenant_database_target = try tenant_session.tableTargetFromObjectName("tenant_ops.analytics.events");
+    try std.testing.expectEqualStrings("tenant_ops", tenant_database_target.database_name);
+    try std.testing.expectEqualStrings("analytics", tenant_database_target.namespace_name);
+    try std.testing.expectEqualStrings("events", tenant_database_target.table_name);
 }

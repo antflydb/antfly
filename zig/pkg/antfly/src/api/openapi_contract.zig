@@ -155,6 +155,12 @@ test "public index contract exposes runtime status metadata" {
     try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "adaptive_cleanup_recommended_count"));
     try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "active_progress_lifecycle"));
     try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "active_progress_rows_processed"));
+    try std.testing.expect(@hasDecl(indexes_generated, "RelationalIndexStats"));
+    try std.testing.expect(@hasField(indexes_generated.RelationalIndexStats, "index_type"));
+    try std.testing.expect(@hasField(indexes_generated.RelationalIndexStats, "rebuild"));
+    try std.testing.expect(@hasField(indexes_generated.RelationalIndexStats, "repair"));
+    try std.testing.expect(@hasDecl(client_generated, "RelationalIndexStats"));
+    try std.testing.expect(@hasField(client_generated.RelationalIndexStats, "repair"));
     try std.testing.expect(!@hasDecl(indexes_generated, "AlgebraicRuntimeHealth"));
     try std.testing.expect(!@hasDecl(indexes_generated, "AlgebraicAdaptiveProgressStatus"));
     try std.testing.expect(!@hasDecl(indexes_generated, "AlgebraicAdaptiveCandidateStatus"));
@@ -248,6 +254,24 @@ test "indexes openapi parses algebraic status as algebraic stats" {
     }
 }
 
+test "indexes openapi parses relational status as relational stats" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(indexes_generated.IndexStats, alloc,
+        \\{"index_type":"relational","access_method":"ordered_tuple","lifecycle":"ready","ready":true,"generation":7,"schema_fingerprint":"fp","rebuild":{"range_count":1,"matching_generation_range_count":1},"repair":{"job_count":1,"active_job_count":0,"completed_job_count":1,"total_ranges_repaired":1,"aggregate_report":{"scanned_rows":3,"indexed_rows":3,"deleted_orphan_entries":0,"written_entries":1},"latest":{"job_id":"repair:1","status":"complete","worker_id":"worker:a","updated_at_ns":10,"last_report":{"scanned_rows":3}}}}
+    , .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    switch (parsed.value) {
+        .relational_index_stats => |stats| {
+            try std.testing.expectEqual(indexes_generated.RelationalIndexStatsIndexType.relational, stats.index_type);
+            try std.testing.expectEqualStrings("ordered_tuple", stats.access_method.?);
+            try std.testing.expectEqual(@as(?i64, 1), stats.repair.?.job_count);
+            try std.testing.expectEqual(@as(?i64, 1), stats.repair.?.aggregate_report.?.written_entries);
+        },
+        else => return error.UnexpectedOpenApiVariant,
+    }
+}
+
 test "indexes openapi concrete stats require discriminator" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.MissingField, std.json.parseFromSlice(indexes_generated.FullTextIndexStats, alloc,
@@ -299,6 +323,8 @@ test "generated extractors: route table covers public API" {
     var found_query_namespace_table = false;
     var found_batch_namespace_table = false;
     var found_rows_batch_namespace_table = false;
+    var found_repair_namespace_table_relational_column_backed_index = false;
+    var found_get_namespace_table_relational_index_repair_job = false;
     var found_backup_namespace_table = false;
     var found_restore_namespace_table = false;
     var found_lookup_namespace_table_document = false;
@@ -309,6 +335,8 @@ test "generated extractors: route table covers public API" {
     var found_create_table = false;
     var found_lookup_key = false;
     var found_batch_write = false;
+    var found_repair_relational_column_backed_index = false;
+    var found_get_relational_index_repair_job = false;
     var found_query_builder = false;
     var found_eval = false;
     var found_list_row_filters = false;
@@ -322,6 +350,8 @@ test "generated extractors: route table covers public API" {
         if (std.mem.eql(u8, route.operation_id, "queryNamespaceTable")) found_query_namespace_table = true;
         if (std.mem.eql(u8, route.operation_id, "batchNamespaceTable")) found_batch_namespace_table = true;
         if (std.mem.eql(u8, route.operation_id, "rowsBatchNamespaceTable")) found_rows_batch_namespace_table = true;
+        if (std.mem.eql(u8, route.operation_id, "repairNamespaceTableRelationalColumnBackedIndex")) found_repair_namespace_table_relational_column_backed_index = true;
+        if (std.mem.eql(u8, route.operation_id, "getNamespaceTableRelationalIndexRepairJob")) found_get_namespace_table_relational_index_repair_job = true;
         if (std.mem.eql(u8, route.operation_id, "backupNamespaceTable")) found_backup_namespace_table = true;
         if (std.mem.eql(u8, route.operation_id, "restoreNamespaceTable")) found_restore_namespace_table = true;
         if (std.mem.eql(u8, route.operation_id, "lookupNamespaceTableDocument")) found_lookup_namespace_table_document = true;
@@ -332,6 +362,8 @@ test "generated extractors: route table covers public API" {
         if (std.mem.eql(u8, route.operation_id, "createTable")) found_create_table = true;
         if (std.mem.eql(u8, route.operation_id, "lookupKey")) found_lookup_key = true;
         if (std.mem.eql(u8, route.operation_id, "batchWrite")) found_batch_write = true;
+        if (std.mem.eql(u8, route.operation_id, "repairRelationalColumnBackedIndex")) found_repair_relational_column_backed_index = true;
+        if (std.mem.eql(u8, route.operation_id, "getRelationalIndexRepairJob")) found_get_relational_index_repair_job = true;
         if (std.mem.eql(u8, route.operation_id, "queryBuilderAgent")) found_query_builder = true;
         if (std.mem.eql(u8, route.operation_id, "evaluate")) found_eval = true;
         if (std.mem.eql(u8, route.operation_id, "listRowFilters")) found_list_row_filters = true;
@@ -345,6 +377,8 @@ test "generated extractors: route table covers public API" {
     try std.testing.expect(found_query_namespace_table);
     try std.testing.expect(found_batch_namespace_table);
     try std.testing.expect(found_rows_batch_namespace_table);
+    try std.testing.expect(found_repair_namespace_table_relational_column_backed_index);
+    try std.testing.expect(found_get_namespace_table_relational_index_repair_job);
     try std.testing.expect(found_backup_namespace_table);
     try std.testing.expect(found_restore_namespace_table);
     try std.testing.expect(found_lookup_namespace_table_document);
@@ -355,6 +389,8 @@ test "generated extractors: route table covers public API" {
     try std.testing.expect(found_create_table);
     try std.testing.expect(found_lookup_key);
     try std.testing.expect(found_batch_write);
+    try std.testing.expect(found_repair_relational_column_backed_index);
+    try std.testing.expect(found_get_relational_index_repair_job);
     try std.testing.expect(found_query_builder);
     try std.testing.expect(found_eval);
     try std.testing.expect(found_list_row_filters);
@@ -761,6 +797,8 @@ test "client openapi module resolves shared refs through owner modules" {
     try std.testing.expect(@hasDecl(client_generated.Client, "queryNamespaceTable"));
     try std.testing.expect(@hasDecl(client_generated.Client, "batchNamespaceTable"));
     try std.testing.expect(@hasDecl(client_generated.Client, "rowsBatchNamespaceTable"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "repairNamespaceTableRelationalColumnBackedIndex"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "getNamespaceTableRelationalIndexRepairJob"));
     try std.testing.expect(@hasDecl(client_generated.Client, "backupNamespaceTable"));
     try std.testing.expect(@hasDecl(client_generated.Client, "restoreNamespaceTable"));
     try std.testing.expect(@hasDecl(client_generated.Client, "lookupNamespaceTableDocument"));
@@ -775,6 +813,8 @@ test "client openapi module resolves shared refs through owner modules" {
     try std.testing.expect(@hasDecl(client_generated.Client, "scanKeys"));
     try std.testing.expect(@hasDecl(client_generated.Client, "queryTable"));
     try std.testing.expect(@hasDecl(client_generated.Client, "batchWrite"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "repairRelationalColumnBackedIndex"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "getRelationalIndexRepairJob"));
     try std.testing.expect(@hasDecl(client_generated.Client, "backupTable"));
     try std.testing.expect(@hasDecl(client_generated.Client, "restoreTable"));
     try std.testing.expect(@hasDecl(client_generated.Client, "updateSchema"));

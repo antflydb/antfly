@@ -16,6 +16,7 @@ const ast = @import("ast.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const generated_parser = @import("generated_parser.zig");
 const grammar = @import("grammar.zig");
+const std = @import("std");
 const token_mod = @import("token.zig");
 
 const Token = token_mod.Token;
@@ -56,7 +57,7 @@ pub fn setSqlRowClaimClause(claim: *db_mod.types.RowClaimRequest, clause: ast.Sq
 }
 
 pub fn parseGeneratedReadRowClaimForClauseAlloc(
-    alloc: @import("std").mem.Allocator,
+    alloc: std.mem.Allocator,
     tokens: []const Token,
     keyword_index: usize,
     pos: *usize,
@@ -68,19 +69,106 @@ pub fn parseGeneratedReadRowClaimForClauseAlloc(
     const range = read_ast.row_lock_tokens orelse return error.UnsupportedSqlShape;
     if (range.start != keyword_index or range.start + 1 != pos.* or range.end > tokens.len) return error.UnsupportedSqlShape;
 
-    const scoped_tokens = tokens[0..range.end];
-    var generated_pos = pos.*;
-    const clause = try grammar.parseCheckedForRowClaimClauseAlloc(alloc, scoped_tokens, &generated_pos, allowed_targets);
-    if (generated_pos != range.end) return error.UnsupportedSqlShape;
+    try validateGeneratedReadRowLockClauseAlloc(alloc, tokens, range, read_ast.row_lock_mode, read_ast.row_lock_wait_policy, allowed_targets);
     pos.* = range.end;
 
-    const claim = sqlRowClaimForClause(clause);
-    if (rowClaimModeForGeneratedMode(read_ast.row_lock_mode orelse return error.UnsupportedSqlShape) != claim.mode or
-        rowClaimWaitPolicyForGeneratedPolicy(read_ast.row_lock_wait_policy orelse return error.UnsupportedSqlShape) != claim.wait_policy)
+    const mode = rowClaimModeForGeneratedMode(read_ast.row_lock_mode orelse return error.UnsupportedSqlShape);
+    const wait_policy = rowClaimWaitPolicyForGeneratedPolicy(read_ast.row_lock_wait_policy orelse return error.UnsupportedSqlShape);
+    return .{
+        .mode = mode,
+        .wait_policy = wait_policy,
+        .skip_locked = wait_policy == .skip_locked,
+    };
+}
+
+const ParsedGeneratedRowLockMode = struct {
+    mode: generated_parser.GeneratedSqlRowLockMode,
+    end: usize,
+};
+
+fn parseGeneratedRowLockMode(tokens: []const Token, index: usize, end: usize) !ParsedGeneratedRowLockMode {
+    if (index >= end) return error.UnsupportedSqlShape;
+    if (tokens[index].matchesKeywordTag(.update)) return .{ .mode = .update, .end = index + 1 };
+    if (tokens[index].matchesKeywordTag(.share)) return .{ .mode = .share, .end = index + 1 };
+    if (index + 2 < end and
+        tokens[index].matchesKeywordTag(.no) and
+        tokens[index + 1].matchesKeywordTag(.key) and
+        tokens[index + 2].matchesKeywordTag(.update))
     {
-        return error.UnsupportedSqlShape;
+        return .{ .mode = .no_key_update, .end = index + 3 };
     }
-    return claim;
+    if (index + 1 < end and
+        tokens[index].matchesKeywordTag(.key) and
+        tokens[index + 1].matchesKeywordTag(.share))
+    {
+        return .{ .mode = .key_share, .end = index + 2 };
+    }
+    return error.UnsupportedSqlShape;
+}
+
+fn generatedRowLockWaitPolicyStartsAt(tokens: []const Token, index: usize, end: usize) bool {
+    if (index >= end) return false;
+    if (tokens[index].matchesKeywordTag(.nowait)) return true;
+    return index + 1 < end and tokens[index].matchesKeywordTag(.skip) and tokens[index + 1].matchesKeywordTag(.locked);
+}
+
+const ParsedGeneratedRowLockWaitPolicy = struct {
+    wait_policy: generated_parser.GeneratedSqlRowLockWaitPolicy,
+    end: usize,
+};
+
+fn parseGeneratedRowLockWaitPolicy(tokens: []const Token, index: usize, end: usize) !ParsedGeneratedRowLockWaitPolicy {
+    if (index >= end) return .{ .wait_policy = .wait, .end = index };
+    if (tokens[index].matchesKeywordTag(.nowait)) return .{ .wait_policy = .nowait, .end = index + 1 };
+    if (index + 1 < end and tokens[index].matchesKeywordTag(.skip) and tokens[index + 1].matchesKeywordTag(.locked)) {
+        return .{ .wait_policy = .skip_locked, .end = index + 2 };
+    }
+    return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedReadRowLockClauseAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    lock_tokens: generated_parser.GeneratedSqlTokenRange,
+    expected_mode: ?generated_parser.GeneratedSqlRowLockMode,
+    expected_wait_policy: ?generated_parser.GeneratedSqlRowLockWaitPolicy,
+    allowed_targets: []const []const u8,
+) !void {
+    if (lock_tokens.start >= lock_tokens.end or lock_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    if (!tokens[lock_tokens.start].matchesKeywordTag(.@"for")) return error.UnsupportedSqlShape;
+    const mode = try parseGeneratedRowLockMode(tokens, lock_tokens.start + 1, lock_tokens.end);
+    if (mode.mode != (expected_mode orelse return error.UnsupportedSqlShape)) return error.UnsupportedSqlShape;
+    var cursor = mode.end;
+
+    if (cursor < lock_tokens.end and tokens[cursor].matchesKeywordTag(.of)) {
+        cursor += 1;
+        var saw_target = false;
+        var expect_target = true;
+        while (cursor < lock_tokens.end and !generatedRowLockWaitPolicyStartsAt(tokens, cursor, lock_tokens.end)) {
+            if (!expect_target) {
+                if (tokens[cursor].kind != .comma) return error.UnsupportedSqlShape;
+                expect_target = true;
+                cursor += 1;
+                continue;
+            }
+            if (tokens[cursor].matchesKeywordTag(.only)) cursor += 1;
+            if (cursor >= lock_tokens.end or
+                generatedRowLockWaitPolicyStartsAt(tokens, cursor, lock_tokens.end) or
+                tokens[cursor].kind != .identifier)
+            {
+                return error.UnsupportedSqlShape;
+            }
+            if (!grammar.rowClaimTargetAllowed(alloc, tokens[cursor].text, allowed_targets)) return error.UnsupportedSqlShape;
+            saw_target = true;
+            expect_target = false;
+            cursor += 1;
+        }
+        if (!saw_target or expect_target) return error.UnsupportedSqlShape;
+    }
+
+    const wait_policy = try parseGeneratedRowLockWaitPolicy(tokens, cursor, lock_tokens.end);
+    if (wait_policy.wait_policy != (expected_wait_policy orelse return error.UnsupportedSqlShape)) return error.UnsupportedSqlShape;
+    if (wait_policy.end != lock_tokens.end) return error.UnsupportedSqlShape;
 }
 
 pub fn sqlRowClaimModeName(mode: db_mod.types.RowClaimMode) []const u8 {

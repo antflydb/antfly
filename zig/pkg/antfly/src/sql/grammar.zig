@@ -1712,7 +1712,7 @@ pub fn parseDropRowSecurityPolicyCatalogTailAlloc(
     return .{ .policy_name = policy_name, .table_name = table_name, .if_exists = if_exists };
 }
 
-fn parseRowSecurityPolicyPredicateAlloc(
+pub fn parseRowSecurityPolicyPredicateAlloc(
     alloc: std.mem.Allocator,
     cursor: parser.Cursor,
     tokens: []const Token,
@@ -3085,7 +3085,7 @@ pub fn parseCreateRoutineCatalogTailAlloc(
     return out;
 }
 
-fn parseRoutineBodyPlanAlloc(
+pub fn parseRoutineBodyPlanAlloc(
     alloc: std.mem.Allocator,
     kind: RoutineKindSyntax,
     language: ?[]const u8,
@@ -4305,8 +4305,14 @@ pub fn parseCreateIndexHeaderAlloc(
     pos: *usize,
 ) !CreateIndexHeaderSyntax {
     const cursor = parser.Cursor.init(tokens, pos);
-    try cursor.expectKeyword("index");
-    _ = cursor.matchKeyword("concurrently");
+    var method: ddl_plan.DdlIndexMethod = .btree;
+    if (cursor.matchKeyword("text")) {
+        try cursor.expectKeyword("search");
+        method = .antfly_full_text;
+    } else {
+        try cursor.expectKeyword("index");
+        _ = cursor.matchKeyword("concurrently");
+    }
     const if_not_exists = try parseOptionalIfNotExists(cursor);
 
     const index_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
@@ -4317,8 +4323,8 @@ pub fn parseCreateIndexHeaderAlloc(
     var table_transferred = false;
     errdefer if (!table_transferred) alloc.free(table_name);
 
-    var method: ddl_plan.DdlIndexMethod = .btree;
     if (cursor.matchKeyword("using")) {
+        if (method != .btree) return error.UnsupportedSqlShape;
         const method_token = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
         if (std.ascii.eqlIgnoreCase(method_token.text, "btree")) {
             method = .btree;
@@ -5244,39 +5250,11 @@ pub fn parseOptionalDdlScalarSubqueryDefaultAlloc(
     tokens: []const Token,
     pos: *usize,
 ) !?runtime_schema.RelationalDefaultValue {
+    _ = alloc;
     if (pos.* + 2 >= tokens.len or tokens[pos.*].kind != .lparen or !tokens[pos.* + 1].matchesKeywordTag(.select)) return null;
     const close_index = findMatchingParen(tokens, pos.*, tokens.len) orelse return error.UnsupportedSqlShape;
     if (close_index <= pos.* + 1) return error.UnsupportedSqlShape;
-
-    const value_json = try ddlScalarSubqueryDefaultPayloadJsonAlloc(alloc, tokens[pos.* + 1 .. close_index]);
-    pos.* = close_index + 1;
-    return .{
-        .kind = .scalar_subquery,
-        .value_json = value_json,
-    };
-}
-
-fn ddlScalarSubqueryDefaultPayloadJsonAlloc(
-    alloc: std.mem.Allocator,
-    query_tokens: []const Token,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    const writer = &out.writer;
-    try writer.writeAll("{\"query\":{\"kind\":\"tokenized_sql\",\"tokens\":[");
-    for (query_tokens, 0..) |token, index| {
-        if (index != 0) try writer.writeByte(',');
-        try writer.print("{{\"kind\":{f},\"text\":{f}", .{
-            std.json.fmt(@tagName(token.kind), .{}),
-            std.json.fmt(token.text, .{}),
-        });
-        if (token.keyword) |keyword| {
-            try writer.print(",\"keyword\":{f}", .{std.json.fmt(@tagName(keyword), .{})});
-        }
-        try writer.writeByte('}');
-    }
-    try writer.writeAll("]}}");
-    return try out.toOwnedSlice();
+    return error.UnsupportedSqlShape;
 }
 
 pub fn ddlDefaultValueFromKnownSyntaxAlloc(
@@ -7567,6 +7545,15 @@ pub fn normalizeSqlObjectIdentifierAlloc(alloc: std.mem.Allocator, identifier: [
     return try alloc.dupe(u8, object_name);
 }
 
+pub fn normalizeSqlSchemaIdentifierAlloc(alloc: std.mem.Allocator, identifier: []const u8) ![]const u8 {
+    if (identifier.len == 0) return error.UnsupportedSqlShape;
+    const dot = std.mem.indexOfScalar(u8, identifier, '.') orelse return try alloc.dupe(u8, identifier);
+    if (dot == 0) return error.UnsupportedSqlShape;
+    const schema_name = identifier[dot + 1 ..];
+    if (schema_name.len == 0 or std.mem.indexOfScalar(u8, schema_name, '.') != null) return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, identifier);
+}
+
 pub fn parseIdentifierOwnedAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -8691,7 +8678,7 @@ fn adapterNoopSetSessionSettingAllowed(setting: []const u8) bool {
         std.ascii.eqlIgnoreCase(setting, "client_min_messages");
 }
 
-fn sessionSettingKindForName(setting: []const u8) ?ddl_plan.SessionSettingKind {
+pub fn sessionSettingKindForName(setting: []const u8) ?ddl_plan.SessionSettingKind {
     if (std.mem.startsWith(u8, setting, "app.") and setting.len > "app.".len) return .app;
     if (std.ascii.eqlIgnoreCase(setting, "antfly.sync_level")) return .antfly;
     if (std.ascii.eqlIgnoreCase(setting, "statement_timeout") or
@@ -8704,7 +8691,7 @@ fn sessionSettingKindForName(setting: []const u8) ?ddl_plan.SessionSettingKind {
     return null;
 }
 
-fn validateSetSessionSettingValue(setting: []const u8, kind: ddl_plan.SessionSettingKind, value: []const u8) !void {
+pub fn validateSetSessionSettingValue(setting: []const u8, kind: ddl_plan.SessionSettingKind, value: []const u8) !void {
     switch (kind) {
         .app => {
             if (value.len == 0) return error.UnsupportedSqlShape;
@@ -8717,7 +8704,7 @@ fn validateSetSessionSettingValue(setting: []const u8, kind: ddl_plan.SessionSet
     }
 }
 
-fn sqlSessionNamespaceNameValid(name: []const u8) bool {
+pub fn sqlSessionNamespaceNameValid(name: []const u8) bool {
     if (name.len == 0) return false;
     const first = name[0];
     if (!(std.ascii.isAlphabetic(first) or first == '_')) return false;
@@ -10859,6 +10846,15 @@ test "sql adapter grammar parses ddl known defaults" {
     defer lexer.freeTokens(alloc, &malformed_uuid_tokens);
     var malformed_uuid_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseOptionalDdlKnownDefault(malformed_uuid_tokens.items, &malformed_uuid_pos));
+
+    var scalar_subquery_tokens = try lexer.tokenizeAlloc(alloc, "(SELECT status FROM usage_records LIMIT 1)");
+    defer lexer.freeTokens(alloc, &scalar_subquery_tokens);
+    var scalar_subquery_pos: usize = 0;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        parseDdlDefaultValueUntypedAlloc(alloc, scalar_subquery_tokens.items, &scalar_subquery_pos),
+    );
+    try std.testing.expectEqual(@as(usize, 0), scalar_subquery_pos);
 }
 
 test "sql adapter grammar parses ddl type names" {
@@ -13035,6 +13031,26 @@ test "sql adapter grammar normalizes public object identifiers" {
     try std.testing.expectError(error.UnsupportedSqlShape, normalizeSqlObjectIdentifierAlloc(alloc, ".usage_records"));
     try std.testing.expectError(error.UnsupportedSqlShape, normalizeSqlObjectIdentifierAlloc(alloc, "public."));
     try std.testing.expectError(error.UnsupportedSqlShape, normalizeSqlObjectIdentifierAlloc(alloc, "public.analytics.usage_records"));
+}
+
+test "sql adapter grammar preserves database-qualified schema identifiers" {
+    const alloc = std.testing.allocator;
+
+    const bare = try normalizeSqlSchemaIdentifierAlloc(alloc, "analytics");
+    defer alloc.free(bare);
+    try std.testing.expectEqualStrings("analytics", bare);
+
+    const qualified = try normalizeSqlSchemaIdentifierAlloc(alloc, "tenant_ops.analytics");
+    defer alloc.free(qualified);
+    try std.testing.expectEqualStrings("tenant_ops.analytics", qualified);
+
+    const public_qualified = try normalizeSqlSchemaIdentifierAlloc(alloc, "public.analytics");
+    defer alloc.free(public_qualified);
+    try std.testing.expectEqualStrings("public.analytics", public_qualified);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, normalizeSqlSchemaIdentifierAlloc(alloc, ".analytics"));
+    try std.testing.expectError(error.UnsupportedSqlShape, normalizeSqlSchemaIdentifierAlloc(alloc, "tenant_ops."));
+    try std.testing.expectError(error.UnsupportedSqlShape, normalizeSqlSchemaIdentifierAlloc(alloc, "tenant_ops.analytics.events"));
 }
 
 test "sql adapter grammar peeks joined mutation and assignment syntax" {
