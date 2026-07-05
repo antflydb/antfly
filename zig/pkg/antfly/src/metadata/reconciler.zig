@@ -413,8 +413,7 @@ pub const Reconciler = struct {
                     draining.serving_state = .draining;
                     const watermark = relocationWatermarkForGroup(current, intent.record.group_id);
                     if (draining.relocation_generation == 0) draining.relocation_generation = intent.record.metadata_version + 1;
-                    if (draining.relocation_doc_count_watermark < watermark.doc_count) draining.relocation_doc_count_watermark = watermark.doc_count;
-                    if (draining.relocation_disk_bytes_watermark < watermark.disk_bytes) draining.relocation_disk_bytes_watermark = watermark.disk_bytes;
+                    applyRelocationWatermark(&draining, watermark);
                     if (!placementIntentsEqual(intent, draining)) {
                         try placement_upserts.append(self.alloc, try clonePlacementIntent(self.alloc, draining));
                     }
@@ -813,8 +812,7 @@ fn effectivePlacementIntent(
     }
 
     const watermark = relocationWatermarkForGroup(current, effective.record.group_id);
-    if (effective.relocation_doc_count_watermark < watermark.doc_count) effective.relocation_doc_count_watermark = watermark.doc_count;
-    if (effective.relocation_disk_bytes_watermark < watermark.disk_bytes) effective.relocation_disk_bytes_watermark = watermark.disk_bytes;
+    applyRelocationWatermark(&effective, watermark);
 
     if (existing) |current_intent| {
         effective.relocation_generation = current_intent.relocation_generation;
@@ -827,6 +825,7 @@ fn effectivePlacementIntent(
         if (current_intent.relocation_disk_bytes_watermark > effective.relocation_disk_bytes_watermark) effective.relocation_disk_bytes_watermark = current_intent.relocation_disk_bytes_watermark;
         effective.relocation_target_sequence = current_intent.relocation_target_sequence;
         effective.relocation_applied_sequence = current_intent.relocation_applied_sequence;
+        applyRelocationWatermark(&effective, watermark);
 
         effective.serving_state = switch (current_intent.serving_state) {
             .serving => .serving,
@@ -852,19 +851,22 @@ const RelocationWatermark = struct {
     doc_count: u64 = 0,
     disk_bytes: u64 = 0,
     generation_hint: u64 = 1,
+    has_visible_data: bool = false,
 };
 
 fn relocationWatermarkForGroup(current: CurrentMetadataState, group_id: u64) RelocationWatermark {
     var watermark: RelocationWatermark = .{};
     for (current.placement_intents) |intent| {
         if (intent.record.group_id != group_id) continue;
+        if (intent.relocation_doc_count_watermark > 0) watermark.has_visible_data = true;
         if (intent.relocation_doc_count_watermark > watermark.doc_count) watermark.doc_count = intent.relocation_doc_count_watermark;
-        if (intent.relocation_disk_bytes_watermark > watermark.disk_bytes) watermark.disk_bytes = intent.relocation_disk_bytes_watermark;
+        if (intent.relocation_doc_count_watermark > 0 and intent.relocation_disk_bytes_watermark > watermark.disk_bytes) watermark.disk_bytes = intent.relocation_disk_bytes_watermark;
         if (intent.relocation_generation >= watermark.generation_hint) watermark.generation_hint = intent.relocation_generation + 1;
     }
     if (mergedGroupStatus(current, group_id)) |status| {
+        if (groupStatusHasVisibleData(status.doc_count, status.empty)) watermark.has_visible_data = true;
         if (status.doc_count > watermark.doc_count) watermark.doc_count = status.doc_count;
-        if (status.disk_bytes > watermark.disk_bytes) watermark.disk_bytes = status.disk_bytes;
+        if (groupStatusHasVisibleData(status.doc_count, status.empty) and status.disk_bytes > watermark.disk_bytes) watermark.disk_bytes = status.disk_bytes;
         if (status.updated_at_millis >= watermark.generation_hint) watermark.generation_hint = status.updated_at_millis + 1;
     }
     for (current.stores) |store| {
@@ -872,17 +874,33 @@ fn relocationWatermarkForGroup(current: CurrentMetadataState, group_id: u64) Rel
         if (!storeHasPlacement(current.placement_intents, group_id, store.node_id)) continue;
         for (store.group_statuses) |status| {
             if (status.group_id != group_id) continue;
+            if (groupStatusHasVisibleData(status.doc_count, status.empty)) watermark.has_visible_data = true;
             if (status.doc_count > watermark.doc_count) watermark.doc_count = status.doc_count;
-            if (status.disk_bytes > watermark.disk_bytes) watermark.disk_bytes = status.disk_bytes;
+            if (groupStatusHasVisibleData(status.doc_count, status.empty) and status.disk_bytes > watermark.disk_bytes) watermark.disk_bytes = status.disk_bytes;
             if (status.updated_at_millis >= watermark.generation_hint) watermark.generation_hint = status.updated_at_millis + 1;
         }
         for (store.runtime_statuses) |status| {
             if (status.group_id != group_id) continue;
+            if (status.doc_count > 0) watermark.has_visible_data = true;
             if (status.doc_count > watermark.doc_count) watermark.doc_count = status.doc_count;
-            if (status.disk_bytes > watermark.disk_bytes) watermark.disk_bytes = status.disk_bytes;
+            if (status.doc_count > 0 and status.disk_bytes > watermark.disk_bytes) watermark.disk_bytes = status.disk_bytes;
         }
     }
     return watermark;
+}
+
+fn applyRelocationWatermark(intent: *raft_reconciler.PlacementIntent, watermark: RelocationWatermark) void {
+    if (!watermark.has_visible_data) {
+        intent.relocation_doc_count_watermark = 0;
+        intent.relocation_disk_bytes_watermark = 0;
+        return;
+    }
+    if (intent.relocation_doc_count_watermark < watermark.doc_count) intent.relocation_doc_count_watermark = watermark.doc_count;
+    if (intent.relocation_disk_bytes_watermark < watermark.disk_bytes) intent.relocation_disk_bytes_watermark = watermark.disk_bytes;
+}
+
+fn groupStatusHasVisibleData(doc_count: u64, empty: bool) bool {
+    return doc_count > 0 or !empty;
 }
 
 fn relocationTargetServingState(
@@ -938,20 +956,35 @@ fn placementSafeToRemove(
     const desired_count = countPlacementIntents(desired_placements, source.record.group_id);
     if (desired_count == 0) return true;
     const data_bearing_group = groupHasVisibleData(current, source.record.group_id);
-    if (!data_bearing_group) return true;
+    if (!data_bearing_group) return emptyGroupSourceSafeToRemove(current, desired_placements, source);
     const watermark = relocationWatermarkForGroup(current, source.record.group_id);
+    var saw_replacement = false;
     for (desired_placements) |desired| {
         if (desired.record.group_id != source.record.group_id) continue;
         if (desired.record.local_node_id == source.record.local_node_id) continue;
+        if (!placementIsReplacementForSource(desired, source)) continue;
+        saw_replacement = true;
         const current_target = findPlacementIntent(current.placement_intents, desired.record.group_id, desired.record.local_node_id) orelse return false;
         if (current_target.serving_state != .serving) return false;
-        if (!placementIsReplacementForSource(current_target, source)) continue;
         var target = current_target;
-        if (target.relocation_doc_count_watermark < watermark.doc_count) target.relocation_doc_count_watermark = watermark.doc_count;
-        if (target.relocation_disk_bytes_watermark < watermark.disk_bytes) target.relocation_disk_bytes_watermark = watermark.disk_bytes;
+        applyRelocationWatermark(&target, watermark);
         if (!relocationTargetReady(current, target)) return false;
     }
-    return true;
+    return saw_replacement;
+}
+
+fn emptyGroupSourceSafeToRemove(
+    current: CurrentMetadataState,
+    desired_placements: []const raft_reconciler.PlacementIntent,
+    source: raft_reconciler.PlacementIntent,
+) bool {
+    for (desired_placements) |desired| {
+        if (desired.record.group_id != source.record.group_id) continue;
+        if (desired.record.local_node_id == source.record.local_node_id) continue;
+        const current_target = findPlacementIntent(current.placement_intents, desired.record.group_id, desired.record.local_node_id) orelse continue;
+        if (current_target.serving_state == .serving) return true;
+    }
+    return false;
 }
 
 fn placementIsReplacementForSource(
@@ -965,16 +998,16 @@ fn placementIsReplacementForSource(
 
 fn groupHasVisibleData(current: CurrentMetadataState, group_id: u64) bool {
     if (mergedGroupStatus(current, group_id)) |status| {
-        if (!status.empty or status.doc_count > 0 or status.disk_bytes > 1024) return true;
+        if (groupStatusHasVisibleData(status.doc_count, status.empty)) return true;
     }
     for (current.stores) |store| {
         for (store.group_statuses) |status| {
             if (status.group_id != group_id) continue;
-            if (!status.empty or status.doc_count > 0 or status.disk_bytes > 1024) return true;
+            if (groupStatusHasVisibleData(status.doc_count, status.empty)) return true;
         }
         for (store.runtime_statuses) |status| {
             if (status.group_id != group_id) continue;
-            if (status.doc_count > 0 or status.disk_bytes > 1024) return true;
+            if (status.doc_count > 0) return true;
         }
     }
     return false;
@@ -1140,7 +1173,7 @@ fn mergeRuntimeGroupFacts(
                 runtimeDocIdentityHasFacts(status.doc_identity);
             if (status.doc_count > merged.doc_count) merged.doc_count = status.doc_count;
             if (status.disk_bytes > merged.disk_bytes) merged.disk_bytes = status.disk_bytes;
-            if (status.doc_count > 0 or status.disk_bytes > 0) merged.empty = false;
+            if (status.doc_count > 0) merged.empty = false;
             const updated_at_millis = @divTrunc(status.updated_at_ns, std.time.ns_per_ms);
             if (updated_at_millis > merged.updated_at_millis) merged.updated_at_millis = updated_at_millis;
             mergeRuntimeDocIdentity(&merged, status.doc_identity);
@@ -2468,6 +2501,109 @@ test "metadata reconciler removes relocation source only after target is durably
     try std.testing.expect(findPlacementIntent(plan.placement_upserts, 2211, 1) == null);
 }
 
+test "metadata reconciler does not gate empty relocation on storage overhead bytes" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 223, .name = "docs", .desired_replica_count = 1 });
+    try manager.upsertRange(.{ .group_id = 2231, .table_id = 223, .start_key = "", .end_key = null });
+
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{
+            .record = .{
+                .group_id = 2231,
+                .replica_id = 1,
+                .local_node_id = 1,
+            },
+            .store_id = 11,
+            .peer_node_ids = &.{ 1, 2 },
+            .serving_state = .draining,
+            .relocation_disk_bytes_watermark = 2190,
+        },
+        .{
+            .record = .{
+                .group_id = 2231,
+                .replica_id = 1,
+                .local_node_id = 2,
+                .bootstrap_mode = .persisted,
+            },
+            .store_id = 22,
+            .peer_node_ids = &.{ 1, 2 },
+            .serving_state = .replaying,
+            .relocation_source_node_id = 1,
+            .relocation_source_store_id = 11,
+            .relocation_disk_bytes_watermark = 2190,
+        },
+    };
+    const empty_group_status = table_manager.GroupStatusReport{
+        .group_id = 2231,
+        .doc_count = 0,
+        .disk_bytes = 0,
+        .empty = true,
+        .local_voter = true,
+        .voter_count = 1,
+    };
+    const stores = [_]table_manager.StoreRecord{
+        .{
+            .store_id = 11,
+            .node_id = 1,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{empty_group_status})[0..]),
+            .runtime_statuses = @constCast((&[_]table_manager.RuntimeGroupStatusReport{.{
+                .table_id = 223,
+                .group_id = 2231,
+                .store_id = 11,
+                .node_id = 1,
+                .doc_count = 0,
+                .disk_bytes = 2190,
+            }})[0..]),
+        },
+        .{
+            .store_id = 22,
+            .node_id = 2,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{empty_group_status})[0..]),
+            .runtime_statuses = @constCast((&[_]table_manager.RuntimeGroupStatusReport{.{
+                .table_id = 223,
+                .group_id = 2231,
+                .store_id = 22,
+                .node_id = 2,
+                .doc_count = 0,
+                .disk_bytes = 2190,
+            }})[0..]),
+        },
+    };
+    const candidates = [_]@import("state.zig").CandidatePlacementInfo{.{
+        .node_id = 2,
+        .store_id = 22,
+        .role = "data",
+        .failure_domain = "rack-b",
+        .retain_current = true,
+    }};
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var plan = try reconciler.computePlan(&manager, &.{2}, &candidates, .{
+        .placement_intents = &current,
+        .stores = &stores,
+        .reallocate_requested = true,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), plan.placement_removals.len);
+    const target = findPlacementIntent(plan.placement_upserts, 2231, 2) orelse return error.MissingRelocationTarget;
+    try std.testing.expectEqual(raft_reconciler.PlacementServingState.serving, target.serving_state);
+    try std.testing.expectEqual(@as(u64, 0), target.relocation_doc_count_watermark);
+    try std.testing.expectEqual(@as(u64, 0), target.relocation_disk_bytes_watermark);
+    const source = findPlacementIntent(plan.placement_upserts, 2231, 1) orelse return error.MissingDrainingSource;
+    try std.testing.expectEqual(raft_reconciler.PlacementServingState.draining, source.serving_state);
+    try std.testing.expectEqual(@as(u64, 0), source.relocation_doc_count_watermark);
+    try std.testing.expectEqual(@as(u64, 0), source.relocation_disk_bytes_watermark);
+}
+
 test "metadata reconciler does not require preserved peers to report relocation cutover" {
     var manager = table_manager.TableManager.init(std.testing.allocator);
     defer manager.deinit();
@@ -2594,6 +2730,137 @@ test "metadata reconciler does not require preserved peers to report relocation 
     try std.testing.expectEqual(@as(usize, 1), plan.placement_removals.len);
     try std.testing.expectEqual(@as(u64, 2221), plan.placement_removals[0].group_id);
     try std.testing.expectEqual(@as(u64, 1), plan.placement_removals[0].local_node_id);
+}
+
+test "metadata reconciler ignores unrelated relocation targets when removing a drained source" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 224, .name = "docs", .desired_replica_count = 3 });
+    try manager.upsertRange(.{ .group_id = 2241, .table_id = 224, .start_key = "", .end_key = null });
+
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{
+            .record = .{ .group_id = 2241, .replica_id = 1, .local_node_id = 101 },
+            .store_id = 101,
+            .peer_node_ids = &.{ 102, 103, 104 },
+            .serving_state = .draining,
+            .relocation_doc_count_watermark = 3,
+            .relocation_disk_bytes_watermark = 2048,
+        },
+        .{
+            .record = .{ .group_id = 2241, .replica_id = 2, .local_node_id = 102 },
+            .store_id = 102,
+            .peer_node_ids = &.{ 102, 103, 104 },
+            .serving_state = .serving,
+        },
+        .{
+            .record = .{ .group_id = 2241, .replica_id = 3, .local_node_id = 103 },
+            .store_id = 103,
+            .peer_node_ids = &.{ 102, 103, 104 },
+            .serving_state = .serving,
+            .relocation_source_node_id = 101,
+            .relocation_source_store_id = 101,
+            .relocation_doc_count_watermark = 3,
+            .relocation_disk_bytes_watermark = 2048,
+        },
+        .{
+            .record = .{ .group_id = 2241, .replica_id = 1, .local_node_id = 104 },
+            .store_id = 104,
+            .peer_node_ids = &.{ 102, 103, 104 },
+            .serving_state = .replaying,
+            .relocation_source_node_id = 102,
+            .relocation_source_store_id = 102,
+            .relocation_doc_count_watermark = 3,
+            .relocation_disk_bytes_watermark = 2048,
+        },
+    };
+    const stores = [_]table_manager.StoreRecord{
+        .{
+            .store_id = 101,
+            .node_id = 101,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2241,
+                .doc_count = 3,
+                .disk_bytes = 2048,
+                .empty = false,
+                .local_voter = true,
+                .voter_count = 3,
+            }})[0..]),
+        },
+        .{
+            .store_id = 102,
+            .node_id = 102,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2241,
+                .doc_count = 3,
+                .disk_bytes = 2048,
+                .empty = false,
+                .local_voter = true,
+                .voter_count = 3,
+            }})[0..]),
+        },
+        .{
+            .store_id = 103,
+            .node_id = 103,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2241,
+                .doc_count = 3,
+                .disk_bytes = 2048,
+                .empty = false,
+                .local_leader = true,
+                .local_voter = true,
+                .voter_count = 3,
+                .replay_required = false,
+                .replay_caught_up = true,
+                .cutover_ready = true,
+                .reads_ready_after_cutover = true,
+            }})[0..]),
+        },
+        .{
+            .store_id = 104,
+            .node_id = 104,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2241,
+                .doc_count = 3,
+                .disk_bytes = 2048,
+                .empty = false,
+                .local_voter = true,
+                .voter_count = 3,
+                .replay_required = true,
+                .replay_caught_up = false,
+            }})[0..]),
+        },
+    };
+    const candidates = [_]@import("state.zig").CandidatePlacementInfo{
+        .{ .node_id = 102, .store_id = 102, .role = "data", .failure_domain = "rack-b", .retain_current = true },
+        .{ .node_id = 103, .store_id = 103, .role = "data", .failure_domain = "rack-c", .retain_current = true },
+        .{ .node_id = 104, .store_id = 104, .role = "data", .failure_domain = "rack-d", .retain_current = true },
+    };
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var plan = try reconciler.computePlan(&manager, &.{ 102, 103, 104 }, &candidates, .{
+        .placement_intents = &current,
+        .stores = &stores,
+        .reallocate_requested = true,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), plan.placement_removals.len);
+    try std.testing.expectEqual(@as(u64, 2241), plan.placement_removals[0].group_id);
+    try std.testing.expectEqual(@as(u64, 101), plan.placement_removals[0].local_node_id);
 }
 
 test "metadata reconciler finalizes schema migration once every hosting node reports target schema progress" {
