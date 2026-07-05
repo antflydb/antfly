@@ -7272,7 +7272,15 @@ pub const DB = struct {
             .degraded, .repair_required => return true,
             .clean, .rebuilding => {},
         }
+        if (try self.denseCoverageRegressionRepairRequired(alloc, index_name)) return true;
         return try self.artifactRepairSummaryIndexCount(alloc, index_name) != 0;
+    }
+
+    fn denseCoverageRegressionRepairRequired(self: *DB, alloc: Allocator, index_name: []const u8) !bool {
+        const entry = self.core.index_manager.denseIndex(index_name) orelse return false;
+        const status_snapshot = (try self.loadIndexStatusSnapshot(alloc, index_name)) orelse return false;
+        if (status_snapshot.kind != .dense_vector) return false;
+        return status_snapshot.doc_count > entry.index.stats().active_count;
     }
 
     pub fn repairArtifactIssues(

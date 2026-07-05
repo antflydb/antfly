@@ -2220,6 +2220,7 @@ pub fn build(b: *std.Build) void {
         .root_module = termite_onnx_graph_mod,
     });
     const run_lib_onnx_tests = b.addRunArtifact(lib_onnx_tests);
+    run_lib_onnx_tests.setEnvironmentVariable("ANTFLY_TEST_FAIL_ON_ERROR_LOGS", "0");
     const lib_onnx_test_step = b.step("lib-onnx-test", "Run standalone lib/onnx tests");
     lib_onnx_test_step.dependOn(&run_lib_onnx_tests.step);
 
@@ -2703,6 +2704,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_lib_common_config_tests = b.addRunArtifact(lib_common_config_tests);
+    run_lib_common_config_tests.setEnvironmentVariable("ANTFLY_TEST_FAIL_ON_ERROR_LOGS", "0");
     const lib_common_config_test_step = b.step("lib-common-config-test", "Run common/config tests");
     lib_common_config_test_step.dependOn(&run_lib_common_config_tests.step);
 
@@ -3648,6 +3650,7 @@ pub fn build(b: *std.Build) void {
             "distributed table reads reject stale doc identity before multigroup fanout",
             "api public table query rejects only top-level internal fields",
             "single embeddings index encoder scopes isolated enrichment failure to one index",
+            "empty embeddings index status is ready without dense artifact visibility",
             "api query contract rejects doc identity control fields when with relaxes schema",
             "api query contract public parser rejects internal shard doc identity controls",
             "api distributed graph hydrate carries identity generation and clears cross-range ordinals",

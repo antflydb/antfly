@@ -35,24 +35,19 @@ pub fn chainLabeledRun(
     return &run.step;
 }
 
-fn singleTestFilter(b: *std.Build, filter: []const u8) []const []const u8 {
-    const filters = b.allocator.alloc([]const u8, 1) catch @panic("OOM");
-    filters[0] = filter;
-    return filters;
-}
-
-fn chainLabeledFilteredTest(
+fn chainLabeledFilteredRun(
     b: *std.Build,
-    root_module: *std.Build.Module,
+    artifact: *std.Build.Step.Compile,
     phase: []const u8,
     filter: []const u8,
     previous: ?*std.Build.Step,
 ) *std.Build.Step {
-    const tests = b.addTest(.{
-        .root_module = root_module,
-        .filters = singleTestFilter(b, filter),
-    });
-    return chainLabeledRun(b, tests, b.fmt("{s}: {s}", .{ phase, filter }), previous);
+    const banner = addProgressBanner(b, b.fmt("{s}: {s}", .{ phase, filter }));
+    if (previous) |step| banner.step.dependOn(step);
+    const run = b.addRunArtifact(artifact);
+    run.addArgs(&.{ "--test-filter", filter });
+    run.step.dependOn(&banner.step);
+    return &run.step;
 }
 
 pub fn chainLabeledFilteredTests(
@@ -62,9 +57,17 @@ pub fn chainLabeledFilteredTests(
     filters: []const []const u8,
     previous: ?*std.Build.Step,
 ) *std.Build.Step {
+    const tests = b.addTest(.{
+        .root_module = root_module,
+        .filters = filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
     var tail = previous;
     for (filters) |filter| {
-        tail = chainLabeledFilteredTest(b, root_module, phase, filter, tail);
+        tail = chainLabeledFilteredRun(b, tests, phase, filter, tail);
     }
     return tail.?;
 }

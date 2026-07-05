@@ -1230,7 +1230,7 @@ fn normalizeReadyEmbeddingsAggregate(aggregate: *AggregatedIndexStatus) void {
     const enrichment_blocked = aggregate.enrichment.enabled and (aggregate.enrichment.retrying or aggregate.enrichment.worker_failed);
     if (enrichment_blocked) return;
     if (aggregate.catch_up_active or aggregate.catch_up_target_sequence > aggregate.catch_up_applied_sequence) return;
-    if (!embeddingsArtifactVisible(aggregate.*, kind == .sparse_vector)) return;
+    if (!embeddingsArtifactPublishComplete(aggregate.*, kind == .sparse_vector, aggregate.table_doc_count)) return;
     if (aggregate.table_doc_count > 0 and aggregate.doc_count < aggregate.table_doc_count) return;
 
     aggregate.replay_applied_sequence = @max(aggregate.replay_applied_sequence, aggregate.replay_target_sequence);
@@ -1449,7 +1449,7 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, require_table_cove
         stats.enabled and (stats.worker_failed or stats.retrying or stats.applied_sequence < stats.target_sequence)
     else
         false;
-    const artifact_visible = embeddingsArtifactVisible(item, sparse);
+    const artifact_visible = embeddingsArtifactPublishComplete(item, sparse, table_doc_count);
     if (replay_ready and !artifact_visible and view.replay_target_sequence > 0) {
         view.backfill_active = true;
         view.backfill_progress = 0.0;
@@ -1486,6 +1486,11 @@ fn aggregateRuntimeCoverageIncomplete(item: anytype) bool {
 fn embeddingsArtifactVisible(item: anytype, sparse: bool) bool {
     if (sparse) return item.doc_count > 0;
     return item.doc_count > 0 and (item.node_count > 0 or item.root_node > 0);
+}
+
+fn embeddingsArtifactPublishComplete(item: anytype, sparse: bool, table_doc_count: u64) bool {
+    if (table_doc_count == 0 and item.doc_count == 0) return true;
+    return embeddingsArtifactVisible(item, sparse);
 }
 
 fn backfillState(index_type: ApiIndexType, active: bool, enrichment_failed: bool, replay_applied_sequence: u64, replay_target_sequence: u64, enrichment: ?db_mod.types.EnrichmentStats) []const u8 {
@@ -1702,7 +1707,7 @@ fn appendSingleIndexRuntimeStatus(
     try out.appendSlice(alloc, ",\"node_count\":");
     try appendIntValue(alloc, out, item.node_count);
     if (index_type == .embeddings) {
-        const artifact_publish_pending = replay_target_sequence > 0 and !embeddingsArtifactVisible(item, embeddings_sparse);
+        const artifact_publish_pending = replay_target_sequence > 0 and !embeddingsArtifactPublishComplete(item, embeddings_sparse, table_doc_count);
         try out.appendSlice(alloc, ",\"query_visible_doc_count\":");
         try appendIntValue(alloc, out, item.doc_count);
         try out.appendSlice(alloc, ",\"published_doc_count\":");
@@ -4009,7 +4014,7 @@ test "embeddings index replay completion without artifact visibility is not read
             .freshness = .fresh,
         },
         .stats = .{
-            .doc_count = 0,
+            .doc_count = 12,
             .index_count = 1,
             .indexes = indexes,
         },
@@ -4040,6 +4045,69 @@ test "embeddings index replay completion without artifact visibility is not read
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":4000") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":4000") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":false") != null);
+}
+
+test "empty embeddings index status is ready without dense artifact visibility" {
+    const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
+    defer std.testing.allocator.free(indexes);
+    indexes[0] = .{
+        .name = try std.testing.allocator.dupe(u8, "semantic_idx"),
+        .kind = .dense_vector,
+        .doc_count = 0,
+        .node_count = 0,
+        .root_node = 0,
+        .replay_applied_sequence = 1,
+        .replay_target_sequence = 1,
+        .replay_catch_up_required = false,
+        .backfill_active = true,
+        .backfill_progress = 0.0,
+    };
+    defer std.testing.allocator.free(indexes[0].name);
+
+    const local_items = try std.testing.allocator.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+    defer std.testing.allocator.free(local_items);
+    local_items[0] = .{
+        .group_id = 7,
+        .metadata = .{
+            .source = .background_refresh,
+            .freshness = .fresh,
+        },
+        .stats = .{
+            .doc_count = 0,
+            .index_count = 1,
+            .indexes = indexes,
+            .enrichment = .{
+                .enabled = true,
+                .applied_sequence = 1,
+                .target_sequence = 1,
+            },
+        },
+    };
+    var local_status = runtime_status.LocalTableRuntimeStatuses{ .items = local_items };
+
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3}}",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "semantic_idx", &local_status)).?;
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"dense_publish_pending\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":1") != null);
 }
 
 test "single embeddings index encoder keeps partial backfill active while indexed docs lag table docs" {
