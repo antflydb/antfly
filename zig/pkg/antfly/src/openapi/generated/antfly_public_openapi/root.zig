@@ -32,6 +32,7 @@ pub const ArtifactRepairReason = types.ArtifactRepairReason;
 pub const RepairTarget = types.RepairTarget;
 pub const ArtifactRepairIssue = types.ArtifactRepairIssue;
 pub const ArtifactRepairIssueList = types.ArtifactRepairIssueList;
+pub const RepairIssueListRequest = types.RepairIssueListRequest;
 pub const RepairRunRequest = types.RepairRunRequest;
 pub const ArtifactRepairRunResult = types.ArtifactRepairRunResult;
 pub const ArtifactRepairRunResponse = types.ArtifactRepairRunResponse;

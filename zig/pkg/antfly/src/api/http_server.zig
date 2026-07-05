@@ -3975,10 +3975,17 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .POST) {
-            if (routes.Routes.matchTableArtifactRepairRun(uri_parts.path)) |repair_route| {
+            if (routes.Routes.matchTableArtifactRepair(uri_parts.path)) |repair_route| {
+                if (uri_parts.query.len != 0) return try textResponse(self.alloc, 400, "repair requests use json body");
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, repair_route.table_name);
                 defer self.alloc.free(table_name);
-                return try self.handlePublicRunTableRepair(table_name, uri_parts.query, req.body);
+                return try self.handlePublicListArtifactRepairIssues(table_name, req.body);
+            }
+            if (routes.Routes.matchTableArtifactRepairRun(uri_parts.path)) |repair_route| {
+                if (uri_parts.query.len != 0) return try textResponse(self.alloc, 400, "repair requests use json body");
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, repair_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicRunTableRepair(table_name, req.body);
             }
             if (routes.Routes.matchTableArtifactReprocessJobs(uri_parts.path)) |job_route| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
@@ -4263,13 +4270,6 @@ pub const ApiHttpServer = struct {
                         .value = try std.fmt.allocPrint(self.alloc, "{d}", .{result.version}),
                     },
                 });
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchTableArtifactRepair(uri_parts.path)) |repair_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, repair_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicListArtifactRepairIssues(table_name, uri_parts.query);
             }
         }
         if (req.method == .GET) {
@@ -7272,23 +7272,30 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    pub fn handlePublicListArtifactRepairIssues(self: *ApiHttpServer, table_name: []const u8, query: []const u8) !http_common.HttpResponse {
+    const PublicRepairListRequest = struct {
+        target: []const u8 = "artifact",
+        kind: ?db_mod.types.ArtifactRepairKind = null,
+        index: ?[]const u8 = null,
+        cursor: ?[]const u8 = null,
+        limit: ?u32 = null,
+    };
+
+    pub fn handlePublicListArtifactRepairIssues(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
         const source = self.table_writes orelse return try textResponse(self.alloc, 405, "method not allowed");
-        const target = (parseRepairTargetQuery(query) catch return try textResponse(self.alloc, 400, "invalid repair target")) orelse .artifact;
+        var parsed = std.json.parseFromSlice(PublicRepairListRequest, self.alloc, if (body.len > 0) body else "{}", .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 400, "invalid repair list request");
+        };
+        defer parsed.deinit();
+        const target = std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) orelse return try textResponse(self.alloc, 400, "invalid repair target");
         if (target != .artifact) return try textResponse(self.alloc, 400, "invalid repair target");
-        const artifact_kind = parseArtifactRepairKindQuery(query) catch return try textResponse(self.alloc, 400, "invalid artifact repair kind");
-        const index_name = parseSimpleQueryParamDecodedAlloc(self.alloc, query, "index") catch return try textResponse(self.alloc, 400, "invalid index");
-        defer if (index_name) |value| self.alloc.free(value);
-        const cursor = parseSimpleQueryParamDecodedAlloc(self.alloc, query, "cursor") catch return try textResponse(self.alloc, 400, "invalid cursor");
-        defer if (cursor) |value| self.alloc.free(value);
-        const raw_limit = (parseUnsignedQueryParam(query, "limit") catch return try textResponse(self.alloc, 400, "invalid limit")) orelse 50;
+        const raw_limit: u32 = parsed.value.limit orelse 50;
         if (raw_limit == 0) return try textResponse(self.alloc, 400, "invalid limit");
-        const limit: u32 = @intCast(@min(raw_limit, 500));
+        const limit: u32 = @min(raw_limit, 500);
         var result = (source.listArtifactRepairIssues(self.alloc, table_name, .{
-            .artifact_kind = artifact_kind,
-            .index_name = index_name,
+            .artifact_kind = parsed.value.kind,
+            .index_name = parsed.value.index,
             .limit = limit,
-            .cursor = cursor,
+            .cursor = parsed.value.cursor,
         }) catch |err| switch (err) {
             error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid cursor"),
             else => {
@@ -7298,7 +7305,7 @@ pub const ApiHttpServer = struct {
         }) orelse return try textResponse(self.alloc, 404, "not found");
         defer result.deinit(self.alloc);
 
-        const body = try std.json.Stringify.valueAlloc(self.alloc, .{
+        const response_body = try std.json.Stringify.valueAlloc(self.alloc, .{
             .table = table_name,
             .target = "artifact",
             .limit = limit,
@@ -7308,8 +7315,8 @@ pub const ApiHttpServer = struct {
             .next_cursor = result.next_cursor,
             .issues = result.issues,
         }, .{ .emit_null_optional_fields = false });
-        defer self.alloc.free(body);
-        return try jsonBodyResponseWithStatus(self.alloc, 200, body);
+        defer self.alloc.free(response_body);
+        return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
     }
 
     const PublicRepairRunRequest = struct {
@@ -7318,37 +7325,29 @@ pub const ApiHttpServer = struct {
         index: ?[]const u8 = null,
         cursor: ?[]const u8 = null,
         limit: ?u32 = null,
+        force: bool = false,
     };
 
-    pub fn handlePublicRunTableRepair(self: *ApiHttpServer, table_name: []const u8, query: []const u8, body: []const u8) !http_common.HttpResponse {
+    pub fn handlePublicRunTableRepair(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
         const source = self.table_writes orelse return try textResponse(self.alloc, 405, "method not allowed");
         var parsed = std.json.parseFromSlice(PublicRepairRunRequest, self.alloc, if (body.len > 0) body else "{}", .{ .ignore_unknown_fields = true }) catch {
             return try textResponse(self.alloc, 400, "invalid repair request");
         };
         defer parsed.deinit();
-        const query_target = parseRepairTargetQuery(query) catch return try textResponse(self.alloc, 400, "invalid repair target");
         const body_target = std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) orelse return try textResponse(self.alloc, 400, "invalid repair target");
-        const target = query_target orelse body_target;
-        const query_kind = parseArtifactRepairKindQuery(query) catch return try textResponse(self.alloc, 400, "invalid artifact repair kind");
-        const artifact_kind = query_kind orelse parsed.value.kind;
-        const query_index_name = parseSimpleQueryParamDecodedAlloc(self.alloc, query, "index") catch return try textResponse(self.alloc, 400, "invalid index");
-        defer if (query_index_name) |value| self.alloc.free(value);
-        const index_name = query_index_name orelse parsed.value.index;
-        const query_cursor = parseSimpleQueryParamDecodedAlloc(self.alloc, query, "cursor") catch return try textResponse(self.alloc, 400, "invalid cursor");
-        defer if (query_cursor) |value| self.alloc.free(value);
-        const cursor = query_cursor orelse parsed.value.cursor;
-        const query_limit = parseUnsignedQueryParam(query, "limit") catch return try textResponse(self.alloc, 400, "invalid limit");
-        const raw_limit = query_limit orelse if (parsed.value.limit) |value| @as(u64, value) else 100;
+        const target = body_target;
+        const raw_limit = parsed.value.limit orelse 100;
         if (raw_limit == 0) return try textResponse(self.alloc, 400, "invalid limit");
-        const limit: u32 = @intCast(@min(raw_limit, 1000));
+        const limit: u32 = @min(raw_limit, 1000);
         var result = (source.repairArtifactIssues(self.alloc, table_name, .{
             .target = target,
-            .artifact_kind = artifact_kind,
-            .index_name = index_name,
+            .artifact_kind = parsed.value.kind,
+            .index_name = parsed.value.index,
             .limit = limit,
-            .cursor = cursor,
+            .cursor = parsed.value.cursor,
+            .force = parsed.value.force,
         }) catch |err| switch (err) {
-            error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid cursor"),
+            error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid repair request"),
             else => {
                 std.log.err("table repair failed table={s} err={}", .{ table_name, err });
                 return try textResponse(self.alloc, 500, "table repair failed");
@@ -8449,8 +8448,8 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
         .GET, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableArtifactRepair(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .GET => .admin,
-        .POST, .PUT, .DELETE => return null,
+        .POST => .admin,
+        .GET, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableArtifactRepairRun(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
         .POST => .admin,
@@ -8552,7 +8551,7 @@ test "document artifact routes declare read and admin permissions" {
         try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
     }
     {
-        const required = (try requiredPermissionForRequest(std.testing.allocator, .GET, "/tables/docs/repair/issues")).?;
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs/repair/issues")).?;
         defer required.deinit(std.testing.allocator);
         try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
         try std.testing.expectEqualStrings("docs", required.resource);
@@ -10052,23 +10051,6 @@ pub fn runtimeSchemaDebugRequested(query: []const u8) bool {
 fn parseUnsignedQueryParam(query: []const u8, key: []const u8) !?u64 {
     const value = parseSimpleQueryParam(query, key) orelse return null;
     return try std.fmt.parseUnsigned(u64, value, 10);
-}
-
-fn parseArtifactRepairKindQuery(query: []const u8) !?db_mod.types.ArtifactRepairKind {
-    const value = parseSimpleQueryParam(query, "kind") orelse return null;
-    return std.meta.stringToEnum(db_mod.types.ArtifactRepairKind, value) orelse error.InvalidArtifactRepairKind;
-}
-
-fn parseRepairTargetQuery(query: []const u8) !?db_mod.types.RepairTarget {
-    const value = parseSimpleQueryParam(query, "target") orelse return null;
-    return std.meta.stringToEnum(db_mod.types.RepairTarget, value) orelse error.InvalidRepairTarget;
-}
-
-test "artifact repair issue list target defaults to artifact" {
-    try std.testing.expectEqual(db_mod.types.RepairTarget.artifact, (try parseRepairTargetQuery("")) orelse .artifact);
-    try std.testing.expectEqual(db_mod.types.RepairTarget.artifact, (try parseRepairTargetQuery("target=artifact")) orelse .artifact);
-    try std.testing.expectEqual(db_mod.types.RepairTarget.index, (try parseRepairTargetQuery("target=index")).?);
-    try std.testing.expectError(error.InvalidRepairTarget, parseRepairTargetQuery("target=bogus"));
 }
 
 test "artifact repair query params decode percent encoded values" {

@@ -2100,14 +2100,17 @@ pub const AntflyApiHandler = struct {
         return respondOwnedApiResponse(ctx, &resp);
     }
 
-    pub fn listArtifactRepairIssues(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, params: metadata_openapi.server.ListArtifactRepairIssuesParams) !httpx.Response {
-        _ = params;
+    pub fn listArtifactRepairIssues(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        if (ctx.request.uri.query) |query| {
+            if (query.len != 0) return textResponse(ctx, 400, "repair requests use json body");
+        }
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_table_name);
-        var response = try self.api_server.handlePublicListArtifactRepairIssues(decoded_table_name, ctx.request.uri.query orelse "");
+        const body_data = (try ctx.body()) orelse "";
+        var response = try self.api_server.handlePublicListArtifactRepairIssues(decoded_table_name, body_data);
         return respondWithAllocator(ctx, &response, self.api_server.alloc);
     }
 
@@ -2115,10 +2118,13 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        if (ctx.request.uri.query) |query| {
+            if (query.len != 0) return textResponse(ctx, 400, "repair requests use json body");
+        }
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_table_name);
         const body_data = (try ctx.body()) orelse "";
-        var response = try self.api_server.handlePublicRunTableRepair(decoded_table_name, ctx.request.uri.query orelse "", body_data);
+        var response = try self.api_server.handlePublicRunTableRepair(decoded_table_name, body_data);
         return respondWithAllocator(ctx, &response, self.api_server.alloc);
     }
 

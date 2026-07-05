@@ -4259,6 +4259,19 @@ pub const DocumentArtifactManifest = struct {
     state_json: ?[]const u8 = null,
 };
 
+/// Bounded request to list table repair issues.
+pub const RepairIssueListRequest = struct {
+    /// Repair subsystem to list. This release supports artifact repair issue listing.
+    target: ?[]const u8 = null,
+    kind: ?ArtifactRepairKind = null,
+    /// Restrict results to one index name.
+    index: ?[]const u8 = null,
+    /// Opaque cursor returned by a prior response.
+    cursor: ?[]const u8 = null,
+    /// Maximum repair records to return.
+    limit: ?i64 = null,
+};
+
 /// Durable repair debt for a derived artifact. This is an operator-facing record and includes exact source and artifact identifiers.
 pub const ArtifactRepairIssue = struct {
     artifact_kind: ArtifactRepairKind,
@@ -4303,6 +4316,8 @@ pub const RepairRunRequest = struct {
     index: ?[]const u8 = null,
     /// Opaque cursor returned by a prior repair response.
     cursor: ?[]const u8 = null,
+    /// Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
+    force: ?bool = null,
     /// Maximum repair records to attempt.
     limit: ?i64 = null,
 };

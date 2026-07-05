@@ -1709,6 +1709,7 @@ pub const ArtifactRepairRunRequest = struct {
     index_name: ?[]const u8 = null,
     limit: u32 = 100,
     cursor: ?[]const u8 = null,
+    force: bool = false,
 };
 
 pub const ArtifactRepairResult = struct {

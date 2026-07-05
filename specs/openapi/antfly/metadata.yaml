@@ -2147,6 +2147,31 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ArtifactRepairIssue"
+    RepairIssueListRequest:
+      type: object
+      description: Bounded request to list table repair issues.
+      properties:
+        target:
+          type: string
+          enum:
+            - artifact
+          default: artifact
+          description: Repair subsystem to list. This release supports artifact repair issue listing.
+        kind:
+          $ref: "#/components/schemas/ArtifactRepairKind"
+        index:
+          type: string
+          description: Restrict results to one index name.
+        cursor:
+          type: string
+          description: Opaque cursor returned by a prior response.
+        limit:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 500
+          default: 50
+          description: Maximum repair records to return.
     RepairRunRequest:
       type: object
       description: Bounded request to run a table repair pass.
@@ -2161,6 +2186,10 @@ components:
         cursor:
           type: string
           description: Opaque cursor returned by a prior repair response.
+        force:
+          type: boolean
+          default: false
+          description: Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
         limit:
           type: integer
           format: uint32
@@ -8369,54 +8398,23 @@ paths:
         description: Name of the table
         schema:
           type: string
-    get:
+    post:
       summary: List artifact repair issues
       description: |
         Lists durable repair debt for a table. This operator-facing endpoint
         returns exact document keys, artifact keys, index names, and repair
         errors, and therefore requires table admin permission when authentication
-        is enabled. This release supports `target=artifact`.
+        is enabled. Request filters are supplied in the JSON body. This release
+        supports `target=artifact`.
       tags:
         - data_operations
       operationId: listArtifactRepairIssues
-      parameters:
-        - name: kind
-          in: query
-          required: false
-          description: Restrict results to one artifact kind.
-          schema:
-            $ref: "#/components/schemas/ArtifactRepairKind"
-        - name: index
-          in: query
-          required: false
-          description: Restrict results to one index name.
-          schema:
-            type: string
-        - name: cursor
-          in: query
-          required: false
-          description: Opaque cursor returned by a prior response.
-          schema:
-            type: string
-        - name: limit
-          in: query
-          required: false
-          description: Maximum repair records to return. Must be greater than zero.
-          schema:
-            type: integer
-            format: uint32
-            minimum: 1
-            default: 50
-            maximum: 500
-        - name: target
-          in: query
-          required: false
-          description: Repair subsystem to list. Defaults to artifact.
-          schema:
-            type: string
-            enum:
-              - artifact
-            default: artifact
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RepairIssueListRequest"
       responses:
         "200":
           description: Artifact repair issue page
@@ -8445,8 +8443,8 @@ paths:
       description: |
         Attempts to repair queued table issues. `target=artifact` reprocesses
         supported artifact kinds and replays derived state. `target=index`
-        rebuilds selected index state from stored artifacts for supported index
-        kinds. The operation is bounded by `limit`, returns an opaque
+        repairs one named index; healthy indexes are skipped unless `force=true`
+        is supplied. The operation is bounded by `limit`, returns an opaque
         continuation cursor when another page of repair work is available,
         reports unresolved debt separately, and requires table admin permission
         when authentication is enabled.

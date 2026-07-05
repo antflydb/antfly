@@ -307,18 +307,10 @@ pub const ListArtifactRepairIssuesPathParams = struct {
     table_name: []const u8,
 };
 
-pub const ListArtifactRepairIssuesParams = struct {
-    /// Restrict results to one artifact kind.
-    kind: ?[]const u8 = null,
-    /// Restrict results to one index name.
-    index: ?[]const u8 = null,
-    /// Opaque cursor returned by a prior response.
-    cursor: ?[]const u8 = null,
-    /// Maximum repair records to return. Must be greater than zero.
-    limit: ?[]const u8 = null,
-    /// Repair subsystem to list. Defaults to artifact.
-    target: ?[]const u8 = null,
-};
+/// Parse the JSON request body for listArtifactRepairIssues.
+pub fn parseListArtifactRepairIssuesBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RepairIssueListRequest) {
+    return std.json.parseFromSlice(types.RepairIssueListRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
 
 /// Run a bounded table repair pass
 pub const RunTableRepairPathParams = struct {
@@ -517,7 +509,7 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey" },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests" },
     .{ .method = "GET", .path = "/tables/{tableName}/artifacts", .operation_id = "listArtifactEnrichments" },
-    .{ .method = "GET", .path = "/tables/{tableName}/repair/issues", .operation_id = "listArtifactRepairIssues" },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/issues", .operation_id = "listArtifactRepairIssues" },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/run", .operation_id = "runTableRepair" },
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifactRange" },
     .{ .method = "PUT", .path = "/tables/{tableName}/artifacts/{artifactName}/enrichment", .operation_id = "putArtifactEnrichment" },
@@ -656,7 +648,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.get("/tables/:tableName/documents/:key", lookupKey);
             try server.get("/tables/:tableName/documents/:key/artifacts", listDocumentArtifactManifests);
             try server.get("/tables/:tableName/artifacts", listArtifactEnrichments);
-            try server.get("/tables/:tableName/repair/issues", listArtifactRepairIssues);
+            try server.post("/tables/:tableName/repair/issues", listArtifactRepairIssues);
             try server.post("/tables/:tableName/repair/run", runTableRepair);
             try server.post("/tables/:tableName/artifacts/:artifactName/reprocess", reprocessDocumentArtifactRange);
             try server.put("/tables/:tableName/artifacts/:artifactName/enrichment", putArtifactEnrichment);
@@ -1010,18 +1002,11 @@ pub fn ServerRouter(comptime Impl: type) type {
         }
 
         /// List artifact repair issues
-        /// GET /tables/{tableName}/repair/issues
+        /// POST /tables/{tableName}/repair/issues
         fn listArtifactRepairIssues(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
-            const query_params = ListArtifactRepairIssuesParams{
-                .kind = ctx.query("kind"),
-                .index = ctx.query("index"),
-                .cursor = ctx.query("cursor"),
-                .limit = ctx.query("limit"),
-                .target = ctx.query("target"),
-            };
-            return impl.listArtifactRepairIssues(ctx, table_name, query_params);
+            return impl.listArtifactRepairIssues(ctx, table_name);
         }
 
         /// Run a bounded table repair pass
@@ -1201,7 +1186,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
 //   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !httpx.Response
 //   fn listArtifactEnrichments(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn listArtifactRepairIssues(self: *Impl, ctx: *httpx.Context, table_name: []const u8, params: ListArtifactRepairIssuesParams) !httpx.Response
+//   fn listArtifactRepairIssues(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn runTableRepair(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn reprocessDocumentArtifactRange(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn putArtifactEnrichment(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response

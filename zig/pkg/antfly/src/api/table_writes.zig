@@ -340,6 +340,7 @@ fn artifactRepairRunRequestForShard(
         .index_name = req.index_name,
         .limit = limit,
         .cursor = cursor,
+        .force = req.force,
     };
 }
 
@@ -350,6 +351,7 @@ test "artifact repair shard run request preserves repair target" {
         .index_name = "semantic",
         .limit = 10,
         .cursor = "idx_b",
+        .force = true,
     }, 2, "idx_c");
 
     try std.testing.expectEqual(db_mod.types.RepairTarget.index, shard_req.target);
@@ -357,6 +359,7 @@ test "artifact repair shard run request preserves repair target" {
     try std.testing.expectEqualStrings("semantic", shard_req.index_name.?);
     try std.testing.expectEqual(@as(u32, 2), shard_req.limit);
     try std.testing.expectEqualStrings("idx_c", shard_req.cursor.?);
+    try std.testing.expect(shard_req.force);
 }
 
 fn cloneArtifactRepairIssueAlloc(alloc: std.mem.Allocator, issue: db_mod.types.ArtifactRepairIssue) !db_mod.types.ArtifactRepairIssue {

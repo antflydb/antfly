@@ -7191,100 +7191,88 @@ pub const DB = struct {
         alloc: Allocator,
         req: types.ArtifactRepairRunRequest,
     ) !types.ArtifactRepairResult {
-        if (req.index_name != null and req.cursor != null and req.cursor.?.len != 0) return error.InvalidArgument;
+        const requested_index = req.index_name orelse return error.InvalidArgument;
+        if (req.cursor != null and req.cursor.?.len != 0) return error.InvalidArgument;
         const limit = if (req.limit == 0) @as(u32, 100) else req.limit;
         var result = types.ArtifactRepairResult{ .limit = limit };
 
-        const configs = try self.core.listIndexes(alloc);
-        defer types.freeIndexConfigs(alloc, configs);
-        std.mem.sort(types.IndexConfig, configs, {}, indexConfigNameLessThan);
-        const cursor_name = if (req.cursor) |cursor| blk: {
-            if (cursor.len == 0) break :blk null;
-            break :blk cursor;
-        } else null;
-        var quarantined_retry_run = false;
-        var cursor_found = cursor_name == null;
-        for (configs) |cfg| {
-            if (!cursor_found) {
-                if (std.mem.eql(u8, cfg.name, cursor_name.?)) {
-                    cursor_found = true;
-                } else {
-                    continue;
-                }
-            }
-            if (req.index_name) |index_name| {
-                if (!std.mem.eql(u8, cfg.name, index_name)) continue;
-            }
-            if (req.artifact_kind) |kind| {
-                const matches_kind = switch (cfg.kind) {
-                    .dense_vector, .sparse_vector => kind == .embedding,
-                    .graph => kind == .graph,
-                    .full_text => kind == .full_text,
-                    .algebraic => false,
-                };
-                if (!matches_kind) continue;
-            }
-            if (result.scanned >= limit) {
-                result.has_more = true;
-                result.debt_remaining = true;
-                result.next_cursor = try alloc.dupe(u8, cfg.name);
-                break;
-            }
+        const cfg_ptr = self.core.index_manager.get(requested_index) orelse return error.NotFound;
+        var cfg = try types.IndexConfig.clone(alloc, cfg_ptr.*);
+        defer cfg.deinit(alloc);
 
-            result.scanned += 1;
-            const had_load_failure = self.core.index_manager.loadFailure(cfg.name) != null;
-            if (had_load_failure) result.indexes_degraded += 1;
-            if (had_load_failure and !quarantined_retry_run) {
-                _ = try self.retryQuarantinedIndexLoads(true);
-                quarantined_retry_run = true;
-            }
-            if (self.core.index_manager.loadFailure(cfg.name) != null) {
-                result.failed += 1;
-                result.unresolved += 1;
-                result.debt_remaining = true;
-                continue;
-            }
-            if (had_load_failure and (cfg.kind == .full_text or cfg.kind == .algebraic)) {
-                result.repaired += 1;
-                continue;
-            }
-
-            const rebuilt = switch (cfg.kind) {
-                .dense_vector => blk: {
-                    try self.core.index_manager.resetDenseIndexForArtifactRebuild(cfg.name);
-                    const count = try rebuildDenseIndexForTargetCoverageContext(self.async_context, cfg.name, 2048);
-                    try self.core.index_manager.syncIndexByName(cfg.name, true);
-                    break :blk count;
-                },
-                .sparse_vector => blk: {
-                    const count = try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(self.async_context, cfg.name, 2048);
-                    try self.core.index_manager.syncIndexByName(cfg.name, true);
-                    break :blk count;
-                },
-                .graph => blk: {
-                    const count = try applySplitGraphArtifactsForIndexStreaming(
-                        alloc,
-                        self.core.store,
-                        self.core.index_manager,
-                        cfg.name,
-                        graph_repair_rebuild_batch_size,
-                    );
-                    try self.core.index_manager.syncIndexByName(cfg.name, true);
-                    break :blk count;
-                },
-                .full_text, .algebraic => continue,
+        if (req.artifact_kind) |kind| {
+            const matches_kind = switch (cfg.kind) {
+                .dense_vector, .sparse_vector => kind == .embedding,
+                .graph => kind == .graph,
+                .full_text => kind == .full_text,
+                .algebraic => false,
             };
-            result.reprocessed += rebuilt;
-            result.repaired += 1;
-            result.indexes_rebuilt += 1;
+            if (!matches_kind) return error.NotFound;
         }
-        if (!cursor_found) return error.InvalidArgument;
-        if (req.index_name != null and result.scanned == 0) return error.NotFound;
+
+        if (limit == 0) return result;
+
+        const repair_required = try self.indexRepairRequired(alloc, cfg.name);
+        if (!repair_required and !req.force) return result;
+
+        var quarantined_retry_run = false;
+        result.scanned += 1;
+        const had_load_failure = self.core.index_manager.loadFailure(cfg.name) != null;
+        if (had_load_failure) result.indexes_degraded += 1;
+        if (had_load_failure and !quarantined_retry_run) {
+            _ = try self.retryQuarantinedIndexLoads(true);
+            quarantined_retry_run = true;
+        }
+        if (self.core.index_manager.loadFailure(cfg.name) != null) {
+            result.failed += 1;
+            result.unresolved += 1;
+            result.debt_remaining = true;
+            return result;
+        }
+        if (had_load_failure and (cfg.kind == .full_text or cfg.kind == .algebraic)) {
+            result.repaired += 1;
+            return result;
+        }
+
+        const rebuilt = switch (cfg.kind) {
+            .dense_vector => blk: {
+                try self.core.index_manager.resetDenseIndexForArtifactRebuild(cfg.name);
+                const count = try rebuildDenseIndexForTargetCoverageContext(self.async_context, cfg.name, 2048);
+                try self.core.index_manager.syncIndexByName(cfg.name, true);
+                break :blk count;
+            },
+            .sparse_vector => blk: {
+                const count = try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(self.async_context, cfg.name, 2048);
+                try self.core.index_manager.syncIndexByName(cfg.name, true);
+                break :blk count;
+            },
+            .graph => blk: {
+                const count = try applySplitGraphArtifactsForIndexStreaming(
+                    alloc,
+                    self.core.store,
+                    self.core.index_manager,
+                    cfg.name,
+                    graph_repair_rebuild_batch_size,
+                );
+                try self.core.index_manager.syncIndexByName(cfg.name, true);
+                break :blk count;
+            },
+            .full_text, .algebraic => return result,
+        };
+        result.reprocessed += rebuilt;
+        result.repaired += 1;
+        result.indexes_rebuilt += 1;
         return result;
     }
 
-    fn indexConfigNameLessThan(_: void, lhs: types.IndexConfig, rhs: types.IndexConfig) bool {
-        return std.mem.lessThan(u8, lhs.name, rhs.name);
+    fn indexRepairRequired(self: *DB, alloc: Allocator, index_name: []const u8) !bool {
+        if (self.core.index_manager.loadFailure(index_name) != null) return true;
+        const checkpoint = try self.core.loadProjectionCheckpoint(alloc, index_name);
+        switch (checkpoint.status) {
+            .degraded, .repair_required => return true,
+            .clean, .rebuilding => {},
+        }
+        return try self.artifactRepairSummaryIndexCount(alloc, index_name) != 0;
     }
 
     pub fn repairArtifactIssues(
@@ -37939,7 +37927,7 @@ test "db artifact repair reports unsupported artifact kinds without clearing deb
     try std.testing.expectEqualStrings("graph_reprocessor_unavailable", issues[0].last_error);
 }
 
-test "db index repair cursor advances beyond bounded page" {
+test "db index repair requires explicit index and force for healthy rebuild" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -37949,49 +37937,38 @@ test "db index repair cursor advances beyond bounded page" {
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try db.addIndex(.{ .name = "ft_c", .kind = .full_text, .config_json = "{}" });
-    try db.addIndex(.{ .name = "ft_a", .kind = .full_text, .config_json = "{}" });
-    try db.addIndex(.{ .name = "ft_b", .kind = .full_text, .config_json = "{}" });
-
-    var first = try db.repairArtifactIssuesWithRequest(alloc, .{
-        .target = .index,
-        .limit = 2,
-    });
-    defer first.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 2), first.scanned);
-    try std.testing.expectEqual(@as(u64, 0), first.unsupported);
-    try std.testing.expectEqual(@as(u64, 0), first.unresolved);
-    try std.testing.expect(first.has_more);
-    try std.testing.expect(first.debt_remaining);
-    try std.testing.expectEqualStrings("ft_c", first.next_cursor.?);
-
-    var second = try db.repairArtifactIssuesWithRequest(alloc, .{
-        .target = .index,
-        .limit = 2,
-        .cursor = first.next_cursor,
-    });
-    defer second.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 1), second.scanned);
-    try std.testing.expectEqual(@as(u64, 0), second.unsupported);
-    try std.testing.expectEqual(@as(u64, 0), second.unresolved);
-    try std.testing.expect(!second.has_more);
-    try std.testing.expect(second.next_cursor == null);
-    try std.testing.expect(!second.debt_remaining);
-
-    var targeted = try db.repairArtifactIssuesWithRequest(alloc, .{
-        .target = .index,
-        .index_name = "ft_a",
-        .limit = 1,
-    });
-    defer targeted.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 1), targeted.scanned);
-    try std.testing.expectEqual(@as(u64, 0), targeted.unsupported);
-    try std.testing.expectEqual(@as(u64, 0), targeted.unresolved);
-    try std.testing.expect(!targeted.debt_remaining);
+    try db.addIndex(.{ .name = "graph_v1", .kind = .graph, .config_json = "{}" });
 
     try std.testing.expectError(error.InvalidArgument, db.repairArtifactIssuesWithRequest(alloc, .{
         .target = .index,
-        .cursor = "missing-index",
+        .limit = 1,
+    }));
+
+    var skipped = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .index_name = "graph_v1",
+        .limit = 1,
+    });
+    defer skipped.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 0), skipped.scanned);
+    try std.testing.expectEqual(@as(u64, 0), skipped.indexes_rebuilt);
+    try std.testing.expect(!skipped.debt_remaining);
+
+    var forced = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .index_name = "graph_v1",
+        .limit = 1,
+        .force = true,
+    });
+    defer forced.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), forced.scanned);
+    try std.testing.expectEqual(@as(u64, 1), forced.indexes_rebuilt);
+    try std.testing.expect(!forced.debt_remaining);
+
+    try std.testing.expectError(error.InvalidArgument, db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .index_name = "graph_v1",
+        .cursor = "unexpected-cursor",
     }));
 }
 
@@ -38026,6 +38003,7 @@ test "db index repair targets one graph index per selected config" {
         .artifact_kind = .graph,
         .index_name = "graph_a",
         .limit = 1,
+        .force = true,
     });
     defer repair.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), repair.scanned);
@@ -38122,6 +38100,7 @@ test "db index repair streams graph artifact rebuild in batches" {
         .artifact_kind = .graph,
         .index_name = "graph_stream",
         .limit = 1,
+        .force = true,
     });
     defer repair.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), repair.scanned);
