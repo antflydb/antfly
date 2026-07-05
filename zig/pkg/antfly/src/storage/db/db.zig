@@ -8455,7 +8455,11 @@ pub const DB = struct {
         if (needs_enrichment_replay) {
             if (self.enrichment_runtime != null) {
                 const refs = try self.replayGeneratedEnrichmentsFromStoredDocs(self.alloc);
-                if (refs == 0) try self.core.saveAppliedSequence(cfg.name, self.core.nextDerivedSequence());
+                if (refs == 0) {
+                    const target_sequence = self.core.nextDerivedSequence();
+                    try self.core.saveAppliedSequence(cfg.name, target_sequence);
+                    try self.markEnrichmentAppliedIfNoPendingThrough(target_sequence);
+                }
             }
         }
     }
@@ -9685,6 +9689,16 @@ pub const DB = struct {
             if (group.sequence <= sequence) return false;
         }
         return true;
+    }
+
+    fn markEnrichmentAppliedIfNoPendingThrough(self: *DB, sequence: u64) !void {
+        if (sequence == 0) return;
+        const runtime = self.enrichment_runtime orelse return;
+        const runtime_stats = runtime.stats();
+        if (runtime_stats.applied_sequence >= sequence) return;
+        if (try self.noPendingEnrichmentReplayThrough(runtime_stats.applied_sequence, sequence)) {
+            try runtime.markAppliedThrough(sequence);
+        }
     }
 
     pub fn runMaintenanceUntil(self: *DB, sequence: u64, sync_targets: ManagedSyncTargets) !void {
@@ -40186,6 +40200,33 @@ test "db runUntilIdle drains enrichment and derived indexing" {
 
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db generated enrichment empty backfill advances enrichment checkpoint" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "embedded-worker",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
+    });
+
+    const pending = db.pendingWorkStats();
+    try std.testing.expectEqual(pending.enrichment.target_sequence, pending.enrichment.applied_sequence);
+    try std.testing.expectEqual(pending.derived_target_sequence, try db.core.loadAppliedSequence(alloc, "dv_v1"));
 }
 
 test "db generated enrichment backfill drains stored docs beyond first replay chunk" {
