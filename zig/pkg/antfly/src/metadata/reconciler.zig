@@ -864,9 +864,9 @@ fn relocationWatermarkForGroup(current: CurrentMetadataState, group_id: u64) Rel
         if (intent.relocation_generation >= watermark.generation_hint) watermark.generation_hint = intent.relocation_generation + 1;
     }
     if (mergedGroupStatus(current, group_id)) |status| {
-        if (groupStatusHasVisibleData(status.doc_count, status.empty)) watermark.has_visible_data = true;
+        if (relocationStatusHasVisibleDocuments(status.doc_count)) watermark.has_visible_data = true;
         if (status.doc_count > watermark.doc_count) watermark.doc_count = status.doc_count;
-        if (groupStatusHasVisibleData(status.doc_count, status.empty) and status.disk_bytes > watermark.disk_bytes) watermark.disk_bytes = status.disk_bytes;
+        if (relocationStatusHasVisibleDocuments(status.doc_count) and status.disk_bytes > watermark.disk_bytes) watermark.disk_bytes = status.disk_bytes;
         if (status.updated_at_millis >= watermark.generation_hint) watermark.generation_hint = status.updated_at_millis + 1;
     }
     for (current.stores) |store| {
@@ -874,9 +874,9 @@ fn relocationWatermarkForGroup(current: CurrentMetadataState, group_id: u64) Rel
         if (!storeHasPlacement(current.placement_intents, group_id, store.node_id)) continue;
         for (store.group_statuses) |status| {
             if (status.group_id != group_id) continue;
-            if (groupStatusHasVisibleData(status.doc_count, status.empty)) watermark.has_visible_data = true;
+            if (relocationStatusHasVisibleDocuments(status.doc_count)) watermark.has_visible_data = true;
             if (status.doc_count > watermark.doc_count) watermark.doc_count = status.doc_count;
-            if (groupStatusHasVisibleData(status.doc_count, status.empty) and status.disk_bytes > watermark.disk_bytes) watermark.disk_bytes = status.disk_bytes;
+            if (relocationStatusHasVisibleDocuments(status.doc_count) and status.disk_bytes > watermark.disk_bytes) watermark.disk_bytes = status.disk_bytes;
             if (status.updated_at_millis >= watermark.generation_hint) watermark.generation_hint = status.updated_at_millis + 1;
         }
         for (store.runtime_statuses) |status| {
@@ -899,8 +899,8 @@ fn applyRelocationWatermark(intent: *raft_reconciler.PlacementIntent, watermark:
     if (intent.relocation_disk_bytes_watermark < watermark.disk_bytes) intent.relocation_disk_bytes_watermark = watermark.disk_bytes;
 }
 
-fn groupStatusHasVisibleData(doc_count: u64, empty: bool) bool {
-    return doc_count > 0 or !empty;
+fn relocationStatusHasVisibleDocuments(doc_count: u64) bool {
+    return doc_count > 0;
 }
 
 fn relocationTargetServingState(
@@ -998,12 +998,12 @@ fn placementIsReplacementForSource(
 
 fn groupHasVisibleData(current: CurrentMetadataState, group_id: u64) bool {
     if (mergedGroupStatus(current, group_id)) |status| {
-        if (groupStatusHasVisibleData(status.doc_count, status.empty)) return true;
+        if (relocationStatusHasVisibleDocuments(status.doc_count)) return true;
     }
     for (current.stores) |store| {
         for (store.group_statuses) |status| {
             if (status.group_id != group_id) continue;
-            if (groupStatusHasVisibleData(status.doc_count, status.empty)) return true;
+            if (relocationStatusHasVisibleDocuments(status.doc_count)) return true;
         }
         for (store.runtime_statuses) |status| {
             if (status.group_id != group_id) continue;
@@ -2479,6 +2479,17 @@ test "metadata reconciler removes relocation source only after target is durably
             }})[0..]),
         },
     };
+    const merged_statuses = [_]MergedGroupStatus{.{
+        .group_id = 2231,
+        .doc_count = 0,
+        .disk_bytes = 2190,
+        .empty = false,
+        .leader_known = true,
+        .leader_store_id = 11,
+        .voter_count_known = true,
+        .voter_count = 1,
+        .healthy_voter_reports = 2,
+    }};
     const candidates = [_]@import("state.zig").CandidatePlacementInfo{.{
         .node_id = 2,
         .store_id = 22,
@@ -2491,6 +2502,7 @@ test "metadata reconciler removes relocation source only after target is durably
     var plan = try reconciler.computePlan(&manager, &.{2}, &candidates, .{
         .placement_intents = &current,
         .stores = &stores,
+        .merged_group_statuses = &merged_statuses,
         .reallocate_requested = true,
     });
     defer plan.deinit(std.testing.allocator);
