@@ -1707,6 +1707,7 @@ fn isRetryableMetadataBootstrapError(err: anyerror) bool {
         error.NotLeader,
         error.ProposalDropped,
         error.LeaderTransferInProgress,
+        error.StoreRegistrationNotVisible,
         => true,
         else => false,
     };
@@ -1748,6 +1749,7 @@ test "data runtime treats metadata leadership churn as retryable bootstrap failu
     try std.testing.expect(isRetryableMetadataBootstrapError(error.ProposalDropped));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.LeaderTransferInProgress));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.ConnectionRefused));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.StoreRegistrationNotVisible));
     try std.testing.expect(!isRetryableMetadataBootstrapError(error.InvalidArguments));
 }
 
