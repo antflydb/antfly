@@ -3630,9 +3630,34 @@ pub const DataServer = struct {
                         err,
                     });
                 };
+                self.reportStoreStatusAfterStructuralChange(table_name);
             },
         }
         self.markRuntimeStatusDirty(table_name, kind);
+    }
+
+    fn reportStoreStatusAfterStructuralChange(self: *DataServer, table_name: []const u8) void {
+        if (self.remote_metadata == null or self.store_registration == null) return;
+        if (!self.store_registration_confirmed) {
+            self.registerNodeIfConfigured() catch |err| {
+                std.log.warn("failed to register store before structural status report table={s} err={}", .{
+                    table_name,
+                    err,
+                });
+                return;
+            };
+        }
+        self.reportStoreStatus() catch |err| switch (err) {
+            error.FileNotFound,
+            error.UnknownGroup,
+            error.LmdbUnexpected,
+            error.Corrupted,
+            => {},
+            else => std.log.warn("failed to report store status after structural change table={s} err={}", .{
+                table_name,
+                err,
+            }),
+        };
     }
 
     fn markLocalGroupDataChanged(self: *DataServer) void {
