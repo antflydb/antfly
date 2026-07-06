@@ -17131,6 +17131,9 @@ fn scanDocumentExtractionPreviousStateFromStore(
     out.unit_keys = try unit_keys.toOwnedSlice(alloc);
     out.chunk_keys = try chunk_keys.toOwnedSlice(alloc);
     out.unit_descriptors = try alloc.alloc(DocumentExtractionUnitDescriptor, out.unit_keys.len);
+    for (out.unit_descriptors) |*descriptor| {
+        descriptor.* = .{ .key = "", .fingerprint = "" };
+    }
     for (out.unit_descriptors, out.unit_keys) |*descriptor, key| {
         descriptor.* = .{
             .key = try alloc.dupe(u8, key),

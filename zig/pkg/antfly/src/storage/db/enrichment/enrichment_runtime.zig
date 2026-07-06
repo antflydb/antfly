@@ -2052,9 +2052,6 @@ fn processDocumentExtractionAsset(
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
             try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, previous_key);
         }
-        if (previous_state.recovered_from_store_scan) {
-            try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, state_key));
-        }
     }
 
     const empty_units: [0]document_extraction_mod.Unit = .{};
@@ -5687,6 +5684,9 @@ fn scanRuntimeDocumentExtractionPreviousStateFromStore(
     out.unit_keys = try unit_keys.toOwnedSlice(runtime.alloc);
     out.chunk_keys = try chunk_keys.toOwnedSlice(runtime.alloc);
     out.unit_descriptors = try runtime.alloc.alloc(DocumentExtractionUnitDescriptor, out.unit_keys.len);
+    for (out.unit_descriptors) |*descriptor| {
+        descriptor.* = .{ .key = "", .fingerprint = "" };
+    }
     for (out.unit_descriptors, out.unit_keys) |*descriptor, key| {
         descriptor.* = .{
             .key = try runtime.alloc.dupe(u8, key),
