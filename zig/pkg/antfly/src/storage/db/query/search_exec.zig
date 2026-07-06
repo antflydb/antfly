@@ -1639,11 +1639,19 @@ fn rejectSortedQueryWithUnresolvedStoredFilters(
 ) error{UnsupportedQueryRequest}!void {
     if (!requestHasSortPageOptions(req)) return;
     if (req.filter_query_json.len > 0 and !filter_query_json_resolved) {
-        logNativeSortPlanRejection("*", "missing_native_filter_coverage", "filter_query_json_unresolved");
+        logNativeSortPlanRejection(
+            "*",
+            nativeSortPlanRejectionReasonName(.missing_native_filter_coverage),
+            "filter_query_json_unresolved",
+        );
         return error.UnsupportedQueryRequest;
     }
     if (req.exclusion_query_json.len > 0 and !exclusion_query_json_resolved) {
-        logNativeSortPlanRejection("*", "missing_native_filter_coverage", "exclusion_query_json_unresolved");
+        logNativeSortPlanRejection(
+            "*",
+            nativeSortPlanRejectionReasonName(.missing_native_filter_coverage),
+            "exclusion_query_json_unresolved",
+        );
         return error.UnsupportedQueryRequest;
     }
 }
@@ -11467,6 +11475,7 @@ const NativeSortPlanRejectionReason = enum {
     invalid_cursor_type,
     invalid_doc_value_type,
     missing_null_policy,
+    missing_native_filter_coverage,
     approximate_candidate_source,
     non_score_bearing_source,
     invalid_score_value,
@@ -11483,6 +11492,7 @@ fn nativeSortPlanRejectionReasonName(reason: NativeSortPlanRejectionReason) []co
         .invalid_cursor_type => "invalid_cursor_type",
         .invalid_doc_value_type => "invalid_doc_value_type",
         .missing_null_policy => "missing_null_policy",
+        .missing_native_filter_coverage => "missing_native_filter_coverage",
         .approximate_candidate_source => "approximate_candidate_source",
         .non_score_bearing_source => "non_score_bearing_source",
         .invalid_score_value => "invalid_score_value",
@@ -11500,6 +11510,7 @@ fn nativeSortPlanRejectionDetailName(reason: NativeSortPlanRejectionReason) []co
         .invalid_cursor_type => "invalid_cursor_type",
         .invalid_doc_value_type => "invalid_doc_value_type",
         .missing_null_policy => "missing_null_policy",
+        .missing_native_filter_coverage => "missing_native_filter_coverage",
         .approximate_candidate_source => "approximate_candidate_source",
         .non_score_bearing_source => "non_score_bearing_source",
         .invalid_score_value => "invalid_score_value",
@@ -11516,6 +11527,7 @@ test "native sort plan rejection reason names are stable for diagnostics" {
     try std.testing.expectEqualStrings("invalid_cursor_type", nativeSortPlanRejectionReasonName(.invalid_cursor_type));
     try std.testing.expectEqualStrings("invalid_doc_value_type", nativeSortPlanRejectionReasonName(.invalid_doc_value_type));
     try std.testing.expectEqualStrings("missing_null_policy", nativeSortPlanRejectionReasonName(.missing_null_policy));
+    try std.testing.expectEqualStrings("missing_native_filter_coverage", nativeSortPlanRejectionReasonName(.missing_native_filter_coverage));
     try std.testing.expectEqualStrings("approximate_candidate_source", nativeSortPlanRejectionReasonName(.approximate_candidate_source));
     try std.testing.expectEqualStrings("non_score_bearing_source", nativeSortPlanRejectionReasonName(.non_score_bearing_source));
     try std.testing.expectEqualStrings("invalid_score_value", nativeSortPlanRejectionReasonName(.invalid_score_value));
@@ -11525,6 +11537,7 @@ test "native sort plan rejection reason names are stable for diagnostics" {
     try std.testing.expectEqualStrings("non_sortable_field", nativeSortPlanRejectionDetailName(.non_sortable_field));
     try std.testing.expectEqualStrings("missing_doc_values_capability", nativeSortPlanRejectionDetailName(.missing_doc_values_capability));
     try std.testing.expectEqualStrings("invalid_cursor_arity", nativeSortPlanRejectionDetailName(.invalid_cursor_arity));
+    try std.testing.expectEqualStrings("missing_native_filter_coverage", nativeSortPlanRejectionDetailName(.missing_native_filter_coverage));
     try std.testing.expectEqualStrings("approximate_candidate_source", nativeSortPlanRejectionDetailName(.approximate_candidate_source));
     try std.testing.expectEqualStrings("non_score_bearing_source", nativeSortPlanRejectionDetailName(.non_score_bearing_source));
     try std.testing.expectEqualStrings("invalid_score_value", nativeSortPlanRejectionDetailName(.invalid_score_value));

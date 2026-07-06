@@ -236,16 +236,27 @@ The public API already has the right high-level shape:
 
 The implementation is intentionally conservative today:
 
-- Text-backed and match-all stored sort collect a bounded candidate window.
-- The engine only returns a sorted page if it can sort the full required
-  candidate set exactly.
-- If the candidate window exceeds the exact-sort budget, the API returns 422
-  instead of returning a partially sorted page.
-- The current fallback extracts sort values from stored JSON and sorts in
-  memory.
+- Public mappings expose `sortable`; the schema compiler derives internal
+  typed doc-values capability from it.
+- Public schema requests that try to configure `doc_values` directly are
+  rejected; `doc_values` remains a runtime capability and diagnostic term.
+- Sortable mappings are rejected for multi-valued JSON shapes and for reserved
+  `_id` document fields, including dynamic templates and pattern properties
+  that could target `_id`.
+- Text-backed, match-all, and filter-backed exact field sorts require a native
+  sort plan (`native_doc_values_top_n`, `_id` seek, sorted-segment seek, or
+  distributed k-way merge).
+- The engine only returns a sorted page when it can prove the candidate set and
+  sort tuple are exact under the requested order.
+- If native coverage, cursor typing, or exact candidate budgets cannot be
+  proven, the API returns 422 instead of returning a partially sorted page.
+- Stored JSON sorting is test/debug-only compatibility behavior and is not a
+  production fallback for public exact `order_by`.
 
-That is correct as a bridge, but it is not the final production design. The
-long-term shape should move sort values into native index structures.
+The remaining production work is mostly performance depth: broader native
+filter coverage, physical `index_sort` acceleration, compaction/backfill
+tooling for coverage changes, and continued benchmarks over broad and selective
+query shapes.
 
 ## Overall Search Model
 
@@ -581,7 +592,7 @@ view rather than from hand-maintained release notes.
 
 ## Doc Values
 
-Doc values are the first native primitive Antfly needs for production sorting.
+Doc values are the first native primitive Antfly uses for production sorting.
 
 For every mapped field whose runtime schema has internal doc-values capability
 derived from `sortable: true`, segment build and replay should write a typed
@@ -1207,10 +1218,12 @@ Rejections should use stable machine-readable reasons, such as:
 - `unmapped_sort_field`
 - `non_sortable_sort_field`
 - `missing_doc_values_coverage`
+- `missing_native_filter_coverage`
 - `invalid_cursor_arity`
 - `invalid_cursor_type`
 - `approximate_candidate_source`
 - `candidate_budget_exceeded`
+- `count_only_ordered_page`
 - `stored_json_sort_disabled`
 - `distributed_merge_unsupported`
 

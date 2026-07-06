@@ -876,8 +876,12 @@ pub fn applySchemaUpdateRecord(
     const next_version = if (doc_schemas_changed) current_version + 1 else current_version;
 
     const normalized_schema_json = try normalizeSchemaVersion(alloc, schema_json, next_version);
+    var normalized_schema_json_owned = true;
+    errdefer if (normalized_schema_json_owned) alloc.free(normalized_schema_json);
+    try validateRuntimeDerivableSchemaJson(alloc, normalized_schema_json);
     alloc.free(updated.schema_json);
     updated.schema_json = normalized_schema_json;
+    normalized_schema_json_owned = false;
 
     if (!doc_schemas_changed) return updated;
 
@@ -894,6 +898,14 @@ pub fn applySchemaUpdateRecord(
     alloc.free(updated.indexes_json);
     updated.indexes_json = next_indexes_json;
     return updated;
+}
+
+fn validateRuntimeDerivableSchemaJson(alloc: std.mem.Allocator, schema_json: []const u8) !void {
+    var parsed_schema = try parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+
+    const runtime_schema = try deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer runtime_schema_mod.freeSchema(alloc, runtime_schema);
 }
 
 pub fn routeQueryRequestToActiveReadIndex(
@@ -3456,6 +3468,49 @@ test "metadata.schema update keeps version for template-only changes" {
     try std.testing.expectEqualStrings(table.read_schema_json, updated.read_schema_json);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v2\":{\"type\":\"full_text\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v3\"") == null);
+}
+
+test "metadata.schema update rejects schemas that cannot derive runtime mappings" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":0}",
+        .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    const invalid_index_sort =
+        \\{
+        \\  "dynamic_templates": [
+        \\    {"name":"rank","path_match":"rank","mapping":{"type":"numeric","sortable":false}}
+        \\  ],
+        \\  "index_sort": [
+        \\    {"field":"rank","order":"asc"}
+        \\  ]
+        \\}
+    ;
+
+    const normalized = try parseSchemaUpdateRequest(std.testing.allocator, invalid_index_sort);
+    defer std.testing.allocator.free(normalized);
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        applySchemaUpdateRecord(std.testing.allocator, &table, normalized),
+    );
+
+    const invalid_id_order =
+        \\{
+        \\  "index_sort": [
+        \\    {"field":"_id","order":"desc"}
+        \\  ]
+        \\}
+    ;
+    const normalized_id_order = try parseSchemaUpdateRequest(std.testing.allocator, invalid_id_order);
+    defer std.testing.allocator.free(normalized_id_order);
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        applySchemaUpdateRecord(std.testing.allocator, &table, normalized_id_order),
+    );
 }
 
 test "metadata.query routing selects read schema full text index" {

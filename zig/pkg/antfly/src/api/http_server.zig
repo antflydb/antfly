@@ -4532,7 +4532,7 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         query_req: db_mod.types.SearchRequest,
     ) !void {
-        if (query_req.order_by.len == 0) return;
+        if (!publicSearchRequestHasSortPageControls(query_req)) return;
 
         var snapshot = (try self.source.adminSnapshot()) orelse return;
         defer self.source.freeAdminSnapshot(&snapshot);
@@ -7861,6 +7861,7 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntime(
 ) !void {
     const cursor = if (query_req.search_after.len > 0) query_req.search_after else query_req.search_before;
     if (query_req.order_by.len == 0 and cursor.len == 0) return;
+    try validatePublicCountOnlySortPageContract(query_req);
     try validatePublicSortCursorContract(query_req);
     try validatePublicScoreSortSource(query_req);
     try validatePublicApproximateSortSource(query_req);
@@ -7896,6 +7897,19 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntime(
         recordPublicSortCapabilityRejection(field.field, "unmapped_sort_field", "unmapped_field");
         return error.UnsupportedExactSort;
     }
+}
+
+fn publicSearchRequestHasSortPageControls(query_req: db_mod.types.SearchRequest) bool {
+    return query_req.order_by.len > 0 or
+        query_req.search_after.len > 0 or
+        query_req.search_before.len > 0;
+}
+
+fn validatePublicCountOnlySortPageContract(query_req: db_mod.types.SearchRequest) !void {
+    if (!query_req.count_only) return;
+    if (!publicSearchRequestHasSortPageControls(query_req)) return;
+    recordPublicSortCapabilityRejection("*", "unsupported_exact_sort", "count_only_ordered_page");
+    return error.UnsupportedExactSort;
 }
 
 fn validatePublicSortCursorContract(query_req: db_mod.types.SearchRequest) !void {
@@ -8118,6 +8132,7 @@ fn validatePublicSortCapabilityEvidence(
         }
     }
     if (matched_preferred) return preferred_type;
+    if (preferred_index_name != null) return null;
 
     var matched_fallback = false;
     var fallback_type: ?storage_schema.AntflyType = null;
@@ -10912,12 +10927,38 @@ test "api http public sort capability gate validates mapped sortable fields" {
         .index_name = @constCast("full_text_index_v0"),
         .field_capabilities = @constCast((&[_]storage_schema.FieldCapability{covered_created})[0..]),
     };
+    const covered_created_other_index_set = table_reads.ObservedDynamicFieldCapabilitySet{
+        .index_name = @constCast("full_text_index_v1"),
+        .field_capabilities = @constCast((&[_]storage_schema.FieldCapability{covered_created})[0..]),
+    };
 
     const created_order = [_]db_mod.types.SortField{.{ .field = "created_at", .desc = true }};
     try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
         .order_by = &created_order,
         .primary_text_index_name = "full_text_index_v0",
     }, runtime_schema, &.{covered_created_set});
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .count_only = true,
+        .order_by = &created_order,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{covered_created_set}));
+    var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("count_only_ordered_page", diagnostic.detail);
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &created_order,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{covered_created_other_index_set}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("created_at", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", diagnostic.reason);
+    try std.testing.expectEqualStrings("schema_declared", diagnostic.detail);
+    try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &created_order,
+    }, runtime_schema, &.{covered_created_other_index_set});
     const created_effective_order = [_]db_mod.types.SortField{
         .{ .field = "created_at", .desc = true },
         .{ .field = "_id", .desc = false },
@@ -10942,7 +10983,7 @@ test "api http public sort capability gate validates mapped sortable fields" {
         .search_after = &short_date_cursor,
         .primary_text_index_name = "full_text_index_v0",
     }, runtime_schema, &.{covered_created_set}));
-    var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("*", diagnostic.field);
     try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.reason);
     try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.detail);
@@ -10951,6 +10992,15 @@ test "api http public sort capability gate validates mapped sortable fields" {
     try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
         .search_after = &id_cursor,
     }, runtime_schema, &.{});
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .count_only = true,
+        .search_after = &id_cursor,
+    }, runtime_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("count_only_ordered_page", diagnostic.detail);
 
     const bad_id_cursor = [_]std.json.Value{.{ .integer = 7 }};
     db_mod.resetLastSortRejectionDiagnostic();

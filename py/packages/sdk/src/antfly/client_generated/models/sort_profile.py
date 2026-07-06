@@ -33,16 +33,45 @@ class SortProfile:
             distributed_behavior (str | Unset): Distributed sort behavior.
             selection_reason (str | Unset): Stable reason the planner selected this sort plan.
             require_native (bool | Unset): Whether exact execution required native typed sort values.
+            native_loader (bool | Unset): Whether a native typed sort value loader was active.
             native_doc_values_coverage (str | Unset): Native typed doc-values coverage status for mapped sort fields.
             index_sort_coverage (str | Unset): Physical index_sort coverage status for the requested order.
+            index_sort_match (bool | Unset): Whether the requested order matched the configured physical index_sort prefix.
+            sorted_segment_executor_available (bool | Unset): Whether sorted-segment execution was available for this
+                request.
+            sorted_segment_bounds_available (bool | Unset): Whether sorted-segment bounds were available for cursor seeks.
             candidate_count (int | Unset): Candidate documents considered by sort execution.
             cursor_rejected_count (int | Unset): Candidates rejected by cursor comparison.
+            admitted_count (int | Unset): Candidate hits admitted to the sort window.
+            replaced_count (int | Unset): Candidate hits replaced in the bounded sort window.
+            discarded_count (int | Unset): Candidate hits discarded by the bounded sort window.
             selected_count (int | Unset): Hits selected for the returned page.
+            decorate_us (int | Unset): Time spent decorating hits with sort values, in microseconds.
+            native_doc_value_load_us (int | Unset): Time spent loading native typed doc values, in microseconds.
+            native_doc_value_hit_count (int | Unset): Native typed doc-value loads that returned a value.
+            native_doc_value_miss_count (int | Unset): Native typed doc-value loads that missed and had to fail or fall
+                back.
+            stored_json_load_us (int | Unset): Time spent loading stored JSON for debug sort paths, in microseconds.
+            stored_json_load_count (int | Unset): Stored JSON loads performed by sort execution.
+            projected_source_load_us (int | Unset): Time spent loading projected source after page selection, in
+                microseconds.
+            projected_source_load_count (int | Unset): Projected source documents loaded after page selection.
+            final_sort_us (int | Unset): Time spent in the final in-memory page/window sort, in microseconds.
             total_us (int | Unset): Total sort execution time in microseconds.
+            window_capacity (int | Unset): Capacity of the bounded sort window.
+            window_len (int | Unset): Number of hits retained in the bounded sort window.
+            collector_heap_peak (int | Unset): Peak collector heap size observed during sort execution.
             distributed_shard_count (int | Unset): Shards participating in distributed sort execution.
             distributed_shard_window (int | Unset): Largest shard-local sorted window merged by the coordinator.
             budget_rejection_reason (str | Unset): Stable budget rejection reason.
-            sort_rejection_reason (str | Unset): Stable exact-sort rejection reason.
+            sort_rejection_reason (str | Unset): Stable exact-sort rejection reason. Known values include
+                `unmapped_sort_field`, `non_sortable_sort_field`,
+                `missing_doc_values_coverage`,
+                `missing_native_filter_coverage`, `invalid_cursor_arity`,
+                `invalid_cursor_type`, `approximate_candidate_source`,
+                `candidate_budget_exceeded`, `count_only_ordered_page`,
+                `stored_json_sort_disabled`, and
+                `distributed_merge_unsupported`.
             sort_rejection_detail (str | Unset): Stable rejection detail.
             sort_rejection_field (str | Unset): Sort field associated with the rejection when safe to expose.
     """
@@ -57,12 +86,31 @@ class SortProfile:
     distributed_behavior: str | Unset = UNSET
     selection_reason: str | Unset = UNSET
     require_native: bool | Unset = UNSET
+    native_loader: bool | Unset = UNSET
     native_doc_values_coverage: str | Unset = UNSET
     index_sort_coverage: str | Unset = UNSET
+    index_sort_match: bool | Unset = UNSET
+    sorted_segment_executor_available: bool | Unset = UNSET
+    sorted_segment_bounds_available: bool | Unset = UNSET
     candidate_count: int | Unset = UNSET
     cursor_rejected_count: int | Unset = UNSET
+    admitted_count: int | Unset = UNSET
+    replaced_count: int | Unset = UNSET
+    discarded_count: int | Unset = UNSET
     selected_count: int | Unset = UNSET
+    decorate_us: int | Unset = UNSET
+    native_doc_value_load_us: int | Unset = UNSET
+    native_doc_value_hit_count: int | Unset = UNSET
+    native_doc_value_miss_count: int | Unset = UNSET
+    stored_json_load_us: int | Unset = UNSET
+    stored_json_load_count: int | Unset = UNSET
+    projected_source_load_us: int | Unset = UNSET
+    projected_source_load_count: int | Unset = UNSET
+    final_sort_us: int | Unset = UNSET
     total_us: int | Unset = UNSET
+    window_capacity: int | Unset = UNSET
+    window_len: int | Unset = UNSET
+    collector_heap_peak: int | Unset = UNSET
     distributed_shard_count: int | Unset = UNSET
     distributed_shard_window: int | Unset = UNSET
     budget_rejection_reason: str | Unset = UNSET
@@ -97,17 +145,55 @@ class SortProfile:
 
         require_native = self.require_native
 
+        native_loader = self.native_loader
+
         native_doc_values_coverage = self.native_doc_values_coverage
 
         index_sort_coverage = self.index_sort_coverage
+
+        index_sort_match = self.index_sort_match
+
+        sorted_segment_executor_available = self.sorted_segment_executor_available
+
+        sorted_segment_bounds_available = self.sorted_segment_bounds_available
 
         candidate_count = self.candidate_count
 
         cursor_rejected_count = self.cursor_rejected_count
 
+        admitted_count = self.admitted_count
+
+        replaced_count = self.replaced_count
+
+        discarded_count = self.discarded_count
+
         selected_count = self.selected_count
 
+        decorate_us = self.decorate_us
+
+        native_doc_value_load_us = self.native_doc_value_load_us
+
+        native_doc_value_hit_count = self.native_doc_value_hit_count
+
+        native_doc_value_miss_count = self.native_doc_value_miss_count
+
+        stored_json_load_us = self.stored_json_load_us
+
+        stored_json_load_count = self.stored_json_load_count
+
+        projected_source_load_us = self.projected_source_load_us
+
+        projected_source_load_count = self.projected_source_load_count
+
+        final_sort_us = self.final_sort_us
+
         total_us = self.total_us
+
+        window_capacity = self.window_capacity
+
+        window_len = self.window_len
+
+        collector_heap_peak = self.collector_heap_peak
 
         distributed_shard_count = self.distributed_shard_count
 
@@ -144,18 +230,56 @@ class SortProfile:
             field_dict["selection_reason"] = selection_reason
         if require_native is not UNSET:
             field_dict["require_native"] = require_native
+        if native_loader is not UNSET:
+            field_dict["native_loader"] = native_loader
         if native_doc_values_coverage is not UNSET:
             field_dict["native_doc_values_coverage"] = native_doc_values_coverage
         if index_sort_coverage is not UNSET:
             field_dict["index_sort_coverage"] = index_sort_coverage
+        if index_sort_match is not UNSET:
+            field_dict["index_sort_match"] = index_sort_match
+        if sorted_segment_executor_available is not UNSET:
+            field_dict["sorted_segment_executor_available"] = sorted_segment_executor_available
+        if sorted_segment_bounds_available is not UNSET:
+            field_dict["sorted_segment_bounds_available"] = sorted_segment_bounds_available
         if candidate_count is not UNSET:
             field_dict["candidate_count"] = candidate_count
         if cursor_rejected_count is not UNSET:
             field_dict["cursor_rejected_count"] = cursor_rejected_count
+        if admitted_count is not UNSET:
+            field_dict["admitted_count"] = admitted_count
+        if replaced_count is not UNSET:
+            field_dict["replaced_count"] = replaced_count
+        if discarded_count is not UNSET:
+            field_dict["discarded_count"] = discarded_count
         if selected_count is not UNSET:
             field_dict["selected_count"] = selected_count
+        if decorate_us is not UNSET:
+            field_dict["decorate_us"] = decorate_us
+        if native_doc_value_load_us is not UNSET:
+            field_dict["native_doc_value_load_us"] = native_doc_value_load_us
+        if native_doc_value_hit_count is not UNSET:
+            field_dict["native_doc_value_hit_count"] = native_doc_value_hit_count
+        if native_doc_value_miss_count is not UNSET:
+            field_dict["native_doc_value_miss_count"] = native_doc_value_miss_count
+        if stored_json_load_us is not UNSET:
+            field_dict["stored_json_load_us"] = stored_json_load_us
+        if stored_json_load_count is not UNSET:
+            field_dict["stored_json_load_count"] = stored_json_load_count
+        if projected_source_load_us is not UNSET:
+            field_dict["projected_source_load_us"] = projected_source_load_us
+        if projected_source_load_count is not UNSET:
+            field_dict["projected_source_load_count"] = projected_source_load_count
+        if final_sort_us is not UNSET:
+            field_dict["final_sort_us"] = final_sort_us
         if total_us is not UNSET:
             field_dict["total_us"] = total_us
+        if window_capacity is not UNSET:
+            field_dict["window_capacity"] = window_capacity
+        if window_len is not UNSET:
+            field_dict["window_len"] = window_len
+        if collector_heap_peak is not UNSET:
+            field_dict["collector_heap_peak"] = collector_heap_peak
         if distributed_shard_count is not UNSET:
             field_dict["distributed_shard_count"] = distributed_shard_count
         if distributed_shard_window is not UNSET:
@@ -203,17 +327,55 @@ class SortProfile:
 
         require_native = d.pop("require_native", UNSET)
 
+        native_loader = d.pop("native_loader", UNSET)
+
         native_doc_values_coverage = d.pop("native_doc_values_coverage", UNSET)
 
         index_sort_coverage = d.pop("index_sort_coverage", UNSET)
+
+        index_sort_match = d.pop("index_sort_match", UNSET)
+
+        sorted_segment_executor_available = d.pop("sorted_segment_executor_available", UNSET)
+
+        sorted_segment_bounds_available = d.pop("sorted_segment_bounds_available", UNSET)
 
         candidate_count = d.pop("candidate_count", UNSET)
 
         cursor_rejected_count = d.pop("cursor_rejected_count", UNSET)
 
+        admitted_count = d.pop("admitted_count", UNSET)
+
+        replaced_count = d.pop("replaced_count", UNSET)
+
+        discarded_count = d.pop("discarded_count", UNSET)
+
         selected_count = d.pop("selected_count", UNSET)
 
+        decorate_us = d.pop("decorate_us", UNSET)
+
+        native_doc_value_load_us = d.pop("native_doc_value_load_us", UNSET)
+
+        native_doc_value_hit_count = d.pop("native_doc_value_hit_count", UNSET)
+
+        native_doc_value_miss_count = d.pop("native_doc_value_miss_count", UNSET)
+
+        stored_json_load_us = d.pop("stored_json_load_us", UNSET)
+
+        stored_json_load_count = d.pop("stored_json_load_count", UNSET)
+
+        projected_source_load_us = d.pop("projected_source_load_us", UNSET)
+
+        projected_source_load_count = d.pop("projected_source_load_count", UNSET)
+
+        final_sort_us = d.pop("final_sort_us", UNSET)
+
         total_us = d.pop("total_us", UNSET)
+
+        window_capacity = d.pop("window_capacity", UNSET)
+
+        window_len = d.pop("window_len", UNSET)
+
+        collector_heap_peak = d.pop("collector_heap_peak", UNSET)
 
         distributed_shard_count = d.pop("distributed_shard_count", UNSET)
 
@@ -238,12 +400,31 @@ class SortProfile:
             distributed_behavior=distributed_behavior,
             selection_reason=selection_reason,
             require_native=require_native,
+            native_loader=native_loader,
             native_doc_values_coverage=native_doc_values_coverage,
             index_sort_coverage=index_sort_coverage,
+            index_sort_match=index_sort_match,
+            sorted_segment_executor_available=sorted_segment_executor_available,
+            sorted_segment_bounds_available=sorted_segment_bounds_available,
             candidate_count=candidate_count,
             cursor_rejected_count=cursor_rejected_count,
+            admitted_count=admitted_count,
+            replaced_count=replaced_count,
+            discarded_count=discarded_count,
             selected_count=selected_count,
+            decorate_us=decorate_us,
+            native_doc_value_load_us=native_doc_value_load_us,
+            native_doc_value_hit_count=native_doc_value_hit_count,
+            native_doc_value_miss_count=native_doc_value_miss_count,
+            stored_json_load_us=stored_json_load_us,
+            stored_json_load_count=stored_json_load_count,
+            projected_source_load_us=projected_source_load_us,
+            projected_source_load_count=projected_source_load_count,
+            final_sort_us=final_sort_us,
             total_us=total_us,
+            window_capacity=window_capacity,
+            window_len=window_len,
+            collector_heap_peak=collector_heap_peak,
             distributed_shard_count=distributed_shard_count,
             distributed_shard_window=distributed_shard_window,
             budget_rejection_reason=budget_rejection_reason,

@@ -2388,12 +2388,19 @@ export interface components {
              */
             message: string;
             /**
-             * @description Stable machine-readable rejection reason.
+             * @description Stable machine-readable rejection reason. Known exact-sort
+             *     reasons include `unmapped_sort_field`,
+             *     `non_sortable_sort_field`, `missing_doc_values_coverage`,
+             *     `missing_native_filter_coverage`, `invalid_cursor_arity`,
+             *     `invalid_cursor_type`, `approximate_candidate_source`,
+             *     `candidate_budget_exceeded`, `count_only_ordered_page`,
+             *     `stored_json_sort_disabled`, and
+             *     `distributed_merge_unsupported`.
              * @example missing_doc_values_coverage
              */
             reason: string;
             /**
-             * @description Stable exact-sort rejection reason.
+             * @description Stable exact-sort rejection reason; uses the same stable reason taxonomy as `reason`.
              * @example missing_doc_values_coverage
              */
             sort_rejection_reason: string;
@@ -5883,10 +5890,18 @@ export interface components {
             selection_reason?: string;
             /** @description Whether exact execution required native typed sort values. */
             require_native?: boolean;
+            /** @description Whether a native typed sort value loader was active. */
+            native_loader?: boolean;
             /** @description Native typed doc-values coverage status for mapped sort fields. */
             native_doc_values_coverage?: string;
             /** @description Physical index_sort coverage status for the requested order. */
             index_sort_coverage?: string;
+            /** @description Whether the requested order matched the configured physical index_sort prefix. */
+            index_sort_match?: boolean;
+            /** @description Whether sorted-segment execution was available for this request. */
+            sorted_segment_executor_available?: boolean;
+            /** @description Whether sorted-segment bounds were available for cursor seeks. */
+            sorted_segment_bounds_available?: boolean;
             /**
              * Format: int64
              * @description Candidate documents considered by sort execution.
@@ -5899,14 +5914,89 @@ export interface components {
             cursor_rejected_count?: number;
             /**
              * Format: int64
+             * @description Candidate hits admitted to the sort window.
+             */
+            admitted_count?: number;
+            /**
+             * Format: int64
+             * @description Candidate hits replaced in the bounded sort window.
+             */
+            replaced_count?: number;
+            /**
+             * Format: int64
+             * @description Candidate hits discarded by the bounded sort window.
+             */
+            discarded_count?: number;
+            /**
+             * Format: int64
              * @description Hits selected for the returned page.
              */
             selected_count?: number;
             /**
              * Format: int64
+             * @description Time spent decorating hits with sort values, in microseconds.
+             */
+            decorate_us?: number;
+            /**
+             * Format: int64
+             * @description Time spent loading native typed doc values, in microseconds.
+             */
+            native_doc_value_load_us?: number;
+            /**
+             * Format: int64
+             * @description Native typed doc-value loads that returned a value.
+             */
+            native_doc_value_hit_count?: number;
+            /**
+             * Format: int64
+             * @description Native typed doc-value loads that missed and had to fail or fall back.
+             */
+            native_doc_value_miss_count?: number;
+            /**
+             * Format: int64
+             * @description Time spent loading stored JSON for debug sort paths, in microseconds.
+             */
+            stored_json_load_us?: number;
+            /**
+             * Format: int64
+             * @description Stored JSON loads performed by sort execution.
+             */
+            stored_json_load_count?: number;
+            /**
+             * Format: int64
+             * @description Time spent loading projected source after page selection, in microseconds.
+             */
+            projected_source_load_us?: number;
+            /**
+             * Format: int64
+             * @description Projected source documents loaded after page selection.
+             */
+            projected_source_load_count?: number;
+            /**
+             * Format: int64
+             * @description Time spent in the final in-memory page/window sort, in microseconds.
+             */
+            final_sort_us?: number;
+            /**
+             * Format: int64
              * @description Total sort execution time in microseconds.
              */
             total_us?: number;
+            /**
+             * Format: int64
+             * @description Capacity of the bounded sort window.
+             */
+            window_capacity?: number;
+            /**
+             * Format: int64
+             * @description Number of hits retained in the bounded sort window.
+             */
+            window_len?: number;
+            /**
+             * Format: int64
+             * @description Peak collector heap size observed during sort execution.
+             */
+            collector_heap_peak?: number;
             /**
              * Format: int64
              * @description Shards participating in distributed sort execution.
@@ -5919,7 +6009,16 @@ export interface components {
             distributed_shard_window?: number;
             /** @description Stable budget rejection reason. */
             budget_rejection_reason?: string;
-            /** @description Stable exact-sort rejection reason. */
+            /**
+             * @description Stable exact-sort rejection reason. Known values include
+             *     `unmapped_sort_field`, `non_sortable_sort_field`,
+             *     `missing_doc_values_coverage`,
+             *     `missing_native_filter_coverage`, `invalid_cursor_arity`,
+             *     `invalid_cursor_type`, `approximate_candidate_source`,
+             *     `candidate_budget_exceeded`, `count_only_ordered_page`,
+             *     `stored_json_sort_disabled`, and
+             *     `distributed_merge_unsupported`.
+             */
             sort_rejection_reason?: string;
             /** @description Stable rejection detail. */
             sort_rejection_detail?: string;

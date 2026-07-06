@@ -17,8 +17,17 @@ class ExactSortError:
     Attributes:
         error (str): Stable error class. Example: unsupported_exact_sort.
         message (str): Human-readable error summary. Example: exact sort is unsupported for this query.
-        reason (str): Stable machine-readable rejection reason. Example: missing_doc_values_coverage.
-        sort_rejection_reason (str): Stable exact-sort rejection reason. Example: missing_doc_values_coverage.
+        reason (str): Stable machine-readable rejection reason. Known exact-sort
+            reasons include `unmapped_sort_field`,
+            `non_sortable_sort_field`, `missing_doc_values_coverage`,
+            `missing_native_filter_coverage`, `invalid_cursor_arity`,
+            `invalid_cursor_type`, `approximate_candidate_source`,
+            `candidate_budget_exceeded`, `count_only_ordered_page`,
+            `stored_json_sort_disabled`, and
+            `distributed_merge_unsupported`.
+             Example: missing_doc_values_coverage.
+        sort_rejection_reason (str): Stable exact-sort rejection reason; uses the same stable reason taxonomy as
+            `reason`. Example: missing_doc_values_coverage.
         sort_rejection_detail (str): More specific exact-sort rejection detail. Example: missing_doc_values_section.
         sort_rejection_field (str): Sort field associated with the rejection when safe to expose. Example: created_at.
         status (int):  Example: 422.
