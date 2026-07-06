@@ -41320,7 +41320,7 @@ test "db write sync trailing dense no-op batches drain stale delete replay at id
     var drained = false;
     var attempts: usize = 0;
     while (attempts < slow_test_wait_attempts) : (attempts += 1) {
-        const stats = try db.stats(alloc);
+        const stats = try db.runtimeStatusStatsConsistent(alloc);
         defer types.freeDBStats(alloc, stats);
         try std.testing.expectEqual(@as(usize, 1), stats.indexes.len);
         const index = stats.indexes[0];
@@ -41356,7 +41356,7 @@ test "db write sync trailing dense no-op batches drain stale delete replay at id
     var delete_drained = false;
     attempts = 0;
     while (attempts < slow_test_wait_attempts) : (attempts += 1) {
-        const stats = try db.stats(alloc);
+        const stats = try db.runtimeStatusStatsConsistent(alloc);
         defer types.freeDBStats(alloc, stats);
         try std.testing.expectEqual(@as(usize, 1), stats.indexes.len);
         const index = stats.indexes[0];
