@@ -727,6 +727,10 @@ fn preflightQueryRequestAgainstContext(
             }
         }
     }
+    if (try metadataSortCursorFeedback(alloc, context, query_request)) |feedback| {
+        defer alloc.free(feedback.message);
+        try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "invalid_sort_cursor", feedback.path, feedback.message);
+    }
     if (query_request.graph_searches) |graph_searches| {
         if (try metadataValidateGraphSearchesAgainstContext(alloc, context, graph_searches)) |feedback| {
             defer alloc.free(feedback);
@@ -1542,6 +1546,125 @@ fn metadataCapabilityNotQueryableForSort(capability: QueryBuilderFieldCapability
         return if (capability.queryability_state.len > 0) capability.queryability_state else "unknown_queryability_state";
     }
     return null;
+}
+
+const SortCursorFeedback = struct {
+    path: []const u8,
+    message: []const u8,
+};
+
+fn metadataSortCursorFeedback(
+    alloc: std.mem.Allocator,
+    context: *const QueryBuilderTableContext,
+    query_request: metadata_openapi.QueryRequest,
+) !?SortCursorFeedback {
+    const cursor = if (query_request.search_after) |values|
+        values
+    else if (query_request.search_before) |values|
+        values
+    else
+        return null;
+    const path = if (query_request.search_after != null) "query_request.search_after" else "query_request.search_before";
+
+    if (query_request.search_after != null and query_request.search_before != null) return null;
+
+    const field_count = metadataEffectiveSortFieldCount(query_request);
+    if (cursor.len != field_count) return null;
+
+    for (0..field_count) |i| {
+        const field = metadataEffectiveSortFieldAt(query_request, i);
+        if (std.mem.eql(u8, field.field, "_id")) {
+            if (cursor[i] != .string) {
+                return .{ .path = path, .message = try std.fmt.allocPrint(alloc, "{s} value for _id must be a string", .{path}) };
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, field.field, "_score")) {
+            if (!metadataSortCursorValueIsNumeric(cursor[i])) {
+                return .{ .path = path, .message = try std.fmt.allocPrint(alloc, "{s} value for _score must be numeric", .{path}) };
+            }
+            continue;
+        }
+
+        const field_type = metadataQueryableSortFieldType(context, field.field) orelse continue;
+        if (!metadataSortCursorValueMatchesFieldType(cursor[i], field_type)) {
+            return .{
+                .path = path,
+                .message = try std.fmt.allocPrint(
+                    alloc,
+                    "{s} value for sort field '{s}' does not match mapped type '{s}'",
+                    .{ path, field.field, @tagName(field_type) },
+                ),
+            };
+        }
+    }
+    return null;
+}
+
+fn metadataEffectiveSortFieldCount(query_request: metadata_openapi.QueryRequest) usize {
+    const order_by = query_request.order_by orelse return if (query_request.search_after != null or query_request.search_before != null) 1 else 0;
+    if (order_by.len == 0) return 0;
+    return order_by.len + @intFromBool(!std.mem.eql(u8, order_by[order_by.len - 1].field, "_id"));
+}
+
+fn metadataEffectiveSortFieldAt(query_request: metadata_openapi.QueryRequest, index: usize) metadata_openapi.SortField {
+    const order_by = query_request.order_by orelse return .{ .field = "_id", .desc = false };
+    if (index < order_by.len) return order_by[index];
+    return .{ .field = "_id", .desc = false };
+}
+
+fn metadataQueryableSortFieldType(context: *const QueryBuilderTableContext, field: []const u8) ?storage_schema.AntflyType {
+    var field_type: ?storage_schema.AntflyType = null;
+    for (context.field_capabilities) |capability| {
+        if (!std.mem.eql(u8, capability.field, field)) continue;
+        if (!capability.sortable or !capability.doc_values) continue;
+        if (metadataCapabilityNotQueryableForSort(capability) != null) continue;
+        const candidate = capability.field_type orelse continue;
+        if (field_type) |expected| {
+            if (expected != candidate) return null;
+        } else {
+            field_type = candidate;
+        }
+    }
+    return field_type;
+}
+
+fn metadataSortCursorValueMatchesFieldType(value: std.json.Value, field_type: storage_schema.AntflyType) bool {
+    return switch (field_type) {
+        .keyword, .link => value == .string,
+        .numeric => metadataSortCursorValueIsNumeric(value),
+        .datetime => metadataSortCursorValueIsDateLike(value),
+        .boolean => value == .bool,
+        else => false,
+    };
+}
+
+fn metadataSortCursorValueIsNumeric(value: std.json.Value) bool {
+    return switch (value) {
+        .integer => true,
+        .float => |number| std.math.isFinite(number),
+        .number_string => |text| metadataJsonNumberStringIsFinite(text),
+        else => false,
+    };
+}
+
+fn metadataSortCursorValueIsDateLike(value: std.json.Value) bool {
+    return switch (value) {
+        .string => |text| storage_schema.parseDateTimeToNs(text) != null,
+        .integer => |number| number >= 0,
+        .number_string => |text| blk: {
+            _ = std.fmt.parseUnsigned(u64, text, 10) catch break :blk false;
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+fn metadataJsonNumberStringIsFinite(text: []const u8) bool {
+    if (std.fmt.parseInt(i64, text, 10)) |_| return true else |_| {}
+    if (std.fmt.parseInt(u64, text, 10)) |_| return true else |_| {}
+    const value = std.fmt.parseFloat(f64, text) catch return false;
+    return std.math.isFinite(value);
 }
 
 fn metadataFullTextIndexesAllowField(context: *const QueryBuilderTableContext, field: []const u8) bool {
@@ -6414,6 +6537,81 @@ test "query builder preflight accepts queryable mapped sort field outside full t
     defer preflight.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 0), preflight.diagnostics.len);
+}
+
+test "query builder preflight validates cursor values against mapped sort field types" {
+    const capabilities = [_]QueryBuilderFieldCapability{
+        .{
+            .field = "created_at",
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .doc_value_coverage = "covered",
+            .queryability_state = "queryable",
+        },
+        .{
+            .field = "status",
+            .field_type = .keyword,
+            .doc_values = true,
+            .sortable = true,
+            .doc_value_coverage = "covered",
+            .queryability_state = "queryable",
+        },
+    };
+    var collected = collectQueryBuilderContext(.{
+        .schema_fields = &.{ "created_at", "status" },
+        .field_capabilities = &capabilities,
+    });
+
+    const created_order = [_]metadata_openapi.SortField{.{ .field = "created_at", .desc = true }};
+    const invalid_date_cursor = [_]std.json.Value{
+        .{ .float = 1_704_067_200_000_000_000.0 },
+        .{ .string = "doc-9" },
+    };
+    var invalid_date_preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
+        .intent = "newest docs after cursor",
+    }, .{
+        .order_by = &created_order,
+        .search_after = &invalid_date_cursor,
+    }, null, "query_builder", .{});
+    defer invalid_date_preflight.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), invalid_date_preflight.diagnostics.len);
+    try std.testing.expectEqual(QueryPreflightDiagnosticSeverity.@"error", invalid_date_preflight.diagnostics[0].severity);
+    try std.testing.expectEqualStrings("invalid_sort_cursor", invalid_date_preflight.diagnostics[0].code);
+    try std.testing.expectEqualStrings("query_request.search_after", invalid_date_preflight.diagnostics[0].path);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_date_preflight.diagnostics[0].message, "created_at") != null);
+
+    const valid_date_cursor = [_]std.json.Value{
+        .{ .string = "2026-01-01T00:00:00Z" },
+        .{ .string = "doc-9" },
+    };
+    var valid_date_preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
+        .intent = "newest docs after cursor",
+    }, .{
+        .order_by = &created_order,
+        .search_after = &valid_date_cursor,
+    }, null, "query_builder", .{});
+    defer valid_date_preflight.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), valid_date_preflight.diagnostics.len);
+
+    const status_order = [_]metadata_openapi.SortField{.{ .field = "status" }};
+    const invalid_status_cursor = [_]std.json.Value{
+        .{ .integer = 42 },
+        .{ .string = "doc-9" },
+    };
+    var invalid_status_preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
+        .intent = "status sorted docs before cursor",
+    }, .{
+        .order_by = &status_order,
+        .search_before = &invalid_status_cursor,
+    }, null, "query_builder", .{});
+    defer invalid_status_preflight.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), invalid_status_preflight.diagnostics.len);
+    try std.testing.expectEqualStrings("invalid_sort_cursor", invalid_status_preflight.diagnostics[0].code);
+    try std.testing.expectEqualStrings("query_request.search_before", invalid_status_preflight.diagnostics[0].path);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_status_preflight.diagnostics[0].message, "status") != null);
 }
 
 test "query builder preflight rejects declared sort field before doc values are covered" {

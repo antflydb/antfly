@@ -518,6 +518,66 @@ pub const TypedDocValuesReader = struct {
         }
         return result;
     }
+
+    /// Read all doc IDs in a chunk after validating that the typed value
+    /// payload for the same chunk is decodable. Caller owns returned slice.
+    pub fn readValidatedChunkDocIds(self: *const TypedDocValuesReader, chunk_idx: u32) ![]u32 {
+        const chunk_data = try self.decompressChunk(chunk_idx);
+        defer self.alloc.free(chunk_data);
+        if (chunk_data.len < 4) return error.InvalidData;
+        const num_docs = std.mem.readInt(u32, chunk_data[0..4], .little);
+        try self.validateChunkValuePayload(chunk_data, num_docs);
+
+        const result = try self.alloc.alloc(u32, num_docs);
+        for (0..num_docs) |i| {
+            const off = 4 + i * 4;
+            result[i] = std.mem.readInt(u32, chunk_data[off..][0..4], .little);
+        }
+        return result;
+    }
+
+    fn validateChunkValuePayload(
+        self: *const TypedDocValuesReader,
+        chunk_data: []const u8,
+        num_docs: u32,
+    ) !void {
+        switch (self.value_type) {
+            .u64_val, .i64_val => {
+                _ = try fixedValueSpanStart(chunk_data, num_docs, 8);
+            },
+            .f64_val => {
+                const values_start = try fixedValueSpanStart(chunk_data, num_docs, 8);
+                for (0..num_docs) |i| {
+                    const off = values_start + i * 8;
+                    _ = try decodeSerializableF64(chunk_data[off..][0..8].*);
+                }
+            },
+            .geo_point => {
+                const values_start = try fixedValueSpanStart(chunk_data, num_docs, 16);
+                for (0..num_docs) |i| {
+                    const off = values_start + i * 16;
+                    _ = try decodeSerializableF64(chunk_data[off..][0..8].*);
+                    _ = try decodeSerializableF64(chunk_data[off + 8 ..][0..8].*);
+                }
+            },
+            .bool_val => {
+                const values_start = try fixedValueSpanStart(chunk_data, num_docs, 1);
+                for (0..num_docs) |i| {
+                    _ = try decodeSerializableBool(chunk_data[values_start + i]);
+                }
+            },
+            .bytes_val => {
+                var cursor = try valuesStartForDocIds(chunk_data, num_docs);
+                for (0..num_docs) |_| {
+                    if (cursor + 4 > chunk_data.len) return error.InvalidData;
+                    const value_len = std.mem.readInt(u32, chunk_data[cursor..][0..4], .little);
+                    cursor += 4;
+                    if (value_len > chunk_data.len - cursor) return error.InvalidData;
+                    cursor += value_len;
+                }
+            },
+        }
+    }
 };
 
 // ============================================================================
@@ -564,6 +624,10 @@ test "typed doc values u64 round-trip" {
     try std.testing.expectEqual(@as(?u64, 200), try reader.getU64(1));
     try std.testing.expectEqual(@as(?u64, 500), try reader.getU64(5));
     try std.testing.expectEqual(@as(?u64, null), try reader.getU64(3));
+
+    const doc_ids = try reader.readValidatedChunkDocIds(0);
+    defer alloc.free(doc_ids);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 5 }, doc_ids);
 }
 
 test "typed doc values writer rejects mismatched value type" {
@@ -677,6 +741,7 @@ test "typed doc values reader rejects malformed bytes value lengths" {
 
     var reader = try TypedDocValuesReader.init(alloc, data.items);
     try std.testing.expectError(error.InvalidData, reader.getBytesAlloc(0));
+    try std.testing.expectError(error.InvalidData, reader.readValidatedChunkDocIds(0));
 }
 
 test "typed doc values reader rejects non-canonical bool values" {
@@ -687,6 +752,7 @@ test "typed doc values reader rejects non-canonical bool values" {
 
     var reader = try TypedDocValuesReader.init(alloc, data);
     try std.testing.expectError(error.InvalidData, reader.getBool(0));
+    try std.testing.expectError(error.InvalidData, reader.readValidatedChunkDocIds(0));
 }
 
 test "typed doc values reader rejects non-finite floating payloads" {
@@ -699,6 +765,7 @@ test "typed doc values reader rejects non-finite floating payloads" {
     var f64_reader = try TypedDocValuesReader.init(alloc, f64_data);
     try std.testing.expectError(error.InvalidData, f64_reader.getF64(0));
     try std.testing.expectError(error.InvalidData, f64_reader.readF64Chunk(0));
+    try std.testing.expectError(error.InvalidData, f64_reader.readValidatedChunkDocIds(0));
 
     var geo_bytes = std.ArrayListUnmanaged(u8).empty;
     defer geo_bytes.deinit(alloc);
@@ -711,6 +778,7 @@ test "typed doc values reader rejects non-finite floating payloads" {
     var geo_reader = try TypedDocValuesReader.init(alloc, geo_data);
     try std.testing.expectError(error.InvalidData, geo_reader.getGeoPoint(0));
     try std.testing.expectError(error.InvalidData, geo_reader.readGeoPointChunk(0));
+    try std.testing.expectError(error.InvalidData, geo_reader.readValidatedChunkDocIds(0));
 }
 
 test "typed doc values i64 round-trip" {

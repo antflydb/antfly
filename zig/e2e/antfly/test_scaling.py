@@ -1450,27 +1450,7 @@ def test_autoscaling_drains_data_node_and_replaces_placements(
     node_to_drain = sorted(initial_nodes)[0]
     cluster.request_node_shutdown(node_to_drain)
 
-    def drained_and_replaced() -> dict[str, Any] | None:
-        snapshots = _all_metadata_snapshots(cluster)
-        if snapshots is None:
-            return None
-        for snapshot in snapshots:
-            stores = [store for store in snapshot.get("stores", []) if isinstance(store, dict)]
-            drained_store = next(
-                (store for store in stores if int(store.get("node_id", 0)) == node_to_drain),
-                None,
-            )
-            if not drained_store or drained_store.get("drain_requested") is not True:
-                return None
-            for intent in snapshot.get("placement_intents", []):
-                if not isinstance(intent, dict) or not isinstance(intent.get("record"), dict):
-                    continue
-                record = intent["record"]
-                if int(record.get("group_id", 0)) in group_ids and int(record.get("local_node_id", 0)) == node_to_drain:
-                    return None
-        return snapshots[0]
-
-    drained = wait_until(drained_and_replaced, timeout_s=90.0, interval_s=0.5)
+    drained = _wait_node_drained_for_groups(cluster, node_to_drain, group_ids, timeout_s=90.0)
     assert drained is not None, (
         "drained data node still owned table placements\n"
         f"node_to_drain: {node_to_drain}\n"

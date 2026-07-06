@@ -45,6 +45,8 @@ const ttl_mod = @import("../../ttl.zig");
 const lmdb = @import("../../lmdb.zig");
 const mapper = @import("../document_mapper.zig");
 const typed_dv = @import("../../../section/typed_doc_values.zig");
+const typed_dv_coverage = @import("../typed_doc_values_coverage.zig");
+const snappy = @import("../../../encoding/snappy.zig");
 const merger_mod = @import("../../../merger.zig");
 const index_mod = @import("../../../index.zig");
 const text_index_maintenance = @import("text_index_maintenance.zig");
@@ -4008,9 +4010,13 @@ pub const IndexManager = struct {
         }
         for (entry.observed_field_analyzers) |item| {
             var capability = schema_mod.observedDynamicFieldCapability(entry.runtime_schema, item.field_name, item.mapping());
-            if (try observedDynamicFieldHasCompleteTypedDocValueCoverage(alloc, entry, item.field_name, item.mapping())) {
+            const coverage = try observedDynamicFieldTypedDocValueCoverageStatus(alloc, entry, item.field_name, item.mapping());
+            if (coverage == .covered) {
                 capability.doc_value_coverage = "covered";
                 capability.queryability_state = "queryable";
+            } else if (schema_mod.mappingIsSortable(item.mapping())) {
+                capability.doc_value_coverage = typed_dv_coverage.statusName(coverage);
+                capability.queryability_state = "missing_doc_values";
             }
             capabilities[initialized] = try schema_mod.cloneFieldCapabilityAlloc(
                 alloc,
@@ -4023,9 +4029,13 @@ pub const IndexManager = struct {
                 const field = schema_mod.exactDynamicTemplatePath(template) orelse continue;
                 if (!schema_mod.mappingIsSortable(template.mapping)) continue;
                 var capability = schema_mod.dynamicTemplateFieldCapability(schema, template);
-                if (try observedDynamicFieldHasCompleteTypedDocValueCoverage(alloc, entry, field, template.mapping)) {
+                const coverage = try observedDynamicFieldTypedDocValueCoverageStatus(alloc, entry, field, template.mapping);
+                if (coverage == .covered) {
                     capability.doc_value_coverage = "covered";
                     capability.queryability_state = "queryable";
+                } else {
+                    capability.doc_value_coverage = typed_dv_coverage.statusName(coverage);
+                    capability.queryability_state = "missing_doc_values";
                 }
                 capabilities[initialized] = try schema_mod.cloneFieldCapabilityAlloc(alloc, capability);
                 initialized += 1;
@@ -4046,36 +4056,25 @@ pub const IndexManager = struct {
         return capability_count;
     }
 
-    fn observedDynamicFieldHasCompleteTypedDocValueCoverage(
+    fn observedDynamicFieldTypedDocValueCoverageStatus(
         alloc: Allocator,
         entry: *TextIndex,
         field: []const u8,
         mapping: schema_mod.FieldMapping,
-    ) !bool {
-        if (!schema_mod.mappingIsSortable(mapping)) return false;
+    ) !typed_dv_coverage.Status {
+        if (!schema_mod.mappingIsSortable(mapping)) return .missing_doc_values_section;
         const snapshot = entry.persistent.snapshot();
-        if (snapshot.global_doc_count == 0) return true;
+        if (snapshot.global_doc_count == 0) return .covered;
 
-        var covered_live_segment = false;
         for (snapshot.segments) |*segment| {
             if (segment.liveDocCount() == 0) continue;
-            covered_live_segment = true;
-            const section_data = segment.reader.getSection(field, .typed_doc_values) orelse return false;
-            const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch return false;
-            if (!typedDocValueReaderMatchesMapping(reader.value_type, mapping)) return false;
-            for (0..segment.reader.doc_count) |local_usize| {
-                const local_doc: u32 = @intCast(local_usize);
-                if (segment.shared.deleted) |deleted| {
-                    if (deleted.contains(local_doc)) continue;
-                }
-                const has_value = typedDocValueReaderHasDocValue(reader, local_doc) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    else => return false,
-                };
-                if (!has_value) return false;
-            }
+            const section_data = segment.reader.getSection(field, .typed_doc_values) orelse return .missing_doc_values_section;
+            const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch return .malformed_doc_values_section;
+            if (!typedDocValueReaderMatchesMapping(reader.value_type, mapping)) return .doc_values_kind_mismatch;
+            const coverage = try typed_dv_coverage.readerCoversLiveDocsAlloc(alloc, segment, &reader);
+            if (coverage != .covered) return coverage;
         }
-        return covered_live_segment;
+        return .covered;
     }
 
     fn typedDocValueReaderMatchesMapping(value_type: typed_dv.ValueType, mapping: schema_mod.FieldMapping) bool {
@@ -4088,21 +4087,6 @@ pub const IndexManager = struct {
             .boolean => value_type == .bool_val,
             .keyword, .link => value_type == .bytes_val,
             else => false,
-        };
-    }
-
-    fn typedDocValueReaderHasDocValue(reader: typed_dv.TypedDocValuesReader, doc_id: u32) !bool {
-        return switch (reader.value_type) {
-            .u64_val => (try reader.getU64(doc_id)) != null,
-            .i64_val => (try reader.getI64(doc_id)) != null,
-            .f64_val => (try reader.getF64(doc_id)) != null,
-            .bool_val => (try reader.getBool(doc_id)) != null,
-            .bytes_val => blk: {
-                const value = try reader.getBytesAlloc(doc_id) orelse break :blk false;
-                defer reader.alloc.free(value);
-                break :blk true;
-            },
-            .geo_point => false,
         };
     }
 
@@ -16805,8 +16789,94 @@ test "observed dynamic sortable field capability stays declared for sparse doc v
     const capabilities = try manager.observedDynamicFieldCapabilitiesAlloc(alloc, "ft_v1");
     defer schema_mod.freeOwnedFieldCapabilities(alloc, capabilities);
     try std.testing.expectEqual(@as(usize, 1), capabilities.len);
-    try std.testing.expectEqualStrings("observed_declared", capabilities[0].doc_value_coverage);
-    try std.testing.expectEqualStrings("declared", capabilities[0].queryability_state);
+    try std.testing.expectEqualStrings("sparse_live_doc_values", capabilities[0].doc_value_coverage);
+    try std.testing.expectEqualStrings("missing_doc_values", capabilities[0].queryability_state);
+}
+
+fn buildDuplicateF64DocValuesSectionAlloc(alloc: Allocator) ![]u8 {
+    var chunk = std.ArrayListUnmanaged(u8).empty;
+    defer chunk.deinit(alloc);
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 3))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 0))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 0))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
+    try chunk.appendSlice(alloc, &@as([8]u8, @bitCast(@as(f64, 10.0))));
+    try chunk.appendSlice(alloc, &@as([8]u8, @bitCast(@as(f64, 11.0))));
+    try chunk.appendSlice(alloc, &@as([8]u8, @bitCast(@as(f64, 20.0))));
+
+    const compressed = try snappy.encode(alloc, chunk.items);
+    defer alloc.free(compressed);
+
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(alloc);
+    try data.append(alloc, @intFromEnum(typed_dv.ValueType.f64_val));
+    try data.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
+    const chunk_end: u64 = @intCast(5 + 8 + compressed.len);
+    try data.appendSlice(alloc, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, chunk_end))));
+    try data.appendSlice(alloc, compressed);
+    return try data.toOwnedSlice(alloc);
+}
+
+test "observed dynamic sortable field capability stays declared for duplicate doc value rows" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    try manager.addAllNoBackfill(&store, &.{
+        .{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        },
+    });
+    const entry = manager.textIndexEntry("ft_v1").?;
+
+    const dv_data = try buildDuplicateF64DocValuesSectionAlloc(alloc);
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const price_idx = try seg_writer.addField("price");
+    try seg_writer.addSection(price_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"price\":10}");
+    try seg_writer.addStoredDoc("doc:b", "{\"price\":20}");
+    const segment = try seg_writer.build();
+    defer alloc.free(segment);
+    try entry.persistent.indexSegment(segment);
+
+    const observed_field = try alloc.dupe(u8, "price");
+    defer alloc.free(observed_field);
+    const observed_analyzer = try alloc.dupe(u8, "keyword");
+    defer alloc.free(observed_analyzer);
+    const observed = [_]mapper.ObservedFieldAnalyzer{.{
+        .field_name = observed_field,
+        .analyzer_name = observed_analyzer,
+        .field_type = .numeric,
+        .doc_values = true,
+        .sortable = true,
+    }};
+    try mergeObservedTextFieldAnalyzers(&manager, &store, entry, observed[0..]);
+
+    const capabilities = try manager.observedDynamicFieldCapabilitiesAlloc(alloc, "ft_v1");
+    defer schema_mod.freeOwnedFieldCapabilities(alloc, capabilities);
+    try std.testing.expectEqual(@as(usize, 1), capabilities.len);
+    try std.testing.expectEqualStrings("price", capabilities[0].field.?);
+    try std.testing.expect(capabilities[0].doc_values);
+    try std.testing.expect(capabilities[0].sortable);
+    try std.testing.expectEqualStrings("duplicate_doc_value_doc_id", capabilities[0].doc_value_coverage);
+    try std.testing.expectEqualStrings("missing_doc_values", capabilities[0].queryability_state);
 }
 
 test "observed full text analyzer metadata persists mapping decisions" {

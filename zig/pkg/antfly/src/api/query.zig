@@ -1522,18 +1522,20 @@ test "query merge applies distributed typed sort ordering and cursor paging" {
     left_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:a", 1);
     left_hits[1] = try testSortedQueryHitAlloc(alloc, "doc:c", 3);
     left_hits[2] = try testSortedQueryHitAlloc(alloc, "doc:e", 5);
-    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 4);
     right_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:b", 2);
     right_hits[1] = try testSortedQueryHitAlloc(alloc, "doc:d", 4);
+    right_hits[2] = try testSortedQueryHitAlloc(alloc, "doc:f", 6);
+    right_hits[3] = try testSortedQueryHitAlloc(alloc, "doc:h", 8);
 
     var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 3 };
     defer left.deinit();
-    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 2, .total_hits_relation = .gte };
+    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 4, .total_hits_relation = .gte };
     defer right.deinit();
 
     var first_page = try mergeSearchResultsWithRuntimeSchema(alloc, .{ .order_by = &order_by }, &.{ left, right }, 1, 3, schema);
     defer first_page.deinit();
-    try std.testing.expectEqual(@as(u32, 5), first_page.total_hits);
+    try std.testing.expectEqual(@as(u32, 7), first_page.total_hits);
     try std.testing.expectEqual(db_mod.types.TotalHitsRelation.gte, first_page.total_hits_relation);
     try std.testing.expectEqual(@as(usize, 3), first_page.hits.len);
     try std.testing.expectEqualStrings("doc:b", first_page.hits[0].id);
@@ -1559,7 +1561,7 @@ test "query merge applies distributed typed sort ordering and cursor paging" {
     try std.testing.expectEqualStrings("distributed_merge", sort_profile.source);
     try std.testing.expectEqualStrings("coordinator_merge", sort_profile.distributed_behavior);
     try std.testing.expectEqual(@as(usize, 2), sort_profile.distributed_shard_count);
-    try std.testing.expectEqual(@as(usize, 3), sort_profile.distributed_shard_window);
+    try std.testing.expectEqual(@as(usize, 4), sort_profile.distributed_shard_window);
 
     const before_cursor = [_]std.json.Value{
         .{ .integer = 5 },

@@ -22,6 +22,7 @@ const docstore_mod = @import("../../docstore.zig");
 const internal_keys = @import("../../internal_keys.zig");
 const doc_set = @import("../doc_set.zig");
 const doc_identity = @import("../doc_identity.zig");
+const typed_dv_coverage = @import("../typed_doc_values_coverage.zig");
 const graph_exec = @import("graph_exec.zig");
 const result_shape = @import("result_shape.zig");
 const search_mod = @import("../../../search/search.zig");
@@ -30,6 +31,7 @@ const index_mod = @import("../../../index.zig");
 const segment_mod = @import("../../../segment.zig");
 const typed_dv = @import("../../../section/typed_doc_values.zig");
 const roaring = @import("../../../encoding/roaring.zig");
+const snappy = @import("../../../encoding/snappy.zig");
 const distributed_stats_mod = @import("../../../search/distributed_stats.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
 const introducer_mod = @import("../../../introducer.zig");
@@ -3018,6 +3020,7 @@ const SortExecutionPlan = struct {
     index_sort_match: bool = false,
     sorted_segment_executor_available: bool = false,
     sorted_segment_bounds_available: bool = false,
+    selective_filter_doc_values_preferred: bool = false,
 };
 
 fn defaultSortPlanExactness(kind: SortExecutionPlanKind) SortPlanExactness {
@@ -3225,7 +3228,9 @@ fn sortPlanSelectionReason(plan: SortExecutionPlan) []const u8 {
         else
             "sorted_segment_seek",
         .native_doc_values_top_n => if (plan.index_sort_match)
-            if (plan.sorted_segment_executor_available)
+            if (plan.selective_filter_doc_values_preferred)
+                "selective_filter_doc_values_collector"
+            else if (plan.sorted_segment_executor_available)
                 "caller_selected_doc_values_collector"
             else
                 "index_sort_unavailable_doc_values_collector"
@@ -3247,6 +3252,12 @@ test "sort execution plan selection reasons are stable for diagnostics" {
         .kind = .native_doc_values_top_n,
         .index_sort_match = true,
         .sorted_segment_executor_available = true,
+    }));
+    try std.testing.expectEqualStrings("selective_filter_doc_values_collector", sortPlanSelectionReason(.{
+        .kind = .native_doc_values_top_n,
+        .index_sort_match = true,
+        .sorted_segment_executor_available = true,
+        .selective_filter_doc_values_preferred = true,
     }));
     try std.testing.expectEqualStrings("index_sort_sorted_segment_seek", sortPlanSelectionReason(.{
         .kind = .sorted_segment_seek,
@@ -6863,6 +6874,7 @@ fn sortedSegmentLocalDocDeleted(segment: *const index_mod.SegmentEntry, local_do
 
 const SortedSegmentDocMembership = struct {
     segments: []roaring.RoaringBitmap,
+    candidate_count: usize = 0,
 
     fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.segments) |*bitmap| bitmap.deinit();
@@ -6889,13 +6901,37 @@ fn buildSortedSegmentDocMembershipAlloc(
     }
 
     var doc_base: u32 = 0;
+    var candidate_count: usize = 0;
     for (snapshot.segments, 0..) |*segment, i| {
         defer doc_base += segment.reader.doc_count;
         bitmaps[i] = try filter.executeWithOffset(alloc, segment, doc_base);
+        candidate_count += bitmaps[i].cardinality();
         initialized += 1;
     }
 
-    return .{ .segments = bitmaps };
+    return .{ .segments = bitmaps, .candidate_count = candidate_count };
+}
+
+fn sortedSegmentDocMembershipDocNumsAlloc(
+    alloc: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    membership: *const SortedSegmentDocMembership,
+) ![]const u32 {
+    var out = try std.ArrayListUnmanaged(u32).initCapacity(alloc, membership.candidate_count);
+    errdefer out.deinit(alloc);
+
+    var doc_base: u32 = 0;
+    for (snapshot.segments, 0..) |*segment, segment_index| {
+        defer doc_base += segment.reader.doc_count;
+        if (segment_index >= membership.segments.len) continue;
+        var iter = membership.segments[segment_index].iterator();
+        while (iter.next()) |local_doc_id| {
+            if (local_doc_id >= segment.reader.doc_count) continue;
+            try out.append(alloc, doc_base + local_doc_id);
+        }
+    }
+
+    return try out.toOwnedSlice(alloc);
 }
 
 fn decorateSortedSegmentDocAlloc(
@@ -8727,6 +8763,19 @@ fn sortAndPageTextDocValueFilterAlloc(
     executor: SearchTextQueryExecutor,
     plan: SortExecutionPlan,
 ) !types.SearchResult {
+    const doc_nums = try snapshot.executeFilter(alloc, filter);
+    defer alloc.free(doc_nums);
+    return try sortAndPageTextDocValueDocNumsAlloc(alloc, req, snapshot, doc_nums, executor, plan);
+}
+
+fn sortAndPageTextDocValueDocNumsAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    snapshot: *const index_mod.IndexSnapshot,
+    doc_nums: []const u32,
+    executor: SearchTextQueryExecutor,
+    plan: SortExecutionPlan,
+) !types.SearchResult {
     var effective = try effectiveSortRequestAlloc(alloc, req);
     defer effective.deinit(alloc);
     const effective_req = effective.req;
@@ -8739,8 +8788,6 @@ fn sortAndPageTextDocValueFilterAlloc(
     });
     try checkSearchRequestDeadline(effective_req);
 
-    const doc_nums = try snapshot.executeFilter(alloc, filter);
-    defer alloc.free(doc_nums);
     const exact_candidate_budget = lateVisibilityExactCandidateBudget();
     const candidate_count = boundedU32(doc_nums.len);
     enforceLateVisibilityExactCandidateBudget(candidate_count, exact_candidate_budget) catch |err| {
@@ -8779,10 +8826,15 @@ fn sortAndPageTextDocValueFilterAlloc(
         .require_native = plan.require_native,
         .load = loadTextDocValueSortValue,
     };
+    var visible_candidate_count: usize = 0;
     for (doc_nums, 0..) |doc_num, i| {
         if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
-        if (collect_sort_profile) profile.candidate_count += 1;
         const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        if (executor.is_expired_key) |is_expired| {
+            if (try is_expired(executor.ctx, alloc, stored.id)) continue;
+        }
+        visible_candidate_count += 1;
+        if (collect_sort_profile) profile.candidate_count += 1;
         const raw_hit = types.SearchHit{
             .id = try alloc.dupe(u8, stored.id),
             .doc_ordinal = try snapshot.docOrdinal(doc_num),
@@ -8863,8 +8915,8 @@ fn sortAndPageTextDocValueFilterAlloc(
     var out = types.SearchResult{
         .alloc = alloc,
         .hits = selected,
-        .total_hits = boundedU32(doc_nums.len),
-        .total_hits_relation = if (doc_nums.len > std.math.maxInt(u32)) .gte else .exact,
+        .total_hits = boundedU32(visible_candidate_count),
+        .total_hits_relation = if (visible_candidate_count > std.math.maxInt(u32)) .gte else .exact,
         .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, true, profile) else null,
         .graph_results = &.{},
     };
@@ -9009,6 +9061,19 @@ pub fn searchTextQuery(
         if (membership_filter) |filter| {
             var membership = try buildSortedSegmentDocMembershipAlloc(alloc, snapshot, filter);
             defer membership.deinit(alloc);
+
+            if (sortedSegmentSelectiveCandidateDocValuesPlan(effective_req, membership.candidate_count, snapshot)) {
+                const doc_nums = try sortedSegmentDocMembershipDocNumsAlloc(alloc, snapshot, &membership);
+                defer alloc.free(doc_nums);
+                return try sortAndPageTextDocValueDocNumsAlloc(
+                    alloc,
+                    effective_req,
+                    snapshot,
+                    doc_nums,
+                    executor,
+                    docValuesCollectorPlanForSelectiveFilter(field_sort_plan),
+                );
+            }
 
             var sorted_plan = field_sort_plan;
             sorted_plan.kind = .sorted_segment_seek;
@@ -11287,15 +11352,7 @@ fn typedDocValuesTypeMatchesMappedSortField(
     };
 }
 
-const TypedDocValuesCoverageStatus = enum {
-    covered,
-    missing_doc_values_section,
-    malformed_doc_values_section,
-    doc_values_kind_mismatch,
-    sparse_live_doc_values,
-    invalid_doc_value_doc_id,
-    duplicate_doc_value_doc_id,
-};
+const TypedDocValuesCoverageStatus = typed_dv_coverage.Status;
 
 const TypedDocValuesCoverage = struct {
     status: TypedDocValuesCoverageStatus,
@@ -11303,15 +11360,7 @@ const TypedDocValuesCoverage = struct {
 };
 
 fn typedDocValuesCoverageStatusName(status: TypedDocValuesCoverageStatus) []const u8 {
-    return switch (status) {
-        .covered => "covered",
-        .missing_doc_values_section => "missing_doc_values_section",
-        .malformed_doc_values_section => "malformed_doc_values_section",
-        .doc_values_kind_mismatch => "doc_values_kind_mismatch",
-        .sparse_live_doc_values => "sparse_live_doc_values",
-        .invalid_doc_value_doc_id => "invalid_doc_value_doc_id",
-        .duplicate_doc_value_doc_id => "duplicate_doc_value_doc_id",
-    };
+    return typed_dv_coverage.statusName(status);
 }
 
 fn typedDocValuesCoverageRejectionReason(status: TypedDocValuesCoverageStatus) ?NativeSortPlanRejectionReason {
@@ -11390,7 +11439,7 @@ fn snapshotTypedDocValuesCoverageDetailsForMapping(
         } else {
             expected_value_type = reader.value_type;
         }
-        const live_status = try typedDocValuesCoverLiveDocsAlloc(snapshot.alloc, segment, &reader);
+        const live_status = try typed_dv_coverage.readerCoversLiveDocsAlloc(snapshot.alloc, segment, &reader);
         if (live_status != .covered) return .{ .status = live_status, .value_type = expected_value_type };
     }
     return .{ .status = .covered, .value_type = expected_value_type };
@@ -11402,40 +11451,6 @@ fn snapshotTypedDocValuesCoverageForMapping(
     mapping: runtime_schema_mod.FieldMapping,
 ) !TypedDocValuesCoverageStatus {
     return (try snapshotTypedDocValuesCoverageDetailsForMapping(snapshot, field, mapping)).status;
-}
-
-fn typedDocValuesCoverLiveDocsAlloc(
-    alloc: Allocator,
-    segment: *const index_mod.SegmentEntry,
-    reader: *const typed_dv.TypedDocValuesReader,
-) !TypedDocValuesCoverageStatus {
-    const doc_count = segment.reader.doc_count;
-    if (doc_count == 0) return .covered;
-
-    var present = try std.DynamicBitSetUnmanaged.initEmpty(alloc, doc_count);
-    defer present.deinit(alloc);
-
-    for (0..reader.num_chunks) |chunk_idx| {
-        const doc_ids = reader.readChunkDocIds(@intCast(chunk_idx)) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return .malformed_doc_values_section,
-        };
-        defer alloc.free(doc_ids);
-        for (doc_ids) |doc_id| {
-            if (doc_id >= doc_count) return .invalid_doc_value_doc_id;
-            if (present.isSet(doc_id)) return .duplicate_doc_value_doc_id;
-            present.set(doc_id);
-        }
-    }
-
-    for (0..doc_count) |local_doc_id| {
-        const local_doc_u32: u32 = @intCast(local_doc_id);
-        if (segment.shared.deleted) |deleted| {
-            if (deleted.contains(local_doc_u32)) continue;
-        }
-        if (!present.isSet(local_doc_id)) return .sparse_live_doc_values;
-    }
-    return .covered;
 }
 
 fn sortFieldMapping(schema: runtime_schema_mod.TableSchema, field: []const u8) ?runtime_schema_mod.FieldMapping {
@@ -12048,6 +12063,9 @@ fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
             return error.UnsupportedQueryRequest;
         };
         const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        if (executor.is_expired_key) |is_expired| {
+            if (try is_expired(executor.ctx, alloc, stored.id)) continue;
+        }
         total_hits +|= 1;
         if (collect_sort_profile) profile.candidate_count += 1;
         const raw_hit = types.SearchHit{
@@ -12192,6 +12210,37 @@ fn planMatchAllSortBeforeCandidatesAlloc(
     return plan;
 }
 
+fn sortedSegmentSelectiveCandidateDocValuesPlan(req: types.SearchRequest, candidate_count: usize, snapshot: *const index_mod.IndexSnapshot) bool {
+    var live_docs: usize = 0;
+    for (snapshot.segments) |*segment| live_docs +|= segment.liveDocCount();
+    if (live_docs == 0) return false;
+
+    if (candidate_count == 0) return false;
+    if (candidate_count >= live_docs) return false;
+
+    const window = @max(sortWindowCapacity(req), @as(usize, 1));
+    const page_selective_limit = window *| 8;
+    const absolute_selective_limit: usize = 4096;
+    const selective_limit = @max(page_selective_limit, absolute_selective_limit);
+    return candidate_count <= selective_limit and candidate_count *| 16 <= live_docs;
+}
+
+fn sortedSegmentSelectiveFilterDocValuesPlan(req: types.SearchRequest, constraints: *const NativeDocIdConstraints, snapshot: *const index_mod.IndexSnapshot) bool {
+    if (!constraints.positive_filter) return false;
+    if (constraints.filter_doc_nums.len == 0 or constraints.filter_doc_ids.len > 0) return false;
+    return sortedSegmentSelectiveCandidateDocValuesPlan(req, constraints.filter_doc_nums.len, snapshot);
+}
+
+fn docValuesCollectorPlanForSelectiveFilter(plan: SortExecutionPlan) SortExecutionPlan {
+    var out = plan;
+    out.kind = .native_doc_values_top_n;
+    out.source = .doc_values_collector;
+    out.cursor_support = .comparator;
+    out.source_load = .projected_source_after_page;
+    out.selective_filter_doc_values_preferred = true;
+    return out;
+}
+
 fn buildMatchAllNativeSortContextAlloc(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -12315,31 +12364,35 @@ pub fn searchMatchAll(
             );
             return error.UnsupportedQueryRequest;
         };
-        var native_sort_ctx = TextDocValueSortContext{
-            .snapshot = text_entry.persistent.snapshot(),
-        };
-        const native_sort_loader = NativeSortValueLoader{
-            .ctx = &native_sort_ctx,
-            .require_native = true,
-            .load = loadTextDocValueSortValue,
-        };
-        var out = try sortAndPageMatchAllSortedSegmentsAlloc(
-            alloc,
-            postprocess_req,
-            executor,
-            &native_constraints,
-            text_entry,
-            planned_sort,
-            native_sort_loader,
-            null,
-        );
-        errdefer out.deinit();
-        if (postprocess_req.include_stored) {
-            const source_profile = try loadMissingProjectedMatchAllHitDocuments(alloc, postprocess_req, executor, out.hits);
-            applyProjectedSourceLoadProfileToSortProfile(&out, source_profile);
-            logBenchProjectedSourceLoadProfile(postprocess_req, planned_sort, "match_all", source_profile);
+        if (sortedSegmentSelectiveFilterDocValuesPlan(postprocess_req, &native_constraints, text_entry.persistent.snapshot())) {
+            planned_sort = docValuesCollectorPlanForSelectiveFilter(planned_sort);
+        } else {
+            var native_sort_ctx = TextDocValueSortContext{
+                .snapshot = text_entry.persistent.snapshot(),
+            };
+            const native_sort_loader = NativeSortValueLoader{
+                .ctx = &native_sort_ctx,
+                .require_native = true,
+                .load = loadTextDocValueSortValue,
+            };
+            var out = try sortAndPageMatchAllSortedSegmentsAlloc(
+                alloc,
+                postprocess_req,
+                executor,
+                &native_constraints,
+                text_entry,
+                planned_sort,
+                native_sort_loader,
+                null,
+            );
+            errdefer out.deinit();
+            if (postprocess_req.include_stored) {
+                const source_profile = try loadMissingProjectedMatchAllHitDocuments(alloc, postprocess_req, executor, out.hits);
+                applyProjectedSourceLoadProfileToSortProfile(&out, source_profile);
+                logBenchProjectedSourceLoadProfile(postprocess_req, planned_sort, "match_all", source_profile);
+            }
+            return out;
         }
-        return out;
     }
 
     if (exec_req.order_by.len > 0 and planned_sort.kind == .id_seek and !unresolved_stored_filters and executor.collect_candidates_stream != null) {
@@ -14927,6 +14980,8 @@ test "match_all native doc values sort streams candidates without exact candidat
         text_entry: *index_manager_mod.IndexManager.TextIndex,
         collect_count: usize = 0,
         stream_count: usize = 0,
+        expired_doc: ?[]const u8 = null,
+        expired_checks: usize = 0,
         stream_accepted: usize = 0,
 
         fn collectCandidates(
@@ -14990,6 +15045,17 @@ test "match_all native doc values sort streams candidates without exact candidat
         ) anyerror![]u8 {
             return error.UnexpectedTestCall;
         }
+
+        fn isExpiredKey(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            key: []const u8,
+        ) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.expired_checks += 1;
+            const expired_doc = self.expired_doc orelse return false;
+            return std.mem.eql(u8, key, expired_doc);
+        }
     };
 
     var harness = Harness{ .text_entry = &text_entry };
@@ -15007,6 +15073,7 @@ test "match_all native doc values sort streams candidates without exact candidat
         .text_index_entry = Harness.textIndexEntry,
         .load_projected_document = Harness.loadProjectedDocument,
         .load_stored = testUnexpectedLoadStoredCallback,
+        .is_expired_key = Harness.isExpiredKey,
     });
     defer result.deinit();
 
@@ -15140,6 +15207,17 @@ test "match_all native doc values sort consumes selective ordinal candidates dir
             _: []const u8,
         ) anyerror![]u8 {
             return error.UnexpectedTestCall;
+        }
+
+        fn isExpiredKey(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            key: []const u8,
+        ) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.expired_checks += 1;
+            const expired_doc = self.expired_doc orelse return false;
+            return std.mem.eql(u8, key, expired_doc);
         }
     };
 
@@ -16409,6 +16487,30 @@ test "native sort planner classifies mapping and cursor rejection reasons" {
     try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_doc_value_type, nativeSortValueRejectionReason(keyword_mapping, .{ .integer = 1 }).?);
 }
 
+fn buildDuplicateF64DocValuesSectionAlloc(alloc: Allocator) ![]u8 {
+    var chunk = std.ArrayListUnmanaged(u8).empty;
+    defer chunk.deinit(alloc);
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 3))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 0))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 0))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
+    try chunk.appendSlice(alloc, &@as([8]u8, @bitCast(@as(f64, 1.0))));
+    try chunk.appendSlice(alloc, &@as([8]u8, @bitCast(@as(f64, 1.5))));
+    try chunk.appendSlice(alloc, &@as([8]u8, @bitCast(@as(f64, 2.0))));
+
+    const compressed = try snappy.encode(alloc, chunk.items);
+    defer alloc.free(compressed);
+
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(alloc);
+    try data.append(alloc, @intFromEnum(typed_dv.ValueType.f64_val));
+    try data.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
+    const chunk_end: u64 = @intCast(5 + 8 + compressed.len);
+    try data.appendSlice(alloc, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, chunk_end))));
+    try data.appendSlice(alloc, compressed);
+    return try data.toOwnedSlice(alloc);
+}
+
 test "native sort coverage diagnostics classify physical doc value failures" {
     const alloc = std.testing.allocator;
     const numeric_mapping = runtime_schema_mod.FieldMapping{
@@ -16584,7 +16686,29 @@ test "native sort coverage diagnostics classify physical doc value failures" {
         );
     }
 
-    try std.testing.expectEqualStrings("duplicate_doc_value_doc_id", typedDocValuesCoverageStatusName(.duplicate_doc_value_doc_id));
+    {
+        const dv_data = try buildDuplicateF64DocValuesSectionAlloc(alloc);
+        defer alloc.free(dv_data);
+
+        var seg_writer = segment_mod.SegmentWriter.init(alloc);
+        defer seg_writer.deinit();
+        const price_idx = try seg_writer.addField("price");
+        try seg_writer.addSection(price_idx, .typed_doc_values, dv_data);
+        try seg_writer.addStoredDoc("doc:a", "{\"price\":1}");
+        try seg_writer.addStoredDoc("doc:b", "{\"price\":2}");
+        const seg_bytes = try seg_writer.build();
+        defer alloc.free(seg_bytes);
+
+        var writer = try index_mod.IndexWriter.init(alloc);
+        defer writer.deinit();
+        try writer.addSegment(seg_bytes);
+        const snapshot = writer.snapshot();
+
+        try std.testing.expectEqual(
+            TypedDocValuesCoverageStatus.duplicate_doc_value_doc_id,
+            try snapshotTypedDocValuesCoverageForMapping(snapshot, "price", numeric_mapping),
+        );
+    }
 }
 
 test "native text sort validation rejects sparse typed doc values for live docs" {
@@ -17949,6 +18073,17 @@ test "match_all sorted segment seek merges sorted segments and applies cursors" 
         ) anyerror![]u8 {
             return error.UnexpectedTestCall;
         }
+
+        fn isExpiredKey(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            key: []const u8,
+        ) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.expired_checks += 1;
+            const expired_doc = self.expired_doc orelse return false;
+            return std.mem.eql(u8, key, expired_doc);
+        }
     };
 
     var harness = Harness{ .text_entry = &text_entry };
@@ -17971,6 +18106,187 @@ test "match_all sorted segment seek merges sorted segments and applies cursors" 
     try std.testing.expectEqual(@as(usize, 0), harness.collect_count);
     try std.testing.expectEqualStrings("doc:b", filtered_page.hits[0].id);
     try std.testing.expectEqualStrings("doc:d", filtered_page.hits[1].id);
+}
+
+test "match_all index sort uses doc values collector for selective native filters" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-selective-filter-plan", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    const docs = try alloc.alloc(TestSortedPriceDoc, 128);
+    defer alloc.free(docs);
+    const doc_ids = try alloc.alloc([]u8, docs.len);
+    defer {
+        for (doc_ids) |id| alloc.free(id);
+        alloc.free(doc_ids);
+    }
+    for (docs, 0..) |*doc, i| {
+        doc_ids[i] = try std.fmt.allocPrint(alloc, "doc:{d:0>3}", .{i});
+        doc.* = .{
+            .id = doc_ids[i],
+            .price = @floatFromInt(i),
+            .ordinal = @intCast(1000 + i),
+        };
+    }
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const segment = try buildTestSortedPriceSegmentAlloc(alloc, docs);
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = testSortedPriceSchema(),
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const Harness = struct {
+        text_entry: *index_manager_mod.IndexManager.TextIndex,
+        collect_count: usize = 0,
+        stream_count: usize = 0,
+        expired_doc: ?[]const u8 = null,
+        expired_checks: usize = 0,
+
+        fn collectCandidates(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: MatchAllCandidateCollectOptions,
+        ) anyerror!MatchAllCandidates {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.collect_count += 1;
+            return error.UnexpectedTestCall;
+        }
+
+        fn streamCandidates(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: MatchAllCandidateCollectOptions,
+            _: ?*anyopaque,
+            _: MatchAllCandidateConsumer,
+        ) anyerror!MatchAllCandidateStreamStats {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.stream_count += 1;
+            return error.UnexpectedTestCall;
+        }
+
+        fn textIndexEntry(
+            ctx: ?*anyopaque,
+            _: ?[]const u8,
+        ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return self.text_entry;
+        }
+
+        fn loadProjectedDocument(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+        ) anyerror![]u8 {
+            return error.UnexpectedTestCall;
+        }
+
+        fn isExpiredKey(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            key: []const u8,
+        ) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.expired_checks += 1;
+            const expired_doc = self.expired_doc orelse return false;
+            return std.mem.eql(u8, key, expired_doc);
+        }
+    };
+
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{ 1005, 1010 }),
+    };
+    defer filter.deinit(alloc);
+
+    var harness = Harness{ .text_entry = &text_entry };
+    const order_by = [_]types.SortField{.{ .field = "price" }};
+    var result = try searchMatchAll(alloc, .{
+        .index_name = "ft",
+        .resolved_doc_filter = &filter,
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 10,
+    }, .{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .collect_candidates_stream = Harness.streamCandidates,
+        .text_index_entry = Harness.textIndexEntry,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), harness.collect_count);
+    try std.testing.expectEqual(@as(usize, 0), harness.stream_count);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:005", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:010", result.hits[1].id);
+
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqualStrings("doc_values_collector", profile.source);
+    try std.testing.expectEqualStrings("selective_filter_doc_values_collector", profile.selection_reason);
+    try std.testing.expectEqual(@as(u64, 2), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), profile.selected_count);
+    try std.testing.expectEqual(@as(u64, 2), profile.native_doc_value_hit_count);
+
+    harness.expired_doc = "doc:005";
+    var expired_result = try searchMatchAll(alloc, .{
+        .index_name = "ft",
+        .resolved_doc_filter = &filter,
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 10,
+    }, .{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .collect_candidates_stream = Harness.streamCandidates,
+        .text_index_entry = Harness.textIndexEntry,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = testUnexpectedLoadStoredCallback,
+        .is_expired_key = Harness.isExpiredKey,
+    });
+    defer expired_result.deinit();
+
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, expired_result.total_hits_relation);
+    try std.testing.expectEqual(@as(u32, 1), expired_result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), expired_result.hits.len);
+    try std.testing.expectEqualStrings("doc:010", expired_result.hits[0].id);
+    const expired_profile = expired_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("selective_filter_doc_values_collector", expired_profile.selection_reason);
+    try std.testing.expectEqual(@as(u64, 1), expired_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), expired_profile.selected_count);
+    try std.testing.expectEqual(@as(u64, 1), expired_profile.native_doc_value_hit_count);
+    try std.testing.expect(harness.expired_checks >= 2);
 }
 
 test "text field sort uses exact native doc values filter path without index sort" {
@@ -18038,6 +18354,8 @@ test "text field sort uses exact native doc values filter path without index sor
     const Harness = struct {
         text_entry: *index_manager_mod.IndexManager.TextIndex,
         postprocess_count: usize = 0,
+        expired_doc: ?[]const u8 = null,
+        expired_checks: usize = 0,
 
         fn textIndexEntry(
             ctx: ?*anyopaque,
@@ -18081,6 +18399,17 @@ test "text field sort uses exact native doc values filter path without index sor
             return error.UnexpectedTestCall;
         }
 
+        fn isExpiredKey(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            key: []const u8,
+        ) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.expired_checks += 1;
+            const expired_doc = self.expired_doc orelse return false;
+            return std.mem.eql(u8, key, expired_doc);
+        }
+
         fn postprocess(
             ctx: ?*anyopaque,
             _: Allocator,
@@ -18109,6 +18438,7 @@ test "text field sort uses exact native doc values filter path without index sor
         .search_match_all = Harness.searchMatchAll,
         .project_stored_search = Harness.projectStoredSearch,
         .load_stored = Harness.loadStored,
+        .is_expired_key = Harness.isExpiredKey,
         .postprocess = Harness.postprocess,
     });
     defer result.deinit();
@@ -18313,6 +18643,17 @@ test "text score query exposes score top k sort profile" {
             return error.UnexpectedTestCall;
         }
 
+        fn isExpiredKey(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            key: []const u8,
+        ) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.expired_checks += 1;
+            const expired_doc = self.expired_doc orelse return false;
+            return std.mem.eql(u8, key, expired_doc);
+        }
+
         fn postprocess(
             ctx: ?*anyopaque,
             _: Allocator,
@@ -18445,6 +18786,17 @@ test "text ordered query rejects unresolved stored pattern filters" {
             _: []const u8,
         ) anyerror!?[]u8 {
             return error.UnexpectedTestCall;
+        }
+
+        fn isExpiredKey(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            key: []const u8,
+        ) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.expired_checks += 1;
+            const expired_doc = self.expired_doc orelse return false;
+            return std.mem.eql(u8, key, expired_doc);
         }
 
         fn postprocess(
@@ -18705,6 +19057,213 @@ test "text field sort uses sorted segment membership path when index sort matche
     try std.testing.expectEqualStrings("doc:c", expiring_result.hits[0].id);
     try std.testing.expectEqualStrings("doc:d", expiring_result.hits[1].id);
     try std.testing.expect(harness.expired_checks >= 3);
+}
+
+test "text index sort uses doc values collector for selective term filters" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/text-selective-index-sort-doc-values", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const text_fields_alpha = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "alpha" }};
+    const text_fields_beta = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "beta" }};
+    const docs = try alloc.alloc(introducer_mod.TextDocument, 128);
+    defer alloc.free(docs);
+    const doc_ids = try alloc.alloc([]u8, docs.len);
+    defer {
+        for (doc_ids) |id| alloc.free(id);
+        alloc.free(doc_ids);
+    }
+    const stored_docs = try alloc.alloc([]u8, docs.len);
+    defer {
+        for (stored_docs) |stored| alloc.free(stored);
+        alloc.free(stored_docs);
+    }
+    for (docs, 0..) |*doc, i| {
+        const alpha = i == 5 or i == 10;
+        doc_ids[i] = try std.fmt.allocPrint(alloc, "doc:{d:0>3}", .{i});
+        stored_docs[i] = try std.fmt.allocPrint(
+            alloc,
+            "{{\"price\":{d},\"body\":\"{s}\"}}",
+            .{ i, if (alpha) "alpha" else "beta" },
+        );
+        doc.* = .{
+            .id = doc_ids[i],
+            .stored_data = stored_docs[i],
+            .text_fields = if (alpha) &text_fields_alpha else &text_fields_beta,
+            .doc_ordinal = @intCast(1000 + i),
+        };
+    }
+
+    const index_sort = [_]segment_mod.SegmentIndexSortField{
+        .{ .field = "price" },
+        .{ .field = "_id" },
+    };
+    const segment = try introducer_mod.buildSegmentFromTextWithAnalysisOptions(alloc, docs, &analysis_mod.default_analyzer, .{}, .{
+        .index_sort = &index_sort,
+    });
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = testSortedPriceSchema(),
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const Harness = struct {
+        text_entry: *index_manager_mod.IndexManager.TextIndex,
+        postprocess_count: usize = 0,
+        expired_doc: ?[]const u8 = null,
+        expired_checks: usize = 0,
+
+        fn textIndexEntry(
+            ctx: ?*anyopaque,
+            _: ?[]const u8,
+        ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return self.text_entry;
+        }
+
+        fn textIndexIsChunkBacked(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: ?[]const u8,
+        ) anyerror!bool {
+            return false;
+        }
+
+        fn searchMatchAll(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+        ) anyerror!types.SearchResult {
+            return error.UnexpectedTestCall;
+        }
+
+        fn projectStoredSearch(
+            _: ?*anyopaque,
+            project_alloc: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+            raw: []const u8,
+        ) anyerror![]u8 {
+            return try project_alloc.dupe(u8, raw);
+        }
+
+        fn loadStored(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: []const u8,
+        ) anyerror!?[]u8 {
+            return error.UnexpectedTestCall;
+        }
+
+        fn isExpiredKey(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            key: []const u8,
+        ) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.expired_checks += 1;
+            const expired_doc = self.expired_doc orelse return false;
+            return std.mem.eql(u8, key, expired_doc);
+        }
+
+        fn postprocess(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            result: types.SearchResult,
+            _: bool,
+        ) anyerror!types.SearchResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.postprocess_count += 1;
+            return result;
+        }
+    };
+
+    var harness = Harness{ .text_entry = &text_entry };
+    const order_by = [_]types.SortField{.{ .field = "price" }};
+    var result = try searchTextQuery(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 10,
+    }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndexEntry,
+        .text_index_is_chunk_backed = Harness.textIndexIsChunkBacked,
+        .search_match_all = Harness.searchMatchAll,
+        .project_stored_search = Harness.projectStoredSearch,
+        .load_stored = Harness.loadStored,
+        .postprocess = Harness.postprocess,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), harness.postprocess_count);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:005", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:010", result.hits[1].id);
+
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqualStrings("doc_values_collector", profile.source);
+    try std.testing.expectEqualStrings("selective_filter_doc_values_collector", profile.selection_reason);
+    try std.testing.expectEqual(@as(u64, 2), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), profile.selected_count);
+    try std.testing.expectEqual(@as(u64, 2), profile.native_doc_value_hit_count);
+
+    harness.expired_doc = "doc:005";
+    var expired_result = try searchTextQuery(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 10,
+    }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndexEntry,
+        .text_index_is_chunk_backed = Harness.textIndexIsChunkBacked,
+        .search_match_all = Harness.searchMatchAll,
+        .project_stored_search = Harness.projectStoredSearch,
+        .load_stored = Harness.loadStored,
+        .is_expired_key = Harness.isExpiredKey,
+        .postprocess = Harness.postprocess,
+    });
+    defer expired_result.deinit();
+
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, expired_result.total_hits_relation);
+    try std.testing.expectEqual(@as(u32, 1), expired_result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), expired_result.hits.len);
+    try std.testing.expectEqualStrings("doc:010", expired_result.hits[0].id);
+    const expired_profile = expired_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("selective_filter_doc_values_collector", expired_profile.selection_reason);
+    try std.testing.expectEqual(@as(u64, 1), expired_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), expired_profile.selected_count);
+    try std.testing.expectEqual(@as(u64, 1), expired_profile.native_doc_value_hit_count);
+    try std.testing.expect(harness.expired_checks >= 2);
 }
 
 test "match_all sorted segment seek uses cursor seek within each segment" {
