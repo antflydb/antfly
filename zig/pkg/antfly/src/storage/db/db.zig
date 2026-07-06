@@ -7270,11 +7270,6 @@ pub const DB = struct {
         var result = types.ArtifactRepairResult{ .limit = limit };
         if (limit == 0) return result;
 
-        self.beginIndexRepairBarrier();
-        defer self.endIndexRepairBarrier();
-        lockApply(self);
-        defer self.core.unlockApply();
-
         const cfg_ptr = self.core.index_manager.get(requested_index) orelse return error.NotFound;
         var cfg = try types.IndexConfig.clone(alloc, cfg_ptr.*);
         defer cfg.deinit(alloc);
@@ -7301,15 +7296,37 @@ pub const DB = struct {
             quarantined_retry_run = true;
         }
         if (self.core.index_manager.loadFailure(cfg.name) != null) {
-            result.failed += 1;
-            result.unresolved += 1;
-            result.debt_remaining = true;
-            return result;
+            switch (cfg.kind) {
+                .dense_vector, .sparse_vector, .graph, .full_text => {
+                    _ = self.core.index_manager.reopenQuarantinedIndexForArtifactRebuild(self.core.store, cfg.name) catch {
+                        result.failed += 1;
+                        result.unresolved += 1;
+                        result.debt_remaining = true;
+                        return result;
+                    };
+                },
+                .algebraic => {
+                    result.failed += 1;
+                    result.unresolved += 1;
+                    result.debt_remaining = true;
+                    return result;
+                },
+            }
         }
         if (had_load_failure and (cfg.kind == .full_text or cfg.kind == .algebraic) and !try self.indexRepairRequired(alloc, cfg.name)) {
             result.repaired += 1;
             return result;
         }
+
+        const index_ref = index_manager_mod.ManagedIndexRef{
+            .name = cfg.name,
+            .kind = cfg.kind,
+        };
+        const use_dense_search_barrier = cfg.kind == .dense_vector;
+        if (use_dense_search_barrier) self.beginIndexRepairBarrier();
+        defer if (use_dense_search_barrier) self.endIndexRepairBarrier();
+        var index_apply_guard = try self.core.index_manager.lockManagedIndexApply(index_ref);
+        defer index_apply_guard.unlock();
 
         const rebuilt = switch (cfg.kind) {
             .dense_vector => blk: {
@@ -48223,6 +48240,88 @@ test "db rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded repairs externa
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 
     try std.testing.expectEqual(@as(usize, 0), try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
+}
+
+test "db index repair rebuilds dense index quarantined by incomplete bulk publish" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}" },
+            },
+            .sync_level = .full_index,
+        });
+    }
+
+    const dense_index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
+    defer alloc.free(dense_index_path);
+    const dense_index_path_z = try alloc.dupeZ(u8, dense_index_path);
+    defer alloc.free(dense_index_path_z);
+    {
+        var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_index_path_z, .{
+            .dims = 3,
+            .storage_backend = .lsm,
+        }, .{});
+        try hbc.beginBulkIngestSession();
+        hbc.close();
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const recorded = reopened.core.index_manager.loadFailure("dense_idx") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("IncompleteBulkPublish", recorded);
+    {
+        const stats = try reopened.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expect(stats.repair_degraded);
+    }
+
+    var repair = try reopened.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .artifact_kind = .embedding,
+        .index_name = "dense_idx",
+        .limit = 1,
+    });
+    defer repair.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), repair.scanned);
+    try std.testing.expectEqual(@as(u64, 2), repair.reprocessed);
+    try std.testing.expectEqual(@as(u64, 1), repair.repaired);
+    try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
+    try std.testing.expect(!repair.debt_remaining);
+    try std.testing.expect(reopened.core.index_manager.loadFailure("dense_idx") == null);
+
+    var result = try reopened.search(alloc, .{
+        .index_name = "dense_idx",
+        .query = .{ .dense_knn = .{
+            .vector = &.{ 1.0, 0.0, 0.0 },
+            .k = 2,
+        } },
+        .limit = 2,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
 }
 
 test "db dense artifact rebuild preserves stable vector ids distinct from ordinals" {

@@ -3338,6 +3338,51 @@ pub const IndexManager = struct {
         return false;
     }
 
+    pub fn reopenQuarantinedIndexForArtifactRebuild(self: *IndexManager, store: anytype, name: []const u8) !types.IndexKind {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+
+        for (self.status_only_index_configs, 0..) |cfg, i| {
+            if (!std.mem.eql(u8, cfg.name, name)) continue;
+
+            var rebuild_cfg = try types.IndexConfig.clone(self.alloc, cfg);
+            errdefer rebuild_cfg.deinit(self.alloc);
+            const index_path = try self.indexPath(name);
+            defer self.alloc.free(index_path);
+
+            deleteIndexDirIfPresent(index_path);
+            try self.openConfiguredIndex(store, rebuild_cfg, false, false);
+            errdefer self.removeInMemory(name);
+
+            const replacement: []types.IndexConfig = if (self.status_only_index_configs.len > 1)
+                try self.alloc.alloc(types.IndexConfig, self.status_only_index_configs.len - 1)
+            else
+                &.{};
+            errdefer if (replacement.len > 0) self.alloc.free(replacement);
+
+            var out: usize = 0;
+            var removed = cfg;
+            for (self.status_only_index_configs, 0..) |existing, existing_i| {
+                if (existing_i == i) continue;
+                replacement[out] = existing;
+                out += 1;
+            }
+            self.alloc.free(self.status_only_index_configs);
+            self.status_only_index_configs = replacement;
+
+            self.dropFailedIndexLoad(name);
+            self.dropIndexLoadStateNoLock(name);
+            try self.refreshGeneratedEnrichmentTargetCache();
+
+            const kind = rebuild_cfg.kind;
+            removed.deinit(self.alloc);
+            rebuild_cfg.deinit(self.alloc);
+            return kind;
+        }
+
+        return error.IndexNotFound;
+    }
+
     fn removeStatusOnlyConfig(self: *IndexManager, store: anytype, name: []const u8) !bool {
         for (self.status_only_index_configs, 0..) |cfg, i| {
             if (!std.mem.eql(u8, cfg.name, name)) continue;
