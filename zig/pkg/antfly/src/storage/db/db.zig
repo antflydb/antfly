@@ -7385,8 +7385,13 @@ pub const DB = struct {
             else => return err,
         };
         result.reprocessed += rebuilt.reprocessed;
-        result.repaired += 1;
         result.indexes_rebuilt += 1;
+        if (try self.indexRepairRequired(alloc, cfg.name)) {
+            result.unresolved += 1;
+            result.debt_remaining = true;
+        } else {
+            result.repaired += 1;
+        }
         return result;
     }
 
@@ -7503,13 +7508,21 @@ pub const DB = struct {
         index_manager_mod.IndexManager.clearRepairShadowInProgressMarker(alloc, shadow_base) catch |err| {
             std.log.warn("failed to clear repair shadow in-progress marker index={s} err={s}", .{ cfg.name, @errorName(err) });
         };
-        try self.core.saveAppliedSequence(cfg.name, final_target);
         const prior_checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
-        try self.core.saveProjectionCheckpoint(cfg.name, .{
-            .applied_sequence = final_target,
+        const final_update = apply_state.AppliedSequenceUpdate{
+            .index_name = cfg.name,
+            .sequence = final_target,
             .status = .clean,
             .generation = prior_checkpoint.generation +| 1,
             .config_hash = types.indexConfigHash(cfg),
+        };
+        try saveIndexStatusSnapshots(alloc, self.core.store, self.core.index_manager, &[_]apply_state.AppliedSequenceUpdate{final_update});
+        try self.core.saveAppliedSequence(cfg.name, final_target);
+        try self.core.saveProjectionCheckpoint(cfg.name, .{
+            .applied_sequence = final_update.sequence,
+            .status = final_update.status,
+            .generation = final_update.generation,
+            .config_hash = final_update.config_hash,
         });
 
         return .{
@@ -39041,6 +39054,53 @@ test "db repair issue list reports index repair candidates" {
     try std.testing.expectEqualStrings("index_repair_required", page.issues[0].last_error);
 }
 
+test "db index repair reports remaining artifact debt after rebuild" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+
+    var issue = types.ArtifactRepairIssue{
+        .artifact_kind = .graph,
+        .index_name = try alloc.dupe(u8, "graph_v1"),
+        .doc_key = try alloc.dupe(u8, "doc:missing"),
+        .artifact_name = try alloc.dupe(u8, "graph_v1"),
+        .reason = .corrupt_artifact,
+        .sequence = 1,
+    };
+    defer issue.deinit(alloc);
+    try db.recordArtifactRepairIssue(alloc, issue);
+
+    var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .artifact_kind = .graph,
+        .index_name = "graph_v1",
+        .limit = 1,
+        .force = true,
+    });
+    defer repair.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), repair.scanned);
+    try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
+    try std.testing.expectEqual(@as(u64, 0), repair.repaired);
+    try std.testing.expectEqual(@as(u64, 1), repair.unresolved);
+    try std.testing.expect(repair.debt_remaining);
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expect(stats.repair_degraded);
+    try std.testing.expectEqual(@as(u64, 1), stats.repair_issue_count);
+}
+
 test "db repair issue list reports algebraic index debt as unsupported" {
     const alloc = std.testing.allocator;
 
@@ -49281,6 +49341,18 @@ test "db index repair rebuilds dense index quarantined by incomplete bulk publis
     const recorded = reopened.core.index_manager.loadFailure("dense_idx") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("IncompleteBulkPublish", recorded);
     {
+        const status_key = try DB.indexStatusKeyAlloc(alloc, "dense_idx");
+        defer alloc.free(status_key);
+        var stale_status: [DB.index_status_encoded_len]u8 = undefined;
+        DB.encodeIndexStatusSnapshot(.{
+            .kind = .dense_vector,
+            .doc_count = 99,
+            .node_count = 99,
+            .root_node = 99,
+        }, &stale_status);
+        try reopened.core.store.put(status_key, &stale_status);
+    }
+    {
         const stats = try reopened.stats(alloc);
         defer types.freeDBStats(alloc, stats);
         try std.testing.expect(stats.repair_degraded);
@@ -49299,6 +49371,10 @@ test "db index repair rebuilds dense index quarantined by incomplete bulk publis
     try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
     try std.testing.expect(!repair.debt_remaining);
     try std.testing.expect(reopened.core.index_manager.loadFailure("dense_idx") == null);
+    {
+        const persisted_status = (try reopened.loadIndexStatusSnapshot(alloc, "dense_idx")).?;
+        try std.testing.expectEqual(@as(u64, 2), persisted_status.doc_count);
+    }
 
     var result = try reopened.search(alloc, .{
         .index_name = "dense_idx",
