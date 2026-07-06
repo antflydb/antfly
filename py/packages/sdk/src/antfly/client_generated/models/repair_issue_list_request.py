@@ -7,7 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.artifact_repair_kind import ArtifactRepairKind
-from ..models.repair_issue_list_request_target import RepairIssueListRequestTarget
+from ..models.repair_target import RepairTarget
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="RepairIssueListRequest")
@@ -18,15 +18,14 @@ class RepairIssueListRequest:
     """Bounded request to list table repair issues.
 
     Attributes:
-        target (RepairIssueListRequestTarget | Unset): Repair subsystem to list. This release supports artifact repair
-            issue listing. Default: RepairIssueListRequestTarget.ARTIFACT.
+        target (RepairTarget | Unset): Repair subsystem to inspect or run.
         kind (ArtifactRepairKind | Unset): Kind of stored artifact tracked by the repair queue.
         index (str | Unset): Restrict results to one index name.
         cursor (str | Unset): Opaque cursor returned by a prior response.
         limit (int | Unset): Maximum repair records to return. Default: 50.
     """
 
-    target: RepairIssueListRequestTarget | Unset = RepairIssueListRequestTarget.ARTIFACT
+    target: RepairTarget | Unset = UNSET
     kind: ArtifactRepairKind | Unset = UNSET
     index: str | Unset = UNSET
     cursor: str | Unset = UNSET
@@ -68,11 +67,11 @@ class RepairIssueListRequest:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
         _target = d.pop("target", UNSET)
-        target: RepairIssueListRequestTarget | Unset
+        target: RepairTarget | Unset
         if isinstance(_target, Unset):
             target = UNSET
         else:
-            target = RepairIssueListRequestTarget(_target)
+            target = RepairTarget(_target)
 
         _kind = d.pop("kind", UNSET)
         kind: ArtifactRepairKind | Unset

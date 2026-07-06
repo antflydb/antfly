@@ -1059,7 +1059,8 @@ export interface paths {
          *     returns exact document keys, artifact keys, index names, and repair
          *     errors, and therefore requires table admin permission when authentication
          *     is enabled. Request filters are supplied in the JSON body. This release
-         *     supports `target=artifact`.
+         *     supports `target=artifact` for durable artifact queue entries and
+         *     `target=index` for index repair candidates.
          */
         post: operations["listArtifactRepairIssues"];
         delete?: never;
@@ -1083,12 +1084,14 @@ export interface paths {
         /**
          * Run a bounded table repair pass
          * @description Attempts to repair queued table issues. `target=artifact` reprocesses
-         *     supported artifact kinds and replays derived state. `target=index`
-         *     repairs one named index; healthy indexes are skipped unless `force=true`
-         *     is supplied. The operation is bounded by `limit`, returns an opaque
-         *     continuation cursor when another page of repair work is available,
-         *     reports unresolved debt separately, and requires table admin permission
-         *     when authentication is enabled.
+         *     supported artifact kinds and replays derived state; it is bounded by
+         *     `limit` and returns an opaque continuation cursor when another artifact
+         *     repair page is available. `target=index` repairs one named index after
+         *     resetting its derived index storage; healthy indexes are skipped unless
+         *     `force=true` is supplied, and any positive `limit` permits that single
+         *     named index repair. The response reports unresolved debt separately, and
+         *     the endpoint requires table admin permission when authentication is
+         *     enabled.
          */
         post: operations["runTableRepair"];
         delete?: never;
@@ -2795,7 +2798,7 @@ export interface components {
             /** @description Last stable repair error code, when a repair attempt failed. */
             last_error?: string;
         };
-        /** @description Bounded page of artifact repair queue entries. */
+        /** @description Bounded page of table repair issues. */
         ArtifactRepairIssueList: {
             /** @description Table whose repair queue was listed. */
             table: string;
@@ -2817,18 +2820,17 @@ export interface components {
             groups_scanned: number;
             /** @description Whether another page is available. */
             has_more: boolean;
-            /** @description Opaque cursor for the next page. */
+            /** @description Opaque cursor for the next page when has_more is true. */
             next_cursor?: string | null;
             issues: components["schemas"]["ArtifactRepairIssue"][];
         };
         /** @description Bounded request to list table repair issues. */
         RepairIssueListRequest: {
             /**
-             * @description Repair subsystem to list. This release supports artifact repair issue listing.
+             * @description Repair subsystem to list. `artifact` lists durable artifact queue records; `index` lists index repair candidates derived from index status and artifact debt.
              * @default artifact
-             * @enum {string}
              */
-            target?: "artifact";
+            target?: components["schemas"]["RepairTarget"];
             kind?: components["schemas"]["ArtifactRepairKind"];
             /** @description Restrict results to one index name. */
             index?: string;
@@ -2856,7 +2858,7 @@ export interface components {
             force?: boolean;
             /**
              * Format: uint32
-             * @description Maximum repair records to attempt.
+             * @description Maximum artifact repair records to attempt. For target=index, any positive value permits one named index repair.
              * @default 100
              */
             limit?: number;
@@ -2918,9 +2920,9 @@ export interface components {
              * @description Effective repair limit.
              */
             limit: number;
-            /** @description Opaque cursor for the next repair pass when has_more is true. */
+            /** @description Opaque cursor for the next artifact repair pass when has_more is true. Index repair currently repairs one named index per request and does not return a continuation cursor. */
             next_cursor?: string | null;
-            /** @description Whether another scan page is available via next_cursor. */
+            /** @description Whether another artifact scan page is available via next_cursor. */
             has_more: boolean;
             /** @description Whether repair debt remains after this bounded pass. If true and next_cursor is absent, rerun repair from the beginning after addressing failed or unsupported records. */
             debt_remaining: boolean;

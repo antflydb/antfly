@@ -1682,6 +1682,7 @@ pub fn freeArtifactRepairIssues(alloc: Allocator, issues: []ArtifactRepairIssue)
 }
 
 pub const ArtifactRepairListRequest = struct {
+    target: RepairTarget = .artifact,
     artifact_kind: ?ArtifactRepairKind = null,
     index_name: ?[]const u8 = null,
     limit: u32 = 50,

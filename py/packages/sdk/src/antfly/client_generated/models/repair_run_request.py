@@ -24,7 +24,8 @@ class RepairRunRequest:
         cursor (str | Unset): Opaque cursor returned by a prior repair response.
         force (bool | Unset): Force a named index rebuild even when no repair debt is currently recorded. Only applies
             to target=index. Default: False.
-        limit (int | Unset): Maximum repair records to attempt. Default: 100.
+        limit (int | Unset): Maximum artifact repair records to attempt. For target=index, any positive value permits
+            one named index repair. Default: 100.
     """
 
     target: RepairTarget | Unset = UNSET

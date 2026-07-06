@@ -478,7 +478,6 @@ from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
 from .regexp_query import RegexpQuery
 from .repair_issue_list_request import RepairIssueListRequest
-from .repair_issue_list_request_target import RepairIssueListRequestTarget
 from .repair_run_request import RepairRunRequest
 from .repair_target import RepairTarget
 from .replication_source_action_hint import ReplicationSourceActionHint
@@ -1074,7 +1073,6 @@ __all__ = (
     "QueryStringQuery",
     "RegexpQuery",
     "RepairIssueListRequest",
-    "RepairIssueListRequestTarget",
     "RepairRunRequest",
     "RepairTarget",
     "ReplicationSourceActionHint",

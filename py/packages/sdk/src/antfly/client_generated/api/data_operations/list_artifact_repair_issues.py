@@ -92,7 +92,8 @@ def sync_detailed(
     returns exact document keys, artifact keys, index names, and repair
     errors, and therefore requires table admin permission when authentication
     is enabled. Request filters are supplied in the JSON body. This release
-    supports `target=artifact`.
+    supports `target=artifact` for durable artifact queue entries and
+    `target=index` for index repair candidates.
 
     Args:
         table_name (str):
@@ -130,7 +131,8 @@ def sync(
     returns exact document keys, artifact keys, index names, and repair
     errors, and therefore requires table admin permission when authentication
     is enabled. Request filters are supplied in the JSON body. This release
-    supports `target=artifact`.
+    supports `target=artifact` for durable artifact queue entries and
+    `target=index` for index repair candidates.
 
     Args:
         table_name (str):
@@ -163,7 +165,8 @@ async def asyncio_detailed(
     returns exact document keys, artifact keys, index names, and repair
     errors, and therefore requires table admin permission when authentication
     is enabled. Request filters are supplied in the JSON body. This release
-    supports `target=artifact`.
+    supports `target=artifact` for durable artifact queue entries and
+    `target=index` for index repair candidates.
 
     Args:
         table_name (str):
@@ -199,7 +202,8 @@ async def asyncio(
     returns exact document keys, artifact keys, index names, and repair
     errors, and therefore requires table admin permission when authentication
     is enabled. Request filters are supplied in the JSON body. This release
-    supports `target=artifact`.
+    supports `target=artifact` for durable artifact queue entries and
+    `target=index` for index repair candidates.
 
     Args:
         table_name (str):

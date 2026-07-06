@@ -89,12 +89,14 @@ def sync_detailed(
     """Run a bounded table repair pass
 
      Attempts to repair queued table issues. `target=artifact` reprocesses
-    supported artifact kinds and replays derived state. `target=index`
-    repairs one named index; healthy indexes are skipped unless `force=true`
-    is supplied. The operation is bounded by `limit`, returns an opaque
-    continuation cursor when another page of repair work is available,
-    reports unresolved debt separately, and requires table admin permission
-    when authentication is enabled.
+    supported artifact kinds and replays derived state; it is bounded by
+    `limit` and returns an opaque continuation cursor when another artifact
+    repair page is available. `target=index` repairs one named index after
+    resetting its derived index storage; healthy indexes are skipped unless
+    `force=true` is supplied, and any positive `limit` permits that single
+    named index repair. The response reports unresolved debt separately, and
+    the endpoint requires table admin permission when authentication is
+    enabled.
 
     Args:
         table_name (str):
@@ -129,12 +131,14 @@ def sync(
     """Run a bounded table repair pass
 
      Attempts to repair queued table issues. `target=artifact` reprocesses
-    supported artifact kinds and replays derived state. `target=index`
-    repairs one named index; healthy indexes are skipped unless `force=true`
-    is supplied. The operation is bounded by `limit`, returns an opaque
-    continuation cursor when another page of repair work is available,
-    reports unresolved debt separately, and requires table admin permission
-    when authentication is enabled.
+    supported artifact kinds and replays derived state; it is bounded by
+    `limit` and returns an opaque continuation cursor when another artifact
+    repair page is available. `target=index` repairs one named index after
+    resetting its derived index storage; healthy indexes are skipped unless
+    `force=true` is supplied, and any positive `limit` permits that single
+    named index repair. The response reports unresolved debt separately, and
+    the endpoint requires table admin permission when authentication is
+    enabled.
 
     Args:
         table_name (str):
@@ -164,12 +168,14 @@ async def asyncio_detailed(
     """Run a bounded table repair pass
 
      Attempts to repair queued table issues. `target=artifact` reprocesses
-    supported artifact kinds and replays derived state. `target=index`
-    repairs one named index; healthy indexes are skipped unless `force=true`
-    is supplied. The operation is bounded by `limit`, returns an opaque
-    continuation cursor when another page of repair work is available,
-    reports unresolved debt separately, and requires table admin permission
-    when authentication is enabled.
+    supported artifact kinds and replays derived state; it is bounded by
+    `limit` and returns an opaque continuation cursor when another artifact
+    repair page is available. `target=index` repairs one named index after
+    resetting its derived index storage; healthy indexes are skipped unless
+    `force=true` is supplied, and any positive `limit` permits that single
+    named index repair. The response reports unresolved debt separately, and
+    the endpoint requires table admin permission when authentication is
+    enabled.
 
     Args:
         table_name (str):
@@ -202,12 +208,14 @@ async def asyncio(
     """Run a bounded table repair pass
 
      Attempts to repair queued table issues. `target=artifact` reprocesses
-    supported artifact kinds and replays derived state. `target=index`
-    repairs one named index; healthy indexes are skipped unless `force=true`
-    is supplied. The operation is bounded by `limit`, returns an opaque
-    continuation cursor when another page of repair work is available,
-    reports unresolved debt separately, and requires table admin permission
-    when authentication is enabled.
+    supported artifact kinds and replays derived state; it is bounded by
+    `limit` and returns an opaque continuation cursor when another artifact
+    repair page is available. `target=index` repairs one named index after
+    resetting its derived index storage; healthy indexes are skipped unless
+    `force=true` is supplied, and any positive `limit` permits that single
+    named index repair. The response reports unresolved debt separately, and
+    the endpoint requires table admin permission when authentication is
+    enabled.
 
     Args:
         table_name (str):

@@ -476,9 +476,9 @@ pub const ArtifactRepairRunResult = struct {
     indexes_degraded: i64,
     /// Effective repair limit.
     limit: i64,
-    /// Opaque cursor for the next repair pass when has_more is true.
+    /// Opaque cursor for the next artifact repair pass when has_more is true. Index repair currently repairs one named index per request and does not return a continuation cursor.
     next_cursor: ?[]const u8 = null,
-    /// Whether another scan page is available via next_cursor.
+    /// Whether another artifact scan page is available via next_cursor.
     has_more: bool,
     /// Whether repair debt remains after this bounded pass. If true and next_cursor is absent, rerun repair from the beginning after addressing failed or unsupported records.
     debt_remaining: bool,
@@ -1900,19 +1900,6 @@ pub const DocumentArtifactManifest = struct {
     state_json: ?[]const u8 = null,
 };
 
-/// Bounded request to list table repair issues.
-pub const RepairIssueListRequest = struct {
-    /// Repair subsystem to list. This release supports artifact repair issue listing.
-    target: ?[]const u8 = null,
-    kind: ?ArtifactRepairKind = null,
-    /// Restrict results to one index name.
-    index: ?[]const u8 = null,
-    /// Opaque cursor returned by a prior response.
-    cursor: ?[]const u8 = null,
-    /// Maximum repair records to return.
-    limit: ?i64 = null,
-};
-
 /// Durable repair debt for a derived artifact. This is an operator-facing record and includes exact source and artifact identifiers.
 pub const ArtifactRepairIssue = struct {
     artifact_kind: ArtifactRepairKind,
@@ -1949,6 +1936,19 @@ pub const ArtifactRepairIssue = struct {
     last_error: ?[]const u8 = null,
 };
 
+/// Bounded request to list table repair issues.
+pub const RepairIssueListRequest = struct {
+    /// Repair subsystem to list. `artifact` lists durable artifact queue records; `index` lists index repair candidates derived from index status and artifact debt.
+    target: ?RepairTarget = null,
+    kind: ?ArtifactRepairKind = null,
+    /// Restrict results to one index name.
+    index: ?[]const u8 = null,
+    /// Opaque cursor returned by a prior response.
+    cursor: ?[]const u8 = null,
+    /// Maximum repair records to return.
+    limit: ?i64 = null,
+};
+
 /// Bounded request to run a table repair pass.
 pub const RepairRunRequest = struct {
     target: ?RepairTarget = null,
@@ -1959,7 +1959,7 @@ pub const RepairRunRequest = struct {
     cursor: ?[]const u8 = null,
     /// Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
     force: ?bool = null,
-    /// Maximum repair records to attempt.
+    /// Maximum artifact repair records to attempt. For target=index, any positive value permits one named index repair.
     limit: ?i64 = null,
 };
 
@@ -2480,7 +2480,7 @@ pub const DocumentArtifactManifestList = struct {
     artifacts: []const DocumentArtifactManifest,
 };
 
-/// Bounded page of artifact repair queue entries.
+/// Bounded page of table repair issues.
 pub const ArtifactRepairIssueList = struct {
     /// Table whose repair queue was listed.
     table: []const u8,
@@ -2493,7 +2493,7 @@ pub const ArtifactRepairIssueList = struct {
     groups_scanned: i64,
     /// Whether another page is available.
     has_more: bool,
-    /// Opaque cursor for the next page.
+    /// Opaque cursor for the next page when has_more is true.
     next_cursor: ?[]const u8 = null,
     issues: []const ArtifactRepairIssue,
 };

@@ -27,10 +27,11 @@ class ArtifactRepairRunResult:
         indexes_rebuilt (int): Number of indexes rebuilt by this pass when target is index.
         indexes_degraded (int): Number of selected indexes that were already degraded or quarantined before repair.
         limit (int): Effective repair limit.
-        has_more (bool): Whether another scan page is available via next_cursor.
+        has_more (bool): Whether another artifact scan page is available via next_cursor.
         debt_remaining (bool): Whether repair debt remains after this bounded pass. If true and next_cursor is absent,
             rerun repair from the beginning after addressing failed or unsupported records.
-        next_cursor (None | str | Unset): Opaque cursor for the next repair pass when has_more is true.
+        next_cursor (None | str | Unset): Opaque cursor for the next artifact repair pass when has_more is true. Index
+            repair currently repairs one named index per request and does not return a continuation cursor.
     """
 
     scanned: int

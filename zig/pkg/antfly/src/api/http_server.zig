@@ -7287,11 +7287,11 @@ pub const ApiHttpServer = struct {
         };
         defer parsed.deinit();
         const target = std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) orelse return try textResponse(self.alloc, 400, "invalid repair target");
-        if (target != .artifact) return try textResponse(self.alloc, 400, "invalid repair target");
         const raw_limit: u32 = parsed.value.limit orelse 50;
         if (raw_limit == 0) return try textResponse(self.alloc, 400, "invalid limit");
         const limit: u32 = @min(raw_limit, 500);
         var result = (source.listArtifactRepairIssues(self.alloc, table_name, .{
+            .target = target,
             .artifact_kind = parsed.value.kind,
             .index_name = parsed.value.index,
             .limit = limit,
@@ -7307,7 +7307,7 @@ pub const ApiHttpServer = struct {
 
         const response_body = try std.json.Stringify.valueAlloc(self.alloc, .{
             .table = table_name,
-            .target = "artifact",
+            .target = @tagName(target),
             .limit = limit,
             .scanned = result.scanned,
             .groups_scanned = result.groups_scanned,

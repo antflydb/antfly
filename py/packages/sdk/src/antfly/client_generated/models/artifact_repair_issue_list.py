@@ -18,7 +18,7 @@ T = TypeVar("T", bound="ArtifactRepairIssueList")
 
 @_attrs_define
 class ArtifactRepairIssueList:
-    """Bounded page of artifact repair queue entries.
+    """Bounded page of table repair issues.
 
     Attributes:
         table (str): Table whose repair queue was listed.
@@ -28,7 +28,7 @@ class ArtifactRepairIssueList:
         groups_scanned (int): Number of table groups touched while building this page.
         has_more (bool): Whether another page is available.
         issues (list[ArtifactRepairIssue]):
-        next_cursor (None | str | Unset): Opaque cursor for the next page.
+        next_cursor (None | str | Unset): Opaque cursor for the next page when has_more is true.
     """
 
     table: str

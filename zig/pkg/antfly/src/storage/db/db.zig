@@ -6868,11 +6868,82 @@ pub const DB = struct {
         return @min(@max(requested, 256), 4096);
     }
 
+    fn artifactRepairKindForIndexKind(kind: types.IndexKind) ?types.ArtifactRepairKind {
+        return switch (kind) {
+            .dense_vector, .sparse_vector => .embedding,
+            .graph => .graph,
+            .full_text => .full_text,
+            .algebraic => null,
+        };
+    }
+
+    fn listIndexRepairIssuesPage(
+        self: *DB,
+        alloc: Allocator,
+        req: types.ArtifactRepairListRequest,
+    ) !types.ArtifactRepairListResult {
+        const configs = try self.core.listIndexes(alloc);
+        defer types.freeIndexConfigs(alloc, configs);
+        std.mem.sort(types.IndexConfig, configs, {}, struct {
+            fn lessThan(_: void, lhs: types.IndexConfig, rhs: types.IndexConfig) bool {
+                return std.mem.order(u8, lhs.name, rhs.name) == .lt;
+            }
+        }.lessThan);
+
+        var issues = std.ArrayListUnmanaged(types.ArtifactRepairIssue).empty;
+        errdefer {
+            for (issues.items) |*issue| issue.deinit(alloc);
+            issues.deinit(alloc);
+        }
+
+        const cursor = req.cursor orelse "";
+        var last_returned: ?[]const u8 = null;
+        var has_more = false;
+        var scanned: u64 = 0;
+        for (configs) |cfg| {
+            if (cursor.len != 0 and std.mem.order(u8, cfg.name, cursor) != .gt) continue;
+            if (req.index_name) |requested| {
+                if (!std.mem.eql(u8, requested, cfg.name)) continue;
+            }
+            const artifact_kind = artifactRepairKindForIndexKind(cfg.kind) orelse continue;
+            if (req.artifact_kind) |requested_kind| {
+                if (requested_kind != artifact_kind) continue;
+            }
+            if (!(try self.indexRepairRequired(alloc, cfg.name))) continue;
+            scanned += 1;
+            if (req.limit != 0 and issues.items.len >= req.limit) {
+                has_more = true;
+                break;
+            }
+
+            const load_error = self.core.index_manager.loadFailure(cfg.name);
+            try issues.append(alloc, .{
+                .artifact_kind = artifact_kind,
+                .index_name = try alloc.dupe(u8, cfg.name),
+                .artifact_name = try alloc.dupe(u8, cfg.name),
+                .repairable = true,
+                .reason = if (load_error != null) .unreadable_artifact else .missing_artifact,
+                .last_error = if (load_error) |err_name| try alloc.dupe(u8, err_name) else try alloc.dupe(u8, "index_repair_required"),
+            });
+            last_returned = cfg.name;
+        }
+
+        return .{
+            .issues = try issues.toOwnedSlice(alloc),
+            .limit = req.limit,
+            .scanned = scanned,
+            .next_cursor = if (has_more and last_returned != null) try alloc.dupe(u8, last_returned.?) else null,
+            .has_more = has_more,
+        };
+    }
+
     pub fn listArtifactRepairIssuesPage(
         self: *DB,
         alloc: Allocator,
         req: types.ArtifactRepairListRequest,
     ) !types.ArtifactRepairListResult {
+        if (req.target == .index) return try self.listIndexRepairIssuesPage(alloc, req);
+
         var filtering_without_kind_index = false;
         const prefix = if (req.artifact_kind) |kind| prefix_blk: {
             if (try self.artifactRepairKindIndexReady(alloc)) {
@@ -7242,11 +7313,13 @@ pub const DB = struct {
                 break :blk count;
             },
             .sparse_vector => blk: {
+                try self.core.index_manager.resetSparseIndexForArtifactRebuild(cfg.name);
                 const count = try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(self.async_context, cfg.name, 2048);
                 try self.core.index_manager.syncIndexByName(cfg.name, true);
                 break :blk count;
             },
             .graph => blk: {
+                try self.core.index_manager.resetGraphIndexForArtifactRebuild(cfg.name);
                 const count = try applySplitGraphArtifactsForIndexStreaming(
                     alloc,
                     self.core.store,
@@ -38005,6 +38078,19 @@ test "db index repair targets one graph index per selected config" {
         .{ .key = key_a, .value = value_a },
         .{ .key = key_b, .value = value_b },
     }, &.{});
+    const graph_entry = db.core.index_manager.graphIndex("graph_a") orelse return error.TestUnexpectedResult;
+    try graph_entry.index.batchApply(&.{.{
+        .source = "doc:stale-source",
+        .target = "doc:stale",
+        .edge_type = "mentions",
+        .weight = 1.0,
+    }}, &.{});
+
+    {
+        const before_edges = try graph_entry.index.getEdges(alloc, "doc:stale-source", "mentions", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, before_edges);
+        try std.testing.expectEqual(@as(usize, 1), before_edges.len);
+    }
 
     var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
         .target = .index,
@@ -38019,6 +38105,15 @@ test "db index repair targets one graph index per selected config" {
     try std.testing.expectEqual(@as(u64, 1), repair.repaired);
     try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
 
+    const repaired_graph_entry = db.core.index_manager.graphIndex("graph_a") orelse return error.TestUnexpectedResult;
+    const raw_edges_a = try repaired_graph_entry.index.getEdges(alloc, "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, raw_edges_a);
+    try std.testing.expectEqual(@as(usize, 1), raw_edges_a.len);
+    try std.testing.expectEqualStrings("doc:b", raw_edges_a[0].target);
+    const raw_stale_edges = try repaired_graph_entry.index.getEdges(alloc, "doc:stale-source", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, raw_stale_edges);
+    try std.testing.expectEqual(@as(usize, 0), raw_stale_edges.len);
+
     const edges_a = try db.getEdges(alloc, "graph_a", "doc:a", "mentions", .out);
     defer graph_mod.GraphIndex.freeEdges(alloc, edges_a);
     try std.testing.expectEqual(@as(usize, 1), edges_a.len);
@@ -38027,6 +38122,110 @@ test "db index repair targets one graph index per selected config" {
     const edges_b = try db.getEdges(alloc, "graph_b", "doc:a", "mentions", .out);
     defer graph_mod.GraphIndex.freeEdges(alloc, edges_b);
     try std.testing.expectEqual(@as(usize, 0), edges_b.len);
+}
+
+test "db index repair resets sparse index before rebuilding from artifacts" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "sp_v1",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse\"}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const key_a = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "sp_v1");
+    defer alloc.free(key_a);
+    const value_a = try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(alloc, null, &.{1}, &.{1.0});
+    defer alloc.free(value_a);
+    const key_b = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:b", "sp_v1");
+    defer alloc.free(key_b);
+    const value_b = try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(alloc, null, &.{2}, &.{1.0});
+    defer alloc.free(value_b);
+    try db.core.store.putBatch(&.{
+        .{ .key = key_a, .value = value_a },
+        .{ .key = key_b, .value = value_b },
+    }, &.{});
+
+    const sparse_entry = db.core.index_manager.sparseIndex("sp_v1") orelse return error.TestUnexpectedResult;
+    try sparse_entry.index.batch(&.{
+        .{ .doc_id = "doc:a", .vec = .{ .indices = &.{1}, .values = &.{1.0} } },
+        .{ .doc_id = "doc:b", .vec = .{ .indices = &.{2}, .values = &.{1.0} } },
+        .{ .doc_id = "doc:stale", .vec = .{ .indices = &.{3}, .values = &.{1.0} } },
+    }, &.{});
+    try std.testing.expect((try sparse_entry.index.debugDocNumForDocId("doc:stale")) != null);
+
+    var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .artifact_kind = .embedding,
+        .index_name = "sp_v1",
+        .limit = 1,
+        .force = true,
+    });
+    defer repair.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), repair.scanned);
+    try std.testing.expectEqual(@as(u64, 2), repair.reprocessed);
+    try std.testing.expectEqual(@as(u64, 1), repair.repaired);
+    try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
+
+    const repaired_entry = db.core.index_manager.sparseIndex("sp_v1") orelse return error.TestUnexpectedResult;
+    try std.testing.expect((try repaired_entry.index.debugDocNumForDocId("doc:a")) != null);
+    try std.testing.expect((try repaired_entry.index.debugDocNumForDocId("doc:b")) != null);
+    try std.testing.expectEqual(@as(?u32, null), try repaired_entry.index.debugDocNumForDocId("doc:stale"));
+}
+
+test "db repair issue list reports index repair candidates" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+
+    var issue = types.ArtifactRepairIssue{
+        .artifact_kind = .graph,
+        .index_name = try alloc.dupe(u8, "graph_v1"),
+        .doc_key = try alloc.dupe(u8, "doc:a"),
+        .artifact_name = try alloc.dupe(u8, "graph_v1"),
+        .reason = .corrupt_artifact,
+        .sequence = 1,
+    };
+    defer issue.deinit(alloc);
+    try db.recordArtifactRepairIssue(alloc, issue);
+
+    var page = try db.listArtifactRepairIssuesPage(alloc, .{
+        .target = .index,
+        .artifact_kind = .graph,
+        .limit = 10,
+    });
+    defer page.deinit(alloc);
+
+    try std.testing.expect(!page.has_more);
+    try std.testing.expectEqual(@as(usize, 1), page.issues.len);
+    try std.testing.expectEqual(.graph, page.issues[0].artifact_kind);
+    try std.testing.expectEqualStrings("graph_v1", page.issues[0].index_name);
+    try std.testing.expectEqualStrings("index_repair_required", page.issues[0].last_error);
 }
 
 test "db index repair recovers quarantined index load before rebuild" {

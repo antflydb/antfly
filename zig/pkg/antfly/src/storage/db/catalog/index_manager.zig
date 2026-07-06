@@ -1534,6 +1534,61 @@ pub const IndexManager = struct {
         try self.reopenDenseIndexStorage(entry, path);
     }
 
+    pub fn resetSparseIndexForArtifactRebuild(self: *IndexManager, index_name: []const u8) !void {
+        const entry = self.sparseIndex(index_name) orelse return error.IndexNotFound;
+        const path = try self.indexPath(index_name);
+        defer self.alloc.free(path);
+
+        entry.index.close();
+        deleteIndexDirIfPresent(path);
+
+        const zpath = try self.alloc.dupeZ(u8, path);
+        defer self.alloc.free(zpath);
+        entry.index = try sparse_mod.SparseIndex.open(self.alloc, zpath, .{
+            .no_sync = self.relaxed_split_durability,
+            .no_meta_sync = self.relaxed_split_durability,
+            .backend = self.sparse_backend,
+            .lsm_storage = self.sparse_lsm_storage,
+            .lsm_cache = self.lsm_cache,
+            .lsm_options = self.sparse_lsm_options,
+            .lsm_root_generation = self.lsm_root_generation,
+        });
+    }
+
+    pub fn resetGraphIndexForArtifactRebuild(self: *IndexManager, index_name: []const u8) !void {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        const path = try self.indexPath(index_name);
+        defer self.alloc.free(path);
+
+        var graph_cfg = try parseGraphConfig(self.alloc, entry.config.config_json);
+        defer graph_cfg.deinit(self.alloc);
+
+        const forward_path = try std.fmt.allocPrint(self.alloc, "{s}/forward", .{path});
+        defer self.alloc.free(forward_path);
+        const reverse_path = try std.fmt.allocPrint(self.alloc, "{s}/reverse", .{path});
+        defer self.alloc.free(reverse_path);
+        const zforward = try self.alloc.dupeZ(u8, forward_path);
+        defer self.alloc.free(zforward);
+        const zreverse = try self.alloc.dupeZ(u8, reverse_path);
+        defer self.alloc.free(zreverse);
+
+        entry.index.close();
+        deleteIndexDirIfPresent(path);
+
+        entry.index = try graph_mod.GraphIndex.openWithPrivateStores(self.alloc, zforward, zreverse, entry.config.name, .{
+            .no_sync = self.relaxed_split_durability,
+            .no_meta_sync = self.relaxed_split_durability,
+            .reverse_backend = self.graph_reverse_backend,
+            .reverse_lsm_storage = self.graph_lsm_storage,
+            .reverse_lsm_cache = self.lsm_cache,
+            .reverse_lsm_options = self.graph_reverse_lsm_options,
+            .reverse_lsm_root_generation = self.lsm_root_generation,
+            .edge_type_configs = entry.edge_type_configs,
+            .rebuild_root_path = path,
+            .algebraic_semiring_traversal = graph_cfg.algebraic_semiring_traversal,
+        });
+    }
+
     pub fn clearDenseHbcCaches(self: *IndexManager) void {
         for (self.dense_indexes.items) |*entry| entry.index.clearAllCaches();
     }

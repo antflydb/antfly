@@ -322,6 +322,7 @@ fn artifactRepairListRequestForShard(
     cursor: ?[]const u8,
 ) db_mod.types.ArtifactRepairListRequest {
     return .{
+        .target = req.target,
         .artifact_kind = req.artifact_kind,
         .index_name = req.index_name,
         .limit = limit,
