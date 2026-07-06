@@ -187,6 +187,21 @@ pub fn publicIndexConfigsAlloc(alloc: Allocator, configs: []const IndexConfig) !
     return public_configs;
 }
 
+pub fn indexConfigHash(cfg: IndexConfig) u64 {
+    var hasher = std.hash.Wyhash.init(0x41504a4346470001);
+    hashLengthPrefixedBytes(&hasher, cfg.name);
+    hashLengthPrefixedBytes(&hasher, @tagName(cfg.kind));
+    hashLengthPrefixedBytes(&hasher, cfg.config_json);
+    return hasher.final();
+}
+
+fn hashLengthPrefixedBytes(hasher: *std.hash.Wyhash, bytes: []const u8) void {
+    var len_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len_buf, bytes.len, .little);
+    hasher.update(&len_buf);
+    hasher.update(bytes);
+}
+
 pub fn freeIndexConfigs(alloc: Allocator, configs: []IndexConfig) void {
     for (configs) |*cfg| cfg.deinit(alloc);
     if (configs.len > 0) alloc.free(configs);
@@ -296,6 +311,33 @@ pub const EnrichmentConfig = struct {
         self.* = undefined;
     }
 };
+
+pub fn enrichmentConfigHash(cfg: EnrichmentConfig) u64 {
+    var hasher = std.hash.Wyhash.init(0x41454a4346470001);
+    hashLengthPrefixedBytes(&hasher, cfg.name);
+    hashLengthPrefixedBytes(&hasher, @tagName(cfg.kind));
+    hashLengthPrefixedBytes(&hasher, cfg.field);
+    hashLengthPrefixedBytes(&hasher, cfg.template);
+    hashLengthPrefixedBytes(&hasher, cfg.source_artifact_name);
+    hashU32(&hasher, cfg.expected_dims);
+    hashU32(&hasher, cfg.chunk_size);
+    hashU32(&hasher, cfg.chunk_overlap);
+    hashLengthPrefixedBytes(&hasher, cfg.chunker_json);
+    hashBool(&hasher, cfg.full_text_index);
+    hashLengthPrefixedBytes(&hasher, cfg.content_type);
+    hashLengthPrefixedBytes(&hasher, cfg.producer_json);
+    return hasher.final();
+}
+
+fn hashU32(hasher: *std.hash.Wyhash, value: u32) void {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, value, .little);
+    hasher.update(&buf);
+}
+
+fn hashBool(hasher: *std.hash.Wyhash, value: bool) void {
+    hasher.update(if (value) "\x01" else "\x00");
+}
 
 pub fn freeEnrichmentConfigs(alloc: Allocator, configs: []EnrichmentConfig) void {
     for (configs) |*cfg| cfg.deinit(alloc);
@@ -1580,6 +1622,11 @@ pub const EnrichmentStats = struct {
     last_acquired_ms: u64 = 0,
     target_sequence: u64 = 0,
     applied_sequence: u64 = 0,
+    projection_checkpoint_status: []const u8 = "clean",
+    projection_checkpoint_applied_sequence: u64 = 0,
+    projection_checkpoint_generation: u64 = 0,
+    projection_checkpoint_config_hash: u64 = 0,
+    checkpoint_replay_tail_sequence_count: u64 = 0,
     processed_requests: u64 = 0,
     error_count: u64 = 0,
     retryable_error_count: u64 = 0,
@@ -1761,6 +1808,10 @@ pub const DBStats = struct {
     doc_count: u64 = 0,
     index_count: u32 = 0,
     indexes: []DBIndexStats = &.{},
+    repair_degraded: bool = false,
+    repair_issue_count: u64 = 0,
+    repair_summary_ready: bool = true,
+    repair_issue_count_estimated: bool = false,
     doc_identity: DocIdentityStats = .{},
     doc_set_planning: DocSetPlanningStats = .{},
     enrichment: EnrichmentStats = .{},
@@ -1774,6 +1825,192 @@ pub const DBStats = struct {
     term_doc_freq_cache_misses: u64 = 0,
     async_indexing: AsyncIndexingStats = .{},
 };
+
+pub const ArtifactRepairKind = enum {
+    embedding,
+    asset,
+    chunk,
+    graph,
+    full_text,
+};
+
+pub const RepairTarget = enum {
+    artifact,
+    index,
+};
+
+pub const ArtifactRepairReason = enum {
+    missing_artifact,
+    corrupt_artifact,
+    unreadable_artifact,
+};
+
+pub const ArtifactRepairIssue = struct {
+    artifact_kind: ArtifactRepairKind = .embedding,
+    index_name: []const u8 = "",
+    doc_key: []const u8 = "",
+    parent_doc_key: []const u8 = "",
+    unit_id: []const u8 = "",
+    source_artifact_name: []const u8 = "",
+    artifact_name: []const u8 = "",
+    artifact_key: []const u8 = "",
+    chunk_id: ?u32 = null,
+    repairable: bool = true,
+    unsupported_reason: []const u8 = "",
+    sequence: u64 = 0,
+    reason: ArtifactRepairReason = .missing_artifact,
+    attempts: u64 = 0,
+    first_seen_ns: u64 = 0,
+    last_seen_ns: u64 = 0,
+    last_error: []const u8 = "",
+
+    pub fn deinit(self: *ArtifactRepairIssue, alloc: Allocator) void {
+        if (self.index_name.len > 0) alloc.free(@constCast(self.index_name));
+        if (self.doc_key.len > 0) alloc.free(@constCast(self.doc_key));
+        if (self.parent_doc_key.len > 0) alloc.free(@constCast(self.parent_doc_key));
+        if (self.unit_id.len > 0) alloc.free(@constCast(self.unit_id));
+        if (self.source_artifact_name.len > 0) alloc.free(@constCast(self.source_artifact_name));
+        if (self.artifact_name.len > 0) alloc.free(@constCast(self.artifact_name));
+        if (self.artifact_key.len > 0) alloc.free(@constCast(self.artifact_key));
+        if (self.unsupported_reason.len > 0) alloc.free(@constCast(self.unsupported_reason));
+        if (self.last_error.len > 0) alloc.free(@constCast(self.last_error));
+        self.* = undefined;
+    }
+};
+
+pub fn freeArtifactRepairIssues(alloc: Allocator, issues: []ArtifactRepairIssue) void {
+    for (issues) |*issue| issue.deinit(alloc);
+    if (issues.len > 0) alloc.free(issues);
+}
+
+pub const ArtifactRepairListRequest = struct {
+    target: RepairTarget = .artifact,
+    artifact_kind: ?ArtifactRepairKind = null,
+    index_name: ?[]const u8 = null,
+    limit: u32 = 50,
+    cursor: ?[]const u8 = null,
+};
+
+pub const ArtifactRepairListResult = struct {
+    issues: []ArtifactRepairIssue = &.{},
+    limit: u32 = 0,
+    scanned: u64 = 0,
+    groups_scanned: u64 = 0,
+    next_cursor: ?[]u8 = null,
+    has_more: bool = false,
+
+    pub fn deinit(self: *ArtifactRepairListResult, alloc: Allocator) void {
+        freeArtifactRepairIssues(alloc, self.issues);
+        if (self.next_cursor) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const ArtifactRepairRunRequest = struct {
+    target: RepairTarget = .artifact,
+    artifact_kind: ?ArtifactRepairKind = null,
+    index_name: ?[]const u8 = null,
+    limit: u32 = 100,
+    cursor: ?[]const u8 = null,
+    force: bool = false,
+};
+
+pub const ArtifactRepairResult = struct {
+    scanned: u64 = 0,
+    groups_scanned: u64 = 0,
+    reprocessed: u64 = 0,
+    repaired: u64 = 0,
+    missing_source_docs: u64 = 0,
+    failed: u64 = 0,
+    unsupported: u64 = 0,
+    unresolved: u64 = 0,
+    indexes_rebuilt: u64 = 0,
+    indexes_degraded: u64 = 0,
+    limit: u32 = 0,
+    next_cursor: ?[]u8 = null,
+    has_more: bool = false,
+    debt_remaining: bool = false,
+
+    pub fn deinit(self: *ArtifactRepairResult, alloc: Allocator) void {
+        if (self.next_cursor) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const EmbeddingArtifactRepairReason = enum {
+    missing_embedding_artifact,
+    corrupt_embedding_artifact,
+};
+
+pub const EmbeddingArtifactRepairIssue = struct {
+    artifact_kind: ArtifactRepairKind = .embedding,
+    index_name: []const u8 = "",
+    doc_key: []const u8 = "",
+    parent_doc_key: []const u8 = "",
+    unit_id: []const u8 = "",
+    source_artifact_name: []const u8 = "",
+    artifact_name: []const u8 = "",
+    artifact_key: []const u8 = "",
+    chunk_id: ?u32 = null,
+    repairable: bool = true,
+    unsupported_reason: []const u8 = "",
+    sequence: u64 = 0,
+    reason: EmbeddingArtifactRepairReason = .missing_embedding_artifact,
+    attempts: u64 = 0,
+    first_seen_ns: u64 = 0,
+    last_seen_ns: u64 = 0,
+    last_error: []const u8 = "",
+
+    pub fn deinit(self: *EmbeddingArtifactRepairIssue, alloc: Allocator) void {
+        if (self.index_name.len > 0) alloc.free(@constCast(self.index_name));
+        if (self.doc_key.len > 0) alloc.free(@constCast(self.doc_key));
+        if (self.parent_doc_key.len > 0) alloc.free(@constCast(self.parent_doc_key));
+        if (self.unit_id.len > 0) alloc.free(@constCast(self.unit_id));
+        if (self.source_artifact_name.len > 0) alloc.free(@constCast(self.source_artifact_name));
+        if (self.artifact_name.len > 0) alloc.free(@constCast(self.artifact_name));
+        if (self.artifact_key.len > 0) alloc.free(@constCast(self.artifact_key));
+        if (self.unsupported_reason.len > 0) alloc.free(@constCast(self.unsupported_reason));
+        if (self.last_error.len > 0) alloc.free(@constCast(self.last_error));
+        self.* = undefined;
+    }
+};
+pub const EmbeddingArtifactRepairResult = ArtifactRepairResult;
+
+pub fn embeddingArtifactRepairReasonFromArtifact(reason: ArtifactRepairReason) EmbeddingArtifactRepairReason {
+    return switch (reason) {
+        .missing_artifact => .missing_embedding_artifact,
+        .corrupt_artifact, .unreadable_artifact => .corrupt_embedding_artifact,
+    };
+}
+
+pub fn embeddingArtifactRepairIssueFromArtifactAlloc(alloc: Allocator, issue: ArtifactRepairIssue) !EmbeddingArtifactRepairIssue {
+    var out = EmbeddingArtifactRepairIssue{
+        .artifact_kind = issue.artifact_kind,
+        .chunk_id = issue.chunk_id,
+        .repairable = issue.repairable,
+        .sequence = issue.sequence,
+        .reason = embeddingArtifactRepairReasonFromArtifact(issue.reason),
+        .attempts = issue.attempts,
+        .first_seen_ns = issue.first_seen_ns,
+        .last_seen_ns = issue.last_seen_ns,
+    };
+    errdefer out.deinit(alloc);
+    out.index_name = try alloc.dupe(u8, issue.index_name);
+    out.doc_key = try alloc.dupe(u8, issue.doc_key);
+    out.parent_doc_key = try alloc.dupe(u8, issue.parent_doc_key);
+    out.unit_id = try alloc.dupe(u8, issue.unit_id);
+    out.source_artifact_name = try alloc.dupe(u8, issue.source_artifact_name);
+    out.artifact_name = try alloc.dupe(u8, issue.artifact_name);
+    out.artifact_key = try alloc.dupe(u8, issue.artifact_key);
+    out.unsupported_reason = try alloc.dupe(u8, issue.unsupported_reason);
+    out.last_error = try alloc.dupe(u8, issue.last_error);
+    return out;
+}
+
+pub fn freeEmbeddingArtifactRepairIssues(alloc: Allocator, issues: []EmbeddingArtifactRepairIssue) void {
+    for (issues) |*issue| issue.deinit(alloc);
+    if (issues.len > 0) alloc.free(issues);
+}
 
 pub const AlgebraicCandidateStatus = struct {
     recommendation: []const u8,
@@ -1832,8 +2069,18 @@ pub const DBIndexStats = struct {
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
     enrichment_failed: bool = false,
+    repair_degraded: bool = false,
+    repair_issue_count: u64 = 0,
+    repair_summary_ready: bool = true,
+    repair_issue_count_estimated: bool = false,
+    repair_scan_issue_count: u64 = 0,
+    projection_checkpoint_status: []const u8 = "clean",
+    projection_checkpoint_applied_sequence: u64 = 0,
+    projection_checkpoint_generation: u64 = 0,
+    projection_checkpoint_config_hash: u64 = 0,
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
+    checkpoint_replay_tail_sequence_count: u64 = 0,
     replay_catch_up_required: bool = false,
     catch_up_active: bool = false,
     catch_up_phase: DenseCatchUpStats.Phase = .idle,

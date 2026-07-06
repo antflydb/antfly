@@ -3989,6 +3989,112 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/tables/{tableName}/repair/issues:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+    post:
+      summary: List artifact repair issues
+      description: >
+        Lists durable repair debt for a table. This operator-facing endpoint
+
+        returns exact document keys, artifact keys, index names, and repair
+
+        errors, and therefore requires table admin permission when authentication
+
+        is enabled. Request filters are supplied in the JSON body. This release
+
+        supports `target=artifact` for durable artifact queue entries and
+
+        `target=index` for index repair candidates.
+      tags:
+        - data_operations
+      operationId: listArtifactRepairIssues
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RepairIssueListRequest'
+      responses:
+        '200':
+          description: Artifact repair issue page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArtifactRepairIssueList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/repair/run:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+    post:
+      summary: Run a bounded table repair pass
+      description: >
+        Attempts to repair queued table issues. `target=artifact` reprocesses
+
+        supported artifact kinds and replays derived state; it is bounded by
+
+        `limit` and returns an opaque continuation cursor when another artifact
+
+        repair page is available. `target=index` repairs one named index after
+
+        resetting its derived index storage; healthy indexes are skipped unless
+
+        `force=true` is supplied, and any positive `limit` permits that single
+
+        named index repair. The response reports unresolved debt separately, and
+
+        the endpoint requires table admin permission when authentication is
+
+        enabled.
+      tags:
+        - data_operations
+      operationId: runTableRepair
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RepairRunRequest'
+      responses:
+        '202':
+          description: Bounded table repair pass was accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArtifactRepairRunResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess:
     parameters:
       - name: tableName
@@ -7271,6 +7377,285 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/EnrichmentConfig'
+    ArtifactRepairKind:
+      type: string
+      description: Kind of stored artifact tracked by the repair queue.
+      enum:
+        - embedding
+        - asset
+        - chunk
+        - graph
+        - full_text
+    ArtifactRepairReason:
+      type: string
+      description: Reason an artifact was added to the repair queue.
+      enum:
+        - missing_artifact
+        - corrupt_artifact
+        - unreadable_artifact
+    RepairTarget:
+      type: string
+      description: Repair subsystem to inspect or run.
+      enum:
+        - artifact
+        - index
+    ArtifactRepairIssue:
+      type: object
+      description: Durable repair debt for a derived artifact. This is an operator-facing record and includes
+        exact source and artifact identifiers.
+      required:
+        - artifact_kind
+        - index_name
+        - doc_key
+        - artifact_name
+        - repairable
+        - sequence
+        - reason
+        - attempts
+        - first_seen_ns
+        - last_seen_ns
+      properties:
+        artifact_kind:
+          $ref: '#/components/schemas/ArtifactRepairKind'
+        index_name:
+          type: string
+          description: Index whose replay or derived state observed the artifact problem.
+        doc_key:
+          type: string
+          description: Source or derived document key whose artifact is missing or unreadable.
+        parent_doc_key:
+          type: string
+          description: Parent source document key for chunk-derived artifacts.
+        unit_id:
+          type: string
+          description: Unit identifier for unit-scoped artifacts, when applicable.
+        source_artifact_name:
+          type: string
+          description: Source artifact stream used to produce this artifact, when applicable.
+        artifact_name:
+          type: string
+          description: Derived artifact name that must be reprocessed or made readable.
+        artifact_key:
+          type: string
+          description: Hex-encoded internal artifact storage key, when known.
+        chunk_id:
+          type: integer
+          format: uint32
+          nullable: true
+          description: Chunk ordinal for chunk-derived artifacts.
+        repairable:
+          type: boolean
+          description: Whether this artifact kind currently has an automated repair reprocessor.
+        unsupported_reason:
+          type: string
+          description: Stable reason code when repairable is false.
+        sequence:
+          type: integer
+          format: uint64
+          description: Derived replay sequence that observed the issue.
+        reason:
+          $ref: '#/components/schemas/ArtifactRepairReason'
+        attempts:
+          type: integer
+          format: uint64
+          description: Number of repair attempts made for this issue.
+        first_seen_ns:
+          type: integer
+          format: uint64
+          description: Monotonic timestamp when this issue was first recorded.
+        last_seen_ns:
+          type: integer
+          format: uint64
+          description: Monotonic timestamp when this issue was last observed or attempted.
+        last_error:
+          type: string
+          description: Last stable repair error code, when a repair attempt failed.
+    ArtifactRepairIssueList:
+      type: object
+      description: Bounded page of table repair issues.
+      required:
+        - table
+        - target
+        - limit
+        - scanned
+        - groups_scanned
+        - has_more
+        - issues
+      properties:
+        table:
+          type: string
+          description: Table whose repair queue was listed.
+        target:
+          $ref: '#/components/schemas/RepairTarget'
+        limit:
+          type: integer
+          format: uint32
+          description: Effective page limit.
+        scanned:
+          type: integer
+          format: uint64
+          description: Number of repair records scanned while building this page.
+        groups_scanned:
+          type: integer
+          format: uint64
+          description: Number of table groups touched while building this page.
+        has_more:
+          type: boolean
+          description: Whether another page is available.
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor for the next page when has_more is true.
+        issues:
+          type: array
+          items:
+            $ref: '#/components/schemas/ArtifactRepairIssue'
+    RepairIssueListRequest:
+      type: object
+      description: Bounded request to list table repair issues.
+      properties:
+        target:
+          $ref: '#/components/schemas/RepairTarget'
+          default: artifact
+          description: Repair subsystem to list. `artifact` lists durable artifact queue records; `index`
+            lists index repair candidates derived from index status and artifact debt.
+        kind:
+          $ref: '#/components/schemas/ArtifactRepairKind'
+        index:
+          type: string
+          description: Restrict results to one index name.
+        cursor:
+          type: string
+          description: Opaque cursor returned by a prior response.
+        limit:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 500
+          default: 50
+          description: Maximum repair records to return.
+    RepairRunRequest:
+      type: object
+      description: Bounded request to run a table repair pass.
+      properties:
+        target:
+          $ref: '#/components/schemas/RepairTarget'
+        kind:
+          $ref: '#/components/schemas/ArtifactRepairKind'
+        index:
+          type: string
+          description: Restrict repair attempts to one index name.
+        cursor:
+          type: string
+          description: Opaque cursor returned by a prior repair response.
+        force:
+          type: boolean
+          default: false
+          description: Force a named index rebuild even when no repair debt is currently recorded. Only
+            applies to target=index.
+        limit:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 1000
+          default: 100
+          description: Maximum artifact repair records to attempt. For target=index, any positive value
+            permits one named index repair.
+    ArtifactRepairRunResult:
+      type: object
+      description: Result of one bounded artifact repair pass.
+      required:
+        - scanned
+        - groups_scanned
+        - reprocessed
+        - repaired
+        - missing_source_docs
+        - failed
+        - unsupported
+        - unresolved
+        - indexes_rebuilt
+        - indexes_degraded
+        - limit
+        - has_more
+        - debt_remaining
+      properties:
+        scanned:
+          type: integer
+          format: uint64
+          description: Number of repair records attempted by this pass.
+        groups_scanned:
+          type: integer
+          format: uint64
+          description: Number of table groups touched by this bounded repair pass.
+        reprocessed:
+          type: integer
+          format: uint64
+          description: Number of artifacts whose source was reprocessed.
+        repaired:
+          type: integer
+          format: uint64
+          description: Number of repair records cleared because the artifact became readable.
+        missing_source_docs:
+          type: integer
+          format: uint64
+          description: Number of repair records whose source document no longer exists.
+        failed:
+          type: integer
+          format: uint64
+          description: Number of supported repair attempts that failed.
+        unsupported:
+          type: integer
+          format: uint64
+          description: Number of repair records skipped because no reprocessor exists for the artifact
+            kind.
+        unresolved:
+          type: integer
+          format: uint64
+          description: Number of attempted repair records that remained queued after this pass.
+        indexes_rebuilt:
+          type: integer
+          format: uint64
+          description: Number of indexes rebuilt by this pass when target is index.
+        indexes_degraded:
+          type: integer
+          format: uint64
+          description: Number of selected indexes that were already degraded or quarantined before repair.
+        limit:
+          type: integer
+          format: uint32
+          description: Effective repair limit.
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor for the next artifact repair pass when has_more is true. Index repair
+            currently repairs one named index per request and does not return a continuation cursor.
+        has_more:
+          type: boolean
+          description: Whether another artifact scan page is available via next_cursor.
+        debt_remaining:
+          type: boolean
+          description: Whether repair debt remains after this bounded pass. If true and next_cursor is
+            absent, rerun repair from the beginning after addressing failed or unsupported records.
+    ArtifactRepairRunResponse:
+      type: object
+      description: Response for a bounded table repair pass.
+      required:
+        - table
+        - target
+        - limit
+        - result
+      properties:
+        table:
+          type: string
+          description: Table whose repair queue was processed.
+        target:
+          $ref: '#/components/schemas/RepairTarget'
+        limit:
+          type: integer
+          format: uint32
+          description: Effective repair limit.
+        result:
+          $ref: '#/components/schemas/ArtifactRepairRunResult'
     DocumentArtifactReprocessResponse:
       type: object
       required:
@@ -15251,6 +15636,35 @@ components:
           type: object
           additionalProperties: true
           description: Asynchronous indexer runtime diagnostics.
+        projection_checkpoint_status:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: 'Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required.'
+        projection_checkpoint_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Highest derived-log sequence covered by the durable projection checkpoint.
+        projection_checkpoint_generation:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Projection generation associated with the durable checkpoint.
+        projection_checkpoint_config_hash:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Projection configuration identity associated with the durable checkpoint.
+        checkpoint_replay_tail_sequence_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Number of derived-log sequences after the durable checkpoint that still need replay.
+        repair_scan_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Repair issues found by explicit repair-scan accounting for this projection.
     EmbeddingsIndexStats:
       type: object
       description: Statistics for an embeddings index (dense or sparse)
@@ -15396,6 +15810,35 @@ components:
           x-go-type-skip-optional-pointer: true
           type: object
           additionalProperties: true
+        projection_checkpoint_status:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: 'Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required.'
+        projection_checkpoint_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Highest derived-log sequence covered by the durable projection checkpoint.
+        projection_checkpoint_generation:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Projection generation associated with the durable checkpoint.
+        projection_checkpoint_config_hash:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Projection configuration identity associated with the durable checkpoint.
+        checkpoint_replay_tail_sequence_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Number of derived-log sequences after the durable checkpoint that still need replay.
+        repair_scan_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Repair issues found by explicit repair-scan accounting for this projection.
     GraphIndexStats:
       type: object
       description: Statistics for graph index
@@ -15506,6 +15949,35 @@ components:
           x-go-type-skip-optional-pointer: true
           type: object
           additionalProperties: true
+        projection_checkpoint_status:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: 'Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required.'
+        projection_checkpoint_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Highest derived-log sequence covered by the durable projection checkpoint.
+        projection_checkpoint_generation:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Projection generation associated with the durable checkpoint.
+        projection_checkpoint_config_hash:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Projection configuration identity associated with the durable checkpoint.
+        checkpoint_replay_tail_sequence_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Number of derived-log sequences after the durable checkpoint that still need replay.
+        repair_scan_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Repair issues found by explicit repair-scan accounting for this projection.
         algebraic_graph:
           x-go-type-skip-optional-pointer: true
           type: object
@@ -15706,6 +16178,35 @@ components:
           x-go-type-skip-optional-pointer: true
           type: integer
           format: uint64
+        projection_checkpoint_status:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: 'Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required.'
+        projection_checkpoint_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Highest derived-log sequence covered by the durable projection checkpoint.
+        projection_checkpoint_generation:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Projection generation associated with the durable checkpoint.
+        projection_checkpoint_config_hash:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Projection configuration identity associated with the durable checkpoint.
+        checkpoint_replay_tail_sequence_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Number of derived-log sequences after the durable checkpoint that still need replay.
+        repair_scan_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Repair issues found by explicit repair-scan accounting for this projection.
     IndexStats:
       type: object
       description: Statistics for an index

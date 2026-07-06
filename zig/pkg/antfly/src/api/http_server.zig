@@ -1347,23 +1347,34 @@ pub const ApiHttpServer = struct {
         }
 
         var read_needs_refresh = false;
+        var read_statuses_present = false;
         if (self.table_reads) |source| {
             if (try source.localRuntimeStatuses(self.alloc, table_name)) |statuses| {
                 var owned = statuses;
-                errdefer owned.deinit(self.alloc);
-                read_needs_refresh = runtimeStatusesNeedDenseVisibilityRefresh(owned.items);
-                try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &owned, .append);
+                if (owned.items.len == 0) {
+                    owned.deinit(self.alloc);
+                } else {
+                    read_statuses_present = true;
+                    errdefer owned.deinit(self.alloc);
+                    read_needs_refresh = runtimeStatusesNeedWriterRefresh(owned.items);
+                    try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &owned, .append);
+                }
             }
         }
-        if ((self.table_reads == null or read_needs_refresh) and self.table_writes != null) {
+        if (snapshot) |admin_snapshot| {
+            try self.appendRemoteRuntimeStatusesFromSnapshot(&items, table_name, admin_snapshot);
+        }
+        const snapshot_has_groups = self.snapshotHasProjectedTableGroups(table_name, snapshot);
+        const should_query_writes = if (snapshot == null)
+            self.table_reads == null or !read_statuses_present or read_needs_refresh
+        else
+            !snapshot_has_groups and (items.items.len == 0 or !read_statuses_present or read_needs_refresh);
+        if (should_query_writes and self.table_writes != null) {
             if (try self.table_writes.?.localRuntimeStatuses(self.alloc, table_name)) |statuses| {
                 var owned = statuses;
                 errdefer owned.deinit(self.alloc);
                 try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &owned, if (read_needs_refresh) .replace_existing else .append);
             }
-        }
-        if (snapshot) |admin_snapshot| {
-            try self.appendRemoteRuntimeStatusesFromSnapshot(&items, table_name, admin_snapshot);
         }
         if (items.items.len == 0) {
             items.deinit(self.alloc);
@@ -1377,6 +1388,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn runtimeStatusNeedsDenseVisibilityRefresh(status: runtime_status.LocalTableRuntimeStatus) bool {
+        if (status.stats.repair_degraded or status.stats.repair_issue_count != 0) return false;
         const has_primary_facts = status.stats.doc_identity.live_ordinals != 0 or status.stats.doc_count != 0;
         for (status.stats.indexes) |item| {
             if (item.kind != .dense_vector) continue;
@@ -1388,9 +1400,16 @@ pub const ApiHttpServer = struct {
         return false;
     }
 
-    fn runtimeStatusesNeedDenseVisibilityRefresh(statuses: []const runtime_status.LocalTableRuntimeStatus) bool {
+    fn runtimeStatusNeedsWriterRefresh(status: runtime_status.LocalTableRuntimeStatus) bool {
+        if (runtimeStatusNeedsDenseVisibilityRefresh(status)) return true;
+        if (runtime_status.statusHasRuntimeFacts(status)) return false;
+        if (status.metadata.source == .live_writer_publish) return false;
+        return status.stats.indexes.len != 0;
+    }
+
+    fn runtimeStatusesNeedWriterRefresh(statuses: []const runtime_status.LocalTableRuntimeStatus) bool {
         for (statuses) |status| {
-            if (runtimeStatusNeedsDenseVisibilityRefresh(status)) return true;
+            if (runtimeStatusNeedsWriterRefresh(status)) return true;
         }
         return false;
     }
@@ -1473,7 +1492,9 @@ pub const ApiHttpServer = struct {
         for (items.items) |*existing| {
             if (existing.group_id != status.group_id) continue;
             if (existing.metadata.source != .remote_store) {
-                status.deinit(alloc);
+                existing.deinit(alloc);
+                existing.* = status.*;
+                status.* = undefined;
                 return;
             }
             if (existing.metadata.updated_at_ns >= status.metadata.updated_at_ns) {
@@ -2037,11 +2058,17 @@ pub const ApiHttpServer = struct {
             return try jsonResponse(self.alloc, topology_status);
         }
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.connections)) {
+            const connection_types = parseSimpleQueryParamDecodedAlloc(self.alloc, uri_parts.query, "types") catch return try textResponse(self.alloc, 400, "invalid types");
+            defer if (connection_types) |value| self.alloc.free(value);
+            const connection_include = parseSimpleQueryParamDecodedAlloc(self.alloc, uri_parts.query, "include") catch return try textResponse(self.alloc, 400, "invalid include");
+            defer if (connection_include) |value| self.alloc.free(value);
+            const connection_refresh = parseSimpleQueryParamDecodedAlloc(self.alloc, uri_parts.query, "refresh") catch return try textResponse(self.alloc, 400, "invalid refresh");
+            defer if (connection_refresh) |value| self.alloc.free(value);
             const body = try self.listConnectionsJsonAlloc(
                 self.alloc,
-                parseSimpleQueryParam(uri_parts.query, "types"),
-                parseSimpleQueryParam(uri_parts.query, "include"),
-                parseSimpleQueryParam(uri_parts.query, "refresh"),
+                connection_types,
+                connection_include,
+                connection_refresh,
             );
             return .{
                 .status = 200,
@@ -2131,6 +2158,9 @@ pub const ApiHttpServer = struct {
             }
             return try self.bodyResponse(200, "application/yaml", spec.body, false);
         }
+        var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        defer query_arena_impl.deinit();
+        const query_alloc = query_arena_impl.allocator();
         if (std.mem.eql(u8, uri_parts.path, routes.Routes.ai_catalog)) {
             if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
             const mode: ard_catalog.CatalogMode = if (authenticated_identity != null) .tenant else .public_bootstrap;
@@ -2142,7 +2172,7 @@ pub const ApiHttpServer = struct {
             } else null;
             const body = try ard_catalog.catalogJsonWithExtensionsAlloc(
                 self.alloc,
-                self.ardCatalogOptions(mode, uri_parts.query, authenticated_identity),
+                try self.ardCatalogOptions(query_alloc, mode, uri_parts.query, authenticated_identity),
                 extension_context,
             );
             return try self.ardCatalogResponse(200, body, mode == .public_bootstrap);
@@ -2153,7 +2183,7 @@ pub const ApiHttpServer = struct {
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
             const body = try ard_catalog.catalogJsonWithExtensionsAlloc(
                 self.alloc,
-                self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
+                try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
             );
             return try self.ardCatalogResponse(200, body, false);
@@ -2164,7 +2194,7 @@ pub const ApiHttpServer = struct {
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
             const body = ard_catalog.searchJsonWithExtensionsAlloc(
                 self.alloc,
-                self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
+                try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
                 req.body,
                 false,
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
@@ -2180,7 +2210,7 @@ pub const ApiHttpServer = struct {
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
             const body = ard_catalog.searchJsonWithExtensionsAlloc(
                 self.alloc,
-                self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
+                try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
                 req.body,
                 true,
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
@@ -2196,7 +2226,7 @@ pub const ApiHttpServer = struct {
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
             const body = ard_catalog.agentsJsonWithExtensionsQueryAlloc(
                 self.alloc,
-                self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
+                try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
                 uri_parts.query,
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
             ) catch |err| switch (err) {
@@ -2208,7 +2238,7 @@ pub const ApiHttpServer = struct {
         if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.ard_v1_skills_prefix)) {
             if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
             const slug = uri_parts.path[routes.Routes.ard_v1_skills_prefix.len..];
-            const options = self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity);
+            const options = try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity);
             const body = (try ard_catalog.skillMarkdownAlloc(self.alloc, options, slug)) orelse blk: {
                 var snapshot_opt = try self.source.adminSnapshot();
                 defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
@@ -2231,7 +2261,7 @@ pub const ApiHttpServer = struct {
                 const body = (try ard_catalog.mcpDescriptorJsonAlloc(
                     self.alloc,
                     name,
-                    self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
+                    try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
                     if (snapshot_opt) |snapshot| self.ardExtensionCatalogContext(snapshot, authenticated_identity) else null,
                 )) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
                 return try self.ardCatalogResponse(200, body, false);
@@ -2243,7 +2273,7 @@ pub const ApiHttpServer = struct {
                 const body = (try ard_catalog.agentDescriptorJsonAlloc(
                     self.alloc,
                     name,
-                    self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
+                    try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
                     if (snapshot_opt) |snapshot| self.ardExtensionCatalogContext(snapshot, authenticated_identity) else null,
                 )) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
                 return try self.ardCatalogResponse(200, body, false);
@@ -2303,10 +2333,12 @@ pub const ApiHttpServer = struct {
         defer self.alloc.free(route);
         var snapshot_opt = try self.source.adminSnapshot();
         defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+        var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        defer query_arena_impl.deinit();
         return try ard_catalog.agentDescriptorJsonAlloc(
             self.alloc,
             route,
-            self.ardCatalogOptions(.tenant, query, authenticated_identity),
+            try self.ardCatalogOptions(query_arena_impl.allocator(), .tenant, query, authenticated_identity),
             self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
         );
     }
@@ -2338,7 +2370,7 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    fn ardCatalogOptions(self: *ApiHttpServer, mode: ard_catalog.CatalogMode, query: []const u8, authenticated_identity: ?AuthenticatedIdentity) ard_catalog.CatalogOptions {
+    fn ardCatalogOptions(self: *ApiHttpServer, alloc: std.mem.Allocator, mode: ard_catalog.CatalogMode, query: []const u8, authenticated_identity: ?AuthenticatedIdentity) !ard_catalog.CatalogOptions {
         return .{
             .mode = mode,
             .base_url = self.cfg.ard_base_url,
@@ -2346,9 +2378,9 @@ pub const ApiHttpServer = struct {
             .display_name = if (self.cfg.ard_display_name.len > 0) self.cfg.ard_display_name else "Antfly",
             .is_admin = !self.cfg.auth_enabled or authenticatedIdentityIsAdmin(authenticated_identity),
             .permissions = if (authenticated_identity) |identity| identity.permissions else null,
-            .profile = parseSimpleQueryParam(query, "profile"),
-            .types = parseSimpleQueryParam(query, "types"),
-            .include = parseSimpleQueryParam(query, "include"),
+            .profile = try parseSimpleQueryParamDecodedAlloc(alloc, query, "profile"),
+            .types = try parseSimpleQueryParamDecodedAlloc(alloc, query, "types"),
+            .include = try parseSimpleQueryParamDecodedAlloc(alloc, query, "include"),
         };
     }
 
@@ -2692,10 +2724,14 @@ pub const ApiHttpServer = struct {
         if (req.method == .DELETE) {
             if (routes.Routes.matchUserPermissions(uri_parts.path)) |user_path| {
                 const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const params = parseRemovePermissionFromUserParams(uri_parts.query) catch |err| switch (err) {
+                var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+                defer query_arena_impl.deinit();
+                const params = parseRemovePermissionFromUserParams(query_arena_impl.allocator(), uri_parts.query) catch |err| switch (err) {
                     error.MissingResource => return try jsonErrorResponse(self.alloc, 400, "missing resource"),
                     error.MissingResourceType => return try jsonErrorResponse(self.alloc, 400, "missing resourceType"),
                     error.InvalidResourceType => return try jsonErrorResponse(self.alloc, 400, "invalid resourceType"),
+                    error.InvalidArgument => return try jsonErrorResponse(self.alloc, 400, "invalid query parameter"),
+                    else => return err,
                 };
                 manager.removePermissionFromUser(
                     user_path.user_name,
@@ -2713,7 +2749,9 @@ pub const ApiHttpServer = struct {
             }
             if (routes.Routes.matchUserRoles(uri_parts.path)) |user_path| {
                 const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const params = parseRemoveRoleFromUserParams(uri_parts.query) catch {
+                var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+                defer query_arena_impl.deinit();
+                const params = parseRemoveRoleFromUserParams(query_arena_impl.allocator(), uri_parts.query) catch {
                     return try jsonErrorResponse(self.alloc, 400, "missing role");
                 };
                 manager.removeRoleFromUser(user_path.user_name, params.role) catch |err| switch (err) {
@@ -3875,13 +3913,17 @@ pub const ApiHttpServer = struct {
 
     fn dispatchPublicTableRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.backups)) {
-            const params = parseListBackupsParams(uri_parts.query) catch return try textResponse(self.alloc, 400, "missing location");
+            var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+            defer query_arena_impl.deinit();
+            const params = parseListBackupsParams(query_arena_impl.allocator(), uri_parts.query) catch return try textResponse(self.alloc, 400, "missing location");
             return try self.handlePublicClusterBackupList(params.location);
         }
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.tables)) {
             var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
             defer self.source.freeAdminSnapshot(&snapshot);
-            const params = try parseListTablesParams(uri_parts.query);
+            var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+            defer query_arena_impl.deinit();
+            const params = try parseListTablesParams(query_arena_impl.allocator(), uri_parts.query);
             if (params.pattern != null) return try textResponse(self.alloc, 400, "unsupported table pattern");
             const storage_statuses = try self.collectTableStorageStatuses(&snapshot, params.prefix);
             defer if (storage_statuses) |items| self.alloc.free(items);
@@ -3957,6 +3999,18 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .POST) {
+            if (routes.Routes.matchTableArtifactRepair(uri_parts.path)) |repair_route| {
+                if (uri_parts.query.len != 0) return try textResponse(self.alloc, 400, "repair requests use json body");
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, repair_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicListArtifactRepairIssues(table_name, req.body);
+            }
+            if (routes.Routes.matchTableArtifactRepairRun(uri_parts.path)) |repair_route| {
+                if (uri_parts.query.len != 0) return try textResponse(self.alloc, 400, "repair requests use json body");
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, repair_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicRunTableRepair(table_name, req.body);
+            }
             if (routes.Routes.matchTableArtifactReprocessJobs(uri_parts.path)) |job_route| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
                 defer self.alloc.free(table_name);
@@ -4030,7 +4084,7 @@ pub const ApiHttpServer = struct {
                     self.source.createTable(self.alloc, table_name, create_req) catch |err| switch (err) {
                         error.TableAlreadyExists => return try textResponse(self.alloc, 409, "table already exists"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
-                        error.NotLeader => return err,
+                        error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return err,
                         error.UnexpectedHttpStatus => {
                             if (platform_time.monotonicNs() -| metadata_create_start_ns >= metadata_create_timeout_ns) {
                                 std.log.err("public create table metadata create failed table={s} err={}", .{ table_name, err });
@@ -5025,7 +5079,7 @@ pub const ApiHttpServer = struct {
         query: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !public_table_http.DocumentArtifactManifestOptions {
-        var opts = public_table_http.parseDocumentArtifactManifestOptions(query) catch return error.InvalidDetail;
+        var opts = public_table_http.parseDocumentArtifactManifestOptions(self.alloc, query) catch return error.InvalidDetail;
         if (self.cfg.auth_enabled and parseSimpleQueryParam(query, "detail") == null) opts.detail = .summary;
         if (opts.detail == .raw and self.cfg.auth_enabled) {
             const identity = authenticated_identity orelse return error.Forbidden;
@@ -6593,6 +6647,9 @@ pub const ApiHttpServer = struct {
                 error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
                 else => {
                     std.log.err("public create index local apply failed table={s} index={s} err={}", .{ table_name, index_name, err });
+                    _ = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |reconcile_err| {
+                        std.log.warn("public create index structural reconcile enqueue failed table={s} index={s} err={}", .{ table_name, index_name, reconcile_err });
+                    };
                 },
             };
         }
@@ -6612,19 +6669,29 @@ pub const ApiHttpServer = struct {
             error.TableNotFound, error.IndexNotFound => return error.NotFound,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
-            else => return error.InternalFailure,
+            else => {
+                std.log.err("public delete index metadata update failed table={s} index={s} err={}", .{ table_name, index_name, err });
+                return error.InternalFailure;
+            },
         };
         const expected_indexes_json = (indexes_api.removeIndexFromTableIndexesJson(alloc, table_before.indexes_json, index_name) catch return error.InternalFailure) orelse {
             return error.NotFound;
         };
         defer alloc.free(expected_indexes_json);
         self.waitForMetadataProjection(table_name, null, expected_indexes_json) catch |err| {
-            return metadataAccessFailure(err);
+            if (isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+            std.log.err("public delete index metadata projection wait failed table={s} index={s} err={}", .{ table_name, index_name, err });
+            return error.InternalFailure;
         };
         if (self.table_writes) |table_writes_source| {
             _ = table_writes_source.dropIndex(alloc, table_name, index_name) catch |err| switch (err) {
                 error.IndexNotFound => {},
-                else => return error.InternalFailure,
+                else => {
+                    std.log.warn("public delete index local apply deferred table={s} index={s} err={}", .{ table_name, index_name, err });
+                    _ = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |reconcile_err| {
+                        std.log.warn("public delete index structural reconcile enqueue failed table={s} index={s} err={}", .{ table_name, index_name, reconcile_err });
+                    };
+                },
             };
         }
     }
@@ -6674,6 +6741,9 @@ pub const ApiHttpServer = struct {
             _ = table_writes_source.putArtifactEnrichment(alloc, table_name, artifact_name, enrichment_json) catch |err| switch (err) {
                 else => {
                     std.log.err("public artifact enrichment local apply failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
+                    _ = table_writes_source.requestTableStructuralReconcile(alloc, table_name) catch |reconcile_err| {
+                        std.log.warn("public artifact enrichment structural reconcile enqueue failed table={s} artifact={s} err={}", .{ table_name, artifact_name, reconcile_err });
+                    };
                 },
             };
         }
@@ -6712,6 +6782,9 @@ pub const ApiHttpServer = struct {
             _ = table_writes_source.deleteArtifactEnrichment(alloc, table_name, artifact_name) catch |err| switch (err) {
                 else => {
                     std.log.err("public artifact enrichment local delete failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
+                    _ = table_writes_source.requestTableStructuralReconcile(alloc, table_name) catch |reconcile_err| {
+                        std.log.warn("public artifact enrichment delete structural reconcile enqueue failed table={s} artifact={s} err={}", .{ table_name, artifact_name, reconcile_err });
+                    };
                 },
             };
         }
@@ -7357,6 +7430,98 @@ pub const ApiHttpServer = struct {
             202 => try jsonBodyResponseWithStatus(self.alloc, 202, resp.body),
             else => try textResponse(self.alloc, resp.status, resp.body),
         };
+    }
+
+    const PublicRepairListRequest = struct {
+        target: []const u8 = "artifact",
+        kind: ?db_mod.types.ArtifactRepairKind = null,
+        index: ?[]const u8 = null,
+        cursor: ?[]const u8 = null,
+        limit: ?u32 = null,
+    };
+
+    pub fn handlePublicListArtifactRepairIssues(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
+        const source = self.table_writes orelse return try textResponse(self.alloc, 405, "method not allowed");
+        var parsed = std.json.parseFromSlice(PublicRepairListRequest, self.alloc, if (body.len > 0) body else "{}", .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 400, "invalid repair list request");
+        };
+        defer parsed.deinit();
+        const target = std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) orelse return try textResponse(self.alloc, 400, "invalid repair target");
+        const raw_limit: u32 = parsed.value.limit orelse 50;
+        if (raw_limit == 0) return try textResponse(self.alloc, 400, "invalid limit");
+        const limit: u32 = @min(raw_limit, 500);
+        var result = (source.listArtifactRepairIssues(self.alloc, table_name, .{
+            .target = target,
+            .artifact_kind = parsed.value.kind,
+            .index_name = parsed.value.index,
+            .limit = limit,
+            .cursor = parsed.value.cursor,
+        }) catch |err| switch (err) {
+            error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid cursor"),
+            else => {
+                std.log.err("artifact repair issue list failed table={s} err={}", .{ table_name, err });
+                return try textResponse(self.alloc, 500, "artifact repair issue list failed");
+            },
+        }) orelse return try textResponse(self.alloc, 404, "not found");
+        defer result.deinit(self.alloc);
+
+        const response_body = try std.json.Stringify.valueAlloc(self.alloc, .{
+            .table = table_name,
+            .target = @tagName(target),
+            .limit = limit,
+            .scanned = result.scanned,
+            .groups_scanned = result.groups_scanned,
+            .has_more = result.has_more,
+            .next_cursor = result.next_cursor,
+            .issues = result.issues,
+        }, .{ .emit_null_optional_fields = false });
+        defer self.alloc.free(response_body);
+        return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+    }
+
+    const PublicRepairRunRequest = struct {
+        target: []const u8 = "artifact",
+        kind: ?db_mod.types.ArtifactRepairKind = null,
+        index: ?[]const u8 = null,
+        cursor: ?[]const u8 = null,
+        limit: ?u32 = null,
+        force: bool = false,
+    };
+
+    pub fn handlePublicRunTableRepair(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
+        const source = self.table_writes orelse return try textResponse(self.alloc, 405, "method not allowed");
+        var parsed = std.json.parseFromSlice(PublicRepairRunRequest, self.alloc, if (body.len > 0) body else "{}", .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 400, "invalid repair request");
+        };
+        defer parsed.deinit();
+        const body_target = std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) orelse return try textResponse(self.alloc, 400, "invalid repair target");
+        const target = body_target;
+        const raw_limit = parsed.value.limit orelse 100;
+        if (raw_limit == 0) return try textResponse(self.alloc, 400, "invalid limit");
+        const limit: u32 = @min(raw_limit, 1000);
+        var result = (source.repairArtifactIssues(self.alloc, table_name, .{
+            .target = target,
+            .artifact_kind = parsed.value.kind,
+            .index_name = parsed.value.index,
+            .limit = limit,
+            .cursor = parsed.value.cursor,
+            .force = parsed.value.force,
+        }) catch |err| switch (err) {
+            error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid repair request"),
+            else => {
+                std.log.err("table repair failed table={s} err={}", .{ table_name, err });
+                return try textResponse(self.alloc, 500, "table repair failed");
+            },
+        }) orelse return try textResponse(self.alloc, 404, "not found");
+        defer result.deinit(self.alloc);
+        const response_body = try std.json.Stringify.valueAlloc(self.alloc, .{
+            .table = table_name,
+            .target = @tagName(target),
+            .limit = limit,
+            .result = result,
+        }, .{ .emit_null_optional_fields = false });
+        defer self.alloc.free(response_body);
+        return try jsonBodyResponseWithStatus(self.alloc, 202, response_body);
     }
 
     pub fn handlePublicStartDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, body: []const u8) !http_common.HttpResponse {
@@ -8697,6 +8862,14 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
         .POST => .admin,
         .GET, .PUT, .DELETE => return null,
     });
+    if (routes.Routes.matchTableArtifactRepair(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
+        .POST => .admin,
+        .GET, .PUT, .DELETE => return null,
+    });
+    if (routes.Routes.matchTableArtifactRepairRun(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
+        .POST => .admin,
+        .GET, .PUT, .DELETE => return null,
+    });
     if (routes.Routes.matchTableArtifacts(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
         .GET => .read,
         .POST, .PUT, .DELETE => return null,
@@ -8791,6 +8964,20 @@ test "document artifact routes declare read and admin permissions" {
         try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
         try std.testing.expectEqualStrings("docs", required.resource);
         try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
+    }
+    {
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs/repair/issues")).?;
+        defer required.deinit(std.testing.allocator);
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    {
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs/repair/run")).?;
+        defer required.deinit(std.testing.allocator);
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
     }
     {
         const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs/artifacts/document_units_v1/reprocess")).?;
@@ -9355,9 +9542,9 @@ fn cloneRowFiltersFromOpenApi(
     return out;
 }
 
-fn parseRemovePermissionFromUserParams(query: []const u8) !usermgr_openapi.server.RemovePermissionFromUserParams {
-    const resource = parseSimpleQueryParam(query, "resource") orelse return error.MissingResource;
-    const resource_type = parseSimpleQueryParam(query, "resourceType") orelse return error.MissingResourceType;
+fn parseRemovePermissionFromUserParams(alloc: std.mem.Allocator, query: []const u8) !usermgr_openapi.server.RemovePermissionFromUserParams {
+    const resource = (try parseSimpleQueryParamDecodedAlloc(alloc, query, "resource")) orelse return error.MissingResource;
+    const resource_type = (try parseSimpleQueryParamDecodedAlloc(alloc, query, "resourceType")) orelse return error.MissingResourceType;
     _ = usermgr.ResourceType.fromSlice(resource_type) catch return error.InvalidResourceType;
     return .{
         .resource = resource,
@@ -9365,22 +9552,22 @@ fn parseRemovePermissionFromUserParams(query: []const u8) !usermgr_openapi.serve
     };
 }
 
-fn parseRemoveRoleFromUserParams(query: []const u8) !usermgr_openapi.server.RemoveRoleFromUserParams {
-    const role = parseSimpleQueryParam(query, "role") orelse return error.MissingRole;
+fn parseRemoveRoleFromUserParams(alloc: std.mem.Allocator, query: []const u8) !usermgr_openapi.server.RemoveRoleFromUserParams {
+    const role = (try parseSimpleQueryParamDecodedAlloc(alloc, query, "role")) orelse return error.MissingRole;
     if (role.len == 0) return error.MissingRole;
     return .{ .role = role };
 }
 
-fn parseListBackupsParams(query: []const u8) !metadata_openapi.server.ListBackupsParams {
+fn parseListBackupsParams(alloc: std.mem.Allocator, query: []const u8) !metadata_openapi.server.ListBackupsParams {
     return .{
-        .location = parseSimpleQueryParam(query, "location") orelse return error.MissingLocation,
+        .location = (try parseSimpleQueryParamDecodedAlloc(alloc, query, "location")) orelse return error.MissingLocation,
     };
 }
 
-fn parseListTablesParams(query: []const u8) !metadata_openapi.server.ListTablesParams {
+fn parseListTablesParams(alloc: std.mem.Allocator, query: []const u8) !metadata_openapi.server.ListTablesParams {
     return .{
-        .prefix = parseSimpleQueryParam(query, "prefix"),
-        .pattern = parseSimpleQueryParam(query, "pattern"),
+        .prefix = try parseSimpleQueryParamDecodedAlloc(alloc, query, "prefix"),
+        .pattern = try parseSimpleQueryParamDecodedAlloc(alloc, query, "pattern"),
     };
 }
 
@@ -10327,6 +10514,11 @@ fn parseSimpleQueryParam(query: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+fn parseSimpleQueryParamDecodedAlloc(alloc: std.mem.Allocator, query: []const u8, key: []const u8) !?[]u8 {
+    const raw = parseSimpleQueryParam(query, key) orelse return null;
+    return try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, raw);
+}
+
 pub fn parseLookupReadConsistency(query: []const u8) !raft_mod.ReadConsistency {
     const value = parseSimpleQueryParam(query, "consistency") orelse
         parseSimpleQueryParam(query, "read_consistency") orelse
@@ -10345,6 +10537,35 @@ pub fn runtimeSchemaDebugRequested(query: []const u8) bool {
 fn parseUnsignedQueryParam(query: []const u8, key: []const u8) !?u64 {
     const value = parseSimpleQueryParam(query, key) orelse return null;
     return try std.fmt.parseUnsigned(u64, value, 10);
+}
+
+test "artifact repair query params decode percent encoded values" {
+    const alloc = std.testing.allocator;
+    const index = (try parseSimpleQueryParamDecodedAlloc(alloc, "index=tenant%2Fembedding%20v1&cursor=7001%3Aabc%2Fdef", "index")).?;
+    defer alloc.free(index);
+    try std.testing.expectEqualStrings("tenant/embedding v1", index);
+
+    const cursor = (try parseSimpleQueryParamDecodedAlloc(alloc, "index=tenant%2Fembedding%20v1&cursor=7001%3Aabc%2Fdef", "cursor")).?;
+    defer alloc.free(cursor);
+    try std.testing.expectEqualStrings("7001:abc/def", cursor);
+}
+
+test "generated client query params decode for metadata parsers" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const tables = try parseListTablesParams(arena, "prefix=tenant%2Fdocs%20v1&pattern=docs%2A");
+    try std.testing.expectEqualStrings("tenant/docs v1", tables.prefix.?);
+    try std.testing.expectEqualStrings("docs*", tables.pattern.?);
+
+    const backups = try parseListBackupsParams(arena, "location=s3%3A%2F%2Fbucket%2Fpath%20one");
+    try std.testing.expectEqualStrings("s3://bucket/path one", backups.location);
+
+    const permission = try parseRemovePermissionFromUserParams(arena, "resource=docs%2Ftenant&resourceType=table");
+    try std.testing.expectEqualStrings("docs/tenant", permission.resource);
+    try std.testing.expectEqualStrings("table", permission.resource_type);
 }
 
 test "api http server serves status" {
@@ -20519,7 +20740,37 @@ test "api index status uses read runtime status without consulting write source"
     try std.testing.expectEqual(@as(?bool, false), shard_10.replay_catch_up_required);
 }
 
-test "api index status falls through to read runtime status when write cache is empty" {
+test "api index status refreshes synthetic configured index status from write source" {
+    const synthetic_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "vec",
+        .kind = .dense_vector,
+    }};
+    const synthetic_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .synthetic_config, .freshness = .stale },
+        .stats = .{
+            .index_count = synthetic_indexes.len,
+            .indexes = @constCast(synthetic_indexes[0..]),
+        },
+    }};
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefresh(synthetic_statuses[0..]));
+
+    const live_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "search",
+        .kind = .full_text,
+    }};
+    const live_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{
+            .index_count = live_indexes.len,
+            .indexes = @constCast(live_indexes[0..]),
+        },
+    }};
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefresh(live_statuses[0..]));
+}
+
+test "api index status asks write source when read runtime status is absent" {
     const alloc = std.testing.allocator;
 
     const FakeSource = struct {
@@ -20633,7 +20884,7 @@ test "api index status falls through to read runtime status when write cache is 
     defer resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqual(@as(u32, 1), reads.status_calls.load(.monotonic));
-    try std.testing.expectEqual(@as(u32, 0), writes.status_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), writes.status_calls.load(.monotonic));
 }
 
 test "api index status uses propagated remote store runtime status" {

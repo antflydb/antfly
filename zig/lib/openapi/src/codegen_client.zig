@@ -450,18 +450,20 @@ test "client generator percent-encodes query parameters" {
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var query_params = [_]types.ParameterOrRef{
+    var params = [_]types.ParameterOrRef{
+        .{ .parameter = .{ .name = "tableName", .in = .path, .required = true } },
         .{ .parameter = .{ .name = "resource", .in = .query, .required = true } },
-        .{ .parameter = .{ .name = "resourceType", .in = .query } },
+        .{ .parameter = .{ .name = "index", .in = .query, .required = false } },
+        .{ .parameter = .{ .name = "cursor", .in = .query, .required = false } },
     };
     var doc = types.OpenApiDoc{
         .openapi = "3.0.3",
         .info = .{ .title = "Test", .version = "1.0" },
     };
-    try doc.paths.put(arena, "/db/v1/permissions", .{
+    try doc.paths.put(arena, "/db/v1/tables/{tableName}/repair/issues", .{
         .get = .{
-            .operation_id = "listPermissions",
-            .parameters = &query_params,
+            .operation_id = "listRepairIssues",
+            .parameters = &params,
         },
     });
 
@@ -476,4 +478,7 @@ test "client generator percent-encodes query parameters" {
     try std.testing.expect(std.mem.indexOf(u8, generated, "try query_buf.appendSlice(self.allocator, encoded_query_value_resource);") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "try query_buf.appendSlice(self.allocator, encoded_query_value);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "resource=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "index=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "cursor=") != null);
 }

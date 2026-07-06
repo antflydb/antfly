@@ -201,6 +201,8 @@ pub const ProvisionedTableReadCache = struct {
     pending_opens: std.ArrayListUnmanaged(PendingOpen) = .empty,
 
     const max_cached_tables = 64;
+    const pending_open_wait_poll_ns: u64 = 25 * std.time.ns_per_ms;
+    const pending_open_wait_timeout_ns: u64 = 5 * std.time.ns_per_s;
 
     /// Current epoch for `table_name`, creating its slot on first use. The
     /// key is duped on insert and owned by the map. Must be called with the
@@ -324,6 +326,7 @@ pub const ProvisionedTableReadCache = struct {
     ) !Lease {
         const io = self.threaded.io();
         var stale_epoch_retries: u8 = 0;
+        var pending_open_wait_started_ns: u64 = 0;
         while (true) {
             // Reloaded every attempt: a stale-epoch retry usually means the
             // table was dropped/recreated or moved mid-open, which changes
@@ -346,10 +349,15 @@ pub const ProvisionedTableReadCache = struct {
                 };
             }
             if (self.hasPendingOpenForNamespaceLocked(group_id, identity_namespace, table_name)) {
-                self.ready.waitUncancelable(io, &self.mutex);
                 self.mutex.unlock(io);
+                const now_ns = platform_time.monotonicNs();
+                if (pending_open_wait_started_ns == 0) pending_open_wait_started_ns = now_ns;
+                const waited_ns = now_ns -| pending_open_wait_started_ns;
+                if (waited_ns >= pending_open_wait_timeout_ns) return error.TableReadChurn;
+                io.sleep(Io.Duration.fromNanoseconds(@min(pending_open_wait_poll_ns, pending_open_wait_timeout_ns - waited_ns)), .awake) catch {};
                 continue;
             }
+            pending_open_wait_started_ns = 0;
             const owned_pending_name = try self.alloc.dupe(u8, table_name);
             var pending_name_owned_locally = true;
             errdefer if (pending_name_owned_locally) self.alloc.free(owned_pending_name);
@@ -3379,6 +3387,7 @@ pub const HostedProvisionedTableReadSource = struct {
         };
 
         for (placements) |intent| {
+            if (!placementRefReadableWithPeers(placements, intent)) continue;
             const node_id = intent.record.local_node_id;
             if (node_id == local_node_id) {
                 if (tried_local or self.router.localStatus(group_id) != .active) continue;
@@ -3399,6 +3408,27 @@ pub const HostedProvisionedTableReadSource = struct {
             }
         }
         return null;
+    }
+
+    fn placementRefReadableWithPeers(
+        placements: []const *const raft_reconciler.PlacementIntent,
+        intent: *const raft_reconciler.PlacementIntent,
+    ) bool {
+        switch (intent.serving_state) {
+            .serving => return true,
+            .draining => {
+                for (placements) |peer| {
+                    if (peer.record.group_id == intent.record.group_id and
+                        peer.record.local_node_id != intent.record.local_node_id and
+                        peer.serving_state == .serving)
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            },
+            .planned, .bootstrapping, .replaying, .cutover_ready => return false,
+        }
     }
 
     fn scan(

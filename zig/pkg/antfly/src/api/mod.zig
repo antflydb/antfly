@@ -39,6 +39,7 @@ pub const table_router = @import("table_router.zig");
 pub const tables = @import("tables.zig");
 pub const table_contract = @import("table_contract.zig");
 pub const indexes = @import("indexes.zig");
+const openapi_contract = @import("openapi_contract.zig");
 pub const http_routes = @import("http_routes.zig");
 pub const provisioned_storage = @import("provisioned_storage.zig");
 pub const table_reads = @import("table_reads.zig");
@@ -80,6 +81,10 @@ pub const HostedProvisionedTableWriteSource = table_writes.HostedProvisionedTabl
 pub const HostedGroupRouter = table_router.HostedGroupRouter;
 pub const ApiHttpServer = http_server.ApiHttpServer;
 pub const ApiHttpClient = http_client.ApiHttpClient;
+
+test "public index contract exposes runtime status metadata" {
+    try openapi_contract.expectPublicIndexRuntimeStatusMetadata();
+}
 
 test "linear merge request parser accepts raw payload value under public request cap" {
     const alloc = std.testing.allocator;

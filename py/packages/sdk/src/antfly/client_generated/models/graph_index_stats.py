@@ -50,6 +50,17 @@ class GraphIndexStats:
         source_artifact (GraphIndexStatsSourceArtifact | Unset): Graph source artifact materialization status.
         resolver_replay (GraphIndexStatsResolverReplay | Unset): Resolver replay diagnostics for graph materialization.
         async_indexing (GraphIndexStatsAsyncIndexing | Unset):
+        projection_checkpoint_status (str | Unset): Durable projection checkpoint status: clean, rebuilding, degraded,
+            or repair_required.
+        projection_checkpoint_applied_sequence (int | Unset): Highest derived-log sequence covered by the durable
+            projection checkpoint.
+        projection_checkpoint_generation (int | Unset): Projection generation associated with the durable checkpoint.
+        projection_checkpoint_config_hash (int | Unset): Projection configuration identity associated with the durable
+            checkpoint.
+        checkpoint_replay_tail_sequence_count (int | Unset): Number of derived-log sequences after the durable
+            checkpoint that still need replay.
+        repair_scan_issue_count (int | Unset): Repair issues found by explicit repair-scan accounting for this
+            projection.
         algebraic_graph (GraphIndexStatsAlgebraicGraph | Unset): Algebraic graph execution health for bounded semiring
             traversal.
     """
@@ -79,6 +90,12 @@ class GraphIndexStats:
     source_artifact: GraphIndexStatsSourceArtifact | Unset = UNSET
     resolver_replay: GraphIndexStatsResolverReplay | Unset = UNSET
     async_indexing: GraphIndexStatsAsyncIndexing | Unset = UNSET
+    projection_checkpoint_status: str | Unset = UNSET
+    projection_checkpoint_applied_sequence: int | Unset = UNSET
+    projection_checkpoint_generation: int | Unset = UNSET
+    projection_checkpoint_config_hash: int | Unset = UNSET
+    checkpoint_replay_tail_sequence_count: int | Unset = UNSET
+    repair_scan_issue_count: int | Unset = UNSET
     algebraic_graph: GraphIndexStatsAlgebraicGraph | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -141,6 +158,18 @@ class GraphIndexStats:
         if not isinstance(self.async_indexing, Unset):
             async_indexing = self.async_indexing.to_dict()
 
+        projection_checkpoint_status = self.projection_checkpoint_status
+
+        projection_checkpoint_applied_sequence = self.projection_checkpoint_applied_sequence
+
+        projection_checkpoint_generation = self.projection_checkpoint_generation
+
+        projection_checkpoint_config_hash = self.projection_checkpoint_config_hash
+
+        checkpoint_replay_tail_sequence_count = self.checkpoint_replay_tail_sequence_count
+
+        repair_scan_issue_count = self.repair_scan_issue_count
+
         algebraic_graph: dict[str, Any] | Unset = UNSET
         if not isinstance(self.algebraic_graph, Unset):
             algebraic_graph = self.algebraic_graph.to_dict()
@@ -200,6 +229,18 @@ class GraphIndexStats:
             field_dict["resolver_replay"] = resolver_replay
         if async_indexing is not UNSET:
             field_dict["async_indexing"] = async_indexing
+        if projection_checkpoint_status is not UNSET:
+            field_dict["projection_checkpoint_status"] = projection_checkpoint_status
+        if projection_checkpoint_applied_sequence is not UNSET:
+            field_dict["projection_checkpoint_applied_sequence"] = projection_checkpoint_applied_sequence
+        if projection_checkpoint_generation is not UNSET:
+            field_dict["projection_checkpoint_generation"] = projection_checkpoint_generation
+        if projection_checkpoint_config_hash is not UNSET:
+            field_dict["projection_checkpoint_config_hash"] = projection_checkpoint_config_hash
+        if checkpoint_replay_tail_sequence_count is not UNSET:
+            field_dict["checkpoint_replay_tail_sequence_count"] = checkpoint_replay_tail_sequence_count
+        if repair_scan_issue_count is not UNSET:
+            field_dict["repair_scan_issue_count"] = repair_scan_issue_count
         if algebraic_graph is not UNSET:
             field_dict["algebraic_graph"] = algebraic_graph
 
@@ -284,6 +325,18 @@ class GraphIndexStats:
         else:
             async_indexing = GraphIndexStatsAsyncIndexing.from_dict(_async_indexing)
 
+        projection_checkpoint_status = d.pop("projection_checkpoint_status", UNSET)
+
+        projection_checkpoint_applied_sequence = d.pop("projection_checkpoint_applied_sequence", UNSET)
+
+        projection_checkpoint_generation = d.pop("projection_checkpoint_generation", UNSET)
+
+        projection_checkpoint_config_hash = d.pop("projection_checkpoint_config_hash", UNSET)
+
+        checkpoint_replay_tail_sequence_count = d.pop("checkpoint_replay_tail_sequence_count", UNSET)
+
+        repair_scan_issue_count = d.pop("repair_scan_issue_count", UNSET)
+
         _algebraic_graph = d.pop("algebraic_graph", UNSET)
         algebraic_graph: GraphIndexStatsAlgebraicGraph | Unset
         if isinstance(_algebraic_graph, Unset):
@@ -317,6 +370,12 @@ class GraphIndexStats:
             source_artifact=source_artifact,
             resolver_replay=resolver_replay,
             async_indexing=async_indexing,
+            projection_checkpoint_status=projection_checkpoint_status,
+            projection_checkpoint_applied_sequence=projection_checkpoint_applied_sequence,
+            projection_checkpoint_generation=projection_checkpoint_generation,
+            projection_checkpoint_config_hash=projection_checkpoint_config_hash,
+            checkpoint_replay_tail_sequence_count=checkpoint_replay_tail_sequence_count,
+            repair_scan_issue_count=repair_scan_issue_count,
             algebraic_graph=algebraic_graph,
         )
 

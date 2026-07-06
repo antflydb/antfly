@@ -46,6 +46,7 @@ const Worker = struct {
     replay_cursor: ?replay_source_mod.MatchingCursor = null,
     replay_cursor_open_sequence: u64 = 0,
     catch_up_active: bool = false,
+    last_replay_tail_records: u64 = 0,
 };
 
 const PersistSnapshot = struct {
@@ -756,6 +757,8 @@ fn workerMain(worker: *Worker) void {
         }
         const from_sequence = worker.applied_sequence;
         const target_sequence = worker.target_sequence;
+        const replay_tail_records = target_sequence -| from_sequence;
+        if (replay_tail_records > 0) worker.last_replay_tail_records = replay_tail_records;
         worker.catch_up_active = true;
         runtime.mutex.unlock(io);
 
@@ -1009,6 +1012,7 @@ fn closeWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, success: b
     worker.replay_cursor = null;
     worker.replay_cursor_open_sequence = 0;
     worker.catch_up_open = false;
+    worker.last_replay_tail_records = 0;
     runtime.mutex.unlock(io);
 
     if (replay_cursor) |*cursor| cursor.deinit(runtime.alloc);
@@ -1019,7 +1023,7 @@ fn closeWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, success: b
 fn isRecoverablePublishError(worker: *const Worker, err: anyerror) bool {
     return switch (err) {
         error.NotFound => catch_up_policy.forIndex(worker.kind, worker.runtime.backlog.resource_manager).not_found_is_recoverable,
-        error.ReplayDocumentNotVisible, error.WriterLocked => true,
+        error.ReplayDocumentNotVisible, error.ArtifactRepairRequired, error.WriterLocked => true,
         else => false,
     };
 }
@@ -1028,6 +1032,7 @@ fn isRecoverableCatchUpError(worker: *const Worker, err: anyerror) bool {
     return switch (err) {
         error.WriterLocked,
         error.ReplayDocumentNotVisible,
+        error.ArtifactRepairRequired,
         => true,
         error.NotFound => catch_up_policy.forIndex(worker.kind, worker.runtime.backlog.resource_manager).not_found_is_recoverable,
         else => false,
@@ -1036,11 +1041,12 @@ fn isRecoverableCatchUpError(worker: *const Worker, err: anyerror) bool {
 
 fn waitForCatchUpSessionReuse(runtime: *DerivedRuntime, worker: *Worker, io: Io) bool {
     const policy = catch_up_policy.forIndex(worker.kind, runtime.backlog.resource_manager);
-    if (!worker.catch_up_open or policy.session_idle_ns == 0) return false;
+    const idle_wait_ns = catch_up_policy.sessionIdleMaxWaitNs(policy, worker.last_replay_tail_records);
+    if (!worker.catch_up_open or idle_wait_ns == 0) return false;
     var waited_ns: u64 = 0;
     const from_sequence = worker.applied_sequence;
     const delay_ns = @max(@as(u64, std.time.ns_per_ms), policy.coalesce_delay_ns);
-    while (waited_ns < policy.session_idle_ns) {
+    while (waited_ns < idle_wait_ns) {
         runtime.mutex.lockUncancelable(io);
         const shutdown = runtime.shutdown or worker.stop or runtime.last_error_name != null;
         const target = worker.target_sequence;
@@ -1048,20 +1054,20 @@ fn waitForCatchUpSessionReuse(runtime: *DerivedRuntime, worker: *Worker, io: Io)
         runtime.mutex.unlock(io);
         if (shutdown) return false;
         if (target > from_sequence or force_sequence > from_sequence) return true;
-        io.sleep(Io.Duration.fromNanoseconds(@intCast(delay_ns)), .awake) catch {};
-        waited_ns +|= delay_ns;
+        const sleep_ns = @min(delay_ns, idle_wait_ns - waited_ns);
+        io.sleep(Io.Duration.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {};
+        waited_ns +|= sleep_ns;
     }
     return false;
 }
 
 fn waitForReplayWindow(runtime: *DerivedRuntime, worker: *Worker, from_sequence: u64, io: Io) void {
     const policy = catch_up_policy.forIndex(worker.kind, runtime.backlog.resource_manager);
-    const min_records = policy.coalesce_min_records;
     const delay_ns = policy.coalesce_delay_ns;
-    if (min_records == 0 or delay_ns == 0) return;
+    if (delay_ns == 0) return;
 
     var waited_ns: u64 = 0;
-    while (waited_ns < policy.coalesce_max_wait_ns) {
+    while (true) {
         runtime.mutex.lockUncancelable(io);
         const shutdown = runtime.shutdown or worker.stop or runtime.last_error_name != null;
         const target = worker.target_sequence;
@@ -1069,10 +1075,12 @@ fn waitForReplayWindow(runtime: *DerivedRuntime, worker: *Worker, from_sequence:
         const force_sequence = runtime.force_catch_up_sequence;
         runtime.mutex.unlock(io);
 
-        if (shutdown or pending_records == 0 or pending_records >= min_records or force_sequence > from_sequence) return;
+        const max_wait_ns = catch_up_policy.replayWindowMaxWaitNs(policy, pending_records);
+        if (shutdown or pending_records == 0 or max_wait_ns == 0 or force_sequence > from_sequence or waited_ns >= max_wait_ns) return;
 
-        io.sleep(Io.Duration.fromNanoseconds(@intCast(delay_ns)), .awake) catch {};
-        waited_ns +|= delay_ns;
+        const sleep_ns = @min(delay_ns, max_wait_ns - waited_ns);
+        io.sleep(Io.Duration.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {};
+        waited_ns +|= sleep_ns;
     }
 }
 

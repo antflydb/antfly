@@ -21,6 +21,7 @@ const Allocator = std.mem.Allocator;
 const common_secrets = @import("../../../common/secrets.zig");
 const backend_erased = @import("../../backend_erased.zig");
 const backend_scan = @import("../../backend_scan.zig");
+const mem_backend = @import("../../mem_backend.zig");
 const internal_keys = @import("../../internal_keys.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
 const change_journal_mod = @import("../derived/change_journal.zig");
@@ -34,6 +35,7 @@ const enrichment_state = @import("enrichment_state.zig");
 const embedder_mod = @import("embedder.zig");
 const asset_producer_mod = @import("asset_producer.zig");
 const document_extraction_mod = @import("document_extraction.zig");
+const artifact_ids = @import("../artifact_ids.zig");
 const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("chunker_stub.zig")
 else
@@ -439,6 +441,12 @@ fn runtimeStatusSnapshot(runtime: *EnrichmentRuntime) enrichment_state.RuntimeSt
         .retrying = runtime.retrying,
         .worker_failed = runtime.worker_failed,
     };
+}
+
+fn runtimeProjectionStatus(retrying: bool, worker_failed: bool) enrichment_state.ProjectionStatus {
+    if (worker_failed) return .repair_required;
+    if (retrying) return .degraded;
+    return .clean;
 }
 
 fn restorePersistedRuntimeStatus(runtime: anytype, persisted_status: enrichment_state.RuntimeStatus) void {
@@ -1099,6 +1107,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn stats(self: *@This()) types.EnrichmentStats {
+        const projection_status = runtimeProjectionStatus(self.retrying, self.worker_failed);
+        const config_hash = enrichmentCatalogConfigHash(self.alloc, self.index_manager) catch 0;
         return .{
             .enabled = self.config.dense_embedder != null or self.config.sparse_embedder != null or self.config.asset_producer != null or self.config.enable_without_producers,
             .lease_owned = true,
@@ -1109,6 +1119,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .last_acquired_ms = 0,
             .target_sequence = self.target_sequence,
             .applied_sequence = self.applied_sequence,
+            .projection_checkpoint_status = enrichment_state.projectionStatusName(projection_status),
+            .projection_checkpoint_applied_sequence = self.applied_sequence,
+            .projection_checkpoint_config_hash = config_hash,
+            .checkpoint_replay_tail_sequence_count = self.target_sequence -| self.applied_sequence,
             .processed_requests = self.processed_requests,
             .error_count = self.error_count,
             .retryable_error_count = self.retryable_error_count,
@@ -1386,6 +1400,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         defer if (maybe_io) |io| self.mutex.unlock(io);
 
         const ownership_stats = self.ownership.stats();
+        const projection_status = runtimeProjectionStatus(self.retrying, self.worker_failed);
+        const config_hash = enrichmentCatalogConfigHash(self.alloc, self.index_manager) catch 0;
         return .{
             .enabled = self.config.dense_embedder != null or self.config.sparse_embedder != null or self.config.asset_producer != null or self.config.enable_without_producers,
             .lease_owned = ownership_stats.lease_owned,
@@ -1396,6 +1412,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .last_acquired_ms = ownership_stats.last_acquired_ms,
             .target_sequence = self.target_sequence,
             .applied_sequence = self.applied_sequence,
+            .projection_checkpoint_status = enrichment_state.projectionStatusName(projection_status),
+            .projection_checkpoint_applied_sequence = self.applied_sequence,
+            .projection_checkpoint_config_hash = config_hash,
+            .checkpoint_replay_tail_sequence_count = self.target_sequence -| self.applied_sequence,
             .processed_requests = self.processed_requests,
             .error_count = self.error_count,
             .retryable_error_count = self.retryable_error_count,
@@ -6954,6 +6974,143 @@ fn keyInList(key: []const u8, keys: []const []const u8) bool {
     return false;
 }
 
+fn enrichmentConfigLessThan(_: void, lhs: types.EnrichmentConfig, rhs: types.EnrichmentConfig) bool {
+    const lhs_kind = @intFromEnum(lhs.kind);
+    const rhs_kind = @intFromEnum(rhs.kind);
+    if (lhs_kind != rhs_kind) return lhs_kind < rhs_kind;
+    return std.mem.lessThan(u8, lhs.name, rhs.name);
+}
+
+fn enrichmentCatalogConfigHash(alloc: Allocator, index_manager: *const index_manager_mod.IndexManager) !u64 {
+    const configs = try index_manager.listEnrichmentsPublic(alloc);
+    defer types.freeEnrichmentConfigs(alloc, configs);
+    std.mem.sort(types.EnrichmentConfig, configs, {}, enrichmentConfigLessThan);
+
+    var hasher = std.hash.Wyhash.init(0x41454a4341540001);
+    var count_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &count_buf, configs.len, .little);
+    hasher.update(&count_buf);
+    for (configs) |cfg| {
+        var hash_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &hash_buf, types.enrichmentConfigHash(cfg), .little);
+        hasher.update(&hash_buf);
+    }
+    return hasher.final();
+}
+
+const dense_artifact_target_counter_prefix = "\x00\x00__metadata__:dense_artifact_target_count:";
+
+fn denseArtifactTargetCounterKeyAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ dense_artifact_target_counter_prefix, index_name });
+}
+
+fn denseArtifactTargetsForArtifact(
+    runtime: *EnrichmentRuntime,
+    artifact_name: []const u8,
+    dims: u32,
+    out: *std.ArrayListUnmanaged(usize),
+) !void {
+    for (runtime.index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
+        const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null;
+        if (!artifact_backed) continue;
+        if (entry.dims != dims) continue;
+        if (std.mem.eql(u8, entry.config.name, artifact_name) or
+            (entry.embedding_name != null and std.mem.eql(u8, entry.embedding_name.?, artifact_name)))
+        {
+            try out.append(runtime.alloc, dense_index_idx);
+        }
+    }
+}
+
+fn loadDenseArtifactTargetCounterTxn(runtime: *EnrichmentRuntime, txn: anytype, index_name: []const u8) !u64 {
+    var mutable_txn = txn;
+    const key = try denseArtifactTargetCounterKeyAlloc(runtime.alloc, index_name);
+    defer runtime.alloc.free(key);
+    const raw = mutable_txn.get(key) catch |err| switch (err) {
+        error.NotFound => return 0,
+        else => return err,
+    };
+    if (raw.len != 8) return error.InvalidDenseArtifactTargetCounter;
+    return std.mem.readInt(u64, raw[0..8], .little);
+}
+
+fn saveDenseArtifactTargetCounterTxn(runtime: *EnrichmentRuntime, txn: anytype, index_name: []const u8, count: u64) !void {
+    var mutable_txn = txn;
+    const key = try denseArtifactTargetCounterKeyAlloc(runtime.alloc, index_name);
+    defer runtime.alloc.free(key);
+    var value: [8]u8 = undefined;
+    std.mem.writeInt(u64, &value, count, .little);
+    try mutable_txn.put(key, &value);
+}
+
+fn applyDenseArtifactCounterDeltaRuntime(
+    runtime: *EnrichmentRuntime,
+    txn: anytype,
+    counts: *std.AutoHashMapUnmanaged(usize, u64),
+    artifact_key: []const u8,
+    artifact_value: ?[]const u8,
+    delta: i64,
+) !void {
+    if (delta == 0) return;
+    var identity = (try artifact_ids.decodeEmbeddingArtifactIdentityAlloc(runtime.alloc, artifact_key)) orelse return;
+    defer identity.deinit(runtime.alloc);
+    const value = artifact_value orelse return;
+    const dims = enrichment_artifact_codec.decodeDenseEmbeddingDims(value) catch return;
+    if (dims == 0) return;
+
+    var targets = std.ArrayListUnmanaged(usize).empty;
+    defer targets.deinit(runtime.alloc);
+    try denseArtifactTargetsForArtifact(runtime, identity.embedding_name, dims, &targets);
+    for (targets.items) |dense_index_idx| {
+        const entry = &runtime.index_manager.dense_indexes.items[dense_index_idx];
+        const gop = try counts.getOrPut(runtime.alloc, dense_index_idx);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = try loadDenseArtifactTargetCounterTxn(runtime, txn, entry.config.name);
+        }
+        if (delta > 0) {
+            gop.value_ptr.* +|= @as(u64, @intCast(delta));
+        } else {
+            gop.value_ptr.* -|= @as(u64, @intCast(-delta));
+        }
+    }
+}
+
+fn updateDenseArtifactTargetCountersTxn(
+    runtime: *EnrichmentRuntime,
+    txn: anytype,
+    writes: []const KVPair,
+    deletes: []const []const u8,
+) !void {
+    if (runtime.index_manager.dense_indexes.items.len == 0) return;
+    var mutable_txn = txn;
+    var counts = std.AutoHashMapUnmanaged(usize, u64){};
+    defer counts.deinit(runtime.alloc);
+
+    for (deletes) |key| {
+        const old_value = mutable_txn.get(key) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        try applyDenseArtifactCounterDeltaRuntime(runtime, mutable_txn, &counts, key, old_value, -1);
+    }
+    for (writes) |write| {
+        const old_value = mutable_txn.get(write.key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (old_value) |value| {
+            try applyDenseArtifactCounterDeltaRuntime(runtime, mutable_txn, &counts, write.key, value, -1);
+        }
+        try applyDenseArtifactCounterDeltaRuntime(runtime, mutable_txn, &counts, write.key, write.value, 1);
+    }
+
+    var it = counts.iterator();
+    while (it.next()) |entry| {
+        const dense_entry = &runtime.index_manager.dense_indexes.items[entry.key_ptr.*];
+        try saveDenseArtifactTargetCounterTxn(runtime, mutable_txn, dense_entry.config.name, entry.value_ptr.*);
+    }
+}
+
 fn appendUniqueDupeKey(alloc: Allocator, keys: *std.ArrayListUnmanaged([]u8), key: []const u8) !void {
     for (keys.items) |candidate| {
         if (std.mem.eql(u8, candidate, key)) return;
@@ -7032,7 +7189,18 @@ fn storePutBatchWithRetry(runtime: *EnrichmentRuntime, writes: []const KVPair, d
 fn saveAppliedSequenceWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, sequence: u64) !void {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        enrichment_state.saveAppliedSequence(runtime.store, scope, sequence) catch |err| switch (err) {
+        var checkpoint = enrichment_state.loadProjectionCheckpoint(runtime.alloc, runtime.store, scope) catch |err| switch (err) {
+            error.WriterLocked => {
+                if (attempt >= writer_locked_retry_count) return err;
+                backoffWriterLockRetry();
+                continue;
+            },
+            else => return err,
+        };
+        checkpoint.applied_sequence = sequence;
+        checkpoint.status = runtimeProjectionStatus(runtime.retrying, runtime.worker_failed);
+        checkpoint.config_hash = try enrichmentCatalogConfigHash(runtime.alloc, runtime.index_manager);
+        enrichment_state.saveProjectionCheckpoint(runtime.store, scope, checkpoint) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -7048,6 +7216,24 @@ fn saveRuntimeStatusWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, st
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         enrichment_state.saveRuntimeStatus(runtime.store, scope, status) catch |err| switch (err) {
+            error.WriterLocked => {
+                if (attempt >= writer_locked_retry_count) return err;
+                backoffWriterLockRetry();
+                continue;
+            },
+            else => return err,
+        };
+        var checkpoint = enrichment_state.loadProjectionCheckpoint(runtime.alloc, runtime.store, scope) catch |err| switch (err) {
+            error.WriterLocked => {
+                if (attempt >= writer_locked_retry_count) return err;
+                backoffWriterLockRetry();
+                continue;
+            },
+            else => return err,
+        };
+        checkpoint.status = runtimeProjectionStatus(status.retrying, status.worker_failed);
+        checkpoint.config_hash = try enrichmentCatalogConfigHash(runtime.alloc, runtime.index_manager);
+        enrichment_state.saveProjectionCheckpoint(runtime.store, scope, checkpoint) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -7216,6 +7402,63 @@ fn deleteCoverageMarkersAfterReplayAppend(runtime: *EnrichmentRuntime, marker_de
     }
 }
 
+test "enrichment applied checkpoint stays degraded until runtime status clears" {
+    const alloc = std.testing.allocator;
+
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/indexes", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+        .retrying = true,
+        .worker_failed = false,
+    };
+
+    try enrichment_state.saveProjectionCheckpoint(runtime.store, scope_name, .{
+        .applied_sequence = 3,
+        .status = .degraded,
+        .generation = 2,
+        .config_hash = 0,
+    });
+
+    try saveAppliedSequenceWithRetry(&runtime, scope_name, 5);
+    const degraded_checkpoint = try enrichment_state.loadProjectionCheckpoint(alloc, runtime.store, scope_name);
+    try std.testing.expectEqual(@as(u64, 5), degraded_checkpoint.applied_sequence);
+    try std.testing.expectEqual(enrichment_state.ProjectionStatus.degraded, degraded_checkpoint.status);
+
+    runtime.retrying = false;
+    runtime.worker_failed = false;
+    try saveRuntimeStatusWithRetry(&runtime, scope_name, runtimeStatusSnapshot(&runtime));
+    const clean_checkpoint = try enrichment_state.loadProjectionCheckpoint(alloc, runtime.store, scope_name);
+    try std.testing.expectEqual(@as(u64, 5), clean_checkpoint.applied_sequence);
+    try std.testing.expectEqual(enrichment_state.ProjectionStatus.clean, clean_checkpoint.status);
+}
+
 fn appendGeneratedBatchWithRetry(
     runtime: *EnrichmentRuntime,
     batch: derived_types.DerivedBatch,
@@ -7289,6 +7532,8 @@ fn storeGetAlloc(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
 fn storePut(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !void {
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
+    const write = KVPair{ .key = key, .value = value };
+    try updateDenseArtifactTargetCountersTxn(runtime, &txn, &.{write}, &.{});
     try txn.put(key, value);
     if (try assetSourceIndexKeyForArtifactAlloc(runtime.alloc, key)) |marker_key| {
         defer runtime.alloc.free(marker_key);
@@ -7300,6 +7545,7 @@ fn storePut(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !vo
 fn storePutBatch(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: []const []const u8) !void {
     var batch = try runtime.store.beginBatch();
     errdefer batch.abort();
+    try updateDenseArtifactTargetCountersTxn(runtime, &batch, writes, deletes);
     var marker_keys = std.ArrayListUnmanaged([]u8).empty;
     defer {
         for (marker_keys.items) |key| runtime.alloc.free(key);

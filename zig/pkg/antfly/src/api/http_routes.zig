@@ -113,6 +113,8 @@ pub const Routes = struct {
     pub const indexes_marker = "/indexes/";
     pub const documents_suffix = "/documents";
     pub const artifacts_suffix = "/artifacts";
+    pub const artifact_repair_suffix = "/repair/issues";
+    pub const artifact_repair_run_suffix = "/repair/run";
     pub const documents_marker = "/documents/";
     pub const artifacts_marker = "/artifacts/";
     pub const reprocess_suffix = "/reprocess";
@@ -166,6 +168,10 @@ pub const Routes = struct {
     };
 
     pub const TableArtifacts = struct {
+        table_name: []const u8,
+    };
+
+    pub const TableArtifactRepair = struct {
         table_name: []const u8,
     };
 
@@ -328,6 +334,11 @@ pub const Routes = struct {
         artifact_name: []const u8,
     };
 
+    pub const GroupTableArtifactRepair = struct {
+        group_id: u64,
+        table_name: []const u8,
+    };
+
     pub const GroupDocumentArtifacts = struct {
         group_id: u64,
         table_name: []const u8,
@@ -467,6 +478,22 @@ pub const Routes = struct {
         if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, path, artifacts_suffix)) return null;
         const table_name = path[tables_prefix.len .. path.len - artifacts_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .table_name = table_name };
+    }
+
+    pub fn matchTableArtifactRepair(path: []const u8) ?TableArtifactRepair {
+        return matchTableArtifactRepairWithSuffix(path, artifact_repair_suffix);
+    }
+
+    pub fn matchTableArtifactRepairRun(path: []const u8) ?TableArtifactRepair {
+        return matchTableArtifactRepairWithSuffix(path, artifact_repair_run_suffix);
+    }
+
+    fn matchTableArtifactRepairWithSuffix(path: []const u8, suffix: []const u8) ?TableArtifactRepair {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, suffix)) return null;
+        const table_name = path[tables_prefix.len .. path.len - suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .table_name = table_name };
     }
@@ -966,6 +993,24 @@ pub const Routes = struct {
         };
     }
 
+    pub fn matchGroupTableArtifactRepair(path: []const u8) ?GroupTableArtifactRepair {
+        return matchGroupTableArtifactRepairWithSuffix(path, artifact_repair_suffix);
+    }
+
+    pub fn matchGroupTableArtifactRepairRun(path: []const u8) ?GroupTableArtifactRepair {
+        return matchGroupTableArtifactRepairWithSuffix(path, artifact_repair_run_suffix);
+    }
+
+    fn matchGroupTableArtifactRepairWithSuffix(path: []const u8, suffix: []const u8) ?GroupTableArtifactRepair {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
     pub fn matchGroupDocumentArtifacts(path: []const u8) ?GroupDocumentArtifacts {
         const group = parseGroupPrefix(path) orelse return null;
         const rest = group.rest;
@@ -1261,6 +1306,10 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("docs", backup.table_name);
     const restore = Routes.matchTableRestore("/tables/docs/restore").?;
     try std.testing.expectEqualStrings("docs", restore.table_name);
+    const repair = Routes.matchTableArtifactRepair("/tables/docs/repair/issues").?;
+    try std.testing.expectEqualStrings("docs", repair.table_name);
+    const repair_run = Routes.matchTableArtifactRepairRun("/tables/docs/repair/run").?;
+    try std.testing.expectEqualStrings("docs", repair_run.table_name);
     const indexes = Routes.matchTableIndexes("/tables/docs/indexes").?;
     try std.testing.expectEqualStrings("docs", indexes.table_name);
     const index = Routes.matchTableIndex("/tables/docs/indexes/search_idx").?;

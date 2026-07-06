@@ -111,8 +111,10 @@ pub fn parseLookupOptions(alloc: std.mem.Allocator, query: []const u8) !OwnedLoo
         if (!std.mem.startsWith(u8, part, "fields=")) continue;
         const raw_fields = part["fields=".len..];
         if (raw_fields.len == 0) return .{};
+        const decoded_fields = try decodePercentEncodedPathComponentAlloc(alloc, raw_fields);
+        defer alloc.free(decoded_fields);
         var field_count: usize = 1;
-        for (raw_fields) |ch| {
+        for (decoded_fields) |ch| {
             if (ch == ',') field_count += 1;
         }
         const fields = try alloc.alloc([]const u8, field_count);
@@ -121,7 +123,7 @@ pub fn parseLookupOptions(alloc: std.mem.Allocator, query: []const u8) !OwnedLoo
             for (fields[0..field_index]) |field| alloc.free(field);
             alloc.free(fields);
         }
-        var field_it = std.mem.splitScalar(u8, raw_fields, ',');
+        var field_it = std.mem.splitScalar(u8, decoded_fields, ',');
         while (field_it.next()) |field| {
             fields[field_index] = try alloc.dupe(u8, field);
             field_index += 1;
@@ -163,6 +165,16 @@ pub fn decodePercentEncodedPathComponentAlloc(alloc: std.mem.Allocator, raw: []c
     }
 
     return try alloc.realloc(out, out_index);
+}
+
+test "lookup options decode generated SDK query values before splitting fields" {
+    const alloc = std.testing.allocator;
+    var opts = try parseLookupOptions(alloc, "fields=title%2Cbody%2Cauthor");
+    defer opts.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), opts.fields.len);
+    try std.testing.expectEqualStrings("title", opts.fields[0]);
+    try std.testing.expectEqualStrings("body", opts.fields[1]);
+    try std.testing.expectEqualStrings("author", opts.fields[2]);
 }
 
 pub fn parseScanKeysRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedScanKeysRequest {

@@ -148,7 +148,7 @@ test "public table contract exposes migration metadata" {
     try std.testing.expect(@hasField(generated.TableMigration, "read_schema"));
 }
 
-test "public index contract exposes runtime status metadata" {
+pub fn expectPublicIndexRuntimeStatusMetadata() !void {
     try std.testing.expect(@hasField(generated.IndexStatus, "config"));
     try std.testing.expect(@hasField(generated.IndexStatus, "status"));
     try std.testing.expect(@hasField(generated.IndexStatus, "shard_status"));
@@ -157,10 +157,34 @@ test "public index contract exposes runtime status metadata" {
     try std.testing.expect(@hasField(indexes_generated.FullTextIndexStats, "index_type"));
     try std.testing.expect(@hasField(indexes_generated.FullTextIndexStats, "rebuilding"));
     try std.testing.expect(@hasField(indexes_generated.FullTextIndexStats, "total_indexed"));
+    try std.testing.expect(@hasField(indexes_generated.FullTextIndexStats, "projection_checkpoint_status"));
+    try std.testing.expect(@hasField(indexes_generated.FullTextIndexStats, "projection_checkpoint_applied_sequence"));
+    try std.testing.expect(@hasField(indexes_generated.FullTextIndexStats, "projection_checkpoint_generation"));
+    try std.testing.expect(@hasField(indexes_generated.FullTextIndexStats, "projection_checkpoint_config_hash"));
+    try std.testing.expect(@hasField(indexes_generated.FullTextIndexStats, "checkpoint_replay_tail_sequence_count"));
+    try std.testing.expect(@hasField(indexes_generated.FullTextIndexStats, "repair_scan_issue_count"));
     try std.testing.expect(@hasField(indexes_generated.EmbeddingsIndexStats, "index_type"));
+    try std.testing.expect(@hasField(indexes_generated.EmbeddingsIndexStats, "projection_checkpoint_status"));
+    try std.testing.expect(@hasField(indexes_generated.EmbeddingsIndexStats, "projection_checkpoint_applied_sequence"));
+    try std.testing.expect(@hasField(indexes_generated.EmbeddingsIndexStats, "projection_checkpoint_generation"));
+    try std.testing.expect(@hasField(indexes_generated.EmbeddingsIndexStats, "projection_checkpoint_config_hash"));
+    try std.testing.expect(@hasField(indexes_generated.EmbeddingsIndexStats, "checkpoint_replay_tail_sequence_count"));
+    try std.testing.expect(@hasField(indexes_generated.EmbeddingsIndexStats, "repair_scan_issue_count"));
     try std.testing.expect(@hasField(indexes_generated.GraphIndexStats, "index_type"));
+    try std.testing.expect(@hasField(indexes_generated.GraphIndexStats, "projection_checkpoint_status"));
+    try std.testing.expect(@hasField(indexes_generated.GraphIndexStats, "projection_checkpoint_applied_sequence"));
+    try std.testing.expect(@hasField(indexes_generated.GraphIndexStats, "projection_checkpoint_generation"));
+    try std.testing.expect(@hasField(indexes_generated.GraphIndexStats, "projection_checkpoint_config_hash"));
+    try std.testing.expect(@hasField(indexes_generated.GraphIndexStats, "checkpoint_replay_tail_sequence_count"));
+    try std.testing.expect(@hasField(indexes_generated.GraphIndexStats, "repair_scan_issue_count"));
     try std.testing.expect(@hasDecl(indexes_generated, "AlgebraicIndexStats"));
     try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "index_type"));
+    try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "projection_checkpoint_status"));
+    try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "projection_checkpoint_applied_sequence"));
+    try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "projection_checkpoint_generation"));
+    try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "projection_checkpoint_config_hash"));
+    try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "checkpoint_replay_tail_sequence_count"));
+    try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "repair_scan_issue_count"));
     try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "healthy"));
     try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "capability_lifecycle_status"));
     try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "planner_last_decision"));
@@ -189,6 +213,10 @@ test "public index contract exposes runtime status metadata" {
     try std.testing.expect(!@hasField(indexes_generated.AlgebraicIndexStats, "active_progress_applied_sequence"));
     try std.testing.expect(!@hasField(indexes_generated.AlgebraicIndexStats, "materialization_id"));
     try std.testing.expect(!@hasField(indexes_generated.AlgebraicIndexStats, "engine_state_id"));
+}
+
+test "public index contract exposes runtime status metadata" {
+    try expectPublicIndexRuntimeStatusMetadata();
 }
 
 test "indexes openapi parses algebraic status as algebraic stats" {

@@ -301,6 +301,28 @@ pub const ListArtifactEnrichmentsPathParams = struct {
     table_name: []const u8,
 };
 
+/// List artifact repair issues
+pub const ListArtifactRepairIssuesPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for listArtifactRepairIssues.
+pub fn parseListArtifactRepairIssuesBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RepairIssueListRequest) {
+    return std.json.parseFromSlice(types.RepairIssueListRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Run a bounded table repair pass
+pub const RunTableRepairPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for runTableRepair.
+pub fn parseRunTableRepairBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RepairRunRequest) {
+    return std.json.parseFromSlice(types.RepairRunRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Reprocess a derived document artifact across a table range
 pub const ReprocessDocumentArtifactRangePathParams = struct {
     /// Name of the table
@@ -487,6 +509,8 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey" },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests" },
     .{ .method = "GET", .path = "/tables/{tableName}/artifacts", .operation_id = "listArtifactEnrichments" },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/issues", .operation_id = "listArtifactRepairIssues" },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/run", .operation_id = "runTableRepair" },
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifactRange" },
     .{ .method = "PUT", .path = "/tables/{tableName}/artifacts/{artifactName}/enrichment", .operation_id = "putArtifactEnrichment" },
     .{ .method = "DELETE", .path = "/tables/{tableName}/artifacts/{artifactName}/enrichment", .operation_id = "deleteArtifactEnrichment" },
@@ -554,6 +578,8 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "lookupKey")) @compileError("ServerRouter: Impl missing required method 'lookupKey'");
         if (!@hasDecl(Impl, "listDocumentArtifactManifests")) @compileError("ServerRouter: Impl missing required method 'listDocumentArtifactManifests'");
         if (!@hasDecl(Impl, "listArtifactEnrichments")) @compileError("ServerRouter: Impl missing required method 'listArtifactEnrichments'");
+        if (!@hasDecl(Impl, "listArtifactRepairIssues")) @compileError("ServerRouter: Impl missing required method 'listArtifactRepairIssues'");
+        if (!@hasDecl(Impl, "runTableRepair")) @compileError("ServerRouter: Impl missing required method 'runTableRepair'");
         if (!@hasDecl(Impl, "reprocessDocumentArtifactRange")) @compileError("ServerRouter: Impl missing required method 'reprocessDocumentArtifactRange'");
         if (!@hasDecl(Impl, "putArtifactEnrichment")) @compileError("ServerRouter: Impl missing required method 'putArtifactEnrichment'");
         if (!@hasDecl(Impl, "deleteArtifactEnrichment")) @compileError("ServerRouter: Impl missing required method 'deleteArtifactEnrichment'");
@@ -622,6 +648,8 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.get("/tables/:tableName/documents/:key", lookupKey);
             try server.get("/tables/:tableName/documents/:key/artifacts", listDocumentArtifactManifests);
             try server.get("/tables/:tableName/artifacts", listArtifactEnrichments);
+            try server.post("/tables/:tableName/repair/issues", listArtifactRepairIssues);
+            try server.post("/tables/:tableName/repair/run", runTableRepair);
             try server.post("/tables/:tableName/artifacts/:artifactName/reprocess", reprocessDocumentArtifactRange);
             try server.put("/tables/:tableName/artifacts/:artifactName/enrichment", putArtifactEnrichment);
             try server.delete("/tables/:tableName/artifacts/:artifactName/enrichment", deleteArtifactEnrichment);
@@ -973,6 +1001,22 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.listArtifactEnrichments(ctx, table_name);
         }
 
+        /// List artifact repair issues
+        /// POST /tables/{tableName}/repair/issues
+        fn listArtifactRepairIssues(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.listArtifactRepairIssues(ctx, table_name);
+        }
+
+        /// Run a bounded table repair pass
+        /// POST /tables/{tableName}/repair/run
+        fn runTableRepair(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.runTableRepair(ctx, table_name);
+        }
+
         /// Reprocess a derived document artifact across a table range
         /// POST /tables/{tableName}/artifacts/{artifactName}/reprocess
         fn reprocessDocumentArtifactRange(ctx: *httpx.Context) anyerror!httpx.Response {
@@ -1142,6 +1186,8 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
 //   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !httpx.Response
 //   fn listArtifactEnrichments(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn listArtifactRepairIssues(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn runTableRepair(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn reprocessDocumentArtifactRange(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn putArtifactEnrichment(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn deleteArtifactEnrichment(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response

@@ -59,6 +59,17 @@ class EmbeddingsIndexStats:
         hbc_cache (EmbeddingsIndexStatsHbcCache | Unset):
         hbc_posting (EmbeddingsIndexStatsHbcPosting | Unset):
         async_indexing (EmbeddingsIndexStatsAsyncIndexing | Unset):
+        projection_checkpoint_status (str | Unset): Durable projection checkpoint status: clean, rebuilding, degraded,
+            or repair_required.
+        projection_checkpoint_applied_sequence (int | Unset): Highest derived-log sequence covered by the durable
+            projection checkpoint.
+        projection_checkpoint_generation (int | Unset): Projection generation associated with the durable checkpoint.
+        projection_checkpoint_config_hash (int | Unset): Projection configuration identity associated with the durable
+            checkpoint.
+        checkpoint_replay_tail_sequence_count (int | Unset): Number of derived-log sequences after the durable
+            checkpoint that still need replay.
+        repair_scan_issue_count (int | Unset): Repair issues found by explicit repair-scan accounting for this
+            projection.
     """
 
     index_type: EmbeddingsIndexStatsIndexType
@@ -94,6 +105,12 @@ class EmbeddingsIndexStats:
     hbc_cache: EmbeddingsIndexStatsHbcCache | Unset = UNSET
     hbc_posting: EmbeddingsIndexStatsHbcPosting | Unset = UNSET
     async_indexing: EmbeddingsIndexStatsAsyncIndexing | Unset = UNSET
+    projection_checkpoint_status: str | Unset = UNSET
+    projection_checkpoint_applied_sequence: int | Unset = UNSET
+    projection_checkpoint_generation: int | Unset = UNSET
+    projection_checkpoint_config_hash: int | Unset = UNSET
+    checkpoint_replay_tail_sequence_count: int | Unset = UNSET
+    repair_scan_issue_count: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -171,6 +188,18 @@ class EmbeddingsIndexStats:
         if not isinstance(self.async_indexing, Unset):
             async_indexing = self.async_indexing.to_dict()
 
+        projection_checkpoint_status = self.projection_checkpoint_status
+
+        projection_checkpoint_applied_sequence = self.projection_checkpoint_applied_sequence
+
+        projection_checkpoint_generation = self.projection_checkpoint_generation
+
+        projection_checkpoint_config_hash = self.projection_checkpoint_config_hash
+
+        checkpoint_replay_tail_sequence_count = self.checkpoint_replay_tail_sequence_count
+
+        repair_scan_issue_count = self.repair_scan_issue_count
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -242,6 +271,18 @@ class EmbeddingsIndexStats:
             field_dict["hbc_posting"] = hbc_posting
         if async_indexing is not UNSET:
             field_dict["async_indexing"] = async_indexing
+        if projection_checkpoint_status is not UNSET:
+            field_dict["projection_checkpoint_status"] = projection_checkpoint_status
+        if projection_checkpoint_applied_sequence is not UNSET:
+            field_dict["projection_checkpoint_applied_sequence"] = projection_checkpoint_applied_sequence
+        if projection_checkpoint_generation is not UNSET:
+            field_dict["projection_checkpoint_generation"] = projection_checkpoint_generation
+        if projection_checkpoint_config_hash is not UNSET:
+            field_dict["projection_checkpoint_config_hash"] = projection_checkpoint_config_hash
+        if checkpoint_replay_tail_sequence_count is not UNSET:
+            field_dict["checkpoint_replay_tail_sequence_count"] = checkpoint_replay_tail_sequence_count
+        if repair_scan_issue_count is not UNSET:
+            field_dict["repair_scan_issue_count"] = repair_scan_issue_count
 
         return field_dict
 
@@ -339,6 +380,18 @@ class EmbeddingsIndexStats:
         else:
             async_indexing = EmbeddingsIndexStatsAsyncIndexing.from_dict(_async_indexing)
 
+        projection_checkpoint_status = d.pop("projection_checkpoint_status", UNSET)
+
+        projection_checkpoint_applied_sequence = d.pop("projection_checkpoint_applied_sequence", UNSET)
+
+        projection_checkpoint_generation = d.pop("projection_checkpoint_generation", UNSET)
+
+        projection_checkpoint_config_hash = d.pop("projection_checkpoint_config_hash", UNSET)
+
+        checkpoint_replay_tail_sequence_count = d.pop("checkpoint_replay_tail_sequence_count", UNSET)
+
+        repair_scan_issue_count = d.pop("repair_scan_issue_count", UNSET)
+
         embeddings_index_stats = cls(
             index_type=index_type,
             error=error,
@@ -373,6 +426,12 @@ class EmbeddingsIndexStats:
             hbc_cache=hbc_cache,
             hbc_posting=hbc_posting,
             async_indexing=async_indexing,
+            projection_checkpoint_status=projection_checkpoint_status,
+            projection_checkpoint_applied_sequence=projection_checkpoint_applied_sequence,
+            projection_checkpoint_generation=projection_checkpoint_generation,
+            projection_checkpoint_config_hash=projection_checkpoint_config_hash,
+            checkpoint_replay_tail_sequence_count=checkpoint_replay_tail_sequence_count,
+            repair_scan_issue_count=repair_scan_issue_count,
         )
 
         embeddings_index_stats.additional_properties = d

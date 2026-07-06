@@ -2411,11 +2411,7 @@ fn decodePlacementIntent(alloc: std.mem.Allocator, encoded: []const u8) !raft_re
 }
 
 fn clonePlacementIntent(alloc: std.mem.Allocator, intent: raft_reconciler.PlacementIntent) !raft_reconciler.PlacementIntent {
-    return .{
-        .record = try intent.record.clone(alloc),
-        .store_id = intent.store_id,
-        .peer_node_ids = try alloc.dupe(u64, intent.peer_node_ids),
-    };
+    return try raft_reconciler.cloneIntentOwned(alloc, intent);
 }
 
 fn freePlacementIntent(alloc: std.mem.Allocator, intent: raft_reconciler.PlacementIntent) void {
@@ -3031,6 +3027,14 @@ fn appendPlacementIntent(
         },
         else => {},
     }
+    try out.append(alloc, @intFromEnum(intent.serving_state));
+    try appendInt(alloc, out, u64, intent.relocation_generation);
+    try appendInt(alloc, out, u64, intent.relocation_source_node_id);
+    try appendInt(alloc, out, u64, intent.relocation_source_store_id);
+    try appendInt(alloc, out, u64, intent.relocation_doc_count_watermark);
+    try appendInt(alloc, out, u64, intent.relocation_disk_bytes_watermark);
+    try appendInt(alloc, out, u64, intent.relocation_target_sequence);
+    try appendInt(alloc, out, u64, intent.relocation_applied_sequence);
 }
 
 fn appendTableRecord(
@@ -3686,6 +3690,25 @@ fn readPlacementIntent(
             else => return error.InvalidMetadataTransitionEncoding,
         }
     }
+    var serving_state: raft_reconciler.PlacementServingState = .serving;
+    var relocation_generation: u64 = 0;
+    var relocation_source_node_id: u64 = 0;
+    var relocation_source_store_id: u64 = 0;
+    var relocation_doc_count_watermark: u64 = 0;
+    var relocation_disk_bytes_watermark: u64 = 0;
+    var relocation_target_sequence: u64 = 0;
+    var relocation_applied_sequence: u64 = 0;
+    if (pos.* < encoded.len) {
+        serving_state = @enumFromInt(encoded[pos.*]);
+        pos.* += 1;
+        relocation_generation = try readInt(encoded, pos, u64);
+        relocation_source_node_id = try readInt(encoded, pos, u64);
+        relocation_source_store_id = try readInt(encoded, pos, u64);
+        relocation_doc_count_watermark = try readInt(encoded, pos, u64);
+        relocation_disk_bytes_watermark = try readInt(encoded, pos, u64);
+        relocation_target_sequence = try readInt(encoded, pos, u64);
+        relocation_applied_sequence = try readInt(encoded, pos, u64);
+    }
     return .{
         .record = .{
             .group_id = group_id,
@@ -3698,6 +3721,14 @@ fn readPlacementIntent(
         },
         .store_id = store_id,
         .peer_node_ids = peer_node_ids,
+        .serving_state = serving_state,
+        .relocation_generation = relocation_generation,
+        .relocation_source_node_id = relocation_source_node_id,
+        .relocation_source_store_id = relocation_source_store_id,
+        .relocation_doc_count_watermark = relocation_doc_count_watermark,
+        .relocation_disk_bytes_watermark = relocation_disk_bytes_watermark,
+        .relocation_target_sequence = relocation_target_sequence,
+        .relocation_applied_sequence = relocation_applied_sequence,
     };
 }
 

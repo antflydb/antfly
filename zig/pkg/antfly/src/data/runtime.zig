@@ -22,6 +22,7 @@ const runtime_status = @import("../api/runtime_status.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const lsm_backend_mod = @import("../storage/lsm_backend.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
+const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
 const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
 const data_raft_batch = @import("raft_batch.zig");
@@ -3695,7 +3696,9 @@ pub const DataServer = struct {
     ) void {
         _ = table_name;
         self.runtime_status_dirty.store(true, .release);
-        if (kind == .data) self.provisioned_startup_catch_up_dirty.store(true, .release);
+        switch (kind) {
+            .data, .structural => self.provisioned_startup_catch_up_dirty.store(true, .release),
+        }
     }
 
     fn markLocalSplitKeyCacheDirty(self: *DataServer) void {
@@ -4805,11 +4808,9 @@ pub const DataServer = struct {
                 snapshot.placement_intents,
                 intent.record.group_id,
             );
-            try local_intents.append(self.alloc, .{
-                .record = intent.record,
-                .store_id = intent.store_id,
-                .peer_node_ids = peer_node_ids,
-            });
+            var local_intent = intent;
+            local_intent.peer_node_ids = peer_node_ids;
+            try local_intents.append(self.alloc, local_intent);
         }
         const placement_fingerprint = dataRaftPlacementIntentsFingerprint(local_intents.items);
         const placement_changed = self.last_data_raft_placement_fingerprint == null or self.last_data_raft_placement_fingerprint.? != placement_fingerprint;
@@ -4857,8 +4858,20 @@ pub const DataServer = struct {
         if (updates.items.len > 0) try raft.host.applyBatch(updates.items);
         var campaigned = false;
         for (local_intents.items) |intent| {
-            if (!localIntentPreferredCampaigner(intent, registration.node_id)) continue;
             const status = raft.host.http_host.host.raftStatus(intent.record.group_id);
+            if (drainingLeaderShouldHandoff(snapshot.placement_intents, status, intent, registration.node_id)) {
+                raft.host.http_host.campaignGroup(intent.record.group_id) catch |err| {
+                    std.log.warn("data raft draining leader handoff campaign failed group_id={} node_id={} err={}", .{
+                        intent.record.group_id,
+                        registration.node_id,
+                        err,
+                    });
+                    continue;
+                };
+                campaigned = true;
+                continue;
+            }
+            if (!localIntentPreferredCampaigner(intent, registration.node_id)) continue;
             if (!localRaftStatusShouldBootstrapCampaign(status, registration.node_id)) continue;
             raft.host.http_host.campaignGroup(intent.record.group_id) catch |err| {
                 std.log.warn("data raft bootstrap campaign failed group_id={} node_id={} err={}", .{
@@ -5454,6 +5467,12 @@ pub const DataServer = struct {
                 }
                 if (!result.had_debt) continue;
                 stats.groups_with_debt += 1;
+                if (result.terminal_degraded) {
+                    std.log.warn("provisioned startup catch-up found terminal degraded state group={} table={s}", .{ group_id, table.name });
+                    self.runtime_status_dirty.store(true, .release);
+                    self.store_status_dirty = true;
+                    continue;
+                }
                 if (result.cleared_debt) {
                     stats.groups_cleared += 1;
                 } else {
@@ -8264,6 +8283,53 @@ fn localIntentPreferredCampaigner(intent: antfly.raft.PlacementIntent, local_nod
     return local_node_id == min_node_id;
 }
 
+fn drainingLeaderShouldHandoff(
+    placement_intents: []const antfly.raft.PlacementIntent,
+    status: ?raft_engine.core.Status,
+    local_intent: antfly.raft.PlacementIntent,
+    local_node_id: u64,
+) bool {
+    if (local_intent.serving_state != .serving) return false;
+    const raft_status = status orelse return false;
+    const leader_node_id = raft_status.soft.leader_id orelse return false;
+    if (leader_node_id == local_node_id) return false;
+    if (!DataServer.localRaftStatusIsVoter(raft_status, local_node_id)) return false;
+    if (!groupLeaderPlacementIsDraining(placement_intents, local_intent.record.group_id, leader_node_id)) return false;
+    return localNodePreferredServingPeer(placement_intents, local_intent.record.group_id, local_node_id);
+}
+
+fn groupLeaderPlacementIsDraining(
+    placement_intents: []const antfly.raft.PlacementIntent,
+    group_id: u64,
+    leader_node_id: u64,
+) bool {
+    for (placement_intents) |intent| {
+        if (intent.record.group_id == group_id and
+            intent.record.local_node_id == leader_node_id and
+            intent.serving_state == .draining)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn localNodePreferredServingPeer(
+    placement_intents: []const antfly.raft.PlacementIntent,
+    group_id: u64,
+    local_node_id: u64,
+) bool {
+    var min_node_id: ?u64 = null;
+    for (placement_intents) |intent| {
+        if (intent.record.group_id != group_id) continue;
+        if (intent.serving_state != .serving) continue;
+        if (min_node_id == null or intent.record.local_node_id < min_node_id.?) {
+            min_node_id = intent.record.local_node_id;
+        }
+    }
+    return min_node_id != null and min_node_id.? == local_node_id;
+}
+
 fn dataRaftPlacementIntentsFingerprint(intents: []const antfly.raft.PlacementIntent) u64 {
     var hasher = std.hash.Wyhash.init(0x48f9_2026_da7a_4a17);
     hashU64(&hasher, intents.len);
@@ -9298,6 +9364,26 @@ test "data raft bootstrap campaign retries leaderless voter elections" {
 
     status.soft.leader_id = null;
     try std.testing.expect(!DataServer.localRaftStatusShouldBootstrapCampaign(status, 4));
+}
+
+test "data raft draining leader handoff campaigns preferred serving survivor" {
+    var voters = [_]u64{ 101, 102, 103 };
+    const status = raft_engine.core.Status{
+        .id = 102,
+        .group_id = 7002,
+        .soft = .{ .leader_id = 101, .role = .follower },
+        .hard = .{},
+        .conf_state = .{ .voters = voters[0..] },
+    };
+    const intents = [_]antfly.raft.PlacementIntent{
+        .{ .record = .{ .group_id = 7002, .replica_id = 1, .local_node_id = 101 }, .serving_state = .draining },
+        .{ .record = .{ .group_id = 7002, .replica_id = 2, .local_node_id = 102 }, .serving_state = .serving },
+        .{ .record = .{ .group_id = 7002, .replica_id = 3, .local_node_id = 103 }, .serving_state = .serving },
+    };
+
+    try std.testing.expect(drainingLeaderShouldHandoff(&intents, status, intents[1], 102));
+    try std.testing.expect(!drainingLeaderShouldHandoff(&intents, status, intents[2], 103));
+    try std.testing.expect(!drainingLeaderShouldHandoff(&intents, status, intents[0], 101));
 }
 
 test "data runtime live writer source follows raft apply ownership" {
@@ -12880,6 +12966,172 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
     }
 }
 
+test "data runtime startup catch-up clears dirty bit for terminal degraded index load" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-terminal-startup-load", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root_dir});
+    defer alloc.free(db_path);
+    const indexes_json = "{\"dv_v1\":{\"type\":\"embeddings\",\"field\":\"embedding\",\"dims\":2}}";
+    const identity_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 77, .range_id = 77 };
+
+    {
+        var db = try antfly.db.DB.open(alloc, db_path, .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+            .identity_namespace = identity_namespace,
+        });
+        defer db.close();
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+        });
+    }
+
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = indexes_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = 77,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{.{
+                    .store_id = 19,
+                    .node_id = 9,
+                    .role = "data",
+                    .live = true,
+                    .health_class = "healthy",
+                }})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{.{
+                    .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 9 },
+                    .store_id = 19,
+                    .peer_node_ids = &.{9},
+                }})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FalseLeader = struct {
+        fn iface() GroupLeadershipSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .is_local_leader = isLocalLeader,
+                },
+            };
+        }
+
+        fn isLocalLeader(_: *anyopaque, _: u64) bool {
+            return false;
+        }
+    };
+
+    var server: DataServer = .{
+        .alloc = alloc,
+        .store_registration = .{
+            .node_id = 9,
+            .store_id = 19,
+            .role = "data",
+            .failure_domain = "test",
+        },
+        .group_leadership_source = FalseLeader.iface(),
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            FakeCatalog.iface(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            replica_root_dir,
+            FakeCatalog.iface(),
+        ),
+        .status_source = FakeStatus.iface(),
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+    server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+    server.runtime_status_dirty.store(false, .release);
+    server.store_status_dirty = false;
+    server.provisioned_startup_catch_up_dirty.store(true, .release);
+
+    index_manager_mod.test_inject_index_open_error = error.FileNotFound;
+    defer index_manager_mod.test_inject_index_open_error = null;
+
+    _ = server.runProvisionedStartupCatchUp();
+
+    try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_started.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_completed.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), server.provisioned_startup_catch_up_failed.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_last_group_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_last_groups_with_debt.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), server.provisioned_startup_catch_up_last_groups_cleared.load(.monotonic));
+    try std.testing.expect(!server.provisioned_startup_catch_up_dirty.load(.acquire));
+    try std.testing.expect(server.runtime_status_dirty.load(.acquire));
+    try std.testing.expect(server.store_status_dirty);
+
+    var statuses = (try server.provisioned_storage.runtime_status_cache.snapshot(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expect(statuses.items[0].stats.repair_degraded);
+    try std.testing.expectEqual(@as(usize, 1), statuses.items[0].stats.indexes.len);
+    try std.testing.expect(statuses.items[0].stats.indexes[0].repair_degraded);
+    try std.testing.expect(statuses.items[0].stats.indexes[0].load_error != null);
+    try std.testing.expectEqualStrings("FileNotFound", statuses.items[0].stats.indexes[0].load_error.?);
+}
+
 test "data runtime startup catch-up clears no-debt busy writer groups" {
     const alloc = std.testing.allocator;
 
@@ -13450,7 +13702,7 @@ test "data runtime data changes mark provisioned startup catch-up dirty" {
     try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.acquire));
 }
 
-test "data runtime structural changes preserve writer-published runtime status" {
+test "data runtime structural changes preserve writer-published runtime status and schedule catch-up" {
     const alloc = std.testing.allocator;
     var server: DataServer = .{
         .alloc = alloc,
@@ -13474,7 +13726,7 @@ test "data runtime structural changes preserve writer-published runtime status" 
     server.markRuntimeStatusDirty("docs", .structural);
 
     try std.testing.expect(server.runtime_status_dirty.load(.acquire));
-    try std.testing.expect(!server.provisioned_startup_catch_up_dirty.load(.acquire));
+    try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.acquire));
     var statuses = (try server.provisioned_storage.runtime_status_cache.snapshot(alloc, "docs")).?;
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);

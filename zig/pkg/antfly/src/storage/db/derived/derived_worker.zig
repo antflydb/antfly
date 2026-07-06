@@ -146,6 +146,7 @@ fn logCatchUpError(
 ) void {
     if (err == error.WriterLocked) return;
     if (err == error.ReplayDocumentNotVisible) return;
+    if (err == error.ArtifactRepairRequired) return;
     if (index_ref.kind == .dense_vector and err == error.NotFound) return;
     std.log.err(
         "derived catch_up failed index={s} kind={s} phase={s} sequence={} scanned_entries={} applied_entries={} err={s}",
@@ -286,12 +287,13 @@ pub fn catchUpIndexFromMatchingCursor(
         }
 
         const apply_started_ns = monotonicTimeNs();
-        if (apply_fn(apply_ctx, batch, index_ref) catch |err| {
+        const applied = apply_fn(apply_ctx, batch, index_ref) catch |err| {
             stats.apply_ns += monotonicTimeNs() - apply_started_ns;
             logCatchUpError(index_ref, "journal_apply", chunk_stats.last_sequence, stats.scanned_entries, stats.applied_entries, err);
             derived_types.deinitDerivedBatch(alloc, &batch);
             return err;
-        }) {
+        };
+        if (applied) {
             stats.apply_ns += monotonicTimeNs() - apply_started_ns;
             stats.applied_entries += 1;
         } else {
@@ -315,11 +317,13 @@ pub fn catchUpIndexFromMatchingCursor(
             window_open = false;
         }
         if (options.persist_progress_fn) |persist| {
-            persist(options.persist_ctx.?, index_ref.name, chunk_stats.last_sequence) catch |err| {
-                logCatchUpError(index_ref, "persist_progress", chunk_stats.last_sequence, stats.scanned_entries, stats.applied_entries, err);
-                derived_types.deinitDerivedBatch(alloc, &batch);
-                return err;
-            };
+            if (applied) {
+                persist(options.persist_ctx.?, index_ref.name, chunk_stats.last_sequence) catch |err| {
+                    logCatchUpError(index_ref, "persist_progress", chunk_stats.last_sequence, stats.scanned_entries, stats.applied_entries, err);
+                    derived_types.deinitDerivedBatch(alloc, &batch);
+                    return err;
+                };
+            }
         }
         derived_types.deinitDerivedBatch(alloc, &batch);
         completed_windows += 1;

@@ -3672,6 +3672,14 @@ fn hashPlacementIntent(hasher: *std.hash.Wyhash, intent: raft_reconciler.Placeme
     hashPlacementU64(hasher, @intFromEnum(intent.record.bootstrap_mode));
     hashPlacementU64(hasher, intent.record.metadata_version);
     hashPlacementU64(hasher, intent.store_id);
+    hashPlacementU64(hasher, @intFromEnum(intent.serving_state));
+    hashPlacementU64(hasher, intent.relocation_generation);
+    hashPlacementU64(hasher, intent.relocation_source_node_id);
+    hashPlacementU64(hasher, intent.relocation_source_store_id);
+    hashPlacementU64(hasher, intent.relocation_doc_count_watermark);
+    hashPlacementU64(hasher, intent.relocation_disk_bytes_watermark);
+    hashPlacementU64(hasher, intent.relocation_target_sequence);
+    hashPlacementU64(hasher, intent.relocation_applied_sequence);
     hashPlacementU64(hasher, intent.peer_node_ids.len);
     for (intent.peer_node_ids) |node_id| hashPlacementU64(hasher, node_id);
 
@@ -3725,6 +3733,14 @@ fn placementIntentEquals(
         if (!std.mem.eql(u8, backup.snapshot_path, other.snapshot_path)) return false;
     }
     if (left.store_id != right.store_id) return false;
+    if (left.serving_state != right.serving_state) return false;
+    if (left.relocation_generation != right.relocation_generation) return false;
+    if (left.relocation_source_node_id != right.relocation_source_node_id) return false;
+    if (left.relocation_source_store_id != right.relocation_source_store_id) return false;
+    if (left.relocation_doc_count_watermark != right.relocation_doc_count_watermark) return false;
+    if (left.relocation_disk_bytes_watermark != right.relocation_disk_bytes_watermark) return false;
+    if (left.relocation_target_sequence != right.relocation_target_sequence) return false;
+    if (left.relocation_applied_sequence != right.relocation_applied_sequence) return false;
     return std.mem.eql(u64, left.peer_node_ids, right.peer_node_ids);
 }
 

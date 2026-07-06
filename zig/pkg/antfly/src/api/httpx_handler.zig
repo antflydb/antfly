@@ -185,17 +185,15 @@ pub const AntflyApiHandler = struct {
         var runtime_io = runtime.io() orelse return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
         const job_alloc = std.heap.page_allocator;
         const owned_table_name = try job_alloc.dupe(u8, table_name);
-        errdefer job_alloc.free(owned_table_name);
+        defer job_alloc.free(owned_table_name);
         const owned_body_data = try job_alloc.dupe(u8, body_data);
-        errdefer job_alloc.free(owned_body_data);
+        defer job_alloc.free(owned_body_data);
         var job = OffloadedTableBatch{
             .alloc = job_alloc,
             .table_name = owned_table_name,
             .body_data = owned_body_data,
             .api = api,
         };
-        defer job_alloc.free(owned_table_name);
-        defer job_alloc.free(owned_body_data);
         var future = try runtime_io.concurrent(OffloadedTableBatch.run, .{&job});
         while (!job.done.load(.acquire)) {
             ctx.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
@@ -2100,6 +2098,34 @@ pub const AntflyApiHandler = struct {
         defer ctx.allocator.free(decoded_table_name);
         var resp = try public_table_http.handleListArtifactEnrichments(ctx.allocator, decoded_table_name, self.api_server.tableApi());
         return respondOwnedApiResponse(ctx, &resp);
+    }
+
+    pub fn listArtifactRepairIssues(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        if (ctx.request.uri.query) |query| {
+            if (query.len != 0) return textResponse(ctx, 400, "repair requests use json body");
+        }
+        const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
+        defer ctx.allocator.free(decoded_table_name);
+        const body_data = (try ctx.body()) orelse "";
+        var response = try self.api_server.handlePublicListArtifactRepairIssues(decoded_table_name, body_data);
+        return respondWithAllocator(ctx, &response, self.api_server.alloc);
+    }
+
+    pub fn runTableRepair(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        if (ctx.request.uri.query) |query| {
+            if (query.len != 0) return textResponse(ctx, 400, "repair requests use json body");
+        }
+        const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
+        defer ctx.allocator.free(decoded_table_name);
+        const body_data = (try ctx.body()) orelse "";
+        var response = try self.api_server.handlePublicRunTableRepair(decoded_table_name, body_data);
+        return respondWithAllocator(ctx, &response, self.api_server.alloc);
     }
 
     pub fn reprocessDocumentArtifact(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response {

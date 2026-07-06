@@ -1068,6 +1068,55 @@ pub const PersistentIndex = struct {
         self.* = undefined;
     }
 
+    pub fn resetAllForRebuild(self: *PersistentIndex) !void {
+        if (self.read_only) return error.ReadOnly;
+
+        const retired_cleanup = self.writer.retired_segment_cleanup;
+        var replacement_writer = try index_mod.IndexWriter.init(self.alloc);
+        var replacement_writer_moved = false;
+        defer if (!replacement_writer_moved) replacement_writer.deinit();
+        replacement_writer.setRetiredSegmentCleanup(retired_cleanup);
+
+        self.lockStorage();
+        defer self.unlockStorage();
+
+        const active_ids = blk: {
+            var read_txn = try self.beginReadMainTxn();
+            defer read_txn.abort();
+            break :blk try self.loadActiveSegmentIds(&read_txn, self.alloc);
+        };
+        defer self.alloc.free(active_ids);
+
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        for (active_ids) |seg_id| {
+            const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
+            txn.delete(.segments, &seg_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            txn.delete(.deletions, &seg_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            try self.deleteSegmentRange(&txn, seg_id);
+            try self.updateActiveSegments(&txn, seg_id, .remove);
+            self.deleteSegmentFile(seg_id);
+        }
+        txn.delete(.meta, meta_committed_lsn) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        try txn.commit();
+
+        try self.wal.truncateAfter(0);
+        self.committed_lsn = 0;
+
+        self.writer.deinit();
+        self.writer = replacement_writer;
+        replacement_writer_moved = true;
+    }
+
     pub fn sync(self: *PersistentIndex, force: bool) !void {
         self.lockStorage();
         defer self.unlockStorage();

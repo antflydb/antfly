@@ -1592,6 +1592,20 @@ func (t *TableApi) UpdateSchema(w http.ResponseWriter, r *http.Request, tableNam
 	}
 }
 
+func (t *TableApi) ListArtifactRepairIssues(w http.ResponseWriter, r *http.Request, tableName string) {
+	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, tableName, usermgr.PermissionTypeAdmin) {
+		return
+	}
+	errorResponse(w, "table repair is only available in the Zig runtime", http.StatusMethodNotAllowed)
+}
+
+func (t *TableApi) RunTableRepair(w http.ResponseWriter, r *http.Request, tableName string) {
+	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, tableName, usermgr.PermissionTypeAdmin) {
+		return
+	}
+	errorResponse(w, "table repair is only available in the Zig runtime", http.StatusMethodNotAllowed)
+}
+
 // authApiRoutes configures the public authentication API.
 func (ms *MetadataStore) authApiRoutes() *http.ServeMux {
 	mux := http.NewServeMux()

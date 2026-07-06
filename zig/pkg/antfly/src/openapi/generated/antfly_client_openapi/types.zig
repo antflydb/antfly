@@ -375,6 +375,128 @@ pub const DocumentArtifactChildRange = struct {
     text_bytes: ?i64 = null,
 };
 
+/// Kind of stored artifact tracked by the repair queue.
+pub const ArtifactRepairKind = enum {
+    embedding,
+    asset,
+    chunk,
+    graph,
+    full_text,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .embedding => "embedding",
+            .asset => "asset",
+            .chunk => "chunk",
+            .graph => "graph",
+            .full_text => "full_text",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "embedding", .embedding },
+            .{ "asset", .asset },
+            .{ "chunk", .chunk },
+            .{ "graph", .graph },
+            .{ "full_text", .full_text },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Reason an artifact was added to the repair queue.
+pub const ArtifactRepairReason = enum {
+    missing_artifact,
+    corrupt_artifact,
+    unreadable_artifact,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .missing_artifact => "missing_artifact",
+            .corrupt_artifact => "corrupt_artifact",
+            .unreadable_artifact => "unreadable_artifact",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "missing_artifact", .missing_artifact },
+            .{ "corrupt_artifact", .corrupt_artifact },
+            .{ "unreadable_artifact", .unreadable_artifact },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Repair subsystem to inspect or run.
+pub const RepairTarget = enum {
+    artifact,
+    index,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .artifact => "artifact",
+            .index => "index",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "artifact", .artifact },
+            .{ "index", .index },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Result of one bounded artifact repair pass.
+pub const ArtifactRepairRunResult = struct {
+    /// Number of repair records attempted by this pass.
+    scanned: i64,
+    /// Number of table groups touched by this bounded repair pass.
+    groups_scanned: i64,
+    /// Number of artifacts whose source was reprocessed.
+    reprocessed: i64,
+    /// Number of repair records cleared because the artifact became readable.
+    repaired: i64,
+    /// Number of repair records whose source document no longer exists.
+    missing_source_docs: i64,
+    /// Number of supported repair attempts that failed.
+    failed: i64,
+    /// Number of repair records skipped because no reprocessor exists for the artifact kind.
+    unsupported: i64,
+    /// Number of attempted repair records that remained queued after this pass.
+    unresolved: i64,
+    /// Number of indexes rebuilt by this pass when target is index.
+    indexes_rebuilt: i64,
+    /// Number of selected indexes that were already degraded or quarantined before repair.
+    indexes_degraded: i64,
+    /// Effective repair limit.
+    limit: i64,
+    /// Opaque cursor for the next artifact repair pass when has_more is true. Index repair currently repairs one named index per request and does not return a continuation cursor.
+    next_cursor: ?[]const u8 = null,
+    /// Whether another artifact scan page is available via next_cursor.
+    has_more: bool,
+    /// Whether repair debt remains after this bounded pass. If true and next_cursor is absent, rerun repair from the beginning after addressing failed or unsupported records.
+    debt_remaining: bool,
+};
+
 pub const DocumentArtifactReprocessResponse = struct {
     /// Indicates that reprocessing was accepted.
     reprocess: []const u8,
@@ -2535,6 +2657,18 @@ pub const FullTextIndexStats = struct {
     text_merge: ?std.json.Value = null,
     /// Asynchronous indexer runtime diagnostics.
     async_indexing: ?std.json.Value = null,
+    /// Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required.
+    projection_checkpoint_status: ?[]const u8 = null,
+    /// Highest derived-log sequence covered by the durable projection checkpoint.
+    projection_checkpoint_applied_sequence: ?i64 = null,
+    /// Projection generation associated with the durable checkpoint.
+    projection_checkpoint_generation: ?i64 = null,
+    /// Projection configuration identity associated with the durable checkpoint.
+    projection_checkpoint_config_hash: ?i64 = null,
+    /// Number of derived-log sequences after the durable checkpoint that still need replay.
+    checkpoint_replay_tail_sequence_count: ?i64 = null,
+    /// Repair issues found by explicit repair-scan accounting for this projection.
+    repair_scan_issue_count: ?i64 = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -2608,6 +2742,18 @@ pub const EmbeddingsIndexStats = struct {
     hbc_cache: ?std.json.Value = null,
     hbc_posting: ?std.json.Value = null,
     async_indexing: ?std.json.Value = null,
+    /// Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required.
+    projection_checkpoint_status: ?[]const u8 = null,
+    /// Highest derived-log sequence covered by the durable projection checkpoint.
+    projection_checkpoint_applied_sequence: ?i64 = null,
+    /// Projection generation associated with the durable checkpoint.
+    projection_checkpoint_generation: ?i64 = null,
+    /// Projection configuration identity associated with the durable checkpoint.
+    projection_checkpoint_config_hash: ?i64 = null,
+    /// Number of derived-log sequences after the durable checkpoint that still need replay.
+    checkpoint_replay_tail_sequence_count: ?i64 = null,
+    /// Repair issues found by explicit repair-scan accounting for this projection.
+    repair_scan_issue_count: ?i64 = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -2673,6 +2819,18 @@ pub const GraphIndexStats = struct {
     /// Resolver replay diagnostics for graph materialization.
     resolver_replay: ?std.json.Value = null,
     async_indexing: ?std.json.Value = null,
+    /// Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required.
+    projection_checkpoint_status: ?[]const u8 = null,
+    /// Highest derived-log sequence covered by the durable projection checkpoint.
+    projection_checkpoint_applied_sequence: ?i64 = null,
+    /// Projection generation associated with the durable checkpoint.
+    projection_checkpoint_generation: ?i64 = null,
+    /// Projection configuration identity associated with the durable checkpoint.
+    projection_checkpoint_config_hash: ?i64 = null,
+    /// Number of derived-log sequences after the durable checkpoint that still need replay.
+    checkpoint_replay_tail_sequence_count: ?i64 = null,
+    /// Repair issues found by explicit repair-scan accounting for this projection.
+    repair_scan_issue_count: ?i64 = null,
     /// Algebraic graph execution health for bounded semiring traversal.
     algebraic_graph: ?std.json.Value = null,
 };
@@ -2757,6 +2915,18 @@ pub const AlgebraicIndexStats = struct {
     active_progress_lifecycle: ?[]const u8 = null,
     active_progress_rows_processed: ?i64 = null,
     active_progress_target_rows: ?i64 = null,
+    /// Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required.
+    projection_checkpoint_status: ?[]const u8 = null,
+    /// Highest derived-log sequence covered by the durable projection checkpoint.
+    projection_checkpoint_applied_sequence: ?i64 = null,
+    /// Projection generation associated with the durable checkpoint.
+    projection_checkpoint_generation: ?i64 = null,
+    /// Projection configuration identity associated with the durable checkpoint.
+    projection_checkpoint_config_hash: ?i64 = null,
+    /// Number of derived-log sequences after the durable checkpoint that still need replay.
+    checkpoint_replay_tail_sequence_count: ?i64 = null,
+    /// Repair issues found by explicit repair-scan accounting for this projection.
+    repair_scan_issue_count: ?i64 = null,
 };
 
 /// Available tool names for retrieval agents. - add_filter: Add search filters (field constraints) - ask_clarification: Ask user for clarification - web_search: Search the web (requires web_search_connection or web_search_config) - fetch: Fetch URL content (subject to security controls) - semantic_search: Execute semantic/vector search against an index - full_text_search: Execute full-text BM25 search against an index - tree_search: Execute tree search with beam search navigation - graph_search: Execute graph traversal search - aggregate: Execute aggregations against an index
@@ -4250,6 +4420,79 @@ pub const DocumentArtifactManifest = struct {
     state_json: ?[]const u8 = null,
 };
 
+/// Durable repair debt for a derived artifact. This is an operator-facing record and includes exact source and artifact identifiers.
+pub const ArtifactRepairIssue = struct {
+    artifact_kind: ArtifactRepairKind,
+    /// Index whose replay or derived state observed the artifact problem.
+    index_name: []const u8,
+    /// Source or derived document key whose artifact is missing or unreadable.
+    doc_key: []const u8,
+    /// Parent source document key for chunk-derived artifacts.
+    parent_doc_key: ?[]const u8 = null,
+    /// Unit identifier for unit-scoped artifacts, when applicable.
+    unit_id: ?[]const u8 = null,
+    /// Source artifact stream used to produce this artifact, when applicable.
+    source_artifact_name: ?[]const u8 = null,
+    /// Derived artifact name that must be reprocessed or made readable.
+    artifact_name: []const u8,
+    /// Hex-encoded internal artifact storage key, when known.
+    artifact_key: ?[]const u8 = null,
+    /// Chunk ordinal for chunk-derived artifacts.
+    chunk_id: ?i64 = null,
+    /// Whether this artifact kind currently has an automated repair reprocessor.
+    repairable: bool,
+    /// Stable reason code when repairable is false.
+    unsupported_reason: ?[]const u8 = null,
+    /// Derived replay sequence that observed the issue.
+    sequence: i64,
+    reason: ArtifactRepairReason,
+    /// Number of repair attempts made for this issue.
+    attempts: i64,
+    /// Monotonic timestamp when this issue was first recorded.
+    first_seen_ns: i64,
+    /// Monotonic timestamp when this issue was last observed or attempted.
+    last_seen_ns: i64,
+    /// Last stable repair error code, when a repair attempt failed.
+    last_error: ?[]const u8 = null,
+};
+
+/// Bounded request to list table repair issues.
+pub const RepairIssueListRequest = struct {
+    /// Repair subsystem to list. `artifact` lists durable artifact queue records; `index` lists index repair candidates derived from index status and artifact debt.
+    target: ?RepairTarget = null,
+    kind: ?ArtifactRepairKind = null,
+    /// Restrict results to one index name.
+    index: ?[]const u8 = null,
+    /// Opaque cursor returned by a prior response.
+    cursor: ?[]const u8 = null,
+    /// Maximum repair records to return.
+    limit: ?i64 = null,
+};
+
+/// Bounded request to run a table repair pass.
+pub const RepairRunRequest = struct {
+    target: ?RepairTarget = null,
+    kind: ?ArtifactRepairKind = null,
+    /// Restrict repair attempts to one index name.
+    index: ?[]const u8 = null,
+    /// Opaque cursor returned by a prior repair response.
+    cursor: ?[]const u8 = null,
+    /// Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
+    force: ?bool = null,
+    /// Maximum artifact repair records to attempt. For target=index, any positive value permits one named index repair.
+    limit: ?i64 = null,
+};
+
+/// Response for a bounded table repair pass.
+pub const ArtifactRepairRunResponse = struct {
+    /// Table whose repair queue was processed.
+    table: []const u8,
+    target: RepairTarget,
+    /// Effective repair limit.
+    limit: i64,
+    result: ArtifactRepairRunResult,
+};
+
 /// Bounded request for reprocessing a derived artifact across source rows in key order.
 pub const DocumentArtifactTableReprocessRequest = struct {
     /// Exclusive lower bound source document key. Use the prior response next_key to continue.
@@ -5543,6 +5786,24 @@ pub const DocumentArtifactManifestList = struct {
     /// Stable identity of the source document.
     document_id: []const u8,
     artifacts: []const DocumentArtifactManifest,
+};
+
+/// Bounded page of table repair issues.
+pub const ArtifactRepairIssueList = struct {
+    /// Table whose repair queue was listed.
+    table: []const u8,
+    target: RepairTarget,
+    /// Effective page limit.
+    limit: i64,
+    /// Number of repair records scanned while building this page.
+    scanned: i64,
+    /// Number of table groups touched while building this page.
+    groups_scanned: i64,
+    /// Whether another page is available.
+    has_more: bool,
+    /// Opaque cursor for the next page when has_more is true.
+    next_cursor: ?[]const u8 = null,
+    issues: []const ArtifactRepairIssue,
 };
 
 pub const ClusterTopology = struct {
