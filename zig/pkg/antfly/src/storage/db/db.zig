@@ -7300,7 +7300,7 @@ pub const DB = struct {
             result.debt_remaining = true;
             return result;
         }
-        if (had_load_failure and (cfg.kind == .full_text or cfg.kind == .algebraic)) {
+        if (had_load_failure and (cfg.kind == .full_text or cfg.kind == .algebraic) and !try self.indexRepairRequired(alloc, cfg.name)) {
             result.repaired += 1;
             return result;
         }
@@ -7330,7 +7330,12 @@ pub const DB = struct {
                 try self.core.index_manager.syncIndexByName(cfg.name, true);
                 break :blk count;
             },
-            .full_text, .algebraic => return result,
+            .full_text => blk: {
+                const count = try self.core.index_manager.resetFullTextIndexForArtifactRebuild(self.core.store, cfg.name);
+                try self.core.index_manager.syncIndexByName(cfg.name, true);
+                break :blk count;
+            },
+            .algebraic => return result,
         };
         result.reprocessed += rebuilt;
         result.repaired += 1;
@@ -38185,6 +38190,84 @@ test "db index repair resets sparse index before rebuilding from artifacts" {
     try std.testing.expect((try repaired_entry.index.debugDocNumForDocId("doc:a")) != null);
     try std.testing.expect((try repaired_entry.index.debugDocNumForDocId("doc:b")) != null);
     try std.testing.expectEqual(@as(?u32, null), try repaired_entry.index.debugDocNumForDocId("doc:stale"));
+}
+
+test "db index repair rebuilds full text index from stored documents" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const text_cfg: types.IndexConfig = .{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    };
+    try db.addIndex(text_cfg);
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha winner\"}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"beta winner\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var before = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+    });
+    defer before.deinit();
+    try std.testing.expectEqual(@as(u32, 1), before.total_hits);
+
+    try db.core.saveProjectionCheckpoint("ft_v1", .{
+        .applied_sequence = 0,
+        .status = .repair_required,
+        .config_hash = types.indexConfigHash(text_cfg),
+    });
+
+    const page = try db.listArtifactRepairIssuesPage(alloc, .{
+        .target = .index,
+        .artifact_kind = .full_text,
+        .index_name = "ft_v1",
+        .limit = 1,
+    });
+    defer {
+        types.freeArtifactRepairIssues(alloc, page.issues);
+        if (page.next_cursor) |cursor| alloc.free(cursor);
+    }
+    try std.testing.expectEqual(@as(usize, 1), page.issues.len);
+    try std.testing.expect(page.issues[0].repairable);
+    try std.testing.expectEqual(types.ArtifactRepairKind.full_text, page.issues[0].artifact_kind);
+    try std.testing.expectEqualStrings("ft_v1", page.issues[0].index_name);
+
+    var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .artifact_kind = .full_text,
+        .index_name = "ft_v1",
+        .limit = 1,
+    });
+    defer repair.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), repair.scanned);
+    try std.testing.expectEqual(@as(u64, 2), repair.reprocessed);
+    try std.testing.expectEqual(@as(u64, 1), repair.repaired);
+    try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
+    try std.testing.expect(!repair.debt_remaining);
+
+    const checkpoint = try db.core.loadProjectionCheckpoint(alloc, "ft_v1");
+    try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
+    try std.testing.expectEqual(types.indexConfigHash(text_cfg), checkpoint.config_hash);
+
+    var after = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+    });
+    defer after.deinit();
+    try std.testing.expectEqual(@as(u32, 1), after.total_hits);
+    try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
 }
 
 test "db repair issue list reports index repair candidates" {

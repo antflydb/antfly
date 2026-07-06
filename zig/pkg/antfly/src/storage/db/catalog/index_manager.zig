@@ -1589,6 +1589,40 @@ pub const IndexManager = struct {
         });
     }
 
+    pub fn resetFullTextIndexForArtifactRebuild(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8) !u64 {
+        const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+
+        try entry.persistent.resetAllForRebuild();
+        try rebuild_state.update("");
+        try self.backfillTextIndex(store, entry, null);
+        try self.saveBackfilledAppliedSequence(store, entry.config);
+        var checkpoint = try apply_state.loadProjectionCheckpointWithSidecar(
+            self.alloc,
+            store,
+            self.applied_sequence_checkpoint_path,
+            entry.config.name,
+        );
+        checkpoint.status = .clean;
+        checkpoint.config_hash = types.indexConfigHash(entry.config);
+        try apply_state.saveProjectionCheckpointWithSidecar(
+            self.alloc,
+            store,
+            self.applied_sequence_checkpoint_path,
+            entry.config.name,
+            checkpoint,
+        );
+
+        const rebuilt = entry.persistent.snapshot().global_doc_count;
+        entry.compaction_pending = try self.textIndexNeedsMerge(&entry.persistent, default_merge_policy);
+        if (entry.compaction_pending) {
+            TextMergeScheduler.schedule(entry);
+        } else {
+            TextMergeScheduler.noteComplete(entry);
+        }
+        return rebuilt;
+    }
+
     pub fn clearDenseHbcCaches(self: *IndexManager) void {
         for (self.dense_indexes.items) |*entry| entry.index.clearAllCaches();
     }
