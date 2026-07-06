@@ -127,16 +127,26 @@ func TestTranslateTemplateFieldMapping(t *testing.T) {
 			wantIndex:    true,
 		},
 		{
-			name: "store and doc_values enabled",
+			name: "store and sortable enabled",
 			input: TemplateFieldMapping{
-				Type:      AntflyTypeText,
-				Store:     true,
-				DocValues: true,
+				Type:     AntflyTypeKeyword,
+				Store:    true,
+				Sortable: true,
 			},
 			wantType:      "text",
+			wantAnalyzer:  keyword.Name,
 			wantIndex:     true,
 			wantStore:     true,
 			wantDocValues: true,
+		},
+		{
+			name: "sortable ignored for unsupported text type",
+			input: TemplateFieldMapping{
+				Type:     AntflyTypeText,
+				Sortable: true,
+			},
+			wantType:  "text",
+			wantIndex: true,
 		},
 		{
 			name: "include_in_all enabled",

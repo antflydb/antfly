@@ -1835,9 +1835,10 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid schema update request");
         };
+        const invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(body_data);
         const schema_json = table_contract.parseSchemaUpdateRequest(alloc, body_data) catch {
             _ = ctx.status(400);
-            return ctx.text("invalid schema update request");
+            return ctx.text(invalid_schema_message);
         };
         defer alloc.free(schema_json);
 
@@ -1846,7 +1847,7 @@ pub const AntflyApiHandler = struct {
             self.api_server.source.updateSchema(alloc, decoded_table_name, schema_json) catch |err| switch (err) {
                 error.InvalidSchemaUpdateRequest => {
                     _ = ctx.status(400);
-                    return ctx.text("invalid schema update request");
+                    return ctx.text(invalid_schema_message);
                 },
                 error.TableNotFound => {
                     _ = ctx.status(404);
@@ -1860,7 +1861,7 @@ pub const AntflyApiHandler = struct {
                     _ = table_writes_source.updateSchema(alloc, decoded_table_name, schema_json) catch |write_err| switch (write_err) {
                         error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => {
                             _ = ctx.status(400);
-                            return ctx.text("invalid schema update request");
+                            return ctx.text(invalid_schema_message);
                         },
                         else => return write_err,
                     } orelse {
@@ -1881,7 +1882,7 @@ pub const AntflyApiHandler = struct {
         self.api_server.source.updateSchema(alloc, decoded_table_name, schema_json) catch |err| switch (err) {
             error.InvalidSchemaUpdateRequest => {
                 _ = ctx.status(400);
-                return ctx.text("invalid schema update request");
+                return ctx.text(invalid_schema_message);
             },
             error.TableNotFound => {
                 _ = ctx.status(404);
@@ -1895,7 +1896,7 @@ pub const AntflyApiHandler = struct {
                 _ = table_writes_source.updateSchema(alloc, decoded_table_name, schema_json) catch |write_err| switch (write_err) {
                     error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => {
                         _ = ctx.status(400);
-                        return ctx.text("invalid schema update request");
+                        return ctx.text(invalid_schema_message);
                     },
                     else => return write_err,
                 };
@@ -1917,7 +1918,7 @@ pub const AntflyApiHandler = struct {
                 _ = table_writes_source.updateSchema(alloc, decoded_table_name, schema_json) catch |write_err| switch (write_err) {
                     error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => {
                         _ = ctx.status(400);
-                        return ctx.text("invalid schema update request");
+                        return ctx.text(invalid_schema_message);
                     },
                     else => return write_err,
                 };

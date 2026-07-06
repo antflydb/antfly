@@ -5129,9 +5129,7 @@ pub const TemplateFieldMapping = struct {
     store: ?bool = null,
     /// Whether to include in the _all field for cross-field search
     include_in_all: ?bool = null,
-    /// Whether to enable doc values for sorting/faceting
-    doc_values: ?bool = null,
-    /// Whether this doc-valued scalar field can be used in order_by
+    /// Whether this scalar field can be used in order_by. When true, Antfly derives the internal typed doc-value structures required for exact sorting; users should not configure doc_values directly.
     sortable: ?bool = null,
     /// Missing/null sort policy for this mapped field. The current production policy rejects missing or null native sort values so sorted cursors remain replayable JSON scalar tuples.
     missing_null_policy: ?[]const u8 = null,

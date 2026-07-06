@@ -105,7 +105,7 @@ fn freeRuntimeDynamicTemplateItems(alloc: std.mem.Allocator, templates: []storag
 
 fn runtimeDynamicTemplateFromParsed(alloc: std.mem.Allocator, template: impl.DynamicTemplate) !storage_schema.DynamicTemplate {
     const field_type = parseRuntimeFieldType(template.field_type orelse "text");
-    const doc_values = template.doc_values orelse false;
+    const sortable = template.sortable orelse false;
     return .{
         .name = try alloc.dupe(u8, template.name),
         .match_pattern = if (template.match_pattern) |value| try alloc.dupe(u8, value) else null,
@@ -117,8 +117,8 @@ fn runtimeDynamicTemplateFromParsed(alloc: std.mem.Allocator, template: impl.Dyn
             .field_type = field_type,
             .do_index = template.do_index orelse true,
             .store = template.store orelse false,
-            .doc_values = doc_values,
-            .sortable = template.sortable orelse storage_schema.defaultSortableForMapping(field_type, doc_values),
+            .doc_values = sortable,
+            .sortable = sortable,
             .missing_null_policy = if (template.missing_null_policy) |policy|
                 storage_schema.parseMissingNullPolicy(policy) orelse return error.InvalidSchemaUpdateRequest
             else
@@ -196,7 +196,7 @@ fn runtimeDocumentFieldTemplateFromParsed(
     mapping: impl.DynamicTemplate,
 ) !storage_schema.DynamicTemplate {
     const field_type = parseRuntimeFieldType(mapping.field_type orelse "text");
-    const doc_values = mapping.doc_values orelse false;
+    const sortable = mapping.sortable orelse false;
     return .{
         .name = try alloc.dupe(u8, path),
         .path_match = try alloc.dupe(u8, path),
@@ -204,8 +204,8 @@ fn runtimeDocumentFieldTemplateFromParsed(
             .field_type = field_type,
             .do_index = mapping.do_index orelse true,
             .store = mapping.store orelse false,
-            .doc_values = doc_values,
-            .sortable = mapping.sortable orelse storage_schema.defaultSortableForMapping(field_type, doc_values),
+            .doc_values = sortable,
+            .sortable = sortable,
             .missing_null_policy = if (mapping.missing_null_policy) |policy|
                 storage_schema.parseMissingNullPolicy(policy) orelse return error.InvalidSchemaUpdateRequest
             else
@@ -864,14 +864,14 @@ fn findFieldCapability(capabilities: []const storage_schema.FieldCapability, fie
     return null;
 }
 
-test "runtime schema derives sortable capability from scalar doc values" {
+test "runtime schema derives internal doc values from sortable scalar mappings" {
     const alloc = std.testing.allocator;
     var parsed = try parseValidatedTableSchema(alloc,
         \\{
         \\  "dynamic_templates": [
-        \\    {"name":"dates","path_match":"created_at","mapping":{"type":"datetime","doc_values":true,"missing_null_policy":"missing_rejected"}},
-        \\    {"name":"body","path_match":"body","mapping":{"type":"text","doc_values":true}},
-        \\    {"name":"rank","path_match":"rank","mapping":{"type":"numeric","doc_values":true,"sortable":false}}
+        \\    {"name":"dates","path_match":"created_at","mapping":{"type":"datetime","sortable":true,"missing_null_policy":"missing_rejected"}},
+        \\    {"name":"body","path_match":"body","mapping":{"type":"text"}},
+        \\    {"name":"rank","path_match":"rank","mapping":{"type":"numeric","sortable":false}}
         \\  ]
         \\}
     );
@@ -884,9 +884,9 @@ test "runtime schema derives sortable capability from scalar doc values" {
     try std.testing.expect(runtime.dynamic_templates[0].mapping.doc_values);
     try std.testing.expect(runtime.dynamic_templates[0].mapping.sortable);
     try std.testing.expectEqual(storage_schema.MissingNullPolicy.missing_rejected, runtime.dynamic_templates[0].mapping.missing_null_policy);
-    try std.testing.expect(runtime.dynamic_templates[1].mapping.doc_values);
+    try std.testing.expect(!runtime.dynamic_templates[1].mapping.doc_values);
     try std.testing.expect(!runtime.dynamic_templates[1].mapping.sortable);
-    try std.testing.expect(runtime.dynamic_templates[2].mapping.doc_values);
+    try std.testing.expect(!runtime.dynamic_templates[2].mapping.doc_values);
     try std.testing.expect(!runtime.dynamic_templates[2].mapping.sortable);
 }
 
@@ -902,12 +902,12 @@ test "runtime schema lowers document field mappings to exact declared fields" {
         \\          "created_at": {
         \\            "type": "string",
         \\            "format": "date-time",
-        \\            "x-antfly-field": {"type":"date","doc_values":true,"sortable":true}
+        \\            "x-antfly-field": {"type":"date","sortable":true}
         \\          },
         \\          "meta": {
         \\            "type": "object",
         \\            "properties": {
-        \\              "rank": {"type":"number","x-antfly-field":{"type":"number","doc_values":true}}
+        \\              "rank": {"type":"number","x-antfly-field":{"type":"number","sortable":true}}
         \\            }
         \\          },
         \\          "title": {
@@ -915,7 +915,7 @@ test "runtime schema lowers document field mappings to exact declared fields" {
         \\            "x-antfly-field": {
         \\              "type": "text",
         \\              "fields": {
-        \\                "keyword": {"type":"keyword","doc_values":true,"sortable":true}
+        \\                "keyword": {"type":"keyword","sortable":true}
         \\              }
         \\            }
         \\          }
@@ -978,8 +978,8 @@ test "runtime schema derives and validates index sort metadata" {
     var parsed = try parseValidatedTableSchema(alloc,
         \\{
         \\  "dynamic_templates": [
-        \\    {"name":"created","path_match":"created_at","mapping":{"type":"datetime","doc_values":true}},
-        \\    {"name":"rank","path_match":"rank","mapping":{"type":"numeric","doc_values":true,"sortable":false}}
+        \\    {"name":"created","path_match":"created_at","mapping":{"type":"datetime","sortable":true}},
+        \\    {"name":"rank","path_match":"rank","mapping":{"type":"numeric","sortable":false}}
         \\  ],
         \\  "index_sort": [
         \\    {"field":"created_at","order":"desc"}
@@ -1000,7 +1000,7 @@ test "runtime schema derives and validates index sort metadata" {
     var explicit_id = try parseValidatedTableSchema(alloc,
         \\{
         \\  "dynamic_templates": [
-        \\    {"name":"created","path_match":"created_at","mapping":{"type":"datetime","doc_values":true}}
+        \\    {"name":"created","path_match":"created_at","mapping":{"type":"datetime","sortable":true}}
         \\  ],
         \\  "index_sort": [
         \\    {"field":"created_at","order":"asc"},
@@ -1017,7 +1017,7 @@ test "runtime schema derives and validates index sort metadata" {
     var match_mapping_type = try parseValidatedTableSchema(alloc,
         \\{
         \\  "dynamic_templates": [
-        \\    {"name":"dates","path_match":"meta.*_at","match_mapping_type":"date","mapping":{"type":"datetime","doc_values":true,"sortable":true}}
+        \\    {"name":"dates","path_match":"meta.*_at","match_mapping_type":"date","mapping":{"type":"datetime","sortable":true}}
         \\  ],
         \\  "index_sort": [
         \\    {"field":"meta.created_at","order":"desc"}
@@ -1035,7 +1035,7 @@ test "runtime schema derives and validates index sort metadata" {
     var unsortable = try parseValidatedTableSchema(alloc,
         \\{
         \\  "dynamic_templates": [
-        \\    {"name":"rank","path_match":"rank","mapping":{"type":"numeric","doc_values":true,"sortable":false}}
+        \\    {"name":"rank","path_match":"rank","mapping":{"type":"numeric","sortable":false}}
         \\  ],
         \\  "index_sort": [
         \\    {"field":"rank","order":"asc"}
@@ -1048,7 +1048,7 @@ test "runtime schema derives and validates index sort metadata" {
     var id_not_final = try parseValidatedTableSchema(alloc,
         \\{
         \\  "dynamic_templates": [
-        \\    {"name":"created","path_match":"created_at","mapping":{"type":"datetime","doc_values":true}}
+        \\    {"name":"created","path_match":"created_at","mapping":{"type":"datetime","sortable":true}}
         \\  ],
         \\  "index_sort": [
         \\    {"field":"_id","order":"asc"},

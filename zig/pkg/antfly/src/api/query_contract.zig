@@ -1832,15 +1832,19 @@ fn cloneSortFieldsWithStableTiebreaker(
     alloc: std.mem.Allocator,
     fields: []const metadata_openapi.SortField,
 ) ![]const db_mod.types.SortField {
-    if (fields.len == 0) return error.UnsupportedQueryRequest;
+    if (fields.len == 0) return unsupportedExactSort("*", "invalid_cursor_arity", "invalid_cursor_arity");
     var has_final_id = false;
     for (fields, 0..) |field, i| {
-        if (field.field.len == 0) return error.UnsupportedQueryRequest;
+        if (field.field.len == 0) return unsupportedExactSort("*", "invalid_cursor_arity", "invalid_cursor_arity");
         for (fields[0..i]) |prior| {
-            if (std.mem.eql(u8, prior.field, field.field)) return error.UnsupportedQueryRequest;
+            if (std.mem.eql(u8, prior.field, field.field)) {
+                return unsupportedExactSort(field.field, "invalid_cursor_arity", "invalid_cursor_arity");
+            }
         }
         if (std.mem.eql(u8, field.field, "_id")) {
-            if (i + 1 != fields.len or (field.desc orelse false)) return error.UnsupportedQueryRequest;
+            if (i + 1 != fields.len or (field.desc orelse false)) {
+                return unsupportedExactSort("_id", "invalid_cursor_arity", "invalid_cursor_arity");
+            }
             has_final_id = true;
         }
     }
@@ -7164,6 +7168,25 @@ test "api query contract preflight rejects cursor pagination without sort when c
     try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.detail);
 }
 
+test "api query contract preflight rejects cursor pagination over approximate vector source" {
+    var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
+        \\{
+        \\  "embeddings": {"dense_idx":"AACAPwAAAEAAAEBA"},
+        \\  "indexes": ["dense_idx"],
+        \\  "search_after": ["doc-9"],
+        \\  "limit": 10
+        \\}
+    , .{});
+    defer parsed.deinit();
+
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed.value));
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_id", diagnostic.field);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
+}
+
 test "api query contract preflight rejects score sort without score-bearing source" {
     var parsed_match_all = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
         \\{
@@ -7337,26 +7360,41 @@ test "api query contract rejects non replayable search_before cursor values" {
 test "api query contract rejects ambiguous explicit id sort tiebreaker" {
     const alloc = std.testing.allocator;
 
+    db_mod.resetLastSortRejectionDiagnostic();
     try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs",
         \\{
         \\  "full_text_search": {"match":"raft","field":"body"},
         \\  "order_by": [{"field":"_id"},{"field":"created_at"}]
         \\}
     ));
+    var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_id", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.detail);
 
+    db_mod.resetLastSortRejectionDiagnostic();
     try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs",
         \\{
         \\  "full_text_search": {"match":"raft","field":"body"},
         \\  "order_by": [{"field":"created_at"},{"field":"_id","desc":true}]
         \\}
     ));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_id", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.detail);
 
+    db_mod.resetLastSortRejectionDiagnostic();
     try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs",
         \\{
         \\  "full_text_search": {"match":"raft","field":"body"},
         \\  "order_by": [{"field":"created_at"},{"field":"created_at","desc":true}]
         \\}
     ));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("created_at", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.detail);
 }
 
 test "api query contract parses packed dense embeddings via antfly-json" {

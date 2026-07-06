@@ -8002,12 +8002,9 @@ export interface components {
              */
             include_in_all?: boolean;
             /**
-             * @description Whether to enable doc values for sorting/faceting
-             * @default false
-             */
-            doc_values?: boolean;
-            /**
-             * @description Whether this doc-valued scalar field can be used in order_by
+             * @description Whether this scalar field can be used in order_by. When true,
+             *     Antfly derives the internal typed doc-value structures required
+             *     for exact sorting; users should not configure doc_values directly.
              * @default false
              */
             sortable?: boolean;

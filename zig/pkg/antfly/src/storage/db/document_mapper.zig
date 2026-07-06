@@ -3330,7 +3330,7 @@ test "document mapper emits schema-derived mapped keyword subfield coverage" {
         \\            "x-antfly-field": {
         \\              "type": "text",
         \\              "fields": {
-        \\                "keyword": {"type":"keyword","doc_values":true,"sortable":true}
+        \\                "keyword": {"type":"keyword","sortable":true}
         \\              }
         \\            }
         \\          }

@@ -4178,21 +4178,22 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTableSchema(uri_parts.path)) |table_schema| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, table_schema.table_name);
                 defer self.alloc.free(table_name);
+                const invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(req.body);
                 const schema_json = table_contract.parseSchemaUpdateRequest(self.alloc, req.body) catch {
-                    return try textResponse(self.alloc, 400, "invalid schema update request");
+                    return try textResponse(self.alloc, 400, invalid_schema_message);
                 };
                 defer self.alloc.free(schema_json);
 
                 const table_before = try self.loadOwnedTableRecord(table_name);
                 if (table_before == null) {
                     self.source.updateSchema(self.alloc, table_name, schema_json) catch |err| switch (err) {
-                        error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, "invalid schema update request"),
+                        error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
                         error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
                         error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => {
                             const table_writes_source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
                             _ = table_writes_source.updateSchema(self.alloc, table_name, schema_json) catch |write_err| switch (write_err) {
-                                error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, "invalid schema update request"),
+                                error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
                                 else => return write_err,
                             } orelse return try textResponse(self.alloc, 404, "not found");
                         },
@@ -4207,13 +4208,13 @@ pub const ApiHttpServer = struct {
 
                 var local_schema_applied = false;
                 self.source.updateSchema(self.alloc, table_name, schema_json) catch |err| switch (err) {
-                    error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, "invalid schema update request"),
+                    error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
                     error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
                     error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                     error.UnsupportedOperation => {
                         const table_writes_source = self.table_writes orelse return try textResponse(self.alloc, 405, "method not allowed");
                         _ = table_writes_source.updateSchema(self.alloc, table_name, schema_json) catch |write_err| switch (write_err) {
-                            error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, "invalid schema update request"),
+                            error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
                             else => return write_err,
                         };
                         local_schema_applied = true;
@@ -4229,7 +4230,7 @@ pub const ApiHttpServer = struct {
                 if (self.table_writes) |table_writes_source| {
                     if (!local_schema_applied) {
                         _ = table_writes_source.updateSchema(self.alloc, table_name, schema_json) catch |write_err| switch (write_err) {
-                            error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, "invalid schema update request"),
+                            error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
                             else => return write_err,
                         };
                     }
@@ -7855,10 +7856,12 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntime(
     runtime_schema: storage_schema.TableSchema,
     observed_dynamic_capability_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
 ) !void {
-    if (query_req.order_by.len == 0) return;
+    const cursor = if (query_req.search_after.len > 0) query_req.search_after else query_req.search_before;
+    if (query_req.order_by.len == 0 and cursor.len == 0) return;
+    try validatePublicSortCursorContract(query_req);
     try validatePublicScoreSortSource(query_req);
     try validatePublicApproximateSortSource(query_req);
-    const cursor = if (query_req.search_after.len > 0) query_req.search_after else query_req.search_before;
+    if (query_req.order_by.len == 0) return;
     for (query_req.order_by, 0..) |field, i| {
         if (std.mem.eql(u8, field.field, "_id")) continue;
         if (std.mem.eql(u8, field.field, "_score")) continue;
@@ -7890,6 +7893,75 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntime(
         recordPublicSortCapabilityRejection(field.field, "unmapped_sort_field", "unmapped_field");
         return error.UnsupportedExactSort;
     }
+}
+
+fn validatePublicSortCursorContract(query_req: db_mod.types.SearchRequest) !void {
+    try validatePublicSortIdTiebreaker(query_req.order_by);
+    const cursor = if (query_req.search_after.len > 0) query_req.search_after else query_req.search_before;
+    const field_count = publicEffectiveSortFieldCount(query_req);
+    if (query_req.search_after.len > 0 and query_req.search_before.len > 0) {
+        recordPublicSortCapabilityRejection("*", "invalid_cursor_arity", "invalid_cursor_arity");
+        return error.InvalidQueryRequest;
+    }
+    if (cursor.len > 0 and query_req.offset != 0) {
+        recordPublicSortCapabilityRejection("*", "invalid_cursor_arity", "invalid_cursor_arity");
+        return error.InvalidQueryRequest;
+    }
+    if (cursor.len > 0 and cursor.len != field_count) {
+        recordPublicSortCapabilityRejection("*", "invalid_cursor_arity", "invalid_cursor_arity");
+        return error.InvalidQueryRequest;
+    }
+    for (0..@min(field_count, cursor.len)) |i| {
+        const field = publicEffectiveSortFieldAt(query_req, i);
+        if (!publicSortCursorValueIsReplayable(cursor[i])) {
+            recordPublicSortCapabilityRejection(field.field, "invalid_cursor_type", "invalid_cursor_type");
+            return error.InvalidQueryRequest;
+        }
+        if (std.mem.eql(u8, field.field, "_id") and cursor[i] != .string) {
+            recordPublicSortCapabilityRejection(field.field, "invalid_cursor_type", "invalid_cursor_type");
+            return error.InvalidQueryRequest;
+        }
+        if (std.mem.eql(u8, field.field, "_score") and !publicSortCursorValueIsNumeric(cursor[i])) {
+            recordPublicSortCapabilityRejection(field.field, "invalid_cursor_type", "invalid_cursor_type");
+            return error.InvalidQueryRequest;
+        }
+    }
+}
+
+fn validatePublicSortIdTiebreaker(order_by: []const db_mod.types.SortField) !void {
+    for (order_by, 0..) |field, i| {
+        for (order_by[0..i]) |prior| {
+            if (std.mem.eql(u8, prior.field, field.field)) {
+                recordPublicSortCapabilityRejection(field.field, "invalid_cursor_arity", "invalid_cursor_arity");
+                return error.InvalidQueryRequest;
+            }
+        }
+        if (!std.mem.eql(u8, field.field, "_id")) continue;
+        if (i + 1 != order_by.len or field.desc) {
+            recordPublicSortCapabilityRejection("_id", "invalid_cursor_arity", "invalid_cursor_arity");
+            return error.InvalidQueryRequest;
+        }
+    }
+}
+
+fn publicSortRequestNeedsDefaultIdOrder(query_req: db_mod.types.SearchRequest) bool {
+    return query_req.order_by.len == 0 and (query_req.search_after.len > 0 or query_req.search_before.len > 0);
+}
+
+fn publicSortFieldsNeedImplicitIdTiebreaker(order_by: []const db_mod.types.SortField) bool {
+    if (order_by.len == 0) return false;
+    return !std.mem.eql(u8, order_by[order_by.len - 1].field, "_id");
+}
+
+fn publicEffectiveSortFieldCount(query_req: db_mod.types.SearchRequest) usize {
+    if (publicSortRequestNeedsDefaultIdOrder(query_req)) return 1;
+    return query_req.order_by.len + @as(usize, if (publicSortFieldsNeedImplicitIdTiebreaker(query_req.order_by)) 1 else 0);
+}
+
+fn publicEffectiveSortFieldAt(query_req: db_mod.types.SearchRequest, index: usize) db_mod.types.SortField {
+    if (publicSortRequestNeedsDefaultIdOrder(query_req)) return .{ .field = "_id", .desc = false };
+    if (index < query_req.order_by.len) return query_req.order_by[index];
+    return .{ .field = "_id", .desc = false };
 }
 
 fn validatePublicScoreSortSource(query_req: db_mod.types.SearchRequest) !void {
@@ -7984,6 +8056,15 @@ fn validatePublicMappedSortCursor(field: []const u8, field_type: storage_schema.
         recordPublicSortCapabilityRejection(field, "invalid_cursor_type", "invalid_cursor_type");
         return error.InvalidQueryRequest;
     }
+}
+
+fn publicSortCursorValueIsReplayable(value: std.json.Value) bool {
+    return switch (value) {
+        .bool, .integer, .string => true,
+        .float => |number| std.math.isFinite(number),
+        .number_string => |text| publicJsonNumberStringIsFinite(text),
+        .null, .array, .object => false,
+    };
 }
 
 fn publicSortCursorValueIsNumeric(value: std.json.Value) bool {
@@ -10844,6 +10925,39 @@ test "api http public sort capability gate validates mapped sortable fields" {
         .search_after = &valid_date_cursor,
         .primary_text_index_name = "full_text_index_v0",
     }, runtime_schema, &.{covered_created_set});
+    const valid_date_ns_cursor = [_]std.json.Value{ .{ .number_string = "1767225600000000000" }, .{ .string = "doc:1" } };
+    try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &created_effective_order,
+        .search_after = &valid_date_ns_cursor,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{covered_created_set});
+
+    const short_date_cursor = [_]std.json.Value{.{ .string = "2026-01-01T00:00:00Z" }};
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &created_order,
+        .search_after = &short_date_cursor,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{covered_created_set}));
+    var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.detail);
+
+    const id_cursor = [_]std.json.Value{.{ .string = "doc:1" }};
+    try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .search_after = &id_cursor,
+    }, runtime_schema, &.{});
+
+    const bad_id_cursor = [_]std.json.Value{.{ .integer = 7 }};
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .search_after = &bad_id_cursor,
+    }, runtime_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_id", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
 
     const invalid_date_cursor = [_]std.json.Value{ .{ .string = "not-a-date" }, .{ .string = "doc:1" } };
     db_mod.resetLastSortRejectionDiagnostic();
@@ -10852,7 +10966,19 @@ test "api http public sort capability gate validates mapped sortable fields" {
         .search_after = &invalid_date_cursor,
         .primary_text_index_name = "full_text_index_v0",
     }, runtime_schema, &.{covered_created_set}));
-    var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("created_at", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+
+    const rounded_date_cursor = [_]std.json.Value{ .{ .float = 1767225600000000000.0 }, .{ .string = "doc:1" } };
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &created_effective_order,
+        .search_after = &rounded_date_cursor,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{covered_created_set}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("created_at", diagnostic.field);
     try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
     try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
@@ -10915,6 +11041,16 @@ test "api http public sort capability gate validates score-bearing source" {
     }, runtime_schema, &.{});
 
     const vector = [_]f32{ 0.1, 0.2 };
+    const id_cursor = [_]std.json.Value{.{ .string = "doc:1" }};
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .search_after = &id_cursor,
+        .dense = .{ .vector = &vector, .k = 10 },
+    }, runtime_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
+
     db_mod.resetLastSortRejectionDiagnostic();
     try std.testing.expectError(error.UnsupportedQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
         .order_by = &score_order,

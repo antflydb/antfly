@@ -1484,7 +1484,7 @@ fn metadataSortFieldFeedback(
             return try std.fmt.allocPrint(alloc, "query_request.order_by references non-sortable field '{s}'", .{field});
         }
         if (saw_observed_missing_doc_values) {
-            return try std.fmt.allocPrint(alloc, "query_request.order_by references field '{s}' without doc_values", .{field});
+            return try std.fmt.allocPrint(alloc, "query_request.order_by references field '{s}' before sortable runtime coverage is available", .{field});
         }
         if (saw_observed_not_queryable) {
             return try std.fmt.allocPrint(alloc, "query_request.order_by references field '{s}' that is not queryable for exact sort ({s})", .{ field, observed_not_queryable_reason });
@@ -1526,7 +1526,7 @@ fn metadataSortFieldFeedback(
         return try std.fmt.allocPrint(alloc, "query_request.order_by references non-sortable field '{s}'", .{field});
     }
     if (saw_missing_doc_values) {
-        return try std.fmt.allocPrint(alloc, "query_request.order_by references field '{s}' without doc_values", .{field});
+        return try std.fmt.allocPrint(alloc, "query_request.order_by references field '{s}' before sortable runtime coverage is available", .{field});
     }
     if (saw_not_queryable) {
         return try std.fmt.allocPrint(alloc, "query_request.order_by references field '{s}' that is not queryable for exact sort ({s})", .{ field, not_queryable_reason });
@@ -1536,7 +1536,7 @@ fn metadataSortFieldFeedback(
 
 fn metadataCapabilityNotQueryableForSort(capability: QueryBuilderFieldCapability) ?[]const u8 {
     if (!std.mem.eql(u8, capability.doc_value_coverage, "covered")) {
-        return if (capability.doc_value_coverage.len > 0) capability.doc_value_coverage else "unknown_doc_value_coverage";
+        return if (capability.doc_value_coverage.len > 0) capability.doc_value_coverage else "unknown_sortable_coverage";
     }
     if (!std.mem.eql(u8, capability.queryability_state, "queryable")) {
         return if (capability.queryability_state.len > 0) capability.queryability_state else "unknown_queryability_state";
@@ -6444,6 +6444,39 @@ test "query builder preflight rejects declared sort field before doc values are 
     try std.testing.expectEqualStrings("invalid_sort_field", preflight.diagnostics[0].code);
     try std.testing.expectEqualStrings("query_request.order_by", preflight.diagnostics[0].path);
     try std.testing.expect(std.mem.indexOf(u8, preflight.diagnostics[0].message, "not queryable for exact sort (schema_declared)") != null);
+}
+
+pub fn testPreflightDescribesMissingPhysicalSortCoverageWithPublicSortableWording() !void {
+    const capabilities = [_]QueryBuilderFieldCapability{
+        .{
+            .field = "created_at",
+            .field_type = .datetime,
+            .sortable = true,
+            .doc_value_coverage = "missing_doc_values_section",
+            .queryability_state = "declared",
+        },
+    };
+    var collected = collectQueryBuilderContext(.{
+        .schema_fields = &.{"created_at"},
+        .field_capabilities = &capabilities,
+    });
+    const order_by = [_]metadata_openapi.SortField{.{ .field = "created_at", .desc = true }};
+    var preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
+        .intent = "newest docs",
+    }, .{
+        .order_by = &order_by,
+    }, null, "query_builder", .{});
+    defer preflight.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), preflight.diagnostics.len);
+    try std.testing.expectEqual(QueryPreflightDiagnosticSeverity.@"error", preflight.diagnostics[0].severity);
+    try std.testing.expectEqualStrings("invalid_sort_field", preflight.diagnostics[0].code);
+    try std.testing.expectEqualStrings("query_request.order_by", preflight.diagnostics[0].path);
+    try std.testing.expect(std.mem.indexOf(u8, preflight.diagnostics[0].message, "before sortable runtime coverage is available") != null);
+}
+
+test "query builder preflight describes missing physical sort coverage with public sortable wording" {
+    try testPreflightDescribesMissingPhysicalSortCoverageWithPublicSortableWording();
 }
 
 test "query builder preflight accepts observed dynamic sortable field" {

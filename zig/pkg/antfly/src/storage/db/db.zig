@@ -32271,7 +32271,8 @@ test "db non chunked search paths apply broad live doc filter" {
         .include_stored = false,
     }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
     defer dense_live_page_two.result.deinit();
-    try std.testing.expectEqual(@as(u32, 1), dense_live_page_two.result.total_hits);
+    try std.testing.expectEqual(@as(u32, 2), dense_live_page_two.result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, dense_live_page_two.result.total_hits_relation);
     try std.testing.expectEqual(@as(usize, 1), dense_live_page_two.result.hits.len);
     try std.testing.expectEqualStrings("doc:c", dense_live_page_two.result.hits[0].id);
     try std.testing.expectEqual(@as(u32, 2), dense_live_page_two.profile.raw_hit_count);

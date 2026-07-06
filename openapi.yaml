@@ -14949,6 +14949,7 @@ components:
         - search_as_you_type
     TemplateFieldMapping:
       type: object
+      additionalProperties: false
       description: Field mapping to apply when a dynamic template matches
       properties:
         type:
@@ -14971,14 +14972,15 @@ components:
           type: boolean
           default: false
           description: Whether to include in the _all field for cross-field search
-        doc_values:
-          type: boolean
-          default: false
-          description: Whether to enable doc values for sorting/faceting
         sortable:
           type: boolean
           default: false
-          description: Whether this doc-valued scalar field can be used in order_by
+          description: >
+            Whether this scalar field can be used in order_by. When true,
+
+            Antfly derives the internal typed doc-value structures required
+
+            for exact sorting; users should not configure doc_values directly.
         missing_null_policy:
           type: string
           enum:
@@ -14992,6 +14994,7 @@ components:
             remain replayable JSON scalar tuples.
     DynamicTemplate:
       type: object
+      additionalProperties: false
       description: >
         A rule for mapping dynamically detected fields. Templates are checked in order
 

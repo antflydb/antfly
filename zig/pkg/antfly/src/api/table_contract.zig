@@ -180,6 +180,13 @@ pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u
     return try tables_api.parseSchemaUpdateRequest(alloc, body);
 }
 
+pub fn schemaUpdateRequestErrorMessage(body: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, body, "\"doc_values\"") != null) {
+        return "invalid schema update request: doc_values is internal; use sortable: true on scalar mappings";
+    }
+    return "invalid schema update request";
+}
+
 pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, index_name: []const u8, body: []const u8) ![]u8 {
     if (body.len == 0) return error.InvalidCreateIndexRequest;
 
@@ -745,4 +752,15 @@ test "table contract skips arbitrary public full text names in table-definition 
     defer std.testing.allocator.free(normalized);
     try std.testing.expect(std.mem.indexOf(u8, normalized, "\"search_idx\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, normalized, "\"full_text_index_v0\"") != null);
+}
+
+test "table contract schema update error message explains public sortable replacement for doc values" {
+    try std.testing.expectEqualStrings(
+        "invalid schema update request: doc_values is internal; use sortable: true on scalar mappings",
+        schemaUpdateRequestErrorMessage("{\"dynamic_templates\":[{\"mapping\":{\"type\":\"keyword\",\"doc_values\":true}}]}"),
+    );
+    try std.testing.expectEqualStrings(
+        "invalid schema update request",
+        schemaUpdateRequestErrorMessage("{\"dynamic_templates\":[{\"mapping\":{\"type\":\"keyword\",\"sortable\":true}}]}"),
+    );
 }

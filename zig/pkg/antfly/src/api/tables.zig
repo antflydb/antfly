@@ -2097,8 +2097,6 @@ fn appendRuntimeSchemaObject(
         try out.appendSlice(alloc, if (tmpl.mapping.do_index) "true" else "false");
         try out.appendSlice(alloc, ",\"store\":");
         try out.appendSlice(alloc, if (tmpl.mapping.store) "true" else "false");
-        try out.appendSlice(alloc, ",\"doc_values\":");
-        try out.appendSlice(alloc, if (tmpl.mapping.doc_values) "true" else "false");
         try out.appendSlice(alloc, ",\"sortable\":");
         try out.appendSlice(alloc, if (tmpl.mapping.sortable) "true" else "false");
         try out.appendSlice(alloc, ",\"missing_null_policy\":");
@@ -2797,7 +2795,7 @@ fn testGeneratedCapabilityByIdentifier(capabilities: []const metadata_openapi.Fi
 
 test "metadata.table generated field capabilities include schema dynamic templates" {
     const schema_json =
-        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"created","path_match":"created_at","mapping":{"type":"datetime","doc_values":true,"sortable":true}}],"index_sort":[{"field":"created_at","order":"desc"}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"string","x-antfly-types":["text"]}}}}}}
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"created","path_match":"created_at","mapping":{"type":"datetime","sortable":true}}],"index_sort":[{"field":"created_at","order":"desc"}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"string","x-antfly-types":["text"]}}}}}}
     ;
     const table = metadata_table_manager.TableRecord{
         .table_id = 7,
@@ -2825,7 +2823,7 @@ test "metadata.table generated field capabilities include schema dynamic templat
 
 test "metadata.table status exposes stable field capabilities" {
     const schema_json =
-        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"created","path_match":"created_at","mapping":{"type":"datetime","doc_values":true,"sortable":true}}],"index_sort":[{"field":"created_at","order":"desc"}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"string","x-antfly-types":["text"]}}}}}}
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"created","path_match":"created_at","mapping":{"type":"datetime","sortable":true}}],"index_sort":[{"field":"created_at","order":"desc"}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"string","x-antfly-types":["text"]}}}}}}
     ;
     const snapshot: metadata_api.AdminSnapshot = .{
         .status = .{ .metadata_group_id = 1, .metrics = .{} },
@@ -2899,7 +2897,7 @@ test "metadata.table status includes observed dynamic field capabilities" {
 
 test "metadata.table status promotes schema capability when runtime coverage is complete" {
     const schema_json =
-        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"created","path_match":"created_at","mapping":{"type":"datetime","doc_values":true,"sortable":true}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"created_at":{"type":"string","format":"date-time"}}}}}}
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"created","path_match":"created_at","mapping":{"type":"datetime","sortable":true}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"created_at":{"type":"string","format":"date-time"}}}}}}
     ;
     const snapshot: metadata_api.AdminSnapshot = .{
         .status = .{ .metadata_group_id = 1, .metrics = .{} },
@@ -3034,7 +3032,7 @@ test "metadata.table status encoder projects inline enrichment configs as names"
 
 test "metadata.table debug encoder emits runtime schemas and index bindings" {
     const schema_v1 =
-        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"dates","path_match":"created_at","mapping":{"type":"datetime","doc_values":true}}],"index_sort":[{"field":"created_at","order":"desc"}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"string","x-antfly-types":["text"],"x-antfly-analyzer":"french"}}}}}}
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"dates","path_match":"created_at","mapping":{"type":"datetime","sortable":true}}],"index_sort":[{"field":"created_at","order":"desc"}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"string","x-antfly-types":["text"],"x-antfly-analyzer":"french"}}}}}}
     ;
     const schema_v0 =
         \\{"version":0,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"name":{"type":"string","x-antfly-types":["search_as_you_type"]}}}}}}
@@ -3085,7 +3083,7 @@ test "metadata.table debug encoder emits runtime schemas and index bindings" {
 
 pub fn testRuntimeSchemaDebugEmitsObservedDynamicCapabilities() !void {
     const schema_json =
-        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"status","path_match":"meta.status","mapping":{"type":"keyword","doc_values":true}}],"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true}}}}
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"status","path_match":"meta.status","mapping":{"type":"keyword"}}],"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true}}}}
     ;
     const snapshot: metadata_api.AdminSnapshot = .{
         .status = .{ .metadata_group_id = 1, .metrics = .{} },
@@ -3135,7 +3133,7 @@ pub fn testRuntimeSchemaDebugEmitsObservedDynamicCapabilities() !void {
 
 pub fn testRuntimeSchemaDebugEmitsSortCapabilities() !void {
     const schema_json =
-        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"dates","path_match":"created_at","mapping":{"type":"datetime","doc_values":true}}],"index_sort":[{"field":"created_at","order":"desc"}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"string","x-antfly-types":["text"],"x-antfly-analyzer":"french"}}}}}}
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"dates","path_match":"created_at","mapping":{"type":"datetime","sortable":true}}],"index_sort":[{"field":"created_at","order":"desc"}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"string","x-antfly-types":["text"],"x-antfly-analyzer":"french"}}}}}}
     ;
     const snapshot: metadata_api.AdminSnapshot = .{
         .status = .{ .metadata_group_id = 1, .metrics = .{} },

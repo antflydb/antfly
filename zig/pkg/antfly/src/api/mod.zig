@@ -123,6 +123,10 @@ test "api table runtime schema debug emits observed dynamic capabilities" {
     try tables.testRuntimeSchemaDebugEmitsObservedDynamicCapabilities();
 }
 
+test "api query builder preflight describes missing physical sort coverage with public sortable wording" {
+    try query_builder_agent.testPreflightDescribesMissingPhysicalSortCoverageWithPublicSortableWording();
+}
+
 test "public batch default schema accepts docsaf doc_type row and rejects reserved _type" {
     const alloc = std.testing.allocator;
 

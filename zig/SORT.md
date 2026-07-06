@@ -374,7 +374,8 @@ belongs in the existing schema and mapping system described in `SCHEMA.md` and
 `FULL_TEXT.md`.
 
 Public schema examples should desugar into runtime mappings with typed field
-capabilities:
+capabilities. `sortable` is the user-facing declaration; Antfly derives the
+internal typed doc-value structures needed for exact sort execution:
 
 ```json
 {
@@ -386,7 +387,6 @@ capabilities:
         "fields": {
           "keyword": {
             "type": "keyword",
-            "doc_values": true,
             "sortable": true
           }
         }
@@ -397,7 +397,6 @@ capabilities:
       "format": "date-time",
       "x-antfly-field": {
         "type": "date",
-        "doc_values": true,
         "sortable": true
       }
     },
@@ -405,7 +404,6 @@ capabilities:
       "type": "integer",
       "x-antfly-field": {
         "type": "integer",
-        "doc_values": true,
         "sortable": true
       }
     },
@@ -426,7 +424,7 @@ The runtime schema should compile those declarations into field descriptors:
   `title.keyword`
 - scalar type
 - analyzer, when text-indexed
-- `doc_values` capability
+- internal typed doc-values capability derived from `sortable`
 - `sortable` capability
 - missing/null ordering policy
 - multi-value sort mode, if arrays become sortable
@@ -491,19 +489,23 @@ as the visible tie-breaker only when it is globally unique for that index.
 
 ### Dynamic Mappings
 
-Dynamic templates should be able to mark scalar fields as doc-valued and
-sortable:
+Dynamic templates should mark scalar fields as sortable. Runtime compilation
+derives the internal doc-values requirement:
 
 ```json
 {
   "match_mapping_type": "date",
   "mapping": {
     "type": "date",
-    "doc_values": true,
     "sortable": true
   }
 }
 ```
+
+Public mappings should not expose a separate `doc_values` switch for sort.
+Schemas that contain `doc_values` should be rejected at the public schema
+boundary; `doc_values` remains an internal runtime capability and diagnostic
+term only.
 
 The runtime schema must persist the observed dynamic mapping decision for a
 field path. Query-time validation should not guess sortability from the latest
@@ -581,8 +583,9 @@ view rather than from hand-maintained release notes.
 
 Doc values are the first native primitive Antfly needs for production sorting.
 
-For every mapped field with `doc_values: true`, segment build and replay should
-write a typed column keyed by document ordinal:
+For every mapped field whose runtime schema has internal doc-values capability
+derived from `sortable: true`, segment build and replay should write a typed
+column keyed by document ordinal:
 
 ```text
 doc_values/<index>/<field>/<segment_id>/<doc_ordinal> -> encoded_value
@@ -620,7 +623,8 @@ A native sortable field path consists of all of the following:
 
 - a runtime mapping entry for the field path
 - a scalar sort type: keyword, integer, floating number, date, boolean, or `_id`
-- `doc_values: true`, except for `_id` which is backed by identity metadata
+- `sortable: true`, which derives typed doc values except for `_id`, which is
+  backed by identity metadata
 - a deterministic missing/null policy
 - a typed encoder whose byte/comparator order matches query semantics
 - segment-level doc-value sections written at index time
@@ -1280,10 +1284,10 @@ Public documentation should expose two related views:
   deployed index generation
 
 `www-antfly`, OpenAPI examples, and generated SDK docs should describe the
-schema-time rules: sort on `_id` or mapped scalar fields with doc values; do not
-sort on analyzed `text`; use `.keyword` multi-fields for exact string sorting;
-pass returned `_sort` tuples to `search_after` / `search_before`; expect 422
-when exact native execution is unavailable.
+schema-time rules: sort on `_id` or mapped scalar fields declared
+`sortable: true`; do not sort on analyzed `text`; use `.keyword` multi-fields
+for exact string sorting; pass returned `_sort` tuples to `search_after` /
+`search_before`; expect 422 when exact native execution is unavailable.
 
 Runtime introspection should expose the per-index field capability matrix so
 operators and clients can discover concrete configured fields. That endpoint or

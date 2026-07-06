@@ -4115,6 +4115,67 @@ test "distributed field sort requires runtime mappings" {
     try std.testing.expectEqualStrings("missing_runtime_mapping", diagnostic.detail);
 }
 
+test "distributed merge rejects provably incomplete exact shard windows" {
+    const alloc = std.testing.allocator;
+    const order_by = [_]types.SortField{.{ .field = "rank" }};
+    const schema = testNumericRankRuntimeSchema();
+
+    var hits = [_]types.SearchHit{try testSortedHitAlloc(alloc, "doc:a", 1)};
+    defer testDeinitFixedHits(alloc, &hits);
+    const incomplete = types.SearchResult{
+        .alloc = alloc,
+        .hits = &hits,
+        .total_hits = 3,
+        .total_hits_relation = .exact,
+    };
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+        .order_by = &order_by,
+        .offset = 1,
+        .limit = 1,
+    }, &.{incomplete}, schema));
+    var diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("distributed_shard_window_incomplete", diagnostic.detail);
+
+    const lower_bound_short = types.SearchResult{
+        .alloc = alloc,
+        .hits = &hits,
+        .total_hits = 1,
+        .total_hits_relation = .gte,
+    };
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+        .order_by = &order_by,
+        .offset = 1,
+        .limit = 1,
+    }, &.{lower_bound_short}, schema));
+    diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("distributed_shard_window_incomplete", diagnostic.detail);
+
+    const empty_with_possible_hits = types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 1,
+        .total_hits_relation = .gte,
+    };
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+        .order_by = &order_by,
+        .limit = 1,
+    }, &.{empty_with_possible_hits}, schema));
+    diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("distributed_shard_window_incomplete", diagnostic.detail);
+}
+
 test "distributed score sort requires finite hit score matching sort tuple" {
     const alloc = std.testing.allocator;
     const plan = SortExecutionPlan{ .kind = .distributed_k_way_merge };
@@ -4143,7 +4204,7 @@ test "distributed score sort requires finite hit score matching sort tuple" {
         .order_by = &score_desc,
         .limit = 3,
     }, plan, &shards));
-    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    var diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("_score", diagnostic.field);
     try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.reason);
     try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.detail);
@@ -4713,6 +4774,7 @@ fn searchHitAllowedByCursor(req: types.SearchRequest, plan: SortExecutionPlan, h
 
 const DistributedSortedShard = struct {
     hits: []const types.SearchHit = &.{},
+    total_hits: ?u32 = null,
     total_hits_relation: types.TotalHitsRelation = .exact,
 };
 
@@ -4826,6 +4888,29 @@ fn validateDistributedSortedShards(
             if (order == .gt) {
                 recordDistributedSortTupleRejection("*", "unsorted_shard_window");
                 return error.InvalidQueryRequest;
+            }
+        }
+    }
+}
+
+fn validateDistributedShardWindowsCompleteForRequestedPage(
+    req: types.SearchRequest,
+    shards: []const DistributedSortedShard,
+) !void {
+    if (req.search_after.len > 0 or req.search_before.len > 0) return;
+    const required_window = @as(u64, req.offset) +| @as(u64, req.limit);
+    if (required_window == 0) return;
+    for (shards) |shard| {
+        const returned_window: u64 = @intCast(shard.hits.len);
+        if (returned_window >= required_window) continue;
+        if (shard.total_hits) |total_hits| {
+            if (shard.total_hits_relation == .exact and @as(u64, total_hits) > returned_window) {
+                logNativeSortPlanRejection("*", "unsupported_exact_sort", "distributed_shard_window_incomplete");
+                return error.UnsupportedQueryRequest;
+            }
+            if (shard.total_hits_relation == .gte) {
+                logNativeSortPlanRejection("*", "unsupported_exact_sort", "distributed_shard_window_incomplete");
+                return error.UnsupportedQueryRequest;
             }
         }
     }
@@ -5078,6 +5163,7 @@ fn mergeDistributedSortedHitsWithProfileAlloc(
     try validateScoreSortHasScoreBearingTextSource(effective_req);
     try validateDistributedSortRuntimeMappings(plan, effective_req);
     try validateDistributedSortedShards(alloc, effective_req, plan, shards);
+    try validateDistributedShardWindowsCompleteForRequestedPage(effective_req, shards);
     try enforceDistributedSortShardWindowBudget(shards, distributedSortShardWindowBudget());
     const total_hits_relation = distributedShardTotalHitsRelation(shards);
 
@@ -5248,6 +5334,7 @@ pub fn mergeDistributedSortedSearchResultHitsWithRuntimeSchemaAlloc(
     for (results, 0..) |result, i| {
         shards[i] = .{
             .hits = result.hits,
+            .total_hits = result.total_hits,
             .total_hits_relation = result.total_hits_relation,
         };
         available_hits += result.hits.len;
@@ -5291,6 +5378,7 @@ pub fn mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(
     for (results, 0..) |result, i| {
         shards[i] = .{
             .hits = result.hits,
+            .total_hits = result.total_hits,
             .total_hits_relation = result.total_hits_relation,
         };
         available_hits += result.hits.len;
@@ -9970,7 +10058,7 @@ fn searchDenseInternal(
     const effective_k: u32 = if (full_candidate_window)
         @intCast(index_stats.active_count)
     else
-        @max(dense.k, page_candidate_window);
+        scoreOrderCandidateWindowK(dense.k, paging);
     const effort = resolvedSearchEffort(req.search_effort);
     const resolved_search_width = resolveSearchWidth(dense.k, effort, index_stats);
     const resolved_epsilon = resolveSearchEpsilon(effort);
@@ -10005,6 +10093,7 @@ fn searchDenseInternal(
 
     while (true) {
         var score_exactness = SortPlanExactness.approximate;
+        var projected_source_profile = ProjectedSourceLoadProfile{};
         const hbc_effective_k: u32 = if (full_candidate_window) candidate_window else effective_k;
         const hbc_req: vectorindex_mod.SearchRequest = .{
             .query = dense.vector,
@@ -10158,9 +10247,14 @@ fn searchDenseInternal(
                 !unresolved_stored_filters;
             if (load_stored_before_postprocess) {
                 const load_start = platform_time.monotonicNs();
+                projected_source_profile.requested_count += 1;
                 stored_data = try executor.load_projected_document(executor.ctx, alloc, postprocess_req, doc_key);
                 stored_data_owned = true;
-                profile.load_projected_document_ns += platform_time.monotonicNs() - load_start;
+                const load_ns = platform_time.monotonicNs() - load_start;
+                profile.load_projected_document_ns += load_ns;
+                projected_source_profile.loaded_count += 1;
+                projected_source_profile.batch_count += 1;
+                projected_source_profile.total_ns +|= load_ns;
             }
             try hit_vector_ids.append(alloc, hit.vector_id);
             try hits.append(alloc, .{
@@ -10177,7 +10271,7 @@ fn searchDenseInternal(
         profile.doc_ordinal_lookup_ns += platform_time.monotonicNs() - ordinal_lookup_start;
 
         const postprocess_start = platform_time.monotonicNs();
-        const dense_hits_total: u32 = @intCast(hits.items.len);
+        const dense_hits_total: u32 = @intCast(@min(raw_hits.len, @as(usize, std.math.maxInt(u32))));
         const dense_hits = try hits.toOwnedSlice(alloc);
         var result = try executor.postprocess(executor.ctx, alloc, postprocess_req, .{
             .alloc = alloc,
@@ -10202,13 +10296,17 @@ fn searchDenseInternal(
         }
         profile.postprocess_ns += platform_time.monotonicNs() - postprocess_start;
         if (postprocess_req.include_stored and !(chunk_backed and group_chunk_parents)) {
-            const load_start = platform_time.monotonicNs();
-            try loadMissingProjectedDenseHitDocuments(alloc, postprocess_req, executor, result.hits);
-            profile.load_projected_document_ns += platform_time.monotonicNs() - load_start;
+            const source_profile = try loadMissingProjectedDenseHitDocuments(alloc, postprocess_req, executor, result.hits);
+            profile.load_projected_document_ns += source_profile.total_ns;
+            projected_source_profile.requested_count += source_profile.requested_count;
+            projected_source_profile.loaded_count += source_profile.loaded_count;
+            projected_source_profile.batch_count += source_profile.batch_count;
+            projected_source_profile.total_ns +|= source_profile.total_ns;
         }
         profile.returned_hit_count = result.total_hits;
         profile.total_ns = platform_time.monotonicNs() - total_start;
         result.sort_profile = vectorScoreTopKSortProfile(req, collect_sort_profile, score_exactness, raw_hits.len, result.hits.len, profile.total_ns);
+        applyProjectedSourceLoadProfileToSortProfile(&result, projected_source_profile);
         if (bench_query_profile) logBenchDenseQueryProfile(req, dense, index_stats, profile);
         return result;
     }
@@ -10236,6 +10334,15 @@ fn pagingCandidateWindow(paging: ComponentPaging) u32 {
     return paging.offset +| paging.limit;
 }
 
+fn scoreOrderCandidateWindowK(requested_k: u32, paging: ComponentPaging) u32 {
+    return @max(requested_k, pagingCandidateWindow(paging));
+}
+
+fn scoreOrderWindowTotalHitsRelation(effective_k: u32, bounded_candidate_count: u64, raw_hit_count: usize) types.TotalHitsRelation {
+    if (@as(u64, effective_k) < bounded_candidate_count and raw_hit_count >= @as(usize, @intCast(effective_k))) return .gte;
+    return .exact;
+}
+
 fn initialDenseFullCandidateWindow(bounded_full_candidate_count: u32, paging: ComponentPaging) u32 {
     if (bounded_full_candidate_count == 0) return 0;
     const overfetch_window = @max(paging.limit *| 32, @as(u32, 1024));
@@ -10255,6 +10362,15 @@ fn denseCandidateWindowIncomplete(candidate_window: u32, bounded_full_candidate_
 
 test "dense full candidate window covers requested offset page and grows bounded" {
     const paging = ComponentPaging{ .offset = 1024, .limit = 1 };
+    try std.testing.expectEqual(@as(u32, 1025), scoreOrderCandidateWindowK(10, paging));
+    try std.testing.expectEqual(@as(u32, 4096), scoreOrderCandidateWindowK(4096, paging));
+    try std.testing.expectEqual(std.math.maxInt(u32), scoreOrderCandidateWindowK(10, .{
+        .offset = std.math.maxInt(u32),
+        .limit = 1,
+    }));
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, scoreOrderWindowTotalHitsRelation(2, 3, 2));
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, scoreOrderWindowTotalHitsRelation(2, 3, 1));
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, scoreOrderWindowTotalHitsRelation(3, 3, 3));
     try std.testing.expectEqual(@as(u32, 1025), initialDenseFullCandidateWindow(2000, paging));
     try std.testing.expectEqual(@as(u32, 2000), growDenseFullCandidateWindow(1025, 2000, 1025));
     try std.testing.expect(denseCandidateWindowIncomplete(1025, 2000, 1025));
@@ -10357,11 +10473,18 @@ fn loadMissingProjectedDenseHitDocuments(
     req: types.SearchRequest,
     executor: DenseSearchExecutor,
     hits: []types.SearchHit,
-) !void {
+) !ProjectedSourceLoadProfile {
+    const start_ns = platform_time.monotonicNs();
+    var profile = ProjectedSourceLoadProfile{};
     for (hits) |*hit| {
         if (hit.stored_data != null) continue;
+        profile.requested_count += 1;
         hit.stored_data = try executor.load_projected_document(executor.ctx, alloc, req, hit.id);
+        profile.loaded_count += 1;
+        profile.batch_count += 1;
     }
+    profile.total_ns = platform_time.monotonicNs() - start_ns;
+    return profile;
 }
 
 fn lookupDenseHitDocOrdinals(
@@ -10671,6 +10794,7 @@ pub fn searchSparse(
     var hit_build_ns: u64 = 0;
     var postprocess_ns: u64 = 0;
     var page_ns: u64 = 0;
+    var projected_source_profile = ProjectedSourceLoadProfile{};
     const entry = (try executor.sparse_index(executor.ctx, req.index_name)) orelse return error.IndexNotFound;
     const chunk_backed = entry.chunk_name != null;
     const group_chunk_parents = shouldGroupChunkParents(req, chunk_backed);
@@ -10699,10 +10823,14 @@ pub fn searchSparse(
         native_constraints.exclusion_query_json_resolved,
     );
     const full_candidate_window = group_chunk_parents or unresolved_stored_filters;
+    const bounded_sparse_candidate_count: u64 = if (native_constraints.positive_filter)
+        @as(u64, native_constraints.filter_doc_ids.len) +| @as(u64, native_constraints.filter_doc_nums.len)
+    else
+        entry.index.next_doc_num;
     const effective_k: u32 = if (full_candidate_window)
         @intCast(entry.index.next_doc_num)
     else
-        @max(sparse.k, paging.limit);
+        scoreOrderCandidateWindowK(sparse.k, paging);
     const query = sparse_mod.SparseVector{
         .indices = sparse.indices,
         .values = sparse.values,
@@ -10713,7 +10841,7 @@ pub fn searchSparse(
             .alloc = alloc,
             .hits = &.{},
             .total_hits = 0,
-            .sort_profile = vectorScoreTopKSortProfile(req, collect_sort_profile, .approximate, 0, 0, total_ns),
+            .sort_profile = vectorScoreTopKSortProfile(req, collect_sort_profile, .exact, 0, 0, total_ns),
             .graph_results = &.{},
         };
     }
@@ -10785,6 +10913,7 @@ pub fn searchSparse(
         .alloc = alloc,
         .hits = hits,
         .total_hits = @intCast(raw_hits.len),
+        .total_hits_relation = scoreOrderWindowTotalHitsRelation(effective_k, bounded_sparse_candidate_count, raw_hits.len),
         .graph_results = &.{},
     }, chunk_backed);
     if (bench_query_profile) postprocess_ns = platform_time.monotonicNs() - postprocess_start_ns;
@@ -10795,12 +10924,12 @@ pub fn searchSparse(
         if (bench_query_profile) page_ns = platform_time.monotonicNs() - page_start_ns;
     }
     if (postprocess_req.include_stored and !(chunk_backed and group_chunk_parents)) {
-        const load_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-        try loadMissingProjectedSparseHitDocuments(alloc, postprocess_req, executor, result.hits);
-        if (bench_query_profile) hit_build_ns += platform_time.monotonicNs() - load_start_ns;
+        projected_source_profile = try loadMissingProjectedSparseHitDocuments(alloc, postprocess_req, executor, result.hits);
+        if (bench_query_profile) hit_build_ns += projected_source_profile.total_ns;
     }
     if (collect_sort_profile) {
-        result.sort_profile = vectorScoreTopKSortProfile(req, collect_sort_profile, .approximate, raw_hits.len, result.hits.len, platform_time.monotonicNs() - total_start_ns);
+        result.sort_profile = vectorScoreTopKSortProfile(req, collect_sort_profile, .exact, raw_hits.len, result.hits.len, platform_time.monotonicNs() - total_start_ns);
+        applyProjectedSourceLoadProfileToSortProfile(&result, projected_source_profile);
     }
     if (bench_query_profile) {
         std.log.info(
@@ -10827,12 +10956,18 @@ fn loadMissingProjectedSparseHitDocuments(
     req: types.SearchRequest,
     executor: SparseSearchExecutor,
     hits: []types.SearchHit,
-) !void {
+) !ProjectedSourceLoadProfile {
+    const start_ns = platform_time.monotonicNs();
+    var profile = ProjectedSourceLoadProfile{};
     var missing_count: usize = 0;
     for (hits) |hit| {
         if (hit.stored_data == null) missing_count += 1;
     }
-    if (missing_count == 0) return;
+    profile.requested_count = missing_count;
+    if (missing_count == 0) {
+        profile.total_ns = platform_time.monotonicNs() - start_ns;
+        return profile;
+    }
 
     if (executor.load_projected_documents) |load_many| {
         const keys = try alloc.alloc([]const u8, missing_count);
@@ -10845,6 +10980,7 @@ fn loadMissingProjectedSparseHitDocuments(
         }
 
         var loaded = try load_many(executor.ctx, alloc, req, keys);
+        profile.batch_count += 1;
         defer freeOptionalOwnedBytes(alloc, loaded);
         if (loaded.len != keys.len) return error.InvalidSearchResult;
 
@@ -10854,15 +10990,21 @@ fn loadMissingProjectedSparseHitDocuments(
             const stored = loaded[loaded_index] orelse return error.StoredDocMissing;
             hit.stored_data = stored;
             loaded[loaded_index] = null;
+            profile.loaded_count += 1;
             loaded_index += 1;
         }
-        return;
+        profile.total_ns = platform_time.monotonicNs() - start_ns;
+        return profile;
     }
 
     for (hits) |*hit| {
         if (hit.stored_data != null) continue;
         hit.stored_data = try executor.load_projected_document(executor.ctx, alloc, req, hit.id);
+        profile.loaded_count += 1;
+        profile.batch_count += 1;
     }
+    profile.total_ns = platform_time.monotonicNs() - start_ns;
+    return profile;
 }
 
 fn freeOptionalOwnedBytes(alloc: Allocator, values: []?[]u8) void {
@@ -11495,13 +11637,13 @@ fn schemaIndexSortValidForPlanning(schema: runtime_schema_mod.TableSchema) bool 
 }
 
 fn sortRequestMatchesIndexSort(req: types.SearchRequest, schema: runtime_schema_mod.TableSchema) bool {
-    if (req.order_by.len == 0 or !schemaIndexSortValidForPlanning(schema)) return false;
-    const field_count = effectiveSortFieldCount(req.order_by);
+    if (!requestHasSortPageOptions(req) or !schemaIndexSortValidForPlanning(schema)) return false;
+    const field_count = effectiveSortFieldCountForRequest(req);
     if (field_count > schema.index_sort.len) return false;
-    if (!std.mem.eql(u8, effectiveSortFieldAt(req.order_by, field_count - 1).field, "_id")) return false;
+    if (!std.mem.eql(u8, effectiveSortFieldAtForRequest(req, field_count - 1).field, "_id")) return false;
     for (0..field_count) |i| {
         const configured = schema.index_sort[i];
-        const requested = effectiveSortFieldAt(req.order_by, i);
+        const requested = effectiveSortFieldAtForRequest(req, i);
         if (!sortFieldMatchesIndexSortField(requested, configured)) return false;
     }
     return true;
@@ -13481,6 +13623,81 @@ test "dense and sparse search reject unsupported exact sort page options" {
     try std.testing.expectEqualStrings("approximate_candidate_source", sparse_diagnostic.detail);
 }
 
+test "sparse score search fetches offset plus limit candidates" {
+    const alloc = std.testing.allocator;
+
+    var sparse_index = try sparse_mod.SparseIndex.open(alloc, "/tmp/antfly-search-exec-sparse-offset-test", .{ .backend = .mem });
+    defer sparse_index.close();
+    const writes = [_]sparse_mod.SparseWrite{
+        .{ .doc_id = "doc:a", .vec = .{ .indices = &.{1}, .values = &.{1.0} } },
+        .{ .doc_id = "doc:b", .vec = .{ .indices = &.{1}, .values = &.{0.9} } },
+        .{ .doc_id = "doc:c", .vec = .{ .indices = &.{1}, .values = &.{0.8} } },
+    };
+    try sparse_index.batch(&writes, &.{});
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var entry = index_manager_mod.IndexManager.SparseIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "sp", .kind = .sparse_vector, .config_json = "{}" },
+        .field_name = @constCast("sparse"),
+        .chunk_name = null,
+        .embedding_name = null,
+        .rebuild_root_path = @constCast(""),
+        .index = sparse_index,
+    };
+    defer entry.index = undefined;
+
+    const Harness = struct {
+        entry: *index_manager_mod.IndexManager.SparseIndex,
+
+        fn textIndexEntry(_: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            return null;
+        }
+
+        fn sparseIndex(ctx: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.SparseIndex {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return self.entry;
+        }
+
+        fn loadProjectedDocument(_: ?*anyopaque, callback_alloc: Allocator, _: types.SearchRequest, key: []const u8) anyerror![]u8 {
+            try std.testing.expectEqualStrings("doc:b", key);
+            return try callback_alloc.dupe(u8, "{\"selected\":true}");
+        }
+
+        fn postprocess(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, raw: types.SearchResult, _: bool) anyerror!types.SearchResult {
+            return raw;
+        }
+    };
+    var harness = Harness{ .entry = &entry };
+    var result = try searchSparse(alloc, .{
+        .index_name = "sp",
+        .offset = 1,
+        .limit = 1,
+        .include_stored = true,
+        .profile = true,
+    }, .{
+        .indices = &.{1},
+        .values = &.{1.0},
+        .k = 1,
+    }, .{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndexEntry,
+        .sparse_index = Harness.sparseIndex,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .postprocess = Harness.postprocess,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expect(result.hits[0].stored_data != null);
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, result.total_hits_relation);
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("score_top_k", profile.plan);
+    try std.testing.expectEqualStrings("exact", profile.exactness);
+    try std.testing.expectEqual(@as(u64, 1), profile.projected_source_load_count);
+}
+
 test "native dense constraints derive safe doc-id filter and exclusion ids" {
     const alloc = std.testing.allocator;
     var constraints = try deriveNativeDenseConstraintsAlloc(alloc, .{
@@ -13987,7 +14204,7 @@ test "schema-derived keyword subfield backs native sort execution" {
         \\            "x-antfly-field": {
         \\              "type": "text",
         \\              "fields": {
-        \\                "keyword": {"type":"keyword","doc_values":true,"sortable":true}
+        \\                "keyword": {"type":"keyword","sortable":true}
         \\              }
         \\            }
         \\          }
@@ -15836,6 +16053,16 @@ test "sort planner detects exact index sort eligibility after implicit id normal
     try std.testing.expect(sortRequestMatchesIndexSort(.{
         .order_by = &created_desc_with_id,
     }, exact_schema));
+
+    const id_index_sort = [_]runtime_schema_mod.IndexSortField{.{ .field = "_id", .desc = false }};
+    const id_schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &templates,
+        .index_sort = &id_index_sort,
+    };
+    const id_cursor = [_]std.json.Value{.{ .string = "doc:a" }};
+    try std.testing.expect(sortRequestMatchesIndexSort(.{
+        .search_after = &id_cursor,
+    }, id_schema));
 
     const wrong_direction = [_]types.SortField{.{ .field = "created_at", .desc = false }};
     try std.testing.expect(!sortRequestMatchesIndexSort(.{
