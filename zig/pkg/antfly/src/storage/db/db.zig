@@ -10538,7 +10538,10 @@ pub const DB = struct {
         };
 
         var targets = std.ArrayListUnmanaged(DenseArtifactRebuildTarget).empty;
-        errdefer targets.deinit(alloc);
+        errdefer {
+            for (targets.items) |*target| target.deinit(alloc);
+            targets.deinit(alloc);
+        }
 
         var candidates = std.ArrayListUnmanaged(Candidate).empty;
         defer {
@@ -11041,6 +11044,7 @@ pub const DB = struct {
         try self.prepareDenseArtifactRebuildPlan(plan);
         const ResumePersistCtx = struct {
             db: *DB,
+            alloc: Allocator,
             targets: []DenseArtifactRebuildTarget,
 
             fn run(ctx: *anyopaque, last_key: []const u8) !void {
@@ -11050,19 +11054,20 @@ pub const DB = struct {
                         if (std.mem.order(u8, last_key, resume_from) != .gt) continue;
                     }
                     const entry = &persist.db.core.index_manager.dense_indexes.items[target.dense_index_idx];
-                    const rebuild_root_path = try persist.db.denseIndexRebuildStatePathAlloc(persist.db.alloc, entry.config.name);
-                    defer persist.db.alloc.free(rebuild_root_path);
+                    const rebuild_root_path = try persist.db.denseIndexRebuildStatePathAlloc(persist.alloc, entry.config.name);
+                    defer persist.alloc.free(rebuild_root_path);
                     const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
                     try rebuild_state.update(last_key);
-                    const owned_key = try persist.db.alloc.dupe(u8, last_key);
-                    errdefer persist.db.alloc.free(owned_key);
-                    if (target.resume_from) |resume_from| persist.db.alloc.free(resume_from);
+                    const owned_key = try persist.alloc.dupe(u8, last_key);
+                    errdefer persist.alloc.free(owned_key);
+                    if (target.resume_from) |resume_from| persist.alloc.free(resume_from);
                     target.resume_from = owned_key;
                 }
             }
         };
         var persist_ctx = ResumePersistCtx{
             .db = self,
+            .alloc = alloc,
             .targets = plan.targets,
         };
         const rebuilt = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
@@ -49618,6 +49623,67 @@ test "db dense artifact rebuild resumes from persisted state" {
         }
         try std.testing.expectEqual(@as(?u64, doc_count), dense_doc_count);
     }
+}
+
+test "db dense artifact rebuild resume keys are owned by plan allocator" {
+    const alloc = std.testing.allocator;
+    const db_alloc = std.heap.page_allocator;
+    const doc_count: usize = 3;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(db_alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+
+        for (0..doc_count) |i| {
+            const doc_id = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{i});
+            defer alloc.free(doc_id);
+            const stored_key = try internal_keys.documentKeyAlloc(alloc, doc_id);
+            defer alloc.free(stored_key);
+            const stored_value = try std.fmt.allocPrint(alloc, "{{\"title\":\"doc-{d}\"}}", .{i});
+            defer alloc.free(stored_value);
+            try db.core.store.putBatch(&.{
+                .{ .key = stored_key, .value = stored_value },
+            }, &.{});
+
+            const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, doc_id, "dense_idx");
+            defer alloc.free(artifact_key);
+            try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, artifact_key, null, &[_]f32{
+                @floatFromInt(i + 1),
+                0,
+                0,
+            });
+        }
+    }
+
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const dense_index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
+    defer alloc.free(dense_index_path);
+    try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
+
+    var reopened = try DB.open(db_alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const rebuilt = try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+    try std.testing.expectEqual(doc_count, rebuilt);
+    try std.testing.expectEqual(@as(u64, doc_count), reopened.core.index_manager.denseIndex("dense_idx").?.index.metadata.active_count);
 }
 
 test "db dense artifact rebuild progress counts source artifacts across multiple consumer indexes" {
