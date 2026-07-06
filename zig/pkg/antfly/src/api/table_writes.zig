@@ -2208,6 +2208,21 @@ pub const ProvisionedTableWriteCache = struct {
         self.table_metadata.appendAssumeCapacity(replacement);
     }
 
+    fn replaceTableMetadataAndEntrySchemasLocked(
+        self: *ProvisionedTableWriteCache,
+        table_name: []const u8,
+        indexes_json: []const u8,
+        schema_json: []const u8,
+    ) !void {
+        try self.replaceTableMetadataLocked(table_name, indexes_json, schema_json);
+        for (self.entries.items) |entry| {
+            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            const owned_schema_json = try self.alloc.dupe(u8, schema_json);
+            if (entry.schema_json) |old| self.alloc.free(old);
+            entry.schema_json = owned_schema_json;
+        }
+    }
+
     fn installLoadedTableMetadataLocked(
         self: *ProvisionedTableWriteCache,
         cached_index: ?usize,
@@ -7872,6 +7887,44 @@ pub const ProvisionedTableWriteSource = struct {
         if (group_ids.len == 0) return null;
         const indexes_json = try loadTableIndexesJson(alloc, self.catalog, table_name);
         defer if (indexes_json) |value| alloc.free(value);
+
+        if (self.write_cache) |cache| {
+            self.beginLocalStructuralCachedDbMutation(table_name);
+            errdefer self.abortLocalStructuralCachedDbMutation(table_name);
+
+            for (group_ids) |group_id| {
+                const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+                defer alloc.free(path);
+                const target_generation = self.visibleRootGeneration(group_id);
+
+                var cached = try self.getOrOpenCachedDbForLocalMutation(
+                    alloc,
+                    cache,
+                    path,
+                    group_id,
+                    target_generation,
+                    table_name,
+                    false,
+                );
+                defer cached.deinit(alloc);
+                try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, cached.db);
+                try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
+                if (indexes_json) |value| {
+                    _ = try metadata_table_provisioner.reconcileDbIndexes(alloc, cached.db, value);
+                    try rebuildEmptyVersionedFullTextIndexesAfterSchemaUpdate(alloc, cached.db, value);
+                }
+                try drainManagedDbBeforeClose(cached.db);
+                try publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db);
+            }
+
+            lockAtomic(&self.local_db_mutex);
+            errdefer self.local_db_mutex.unlock();
+            try cache.replaceTableMetadataAndEntrySchemasLocked(table_name, indexes_json orelse "", schema_json);
+            self.local_db_mutex.unlock();
+            self.finishLocalStructuralCachedDbMutation(table_name);
+            self.notifyLocalChange(table_name, .structural);
+            return {};
+        }
 
         self.beginLocalStructuralMutation(table_name);
         errdefer self.abortLocalStructuralMutation(table_name);
@@ -25597,6 +25650,8 @@ test "provisioned table write source create table provisions local indexes and s
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
     const Catalog = struct {
+        var indexes_json: []const u8 = tables_api.default_indexes_json;
+
         fn iface() table_catalog.CatalogSource {
             return .{
                 .ptr = undefined,
@@ -25616,7 +25671,7 @@ test "provisioned table write source create table provisions local indexes and s
                     .description = "docs table",
                     .schema_json = schema_json,
                     .read_schema_json = "",
-                    .indexes_json = tables_api.default_indexes_json,
+                    .indexes_json = indexes_json,
                     .replication_sources_json = "[]",
                     .placement_role = "data",
                 }})[0..]),
@@ -25642,6 +25697,7 @@ test "provisioned table write source create table provisions local indexes and s
     var source = ProvisionedTableWriteSource.init(path, Catalog.iface());
     defer source.deinit();
     source.write_cache = &write_cache;
+    Catalog.indexes_json = tables_api.default_indexes_json;
     var req = tables_api.CreateTableRequest{
         .schema_json = try alloc.dupe(u8, schema_json),
     };
@@ -25655,6 +25711,26 @@ test "provisioned table write source create table provisions local indexes and s
         const cached_db = write_cache.getLocked(7001, source.visibleRootGeneration(7001), "docs") orelse return error.TestUnexpectedResult;
         try std.testing.expect(cached_db.core.index_manager.textIndex("full_text_index_v0") != null);
         try std.testing.expect(cached_db.core.schema != null);
+    }
+
+    const updated_schema_json =
+        "{\"version\":1,\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"body\":{\"type\":\"text\"}}}}}}";
+    Catalog.indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v1\":{\"type\":\"full_text\"}}";
+    _ = try source.source().updateSchema(alloc, "docs", updated_schema_json);
+
+    {
+        lockAtomic(&source.local_db_mutex);
+        defer source.local_db_mutex.unlock();
+        const cached_db = write_cache.getLocked(7001, source.visibleRootGeneration(7001), "docs") orelse return error.TestUnexpectedResult;
+        try std.testing.expect(cached_db.core.schema != null);
+        try std.testing.expectEqual(@as(u32, 1), cached_db.core.schema.?.version);
+        try std.testing.expect(cached_db.core.index_manager.textIndex("full_text_index_v1") != null);
+        for (write_cache.table_metadata.items) |metadata| {
+            if (!std.mem.eql(u8, metadata.table_name, "docs")) continue;
+            try std.testing.expectEqualStrings(updated_schema_json, metadata.schema_json orelse "");
+            try std.testing.expectEqualStrings(Catalog.indexes_json, metadata.indexes_json);
+            break;
+        } else return error.TestUnexpectedResult;
     }
 
     _ = try source.source().putArtifactEnrichment(
