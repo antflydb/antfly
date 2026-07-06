@@ -34,9 +34,11 @@ class TableRepairJob:
         limit (int): Effective per-pass repair limit.
         force (bool): Whether the job forces a named index rebuild.
         result (TableRepairRunResult): Result of one bounded table repair pass.
-        created_at_millis (int):
-        last_updated_at_millis (int):
-        expires_at_millis (int):
+        cancel_requested (bool): Whether cancellation has been requested for a running pass. Running passes finish at a
+            bounded repair boundary before the job transitions to cancelled.
+        created_at_millis (int): Unix epoch milliseconds when the job was created.
+        last_updated_at_millis (int): Unix epoch milliseconds when the job state was last updated.
+        expires_at_millis (int): Unix epoch milliseconds when the job is eligible for cleanup.
         kind (ArtifactRepairKind | Unset): Kind of stored artifact tracked by the repair queue.
         index (str | Unset): Index name when the job is restricted to one index.
         cursor (None | str | Unset): Opaque continuation cursor for the next bounded repair pass.
@@ -52,6 +54,7 @@ class TableRepairJob:
     limit: int
     force: bool
     result: TableRepairRunResult
+    cancel_requested: bool
     created_at_millis: int
     last_updated_at_millis: int
     expires_at_millis: int
@@ -79,6 +82,8 @@ class TableRepairJob:
         force = self.force
 
         result = self.result.to_dict()
+
+        cancel_requested = self.cancel_requested
 
         created_at_millis = self.created_at_millis
 
@@ -117,6 +122,7 @@ class TableRepairJob:
                 "limit": limit,
                 "force": force,
                 "result": result,
+                "cancel_requested": cancel_requested,
                 "created_at_millis": created_at_millis,
                 "last_updated_at_millis": last_updated_at_millis,
                 "expires_at_millis": expires_at_millis,
@@ -155,6 +161,8 @@ class TableRepairJob:
         force = d.pop("force")
 
         result = TableRepairRunResult.from_dict(d.pop("result"))
+
+        cancel_requested = d.pop("cancel_requested")
 
         created_at_millis = d.pop("created_at_millis")
 
@@ -199,6 +207,7 @@ class TableRepairJob:
             limit=limit,
             force=force,
             result=result,
+            cancel_requested=cancel_requested,
             created_at_millis=created_at_millis,
             last_updated_at_millis=last_updated_at_millis,
             expires_at_millis=expires_at_millis,

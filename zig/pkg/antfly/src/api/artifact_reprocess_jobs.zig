@@ -282,7 +282,7 @@ pub const Store = struct {
             return .{ .encoded = try alloc.dupe(u8, current_encoded), .started = false };
         }
         const is_running = std.mem.eql(u8, current.phase, phaseString(.running));
-        const running_expired = is_running and now_ms > current.last_updated_at_millis +| running_lease_timeout_ms;
+        const running_expired = is_running and leaseExpired(now_ms, current.last_updated_at_millis, running_lease_timeout_ms);
         if (is_running and !running_expired) {
             return .{ .encoded = try alloc.dupe(u8, current_encoded), .started = false };
         }
@@ -466,7 +466,11 @@ pub fn reprocessStatusForPhase(phase: JobPhase, pending_shards: usize) []const u
 }
 
 pub fn nowMillis() u64 {
-    return @divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms);
+    return @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+}
+
+fn leaseExpired(now_ms: u64, last_updated_ms: u64, timeout_ms: u64) bool {
+    return now_ms < last_updated_ms or now_ms >= last_updated_ms +| timeout_ms;
 }
 
 fn jobKey(alloc: std.mem.Allocator, job_id: u64) ![]u8 {

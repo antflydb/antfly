@@ -81,6 +81,7 @@ pub const JobState = struct {
     force: bool = false,
     result: db_mod.types.ArtifactRepairResult = .{},
     last_error: ?[]const u8 = null,
+    cancel_requested: bool = false,
     created_at_millis: u64,
     last_updated_at_millis: u64,
     expires_at_millis: u64,
@@ -151,6 +152,7 @@ pub const Store = struct {
             .limit = limit,
             .force = req.force,
             .result = .{ .limit = limit },
+            .cancel_requested = false,
             .created_at_millis = now_ms,
             .last_updated_at_millis = now_ms,
             .expires_at_millis = now_ms + self.retentionMillis(),
@@ -191,9 +193,11 @@ pub const Store = struct {
         const current_encoded = (try self.loadJobLocked(previous.job_id)) orelse return error.NotFound;
         var parsed_current = try std.json.parseFromSlice(JobState, self.alloc, current_encoded, .{ .ignore_unknown_fields = true });
         defer parsed_current.deinit();
-        if (!jobStateTransitionTokenMatches(parsed_current.value, previous)) {
+        const current = parsed_current.value;
+        if (!jobStateTransitionTokenMatches(current, previous)) {
             return try alloc.dupe(u8, current_encoded);
         }
+        const cancel_requested = phase == .cancelled or previous.cancel_requested or current.cancel_requested;
 
         const encoded = try encodeState(alloc, .{
             .job_id = previous.job_id,
@@ -209,6 +213,7 @@ pub const Store = struct {
             .force = previous.force,
             .result = previous.result,
             .last_error = last_error,
+            .cancel_requested = cancel_requested,
             .created_at_millis = previous.created_at_millis,
             .last_updated_at_millis = now_ms,
             .expires_at_millis = now_ms + self.retentionMillis(),
@@ -242,13 +247,15 @@ pub const Store = struct {
         total.next_cursor = pass.next_cursor;
 
         const retryable_in_progress = pass.in_progress != 0 and pass.failed == 0 and pass.unsupported == 0 and pass.missing_source_docs == 0;
-        const phase: JobPhase = if (pass.has_more or retryable_in_progress)
+        const phase: JobPhase = if (previous.cancel_requested)
+            .cancelled
+        else if (pass.has_more or retryable_in_progress)
             .queued
         else if (pass.debt_remaining)
             .failed
         else
             .succeeded;
-        const last_error: ?[]const u8 = if (phase == .failed) "repair_debt_remaining" else null;
+        const last_error: ?[]const u8 = if (phase == .cancelled) "cancel_requested" else if (phase == .failed) "repair_debt_remaining" else null;
         const now_ms = nowMillis();
 
         lockAtomic(&self.mutex);
@@ -256,16 +263,20 @@ pub const Store = struct {
         const current_encoded = (try self.loadJobLocked(previous.job_id)) orelse return error.NotFound;
         var parsed_current = try std.json.parseFromSlice(JobState, self.alloc, current_encoded, .{ .ignore_unknown_fields = true });
         defer parsed_current.deinit();
+        const current = parsed_current.value;
         if (!jobStateTransitionTokenMatches(parsed_current.value, previous)) {
             return try alloc.dupe(u8, current_encoded);
         }
+        const cancel_requested = previous.cancel_requested or current.cancel_requested;
+        const final_phase: JobPhase = if (cancel_requested) .cancelled else phase;
+        const final_last_error: ?[]const u8 = if (final_phase == .cancelled) "cancel_requested" else last_error;
 
         const encoded = try encodeState(alloc, .{
             .job_id = previous.job_id,
             .attempt_id = previous.attempt_id,
             .table_name = previous.table_name,
-            .phase = phaseString(phase),
-            .repair_status = repairStatusForPhase(phase, pass.has_more, pass.debt_remaining),
+            .phase = phaseString(final_phase),
+            .repair_status = repairStatusForPhase(final_phase, pass.has_more, pass.debt_remaining),
             .target = previous.target,
             .kind = previous.kind,
             .index = previous.index,
@@ -273,7 +284,8 @@ pub const Store = struct {
             .limit = previous.limit,
             .force = previous.force,
             .result = total,
-            .last_error = last_error,
+            .last_error = final_last_error,
+            .cancel_requested = cancel_requested,
             .created_at_millis = previous.created_at_millis,
             .last_updated_at_millis = now_ms,
             .expires_at_millis = now_ms + self.retentionMillis(),
@@ -296,7 +308,10 @@ pub const Store = struct {
             return .{ .encoded = try alloc.dupe(u8, current_encoded), .started = false };
         }
         const is_running = std.mem.eql(u8, current.phase, phaseString(.running));
-        const running_expired = is_running and now_ms > current.last_updated_at_millis +| running_lease_timeout_ms;
+        const running_expired = is_running and leaseExpired(now_ms, current.last_updated_at_millis, running_lease_timeout_ms);
+        if (current.cancel_requested and (!is_running or running_expired)) {
+            return .{ .encoded = try self.encodeCancelledCurrentLocked(alloc, current, now_ms), .started = false };
+        }
         if (is_running and !running_expired) {
             return .{ .encoded = try alloc.dupe(u8, current_encoded), .started = false };
         }
@@ -317,6 +332,8 @@ pub const Store = struct {
             .limit = current.limit,
             .force = current.force,
             .result = current.result,
+            .last_error = current.last_error,
+            .cancel_requested = false,
             .created_at_millis = current.created_at_millis,
             .last_updated_at_millis = now_ms,
             .expires_at_millis = now_ms + self.retentionMillis(),
@@ -357,12 +374,50 @@ pub const Store = struct {
             .force = current.force,
             .result = current.result,
             .last_error = current.last_error,
+            .cancel_requested = current.cancel_requested,
             .created_at_millis = current.created_at_millis,
             .last_updated_at_millis = now_ms,
             .expires_at_millis = now_ms + self.retentionMillis(),
         });
         defer alloc.free(encoded);
         try self.storeEncodedLocked(current.job_id, encoded, null);
+    }
+
+    pub fn requestCancel(self: *Store, alloc: std.mem.Allocator, expected: JobState) ![]u8 {
+        const now_ms = nowMillis();
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        const current_encoded = (try self.loadJobLocked(expected.job_id)) orelse return error.NotFound;
+        var parsed_current = try std.json.parseFromSlice(JobState, self.alloc, current_encoded, .{ .ignore_unknown_fields = true });
+        defer parsed_current.deinit();
+        const current = parsed_current.value;
+        if (isTerminalPhase(current.phase)) return try alloc.dupe(u8, current_encoded);
+        if (!jobStateTransitionTokenMatches(current, expected)) return try alloc.dupe(u8, current_encoded);
+
+        const phase: JobPhase = if (std.mem.eql(u8, current.phase, phaseString(.running))) .running else .cancelled;
+        const encoded = try encodeState(alloc, .{
+            .job_id = current.job_id,
+            .attempt_id = current.attempt_id,
+            .table_name = current.table_name,
+            .phase = phaseString(phase),
+            .repair_status = repairStatusForPhase(phase, current.result.has_more, current.result.debt_remaining),
+            .target = current.target,
+            .kind = current.kind,
+            .index = current.index,
+            .cursor = current.cursor,
+            .limit = current.limit,
+            .force = current.force,
+            .result = current.result,
+            .last_error = "cancel_requested",
+            .cancel_requested = true,
+            .created_at_millis = current.created_at_millis,
+            .last_updated_at_millis = now_ms,
+            .expires_at_millis = now_ms + self.retentionMillis(),
+        });
+        errdefer alloc.free(encoded);
+        try self.storeEncodedLocked(current.job_id, encoded, null);
+        return encoded;
     }
 
     pub fn cleanupExpiredJobs(self: *Store) void {
@@ -398,6 +453,11 @@ pub const Store = struct {
         for (expired.items) |job_id| {
             if (self.jobs.fetchRemove(job_id)) |removed| self.alloc.free(removed.value);
         }
+    }
+
+    pub fn storeEncodedForTest(self: *Store, job_id: u64, encoded: []const u8) !void {
+        std.debug.assert(@import("builtin").is_test);
+        try self.storeEncoded(job_id, encoded, null);
     }
 
     const ReservedJobId = struct {
@@ -476,6 +536,31 @@ pub const Store = struct {
         self.next_job_id = @max(self.next_job_id, recovered_next_job_id);
         try persistNextJobId(opened.docstore, self.alloc, self.next_job_id);
     }
+
+    fn encodeCancelledCurrentLocked(self: *Store, alloc: std.mem.Allocator, current: JobState, now_ms: u64) ![]u8 {
+        const encoded = try encodeState(alloc, .{
+            .job_id = current.job_id,
+            .attempt_id = current.attempt_id,
+            .table_name = current.table_name,
+            .phase = phaseString(.cancelled),
+            .repair_status = repairStatusForPhase(.cancelled, current.result.has_more, current.result.debt_remaining),
+            .target = current.target,
+            .kind = current.kind,
+            .index = current.index,
+            .cursor = current.cursor,
+            .limit = current.limit,
+            .force = current.force,
+            .result = current.result,
+            .last_error = "cancel_requested",
+            .cancel_requested = true,
+            .created_at_millis = current.created_at_millis,
+            .last_updated_at_millis = now_ms,
+            .expires_at_millis = now_ms + self.retentionMillis(),
+        });
+        errdefer alloc.free(encoded);
+        try self.storeEncodedLocked(current.job_id, encoded, null);
+        return encoded;
+    }
 };
 
 const running_lease_timeout_ms: u64 = 300_000;
@@ -516,7 +601,11 @@ pub fn repairStatusForPhase(phase: JobPhase, has_more: bool, debt_remaining: boo
 }
 
 pub fn nowMillis() u64 {
-    return @divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms);
+    return @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+}
+
+fn leaseExpired(now_ms: u64, last_updated_ms: u64, timeout_ms: u64) bool {
+    return now_ms < last_updated_ms or now_ms >= last_updated_ms +| timeout_ms;
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {

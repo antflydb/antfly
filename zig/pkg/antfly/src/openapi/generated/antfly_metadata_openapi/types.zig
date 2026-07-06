@@ -2019,8 +2019,13 @@ pub const TableRepairJob = struct {
     result: TableRepairRunResult,
     /// Last stable job-level error code.
     last_error: ?[]const u8 = null,
+    /// Whether cancellation has been requested for a running pass. Running passes finish at a bounded repair boundary before the job transitions to cancelled.
+    cancel_requested: bool,
+    /// Unix epoch milliseconds when the job was created.
     created_at_millis: i64,
+    /// Unix epoch milliseconds when the job state was last updated.
     last_updated_at_millis: i64,
+    /// Unix epoch milliseconds when the job is eligible for cleanup.
     expires_at_millis: i64,
 };
 

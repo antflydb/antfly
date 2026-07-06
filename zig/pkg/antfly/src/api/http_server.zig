@@ -7479,11 +7479,7 @@ pub const ApiHttpServer = struct {
         };
         defer parsed.deinit();
         if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return try textResponse(self.alloc, 404, "not found");
-        if (repair_jobs.isTerminalPhase(parsed.value.phase)) return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
-        if (std.mem.eql(u8, parsed.value.phase, repair_jobs.phaseString(.running))) {
-            return try jsonBodyResponseWithStatus(self.alloc, 202, encoded);
-        }
-        const cancelled = try self.repair_job_store.markPhase(self.alloc, parsed.value, .cancelled, null);
+        const cancelled = try self.repair_job_store.requestCancel(self.alloc, parsed.value);
         defer self.alloc.free(cancelled);
         var parsed_cancelled = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, cancelled, .{ .ignore_unknown_fields = true }) catch {
             return try textResponse(self.alloc, 500, "invalid repair job state");

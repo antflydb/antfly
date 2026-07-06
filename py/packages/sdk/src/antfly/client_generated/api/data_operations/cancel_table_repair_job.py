@@ -33,6 +33,11 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
 
         return response_200
 
+    if response.status_code == 202:
+        response_202 = TableRepairJob.from_dict(response.json())
+
+        return response_202
+
     if response.status_code == 400:
         response_400 = Error.from_dict(response.json())
 

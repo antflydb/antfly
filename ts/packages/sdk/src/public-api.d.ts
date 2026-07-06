@@ -3112,11 +3112,22 @@ export interface components {
             result: components["schemas"]["TableRepairRunResult"];
             /** @description Last stable job-level error code. */
             last_error?: string | null;
-            /** Format: uint64 */
+            /** @description Whether cancellation has been requested for a running pass. Running passes finish at a bounded repair boundary before the job transitions to cancelled. */
+            cancel_requested: boolean;
+            /**
+             * Format: uint64
+             * @description Unix epoch milliseconds when the job was created.
+             */
             created_at_millis: number;
-            /** Format: uint64 */
+            /**
+             * Format: uint64
+             * @description Unix epoch milliseconds when the job state was last updated.
+             */
             last_updated_at_millis: number;
-            /** Format: uint64 */
+            /**
+             * Format: uint64
+             * @description Unix epoch milliseconds when the job is eligible for cleanup.
+             */
             expires_at_millis: number;
         };
         DocumentArtifactReprocessResponse: {
@@ -12904,6 +12915,15 @@ export interface operations {
         responses: {
             /** @description Repair job cancelled or already terminal. */
             200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            /** @description Cancellation requested; the current running pass has not yet reached a cancellation boundary. */
+            202: {
                 headers: {
                     [name: string]: unknown;
                 };
