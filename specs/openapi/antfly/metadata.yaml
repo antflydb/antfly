@@ -5942,6 +5942,9 @@ components:
         distributed_behavior:
           type: string
           description: Distributed sort behavior.
+        selection_reason:
+          type: string
+          description: Stable reason the planner selected this sort plan.
         require_native:
           type: boolean
           description: Whether exact execution required native typed sort values.
@@ -5965,6 +5968,10 @@ components:
           type: integer
           format: int64
           description: Shards participating in distributed sort execution.
+        distributed_shard_window:
+          type: integer
+          format: int64
+          description: Largest shard-local sorted window merged by the coordinator.
         budget_rejection_reason:
           type: string
           description: Stable budget rejection reason.

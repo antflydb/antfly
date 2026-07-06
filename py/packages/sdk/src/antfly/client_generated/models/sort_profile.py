@@ -31,12 +31,14 @@ class SortProfile:
             cursor_support (str | Unset): Cursor support level for the selected plan.
             source_load (str | Unset): Stored source load strategy.
             distributed_behavior (str | Unset): Distributed sort behavior.
+            selection_reason (str | Unset): Stable reason the planner selected this sort plan.
             require_native (bool | Unset): Whether exact execution required native typed sort values.
             candidate_count (int | Unset): Candidate documents considered by sort execution.
             cursor_rejected_count (int | Unset): Candidates rejected by cursor comparison.
             selected_count (int | Unset): Hits selected for the returned page.
             total_us (int | Unset): Total sort execution time in microseconds.
             distributed_shard_count (int | Unset): Shards participating in distributed sort execution.
+            distributed_shard_window (int | Unset): Largest shard-local sorted window merged by the coordinator.
             budget_rejection_reason (str | Unset): Stable budget rejection reason.
             sort_rejection_reason (str | Unset): Stable exact-sort rejection reason.
             sort_rejection_detail (str | Unset): Stable rejection detail.
@@ -51,12 +53,14 @@ class SortProfile:
     cursor_support: str | Unset = UNSET
     source_load: str | Unset = UNSET
     distributed_behavior: str | Unset = UNSET
+    selection_reason: str | Unset = UNSET
     require_native: bool | Unset = UNSET
     candidate_count: int | Unset = UNSET
     cursor_rejected_count: int | Unset = UNSET
     selected_count: int | Unset = UNSET
     total_us: int | Unset = UNSET
     distributed_shard_count: int | Unset = UNSET
+    distributed_shard_window: int | Unset = UNSET
     budget_rejection_reason: str | Unset = UNSET
     sort_rejection_reason: str | Unset = UNSET
     sort_rejection_detail: str | Unset = UNSET
@@ -85,6 +89,8 @@ class SortProfile:
 
         distributed_behavior = self.distributed_behavior
 
+        selection_reason = self.selection_reason
+
         require_native = self.require_native
 
         candidate_count = self.candidate_count
@@ -96,6 +102,8 @@ class SortProfile:
         total_us = self.total_us
 
         distributed_shard_count = self.distributed_shard_count
+
+        distributed_shard_window = self.distributed_shard_window
 
         budget_rejection_reason = self.budget_rejection_reason
 
@@ -124,6 +132,8 @@ class SortProfile:
             field_dict["source_load"] = source_load
         if distributed_behavior is not UNSET:
             field_dict["distributed_behavior"] = distributed_behavior
+        if selection_reason is not UNSET:
+            field_dict["selection_reason"] = selection_reason
         if require_native is not UNSET:
             field_dict["require_native"] = require_native
         if candidate_count is not UNSET:
@@ -136,6 +146,8 @@ class SortProfile:
             field_dict["total_us"] = total_us
         if distributed_shard_count is not UNSET:
             field_dict["distributed_shard_count"] = distributed_shard_count
+        if distributed_shard_window is not UNSET:
+            field_dict["distributed_shard_window"] = distributed_shard_window
         if budget_rejection_reason is not UNSET:
             field_dict["budget_rejection_reason"] = budget_rejection_reason
         if sort_rejection_reason is not UNSET:
@@ -175,6 +187,8 @@ class SortProfile:
 
         distributed_behavior = d.pop("distributed_behavior", UNSET)
 
+        selection_reason = d.pop("selection_reason", UNSET)
+
         require_native = d.pop("require_native", UNSET)
 
         candidate_count = d.pop("candidate_count", UNSET)
@@ -186,6 +200,8 @@ class SortProfile:
         total_us = d.pop("total_us", UNSET)
 
         distributed_shard_count = d.pop("distributed_shard_count", UNSET)
+
+        distributed_shard_window = d.pop("distributed_shard_window", UNSET)
 
         budget_rejection_reason = d.pop("budget_rejection_reason", UNSET)
 
@@ -204,12 +220,14 @@ class SortProfile:
             cursor_support=cursor_support,
             source_load=source_load,
             distributed_behavior=distributed_behavior,
+            selection_reason=selection_reason,
             require_native=require_native,
             candidate_count=candidate_count,
             cursor_rejected_count=cursor_rejected_count,
             selected_count=selected_count,
             total_us=total_us,
             distributed_shard_count=distributed_shard_count,
+            distributed_shard_window=distributed_shard_window,
             budget_rejection_reason=budget_rejection_reason,
             sort_rejection_reason=sort_rejection_reason,
             sort_rejection_detail=sort_rejection_detail,

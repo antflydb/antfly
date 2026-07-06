@@ -139,6 +139,14 @@ fn benchQueryProfileEnabled() bool {
     return platform.env.getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
 }
 
+fn observeSearchFailureMetric(name: ?[]const u8, query_type: db_query_metrics.QueryType, duration_ns: u64) void {
+    if (db_query_search.peekLastSortRejectionDiagnostic()) |diagnostic| {
+        db_query_metrics.observeSortRejection(name, query_type, duration_ns, diagnostic.reason, diagnostic.detail);
+        return;
+    }
+    db_query_metrics.observe(name, query_type, duration_ns);
+}
+
 fn validateDocumentExtractionInlineSources(db: *DB, doc_value: []const u8) !void {
     var has_document_extraction_asset = false;
     for (db.core.index_manager.enrichments.items) |entry| {
@@ -11313,7 +11321,7 @@ pub const DB = struct {
         try self.proveTextQueryAccessPaths(algebraic_filter.req.index_name, text_query);
         const metric_name = self.textQueryMetricIndexName(algebraic_filter.req);
         const start_ns = platform_time.monotonicNs();
-        errdefer db_query_metrics.observe(metric_name, .search, platform_time.monotonicNs() -| start_ns);
+        errdefer observeSearchFailureMetric(metric_name, .search, platform_time.monotonicNs() -| start_ns);
         const result = try db_query_search.searchTextQuery(alloc, algebraic_filter.req, text_query, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,

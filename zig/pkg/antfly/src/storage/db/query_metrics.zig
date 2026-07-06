@@ -37,6 +37,9 @@ const Entry = struct {
     name: []u8,
     query_type: QueryType,
     sort_plan: []u8,
+    sort_exactness: []u8,
+    sort_source: []u8,
+    sort_selection_reason: []u8,
     sort_rejection_reason: []u8,
     budget_rejection_reason: []u8,
     buckets: [bucket_bounds.len + 1]u64 = [_]u64{0} ** (bucket_bounds.len + 1),
@@ -46,6 +49,9 @@ const Entry = struct {
 
 pub const SortMetricLabels = struct {
     plan: []const u8 = "",
+    exactness: []const u8 = "",
+    source: []const u8 = "",
+    selection_reason: []const u8 = "",
     sort_rejection_reason: []const u8 = "",
     budget_rejection_reason: []const u8 = "",
 };
@@ -62,6 +68,9 @@ pub const Collector = struct {
         for (self.entries.items) |item| {
             self.alloc.free(item.name);
             self.alloc.free(item.sort_plan);
+            self.alloc.free(item.sort_exactness);
+            self.alloc.free(item.sort_source);
+            self.alloc.free(item.sort_selection_reason);
             self.alloc.free(item.sort_rejection_reason);
             self.alloc.free(item.budget_rejection_reason);
         }
@@ -108,6 +117,9 @@ pub const Collector = struct {
             if (existing.query_type == query_type and
                 std.mem.eql(u8, existing.name, name) and
                 std.mem.eql(u8, existing.sort_plan, sort.plan) and
+                std.mem.eql(u8, existing.sort_exactness, sort.exactness) and
+                std.mem.eql(u8, existing.sort_source, sort.source) and
+                std.mem.eql(u8, existing.sort_selection_reason, sort.selection_reason) and
                 std.mem.eql(u8, existing.sort_rejection_reason, sort.sort_rejection_reason) and
                 std.mem.eql(u8, existing.budget_rejection_reason, sort.budget_rejection_reason))
             {
@@ -119,6 +131,12 @@ pub const Collector = struct {
         errdefer self.alloc.free(owned_name);
         const owned_sort_plan = try self.alloc.dupe(u8, sort.plan);
         errdefer self.alloc.free(owned_sort_plan);
+        const owned_sort_exactness = try self.alloc.dupe(u8, sort.exactness);
+        errdefer self.alloc.free(owned_sort_exactness);
+        const owned_sort_source = try self.alloc.dupe(u8, sort.source);
+        errdefer self.alloc.free(owned_sort_source);
+        const owned_sort_selection_reason = try self.alloc.dupe(u8, sort.selection_reason);
+        errdefer self.alloc.free(owned_sort_selection_reason);
         const owned_sort_rejection_reason = try self.alloc.dupe(u8, sort.sort_rejection_reason);
         errdefer self.alloc.free(owned_sort_rejection_reason);
         const owned_budget_rejection_reason = try self.alloc.dupe(u8, sort.budget_rejection_reason);
@@ -127,6 +145,9 @@ pub const Collector = struct {
             .name = owned_name,
             .query_type = query_type,
             .sort_plan = owned_sort_plan,
+            .sort_exactness = owned_sort_exactness,
+            .sort_source = owned_sort_source,
+            .sort_selection_reason = owned_sort_selection_reason,
             .sort_rejection_reason = owned_sort_rejection_reason,
             .budget_rejection_reason = owned_budget_rejection_reason,
         });
@@ -157,9 +178,16 @@ pub fn observeSortProfile(name: ?[]const u8, query_type: QueryType, duration_ns:
     const profile = sort_profile orelse return observe(name, query_type, duration_ns);
     observeWithSortLabels(name, query_type, duration_ns, .{
         .plan = profile.plan,
+        .exactness = profile.exactness,
+        .source = profile.source,
+        .selection_reason = profile.selection_reason,
         .sort_rejection_reason = profile.sort_rejection_reason,
         .budget_rejection_reason = profile.budget_rejection_reason,
     });
+}
+
+pub fn observeSortRejection(name: ?[]const u8, query_type: QueryType, duration_ns: u64, reason: []const u8, detail: []const u8) void {
+    observeWithSortLabels(name, query_type, duration_ns, sortRejectionMetricLabels(reason, detail));
 }
 
 pub fn observeWithSortLabels(name: ?[]const u8, query_type: QueryType, duration_ns: u64, sort: SortMetricLabels) void {
@@ -168,6 +196,17 @@ pub fn observeWithSortLabels(name: ?[]const u8, query_type: QueryType, duration_
     defer default_mutex.unlock();
     default_collector.observeWithSortLabels(resolved_name, query_type, duration_ns, sort) catch |err| {
         std.log.err("failed to record index query latency metric: {s}", .{@errorName(err)});
+    };
+}
+
+fn sortRejectionMetricLabels(reason: []const u8, detail: []const u8) SortMetricLabels {
+    return .{
+        .plan = "unsupported_exact_sort",
+        .exactness = "unsupported",
+        .source = "unsupported",
+        .selection_reason = "unsupported_exact_sort",
+        .sort_rejection_reason = reason,
+        .budget_rejection_reason = if (std.mem.eql(u8, reason, "candidate_budget_exceeded")) detail else "",
     };
 }
 
@@ -189,6 +228,12 @@ fn writeHistogramBucket(
     try writePromLabelValue(writer, entry.query_type.label());
     try writer.print("\",sort_plan=\"", .{});
     try writePromLabelValue(writer, entry.sort_plan);
+    try writer.print("\",sort_exactness=\"", .{});
+    try writePromLabelValue(writer, entry.sort_exactness);
+    try writer.print("\",sort_source=\"", .{});
+    try writePromLabelValue(writer, entry.sort_source);
+    try writer.print("\",sort_selection_reason=\"", .{});
+    try writePromLabelValue(writer, entry.sort_selection_reason);
     try writer.print("\",sort_rejection_reason=\"", .{});
     try writePromLabelValue(writer, entry.sort_rejection_reason);
     try writer.print("\",budget_rejection_reason=\"", .{});
@@ -210,6 +255,12 @@ fn writeHistogramSample(
     try writePromLabelValue(writer, entry.query_type.label());
     try writer.print("\",sort_plan=\"", .{});
     try writePromLabelValue(writer, entry.sort_plan);
+    try writer.print("\",sort_exactness=\"", .{});
+    try writePromLabelValue(writer, entry.sort_exactness);
+    try writer.print("\",sort_source=\"", .{});
+    try writePromLabelValue(writer, entry.sort_source);
+    try writer.print("\",sort_selection_reason=\"", .{});
+    try writePromLabelValue(writer, entry.sort_selection_reason);
     try writer.print("\",sort_rejection_reason=\"", .{});
     try writePromLabelValue(writer, entry.sort_rejection_reason);
     try writer.print("\",budget_rejection_reason=\"", .{});
@@ -235,6 +286,9 @@ test "collector writes Prometheus histogram for index query latency" {
     try collector.observe("docs", .search, std.time.ns_per_ms);
     try collector.observeWithSortLabels("docs", .search, 2 * std.time.ns_per_ms, .{
         .plan = "native_doc_values_top_n",
+        .exactness = "exact",
+        .source = "doc_values_collector",
+        .selection_reason = "doc_values_collector",
         .sort_rejection_reason = "missing_doc_values_coverage",
         .budget_rejection_reason = "match_all_candidate_collect_limit",
     });
@@ -246,8 +300,34 @@ test "collector writes Prometheus histogram for index query latency" {
     const output = writer.buffered();
 
     try std.testing.expect(std.mem.indexOf(u8, output, "# TYPE antfly_indexes_query_duration_seconds histogram") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_indexes_query_duration_seconds_bucket{Name=\"docs\",query_type=\"search\",sort_plan=\"\",sort_rejection_reason=\"\",budget_rejection_reason=\"\",le=\"0.001\"} 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_indexes_query_duration_seconds_count{Name=\"docs\",query_type=\"search\",sort_plan=\"\",sort_rejection_reason=\"\",budget_rejection_reason=\"\"} 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_indexes_query_duration_seconds_bucket{Name=\"docs\",query_type=\"search\",sort_plan=\"native_doc_values_top_n\",sort_rejection_reason=\"missing_doc_values_coverage\",budget_rejection_reason=\"match_all_candidate_collect_limit\",le=\"0.005\"} 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_indexes_query_duration_seconds_bucket{Name=\"vec\\\"tors\",query_type=\"vector\",sort_plan=\"\",sort_rejection_reason=\"\",budget_rejection_reason=\"\",le=\"2.5\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_indexes_query_duration_seconds_bucket{Name=\"docs\",query_type=\"search\",sort_plan=\"\",sort_exactness=\"\",sort_source=\"\",sort_selection_reason=\"\",sort_rejection_reason=\"\",budget_rejection_reason=\"\",le=\"0.001\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_indexes_query_duration_seconds_count{Name=\"docs\",query_type=\"search\",sort_plan=\"\",sort_exactness=\"\",sort_source=\"\",sort_selection_reason=\"\",sort_rejection_reason=\"\",budget_rejection_reason=\"\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_indexes_query_duration_seconds_bucket{Name=\"docs\",query_type=\"search\",sort_plan=\"native_doc_values_top_n\",sort_exactness=\"exact\",sort_source=\"doc_values_collector\",sort_selection_reason=\"doc_values_collector\",sort_rejection_reason=\"missing_doc_values_coverage\",budget_rejection_reason=\"match_all_candidate_collect_limit\",le=\"0.005\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_indexes_query_duration_seconds_bucket{Name=\"vec\\\"tors\",query_type=\"vector\",sort_plan=\"\",sort_exactness=\"\",sort_source=\"\",sort_selection_reason=\"\",sort_rejection_reason=\"\",budget_rejection_reason=\"\",le=\"2.5\"} 1") != null);
+}
+
+test "sort rejection metrics use stable unsupported exact-sort labels" {
+    var collector = Collector.init(std.testing.allocator);
+    defer collector.deinit();
+
+    const labels = sortRejectionMetricLabels("candidate_budget_exceeded", "match_all_candidate_collect_limit");
+    try std.testing.expectEqualStrings("unsupported_exact_sort", labels.plan);
+    try std.testing.expectEqualStrings("unsupported", labels.exactness);
+    try std.testing.expectEqualStrings("unsupported", labels.source);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", labels.selection_reason);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", labels.sort_rejection_reason);
+    try std.testing.expectEqualStrings("match_all_candidate_collect_limit", labels.budget_rejection_reason);
+
+    const non_budget_labels = sortRejectionMetricLabels("missing_doc_values_coverage", "missing_doc_values_section");
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", non_budget_labels.sort_rejection_reason);
+    try std.testing.expectEqualStrings("", non_budget_labels.budget_rejection_reason);
+
+    try collector.observeWithSortLabels("docs", .search, 2 * std.time.ns_per_ms, labels);
+
+    var writer_buf: [32768]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&writer_buf);
+    try collector.writePrometheus(&writer);
+    const output = writer.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "sort_plan=\"unsupported_exact_sort\",sort_exactness=\"unsupported\",sort_source=\"unsupported\",sort_selection_reason=\"unsupported_exact_sort\",sort_rejection_reason=\"candidate_budget_exceeded\",budget_rejection_reason=\"match_all_candidate_collect_limit\"") != null);
 }

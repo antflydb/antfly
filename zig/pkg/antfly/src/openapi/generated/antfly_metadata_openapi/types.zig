@@ -1742,6 +1742,8 @@ pub const SortProfile = struct {
     source_load: ?[]const u8 = null,
     /// Distributed sort behavior.
     distributed_behavior: ?[]const u8 = null,
+    /// Stable reason the planner selected this sort plan.
+    selection_reason: ?[]const u8 = null,
     /// Whether exact execution required native typed sort values.
     require_native: ?bool = null,
     /// Candidate documents considered by sort execution.
@@ -1754,6 +1756,8 @@ pub const SortProfile = struct {
     total_us: ?i64 = null,
     /// Shards participating in distributed sort execution.
     distributed_shard_count: ?i64 = null,
+    /// Largest shard-local sorted window merged by the coordinator.
+    distributed_shard_window: ?i64 = null,
     /// Stable budget rejection reason.
     budget_rejection_reason: ?[]const u8 = null,
     /// Stable exact-sort rejection reason.

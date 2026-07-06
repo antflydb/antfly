@@ -5612,6 +5612,8 @@ export interface components {
             source_load?: string;
             /** @description Distributed sort behavior. */
             distributed_behavior?: string;
+            /** @description Stable reason the planner selected this sort plan. */
+            selection_reason?: string;
             /** @description Whether exact execution required native typed sort values. */
             require_native?: boolean;
             /**
@@ -5639,6 +5641,11 @@ export interface components {
              * @description Shards participating in distributed sort execution.
              */
             distributed_shard_count?: number;
+            /**
+             * Format: int64
+             * @description Largest shard-local sorted window merged by the coordinator.
+             */
+            distributed_shard_window?: number;
             /** @description Stable budget rejection reason. */
             budget_rejection_reason?: string;
             /** @description Stable exact-sort rejection reason. */
