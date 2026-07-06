@@ -7842,6 +7842,7 @@ pub const ProvisionedTableWriteSource = struct {
                 identity_namespace,
                 .{
                     .inference_api_url = self.inference_api_url,
+                    .drain_resolver_backfill = false,
                 },
             );
             defer if (opened) |*db| db.close();
@@ -7850,7 +7851,9 @@ pub const ProvisionedTableWriteSource = struct {
             // and enrichments are provisioned through the managed-open path, but
             // resolvers are not, so do it here (idempotent: addResolver skips
             // names that already exist on reopen).
-            _ = try metadata_table_provisioner.ensureResolvers(alloc, &opened.?, indexes_json);
+            _ = try metadata_table_provisioner.ensureResolversWithOptions(alloc, &opened.?, indexes_json, .{
+                .drain_backfill = false,
+            });
             if (seed_create_table_writer) {
                 try self.write_cache.?.seedCreatedDbLocked(&opened, group_id, lsm_root_generation, table_name, indexes_json, schema_json);
             } else {
