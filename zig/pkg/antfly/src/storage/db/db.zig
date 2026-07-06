@@ -11254,6 +11254,11 @@ pub const DB = struct {
         exec_ctx: types.ExecutionContext,
     ) !types.SearchResult {
         _ = exec_ctx;
+        const metric_name = composedQueryMetricIndexName(req);
+        const start_ns = platform_time.monotonicNs();
+        errdefer if (db_query_search.peekLastSortRejectionDiagnostic()) |diagnostic| {
+            db_query_metrics.observeSortRejection(metric_name, .search, platform_time.monotonicNs() -| start_ns, diagnostic.reason, diagnostic.detail);
+        };
         return try db_query_search.searchComposed(alloc, req, .{
             .ctx = self,
             .resolve_structured_doc_filter = resolveStructuredDocFilterForComposedCallback,
@@ -11267,6 +11272,14 @@ pub const DB = struct {
             .resolve_hits_to_doc_set = resolveSearchHitsToDocSetCallback,
             .attach_graph_results = attachGraphResultsCallback,
         });
+    }
+
+    fn composedQueryMetricIndexName(req: types.SearchRequest) ?[]const u8 {
+        if (req.index_name) |name| return name;
+        if (req.full_text_queries.len > 0) return req.full_text_queries[0].index_name;
+        if (req.dense_queries.len > 0) return req.dense_queries[0].index_name;
+        if (req.sparse_queries.len > 0) return req.sparse_queries[0].index_name;
+        return null;
     }
 
     fn resolveStructuredDocFilterForComposedCallback(
@@ -11903,7 +11916,7 @@ pub const DB = struct {
         if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
         const metric_name = self.denseQueryMetricIndexName(req);
         const start_ns = platform_time.monotonicNs();
-        defer db_query_metrics.observe(metric_name, .vector, platform_time.monotonicNs() -| start_ns);
+        errdefer observeSearchFailureMetric(metric_name, .vector, platform_time.monotonicNs() -| start_ns);
         const bench_profile = benchQueryProfileEnabled();
         const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         var algebraic_ns: u64 = 0;
@@ -11944,6 +11957,7 @@ pub const DB = struct {
                 .{ (platform_time.monotonicNs() - total_start_ns) / 1000, algebraic_ns / 1000, prove_ns / 1000, inner_ns / 1000 },
             );
         }
+        db_query_metrics.observeSortProfile(metric_name, .vector, platform_time.monotonicNs() -| start_ns, result.sort_profile);
         return result;
     }
 
@@ -12012,7 +12026,7 @@ pub const DB = struct {
         if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
         const metric_name = self.sparseQueryMetricIndexName(req);
         const start_ns = platform_time.monotonicNs();
-        defer db_query_metrics.observe(metric_name, .vector, platform_time.monotonicNs() -| start_ns);
+        errdefer observeSearchFailureMetric(metric_name, .vector, platform_time.monotonicNs() -| start_ns);
         const bench_profile = benchQueryProfileEnabled();
         const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         var algebraic_ns: u64 = 0;
@@ -12047,6 +12061,7 @@ pub const DB = struct {
                 .{ (platform_time.monotonicNs() - total_start_ns) / 1000, algebraic_ns / 1000, prove_ns / 1000, inner_ns / 1000 },
             );
         }
+        db_query_metrics.observeSortProfile(metric_name, .vector, platform_time.monotonicNs() -| start_ns, result.sort_profile);
         return result;
     }
 
