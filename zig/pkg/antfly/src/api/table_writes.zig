@@ -345,6 +345,7 @@ fn artifactRepairRunRequestForShard(
         .force = req.force,
         .repair_job_id = req.repair_job_id,
         .repair_attempt_id = req.repair_attempt_id,
+        .repair_cancel_base_uri = req.repair_cancel_base_uri,
     };
 }
 
@@ -358,6 +359,7 @@ test "artifact repair shard run request preserves repair target" {
         .force = true,
         .repair_job_id = 42,
         .repair_attempt_id = 7,
+        .repair_cancel_base_uri = "http://node-a",
     }, 2, "idx_c");
 
     try std.testing.expectEqual(db_mod.types.RepairTarget.index, shard_req.target);
@@ -368,6 +370,7 @@ test "artifact repair shard run request preserves repair target" {
     try std.testing.expect(shard_req.force);
     try std.testing.expectEqual(@as(u64, 42), shard_req.repair_job_id.?);
     try std.testing.expectEqual(@as(u64, 7), shard_req.repair_attempt_id.?);
+    try std.testing.expectEqualStrings("http://node-a", shard_req.repair_cancel_base_uri.?);
 }
 
 fn cloneArtifactRepairIssueAlloc(alloc: std.mem.Allocator, issue: db_mod.types.ArtifactRepairIssue) !db_mod.types.ArtifactRepairIssue {
@@ -11038,6 +11041,11 @@ pub const HostedProvisionedTableWriteSource = struct {
 
         var total = db_mod.types.ArtifactRepairResult{ .limit = req.limit };
         errdefer total.deinit(alloc);
+        var repair_cancel_base_uri: ?[]u8 = null;
+        defer if (repair_cancel_base_uri) |uri| alloc.free(uri);
+        if (req.repair_job_id != null and req.repair_attempt_id != null) {
+            repair_cancel_base_uri = try self.router.nodeBaseUri(alloc, self.router.localNodeId());
+        }
         var groups_scanned: usize = 0;
         for (group_ids[start_index..], start_index..) |group_id, idx| {
             if (options.cancelled()) return error.Canceled;
@@ -11055,8 +11063,6 @@ pub const HostedProvisionedTableWriteSource = struct {
             }
             const remaining: u32 = if (req.limit == 0) 0 else @intCast(req.limit - @as(u32, @intCast(total.scanned)));
             const group_req = artifactRepairRunRequestForShard(req, remaining, if (idx == start_index) start_cursor else null);
-            const body = try std.json.Stringify.valueAlloc(alloc, group_req, .{ .emit_null_optional_fields = false });
-            defer alloc.free(body);
 
             var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
             var group_result = if (resolved_route) |*route| blk: {
@@ -11065,6 +11071,16 @@ pub const HostedProvisionedTableWriteSource = struct {
                     .local => (try repairArtifactIssuesGroupLocalControlled(ptr, alloc, group_id, table_name, group_req, options)) orelse continue,
                     .remote => |remote| remote_blk: {
                         if (options.cancelled()) return error.Canceled;
+                        var remote_req = group_req;
+                        if (repair_cancel_base_uri) |uri| {
+                            remote_req.repair_cancel_base_uri = uri;
+                        } else {
+                            remote_req.repair_job_id = null;
+                            remote_req.repair_attempt_id = null;
+                            remote_req.repair_cancel_base_uri = null;
+                        }
+                        const body = try std.json.Stringify.valueAlloc(alloc, remote_req, .{ .emit_null_optional_fields = false });
+                        defer alloc.free(body);
                         var client = http_client.ApiHttpClient.init(alloc, self.executor);
                         var response = client.fetchGroupArtifactRepairRun(remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
                             else => return err,

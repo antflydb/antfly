@@ -3581,6 +3581,7 @@ pub const ApiHttpServer = struct {
                 .shard_db_adapter = self.cfg.shard_db_adapter,
                 .writes = self.table_writes,
                 .repair_job_store = &self.repair_job_store,
+                .repair_cancel_executor = self.cfg.session_executor,
                 .batch_validator = .{
                     .ptr = self,
                     .validate = validateInternalGroupBatchWrites,

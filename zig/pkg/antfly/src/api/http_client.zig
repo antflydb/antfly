@@ -74,6 +74,10 @@ pub const ScanResponse = struct {
     }
 };
 
+pub const RepairCancelStateResponse = struct {
+    cancel_requested: bool = false,
+};
+
 pub const QueryResponse = struct {
     content_type: ?[]u8 = null,
     body: []u8,
@@ -1646,6 +1650,40 @@ pub const ApiHttpClient = struct {
             200, 202 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
             404 => return error.NotFound,
             409 => return remoteGroupConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
+    }
+
+    pub fn fetchTableRepairCancelRequested(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        job_id: u64,
+        attempt_id: u64,
+    ) !bool {
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{d}/attempts/{d}/cancel-state", .{
+            routes.Routes.internal_tables_prefix,
+            table_name,
+            routes.Routes.repair_jobs_marker,
+            job_id,
+            attempt_id,
+        });
+        defer self.alloc.free(path);
+        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executor.execute(self.alloc, .{
+            .method = .GET,
+            .uri = uri,
+        });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200 => {
+                var parsed = try parseJsonBody(RepairCancelStateResponse, self.alloc, resp.body);
+                defer parsed.deinit();
+                return parsed.value.cancel_requested;
+            },
+            404 => return true,
             else => return error.UnexpectedHttpStatus,
         }
     }
