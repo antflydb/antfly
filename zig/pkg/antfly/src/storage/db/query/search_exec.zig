@@ -7426,10 +7426,24 @@ fn sortAndPageMatchAllSortedSegmentsAlloc(
     try validateSortExecutionPlanForRuntime(effective_req, plan, native_loader);
     try checkSearchRequestDeadline(effective_req);
 
-    const snapshot = text_entry.persistent.snapshot();
-    const reverse = effective_req.search_before.len > 0;
     const bench_query_profile = shouldLogBenchQueryProfile();
     const collect_sort_profile = bench_query_profile or effective_req.profile;
+    if (effective_req.limit == 0) {
+        var zero_profile = SortCollectorProfile{};
+        zero_profile.window_capacity = 0;
+        zero_profile.sorted_segment_scan_budget = sortedSegmentScanBudget();
+        return .{
+            .alloc = alloc,
+            .hits = &.{},
+            .total_hits = 0,
+            .total_hits_relation = .gte,
+            .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, true, zero_profile) else null,
+            .graph_results = &.{},
+        };
+    }
+
+    const snapshot = text_entry.persistent.snapshot();
+    const reverse = effective_req.search_before.len > 0;
     const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
     var profile = SortCollectorProfile{};
     const scan_budget = sortedSegmentScanBudget();
@@ -11212,8 +11226,10 @@ fn loadMissingProjectedDenseHitDocuments(
 ) !ProjectedSourceLoadProfile {
     const start_ns = platform_time.monotonicNs();
     var profile = ProjectedSourceLoadProfile{};
-    for (hits) |*hit| {
+    try checkSearchRequestDeadline(req);
+    for (hits, 0..) |*hit, i| {
         if (hit.stored_data != null) continue;
+        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
         profile.requested_count += 1;
         hit.stored_data = try executor.load_projected_document(executor.ctx, alloc, req, hit.id);
         profile.loaded_count += 1;
@@ -11695,6 +11711,7 @@ fn loadMissingProjectedSparseHitDocuments(
 ) !ProjectedSourceLoadProfile {
     const start_ns = platform_time.monotonicNs();
     var profile = ProjectedSourceLoadProfile{};
+    try checkSearchRequestDeadline(req);
     var missing_count: usize = 0;
     for (hits) |hit| {
         if (hit.stored_data == null) missing_count += 1;
@@ -11706,6 +11723,7 @@ fn loadMissingProjectedSparseHitDocuments(
     }
 
     if (executor.load_projected_documents) |load_many| {
+        try checkSearchRequestDeadline(req);
         const keys = try alloc.alloc([]const u8, missing_count);
         defer alloc.free(keys);
         var key_count: usize = 0;
@@ -11721,8 +11739,9 @@ fn loadMissingProjectedSparseHitDocuments(
         if (loaded.len != keys.len) return error.InvalidSearchResult;
 
         var loaded_index: usize = 0;
-        for (hits) |*hit| {
+        for (hits, 0..) |*hit, i| {
             if (hit.stored_data != null) continue;
+            if (i % 1024 == 0) try checkSearchRequestDeadline(req);
             const stored = loaded[loaded_index] orelse return error.StoredDocMissing;
             hit.stored_data = stored;
             loaded[loaded_index] = null;
@@ -11733,8 +11752,9 @@ fn loadMissingProjectedSparseHitDocuments(
         return profile;
     }
 
-    for (hits) |*hit| {
+    for (hits, 0..) |*hit, i| {
         if (hit.stored_data != null) continue;
+        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
         hit.stored_data = try executor.load_projected_document(executor.ctx, alloc, req, hit.id);
         profile.loaded_count += 1;
         profile.batch_count += 1;
@@ -11800,6 +11820,7 @@ fn loadMissingProjectedMatchAllHitDocuments(
     var profile = ProjectedSourceLoadProfile{};
     errdefer profile.total_ns = platform_time.monotonicNs() - start_ns;
 
+    try checkSearchRequestDeadline(req);
     var missing_count: usize = 0;
     for (hits) |hit| {
         if (hit.stored_data == null) missing_count += 1;
@@ -11811,6 +11832,7 @@ fn loadMissingProjectedMatchAllHitDocuments(
     }
 
     if (executor.load_projected_documents) |load_many| {
+        try checkSearchRequestDeadline(req);
         const keys = try alloc.alloc([]const u8, missing_count);
         defer alloc.free(keys);
         var key_count: usize = 0;
@@ -11826,8 +11848,9 @@ fn loadMissingProjectedMatchAllHitDocuments(
         if (loaded.len != keys.len) return error.InvalidSearchResult;
 
         var loaded_index: usize = 0;
-        for (hits) |*hit| {
+        for (hits, 0..) |*hit, i| {
             if (hit.stored_data != null) continue;
+            if (i % 1024 == 0) try checkSearchRequestDeadline(req);
             const stored = loaded[loaded_index] orelse return error.StoredDocMissing;
             hit.stored_data = stored;
             loaded[loaded_index] = null;
@@ -11838,8 +11861,9 @@ fn loadMissingProjectedMatchAllHitDocuments(
         return profile;
     }
 
-    for (hits) |*hit| {
+    for (hits, 0..) |*hit, i| {
         if (hit.stored_data != null) continue;
+        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
         hit.stored_data = try executor.load_projected_document(executor.ctx, alloc, req, hit.id);
         profile.loaded_count += 1;
         profile.batch_count += 1;
@@ -11856,8 +11880,10 @@ fn loadMissingProjectedTextHitDocuments(
 ) !ProjectedSourceLoadProfile {
     const start_ns = platform_time.monotonicNs();
     var profile = ProjectedSourceLoadProfile{};
-    for (hits) |*hit| {
+    try checkSearchRequestDeadline(req);
+    for (hits, 0..) |*hit, i| {
         if (hit.stored_data != null) continue;
+        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
         profile.requested_count += 1;
         const stored = (try executor.load_stored(executor.ctx, alloc, hit.id)) orelse return error.StoredDocMissing;
         defer alloc.free(stored);
@@ -13291,17 +13317,23 @@ pub fn searchMatchAll(
     const end_usize: usize = @intCast(end);
 
     var hits = try alloc.alloc(types.SearchHit, end_usize - start_usize);
-    errdefer alloc.free(hits);
+    var initialized: usize = 0;
+    errdefer {
+        for (hits[0..initialized]) |*hit| hit.deinit(alloc);
+        if (hits.len > 0) alloc.free(hits);
+    }
 
     for (candidates.items, 0..) |*candidate, i| {
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
         if (i < start_usize or i >= end_usize) continue;
-        hits[i - start_usize] = .{
+        const out_index = i - start_usize;
+        hits[out_index] = .{
             .id = candidate.id,
             .doc_ordinal = candidate.ordinal,
             .score = 1.0,
-            .stored_data = if (postprocess_req.include_stored) try executor.load_projected_document(executor.ctx, alloc, postprocess_req, candidate.id) else null,
+            .stored_data = null,
         };
+        initialized += 1;
         candidate.id = @constCast(&[_]u8{});
     }
 
@@ -13311,7 +13343,11 @@ pub fn searchMatchAll(
         .total_hits = total_hits,
         .graph_results = &.{},
     };
+    initialized = 0;
     errdefer out.deinit();
+    if (postprocess_req.include_stored) {
+        _ = try loadMissingProjectedMatchAllHitDocuments(alloc, postprocess_req, executor, out.hits);
+    }
     return out;
 }
 
@@ -20457,6 +20493,86 @@ test "match_all sorted segment seek checks deadline while scanning" {
     try std.testing.expectEqual(@as(u64, 1), scanned_count);
 }
 
+test "match_all sorted segment seek zero limit returns profile without scanning" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-zero-limit", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const segment = try buildTestSortedPriceSegmentAlloc(alloc, &.{
+        .{ .id = "doc:000", .price = 0.0, .ordinal = 1000 },
+    });
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = testSortedPriceSchema(),
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const order_by = [_]types.SortField{
+        .{ .field = "price" },
+        .{ .field = "_id" },
+    };
+    const sorted_plan = SortExecutionPlan{
+        .kind = .sorted_segment_seek,
+        .require_native = true,
+        .runtime_schema = text_entry.runtime_schema,
+        .index_sort_match = true,
+        .sorted_segment_executor_available = true,
+        .sorted_segment_bounds_available = true,
+    };
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = text_entry.persistent.snapshot() };
+    const native_loader = NativeSortValueLoader{
+        .ctx = @constCast(&native_sort_ctx),
+        .require_native = true,
+        .load = loadTextDocValueSortValue,
+    };
+    const executor = MatchAllExecutor{
+        .ctx = null,
+        .collect_candidates = undefined,
+        .text_index_entry = undefined,
+        .load_projected_document = undefined,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    };
+    const constraints = NativeDocIdConstraints{};
+
+    var result = try sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 0,
+    }, executor, &constraints, &text_entry, sorted_plan, native_loader, null);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, result.total_hits_relation);
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", profile.plan);
+    try std.testing.expectEqual(@as(u64, 0), profile.sorted_segment_scanned_count);
+    try std.testing.expect(profile.sorted_segment_scan_budget > 0);
+}
+
 test "match_all sorted segment seek rejects cursor when segment bounds are unavailable" {
     const alloc = std.testing.allocator;
 
@@ -20779,6 +20895,58 @@ test "text field sort source loading happens only for selected missing hits" {
     try std.testing.expectEqualStrings("{\"id\":\"doc:b\"}", result.hits[1].stored_data.?);
 }
 
+test "text projected source load rejects expired deadline before stored load" {
+    const alloc = std.testing.allocator;
+
+    const Harness = struct {
+        load_count: usize = 0,
+        project_count: usize = 0,
+
+        fn loadStored(ctx: ?*anyopaque, load_alloc: Allocator, key: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.load_count += 1;
+            return try std.fmt.allocPrint(load_alloc, "{{\"id\":\"{s}\"}}", .{key});
+        }
+
+        fn projectStored(
+            ctx: ?*anyopaque,
+            project_alloc: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+            raw: []const u8,
+        ) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.project_count += 1;
+            return try project_alloc.dupe(u8, raw);
+        }
+    };
+
+    var harness = Harness{};
+    var hits = try alloc.alloc(types.SearchHit, 1);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a") };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    try std.testing.expectError(error.Timeout, loadMissingProjectedTextHitDocuments(alloc, .{
+        .execution_deadline_ns = 0,
+    }, .{
+        .ctx = &harness,
+        .text_index_entry = undefined,
+        .text_index_is_chunk_backed = undefined,
+        .search_match_all = undefined,
+        .project_stored_search = Harness.projectStored,
+        .load_stored = Harness.loadStored,
+        .postprocess = undefined,
+    }, result.hits));
+    try std.testing.expectEqual(@as(usize, 0), harness.load_count);
+    try std.testing.expectEqual(@as(usize, 0), harness.project_count);
+}
+
 fn testMatchAllExecutor(ctx: *const TestMatchAllCtx) MatchAllExecutor {
     return .{
         .ctx = @constCast(ctx),
@@ -20792,6 +20960,35 @@ fn testMatchAllExecutor(ctx: *const TestMatchAllCtx) MatchAllExecutor {
         .load_projected_documents = testMatchAllLoadProjectedManyCallback,
         .load_stored = testMatchAllLoadStoredCallback,
     };
+}
+
+test "match_all projected source load rejects expired deadline before batch load" {
+    const alloc = std.testing.allocator;
+
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a") };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b") };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    var projected_batch_count: usize = 0;
+    var projected_batch_doc_count: usize = 0;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{},
+        .projected_batch_count = &projected_batch_count,
+        .projected_batch_doc_count = &projected_batch_doc_count,
+    };
+
+    try std.testing.expectError(error.Timeout, loadMissingProjectedMatchAllHitDocuments(alloc, .{
+        .execution_deadline_ns = 0,
+    }, testMatchAllExecutor(&ctx), result.hits));
+    try std.testing.expectEqual(@as(usize, 0), projected_batch_count);
+    try std.testing.expectEqual(@as(usize, 0), projected_batch_doc_count);
 }
 
 test "match_all applies explicit doc id constraints before paging" {
@@ -22020,6 +22217,40 @@ test "match_all ordered source loads only selected hits" {
     try std.testing.expectEqualStrings("projected_source_after_page", profile.source_load);
     try std.testing.expectEqual(@as(u64, 0), profile.stored_json_load_count);
     try std.testing.expectEqual(@as(u64, 1), profile.projected_source_load_count);
+}
+
+test "match_all unordered source loads selected hits through projected batch" {
+    const alloc = std.testing.allocator;
+    var collect_count: usize = 0;
+    var projected_load_count: usize = 0;
+    var projected_batch_count: usize = 0;
+    var projected_batch_doc_count: usize = 0;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+        .collect_count = &collect_count,
+        .projected_load_count = &projected_load_count,
+        .projected_batch_count = &projected_batch_count,
+        .projected_batch_doc_count = &projected_batch_doc_count,
+    };
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+    var result = try searchMatchAll(alloc, .{
+        .include_stored = true,
+        .offset = 1,
+        .limit = 1,
+    }, executor);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expect(result.hits[0].stored_data != null);
+    try std.testing.expectEqual(@as(u32, 3), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), collect_count);
+    try std.testing.expectEqual(@as(usize, 0), projected_load_count);
+    try std.testing.expectEqual(@as(usize, 1), projected_batch_count);
+    try std.testing.expectEqual(@as(usize, 1), projected_batch_doc_count);
 }
 
 test "match_all rejects invalid sort cursor contract" {

@@ -111,6 +111,7 @@ pub const IPRangeQuery = struct {
     boost: ?Boost = null,
 };
 
+/// Geographic bounding box filter. Longitude ranges may cross the antimeridian by specifying a western/min longitude that is greater than the eastern/max longitude; for example, 179.5 to -179.5 matches points near +/-180 degrees longitude.
 pub const GeoBoundingBoxQuery = struct {
     /// [lon, lat]
     top_left: []const f64,

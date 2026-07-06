@@ -2103,12 +2103,10 @@ fn appendMappedGeoPointTextField(
 ) !void {
     if (!mapping.do_index or mapping.field_type != .geopoint) return;
     const point = jsonValueToMappedGeoPoint(value) orelse return;
-    var precision = geo_mod.min_index_geohash_precision;
-    while (precision <= geo_mod.max_index_geohash_precision) : (precision += 1) {
-        const geohash = geo_mod.encode(.{ .lat = point.lat, .lon = point.lon }, precision);
-        const term = try alloc.dupe(u8, geohash[0..precision]);
-        try appendNamedTextField(alloc, fields, path, term, "keyword", false, text_analysis);
-    }
+    const precision = geo_mod.index_geohash_precision;
+    const geohash = geo_mod.encode(.{ .lat = point.lat, .lon = point.lon }, precision);
+    const term = try alloc.dupe(u8, geohash[0..precision]);
+    try appendNamedTextField(alloc, fields, path, term, "keyword", false, text_analysis);
 }
 
 fn appendMappedTextField(
@@ -3749,19 +3747,19 @@ test "document mapper emits schema geo point typed doc values" {
     try std.testing.expectApproxEqAbs(@as(f64, -122.4194), point.lon, 0.00001);
 
     const inv_reader = (try reader.invertedIndex("location")) orelse return error.TestExpectedEqual;
-    for ([_]u8{ geo_mod.min_index_geohash_precision, geo_mod.max_index_geohash_precision }) |precision| {
-        const geohash = geo_mod.encode(.{ .lat = 37.7749, .lon = -122.4194 }, precision);
-        const lookup = inv_reader.lookup(geohash[0..precision]) orelse return error.TestExpectedEqual;
-        switch (lookup) {
-            .one_hit => |hit| try std.testing.expectEqual(@as(u32, 0), hit.doc_num),
-            .postings => |postings| {
-                var bitmap = try postings.docBitmap(alloc);
-                defer bitmap.deinit();
-                try std.testing.expectEqual(@as(usize, 1), bitmap.cardinality());
-                try std.testing.expect(bitmap.contains(0));
-            },
-        }
+    const geohash = geo_mod.encode(.{ .lat = 37.7749, .lon = -122.4194 }, geo_mod.index_geohash_precision);
+    const lookup = inv_reader.lookup(geohash[0..geo_mod.index_geohash_precision]) orelse return error.TestExpectedEqual;
+    switch (lookup) {
+        .one_hit => |hit| try std.testing.expectEqual(@as(u32, 0), hit.doc_num),
+        .postings => |postings| {
+            var bitmap = try postings.docBitmap(alloc);
+            defer bitmap.deinit();
+            try std.testing.expectEqual(@as(usize, 1), bitmap.cardinality());
+            try std.testing.expect(bitmap.contains(0));
+        },
     }
+    const coarse_geohash = geo_mod.encode(.{ .lat = 37.7749, .lon = -122.4194 }, geo_mod.min_index_geohash_precision);
+    try std.testing.expect(inv_reader.lookup(coarse_geohash[0..geo_mod.min_index_geohash_precision]) == null);
 
     const mapping = runtime_schema.FieldMapping{
         .field_type = .geopoint,

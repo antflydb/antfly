@@ -27,7 +27,6 @@ const math = std.math;
 pub const min_index_geohash_precision: u8 = 2;
 pub const max_index_geohash_precision: u8 = 9;
 pub const index_geohash_precision: u8 = max_index_geohash_precision;
-pub const index_geohash_precision_count: usize = @as(usize, max_index_geohash_precision) - @as(usize, min_index_geohash_precision) + 1;
 pub const max_filter_geohash_cells: usize = 4096;
 
 pub const GeoPoint = struct {
@@ -225,7 +224,8 @@ pub fn coverBoundingBox(
     max_lon: f64,
     precision: u8,
 ) ![][12]u8 {
-    return (try coverBoundingBoxBudgeted(alloc, min_lat, min_lon, max_lat, max_lon, precision, std.math.maxInt(usize))).?;
+    return (try coverBoundingBoxBudgeted(alloc, min_lat, min_lon, max_lat, max_lon, precision, std.math.maxInt(usize))) orelse
+        error.InvalidArgument;
 }
 
 pub fn estimateBoundingBoxCellCount(
@@ -466,6 +466,12 @@ test "cover bounding box enforces budget with hashed deduplication" {
     defer alloc.free(cells);
     try std.testing.expect(cells.len >= 1);
     try std.testing.expect(cells.len <= 128);
+}
+
+test "cover bounding box rejects invalid bounds" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectError(error.InvalidArgument, coverBoundingBox(alloc, 10.0, -122.0, 9.0, -121.0, 5));
 }
 
 test "cover circle" {

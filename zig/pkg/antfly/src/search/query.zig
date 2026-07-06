@@ -980,6 +980,12 @@ const GeoLongitudeRanges = struct {
     len: usize,
 };
 
+const GeoCandidateProfile = struct {
+    cells: usize = 0,
+    direct_lookups: usize = 0,
+    prefix_range_scans: usize = 0,
+};
+
 fn geoCandidateBitmapForBBoxAlloc(
     alloc: Allocator,
     seg: *const index_mod.SegmentEntry,
@@ -1050,17 +1056,29 @@ fn geoCandidateBitmapForRangesAlloc(
     var result = roaring.RoaringBitmap.init(alloc);
     errdefer result.deinit();
 
+    var profile = GeoCandidateProfile{};
     var remaining_cells = geo.max_filter_geohash_cells;
     for (lon_ranges.items[0..lon_ranges.len]) |range| {
         const cells = (try geo.coverBoundingBoxBudgeted(alloc, min_lat, range.min, max_lat, range.max, precision, remaining_cells)) orelse return null;
         defer alloc.free(cells);
         remaining_cells -= cells.len;
+        profile.cells += cells.len;
         for (cells) |cell| {
-            if (inv_reader.lookup(cell[0..precision])) |lookup_result| {
-                try addLookupResultToBitmap(alloc, &result, lookup_result);
-            }
+            try addGeoCellCandidatesToBitmap(alloc, &inv_reader, &result, cell[0..precision], &profile);
         }
     }
+    std.log.debug(
+        "antfly_geo_filter_candidates field={s} precision={d} ranges={d} cells={d} direct_lookups={d} prefix_range_scans={d} candidates={d}",
+        .{
+            field,
+            precision,
+            lon_ranges.len,
+            profile.cells,
+            profile.direct_lookups,
+            profile.prefix_range_scans,
+            result.cardinality(),
+        },
+    );
     return result;
 }
 
@@ -1097,6 +1115,36 @@ fn addLookupResultToBitmap(alloc: Allocator, result: *roaring.RoaringBitmap, loo
             try result.orWith(&bm);
         },
         .one_hit => |h| try result.add(h.doc_num),
+    }
+}
+
+fn addGeoCellCandidatesToBitmap(
+    alloc: Allocator,
+    inv_reader: *const inverted.InvertedIndexReader,
+    result: *roaring.RoaringBitmap,
+    cell_prefix: []const u8,
+    profile: *GeoCandidateProfile,
+) FilterError!void {
+    if (cell_prefix.len >= geo.index_geohash_precision) {
+        profile.direct_lookups += 1;
+        if (inv_reader.lookup(cell_prefix[0..geo.index_geohash_precision])) |lookup_result| {
+            try addLookupResultToBitmap(alloc, result, lookup_result);
+        }
+        return;
+    }
+
+    profile.prefix_range_scans += 1;
+    var end_buf: [13]u8 = undefined;
+    if (cell_prefix.len + 1 > end_buf.len) return error.InvalidData;
+    @memcpy(end_buf[0..cell_prefix.len], cell_prefix);
+    end_buf[cell_prefix.len] = 0xff;
+
+    var term_iter = try inv_reader.rangeTermIterator(cell_prefix, end_buf[0 .. cell_prefix.len + 1]);
+    defer term_iter.deinit();
+
+    while (try term_iter.next()) |entry| {
+        if (!std.mem.startsWith(u8, entry.term, cell_prefix)) break;
+        try addLookupResultToBitmap(alloc, result, entry.result);
     }
 }
 
@@ -1587,16 +1635,12 @@ fn buildGeoTestSegment(alloc: Allocator, points: []const typed_dv.GeoPoint) ![]u
     var inv_builder = inverted.InvertedIndexBuilder.init(alloc, .{});
     defer inv_builder.deinit();
     for (points, 0..) |point, doc_id| {
-        var hashes: [geo.index_geohash_precision_count][12]u8 = undefined;
-        var hits: [geo.index_geohash_precision_count]inverted.InvertedIndexBuilder.TermHit = undefined;
-        var count: usize = 0;
-        var precision = geo.min_index_geohash_precision;
-        while (precision <= geo.max_index_geohash_precision) : (precision += 1) {
-            hashes[count] = geo.encode(.{ .lat = point.lat, .lon = point.lon }, precision);
-            hits[count] = .{ .term = hashes[count][0..precision], .freq = 1 };
-            count += 1;
-        }
-        try inv_builder.addDocument(@intCast(doc_id), hits[0..count]);
+        const hash = geo.encode(.{ .lat = point.lat, .lon = point.lon }, geo.index_geohash_precision);
+        const hits = [_]inverted.InvertedIndexBuilder.TermHit{.{
+            .term = hash[0..geo.index_geohash_precision],
+            .freq = 1,
+        }};
+        try inv_builder.addDocument(@intCast(doc_id), &hits);
     }
     const inv_data = try inv_builder.build();
     defer alloc.free(inv_data);
@@ -2061,6 +2105,36 @@ test "geo filter candidate precision adapts to selective boxes" {
     const regional_ranges = geoSplitLongitudeRanges(-123.0, -121.0);
     const regional_precision = geoCandidatePrecisionForBBox(37.0, 38.0, regional_ranges) orelse return error.TestExpectedEqual;
     try testing.expect(regional_precision < tiny_precision);
+}
+
+test "geo bbox coarse candidates expand max precision geohash terms" {
+    const alloc = testing.allocator;
+
+    const seg_bytes = try buildGeoTestSegment(alloc, &.{
+        .{ .lat = 37.7749, .lon = -122.4194 }, // San Francisco
+        .{ .lat = 40.7128, .lon = -74.0060 }, // New York
+        .{ .lat = 37.8044, .lon = -122.2712 }, // Oakland
+    });
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+
+    const snap = writer.snapshot();
+    const seg = &snap.segments[0];
+
+    const ranges = geoSplitLongitudeRanges(-123.0, -121.0);
+    const precision = geoCandidatePrecisionForBBox(37.0, 38.0, ranges) orelse return error.TestExpectedEqual;
+    try testing.expect(precision < geo.index_geohash_precision);
+
+    var candidates = (try geoCandidateBitmapForRangesAlloc(alloc, seg, "location", 37.0, 38.0, ranges, precision)) orelse
+        return error.TestExpectedEqual;
+    defer candidates.deinit();
+
+    try testing.expect(candidates.contains(0));
+    try testing.expect(!candidates.contains(1));
+    try testing.expect(candidates.contains(2));
 }
 
 test "geo bbox filter supports antimeridian wrapped longitude ranges" {
