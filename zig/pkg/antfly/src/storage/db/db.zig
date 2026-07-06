@@ -32299,6 +32299,30 @@ test "db exact sort resolves explicit keyword metadata filters natively" {
     try std.testing.expectEqual(@as(u64, 2), sort_profile.candidate_count);
     try std.testing.expectEqual(@as(u64, 0), sort_profile.stored_json_load_count);
     try std.testing.expect(sort_profile.native_doc_value_hit_count >= 2);
+
+    var keyword_range = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .primary_text_index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .filter_query_json = "{\"range\":{\"status\":{\"gte\":\"active\",\"lt\":\"draft\"}}}",
+        .order_by = &order,
+        .limit = 10,
+        .include_stored = false,
+        .profile = true,
+    });
+    defer keyword_range.deinit();
+
+    try std.testing.expectEqual(@as(u32, 3), keyword_range.total_hits);
+    try std.testing.expectEqual(@as(usize, 3), keyword_range.hits.len);
+    try std.testing.expectEqualStrings("doc:d", keyword_range.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", keyword_range.hits[1].id);
+    try std.testing.expectEqualStrings("doc:a", keyword_range.hits[2].id);
+    const keyword_range_profile = keyword_range.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", keyword_range_profile.plan);
+    try std.testing.expectEqualStrings("source_free", keyword_range_profile.source_load);
+    try std.testing.expectEqual(@as(u64, 3), keyword_range_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), keyword_range_profile.stored_json_load_count);
+    try std.testing.expect(keyword_range_profile.native_doc_value_hit_count >= 3);
 }
 
 test "db exact sort resolves mapped numeric metadata filters from typed doc values" {
@@ -32357,6 +32381,171 @@ test "db exact sort resolves mapped numeric metadata filters from typed doc valu
     const sort_profile = result.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("native_doc_values_top_n", sort_profile.plan);
     try std.testing.expectEqualStrings("source_free", sort_profile.source_load);
+    try std.testing.expectEqual(@as(u64, 2), sort_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), sort_profile.stored_json_load_count);
+    try std.testing.expect(sort_profile.native_doc_value_hit_count >= 2);
+
+    var standard_range = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .primary_text_index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .filter_query_json = "{\"range\":{\"amount\":{\"gte\":10,\"lt\":20}}}",
+        .order_by = &order,
+        .limit = 10,
+        .include_stored = false,
+        .profile = true,
+    });
+    defer standard_range.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), standard_range.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), standard_range.hits.len);
+    try std.testing.expectEqualStrings("doc:c", standard_range.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", standard_range.hits[1].id);
+    const standard_sort_profile = standard_range.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", standard_sort_profile.plan);
+    try std.testing.expectEqual(@as(u64, 2), standard_sort_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), standard_sort_profile.stored_json_load_count);
+    try std.testing.expect(standard_sort_profile.native_doc_value_hit_count >= 2);
+}
+
+test "db exact sort resolves mapped date metadata filters from typed doc values" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"body":{"type":"string","x-antfly-field":{"type":"text"}},"created_at":{"type":"string","format":"date-time","x-antfly-field":{"type":"date","sortable":true}},"score":{"type":"number","x-antfly-field":{"type":"number","sortable":true}}}}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha\",\"created_at\":\"2026-01-01T00:00:00Z\",\"score\":30}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"beta\",\"created_at\":\"2026-01-02T00:00:00Z\",\"score\":20}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"gamma\",\"created_at\":\"2026-01-03T00:00:00Z\",\"score\":50}" },
+            .{ .key = "doc:d", .value = "{\"body\":\"delta\",\"created_at\":\"2026-01-04T00:00:00Z\",\"score\":40}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const order = [_]types.SortField{.{ .field = "score", .desc = true }};
+    var result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .primary_text_index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .filter_query_json = "{\"date_range\":{\"field\":\"created_at\",\"start\":\"2026-01-02T00:00:00Z\",\"end\":\"2026-01-04T00:00:00Z\",\"inclusive_start\":true,\"inclusive_end\":false}}",
+        .order_by = &order,
+        .limit = 10,
+        .include_stored = false,
+        .profile = true,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:c", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", result.hits[1].id);
+    const sort_profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", sort_profile.plan);
+    try std.testing.expectEqualStrings("source_free", sort_profile.source_load);
+    try std.testing.expectEqual(@as(u64, 2), sort_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), sort_profile.stored_json_load_count);
+    try std.testing.expect(sort_profile.native_doc_value_hit_count >= 2);
+
+    var standard_range = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .primary_text_index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .filter_query_json = "{\"range\":{\"created_at\":{\"gte\":\"2026-01-02\",\"lt\":\"2026-01-04T00:00:00Z\"}}}",
+        .order_by = &order,
+        .limit = 10,
+        .include_stored = false,
+        .profile = true,
+    });
+    defer standard_range.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), standard_range.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), standard_range.hits.len);
+    try std.testing.expectEqualStrings("doc:c", standard_range.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", standard_range.hits[1].id);
+    const standard_sort_profile = standard_range.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", standard_sort_profile.plan);
+    try std.testing.expectEqual(@as(u64, 2), standard_sort_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), standard_sort_profile.stored_json_load_count);
+    try std.testing.expect(standard_sort_profile.native_doc_value_hit_count >= 2);
+}
+
+test "db exact sort resolves mapped boolean metadata filters from typed doc values" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"body":{"type":"string","x-antfly-field":{"type":"text"}},"published":{"type":"boolean","x-antfly-field":{"type":"boolean","sortable":true}},"score":{"type":"number","x-antfly-field":{"type":"number","sortable":true}}}}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha\",\"published\":false,\"score\":30}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"beta\",\"published\":true,\"score\":20}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"gamma\",\"published\":true,\"score\":50}" },
+            .{ .key = "doc:d", .value = "{\"body\":\"delta\",\"published\":false,\"score\":40}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const order = [_]types.SortField{.{ .field = "score", .desc = true }};
+    var result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .primary_text_index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .filter_query_json = "{\"bool_field\":{\"field\":\"published\",\"value\":true}}",
+        .order_by = &order,
+        .limit = 10,
+        .include_stored = false,
+        .profile = true,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:c", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", result.hits[1].id);
+    const sort_profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", sort_profile.plan);
     try std.testing.expectEqual(@as(u64, 2), sort_profile.candidate_count);
     try std.testing.expectEqual(@as(u64, 0), sort_profile.stored_json_load_count);
     try std.testing.expect(sort_profile.native_doc_value_hit_count >= 2);

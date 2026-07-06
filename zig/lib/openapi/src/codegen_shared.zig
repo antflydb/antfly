@@ -25,6 +25,16 @@ const TypeGenerator = @import("codegen_types.zig").TypeGenerator;
 /// Success status codes to check for response types, in priority order.
 pub const success_status_codes = [_][]const u8{ "200", "201", "202", "2XX" };
 
+pub fn sortedStringKeys(arena: Allocator, keys: []const []const u8) ![]const []const u8 {
+    const sorted = try arena.dupe([]const u8, keys);
+    std.sort.pdq([]const u8, sorted, {}, stringLessThan);
+    return sorted;
+}
+
+fn stringLessThan(_: void, left: []const u8, right: []const u8) bool {
+    return std.mem.order(u8, left, right) == .lt;
+}
+
 /// Derive the query-params struct name for an operation.
 pub fn queryParamsTypeName(arena: Allocator, op_id: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, "{s}Params", .{try naming.toTypeName(arena, op_id)});

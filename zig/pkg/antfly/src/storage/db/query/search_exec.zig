@@ -8078,7 +8078,9 @@ fn patternFilterValueToSearchQuery(
             .auto_fuzzy = field_fuzzy.auto_fuzzy,
         } };
     }
+    if (value.object.get("range")) |range_query| return try parseStandardRangeQuery(range_query, runtime_schema);
     if (value.object.get("numeric_range")) |range_query| return .{ .numeric_range = try parseNumericRangeQuery(range_query) };
+    if (value.object.get("date_range")) |range_query| return .{ .date_range = try parseDateRangeQuery(range_query) };
     if (value.object.get("bool_field")) |bool_query| return .{ .bool_field = try parseBoolFieldQuery(bool_query) };
     if (value.object.get("term_range")) |range_query| return .{ .term_range = try parseTermRangeQuery(range_query) };
     if (value.object.get("ip_range")) |range_query| return .{ .ip_range = try parseIpRangeQuery(range_query) };
@@ -8327,6 +8329,78 @@ test "pattern bool filter clauses are merged into required search clauses" {
     try std.testing.expectEqualStrings("doc:must", query.bool_query.must[1].doc_id.ids[0]);
 }
 
+test "pattern date range filter lowers public date and timestamp bounds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed_dates = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"date_range":{"path":"created_at","start":"2026-01-03T00:00:00Z","end":"2026-01-05","inclusive_start":false,"inclusive_end":true}}
+    , .{});
+    const date_query = try patternFilterValueToSearchQuery(alloc, parsed_dates.value, .{}, null);
+    try std.testing.expect(date_query == .date_range);
+    try std.testing.expectEqualStrings("created_at", date_query.date_range.field);
+    try std.testing.expectEqual(runtime_schema_mod.parseDateTimeToNs("2026-01-03T00:00:00Z").?, date_query.date_range.start_ns.?);
+    try std.testing.expectEqual(runtime_schema_mod.parseDateTimeToNs("2026-01-05").?, date_query.date_range.end_ns.?);
+    try std.testing.expect(!date_query.date_range.inclusive_start);
+    try std.testing.expect(date_query.date_range.inclusive_end);
+
+    const parsed_ns = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"date_range":{"field":"created_at","start_ns":1767398400000000000,"end_ns":1767571200000000000}}
+    , .{});
+    const ns_query = try patternFilterValueToSearchQuery(alloc, parsed_ns.value, .{}, null);
+    try std.testing.expect(ns_query == .date_range);
+    try std.testing.expectEqual(@as(u64, 1767398400000000000), ns_query.date_range.start_ns.?);
+    try std.testing.expectEqual(@as(u64, 1767571200000000000), ns_query.date_range.end_ns.?);
+}
+
+test "pattern standard range filter lowers through runtime scalar mappings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &.{
+            .{ .name = "score", .path_match = "score", .mapping = .{ .field_type = .numeric, .doc_values = true, .sortable = true } },
+            .{ .name = "created_at", .path_match = "created_at", .mapping = .{ .field_type = .datetime, .doc_values = true, .sortable = true } },
+            .{ .name = "category", .path_match = "category", .mapping = .{ .field_type = .keyword, .do_index = true, .doc_values = true, .sortable = true, .analyzer = "keyword" } },
+        },
+    };
+
+    const parsed_numeric = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"range":{"score":{"gte":10,"lt":20}}}
+    , .{});
+    const numeric_query = try patternFilterValueToSearchQuery(alloc, parsed_numeric.value, .{}, schema);
+    try std.testing.expect(numeric_query == .numeric_range);
+    try std.testing.expectEqualStrings("score", numeric_query.numeric_range.field);
+    try std.testing.expectEqual(@as(?f64, 10), numeric_query.numeric_range.min);
+    try std.testing.expectEqual(@as(?f64, 20), numeric_query.numeric_range.max);
+    try std.testing.expect(numeric_query.numeric_range.inclusive_min);
+    try std.testing.expect(!numeric_query.numeric_range.inclusive_max);
+
+    const parsed_date = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"range":{"field":"created_at","from":"2026-01-02","to":"2026-01-04T00:00:00Z","include_lower":false,"include_upper":true}}
+    , .{});
+    const date_query = try patternFilterValueToSearchQuery(alloc, parsed_date.value, .{}, schema);
+    try std.testing.expect(date_query == .date_range);
+    try std.testing.expectEqualStrings("created_at", date_query.date_range.field);
+    try std.testing.expectEqual(runtime_schema_mod.parseDateTimeToNs("2026-01-02").?, date_query.date_range.start_ns.?);
+    try std.testing.expectEqual(runtime_schema_mod.parseDateTimeToNs("2026-01-04T00:00:00Z").?, date_query.date_range.end_ns.?);
+    try std.testing.expect(!date_query.date_range.inclusive_start);
+    try std.testing.expect(date_query.date_range.inclusive_end);
+
+    const parsed_keyword = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"range":{"category":{"gte":"beta","lt":"delta"}}}
+    , .{});
+    const keyword_query = try patternFilterValueToSearchQuery(alloc, parsed_keyword.value, .{}, schema);
+    try std.testing.expect(keyword_query == .term_range);
+    try std.testing.expectEqualStrings("category", keyword_query.term_range.field);
+    try std.testing.expectEqualStrings("beta", keyword_query.term_range.min.?);
+    try std.testing.expectEqualStrings("delta", keyword_query.term_range.max.?);
+    try std.testing.expect(keyword_query.term_range.inclusive_min);
+    try std.testing.expect(!keyword_query.term_range.inclusive_max);
+}
+
 fn parseFuzzyOptions(object: anytype, out: *FieldFuzzy) !void {
     if (object.get("max_edits")) |edits| out.max_edits = jsonU8(edits) orelse return error.InvalidArgument;
     if (object.get("prefix_length")) |prefix| out.prefix_len = jsonU8(prefix) orelse return error.InvalidArgument;
@@ -8362,6 +8436,88 @@ fn jsonScalarTermAlloc(alloc: Allocator, value: std.json.Value) ![]const u8 {
     };
 }
 
+const JsonRangeBound = struct {
+    value: std.json.Value,
+    inclusive: bool,
+};
+
+fn parseStandardRangeQuery(
+    value: std.json.Value,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) !search_mod.SearchQuery {
+    if (value != .object) return error.InvalidArgument;
+    if (value.object.get("field") orelse value.object.get("path")) |field_value| {
+        const field = jsonString(field_value) orelse return error.InvalidArgument;
+        return try parseStandardRangeObject(field, value.object, runtime_schema);
+    }
+
+    if (value.object.count() != 1) return error.InvalidArgument;
+    var it = value.object.iterator();
+    const entry = it.next() orelse return error.InvalidArgument;
+    if (entry.value_ptr.* != .object) return error.InvalidArgument;
+    return try parseStandardRangeObject(entry.key_ptr.*, entry.value_ptr.object, runtime_schema);
+}
+
+fn parseStandardRangeObject(
+    field: []const u8,
+    object: anytype,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) !search_mod.SearchQuery {
+    const schema = runtime_schema orelse return error.InvalidArgument;
+    const mapping = runtime_schema_mod.resolveDeclaredFieldType(schema, field) orelse return error.InvalidArgument;
+    const lower = try standardRangeLowerBound(object);
+    const upper = try standardRangeUpperBound(object);
+    if (lower == null and upper == null) return error.InvalidArgument;
+
+    return switch (mapping.field_type) {
+        .numeric => .{ .numeric_range = .{
+            .field = field,
+            .min = if (lower) |bound| try jsonOptionalF64Strict(bound.value) else null,
+            .max = if (upper) |bound| try jsonOptionalF64Strict(bound.value) else null,
+            .inclusive_min = if (lower) |bound| bound.inclusive else true,
+            .inclusive_max = if (upper) |bound| bound.inclusive else false,
+        } },
+        .datetime => .{ .date_range = .{
+            .field = field,
+            .start_ns = if (lower) |bound| try jsonOptionalDateOrNs(bound.value) else null,
+            .end_ns = if (upper) |bound| try jsonOptionalDateOrNs(bound.value) else null,
+            .inclusive_start = if (lower) |bound| bound.inclusive else true,
+            .inclusive_end = if (upper) |bound| bound.inclusive else false,
+        } },
+        .keyword, .link => .{ .term_range = .{
+            .field = field,
+            .min = if (lower) |bound| try jsonOptionalStringStrict(bound.value) else null,
+            .max = if (upper) |bound| try jsonOptionalStringStrict(bound.value) else null,
+            .inclusive_min = if (lower) |bound| bound.inclusive else true,
+            .inclusive_max = if (upper) |bound| bound.inclusive else false,
+        } },
+        else => error.InvalidArgument,
+    };
+}
+
+fn standardRangeLowerBound(object: anytype) !?JsonRangeBound {
+    var found: ?JsonRangeBound = null;
+    if (object.get("gte")) |value| try setJsonRangeBound(&found, value, true);
+    if (object.get("gt")) |value| try setJsonRangeBound(&found, value, false);
+    if (object.get("from")) |value| try setJsonRangeBound(&found, value, (try jsonOptionalBoolStrict(object.get("include_lower"))) orelse true);
+    if (object.get("min")) |value| try setJsonRangeBound(&found, value, (try jsonOptionalBoolStrict(object.get("inclusive_min"))) orelse true);
+    return found;
+}
+
+fn standardRangeUpperBound(object: anytype) !?JsonRangeBound {
+    var found: ?JsonRangeBound = null;
+    if (object.get("lte")) |value| try setJsonRangeBound(&found, value, true);
+    if (object.get("lt")) |value| try setJsonRangeBound(&found, value, false);
+    if (object.get("to")) |value| try setJsonRangeBound(&found, value, (try jsonOptionalBoolStrict(object.get("include_upper"))) orelse true);
+    if (object.get("max")) |value| try setJsonRangeBound(&found, value, (try jsonOptionalBoolStrict(object.get("inclusive_max"))) orelse false);
+    return found;
+}
+
+fn setJsonRangeBound(found: *?JsonRangeBound, value: std.json.Value, inclusive: bool) !void {
+    if (found.* != null) return error.InvalidArgument;
+    found.* = .{ .value = value, .inclusive = inclusive };
+}
+
 fn parseNumericRangeQuery(value: std.json.Value) !search_mod.NumericRangeQuery {
     if (value != .object) return error.InvalidArgument;
     const field = jsonString(value.object.get("field") orelse return error.InvalidArgument) orelse return error.InvalidArgument;
@@ -8371,6 +8527,27 @@ fn parseNumericRangeQuery(value: std.json.Value) !search_mod.NumericRangeQuery {
         .max = jsonOptionalF64(value.object.get("max")),
         .inclusive_min = jsonOptionalBool(value.object.get("inclusive_min")) orelse true,
         .inclusive_max = jsonOptionalBool(value.object.get("inclusive_max")) orelse false,
+    };
+}
+
+fn parseDateRangeQuery(value: std.json.Value) !search_mod.DateRangeQuery {
+    if (value != .object) return error.InvalidArgument;
+    const field = jsonString(value.object.get("field") orelse value.object.get("path") orelse return error.InvalidArgument) orelse return error.InvalidArgument;
+    const start_ns = if (value.object.get("start_ns") != null)
+        try jsonOptionalU64(value.object.get("start_ns"))
+    else
+        try jsonOptionalDateTimeNs(value.object.get("start"));
+    const end_ns = if (value.object.get("end_ns") != null)
+        try jsonOptionalU64(value.object.get("end_ns"))
+    else
+        try jsonOptionalDateTimeNs(value.object.get("end"));
+    if (start_ns == null and end_ns == null) return error.InvalidArgument;
+    return .{
+        .field = field,
+        .start_ns = start_ns,
+        .end_ns = end_ns,
+        .inclusive_start = jsonOptionalBool(value.object.get("inclusive_start")) orelse true,
+        .inclusive_end = jsonOptionalBool(value.object.get("inclusive_end")) orelse false,
     };
 }
 
@@ -8424,6 +8601,7 @@ fn parseGeoBBoxQuery(value: std.json.Value) !search_mod.GeoBBoxQuery {
 fn jsonString(value: std.json.Value) ?[]const u8 {
     return switch (value) {
         .string => |text| text,
+        .null => null,
         else => null,
     };
 }
@@ -8433,6 +8611,8 @@ fn jsonOptionalF64(value: ?std.json.Value) ?f64 {
     return switch (actual) {
         .integer => |number| @floatFromInt(number),
         .float => |number| number,
+        .number_string => |text| std.fmt.parseFloat(f64, text) catch null,
+        .null => null,
         else => null,
     };
 }
@@ -8441,7 +8621,69 @@ fn jsonOptionalBool(value: ?std.json.Value) ?bool {
     const actual = value orelse return null;
     return switch (actual) {
         .bool => |boolean| boolean,
+        .null => null,
         else => null,
+    };
+}
+
+fn jsonOptionalF64Strict(value: std.json.Value) !?f64 {
+    const parsed: ?f64 = switch (value) {
+        .integer => |number| @floatFromInt(number),
+        .float => |number| number,
+        .number_string => |text| std.fmt.parseFloat(f64, text) catch return error.InvalidArgument,
+        .null => null,
+        else => return error.InvalidArgument,
+    };
+    if (parsed) |number| {
+        if (!std.math.isFinite(number)) return error.InvalidArgument;
+    }
+    return parsed;
+}
+
+fn jsonOptionalStringStrict(value: std.json.Value) !?[]const u8 {
+    return switch (value) {
+        .string => |text| text,
+        .null => null,
+        else => error.InvalidArgument,
+    };
+}
+
+fn jsonOptionalBoolStrict(value: ?std.json.Value) !?bool {
+    const actual = value orelse return null;
+    return switch (actual) {
+        .bool => |boolean| boolean,
+        .null => null,
+        else => error.InvalidArgument,
+    };
+}
+
+fn jsonOptionalU64(value: ?std.json.Value) !?u64 {
+    const actual = value orelse return null;
+    return switch (actual) {
+        .integer => |number| if (number >= 0) @intCast(number) else error.InvalidArgument,
+        .null => null,
+        else => error.InvalidArgument,
+    };
+}
+
+fn jsonOptionalDateOrNs(value: std.json.Value) !?u64 {
+    return switch (value) {
+        .integer => |number| if (number >= 0) @intCast(number) else error.InvalidArgument,
+        .number_string => |text| std.fmt.parseInt(u64, text, 10) catch {
+            return runtime_schema_mod.parseDateTimeToNs(text) orelse error.InvalidArgument;
+        },
+        .string => |text| runtime_schema_mod.parseDateTimeToNs(text) orelse std.fmt.parseInt(u64, text, 10) catch return error.InvalidArgument,
+        .null => null,
+        else => error.InvalidArgument,
+    };
+}
+
+fn jsonOptionalDateTimeNs(value: ?std.json.Value) !?u64 {
+    const actual = value orelse return null;
+    return switch (actual) {
+        .string => |text| runtime_schema_mod.parseDateTimeToNs(text) orelse error.InvalidArgument,
+        .null => null,
+        else => error.InvalidArgument,
     };
 }
 

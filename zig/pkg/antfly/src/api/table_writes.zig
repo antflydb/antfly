@@ -11908,11 +11908,10 @@ fn reconcileCachedLocalTableIndexDrop(
                 return err;
             },
         };
-        cached.db.runUntilIdle() catch |err| {
-            cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
-            cached_active = false;
-            return err;
-        };
+        // DB.deleteIndex removes the target worker synchronously. Do not wait for
+        // global derived/maintenance idle here: unrelated managed workers may be
+        // rate-limited or retrying, and delete-index must stay a bounded metadata
+        // operation instead of inheriting that background latency.
         publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db) catch |err| {
             cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
             cached_active = false;

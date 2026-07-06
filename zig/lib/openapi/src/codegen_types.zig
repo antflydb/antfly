@@ -66,7 +66,7 @@ pub const TypeGenerator = struct {
     /// Schemas with no dependencies come first. Cycles are broken arbitrarily
     /// (Zig handles forward references to named types).
     fn topologicalSort(self: *TypeGenerator, schemas: std.StringArrayHashMapUnmanaged(types.SchemaOrRef)) ![]const []const u8 {
-        const names = schemas.keys();
+        const names = try sortedStringKeys(self.arena, schemas.keys());
 
         // Build name → index map
         var name_index = std.StringArrayHashMapUnmanaged(usize){};
@@ -85,7 +85,8 @@ pub const TypeGenerator = struct {
         }
 
         var refs = std.ArrayListUnmanaged([]const u8).empty;
-        for (names, schemas.values(), 0..) |_, sor, i| {
+        for (names, 0..) |name, i| {
+            const sor = schemas.get(name) orelse continue;
             refs.clearRetainingCapacity();
             try collectRefs(sor, &refs, self.arena);
             for (refs.items) |ref_str| {
@@ -130,6 +131,16 @@ pub const TypeGenerator = struct {
         }
 
         return order.items;
+    }
+
+    fn sortedStringKeys(arena: Allocator, keys: []const []const u8) ![]const []const u8 {
+        const sorted = try arena.dupe([]const u8, keys);
+        std.sort.pdq([]const u8, sorted, {}, stringLessThan);
+        return sorted;
+    }
+
+    fn stringLessThan(_: void, left: []const u8, right: []const u8) bool {
+        return std.mem.order(u8, left, right) == .lt;
     }
 
     /// Collect all $ref strings from a SchemaOrRef tree.

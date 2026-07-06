@@ -41,7 +41,9 @@ pub const ClientGenerator = struct {
 
         // Single pass: detect streaming responses and generate query param structs
         var needs_raw = false;
-        for (doc.paths.values()) |path_item| {
+        const paths = try shared.sortedStringKeys(self.arena, doc.paths.keys());
+        for (paths) |path| {
+            const path_item = doc.paths.get(path) orelse continue;
             for (shared.methodOps(path_item)) |mo| {
                 const op = mo.op orelse continue;
                 if (!needs_raw and shared.isStreamingOrBinaryResponse(op)) {
@@ -93,7 +95,8 @@ pub const ClientGenerator = struct {
         try self.w.blank();
 
         // Generate a method for each operation
-        for (doc.paths.keys(), doc.paths.values()) |path, path_item| {
+        for (paths) |path| {
+            const path_item = doc.paths.get(path) orelse continue;
             for (shared.methodOps(path_item)) |mo| {
                 const op = mo.op orelse continue;
                 const op_id = op.operation_id orelse continue;
