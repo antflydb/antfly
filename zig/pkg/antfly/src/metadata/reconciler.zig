@@ -1144,6 +1144,7 @@ fn pruneAutomaticIntents(
         if (!entry.value_ptr.automatic) continue;
         if (containsU64(desired_split_ids, entry.key_ptr.*)) continue;
         if (findSplitRecord(current.split_transitions, entry.key_ptr.*) != null) continue;
+        if (automaticSplitIntentStillValid(manager, entry.value_ptr.*)) continue;
         try split_ids.append(alloc, entry.key_ptr.*);
     }
     for (split_ids.items) |transition_id| _ = manager.removeSplitIntent(transition_id);
@@ -1155,9 +1156,24 @@ fn pruneAutomaticIntents(
         if (!entry.value_ptr.automatic) continue;
         if (containsU64(desired_merge_ids, entry.key_ptr.*)) continue;
         if (findMergeRecord(current.merge_transitions, entry.key_ptr.*) != null) continue;
+        if (automaticMergeIntentStillValid(manager, entry.value_ptr.*)) continue;
         try merge_ids.append(alloc, entry.key_ptr.*);
     }
     for (merge_ids.items) |transition_id| _ = manager.removeMergeIntent(transition_id);
+}
+
+fn automaticSplitIntentStillValid(manager: *table_manager.TableManager, intent: table_manager.SplitIntent) bool {
+    const source = manager.ranges.get(intent.source_group_id) orelse return false;
+    if (source.table_id != intent.table_id) return false;
+    if (manager.ranges.contains(intent.destination_group_id)) return false;
+    return keyStrictlyInsideRange(intent.split_key, source.start_key, source.end_key);
+}
+
+fn automaticMergeIntentStillValid(manager: *table_manager.TableManager, intent: table_manager.MergeIntent) bool {
+    const donor = manager.ranges.get(intent.donor_group_id) orelse return false;
+    const receiver = manager.ranges.get(intent.receiver_group_id) orelse return false;
+    if (donor.table_id != intent.table_id or receiver.table_id != intent.table_id) return false;
+    return rangesAdjacent(donor, receiver);
 }
 
 fn activeRangeTransitionCount(current: CurrentMetadataState) u32 {
@@ -3266,6 +3282,39 @@ test "metadata reconciler plans an automatic split from fresh group status" {
     try std.testing.expectEqualStrings("doc:m", plan.split_upserts[0].split_key.?);
 }
 
+test "metadata reconciler keeps structurally valid automatic split intent across transient recompute miss" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 401, .name = "docs" });
+    try manager.upsertRange(.{
+        .group_id = 4011,
+        .table_id = 401,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    });
+    try manager.requestSplit(.{
+        .transition_id = 40101,
+        .table_id = 401,
+        .source_group_id = 4011,
+        .destination_group_id = 4012,
+        .split_key = "doc:m",
+        .automatic = true,
+    });
+
+    try pruneAutomaticIntents(std.testing.allocator, &manager, .{}, &.{}, &.{});
+    try std.testing.expectEqual(@as(u32, 1), manager.split_intents.count());
+
+    try manager.upsertRange(.{
+        .group_id = 4011,
+        .table_id = 401,
+        .start_key = "doc:a",
+        .end_key = "doc:b",
+    });
+    try pruneAutomaticIntents(std.testing.allocator, &manager, .{}, &.{}, &.{});
+    try std.testing.expectEqual(@as(u32, 0), manager.split_intents.count());
+}
+
 test "metadata reconciler does not automatically split stale doc identity namespace" {
     var manager = table_manager.TableManager.init(std.testing.allocator);
     defer manager.deinit();
@@ -3727,6 +3776,44 @@ test "metadata reconciler plans an automatic merge from adjacent small fresh gro
     try std.testing.expectEqual(@as(usize, 1), plan.merge_upserts.len);
     try std.testing.expectEqual(@as(u64, 4102), plan.merge_upserts[0].donor_group_id);
     try std.testing.expectEqual(@as(u64, 4101), plan.merge_upserts[0].receiver_group_id);
+}
+
+test "metadata reconciler keeps structurally valid automatic merge intent across transient recompute miss" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 411, .name = "docs", .min_ranges = 1 });
+    try manager.upsertRange(.{
+        .group_id = 4111,
+        .table_id = 411,
+        .start_key = "doc:a",
+        .end_key = "doc:m",
+    });
+    try manager.upsertRange(.{
+        .group_id = 4112,
+        .table_id = 411,
+        .start_key = "doc:m",
+        .end_key = "doc:z",
+    });
+    try manager.requestMerge(.{
+        .transition_id = 41101,
+        .table_id = 411,
+        .donor_group_id = 4112,
+        .receiver_group_id = 4111,
+        .automatic = true,
+    });
+
+    try pruneAutomaticIntents(std.testing.allocator, &manager, .{}, &.{}, &.{});
+    try std.testing.expectEqual(@as(u32, 1), manager.merge_intents.count());
+
+    try manager.upsertRange(.{
+        .group_id = 4112,
+        .table_id = 411,
+        .start_key = "doc:n",
+        .end_key = "doc:z",
+    });
+    try pruneAutomaticIntents(std.testing.allocator, &manager, .{}, &.{}, &.{});
+    try std.testing.expectEqual(@as(u32, 0), manager.merge_intents.count());
 }
 
 test "metadata reconciler does not automatically merge incompatible doc identity namespaces" {
