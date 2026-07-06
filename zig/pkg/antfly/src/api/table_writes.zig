@@ -8258,7 +8258,9 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.BatchRequest,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (self.localWriteOwnerSource()) |owner| return try owner.batch(alloc, table_name, req);
+        if (self.raft_batcher == null) {
+            if (self.localWriteOwnerSource()) |owner| return try owner.batch(alloc, table_name, req);
+        }
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
@@ -8581,12 +8583,13 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.BatchRequest,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (self.localWriteOwnerSource()) |owner| return try owner.batchGroupLocal(alloc, group_id, table_name, req);
-        try enforceHAWriteGateOptional(self.ha_write_gate);
         if (self.raft_batcher) |batcher| {
+            try enforceHAWriteGateOptional(self.ha_write_gate);
             try batcher.batchGroupLocal(alloc, group_id, table_name, req);
             return {};
         }
+        if (self.localWriteOwnerSource()) |owner| return try owner.batchGroupLocal(alloc, group_id, table_name, req);
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         return try self.applyReplicatedBatchGroupLocal(alloc, group_id, table_name, req);
     }
 
@@ -20026,6 +20029,71 @@ test "provisioned create index updates cached writer in place" {
     });
     try std.testing.expectEqual(@as(usize, 0), outer_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+
+    const RaftCapture = struct {
+        const State = struct {
+            batch_count: usize = 0,
+            local_count: usize = 0,
+            last_group_id: u64 = 0,
+            last_write_count: usize = 0,
+        };
+
+        fn batchGroup(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_mod.types.BatchRequest,
+        ) !void {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            state.batch_count += 1;
+            state.last_group_id = group_id;
+            state.last_write_count = req.writes.len;
+        }
+
+        fn batchGroupLocal(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_mod.types.BatchRequest,
+        ) !void {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            state.local_count += 1;
+            state.last_group_id = group_id;
+            state.last_write_count = req.writes.len;
+        }
+    };
+
+    var raft_capture = RaftCapture.State{};
+    _ = outer_source.withRaftBatcher(.{
+        .ptr = &raft_capture,
+        .vtable = &.{
+            .batch_group = RaftCapture.batchGroup,
+            .batch_group_local = RaftCapture.batchGroupLocal,
+        },
+    });
+    _ = try outer_source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:raft-batch", .value = "{\"body\":\"raft batch\"}" }},
+        .sync_level = .write,
+    });
+    try std.testing.expectEqual(@as(usize, 1), raft_capture.batch_count);
+    try std.testing.expectEqual(@as(usize, 0), raft_capture.local_count);
+    try std.testing.expectEqual(@as(u64, 7001), raft_capture.last_group_id);
+    try std.testing.expectEqual(@as(usize, 1), raft_capture.last_write_count);
+    try std.testing.expectEqual(@as(usize, 0), outer_cache.entries.items.len);
+
+    _ = try outer_source.source().batchGroupLocal(alloc, 7001, "docs", .{
+        .writes = &.{.{ .key = "doc:raft-group-local", .value = "{\"body\":\"raft group\"}" }},
+        .sync_level = .write,
+    });
+    try std.testing.expectEqual(@as(usize, 1), raft_capture.batch_count);
+    try std.testing.expectEqual(@as(usize, 1), raft_capture.local_count);
+    try std.testing.expectEqual(@as(u64, 7001), raft_capture.last_group_id);
+    try std.testing.expectEqual(@as(usize, 1), raft_capture.last_write_count);
+    try std.testing.expectEqual(@as(usize, 0), outer_cache.entries.items.len);
 }
 
 test "provisioned table write source runtime status prefers shared snapshot cache" {

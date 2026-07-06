@@ -970,7 +970,50 @@ fn placementSafeToRemove(
         applyRelocationWatermark(&target, watermark);
         if (!relocationTargetReady(current, target)) return false;
     }
-    return saw_replacement;
+    if (saw_replacement) return true;
+    return compactShrinkSafeToRemove(current, desired_placements, source, watermark);
+}
+
+fn compactShrinkSafeToRemove(
+    current: CurrentMetadataState,
+    desired_placements: []const raft_reconciler.PlacementIntent,
+    source: raft_reconciler.PlacementIntent,
+    watermark: RelocationWatermark,
+) bool {
+    const current_count = countPlacementIntents(current.placement_intents, source.record.group_id);
+    const desired_count = countPlacementIntents(desired_placements, source.record.group_id);
+    if (desired_count == 0 or desired_count >= current_count) return false;
+
+    var survivors: usize = 0;
+    for (desired_placements) |desired| {
+        if (desired.record.group_id != source.record.group_id) continue;
+        if (desired.record.local_node_id == source.record.local_node_id) continue;
+        const current_target = findPlacementIntent(current.placement_intents, desired.record.group_id, desired.record.local_node_id) orelse return false;
+        if (current_target.serving_state != .serving) return false;
+        if (!placementCaughtUpForCompactShrink(current, current_target, watermark)) return false;
+        survivors += 1;
+    }
+    return survivors == desired_count;
+}
+
+fn placementCaughtUpForCompactShrink(
+    current: CurrentMetadataState,
+    target: raft_reconciler.PlacementIntent,
+    watermark: RelocationWatermark,
+) bool {
+    const store = findStoreByNode(current.stores, target.record.local_node_id) orelse return false;
+    if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) return false;
+    if (store.active_backfills != 0) return false;
+    for (store.group_statuses) |status| {
+        if (status.group_id != target.record.group_id) continue;
+        if (!status.local_voter) return false;
+        if (status.transition_pending) return false;
+        if (status.replay_required and !status.replay_caught_up) return false;
+        if (status.doc_count < watermark.doc_count) return false;
+        if (status.disk_bytes < watermark.disk_bytes) return false;
+        return true;
+    }
+    return false;
 }
 
 fn emptyGroupSourceSafeToRemove(
@@ -2480,12 +2523,10 @@ test "metadata reconciler removes relocation source only after target is durably
         },
     };
     const merged_statuses = [_]MergedGroupStatus{.{
-        .group_id = 2231,
+        .group_id = 2211,
         .doc_count = 0,
         .disk_bytes = 2190,
         .empty = false,
-        .leader_known = true,
-        .leader_store_id = 11,
         .voter_count_known = true,
         .voter_count = 1,
         .healthy_voter_reports = 2,
@@ -2614,6 +2655,208 @@ test "metadata reconciler does not gate empty relocation on storage overhead byt
     try std.testing.expectEqual(raft_reconciler.PlacementServingState.draining, source.serving_state);
     try std.testing.expectEqual(@as(u64, 0), source.relocation_doc_count_watermark);
     try std.testing.expectEqual(@as(u64, 0), source.relocation_disk_bytes_watermark);
+}
+
+test "metadata reconciler does not remove a data-bearing draining source until compact shrink survivors catch up" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 225, .name = "docs", .desired_replica_count = 2 });
+    try manager.upsertRange(.{ .group_id = 2251, .table_id = 225, .start_key = "", .end_key = null });
+
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{
+            .record = .{ .group_id = 2251, .replica_id = 1, .local_node_id = 101 },
+            .store_id = 101,
+            .peer_node_ids = &.{ 101, 102, 103 },
+            .serving_state = .draining,
+        },
+        .{
+            .record = .{ .group_id = 2251, .replica_id = 2, .local_node_id = 102 },
+            .store_id = 102,
+            .peer_node_ids = &.{ 101, 102, 103 },
+            .serving_state = .serving,
+        },
+        .{
+            .record = .{ .group_id = 2251, .replica_id = 3, .local_node_id = 103 },
+            .store_id = 103,
+            .peer_node_ids = &.{ 101, 102, 103 },
+            .serving_state = .serving,
+        },
+    };
+    const stores = [_]table_manager.StoreRecord{
+        .{
+            .store_id = 101,
+            .node_id = 101,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2251,
+                .doc_count = 18,
+                .disk_bytes = 2048,
+                .empty = false,
+                .local_leader = true,
+                .local_voter = true,
+                .voter_count = 3,
+            }})[0..]),
+            .runtime_statuses = @constCast((&[_]table_manager.RuntimeGroupStatusReport{.{
+                .table_id = 225,
+                .group_id = 2251,
+                .store_id = 101,
+                .node_id = 101,
+                .doc_count = 18,
+                .disk_bytes = 2048,
+            }})[0..]),
+        },
+        .{
+            .store_id = 102,
+            .node_id = 102,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2251,
+                .doc_count = 10,
+                .disk_bytes = 1024,
+                .empty = false,
+                .local_voter = true,
+                .voter_count = 3,
+            }})[0..]),
+        },
+        .{
+            .store_id = 103,
+            .node_id = 103,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2251,
+                .doc_count = 18,
+                .disk_bytes = 2048,
+                .empty = false,
+                .local_voter = true,
+                .voter_count = 3,
+            }})[0..]),
+        },
+    };
+    const merged_statuses = [_]MergedGroupStatus{.{
+        .group_id = 2251,
+        .doc_count = 18,
+        .disk_bytes = 2048,
+        .empty = false,
+        .leader_known = true,
+        .leader_store_id = 101,
+        .voter_count_known = true,
+        .voter_count = 3,
+        .healthy_voter_reports = 3,
+    }};
+    const candidates = [_]@import("state.zig").CandidatePlacementInfo{
+        .{ .node_id = 102, .store_id = 102, .role = "data", .failure_domain = "rack-b", .retain_current = true },
+        .{ .node_id = 103, .store_id = 103, .role = "data", .failure_domain = "rack-c", .retain_current = true },
+    };
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var plan = try reconciler.computePlan(&manager, &.{ 102, 103 }, &candidates, .{
+        .placement_intents = &current,
+        .stores = &stores,
+        .merged_group_statuses = &merged_statuses,
+        .reallocate_requested = true,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), plan.placement_removals.len);
+    const source = findPlacementIntent(plan.placement_upserts, 2251, 101) orelse return error.MissingDrainingSource;
+    try std.testing.expectEqual(raft_reconciler.PlacementServingState.draining, source.serving_state);
+}
+
+test "metadata reconciler removes a data-bearing draining source after compact shrink survivors catch up" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 226, .name = "docs", .desired_replica_count = 2 });
+    try manager.upsertRange(.{ .group_id = 2261, .table_id = 226, .start_key = "", .end_key = null });
+
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{
+            .record = .{ .group_id = 2261, .replica_id = 1, .local_node_id = 101 },
+            .store_id = 101,
+            .peer_node_ids = &.{ 101, 102, 103 },
+            .serving_state = .draining,
+            .relocation_doc_count_watermark = 18,
+            .relocation_disk_bytes_watermark = 2048,
+        },
+        .{
+            .record = .{ .group_id = 2261, .replica_id = 2, .local_node_id = 102 },
+            .store_id = 102,
+            .peer_node_ids = &.{ 101, 102, 103 },
+            .serving_state = .serving,
+        },
+        .{
+            .record = .{ .group_id = 2261, .replica_id = 3, .local_node_id = 103 },
+            .store_id = 103,
+            .peer_node_ids = &.{ 101, 102, 103 },
+            .serving_state = .serving,
+        },
+    };
+    const caught_up = table_manager.GroupStatusReport{
+        .group_id = 2261,
+        .doc_count = 18,
+        .disk_bytes = 2048,
+        .empty = false,
+        .local_voter = true,
+        .voter_count = 3,
+    };
+    const stores = [_]table_manager.StoreRecord{
+        .{
+            .store_id = 101,
+            .node_id = 101,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2261,
+                .doc_count = 18,
+                .disk_bytes = 2048,
+                .empty = false,
+                .local_leader = true,
+                .local_voter = true,
+                .voter_count = 3,
+            }})[0..]),
+        },
+        .{
+            .store_id = 102,
+            .node_id = 102,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{caught_up})[0..]),
+        },
+        .{
+            .store_id = 103,
+            .node_id = 103,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{caught_up})[0..]),
+        },
+    };
+    const candidates = [_]@import("state.zig").CandidatePlacementInfo{
+        .{ .node_id = 102, .store_id = 102, .role = "data", .failure_domain = "rack-b", .retain_current = true },
+        .{ .node_id = 103, .store_id = 103, .role = "data", .failure_domain = "rack-c", .retain_current = true },
+    };
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var plan = try reconciler.computePlan(&manager, &.{ 102, 103 }, &candidates, .{
+        .placement_intents = &current,
+        .stores = &stores,
+        .reallocate_requested = true,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), plan.placement_removals.len);
+    try std.testing.expectEqual(@as(u64, 2261), plan.placement_removals[0].group_id);
+    try std.testing.expectEqual(@as(u64, 101), plan.placement_removals[0].local_node_id);
 }
 
 test "metadata reconciler does not require preserved peers to report relocation cutover" {

@@ -4706,11 +4706,9 @@ pub const DataServer = struct {
                 snapshot.placement_intents,
                 intent.record.group_id,
             );
-            try local_intents.append(self.alloc, .{
-                .record = intent.record,
-                .store_id = intent.store_id,
-                .peer_node_ids = peer_node_ids,
-            });
+            var local_intent = intent;
+            local_intent.peer_node_ids = peer_node_ids;
+            try local_intents.append(self.alloc, local_intent);
         }
         const placement_fingerprint = dataRaftPlacementIntentsFingerprint(local_intents.items);
         const placement_changed = self.last_data_raft_placement_fingerprint == null or self.last_data_raft_placement_fingerprint.? != placement_fingerprint;
@@ -4758,8 +4756,20 @@ pub const DataServer = struct {
         if (updates.items.len > 0) try raft.host.applyBatch(updates.items);
         var campaigned = false;
         for (local_intents.items) |intent| {
-            if (!localIntentPreferredCampaigner(intent, registration.node_id)) continue;
             const status = raft.host.http_host.host.raftStatus(intent.record.group_id);
+            if (drainingLeaderShouldHandoff(snapshot.placement_intents, status, intent, registration.node_id)) {
+                raft.host.http_host.campaignGroup(intent.record.group_id) catch |err| {
+                    std.log.warn("data raft draining leader handoff campaign failed group_id={} node_id={} err={}", .{
+                        intent.record.group_id,
+                        registration.node_id,
+                        err,
+                    });
+                    continue;
+                };
+                campaigned = true;
+                continue;
+            }
+            if (!localIntentPreferredCampaigner(intent, registration.node_id)) continue;
             if (!localRaftStatusShouldBootstrapCampaign(status, registration.node_id)) continue;
             raft.host.http_host.campaignGroup(intent.record.group_id) catch |err| {
                 std.log.warn("data raft bootstrap campaign failed group_id={} node_id={} err={}", .{
@@ -8159,6 +8169,53 @@ fn localIntentPreferredCampaigner(intent: antfly.raft.PlacementIntent, local_nod
     return local_node_id == min_node_id;
 }
 
+fn drainingLeaderShouldHandoff(
+    placement_intents: []const antfly.raft.PlacementIntent,
+    status: ?raft_engine.core.Status,
+    local_intent: antfly.raft.PlacementIntent,
+    local_node_id: u64,
+) bool {
+    if (local_intent.serving_state != .serving) return false;
+    const raft_status = status orelse return false;
+    const leader_node_id = raft_status.soft.leader_id orelse return false;
+    if (leader_node_id == local_node_id) return false;
+    if (!DataServer.localRaftStatusIsVoter(raft_status, local_node_id)) return false;
+    if (!groupLeaderPlacementIsDraining(placement_intents, local_intent.record.group_id, leader_node_id)) return false;
+    return localNodePreferredServingPeer(placement_intents, local_intent.record.group_id, local_node_id);
+}
+
+fn groupLeaderPlacementIsDraining(
+    placement_intents: []const antfly.raft.PlacementIntent,
+    group_id: u64,
+    leader_node_id: u64,
+) bool {
+    for (placement_intents) |intent| {
+        if (intent.record.group_id == group_id and
+            intent.record.local_node_id == leader_node_id and
+            intent.serving_state == .draining)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn localNodePreferredServingPeer(
+    placement_intents: []const antfly.raft.PlacementIntent,
+    group_id: u64,
+    local_node_id: u64,
+) bool {
+    var min_node_id: ?u64 = null;
+    for (placement_intents) |intent| {
+        if (intent.record.group_id != group_id) continue;
+        if (intent.serving_state != .serving) continue;
+        if (min_node_id == null or intent.record.local_node_id < min_node_id.?) {
+            min_node_id = intent.record.local_node_id;
+        }
+    }
+    return min_node_id != null and min_node_id.? == local_node_id;
+}
+
 fn dataRaftPlacementIntentsFingerprint(intents: []const antfly.raft.PlacementIntent) u64 {
     var hasher = std.hash.Wyhash.init(0x48f9_2026_da7a_4a17);
     hashU64(&hasher, intents.len);
@@ -9193,6 +9250,26 @@ test "data raft bootstrap campaign retries leaderless voter elections" {
 
     status.soft.leader_id = null;
     try std.testing.expect(!DataServer.localRaftStatusShouldBootstrapCampaign(status, 4));
+}
+
+test "data raft draining leader handoff campaigns preferred serving survivor" {
+    var voters = [_]u64{ 101, 102, 103 };
+    const status = raft_engine.core.Status{
+        .id = 102,
+        .group_id = 7002,
+        .soft = .{ .leader_id = 101, .role = .follower },
+        .hard = .{},
+        .conf_state = .{ .voters = voters[0..] },
+    };
+    const intents = [_]antfly.raft.PlacementIntent{
+        .{ .record = .{ .group_id = 7002, .replica_id = 1, .local_node_id = 101 }, .serving_state = .draining },
+        .{ .record = .{ .group_id = 7002, .replica_id = 2, .local_node_id = 102 }, .serving_state = .serving },
+        .{ .record = .{ .group_id = 7002, .replica_id = 3, .local_node_id = 103 }, .serving_state = .serving },
+    };
+
+    try std.testing.expect(drainingLeaderShouldHandoff(&intents, status, intents[1], 102));
+    try std.testing.expect(!drainingLeaderShouldHandoff(&intents, status, intents[2], 103));
+    try std.testing.expect(!drainingLeaderShouldHandoff(&intents, status, intents[0], 101));
 }
 
 test "data runtime live writer source follows raft apply ownership" {
