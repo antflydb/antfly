@@ -3338,7 +3338,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db document _embeddings",
             "sort execution plan dimension names are stable for profiles",
             "sort cursor contract classifies arity separately from type",
-            "json sort values reject non-finite floats at API boundaries",
+            "json sort values reject non-replayable numeric values at API boundaries",
             "score sort source detection rejects non-scoring text queries",
             "score sort source detection treats vector sources as score-bearing for public validation",
             "score sort rejects hits without finite scores",
