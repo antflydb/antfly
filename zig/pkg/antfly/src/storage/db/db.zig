@@ -2747,6 +2747,8 @@ pub const DB = struct {
     live_doc_set_cache_set: ?doc_set.ResolvedDocSet = null,
     bulk_ingest_seen_doc_keys: std.StringHashMapUnmanaged(void) = .{},
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
+    index_repair_barriers: std.atomic.Value(u32) = .init(0),
+    published_dense_searches: std.atomic.Value(u32) = .init(0),
 
     const engine_vtable = db_core.Engine.VTable{
         .batch = engineBatch,
@@ -7266,6 +7268,12 @@ pub const DB = struct {
         if (req.cursor != null and req.cursor.?.len != 0) return error.InvalidArgument;
         const limit = if (req.limit == 0) @as(u32, 100) else req.limit;
         var result = types.ArtifactRepairResult{ .limit = limit };
+        if (limit == 0) return result;
+
+        self.beginIndexRepairBarrier();
+        defer self.endIndexRepairBarrier();
+        lockApply(self);
+        defer self.core.unlockApply();
 
         const cfg_ptr = self.core.index_manager.get(requested_index) orelse return error.NotFound;
         var cfg = try types.IndexConfig.clone(alloc, cfg_ptr.*);
@@ -7280,8 +7288,6 @@ pub const DB = struct {
             };
             if (!matches_kind) return error.NotFound;
         }
-
-        if (limit == 0) return result;
 
         const repair_required = try self.indexRepairRequired(alloc, cfg.name);
         if (!repair_required and !req.force) return result;
@@ -7332,7 +7338,6 @@ pub const DB = struct {
             },
             .full_text => blk: {
                 const count = try self.core.index_manager.resetFullTextIndexForArtifactRebuild(self.core.store, cfg.name);
-                try self.core.index_manager.syncIndexByName(cfg.name, true);
                 break :blk count;
             },
             .algebraic => return result,
@@ -12961,7 +12966,8 @@ pub const DB = struct {
         var generation_ns: u64 = 0;
         var lock_wait_ns: u64 = 0;
         var locked_search_ns: u64 = 0;
-        if (self.canUsePublishedDenseSearch(req)) {
+        if (self.canUsePublishedDenseSearch(req) and self.beginPublishedDenseSearch()) {
+            defer self.endPublishedDenseSearch();
             const generation_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
             const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
             if (bench_profile) generation_ns = platform_time.monotonicNs() - generation_start_ns;
@@ -13751,7 +13757,8 @@ pub const DB = struct {
 
     pub fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
         if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
-        if (self.canUsePublishedDenseSearch(req)) {
+        if (self.canUsePublishedDenseSearch(req) and self.beginPublishedDenseSearch()) {
+            defer self.endPublishedDenseSearch();
             return try self.searchDenseProfiledAtSnapshot(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), dense);
         }
         {
@@ -14439,6 +14446,36 @@ pub const DB = struct {
         if (!(req.dense != null or req.query == .dense_knn)) return false;
         const entry = self.core.denseIndex(req.index_name) orelse return false;
         return !entry.index.hasExternalVectorLoader();
+    }
+
+    fn beginPublishedDenseSearch(self: *DB) bool {
+        if (self.index_repair_barriers.load(.acquire) != 0) return false;
+        _ = self.published_dense_searches.fetchAdd(1, .acq_rel);
+        if (self.index_repair_barriers.load(.acquire) != 0) {
+            _ = self.published_dense_searches.fetchSub(1, .acq_rel);
+            return false;
+        }
+        return true;
+    }
+
+    fn endPublishedDenseSearch(self: *DB) void {
+        _ = self.published_dense_searches.fetchSub(1, .acq_rel);
+    }
+
+    fn beginIndexRepairBarrier(self: *DB) void {
+        _ = self.index_repair_barriers.fetchAdd(1, .acq_rel);
+        var spins: usize = 0;
+        while (self.published_dense_searches.load(.acquire) != 0) : (spins += 1) {
+            if (spins < 64) {
+                std.atomic.spinLoopHint();
+            } else {
+                std.Thread.yield() catch {};
+            }
+        }
+    }
+
+    fn endIndexRepairBarrier(self: *DB) void {
+        _ = self.index_repair_barriers.fetchSub(1, .acq_rel);
     }
 
     fn denseDocKeyCallback(
@@ -31197,6 +31234,23 @@ test "db sparse hits resolve doc ordinals through identity not sparse doc nums" 
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, ordinal), result.hits[0].doc_ordinal);
+}
+
+test "db index repair barrier disables published dense fast path" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try std.testing.expect(db.beginPublishedDenseSearch());
+    db.endPublishedDenseSearch();
+
+    db.beginIndexRepairBarrier();
+    defer db.endIndexRepairBarrier();
+    try std.testing.expect(!db.beginPublishedDenseSearch());
 }
 
 test "db dense index stores stable vector ids with ordinal filter mappings" {

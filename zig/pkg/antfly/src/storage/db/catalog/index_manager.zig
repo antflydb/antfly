@@ -1596,6 +1596,7 @@ pub const IndexManager = struct {
         try entry.persistent.resetAllForRebuild();
         try rebuild_state.update("");
         try self.backfillTextIndex(store, entry, null);
+        try entry.persistent.sync(true);
         try self.saveBackfilledAppliedSequence(store, entry.config);
         var checkpoint = try apply_state.loadProjectionCheckpointWithSidecar(
             self.alloc,
@@ -5989,22 +5990,22 @@ pub const IndexManager = struct {
         const upper = try internal_keys.documentRangeUpperAlloc(self.alloc, if (self.byte_range.end.len > 0) self.byte_range.end else "");
         defer if (upper) |buf| self.alloc.free(buf);
 
-        const docs = try backend_scan.scanRange(self.alloc, &runtime_store.store, lower, if (upper) |buf| buf else "");
-        defer backend_scan.freeResults(self.alloc, docs);
         var identity_txn = try runtime_store.store.beginProbe();
         defer identity_txn.abort();
 
         var mapped_docs = std.ArrayListUnmanaged(mapper.MapperDoc).empty;
-        defer mapped_docs.deinit(self.alloc);
-        var owned_doc_ids = std.ArrayListUnmanaged([]u8).empty;
         defer {
-            for (owned_doc_ids.items) |key| self.alloc.free(key);
-            owned_doc_ids.deinit(self.alloc);
+            for (mapped_docs.items) |doc| {
+                self.alloc.free(@constCast(doc.key));
+                self.alloc.free(@constCast(doc.value));
+            }
+            mapped_docs.deinit(self.alloc);
         }
 
         var flushed_batches: usize = 0;
         var saw_visible_doc = false;
         var max_flushed_key: ?[]const u8 = null;
+        defer if (max_flushed_key) |buf| self.alloc.free(buf);
 
         const flush_batch = struct {
             fn run(
@@ -6029,6 +6030,10 @@ pub const IndexManager = struct {
                     try text_entry.persistent.indexSegmentOwned(owned);
                 }
                 try rebuild.update(last_doc_key);
+                for (docs_buf.items) |doc| {
+                    manager.alloc.free(@constCast(doc.key));
+                    manager.alloc.free(@constCast(doc.value));
+                }
                 docs_buf.clearRetainingCapacity();
                 flush_count.* += 1;
                 if (@import("builtin").is_test) {
@@ -6039,34 +6044,80 @@ pub const IndexManager = struct {
             }
         }.run;
 
-        for (docs) |doc| {
-            if (isMetadataKey(doc.key)) continue;
-            if (!self.keyInRange(doc.key)) continue;
-            if (!try textIndexShouldConsumeDoc(self, entry, doc.key)) continue;
-            if (resume_from) |resume_key| {
-                if (resume_key.len > 0 and std.mem.order(u8, doc.key, resume_key) != .gt) continue;
-            }
+        const ScanState = struct {
+            manager: *IndexManager,
+            store: *docstore_mod.DocStore,
+            text_entry: *TextIndex,
+            rebuild_state: backfill_state_mod.RebuildState,
+            identity_txn: *@TypeOf(identity_txn),
+            resume_from: ?[]const u8,
+            mapped_docs: *std.ArrayListUnmanaged(mapper.MapperDoc),
+            max_flushed_key: *?[]const u8,
+            flushed_batches: *usize,
+            saw_visible_doc: *bool,
 
-            saw_visible_doc = true;
-            const doc_id = if (internal_keys.isPrimaryDocumentKey(doc.key))
-                (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, doc.key)) orelse continue
-            else
-                try self.alloc.dupe(u8, doc.key);
-            try owned_doc_ids.append(self.alloc, doc_id);
-            try mapped_docs.append(self.alloc, .{
-                .key = doc_id,
-                .value = doc.value,
-                .doc_ordinal = try doc_identity.lookupOrdinalTxn(self.alloc, &identity_txn, doc_id),
-            });
-            if (max_flushed_key == null or std.mem.order(u8, doc.key, max_flushed_key.?) == .gt) {
-                max_flushed_key = doc.key;
-            }
+            fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!backend_scan.ScanAction {
+                const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
+                if (isMetadataKey(key)) return .@"continue";
+                if (!state.manager.keyInRange(key)) return .@"continue";
+                if (!try textIndexShouldConsumeDoc(state.manager, state.text_entry, key)) return .@"continue";
+                if (state.resume_from) |resume_key| {
+                    if (resume_key.len > 0 and std.mem.order(u8, key, resume_key) != .gt) return .@"continue";
+                }
 
-            const backfill_batch_size = if (@import("builtin").is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
-            if (mapped_docs.items.len >= backfill_batch_size) {
-                try flush_batch(self, store, entry, rebuild_state, &mapped_docs, max_flushed_key.?, &flushed_batches);
+                state.saw_visible_doc.* = true;
+                const doc_id = if (internal_keys.isPrimaryDocumentKey(key))
+                    (try internal_keys.decodePrimaryDocumentKeyAlloc(state.manager.alloc, key)) orelse return .@"continue"
+                else
+                    try state.manager.alloc.dupe(u8, key);
+                var doc_id_owned = true;
+                errdefer if (doc_id_owned) state.manager.alloc.free(doc_id);
+                const doc_value = try state.manager.alloc.dupe(u8, value);
+                var doc_value_owned = true;
+                errdefer if (doc_value_owned) state.manager.alloc.free(doc_value);
+
+                try state.mapped_docs.append(state.manager.alloc, .{
+                    .key = doc_id,
+                    .value = doc_value,
+                    .doc_ordinal = try doc_identity.lookupOrdinalTxn(state.manager.alloc, state.identity_txn, doc_id),
+                });
+                doc_id_owned = false;
+                doc_value_owned = false;
+
+                if (state.max_flushed_key.* == null or std.mem.order(u8, key, state.max_flushed_key.*.?) == .gt) {
+                    if (state.max_flushed_key.*) |old| state.manager.alloc.free(old);
+                    state.max_flushed_key.* = try state.manager.alloc.dupe(u8, key);
+                }
+
+                const backfill_batch_size = if (@import("builtin").is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
+                if (state.mapped_docs.items.len >= backfill_batch_size) {
+                    try flush_batch(
+                        state.manager,
+                        state.store,
+                        state.text_entry,
+                        state.rebuild_state,
+                        state.mapped_docs,
+                        state.max_flushed_key.*.?,
+                        state.flushed_batches,
+                    );
+                }
+                return .@"continue";
             }
-        }
+        };
+
+        var scan_state = ScanState{
+            .manager = self,
+            .store = store,
+            .text_entry = entry,
+            .rebuild_state = rebuild_state,
+            .identity_txn = &identity_txn,
+            .resume_from = resume_from,
+            .mapped_docs = &mapped_docs,
+            .max_flushed_key = &max_flushed_key,
+            .flushed_batches = &flushed_batches,
+            .saw_visible_doc = &saw_visible_doc,
+        };
+        try backend_scan.scanWithContext(&runtime_store.store, lower, if (upper) |buf| buf else "", .{}, &scan_state, ScanState.scanEntry);
 
         if (mapped_docs.items.len > 0) {
             try flush_batch(self, store, entry, rebuild_state, &mapped_docs, max_flushed_key.?, &flushed_batches);
