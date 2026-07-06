@@ -2752,6 +2752,7 @@ pub const DB = struct {
     published_dense_searches: std.atomic.Value(u32) = .init(0),
     index_repair_mutex: std.atomic.Mutex = .unlocked,
     active_index_repairs: std.StringHashMapUnmanaged(void) = .{},
+    shadow_index_repair_hook: ?@This().ShadowIndexRepairHook = null,
 
     const engine_vtable = db_core.Engine.VTable{
         .batch = engineBatch,
@@ -2761,6 +2762,11 @@ pub const DB = struct {
         .stats = engineStats,
         .list_indexes = engineListIndexes,
         .list_enrichments = engineListEnrichments,
+    };
+
+    pub const ShadowIndexRepairHook = struct {
+        ptr: *anyopaque,
+        after_snapshot_build: *const fn (ptr: *anyopaque, db: *DB, index_name: []const u8, build_floor_sequence: u64) anyerror!void,
     };
 
     fn batchContext(self: *DB) BatchExecutionContext {
@@ -7467,6 +7473,9 @@ pub const DB = struct {
             .kind = cfg.kind,
         };
         try self.saveShadowReplacementAppliedSequence(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, build_floor_sequence);
+        if (self.shadow_index_repair_hook) |hook| {
+            try hook.after_snapshot_build(hook.ptr, self, cfg.name, build_floor_sequence);
+        }
         _ = try self.catchUpShadowReplacementUntil(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, self.core.nextDerivedSequence());
 
         const use_dense_search_barrier = cfg.kind == .dense_vector;
@@ -38765,6 +38774,104 @@ test "db index repair shadow swap survives reopen" {
         defer alloc.free(stale_canonical_file);
         try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, stale_canonical_file, .{}));
     }
+}
+
+test "db index repair shadow swap preserves post snapshot mutations" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const text_cfg: types.IndexConfig = .{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    };
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(text_cfg);
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha before\"}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"beta before\"}" },
+        },
+        .sync_level = .full_index,
+    });
+    try db.core.saveProjectionCheckpoint("ft_v1", .{
+        .applied_sequence = 0,
+        .status = .repair_required,
+        .config_hash = types.indexConfigHash(text_cfg),
+    });
+
+    const HookContext = struct {
+        fired: bool = false,
+        observed_floor: u64 = 0,
+    };
+    const Hook = struct {
+        fn afterSnapshotBuild(ptr: *anyopaque, hook_db: *DB, index_name: []const u8, build_floor_sequence: u64) anyerror!void {
+            const ctx: *HookContext = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("ft_v1", index_name);
+            try std.testing.expect(build_floor_sequence > 0);
+            try std.testing.expect(!ctx.fired);
+            ctx.fired = true;
+            ctx.observed_floor = build_floor_sequence;
+
+            try hook_db.batch(.{
+                .writes = &.{
+                    .{ .key = "doc:b", .value = "{\"body\":\"gamma after\"}" },
+                    .{ .key = "doc:c", .value = "{\"body\":\"alpha after\"}" },
+                },
+                .deletes = &.{"doc:a"},
+                .sync_level = .write,
+            });
+        }
+    };
+    var hook_ctx = HookContext{};
+    db.shadow_index_repair_hook = .{
+        .ptr = &hook_ctx,
+        .after_snapshot_build = Hook.afterSnapshotBuild,
+    };
+    defer db.shadow_index_repair_hook = null;
+
+    var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .artifact_kind = .full_text,
+        .index_name = "ft_v1",
+        .limit = 1,
+    });
+    defer repair.deinit(alloc);
+    try std.testing.expect(hook_ctx.fired);
+    try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
+    try std.testing.expect(!repair.debt_remaining);
+    const checkpoint = try db.core.loadProjectionCheckpoint(alloc, "ft_v1");
+    try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
+    try std.testing.expect(checkpoint.applied_sequence > hook_ctx.observed_floor);
+
+    var alpha = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+    });
+    defer alpha.deinit();
+    try std.testing.expectEqual(@as(u32, 1), alpha.total_hits);
+    try std.testing.expectEqualStrings("doc:c", alpha.hits[0].id);
+
+    var beta = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "beta" } },
+    });
+    defer beta.deinit();
+    try std.testing.expectEqual(@as(u32, 0), beta.total_hits);
+
+    var gamma = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "gamma" } },
+    });
+    defer gamma.deinit();
+    try std.testing.expectEqual(@as(u32, 1), gamma.total_hits);
+    try std.testing.expectEqualStrings("doc:b", gamma.hits[0].id);
 }
 
 test "db repair issue list reports index repair candidates" {

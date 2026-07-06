@@ -4052,17 +4052,19 @@ paths:
 
         `limit` and returns an opaque continuation cursor when another artifact
 
-        repair page is available. `target=index` repairs one named index after
+        repair page is available. `target=index` repairs one named index by
 
-        resetting its derived index storage; healthy indexes are skipped unless
+        building a shadow replacement, catching it up to the current derived
 
-        `force=true` is supplied, and any positive `limit` permits that single
+        replay sequence, and atomically swapping it into service; healthy
 
-        named index repair. The response reports unresolved debt separately, and
+        indexes are skipped unless `force=true` is supplied, and any positive
 
-        the endpoint requires table admin permission when authentication is
+        `limit` permits that single named index repair. The response reports
 
-        enabled.
+        unresolved debt separately, and the endpoint requires table admin
+
+        permission when authentication is enabled.
       tags:
         - data_operations
       operationId: runTableRepair
