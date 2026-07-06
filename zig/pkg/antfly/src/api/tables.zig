@@ -1048,7 +1048,22 @@ fn runtimeCapabilityCanPromoteSchemaDeclaration(
         std.mem.eql(u8, existing.queryability_state, "declared") and
         std.mem.eql(u8, incoming.doc_value_coverage, "covered") and
         std.mem.eql(u8, incoming.queryability_state, "queryable") and
-        !std.mem.eql(u8, incoming.provenance, "observed_dynamic");
+        !std.mem.eql(u8, incoming.provenance, "observed_dynamic") and
+        generatedFieldCapabilityPromotionSurfaceEqual(existing, incoming);
+}
+
+fn generatedFieldCapabilityPromotionSurfaceEqual(
+    left: metadata_openapi.FieldCapability,
+    right: metadata_openapi.FieldCapability,
+) bool {
+    return left.searchable == right.searchable and
+        left.filterable == right.filterable and
+        left.aggregatable == right.aggregatable and
+        left.doc_values == right.doc_values and
+        left.sortable == right.sortable and
+        std.mem.eql(u8, left.missing_null_policy, right.missing_null_policy) and
+        left.index_sort_position == right.index_sort_position and
+        optionalStringEql(left.index_sort_order, right.index_sort_order);
 }
 
 fn generatedFieldCapabilityAggregationKeyEqual(
@@ -2955,6 +2970,57 @@ test "metadata.table status promotes schema capability when runtime coverage is 
     try std.testing.expectEqualStrings("covered", created.object.get("doc_value_coverage").?.string);
     try std.testing.expectEqualStrings("dynamic_template", created.object.get("provenance").?.string);
     try std.testing.expectEqualStrings("queryable", created.object.get("queryability_state").?.string);
+}
+
+test "metadata.table status does not promote mismatched index sort runtime capability" {
+    const schema_json =
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"created","path_match":"created_at","mapping":{"type":"datetime","sortable":true}}],"index_sort":[{"field":"created_at","order":"desc"}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"created_at":{"type":"string","format":"date-time"}}}}}}
+    ;
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .schema_json = schema_json, .indexes_json = "{}", .replication_sources_json = "[]", .placement_role = "data" }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null }})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const template = runtime_schema_mod.DynamicTemplate{
+        .name = "created",
+        .path_match = "created_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "standard",
+        },
+    };
+    const runtime_schema_without_index_sort = runtime_schema_mod.TableSchema{ .dynamic_templates = &.{template} };
+    var covered_without_index_sort = runtime_schema_mod.dynamicTemplateFieldCapability(runtime_schema_without_index_sort, template);
+    covered_without_index_sort.doc_value_coverage = "covered";
+    covered_without_index_sort.queryability_state = "queryable";
+    var runtime_capabilities = [_]runtime_schema_mod.FieldCapability{covered_without_index_sort};
+    var observed_sets = [_]table_reads.ObservedDynamicFieldCapabilitySet{.{
+        .index_name = @constCast("full_text_index_v0"),
+        .field_capabilities = runtime_capabilities[0..],
+    }};
+    const storage_statuses = [_]TableStorageStatus{.{
+        .table_name = "docs",
+        .empty = false,
+        .observed_dynamic_field_capability_sets = observed_sets[0..],
+    }};
+
+    const encoded = (try encodeSingleTableStatusWithStorageStatuses(std.testing.allocator, &snapshot, "docs", storage_statuses[0..])).?;
+    defer std.testing.allocator.free(encoded);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    const created = testFieldCapabilityByIdentifier(parsed.value, "created") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("datetime", created.object.get("type").?.string);
+    try std.testing.expectEqualStrings("schema_declared", created.object.get("doc_value_coverage").?.string);
+    try std.testing.expectEqualStrings("declared", created.object.get("queryability_state").?.string);
+    try std.testing.expect(created.object.get("index_sort_position") == null);
+    try std.testing.expect(created.object.get("index_sort_order") == null);
 }
 
 test "metadata.table status merges observed capabilities conservatively" {

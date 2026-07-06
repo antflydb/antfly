@@ -2392,9 +2392,12 @@ export interface components {
              *     reasons include `unmapped_sort_field`,
              *     `non_sortable_sort_field`, `missing_doc_values_coverage`,
              *     `missing_native_filter_coverage`, `invalid_cursor_arity`,
-             *     `invalid_cursor_type`, `approximate_candidate_source`,
-             *     `candidate_budget_exceeded`, `count_only_ordered_page`,
-             *     `stored_json_sort_disabled`, and
+             *     `invalid_cursor_type`, `invalid_sort_tuple`,
+             *     `approximate_candidate_source`, `candidate_budget_exceeded`,
+             *     `missing_runtime_mapping`, `invalid_doc_value_type`,
+             *     `missing_null_policy`, `non_score_bearing_source`,
+             *     `invalid_score_value`, `count_only_ordered_page`,
+             *     `stored_json_sort_disabled`, `unsupported_exact_sort`, and
              *     `distributed_merge_unsupported`.
              * @example missing_doc_values_coverage
              */
@@ -2405,12 +2408,53 @@ export interface components {
              */
             sort_rejection_reason: string;
             /**
-             * @description Stable budget rejection reason when the rejection was budget-driven.
+             * @description Stable budget rejection reason when the rejection was
+             *     budget-driven. Known values include
+             *     `text_exact_late_visibility_totals`,
+             *     `text_field_sort_candidate_window`,
+             *     `match_all_candidate_collect_limit`,
+             *     `match_all_exact_candidate_window`, and
+             *     `distributed_merge_shard_window`.
              * @example text_field_sort_candidate_window
              */
             budget_rejection_reason?: string;
             /**
-             * @description More specific exact-sort rejection detail.
+             * @description More specific exact-sort rejection detail. Known values include
+             *     `unmapped_sort_field`, `unmapped_field`,
+             *     `non_sortable_sort_field`, `non_scalar_field`,
+             *     `non_sortable_field`, `mixed_field_type`,
+             *     `missing_doc_values_section`, `malformed_doc_values_section`,
+             *     `doc_values_kind_mismatch`, `sparse_live_doc_values`,
+             *     `invalid_doc_value_doc_id`, `duplicate_doc_value_doc_id`,
+             *     `unsupported_doc_values_type`, `missing_doc_values_coverage`,
+             *     `missing_doc_values_capability`, `schema_declared`,
+             *     `observed_declared`, `not_declared`, `missing_doc_values`,
+             *     `non_sortable`, `declared`, `text_search_only`, `mixed`,
+             *     `missing_native_filter_coverage`, `invalid_cursor_arity`,
+             *     `invalid_cursor_type`, `invalid_sort_tuple`,
+             *     `sort_tuple_arity`, `invalid_doc_value_type`,
+             *     `incomplete_sort_tuple`, `mixed_sort_value_domain`,
+             *     `unsorted_shard_window`, `unsorted_component_window`,
+             *     `non_numeric_score`, `missing_score`, `non_finite_score`,
+             *     `score_sort_tuple_mismatch`, `non_score_bearing_source`,
+             *     `id_tiebreaker_mismatch`, `approximate_candidate_source`,
+             *     `count_only_ordered_page`, `native_sort_loader_unavailable`,
+             *     `sorted_segment_executor_unavailable`,
+             *     `primary_key_stream_unavailable`,
+             *     `native_candidate_stream_unavailable`,
+             *     `candidate_stream_unavailable`, `incompatible_sort_plan`,
+             *     `sorted_segment_bounds_unavailable`,
+             *     `filter_query_json_unresolved`,
+             *     `exclusion_query_json_unresolved`,
+             *     `text_index_entry_unavailable`,
+             *     `doc_ordinal_projection_unavailable`,
+             *     `component_sort_profile_missing`,
+             *     `unsupported_composed_sort_source`,
+             *     `stored_json_sort_disabled`, `distributed_merge_unsupported`,
+             *     `distributed_merge_plan_required`,
+             *     `distributed_shard_window_incomplete`,
+             *     `distributed_shard_cursor_window_invalid`, and
+             *     `distributed_merge_shard_window`.
              * @example missing_doc_values_section
              */
             sort_rejection_detail: string;
@@ -5870,7 +5914,15 @@ export interface components {
          *     implementation counters.
          */
         SortProfile: {
-            /** @description Stable physical sort plan name. */
+            /**
+             * @description Stable physical sort plan name. Known values include `none`,
+             *     `id_only`, `id_seek`, `sorted_segment_seek`,
+             *     `native_doc_values_top_n`, `score_top_k`,
+             *     `distributed_k_way_merge`, `stored_json_debug`, and
+             *     `unsupported_exact_sort`. Public exact sort requests must not
+             *     silently move from native plans to `stored_json_debug`; missing
+             *     native coverage is reported through the rejection fields instead.
+             */
             plan?: string;
             /** @description Requested order fields, including the implicit _id tie-breaker when applicable. */
             order_by?: components["schemas"]["SortField"][];
@@ -6007,20 +6059,67 @@ export interface components {
              * @description Largest shard-local sorted window merged by the coordinator.
              */
             distributed_shard_window?: number;
-            /** @description Stable budget rejection reason. */
+            /**
+             * @description Stable budget rejection reason. Known values include
+             *     `text_exact_late_visibility_totals`,
+             *     `text_field_sort_candidate_window`,
+             *     `match_all_candidate_collect_limit`,
+             *     `match_all_exact_candidate_window`, and
+             *     `distributed_merge_shard_window`.
+             */
             budget_rejection_reason?: string;
             /**
              * @description Stable exact-sort rejection reason. Known values include
              *     `unmapped_sort_field`, `non_sortable_sort_field`,
              *     `missing_doc_values_coverage`,
              *     `missing_native_filter_coverage`, `invalid_cursor_arity`,
-             *     `invalid_cursor_type`, `approximate_candidate_source`,
-             *     `candidate_budget_exceeded`, `count_only_ordered_page`,
-             *     `stored_json_sort_disabled`, and
+             *     `invalid_cursor_type`, `invalid_sort_tuple`,
+             *     `approximate_candidate_source`, `candidate_budget_exceeded`,
+             *     `missing_runtime_mapping`, `invalid_doc_value_type`,
+             *     `missing_null_policy`, `non_score_bearing_source`,
+             *     `invalid_score_value`, `count_only_ordered_page`,
+             *     `stored_json_sort_disabled`, `unsupported_exact_sort`, and
              *     `distributed_merge_unsupported`.
              */
             sort_rejection_reason?: string;
-            /** @description Stable rejection detail. */
+            /**
+             * @description Stable rejection detail. Known exact-sort details include
+             *     `unmapped_sort_field`, `unmapped_field`,
+             *     `non_sortable_sort_field`, `non_scalar_field`,
+             *     `non_sortable_field`, `mixed_field_type`,
+             *     `missing_doc_values_section`, `malformed_doc_values_section`,
+             *     `doc_values_kind_mismatch`, `sparse_live_doc_values`,
+             *     `invalid_doc_value_doc_id`, `duplicate_doc_value_doc_id`,
+             *     `unsupported_doc_values_type`, `missing_doc_values_coverage`,
+             *     `missing_doc_values_capability`, `schema_declared`,
+             *     `observed_declared`, `not_declared`, `missing_doc_values`,
+             *     `non_sortable`, `declared`, `text_search_only`, `mixed`,
+             *     `missing_native_filter_coverage`, `invalid_cursor_arity`,
+             *     `invalid_cursor_type`, `invalid_sort_tuple`,
+             *     `sort_tuple_arity`, `invalid_doc_value_type`,
+             *     `incomplete_sort_tuple`, `mixed_sort_value_domain`,
+             *     `unsorted_shard_window`, `unsorted_component_window`,
+             *     `non_numeric_score`, `missing_score`, `non_finite_score`,
+             *     `score_sort_tuple_mismatch`, `non_score_bearing_source`,
+             *     `id_tiebreaker_mismatch`, `approximate_candidate_source`,
+             *     `count_only_ordered_page`, `native_sort_loader_unavailable`,
+             *     `sorted_segment_executor_unavailable`,
+             *     `primary_key_stream_unavailable`,
+             *     `native_candidate_stream_unavailable`,
+             *     `candidate_stream_unavailable`, `incompatible_sort_plan`,
+             *     `sorted_segment_bounds_unavailable`,
+             *     `filter_query_json_unresolved`,
+             *     `exclusion_query_json_unresolved`,
+             *     `text_index_entry_unavailable`,
+             *     `doc_ordinal_projection_unavailable`,
+             *     `component_sort_profile_missing`,
+             *     `unsupported_composed_sort_source`,
+             *     `stored_json_sort_disabled`, `distributed_merge_unsupported`,
+             *     `distributed_merge_plan_required`,
+             *     `distributed_shard_window_incomplete`,
+             *     `distributed_shard_cursor_window_invalid`, and
+             *     `distributed_merge_shard_window`.
+             */
             sort_rejection_detail?: string;
             /** @description Sort field associated with the rejection when safe to expose. */
             sort_rejection_field?: string;

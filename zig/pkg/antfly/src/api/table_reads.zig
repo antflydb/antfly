@@ -4397,6 +4397,27 @@ test "distributed query shard request preserves sorted cursor contract" {
     try std.testing.expectEqual(@as(usize, 1), cursor_shard_req.distributed_text_stats.len);
     try std.testing.expectEqualStrings("body", cursor_shard_req.distributed_text_stats[0].field);
 
+    const search_before = [_]std.json.Value{
+        .{ .string = "2025-12-31T23:59:59Z" },
+        .{ .string = "doc:previous" },
+    };
+    const before_shard_req = distributedSearchShardRequest(.{
+        .order_by = order_by[0..],
+        .search_before = search_before[0..],
+        .offset = 50,
+        .limit = 25,
+        .distributed_text_stats = &.{},
+    }, stats[0..]);
+
+    try std.testing.expectEqual(@as(u32, 0), before_shard_req.offset);
+    try std.testing.expectEqual(@as(u32, 25), before_shard_req.limit);
+    try std.testing.expectEqual(@as(usize, 2), before_shard_req.order_by.len);
+    try std.testing.expectEqual(@as(usize, 0), before_shard_req.search_after.len);
+    try std.testing.expectEqual(@as(usize, 2), before_shard_req.search_before.len);
+    try std.testing.expectEqualStrings("2025-12-31T23:59:59Z", before_shard_req.search_before[0].string);
+    try std.testing.expectEqualStrings("doc:previous", before_shard_req.search_before[1].string);
+    try std.testing.expectEqual(@as(usize, 1), before_shard_req.distributed_text_stats.len);
+
     const offset_shard_req = distributedSearchShardRequest(.{
         .order_by = order_by[0..],
         .offset = 50,

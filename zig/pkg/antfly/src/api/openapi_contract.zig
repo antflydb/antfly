@@ -14,6 +14,10 @@
 
 const std = @import("std");
 
+const public_openapi_types_source = @embedFile("../openapi/generated/antfly_public_openapi/types.zig");
+const metadata_openapi_types_source = @embedFile("../openapi/generated/antfly_metadata_openapi/types.zig");
+const client_openapi_types_source = @embedFile("../openapi/generated/antfly_client_openapi/types.zig");
+
 pub const generated = @import("antfly_public_openapi");
 pub const client_generated = @import("antfly_client_openapi");
 pub const schema_generated = @import("antfly_schema_openapi");
@@ -36,11 +40,40 @@ test "public openapi contract module is generated and wired" {
     try std.testing.expect(@hasDecl(generated, "CreateTableRequest"));
     try std.testing.expect(@hasDecl(generated, "Table"));
     try std.testing.expect(@hasDecl(generated, "TableStatus"));
+    try std.testing.expect(@hasDecl(generated, "FieldCapability"));
+    try std.testing.expect(@hasField(generated.FieldCapability, "field"));
+    try std.testing.expect(@hasField(generated.FieldCapability, "type"));
+    try std.testing.expect(@hasField(generated.FieldCapability, "searchable"));
+    try std.testing.expect(@hasField(generated.FieldCapability, "filterable"));
+    try std.testing.expect(@hasField(generated.FieldCapability, "aggregatable"));
+    try std.testing.expect(@hasField(generated.FieldCapability, "doc_values"));
+    try std.testing.expect(@hasField(generated.FieldCapability, "sortable"));
+    try std.testing.expect(@hasField(generated.FieldCapability, "doc_value_coverage"));
+    try std.testing.expect(@hasField(generated.FieldCapability, "provenance"));
+    try std.testing.expect(@hasField(generated.FieldCapability, "missing_null_policy"));
+    try std.testing.expect(@hasField(generated.FieldCapability, "queryability_state"));
+    try std.testing.expect(@hasField(generated.FieldCapability, "index_sort_position"));
+    try std.testing.expect(@hasField(generated.FieldCapability, "index_sort_order"));
+    try std.testing.expect(@hasDecl(metadata_generated, "FieldCapability"));
+    try std.testing.expect(@hasField(metadata_generated.FieldCapability, "doc_value_coverage"));
+    try std.testing.expect(@hasField(metadata_generated.FieldCapability, "queryability_state"));
+    try std.testing.expect(@hasField(metadata_generated.FieldCapability, "index_sort_position"));
+    try std.testing.expect(@hasField(metadata_generated.FieldCapability, "index_sort_order"));
+    try std.testing.expect(@hasDecl(client_generated, "FieldCapability"));
+    try std.testing.expect(@hasField(client_generated.FieldCapability, "doc_value_coverage"));
+    try std.testing.expect(@hasField(client_generated.FieldCapability, "queryability_state"));
+    try std.testing.expect(@hasField(client_generated.FieldCapability, "index_sort_position"));
+    try std.testing.expect(@hasField(client_generated.FieldCapability, "index_sort_order"));
     try std.testing.expect(@hasDecl(generated, "IndexStatus"));
     try std.testing.expect(@hasDecl(generated, "IndexStats"));
     try std.testing.expect(@hasDecl(generated, "FullTextIndexStats"));
     try std.testing.expect(@hasDecl(generated, "TableMigration"));
     try std.testing.expect(@hasDecl(generated, "QueryRequest"));
+    try std.testing.expect(@hasField(generated.QueryRequest, "order_by"));
+    try std.testing.expect(@hasField(generated.QueryRequest, "search_after"));
+    try std.testing.expect(@hasField(generated.QueryRequest, "search_before"));
+    try std.testing.expect(@hasDecl(generated, "QueryHit"));
+    try std.testing.expect(@hasField(generated.QueryHit, "_sort"));
     try std.testing.expect(@hasDecl(generated, "SortProfile"));
     try std.testing.expect(@hasField(generated.QueryProfile, "sort"));
     try std.testing.expect(@hasField(generated.SortProfile, "plan"));
@@ -88,8 +121,16 @@ test "public openapi contract module is generated and wired" {
     try std.testing.expect(@hasField(generated.ExactSortError, "sort_rejection_reason"));
     try std.testing.expect(@hasField(generated.ExactSortError, "budget_rejection_reason"));
     try std.testing.expect(@hasDecl(metadata_generated, "SortProfile"));
+    try std.testing.expect(@hasField(metadata_generated.QueryRequest, "order_by"));
+    try std.testing.expect(@hasField(metadata_generated.QueryRequest, "search_after"));
+    try std.testing.expect(@hasField(metadata_generated.QueryRequest, "search_before"));
+    try std.testing.expect(@hasField(metadata_generated.QueryHit, "_sort"));
     try std.testing.expect(@hasField(metadata_generated.QueryProfile, "sort"));
     try std.testing.expect(@hasDecl(client_generated, "SortProfile"));
+    try std.testing.expect(@hasField(client_generated.QueryRequest, "order_by"));
+    try std.testing.expect(@hasField(client_generated.QueryRequest, "search_after"));
+    try std.testing.expect(@hasField(client_generated.QueryRequest, "search_before"));
+    try std.testing.expect(@hasField(client_generated.QueryHit, "_sort"));
     try std.testing.expect(@hasField(client_generated.QueryProfile, "sort"));
     try std.testing.expect(@hasDecl(generated, "BackupRequest"));
     try std.testing.expect(@hasDecl(generated, "RestoreRequest"));
@@ -98,6 +139,112 @@ test "public openapi contract module is generated and wired" {
     try std.testing.expect(@hasDecl(generated, "ClusterRestoreRequest"));
     try std.testing.expect(@hasDecl(generated, "ClusterRestoreResponse"));
     try std.testing.expect(@hasDecl(generated, "BackupListResponse"));
+}
+
+fn expectOpenApiDocumentsToken(token: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, public_openapi_types_source, token) != null);
+    try std.testing.expect(std.mem.indexOf(u8, metadata_openapi_types_source, token) != null);
+    try std.testing.expect(std.mem.indexOf(u8, client_openapi_types_source, token) != null);
+}
+
+pub fn expectPublicOpenApiDocumentsStableExactSortDiagnostics() !void {
+    const plan_names = [_][]const u8{
+        "`none`",
+        "`id_only`",
+        "`id_seek`",
+        "`sorted_segment_seek`",
+        "`native_doc_values_top_n`",
+        "`score_top_k`",
+        "`distributed_k_way_merge`",
+        "`stored_json_debug`",
+        "`unsupported_exact_sort`",
+    };
+    for (plan_names) |plan| try expectOpenApiDocumentsToken(plan);
+
+    const rejection_reasons = [_][]const u8{
+        "`unmapped_sort_field`",
+        "`non_sortable_sort_field`",
+        "`missing_doc_values_coverage`",
+        "`missing_native_filter_coverage`",
+        "`invalid_cursor_arity`",
+        "`invalid_cursor_type`",
+        "`invalid_sort_tuple`",
+        "`approximate_candidate_source`",
+        "`candidate_budget_exceeded`",
+        "`missing_runtime_mapping`",
+        "`invalid_doc_value_type`",
+        "`missing_null_policy`",
+        "`non_score_bearing_source`",
+        "`invalid_score_value`",
+        "`count_only_ordered_page`",
+        "`stored_json_sort_disabled`",
+        "`unsupported_exact_sort`",
+        "`distributed_merge_unsupported`",
+    };
+    for (rejection_reasons) |reason| try expectOpenApiDocumentsToken(reason);
+
+    const budget_reasons = [_][]const u8{
+        "`text_exact_late_visibility_totals`",
+        "`text_field_sort_candidate_window`",
+        "`match_all_candidate_collect_limit`",
+        "`match_all_exact_candidate_window`",
+        "`distributed_merge_shard_window`",
+    };
+    for (budget_reasons) |reason| try expectOpenApiDocumentsToken(reason);
+
+    const rejection_details = [_][]const u8{
+        "`unmapped_field`",
+        "`non_scalar_field`",
+        "`non_sortable_field`",
+        "`mixed_field_type`",
+        "`missing_doc_values_section`",
+        "`malformed_doc_values_section`",
+        "`doc_values_kind_mismatch`",
+        "`sparse_live_doc_values`",
+        "`invalid_doc_value_doc_id`",
+        "`duplicate_doc_value_doc_id`",
+        "`unsupported_doc_values_type`",
+        "`missing_doc_values_capability`",
+        "`schema_declared`",
+        "`observed_declared`",
+        "`not_declared`",
+        "`missing_doc_values`",
+        "`non_sortable`",
+        "`declared`",
+        "`text_search_only`",
+        "`mixed`",
+        "`sort_tuple_arity`",
+        "`incomplete_sort_tuple`",
+        "`mixed_sort_value_domain`",
+        "`unsorted_shard_window`",
+        "`unsorted_component_window`",
+        "`non_numeric_score`",
+        "`missing_score`",
+        "`non_finite_score`",
+        "`score_sort_tuple_mismatch`",
+        "`id_tiebreaker_mismatch`",
+        "`native_sort_loader_unavailable`",
+        "`sorted_segment_executor_unavailable`",
+        "`primary_key_stream_unavailable`",
+        "`native_candidate_stream_unavailable`",
+        "`candidate_stream_unavailable`",
+        "`incompatible_sort_plan`",
+        "`sorted_segment_bounds_unavailable`",
+        "`filter_query_json_unresolved`",
+        "`exclusion_query_json_unresolved`",
+        "`text_index_entry_unavailable`",
+        "`doc_ordinal_projection_unavailable`",
+        "`component_sort_profile_missing`",
+        "`unsupported_composed_sort_source`",
+        "`distributed_merge_plan_required`",
+        "`distributed_shard_window_incomplete`",
+        "`distributed_shard_cursor_window_invalid`",
+    };
+    for (rejection_details) |detail| try expectOpenApiDocumentsToken(detail);
+}
+
+test "public openapi documents stable exact sort diagnostics" {
+    try expectPublicOpenApiDocumentsStableExactSortDiagnostics();
 }
 
 test "admin openapi contract module is generated and wired" {

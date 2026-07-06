@@ -3865,11 +3865,15 @@ test "distributed sorted hit merge uses typed sort tuple ordering and cursors" {
         .{ .integer = 2 },
         .{ .string = "doc:b" },
     };
+    const after_shards = [_]DistributedSortedShard{
+        .{ .hits = asc_left[1..] },
+        .{ .hits = asc_right[1..] },
+    };
     const after_page = try mergeDistributedSortedHitsAlloc(alloc, .{
         .order_by = &rank_asc,
         .search_after = &after_cursor,
         .limit = 2,
-    }, plan, &asc_shards);
+    }, plan, &after_shards);
     defer testFreeOwnedHits(alloc, after_page);
     try std.testing.expectEqual(@as(usize, 2), after_page.len);
     try std.testing.expectEqualStrings("doc:c", after_page[0].id);
@@ -3880,7 +3884,7 @@ test "distributed sorted hit merge uses typed sort tuple ordering and cursors" {
         .search_after = &after_cursor,
         .limit = 2,
         .profile = true,
-    }, plan, &asc_shards);
+    }, plan, &after_shards);
     defer testFreeOwnedHits(alloc, profiled_page.hits);
     try std.testing.expectEqual(@as(usize, 2), profiled_page.hits.len);
     try std.testing.expectEqual(types.TotalHitsRelation.exact, profiled_page.total_hits_relation);
@@ -3889,17 +3893,21 @@ test "distributed sorted hit merge uses typed sort tuple ordering and cursors" {
     try std.testing.expectEqualStrings("distributed_merge", sort_profile.source);
     try std.testing.expectEqualStrings("distributed_seek", sort_profile.cursor_support);
     try std.testing.expectEqualStrings("coordinator_merge", sort_profile.distributed_behavior);
-    try std.testing.expectEqual(@as(u64, 4), sort_profile.candidate_count);
-    try std.testing.expectEqual(@as(u64, 2), sort_profile.cursor_rejected_count);
+    try std.testing.expectEqual(@as(u64, 2), sort_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), sort_profile.cursor_rejected_count);
     try std.testing.expectEqual(@as(u64, 2), sort_profile.selected_count);
     try std.testing.expect(sort_profile.final_sort_us <= sort_profile.total_us);
     try std.testing.expectEqual(@as(usize, 2), sort_profile.window_capacity);
     try std.testing.expectEqual(@as(usize, 2), sort_profile.window_len);
     try std.testing.expectEqual(@as(usize, 2), sort_profile.collector_heap_peak);
     try std.testing.expectEqual(@as(usize, 2), sort_profile.distributed_shard_count);
-    try std.testing.expectEqual(@as(usize, 3), sort_profile.distributed_shard_window);
+    try std.testing.expectEqual(@as(usize, 2), sort_profile.distributed_shard_window);
 
     {
+        const after_shards_limit_one = [_]DistributedSortedShard{
+            .{ .hits = asc_left[1..2] },
+            .{ .hits = asc_right[1..2] },
+        };
         bench_query_profile_every_cache.store(2, .monotonic);
         bench_query_profile_counter.store(1, .monotonic);
         defer {
@@ -3911,7 +3919,7 @@ test "distributed sorted hit merge uses typed sort tuple ordering and cursors" {
             .search_after = &after_cursor,
             .limit = 1,
             .profile = false,
-        }, plan, &asc_shards);
+        }, plan, &after_shards_limit_one);
         defer testFreeOwnedHits(alloc, internally_profiled_page.hits);
         try std.testing.expectEqual(@as(usize, 1), internally_profiled_page.hits.len);
         const internal_sort_profile = internally_profiled_page.sort_profile orelse return error.TestUnexpectedResult;
@@ -3926,23 +3934,28 @@ test "distributed sorted hit merge uses typed sort tuple ordering and cursors" {
     };
     const gte_page = try mergeDistributedSortedHitsWithProfileAlloc(alloc, .{
         .order_by = &rank_asc,
-        .limit = 2,
+        .limit = 3,
     }, plan, &gte_shards);
     defer testFreeOwnedHits(alloc, gte_page.hits);
     try std.testing.expectEqual(types.TotalHitsRelation.gte, gte_page.total_hits_relation);
-    try std.testing.expectEqual(@as(usize, 2), gte_page.hits.len);
+    try std.testing.expectEqual(@as(usize, 3), gte_page.hits.len);
     try std.testing.expectEqualStrings("doc:a", gte_page.hits[0].id);
     try std.testing.expectEqualStrings("doc:b", gte_page.hits[1].id);
+    try std.testing.expectEqualStrings("doc:c", gte_page.hits[2].id);
 
     const before_cursor = [_]std.json.Value{
         .{ .integer = 5 },
         .{ .string = "doc:e" },
     };
+    const before_shards = [_]DistributedSortedShard{
+        .{ .hits = asc_left[0..2] },
+        .{ .hits = &asc_right },
+    };
     const before_page = try mergeDistributedSortedHitsAlloc(alloc, .{
         .order_by = &rank_asc,
         .search_before = &before_cursor,
         .limit = 2,
-    }, plan, &asc_shards);
+    }, plan, &before_shards);
     defer testFreeOwnedHits(alloc, before_page);
     try std.testing.expectEqual(@as(usize, 2), before_page.len);
     try std.testing.expectEqualStrings("doc:c", before_page[0].id);
@@ -4078,6 +4091,8 @@ test "distributed merge cursor-only request uses implicit id order" {
 
     const left = types.SearchResult{ .alloc = alloc, .hits = &left_hits, .total_hits = 2 };
     const right = types.SearchResult{ .alloc = alloc, .hits = &right_hits, .total_hits = 2 };
+    const left_after = types.SearchResult{ .alloc = alloc, .hits = left_hits[1..], .total_hits = 1 };
+    const right_after = types.SearchResult{ .alloc = alloc, .hits = right_hits[1..], .total_hits = 1 };
     const cursor = [_]std.json.Value{.{ .string = "doc:b" }};
 
     const direct_shards = [_]DistributedSortedShard{
@@ -4091,10 +4106,20 @@ test "distributed merge cursor-only request uses implicit id order" {
         .kind = .distributed_k_way_merge,
     }, &direct_shards);
 
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeDistributedSortedSearchResultHitsWithRuntimeSchemaAlloc(alloc, .{
+        .search_after = &cursor,
+        .limit = 2,
+    }, &.{ left, right }, null));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("distributed_shard_cursor_window_invalid", diagnostic.detail);
+
     const hits = try mergeDistributedSortedSearchResultHitsWithRuntimeSchemaAlloc(alloc, .{
         .search_after = &cursor,
         .limit = 2,
-    }, &.{ left, right }, null);
+    }, &.{ left_after, right_after }, null);
     defer testFreeOwnedHits(alloc, hits);
     try std.testing.expectEqual(@as(usize, 2), hits.len);
     try std.testing.expectEqualStrings("doc:c", hits[0].id);
@@ -4106,7 +4131,7 @@ test "distributed merge cursor-only request uses implicit id order" {
         .search_after = &cursor,
         .limit = 1,
         .profile = true,
-    }, &.{ left, right }, null);
+    }, &.{ left_after, right_after }, null);
     defer testFreeOwnedHits(alloc, merged.hits);
     try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
     try std.testing.expectEqualStrings("doc:c", merged.hits[0].id);
@@ -4114,6 +4139,7 @@ test "distributed merge cursor-only request uses implicit id order" {
     try std.testing.expectEqualStrings("distributed_k_way_merge", profile.plan);
     try std.testing.expectEqualStrings("distributed_seek", profile.cursor_support);
     try std.testing.expectEqualStrings("distributed_merge", profile.source);
+    try std.testing.expectEqual(@as(u64, 0), profile.cursor_rejected_count);
 }
 
 test "distributed field sort requires runtime mappings" {
@@ -4193,6 +4219,76 @@ test "distributed merge rejects provably incomplete exact shard windows" {
     try std.testing.expectEqualStrings("*", diagnostic.field);
     try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
     try std.testing.expectEqualStrings("distributed_shard_window_incomplete", diagnostic.detail);
+
+    const cursor = [_]std.json.Value{
+        .{ .integer = 0 },
+        .{ .string = "doc:0" },
+    };
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_after = &cursor,
+        .limit = 2,
+    }, &.{incomplete}, schema));
+    diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("distributed_shard_window_incomplete", diagnostic.detail);
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_after = &cursor,
+        .limit = 2,
+    }, &.{lower_bound_short}, schema));
+    diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("distributed_shard_window_incomplete", diagnostic.detail);
+}
+
+test "distributed merge rejects oversized shard windows" {
+    const alloc = std.testing.allocator;
+    const order_by = [_]types.SortField{.{ .field = "rank" }};
+    const schema = testNumericRankRuntimeSchema();
+
+    var hits = [_]types.SearchHit{
+        try testSortedHitAlloc(alloc, "doc:a", 1),
+        try testSortedHitAlloc(alloc, "doc:b", 2),
+        try testSortedHitAlloc(alloc, "doc:c", 3),
+    };
+    defer testDeinitFixedHits(alloc, &hits);
+    const oversized = types.SearchResult{
+        .alloc = alloc,
+        .hits = &hits,
+        .total_hits = 3,
+        .total_hits_relation = .exact,
+    };
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+        .order_by = &order_by,
+        .limit = 2,
+    }, &.{oversized}, schema));
+    var diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("", diagnostic.field);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", diagnostic.reason);
+    try std.testing.expectEqualStrings("distributed_merge_shard_window", diagnostic.detail);
+
+    const cursor = [_]std.json.Value{
+        .{ .integer = 1 },
+        .{ .string = "doc:a" },
+    };
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_after = &cursor,
+        .limit = 2,
+    }, &.{oversized}, schema));
+    diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("", diagnostic.field);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", diagnostic.reason);
+    try std.testing.expectEqualStrings("distributed_merge_shard_window", diagnostic.detail);
 }
 
 test "distributed score sort requires finite hit score matching sort tuple" {
@@ -4305,8 +4401,8 @@ test "distributed merge uses runtime schema for typed date cursors" {
     };
     defer testDeinitFixedHits(alloc, &right_hits);
 
-    const left = types.SearchResult{ .alloc = alloc, .hits = &left_hits, .total_hits = 2 };
-    const right = types.SearchResult{ .alloc = alloc, .hits = &right_hits, .total_hits = 2 };
+    const left_after = types.SearchResult{ .alloc = alloc, .hits = left_hits[1..], .total_hits = 1 };
+    const right_after = types.SearchResult{ .alloc = alloc, .hits = right_hits[1..], .total_hits = 1 };
     const order_by = [_]types.SortField{.{ .field = "created_at" }};
     const after_cursor = [_]std.json.Value{
         .{ .number_string = try std.fmt.allocPrint(alloc, "{d}", .{ts_b}) },
@@ -4319,7 +4415,7 @@ test "distributed merge uses runtime schema for typed date cursors" {
         .search_after = &after_cursor,
         .limit = 2,
         .profile = true,
-    }, &.{ left, right }, schema);
+    }, &.{ left_after, right_after }, schema);
     defer testFreeOwnedHits(alloc, merged.hits);
 
     try std.testing.expectEqual(@as(usize, 2), merged.hits.len);
@@ -4337,7 +4433,7 @@ test "distributed merge uses runtime schema for typed date cursors" {
         .order_by = &order_by,
         .search_after = &float_cursor,
         .limit = 2,
-    }, &.{ left, right }, schema));
+    }, &.{ left_after, right_after }, schema));
 }
 
 test "distributed merge rejects cursor outside concrete shard sort tuple domain" {
@@ -4361,7 +4457,7 @@ test "distributed merge rejects cursor outside concrete shard sort tuple domain"
         try testSortedHitAlloc(alloc, "doc:b", 2),
     };
     defer testDeinitFixedHits(alloc, &hits);
-    const result = types.SearchResult{ .alloc = alloc, .hits = &hits, .total_hits = 2 };
+    const after_result = types.SearchResult{ .alloc = alloc, .hits = hits[1..], .total_hits = 1 };
     const order_by = [_]types.SortField{.{ .field = "rank" }};
 
     const valid_cursor = [_]std.json.Value{
@@ -4372,7 +4468,7 @@ test "distributed merge rejects cursor outside concrete shard sort tuple domain"
         .order_by = &order_by,
         .search_after = &valid_cursor,
         .limit = 1,
-    }, &.{result}, schema);
+    }, &.{after_result}, schema);
     defer testFreeOwnedHits(alloc, page.hits);
     try std.testing.expectEqual(@as(usize, 1), page.hits.len);
     try std.testing.expectEqualStrings("doc:b", page.hits[0].id);
@@ -4386,7 +4482,7 @@ test "distributed merge rejects cursor outside concrete shard sort tuple domain"
         .order_by = &order_by,
         .search_after = &fractional_cursor,
         .limit = 1,
-    }, &.{result}, schema));
+    }, &.{after_result}, schema));
     const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("rank", diagnostic.field);
     try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
@@ -4916,8 +5012,7 @@ fn validateDistributedShardWindowsCompleteForRequestedPage(
     req: types.SearchRequest,
     shards: []const DistributedSortedShard,
 ) !void {
-    if (req.search_after.len > 0 or req.search_before.len > 0) return;
-    const required_window = @as(u64, req.offset) +| @as(u64, req.limit);
+    const required_window = distributedRequestedShardWindow(req);
     if (required_window == 0) return;
     for (shards) |shard| {
         const returned_window: u64 = @intCast(shard.hits.len);
@@ -4931,6 +5026,46 @@ fn validateDistributedShardWindowsCompleteForRequestedPage(
                 logNativeSortPlanRejection("*", "unsupported_exact_sort", "distributed_shard_window_incomplete");
                 return error.UnsupportedQueryRequest;
             }
+        }
+    }
+}
+
+fn distributedRequestedShardWindow(req: types.SearchRequest) u64 {
+    if (req.search_after.len > 0 or req.search_before.len > 0) return req.limit;
+    return @as(u64, req.offset) +| @as(u64, req.limit);
+}
+
+fn validateDistributedShardWindowsBoundedForRequestedPage(
+    req: types.SearchRequest,
+    shards: []const DistributedSortedShard,
+) !void {
+    const requested_window = distributedRequestedShardWindow(req);
+    for (shards) |shard| {
+        const returned_window: u64 = @intCast(shard.hits.len);
+        if (returned_window <= requested_window) continue;
+        logExactSortBudgetRejection(
+            "distributed_merge",
+            .distributed_merge_shard_window,
+            null,
+            boundedU32(shard.hits.len),
+            boundedU32(requested_window),
+            .{ .kind = .distributed_k_way_merge },
+        );
+        return error.QueryCandidateBudgetExceeded;
+    }
+}
+
+fn validateDistributedShardWindowsSoughtForCursor(
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    shards: []const DistributedSortedShard,
+) !void {
+    if (req.search_after.len == 0 and req.search_before.len == 0) return;
+    for (shards) |shard| {
+        for (shard.hits) |hit| {
+            if (try searchHitAllowedByCursor(req, plan, hit)) continue;
+            logNativeSortPlanRejection("*", "unsupported_exact_sort", "distributed_shard_cursor_window_invalid");
+            return error.UnsupportedQueryRequest;
         }
     }
 }
@@ -5183,6 +5318,8 @@ fn mergeDistributedSortedHitsWithProfileAlloc(
     try validateDistributedSortRuntimeMappings(plan, effective_req);
     try validateDistributedSortedShards(alloc, effective_req, plan, shards);
     try validateDistributedShardWindowsCompleteForRequestedPage(effective_req, shards);
+    try validateDistributedShardWindowsBoundedForRequestedPage(effective_req, shards);
+    try validateDistributedShardWindowsSoughtForCursor(effective_req, plan, shards);
     try enforceDistributedSortShardWindowBudget(shards, distributedSortShardWindowBudget());
     const total_hits_relation = distributedShardTotalHitsRelation(shards);
 
@@ -18121,6 +18258,154 @@ test "match_all sorted segment seek merges sorted segments and applies cursors" 
     try std.testing.expectEqualStrings("doc:d", filtered_page.hits[1].id);
 }
 
+test "match_all sorted segment seek honors deleted old sort values after upsert" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-upsert-live-docs", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const original_segment = try buildTestSortedPriceSegmentAlloc(alloc, &.{
+        .{ .id = "doc:a", .price = 1.0, .ordinal = 101 },
+        .{ .id = "doc:b", .price = 5.0, .ordinal = 105 },
+    });
+    defer alloc.free(original_segment);
+    try persistent.writer.addSegment(original_segment);
+    try std.testing.expect(try persistent.writer.deleteById("doc:b"));
+
+    const upsert_segment = try buildTestSortedPriceSegmentAlloc(alloc, &.{
+        .{ .id = "doc:b", .price = 2.0, .ordinal = 102 },
+        .{ .id = "doc:c", .price = 3.0, .ordinal = 103 },
+    });
+    defer alloc.free(upsert_segment);
+    try persistent.writer.addSegment(upsert_segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = testSortedPriceSchema(),
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const Harness = struct {
+        text_entry: *index_manager_mod.IndexManager.TextIndex,
+        collect_count: usize = 0,
+        projected_load_count: usize = 0,
+
+        fn collectCandidates(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: MatchAllCandidateCollectOptions,
+        ) anyerror!MatchAllCandidates {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.collect_count += 1;
+            return error.UnexpectedTestCall;
+        }
+
+        fn textIndexEntry(
+            ctx: ?*anyopaque,
+            _: ?[]const u8,
+        ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return self.text_entry;
+        }
+
+        fn loadProjectedDocument(
+            ctx: ?*anyopaque,
+            alloc_inner: Allocator,
+            _: types.SearchRequest,
+            id: []const u8,
+        ) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.projected_load_count += 1;
+            if (std.mem.eql(u8, id, "doc:c")) return error.UnexpectedTestCall;
+            return try std.fmt.allocPrint(alloc_inner, "{{\"id\":\"{s}\"}}", .{id});
+        }
+    };
+
+    var harness = Harness{ .text_entry = &text_entry };
+    const order_by = [_]types.SortField{
+        .{ .field = "price" },
+        .{ .field = "_id" },
+    };
+    var page = try searchMatchAll(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 10,
+    }, .{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .text_index_entry = Harness.textIndexEntry,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    });
+    defer page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), harness.collect_count);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, page.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 3), page.hits.len);
+    try std.testing.expectEqualStrings("doc:a", page.hits[0].id);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), page.hits[0].sort_values[0].float, 0.001);
+    try std.testing.expectEqualStrings("doc:b", page.hits[1].id);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), page.hits[1].sort_values[0].float, 0.001);
+    try std.testing.expectEqualStrings("doc:c", page.hits[2].id);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), page.hits[2].sort_values[0].float, 0.001);
+
+    const profile = page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", profile.plan);
+    try std.testing.expectEqualStrings("sorted_segment_scan", profile.source);
+    try std.testing.expectEqualStrings("source_free", profile.source_load);
+    try std.testing.expectEqual(@as(u64, 0), profile.stored_json_load_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.projected_source_load_count);
+    try std.testing.expectEqual(@as(usize, 0), harness.projected_load_count);
+
+    var stored_page = try searchMatchAll(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = true,
+        .profile = true,
+        .limit = 2,
+    }, .{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .text_index_entry = Harness.textIndexEntry,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    });
+    defer stored_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), stored_page.hits.len);
+    try std.testing.expectEqualStrings("doc:a", stored_page.hits[0].id);
+    try std.testing.expect(stored_page.hits[0].stored_data != null);
+    try std.testing.expectEqualStrings("doc:b", stored_page.hits[1].id);
+    try std.testing.expect(stored_page.hits[1].stored_data != null);
+    try std.testing.expectEqual(@as(usize, 2), harness.projected_load_count);
+    const stored_profile = stored_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", stored_profile.plan);
+    try std.testing.expectEqualStrings("projected_source_after_page", stored_profile.source_load);
+    try std.testing.expectEqual(@as(u64, 0), stored_profile.stored_json_load_count);
+    try std.testing.expectEqual(@as(u64, 2), stored_profile.projected_source_load_count);
+}
+
 test "match_all index sort uses doc values collector for selective native filters" {
     const alloc = std.testing.allocator;
 
@@ -19369,6 +19654,24 @@ test "match_all sorted segment seek uses cursor seek within each segment" {
     };
     const constraints = NativeDocIdConstraints{};
 
+    var first_page = try sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    }, executor, &constraints, &text_entry, sorted_plan, native_loader, null);
+    defer first_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), first_page.hits.len);
+    try std.testing.expectEqualStrings("doc:000", first_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:001", first_page.hits[1].id);
+    try std.testing.expectEqual(@as(usize, 2), counter.count);
+    const first_profile = first_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 2), first_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), first_profile.selected_count);
+    try std.testing.expectEqual(@as(usize, 1), first_profile.collector_heap_peak);
+
+    counter.count = 0;
     var page = try sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
         .order_by = &order_by,
         .search_after = &cursor,
@@ -19381,6 +19684,27 @@ test "match_all sorted segment seek uses cursor seek within each segment" {
     try std.testing.expectEqualStrings("doc:051", page.hits[0].id);
     try std.testing.expectEqualStrings("doc:052", page.hits[1].id);
     try std.testing.expect(counter.count < 16);
+
+    counter.count = 0;
+    var before_page = try sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_before = &cursor,
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    }, executor, &constraints, &text_entry, sorted_plan, native_loader, null);
+    defer before_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), before_page.hits.len);
+    try std.testing.expectEqualStrings("doc:048", before_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:049", before_page.hits[1].id);
+    try std.testing.expect(counter.count < 16);
+    const before_profile = before_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", before_profile.plan);
+    try std.testing.expectEqualStrings("sorted_segment_scan", before_profile.source);
+    try std.testing.expectEqual(@as(u64, 2), before_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), before_profile.selected_count);
+    try std.testing.expectEqual(@as(usize, 1), before_profile.collector_heap_peak);
 
     const beyond_cursor = [_]std.json.Value{
         .{ .float = 100.0 },
@@ -22325,6 +22649,14 @@ test "composed text exact sort preserves native component profile" {
         ) anyerror!types.SearchResult {
             return error.TestUnexpectedResult;
         }
+
+        fn attachGraphResults(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: *types.SearchResult,
+            _: []const graph_exec.NamedResultSet,
+        ) anyerror!void {}
     };
 
     const order_by = [_]types.SortField{.{ .field = "created_at", .desc = true }};
@@ -22341,6 +22673,7 @@ test "composed text exact sort preserves native component profile" {
         .search_sparse = Harness.searchSparse,
         .clone_named_set = Harness.cloneNamedSet,
         .fuse_named_sets = Harness.fuseNamedSets,
+        .attach_graph_results = Harness.attachGraphResults,
     });
     defer result.deinit();
 
@@ -22443,6 +22776,14 @@ test "composed text exact sort propagates internal profile collection to compone
         ) anyerror!types.SearchResult {
             return error.TestUnexpectedResult;
         }
+
+        fn attachGraphResults(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: *types.SearchResult,
+            _: []const graph_exec.NamedResultSet,
+        ) anyerror!void {}
     };
 
     const order_by = [_]types.SortField{.{ .field = "rank" }};
@@ -22459,6 +22800,7 @@ test "composed text exact sort propagates internal profile collection to compone
         .search_sparse = Harness.searchSparse,
         .clone_named_set = Harness.cloneNamedSet,
         .fuse_named_sets = Harness.fuseNamedSets,
+        .attach_graph_results = Harness.attachGraphResults,
     });
     defer result.deinit();
 
@@ -22597,6 +22939,14 @@ test "composed text exact sort surfaces missing component profile" {
         ) anyerror!types.SearchResult {
             return error.TestUnexpectedResult;
         }
+
+        fn attachGraphResults(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: *types.SearchResult,
+            _: []const graph_exec.NamedResultSet,
+        ) anyerror!void {}
     };
 
     const order_by = [_]types.SortField{.{ .field = "created_at", .desc = true }};
@@ -22613,6 +22963,7 @@ test "composed text exact sort surfaces missing component profile" {
         .search_sparse = Harness.searchSparse,
         .clone_named_set = Harness.cloneNamedSet,
         .fuse_named_sets = Harness.fuseNamedSets,
+        .attach_graph_results = Harness.attachGraphResults,
     });
     defer result.deinit();
 

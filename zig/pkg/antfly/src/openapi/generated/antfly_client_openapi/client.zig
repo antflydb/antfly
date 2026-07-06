@@ -418,11 +418,11 @@ pub const Client = struct {
         var query_buf = std.ArrayListUnmanaged(u8).empty;
         defer query_buf.deinit(self.allocator);
         var sep: u8 = '?';
-        const encoded_query_value_0 = try httpx.PercentEncoding.encode(self.allocator, params.location);
-        defer self.allocator.free(encoded_query_value_0);
+        const encoded_query_value_location = try httpx.PercentEncoding.encode(self.allocator, params.location);
+        defer self.allocator.free(encoded_query_value_location);
         try query_buf.appendSlice(self.allocator, &.{sep});
         try query_buf.appendSlice(self.allocator, "location=");
-        try query_buf.appendSlice(self.allocator, encoded_query_value_0);
+        try query_buf.appendSlice(self.allocator, encoded_query_value_location);
         sep = '&';
         if (query_buf.items.len > 0) {
             const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
@@ -1042,17 +1042,17 @@ pub const Client = struct {
         var query_buf = std.ArrayListUnmanaged(u8).empty;
         defer query_buf.deinit(self.allocator);
         var sep: u8 = '?';
-        const encoded_query_value_0 = try httpx.PercentEncoding.encode(self.allocator, params.resource);
-        defer self.allocator.free(encoded_query_value_0);
+        const encoded_query_value_resource = try httpx.PercentEncoding.encode(self.allocator, params.resource);
+        defer self.allocator.free(encoded_query_value_resource);
         try query_buf.appendSlice(self.allocator, &.{sep});
         try query_buf.appendSlice(self.allocator, "resource=");
-        try query_buf.appendSlice(self.allocator, encoded_query_value_0);
+        try query_buf.appendSlice(self.allocator, encoded_query_value_resource);
         sep = '&';
-        const encoded_query_value_1 = try httpx.PercentEncoding.encode(self.allocator, params.resource_type);
-        defer self.allocator.free(encoded_query_value_1);
+        const encoded_query_value_resource_type = try httpx.PercentEncoding.encode(self.allocator, params.resource_type);
+        defer self.allocator.free(encoded_query_value_resource_type);
         try query_buf.appendSlice(self.allocator, &.{sep});
         try query_buf.appendSlice(self.allocator, "resourceType=");
-        try query_buf.appendSlice(self.allocator, encoded_query_value_1);
+        try query_buf.appendSlice(self.allocator, encoded_query_value_resource_type);
         sep = '&';
         if (query_buf.items.len > 0) {
             const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
@@ -1108,11 +1108,11 @@ pub const Client = struct {
         var query_buf = std.ArrayListUnmanaged(u8).empty;
         defer query_buf.deinit(self.allocator);
         var sep: u8 = '?';
-        const encoded_query_value_0 = try httpx.PercentEncoding.encode(self.allocator, params.role);
-        defer self.allocator.free(encoded_query_value_0);
+        const encoded_query_value_role = try httpx.PercentEncoding.encode(self.allocator, params.role);
+        defer self.allocator.free(encoded_query_value_role);
         try query_buf.appendSlice(self.allocator, &.{sep});
         try query_buf.appendSlice(self.allocator, "role=");
-        try query_buf.appendSlice(self.allocator, encoded_query_value_0);
+        try query_buf.appendSlice(self.allocator, encoded_query_value_role);
         sep = '&';
         if (query_buf.items.len > 0) {
             const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
