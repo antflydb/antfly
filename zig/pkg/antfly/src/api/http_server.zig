@@ -40,6 +40,7 @@ const raft_host = @import("../raft/host.zig");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const db_query_search = @import("../storage/db/query/search_exec.zig");
 const storage_schema = @import("../storage/schema.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const table_catalog = @import("table_catalog.zig");
@@ -7690,12 +7691,14 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntime(
     observed_dynamic_capability_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
 ) !void {
     if (query_req.order_by.len == 0) return;
+    try validatePublicScoreSortSource(query_req);
+    try validatePublicApproximateSortSource(query_req);
     const cursor = if (query_req.search_after.len > 0) query_req.search_after else query_req.search_before;
     for (query_req.order_by, 0..) |field, i| {
         if (std.mem.eql(u8, field.field, "_id")) continue;
         if (std.mem.eql(u8, field.field, "_score")) continue;
 
-        if (storage_schema.resolveFieldType(runtime_schema, field.field)) |mapping| {
+        if (storage_schema.resolveDeclaredFieldType(runtime_schema, field.field)) |mapping| {
             try validatePublicMappedSortField(field.field, mapping);
             if (try validatePublicSortCapabilityEvidence(
                 observed_dynamic_capability_sets,
@@ -7722,6 +7725,34 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntime(
         recordPublicSortCapabilityRejection(field.field, "unmapped_sort_field", "unmapped_field");
         return error.UnsupportedExactSort;
     }
+}
+
+fn validatePublicScoreSortSource(query_req: db_mod.types.SearchRequest) !void {
+    var has_score_sort = false;
+    for (query_req.order_by) |field| {
+        if (std.mem.eql(u8, field.field, "_score")) {
+            has_score_sort = true;
+            break;
+        }
+    }
+    if (!has_score_sort) return;
+    if (db_query_search.searchRequestHasScoreBearingSource(query_req)) return;
+    recordPublicSortCapabilityRejection("_score", "non_score_bearing_source", "non_score_bearing_source");
+    return error.UnsupportedQueryRequest;
+}
+
+fn validatePublicApproximateSortSource(query_req: db_mod.types.SearchRequest) !void {
+    if (!db_query_search.searchRequestHasScoreBearingVectorSource(query_req)) return;
+    for (query_req.order_by) |field| {
+        if (std.mem.eql(u8, field.field, "_score") or std.mem.eql(u8, field.field, "_id")) continue;
+        recordPublicSortCapabilityRejection(field.field, "approximate_candidate_source", "approximate_candidate_source");
+        return error.UnsupportedQueryRequest;
+    }
+    for (query_req.order_by) |field| {
+        if (std.mem.eql(u8, field.field, "_score")) return;
+    }
+    recordPublicSortCapabilityRejection("_id", "approximate_candidate_source", "approximate_candidate_source");
+    return error.UnsupportedQueryRequest;
 }
 
 fn validatePublicMappedSortField(field: []const u8, mapping: storage_schema.FieldMapping) !void {
@@ -10616,6 +10647,28 @@ test "api http public sort capability gate validates mapped sortable fields" {
     try std.testing.expectEqualStrings("missing_doc_values_coverage", diagnostic.reason);
     try std.testing.expectEqualStrings("schema_declared", diagnostic.detail);
 
+    const match_mapping_templates = [_]storage_schema.DynamicTemplate{.{
+        .name = "dates",
+        .path_match = "meta.*_at",
+        .match_mapping_type = "date",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "standard",
+        },
+    }};
+    const match_mapping_schema = storage_schema.TableSchema{ .dynamic_templates = &match_mapping_templates };
+    const dynamic_created_order = [_]db_mod.types.SortField{.{ .field = "meta.created_at", .desc = true }};
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &dynamic_created_order,
+    }, match_mapping_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("meta.created_at", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", diagnostic.reason);
+    try std.testing.expectEqualStrings("schema_declared", diagnostic.detail);
+
     const body_order = [_]db_mod.types.SortField{.{ .field = "body" }};
     db_mod.resetLastSortRejectionDiagnostic();
     try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{ .order_by = &body_order }, runtime_schema, &.{}));
@@ -10623,6 +10676,86 @@ test "api http public sort capability gate validates mapped sortable fields" {
     try std.testing.expectEqualStrings("body", diagnostic.field);
     try std.testing.expectEqualStrings("non_sortable_sort_field", diagnostic.reason);
     try std.testing.expectEqualStrings("non_scalar_field", diagnostic.detail);
+}
+
+test "api http public sort capability gate validates score-bearing source" {
+    const runtime_schema = storage_schema.TableSchema{};
+    const score_order = [_]db_mod.types.SortField{.{ .field = "_score", .desc = true }};
+
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &score_order,
+        .full_text = .{ .match_all = {} },
+    }, runtime_schema, &.{}));
+    var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", diagnostic.field);
+    try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.reason);
+    try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.detail);
+
+    try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &score_order,
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+    }, runtime_schema, &.{});
+
+    const vector = [_]f32{ 0.1, 0.2 };
+    try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &score_order,
+        .dense = .{ .vector = &vector, .k = 10 },
+    }, runtime_schema, &.{});
+
+    const id_order = [_]db_mod.types.SortField{.{ .field = "_id", .desc = false }};
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &id_order,
+        .dense = .{ .vector = &vector, .k = 10 },
+    }, runtime_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_id", diagnostic.field);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
+
+    const templates = [_]storage_schema.DynamicTemplate{.{
+        .name = "created_at",
+        .path_match = "created_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const mapped_schema = storage_schema.TableSchema{ .dynamic_templates = &templates };
+    const combined_order = [_]db_mod.types.SortField{
+        .{ .field = "_score", .desc = true },
+        .{ .field = "created_at", .desc = true },
+    };
+
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &combined_order,
+        .full_text = .{ .match_all = {} },
+    }, mapped_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", diagnostic.field);
+    try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.reason);
+
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &combined_order,
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+    }, mapped_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("created_at", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", diagnostic.reason);
+
+    const field_order = [_]db_mod.types.SortField{.{ .field = "created_at", .desc = true }};
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &field_order,
+        .dense = .{ .vector = &vector, .k = 10 },
+    }, mapped_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("created_at", diagnostic.field);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
 }
 
 test "api http public sort capability gate fails closed for uncovered observed dynamic fields" {

@@ -3788,27 +3788,54 @@ pub const IndexManager = struct {
         name: ?[]const u8,
     ) ![]schema_mod.FieldCapability {
         const entry = self.textIndexEntry(name) orelse return &.{};
-        if (entry.observed_field_analyzers.len == 0) return &.{};
+        const declared_capability_count = declaredRuntimeSortableFieldCapabilityCount(entry);
+        const capability_count = entry.observed_field_analyzers.len + declared_capability_count;
+        if (capability_count == 0) return &.{};
 
-        const capabilities = try alloc.alloc(schema_mod.FieldCapability, entry.observed_field_analyzers.len);
+        const capabilities = try alloc.alloc(schema_mod.FieldCapability, capability_count);
         var initialized: usize = 0;
         errdefer {
             for (capabilities[0..initialized]) |item| schema_mod.freeOwnedFieldCapability(alloc, item);
             alloc.free(capabilities);
         }
-        for (entry.observed_field_analyzers, 0..) |item, i| {
+        for (entry.observed_field_analyzers) |item| {
             var capability = schema_mod.observedDynamicFieldCapability(entry.runtime_schema, item.field_name, item.mapping());
             if (try observedDynamicFieldHasCompleteTypedDocValueCoverage(alloc, entry, item.field_name, item.mapping())) {
                 capability.doc_value_coverage = "covered";
                 capability.queryability_state = "queryable";
             }
-            capabilities[i] = try schema_mod.cloneFieldCapabilityAlloc(
+            capabilities[initialized] = try schema_mod.cloneFieldCapabilityAlloc(
                 alloc,
                 capability,
             );
             initialized += 1;
         }
+        if (entry.runtime_schema) |schema| {
+            for (schema.dynamic_templates) |template| {
+                const field = schema_mod.exactDynamicTemplatePath(template) orelse continue;
+                if (!schema_mod.mappingIsSortable(template.mapping)) continue;
+                var capability = schema_mod.dynamicTemplateFieldCapability(schema, template);
+                if (try observedDynamicFieldHasCompleteTypedDocValueCoverage(alloc, entry, field, template.mapping)) {
+                    capability.doc_value_coverage = "covered";
+                    capability.queryability_state = "queryable";
+                }
+                capabilities[initialized] = try schema_mod.cloneFieldCapabilityAlloc(alloc, capability);
+                initialized += 1;
+            }
+        }
+        std.debug.assert(initialized == capability_count);
         return capabilities;
+    }
+
+    fn declaredRuntimeSortableFieldCapabilityCount(entry: *TextIndex) usize {
+        const schema = entry.runtime_schema orelse return 0;
+        var capability_count: usize = 0;
+        for (schema.dynamic_templates) |template| {
+            if (schema_mod.exactDynamicTemplatePath(template) == null) continue;
+            if (!schema_mod.mappingIsSortable(template.mapping)) continue;
+            capability_count += 1;
+        }
+        return capability_count;
     }
 
     fn observedDynamicFieldHasCompleteTypedDocValueCoverage(
@@ -3876,8 +3903,8 @@ pub const IndexManager = struct {
         alloc: Allocator,
     ) ![]ObservedDynamicFieldCapabilitySet {
         var set_count: usize = 0;
-        for (self.text_indexes.items) |entry| {
-            if (entry.observed_field_analyzers.len > 0) set_count += 1;
+        for (self.text_indexes.items) |*entry| {
+            if (entry.observed_field_analyzers.len > 0 or declaredRuntimeSortableFieldCapabilityCount(entry) > 0) set_count += 1;
         }
         if (set_count == 0) return &.{};
 
@@ -3889,7 +3916,7 @@ pub const IndexManager = struct {
         }
 
         for (self.text_indexes.items) |*entry| {
-            if (entry.observed_field_analyzers.len == 0) continue;
+            if (entry.observed_field_analyzers.len == 0 and declaredRuntimeSortableFieldCapabilityCount(entry) == 0) continue;
             sets[initialized] = blk: {
                 const index_name = try alloc.dupe(u8, entry.config.name);
                 errdefer alloc.free(index_name);
@@ -16191,6 +16218,79 @@ test "observed dynamic sortable field capability reports covered queryable state
     try std.testing.expect(capabilities[0].doc_values);
     try std.testing.expect(capabilities[0].sortable);
     try std.testing.expectEqualStrings("covered", capabilities[0].doc_value_coverage);
+    try std.testing.expectEqualStrings("queryable", capabilities[0].queryability_state);
+}
+
+test "declared runtime sortable field capability reports covered queryable state" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    try manager.addAllNoBackfill(&store, &.{
+        .{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        },
+    });
+    const entry = manager.textIndexEntry("ft_v1").?;
+    const templates = try alloc.alloc(schema_mod.DynamicTemplate, 1);
+    templates[0] = .{
+        .name = try alloc.dupe(u8, "created"),
+        .path_match = try alloc.dupe(u8, "created_at"),
+        .mapping = .{
+            .field_type = .datetime,
+            .do_index = true,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = try alloc.dupe(u8, "standard"),
+        },
+    };
+    entry.runtime_schema = .{
+        .default_type = try alloc.dupe(u8, "_default"),
+        .ttl_field = try alloc.dupe(u8, "_timestamp"),
+        .dynamic_templates = templates,
+    };
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .u64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .u64_val = 1_700_000_000_000_000_000 });
+    try dv_writer.add(1, .{ .u64_val = 1_700_000_001_000_000_000 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const created_idx = try seg_writer.addField("created_at");
+    try seg_writer.addSection(created_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"created_at\":\"2023-11-14T22:13:20Z\"}");
+    try seg_writer.addStoredDoc("doc:b", "{\"created_at\":\"2023-11-14T22:13:21Z\"}");
+    const segment = try seg_writer.build();
+    defer alloc.free(segment);
+    try entry.persistent.indexSegment(segment);
+
+    const capabilities = try manager.observedDynamicFieldCapabilitiesAlloc(alloc, "ft_v1");
+    defer schema_mod.freeOwnedFieldCapabilities(alloc, capabilities);
+    try std.testing.expectEqual(@as(usize, 1), capabilities.len);
+    try std.testing.expectEqualStrings("created", capabilities[0].name.?);
+    try std.testing.expectEqualStrings("created_at", capabilities[0].field.?);
+    try std.testing.expectEqual(schema_mod.AntflyType.datetime, capabilities[0].field_type);
+    try std.testing.expect(capabilities[0].doc_values);
+    try std.testing.expect(capabilities[0].sortable);
+    try std.testing.expectEqualStrings("covered", capabilities[0].doc_value_coverage);
+    try std.testing.expectEqualStrings("dynamic_template", capabilities[0].provenance);
     try std.testing.expectEqualStrings("queryable", capabilities[0].queryability_state);
 }
 

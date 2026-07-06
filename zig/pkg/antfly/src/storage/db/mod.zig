@@ -127,6 +127,14 @@ pub fn searchRequestHasScoreBearingTextSource(req: types.SearchRequest) bool {
     return query_search.searchRequestHasScoreBearingTextSource(req);
 }
 
+pub fn searchRequestHasScoreBearingVectorSource(req: types.SearchRequest) bool {
+    return query_search.searchRequestHasScoreBearingVectorSource(req);
+}
+
+pub fn searchRequestHasScoreBearingSource(req: types.SearchRequest) bool {
+    return query_search.searchRequestHasScoreBearingSource(req);
+}
+
 pub fn resetLastSortRejectionDiagnostic() void {
     query_search.resetLastSortRejectionDiagnostic();
 }

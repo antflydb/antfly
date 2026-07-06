@@ -1419,18 +1419,15 @@ fn metadataScoreSortFeedback(
     field: []const u8,
 ) !?[]const u8 {
     if (!std.mem.eql(u8, field, "_score")) return null;
-    if (query_request.semantic_search != null or query_request.embeddings != null) {
-        return try alloc.dupe(u8, "query_request.order_by references _score with an approximate semantic candidate source; omit order_by for native score order");
-    }
+    const score_bearing = query_contract.queryRequestHasScoreBearingSourceAlloc(alloc, query_request) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => false,
+    };
+    if (score_bearing) return null;
     if (query_request.full_text_search != null) {
-        const score_bearing = query_contract.queryRequestHasScoreBearingTextSourceAlloc(alloc, query_request) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => false,
-        };
-        if (score_bearing) return null;
         return try alloc.dupe(u8, "query_request.order_by references _score with a non-score-bearing full_text_search");
     }
-    return try alloc.dupe(u8, "query_request.order_by references _score without a score-bearing full_text_search");
+    return try alloc.dupe(u8, "query_request.order_by references _score without a score-bearing source");
 }
 
 fn metadataSortFieldFeedback(
@@ -6483,6 +6480,7 @@ test "query builder preflight validates score sort source" {
     var collected = collectQueryBuilderContext(.{
         .schema_fields = &.{"body"},
         .full_text_index_metadata = &.{.{ .name = "search_idx", .fields = &.{"body"} }},
+        .embedding_index_metadata = &.{.{ .name = "body_embedding" }},
     });
     const score_order = [_]metadata_openapi.SortField{.{ .field = "_score", .desc = true }};
     var valid_preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
@@ -6500,11 +6498,16 @@ test "query builder preflight validates score sort source" {
         .order_by = &score_order,
     }, null, "query_builder", .{});
     defer invalid_preflight.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), invalid_preflight.diagnostics.len);
-    try std.testing.expectEqual(QueryPreflightDiagnosticSeverity.@"error", invalid_preflight.diagnostics[0].severity);
-    try std.testing.expectEqualStrings("invalid_sort_field", invalid_preflight.diagnostics[0].code);
-    try std.testing.expectEqualStrings("query_request.order_by", invalid_preflight.diagnostics[0].path);
-    try std.testing.expect(std.mem.indexOf(u8, invalid_preflight.diagnostics[0].message, "without a score-bearing full_text_search") != null);
+    var found_missing_source_diagnostic = false;
+    for (invalid_preflight.diagnostics) |diagnostic| {
+        if (std.mem.indexOf(u8, diagnostic.message, "without a score-bearing source") == null) continue;
+        try std.testing.expectEqual(QueryPreflightDiagnosticSeverity.@"error", diagnostic.severity);
+        try std.testing.expectEqualStrings("invalid_sort_field", diagnostic.code);
+        try std.testing.expectEqualStrings("query_request.order_by", diagnostic.path);
+        found_missing_source_diagnostic = true;
+        break;
+    }
+    try std.testing.expect(found_missing_source_diagnostic);
 
     var filter_shaped_preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
         .intent = "highest scoring docs",
@@ -6513,11 +6516,16 @@ test "query builder preflight validates score sort source" {
         .order_by = &score_order,
     }, null, "query_builder", .{});
     defer filter_shaped_preflight.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), filter_shaped_preflight.diagnostics.len);
-    try std.testing.expectEqual(QueryPreflightDiagnosticSeverity.@"error", filter_shaped_preflight.diagnostics[0].severity);
-    try std.testing.expectEqualStrings("invalid_sort_field", filter_shaped_preflight.diagnostics[0].code);
-    try std.testing.expectEqualStrings("query_request.order_by", filter_shaped_preflight.diagnostics[0].path);
-    try std.testing.expect(std.mem.indexOf(u8, filter_shaped_preflight.diagnostics[0].message, "non-score-bearing full_text_search") != null);
+    var found_filter_shaped_diagnostic = false;
+    for (filter_shaped_preflight.diagnostics) |diagnostic| {
+        if (std.mem.indexOf(u8, diagnostic.message, "non-score-bearing full_text_search") == null) continue;
+        try std.testing.expectEqual(QueryPreflightDiagnosticSeverity.@"error", diagnostic.severity);
+        try std.testing.expectEqualStrings("invalid_sort_field", diagnostic.code);
+        try std.testing.expectEqualStrings("query_request.order_by", diagnostic.path);
+        found_filter_shaped_diagnostic = true;
+        break;
+    }
+    try std.testing.expect(found_filter_shaped_diagnostic);
 
     var semantic_preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
         .intent = "semantic score docs",
@@ -6527,7 +6535,6 @@ test "query builder preflight validates score sort source" {
         .order_by = &score_order,
     }, null, "query_builder", .{});
     defer semantic_preflight.deinit(std.testing.allocator);
-    try std.testing.expect(semantic_preflight.diagnostics.len >= 1);
     var found_semantic_score_sort_diagnostic = false;
     for (semantic_preflight.diagnostics) |diagnostic| {
         if (std.mem.indexOf(u8, diagnostic.message, "approximate semantic candidate source") != null) {
@@ -6535,7 +6542,7 @@ test "query builder preflight validates score sort source" {
             break;
         }
     }
-    try std.testing.expect(found_semantic_score_sort_diagnostic);
+    try std.testing.expect(!found_semantic_score_sort_diagnostic);
 }
 
 test "query builder preflight rejects mixed observed dynamic sort coverage" {

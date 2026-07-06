@@ -127,7 +127,7 @@ pub fn mergeSearchResultsWithRuntimeSchema(
             .alloc = alloc,
             .hits = final_hits,
             .total_hits = total_hits,
-            .total_hits_relation = total_hits_relation,
+            .total_hits_relation = sorted_merge.total_hits_relation,
             .identity_read_generation = mergedSearchResultIdentityReadGeneration(req, results),
             .sort_profile = sorted_merge.sort_profile,
             .graph_results = graph_results,
@@ -1056,9 +1056,25 @@ test "query parser records approximate source diagnostic for semantic exact sort
         \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"order_by":[{"field":"created_at","desc":true}],"limit":4}
     ));
     const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("created_at", diagnostic.field);
     try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
     try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
+}
+
+test "query parser allows semantic score sort with stable id tiebreaker" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseQueryRequest(alloc, FakeSemanticResolver.iface(), "docs",
+        \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"order_by":[{"field":"_score","desc":true}],"limit":4}
+    );
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.dense_queries.len);
+    try std.testing.expectEqual(@as(usize, 2), parsed.req.order_by.len);
+    try std.testing.expectEqualStrings("_score", parsed.req.order_by[0].field);
+    try std.testing.expect(parsed.req.order_by[0].desc);
+    try std.testing.expectEqualStrings("_id", parsed.req.order_by[1].field);
+    try std.testing.expect(!parsed.req.order_by[1].desc);
+    try std.testing.expect(db_mod.searchRequestHasScoreBearingSource(parsed.req));
 }
 
 test "query encoder emits antfly-style response envelope" {
@@ -1409,6 +1425,19 @@ fn testSortedQueryHitAlloc(alloc: std.mem.Allocator, id: []const u8, rank: i64) 
     };
 }
 
+fn testScoreSortedQueryHitAlloc(alloc: std.mem.Allocator, id: []const u8, score: f32) !db_mod.types.SearchHit {
+    const sort_values = try alloc.alloc(std.json.Value, 2);
+    errdefer alloc.free(sort_values);
+    sort_values[0] = .{ .float = @floatCast(score) };
+    sort_values[1] = .{ .string = try alloc.dupe(u8, id) };
+    errdefer db_mod.types.deinitJsonValue(alloc, &sort_values[1]);
+    return .{
+        .id = try alloc.dupe(u8, id),
+        .score = score,
+        .sort_values = sort_values,
+    };
+}
+
 fn testDateSortedQueryHitAlloc(alloc: std.mem.Allocator, id: []const u8, created_at_ns: u64) !db_mod.types.SearchHit {
     const sort_values = try alloc.alloc(std.json.Value, 2);
     errdefer alloc.free(sort_values);
@@ -1422,12 +1451,54 @@ fn testDateSortedQueryHitAlloc(alloc: std.mem.Allocator, id: []const u8, created
     };
 }
 
+fn testRankRuntimeSchema() runtime_schema_mod.TableSchema {
+    const templates = struct {
+        const values = [_]runtime_schema_mod.DynamicTemplate{.{
+            .name = "rank",
+            .path_match = "rank",
+            .mapping = .{
+                .field_type = .numeric,
+                .doc_values = true,
+                .sortable = true,
+                .analyzer = "keyword",
+            },
+        }};
+    }.values;
+    return .{ .dynamic_templates = &templates };
+}
+
+test "query merge rejects explicit score sort without score-bearing source" {
+    const alloc = std.testing.allocator;
+    const score_order = [_]db_mod.types.SortField{.{ .field = "_score", .desc = true }};
+
+    var hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+    hits[0] = try testScoreSortedQueryHitAlloc(alloc, "doc:a", 1.0);
+    hits[1] = try testScoreSortedQueryHitAlloc(alloc, "doc:b", 2.0);
+    var result = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 2 };
+    defer result.deinit();
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{
+        .order_by = &score_order,
+        .full_text = .{ .match_all = {} },
+    }, &.{result}, 0, 2));
+
+    var page = try mergeSearchResults(alloc, .{
+        .order_by = &score_order,
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+    }, &.{result}, 0, 2);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 2), page.hits.len);
+    try std.testing.expectEqualStrings("doc:b", page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:a", page.hits[1].id);
+}
+
 test "query merge applies distributed typed sort ordering and cursor paging" {
     const alloc = std.testing.allocator;
     const order_by = [_]db_mod.types.SortField{
         .{ .field = "rank" },
         .{ .field = "_id" },
     };
+    const schema = testRankRuntimeSchema();
 
     var left_hits = try alloc.alloc(db_mod.types.SearchHit, 3);
     left_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:a", 1);
@@ -1442,7 +1513,7 @@ test "query merge applies distributed typed sort ordering and cursor paging" {
     var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 2, .total_hits_relation = .gte };
     defer right.deinit();
 
-    var first_page = try mergeSearchResults(alloc, .{ .order_by = &order_by }, &.{ left, right }, 1, 3);
+    var first_page = try mergeSearchResultsWithRuntimeSchema(alloc, .{ .order_by = &order_by }, &.{ left, right }, 1, 3, schema);
     defer first_page.deinit();
     try std.testing.expectEqual(@as(u32, 5), first_page.total_hits);
     try std.testing.expectEqual(db_mod.types.TotalHitsRelation.gte, first_page.total_hits_relation);
@@ -1456,11 +1527,11 @@ test "query merge applies distributed typed sort ordering and cursor paging" {
         .{ .integer = 2 },
         .{ .string = "doc:b" },
     };
-    var after_page = try mergeSearchResults(alloc, .{
+    var after_page = try mergeSearchResultsWithRuntimeSchema(alloc, .{
         .order_by = &order_by,
         .search_after = &after_cursor,
         .profile = true,
-    }, &.{ left, right }, 0, 2);
+    }, &.{ left, right }, 0, 2, schema);
     defer after_page.deinit();
     try std.testing.expectEqual(@as(usize, 2), after_page.hits.len);
     try std.testing.expectEqualStrings("doc:c", after_page.hits[0].id);
@@ -1476,10 +1547,10 @@ test "query merge applies distributed typed sort ordering and cursor paging" {
         .{ .integer = 5 },
         .{ .string = "doc:e" },
     };
-    var before_page = try mergeSearchResults(alloc, .{
+    var before_page = try mergeSearchResultsWithRuntimeSchema(alloc, .{
         .order_by = &order_by,
         .search_before = &before_cursor,
-    }, &.{ left, right }, 0, 2);
+    }, &.{ left, right }, 0, 2, schema);
     defer before_page.deinit();
     try std.testing.expectEqual(@as(usize, 2), before_page.hits.len);
     try std.testing.expectEqualStrings("doc:c", before_page.hits[0].id);
@@ -1492,6 +1563,7 @@ test "query merge sort profile does not inherit stale rejection diagnostic" {
         .{ .field = "rank" },
         .{ .field = "_id" },
     };
+    const schema = testRankRuntimeSchema();
 
     var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
     left_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:a", 1);
@@ -1504,10 +1576,10 @@ test "query merge sort profile does not inherit stale rejection diagnostic" {
     defer right.deinit();
 
     db_mod.recordSortRejectionDiagnostic("stale_field", "stale_reason", "stale_detail");
-    var merged = try mergeSearchResults(alloc, .{
+    var merged = try mergeSearchResultsWithRuntimeSchema(alloc, .{
         .order_by = &order_by,
         .profile = true,
-    }, &.{ left, right }, 0, 2);
+    }, &.{ left, right }, 0, 2, schema);
     defer merged.deinit();
 
     const sort_profile = merged.sort_profile orelse return error.TestUnexpectedResult;
@@ -1515,6 +1587,23 @@ test "query merge sort profile does not inherit stale rejection diagnostic" {
     try std.testing.expectEqualStrings("", sort_profile.sort_rejection_reason);
     try std.testing.expectEqualStrings("", sort_profile.sort_rejection_detail);
     try std.testing.expectEqualStrings("", sort_profile.sort_rejection_field.slice());
+}
+
+test "query merge rejects distributed field sort without runtime schema" {
+    const alloc = std.testing.allocator;
+    const order_by = [_]db_mod.types.SortField{
+        .{ .field = "rank" },
+        .{ .field = "_id" },
+    };
+
+    var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    hits[0] = try testSortedQueryHitAlloc(alloc, "doc:a", 1);
+    var result = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 1 };
+    defer result.deinit();
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{
+        .order_by = &order_by,
+    }, &.{result}, 0, 1));
 }
 
 test "query merge applies runtime schema to distributed date cursors" {
@@ -1574,6 +1663,7 @@ test "query merge rejects sorted shards without complete sort tuples" {
         .{ .field = "rank" },
         .{ .field = "_id" },
     };
+    const schema = testRankRuntimeSchema();
 
     var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
     hits[0] = .{
@@ -1584,7 +1674,7 @@ test "query merge rejects sorted shards without complete sort tuples" {
     var result = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 1 };
     defer result.deinit();
 
-    try std.testing.expectError(error.InvalidQueryRequest, mergeSearchResults(alloc, .{ .order_by = &order_by }, &.{result}, 0, 10));
+    try std.testing.expectError(error.InvalidQueryRequest, mergeSearchResultsWithRuntimeSchema(alloc, .{ .order_by = &order_by }, &.{result}, 0, 10, schema));
 }
 
 test "query merge rejects sorted shards whose id tiebreaker mismatches hit id" {
@@ -1593,6 +1683,7 @@ test "query merge rejects sorted shards whose id tiebreaker mismatches hit id" {
         .{ .field = "rank" },
         .{ .field = "_id" },
     };
+    const schema = testRankRuntimeSchema();
 
     var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
     hits[0] = .{
@@ -1604,7 +1695,7 @@ test "query merge rejects sorted shards whose id tiebreaker mismatches hit id" {
     var result = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 1 };
     defer result.deinit();
 
-    try std.testing.expectError(error.InvalidQueryRequest, mergeSearchResults(alloc, .{ .order_by = &order_by }, &.{result}, 0, 10));
+    try std.testing.expectError(error.InvalidQueryRequest, mergeSearchResultsWithRuntimeSchema(alloc, .{ .order_by = &order_by }, &.{result}, 0, 10, schema));
 }
 
 test "query merge rejects sorted shards with mixed sort value domains" {
@@ -1613,6 +1704,7 @@ test "query merge rejects sorted shards with mixed sort value domains" {
         .{ .field = "rank" },
         .{ .field = "_id" },
     };
+    const schema = testRankRuntimeSchema();
 
     var numeric_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
     numeric_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:a", 1);
@@ -1629,7 +1721,7 @@ test "query merge rejects sorted shards with mixed sort value domains" {
     var string = db_mod.types.SearchResult{ .alloc = alloc, .hits = string_hits, .total_hits = 1 };
     defer string.deinit();
 
-    try std.testing.expectError(error.InvalidQueryRequest, mergeSearchResults(alloc, .{ .order_by = &order_by }, &.{ numeric, string }, 0, 10));
+    try std.testing.expectError(error.InvalidQueryRequest, mergeSearchResultsWithRuntimeSchema(alloc, .{ .order_by = &order_by }, &.{ numeric, string }, 0, 10, schema));
 }
 
 test "query merge preserves single-result doc ordinals" {

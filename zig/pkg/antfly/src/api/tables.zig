@@ -983,7 +983,7 @@ fn generatedFieldCapabilitiesAlloc(
 
     for (observedDynamicFieldCapabilitySetsFromStatus(storage_status)) |set| {
         for (set.field_capabilities) |capability| {
-            try appendGeneratedFieldCapability(alloc, &out, try generatedFieldCapabilityAlloc(alloc, capability));
+            try appendRuntimeGeneratedFieldCapability(alloc, &out, try generatedFieldCapabilityAlloc(alloc, capability));
         }
     }
 
@@ -1004,6 +1004,39 @@ fn appendGeneratedFieldCapability(
         return;
     }
     try out.append(alloc, owned);
+}
+
+fn appendRuntimeGeneratedFieldCapability(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(metadata_openapi.FieldCapability),
+    capability: metadata_openapi.FieldCapability,
+) !void {
+    const owned = capability;
+    errdefer freeGeneratedFieldCapability(alloc, owned);
+    for (out.items) |*existing| {
+        if (!generatedFieldCapabilityAggregationKeyEqual(existing.*, owned)) continue;
+        if (runtimeCapabilityCanPromoteSchemaDeclaration(existing.*, owned)) {
+            try replaceOwnedStringIfDifferent(alloc, &existing.doc_value_coverage, owned.doc_value_coverage);
+            try replaceOwnedStringIfDifferent(alloc, &existing.queryability_state, owned.queryability_state);
+            freeGeneratedFieldCapability(alloc, owned);
+            return;
+        }
+        try mergeGeneratedFieldCapability(alloc, existing, owned);
+        freeGeneratedFieldCapability(alloc, owned);
+        return;
+    }
+    try out.append(alloc, owned);
+}
+
+fn runtimeCapabilityCanPromoteSchemaDeclaration(
+    existing: metadata_openapi.FieldCapability,
+    incoming: metadata_openapi.FieldCapability,
+) bool {
+    return std.mem.eql(u8, existing.doc_value_coverage, "schema_declared") and
+        std.mem.eql(u8, existing.queryability_state, "declared") and
+        std.mem.eql(u8, incoming.doc_value_coverage, "covered") and
+        std.mem.eql(u8, incoming.queryability_state, "queryable") and
+        !std.mem.eql(u8, incoming.provenance, "observed_dynamic");
 }
 
 fn generatedFieldCapabilityAggregationKeyEqual(
@@ -2862,6 +2895,56 @@ test "metadata.table status includes observed dynamic field capabilities" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field\":\"meta.status\",\"type\":\"keyword\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"doc_value_coverage\":\"observed_declared\",\"provenance\":\"observed_dynamic\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"queryability_state\":\"declared\"") != null);
+}
+
+test "metadata.table status promotes schema capability when runtime coverage is complete" {
+    const schema_json =
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"created","path_match":"created_at","mapping":{"type":"datetime","doc_values":true,"sortable":true}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"created_at":{"type":"string","format":"date-time"}}}}}}
+    ;
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .schema_json = schema_json, .indexes_json = "{}", .replication_sources_json = "[]", .placement_role = "data" }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null }})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const template = runtime_schema_mod.DynamicTemplate{
+        .name = "created",
+        .path_match = "created_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "standard",
+        },
+    };
+    const runtime_schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &.{template} };
+    var covered = runtime_schema_mod.dynamicTemplateFieldCapability(runtime_schema, template);
+    covered.doc_value_coverage = "covered";
+    covered.queryability_state = "queryable";
+    var runtime_capabilities = [_]runtime_schema_mod.FieldCapability{covered};
+    var observed_sets = [_]table_reads.ObservedDynamicFieldCapabilitySet{.{
+        .index_name = @constCast("full_text_index_v0"),
+        .field_capabilities = runtime_capabilities[0..],
+    }};
+    const storage_statuses = [_]TableStorageStatus{.{
+        .table_name = "docs",
+        .empty = false,
+        .observed_dynamic_field_capability_sets = observed_sets[0..],
+    }};
+
+    const encoded = (try encodeSingleTableStatusWithStorageStatuses(std.testing.allocator, &snapshot, "docs", storage_statuses[0..])).?;
+    defer std.testing.allocator.free(encoded);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    const created = testFieldCapabilityByIdentifier(parsed.value, "created") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("datetime", created.object.get("type").?.string);
+    try std.testing.expectEqualStrings("covered", created.object.get("doc_value_coverage").?.string);
+    try std.testing.expectEqualStrings("dynamic_template", created.object.get("provenance").?.string);
+    try std.testing.expectEqualStrings("queryable", created.object.get("queryability_state").?.string);
 }
 
 test "metadata.table status merges observed capabilities conservatively" {

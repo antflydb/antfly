@@ -876,22 +876,24 @@ pub fn dynamicTemplateFieldCapability(schema: TableSchema, tmpl: DynamicTemplate
 }
 
 pub fn fullTextFieldCapability(schema: TableSchema, document_name: []const u8, field: FullTextField) FieldCapability {
+    const exact_keyword = std.mem.eql(u8, field.analyzer, "keyword");
+    const capability_field = if (exact_keyword) field.emitted_name else field.path;
     return .{
-        .field = field.path,
+        .field = capability_field,
         .emitted_name = field.emitted_name,
         .document_schema = document_name,
-        .field_type = .text,
+        .field_type = if (exact_keyword) .keyword else .text,
         .searchable = true,
-        .filterable = false,
+        .filterable = exact_keyword,
         .aggregatable = false,
         .doc_values = false,
         .sortable = false,
         .doc_value_coverage = "not_declared",
         .provenance = "document_schema",
         .missing_null_policy = "not_applicable",
-        .queryability_state = "text_search_only",
+        .queryability_state = if (exact_keyword) "missing_doc_values" else "text_search_only",
         .analyzer = field.analyzer,
-        .index_sort = indexSortMembership(schema, field.path),
+        .index_sort = indexSortMembership(schema, capability_field),
     };
 }
 
@@ -1742,6 +1744,7 @@ test "runtime schema field capability matrix enumerates shared capabilities" {
     const fields = [_]FullTextField{
         .{ .path = "created_at", .emitted_name = "created_at", .analyzer = "keyword" },
         .{ .path = "title", .emitted_name = "title", .analyzer = "english" },
+        .{ .path = "title", .emitted_name = "title.keyword", .analyzer = "keyword" },
         .{ .path = "_id", .emitted_name = "_id", .analyzer = "keyword" },
     };
     const docs = [_]FullTextDocument{.{
@@ -1761,7 +1764,7 @@ test "runtime schema field capability matrix enumerates shared capabilities" {
     const capabilities = try fieldCapabilitiesAlloc(alloc, schema);
     defer freeFieldCapabilities(alloc, capabilities);
 
-    try std.testing.expectEqual(@as(usize, 3), capabilities.len);
+    try std.testing.expectEqual(@as(usize, 4), capabilities.len);
     try std.testing.expectEqualStrings("_id", capabilities[0].field.?);
     try std.testing.expectEqualStrings("reserved", capabilities[0].provenance);
     try std.testing.expectEqual(@as(usize, 1), capabilities[0].index_sort.?.position);
@@ -1774,8 +1777,18 @@ test "runtime schema field capability matrix enumerates shared capabilities" {
 
     try std.testing.expectEqualStrings("title", capabilities[2].field.?);
     try std.testing.expectEqualStrings("document_schema", capabilities[2].provenance);
+    try std.testing.expectEqual(AntflyType.text, capabilities[2].field_type);
     try std.testing.expectEqualStrings("text_search_only", capabilities[2].queryability_state);
     try std.testing.expect(capabilities[2].index_sort == null);
+
+    try std.testing.expectEqualStrings("title.keyword", capabilities[3].field.?);
+    try std.testing.expectEqualStrings("title.keyword", capabilities[3].emitted_name.?);
+    try std.testing.expectEqualStrings("document_schema", capabilities[3].provenance);
+    try std.testing.expectEqual(AntflyType.keyword, capabilities[3].field_type);
+    try std.testing.expect(capabilities[3].filterable);
+    try std.testing.expect(!capabilities[3].doc_values);
+    try std.testing.expect(!capabilities[3].sortable);
+    try std.testing.expectEqualStrings("missing_doc_values", capabilities[3].queryability_state);
 }
 
 test "dynamic template field resolution" {

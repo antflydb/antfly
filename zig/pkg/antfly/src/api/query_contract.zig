@@ -1779,7 +1779,9 @@ fn applyCommonSearchRequestOptions(
 
     const has_semantic = request.semantic_search != null or request.embeddings != null;
     if (has_semantic and req.offset > 0) return error.UnsupportedQueryRequest;
-    if (has_semantic and req.order_by.len > 0) return unsupportedExactSort("*", "approximate_candidate_source", "approximate_candidate_source");
+    if (has_semantic and req.order_by.len > 0 and !sortOrderIsScoreOnly(req.order_by)) {
+        return unsupportedExactSort(approximateSemanticSortField(req.order_by), "approximate_candidate_source", "approximate_candidate_source");
+    }
     if (req.order_by.len > 0 and req.offset > 0 and (req.search_after.len > 0 or req.search_before.len > 0)) {
         return unsupportedExactSort("*", "invalid_cursor_arity", "invalid_cursor_arity");
     }
@@ -1988,7 +1990,6 @@ pub fn parseQueryRequest(
     normalized_query.filter_query_json = "";
     req.exclusion_query_json = normalized_query.exclusion_query_json;
     normalized_query.exclusion_query_json = "";
-    try validateScoreSortHasScoreBearingTextSource(req);
     try parseInternalFilterQueryJsonAlloc(alloc, body, &req);
     req.doc_filter_bindings = try parsePublicDocFilterBindingsAlloc(alloc, body, req.limit);
 
@@ -2000,6 +2001,7 @@ pub fn parseQueryRequest(
     if (request.expand_strategy) |expand_strategy| {
         req.expand_strategy = try parseExpandStrategy(expand_strategy);
     }
+    try validateScoreSortHasScoreBearingSource(req);
 
     return .{
         .fields = fields,
@@ -2034,6 +2036,15 @@ pub fn queryRequestHasScoreBearingTextSourceAlloc(
     return db_mod.searchRequestHasScoreBearingTextSource(preflight_req.req);
 }
 
+pub fn queryRequestHasScoreBearingSourceAlloc(
+    alloc: std.mem.Allocator,
+    request: metadata_openapi.QueryRequest,
+) !bool {
+    var preflight_req = try buildPreflightSearchRequestAlloc(alloc, request);
+    defer preflight_req.deinit(alloc);
+    return db_mod.searchRequestHasScoreBearingSource(preflight_req.req);
+}
+
 fn searchRequestHasScoreSort(req: db_mod.types.SearchRequest) bool {
     for (req.order_by) |field| {
         if (std.mem.eql(u8, field.field, "_score")) return true;
@@ -2041,8 +2052,30 @@ fn searchRequestHasScoreSort(req: db_mod.types.SearchRequest) bool {
     return false;
 }
 
-fn validateScoreSortHasScoreBearingTextSource(req: db_mod.types.SearchRequest) !void {
-    if (searchRequestHasScoreSort(req) and !db_mod.searchRequestHasScoreBearingTextSource(req)) {
+fn sortOrderIsScoreOnly(order_by: []const db_mod.types.SortField) bool {
+    var saw_score = false;
+    for (order_by) |field| {
+        if (std.mem.eql(u8, field.field, "_score")) {
+            saw_score = true;
+            continue;
+        }
+        if (std.mem.eql(u8, field.field, "_id")) continue;
+        return false;
+    }
+    return saw_score;
+}
+
+fn approximateSemanticSortField(order_by: []const db_mod.types.SortField) []const u8 {
+    for (order_by) |field| {
+        if (std.mem.eql(u8, field.field, "_score")) continue;
+        if (std.mem.eql(u8, field.field, "_id")) continue;
+        return field.field;
+    }
+    return if (order_by.len > 0) order_by[0].field else "*";
+}
+
+fn validateScoreSortHasScoreBearingSource(req: db_mod.types.SearchRequest) !void {
+    if (searchRequestHasScoreSort(req) and !db_mod.searchRequestHasScoreBearingSource(req)) {
         return unsupportedExactSort("_score", "non_score_bearing_source", "non_score_bearing_source");
     }
 }
@@ -2089,7 +2122,7 @@ fn buildPreflightSearchRequestAlloc(
     if (request.expand_strategy) |expand_strategy| {
         req.expand_strategy = try parseExpandStrategy(expand_strategy);
     }
-    try validateScoreSortHasScoreBearingTextSource(req);
+    try validateScoreSortHasScoreBearingSource(req);
 
     return .{
         .fields = fields,
@@ -2804,8 +2837,10 @@ test "api query contract serializes sort profile diagnostics" {
             .native_doc_value_miss_count = 19,
             .stored_json_load_us = 23,
             .stored_json_load_count = 29,
+            .projected_source_load_us = 31,
+            .projected_source_load_count = 37,
             .final_sort_us = 31,
-            .total_us = 37,
+            .total_us = 41,
             .window_capacity = 41,
             .window_len = 2,
             .collector_heap_peak = 5,
@@ -2859,7 +2894,8 @@ test "api query contract serializes sort profile diagnostics" {
     try std.testing.expectEqual(@as(i64, 17), sort.get("native_doc_value_hit_count").?.integer);
     try std.testing.expectEqual(@as(i64, 19), sort.get("native_doc_value_miss_count").?.integer);
     try std.testing.expectEqual(@as(i64, 29), sort.get("stored_json_load_count").?.integer);
-    try std.testing.expectEqual(@as(i64, 37), sort.get("total_us").?.integer);
+    try std.testing.expectEqual(@as(i64, 37), sort.get("projected_source_load_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 41), sort.get("total_us").?.integer);
     try std.testing.expectEqual(@as(i64, 41), sort.get("window_capacity").?.integer);
     try std.testing.expectEqual(@as(i64, 2), sort.get("window_len").?.integer);
     try std.testing.expectEqual(@as(i64, 5), sort.get("collector_heap_peak").?.integer);
@@ -4180,6 +4216,8 @@ fn buildSortProfileValue(
     try sort.put(alloc, "native_doc_value_miss_count", try buildProfileUnsignedValue(alloc, profile.native_doc_value_miss_count));
     try sort.put(alloc, "stored_json_load_us", try buildProfileUnsignedValue(alloc, profile.stored_json_load_us));
     try sort.put(alloc, "stored_json_load_count", try buildProfileUnsignedValue(alloc, profile.stored_json_load_count));
+    try sort.put(alloc, "projected_source_load_us", try buildProfileUnsignedValue(alloc, profile.projected_source_load_us));
+    try sort.put(alloc, "projected_source_load_count", try buildProfileUnsignedValue(alloc, profile.projected_source_load_count));
     try sort.put(alloc, "final_sort_us", try buildProfileUnsignedValue(alloc, profile.final_sort_us));
     try sort.put(alloc, "total_us", try buildProfileUnsignedValue(alloc, profile.total_us));
     try sort.put(alloc, "window_capacity", try buildProfileSizeValue(alloc, profile.window_capacity));

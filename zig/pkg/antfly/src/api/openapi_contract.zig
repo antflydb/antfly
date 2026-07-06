@@ -61,6 +61,9 @@ test "public openapi contract module is generated and wired" {
     try std.testing.expect(@hasField(generated.SortProfile, "sort_rejection_reason"));
     try std.testing.expect(@hasField(generated.SortProfile, "sort_rejection_detail"));
     try std.testing.expect(@hasField(generated.SortProfile, "sort_rejection_field"));
+    try std.testing.expect(!@hasField(generated.SortProfile, "native_doc_value_load_us"));
+    try std.testing.expect(!@hasField(generated.SortProfile, "stored_json_load_count"));
+    try std.testing.expect(!@hasField(generated.SortProfile, "collector_heap_peak"));
     try std.testing.expect(@hasDecl(generated, "ExactSortError"));
     try std.testing.expect(@hasField(generated.ExactSortError, "sort_rejection_reason"));
     try std.testing.expect(@hasField(generated.ExactSortError, "budget_rejection_reason"));

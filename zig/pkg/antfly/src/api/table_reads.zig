@@ -4324,6 +4324,60 @@ fn distributedSearchShardLimit(req: db_mod.types.SearchRequest) u32 {
     return if (shard_limit == 0) req.limit else shard_limit;
 }
 
+fn distributedSearchShardRequest(
+    req: db_mod.types.SearchRequest,
+    distributed_text_stats: []const distributed_stats_mod.TextFieldStats,
+) db_mod.types.SearchRequest {
+    var copy = req;
+    copy.offset = 0;
+    copy.limit = distributedSearchShardLimit(req);
+    copy.distributed_text_stats = distributed_text_stats;
+    return copy;
+}
+
+test "distributed query shard request preserves sorted cursor contract" {
+    const order_by = [_]db_mod.types.SortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id" },
+    };
+    const search_after = [_]std.json.Value{
+        .{ .string = "2026-01-01T00:00:00Z" },
+        .{ .string = "doc:cursor" },
+    };
+    const stats = [_]distributed_stats_mod.TextFieldStats{
+        .{ .field = "body", .global_doc_count = 12 },
+    };
+
+    const cursor_shard_req = distributedSearchShardRequest(.{
+        .order_by = order_by[0..],
+        .search_after = search_after[0..],
+        .offset = 50,
+        .limit = 25,
+        .distributed_text_stats = &.{},
+    }, stats[0..]);
+
+    try std.testing.expectEqual(@as(u32, 0), cursor_shard_req.offset);
+    try std.testing.expectEqual(@as(u32, 25), cursor_shard_req.limit);
+    try std.testing.expectEqual(@as(usize, 2), cursor_shard_req.order_by.len);
+    try std.testing.expectEqualStrings("created_at", cursor_shard_req.order_by[0].field);
+    try std.testing.expect(cursor_shard_req.order_by[0].desc);
+    try std.testing.expectEqual(@as(usize, 2), cursor_shard_req.search_after.len);
+    try std.testing.expectEqualStrings("2026-01-01T00:00:00Z", cursor_shard_req.search_after[0].string);
+    try std.testing.expectEqualStrings("doc:cursor", cursor_shard_req.search_after[1].string);
+    try std.testing.expectEqual(@as(usize, 1), cursor_shard_req.distributed_text_stats.len);
+    try std.testing.expectEqualStrings("body", cursor_shard_req.distributed_text_stats[0].field);
+
+    const offset_shard_req = distributedSearchShardRequest(.{
+        .order_by = order_by[0..],
+        .offset = 50,
+        .limit = 25,
+    }, &.{});
+    try std.testing.expectEqual(@as(u32, 0), offset_shard_req.offset);
+    try std.testing.expectEqual(@as(u32, 75), offset_shard_req.limit);
+    try std.testing.expectEqual(@as(usize, 0), offset_shard_req.search_after.len);
+    try std.testing.expectEqual(@as(usize, 0), offset_shard_req.search_before.len);
+}
+
 fn queryMergeRuntimeSchemaAlloc(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
@@ -4715,13 +4769,7 @@ fn queryProvisionedAcrossGroups(
     try validateResolvedDocFilterForGroups(alloc, self.catalog, table_name, group_ids, req);
     const distributed_text_stats = try collectProvisionedSearchRequestTextStats(self, alloc, group_ids, req, table_name);
     defer distributed_stats_mod.deinitTextFieldStats(alloc, distributed_text_stats);
-    const shard_req = blk: {
-        var copy = req;
-        copy.offset = 0;
-        copy.limit = distributedSearchShardLimit(req);
-        copy.distributed_text_stats = distributed_text_stats;
-        break :blk copy;
-    };
+    const shard_req = distributedSearchShardRequest(req, distributed_text_stats);
 
     const plan = planQueryFanout(self.io_impl, group_ids.len, req);
     recordFanoutPlan(.query, plan);
@@ -4757,13 +4805,7 @@ fn queryHostedAcrossGroups(
     try rejectHostedRemoteResolvedDocFilter(self, alloc, group_ids, table_name, req, consistency);
     const distributed_text_stats = try collectHostedSearchRequestTextStats(self, alloc, group_ids, req, table_name, consistency);
     defer distributed_stats_mod.deinitTextFieldStats(alloc, distributed_text_stats);
-    const shard_req = blk: {
-        var copy = req;
-        copy.offset = 0;
-        copy.limit = distributedSearchShardLimit(req);
-        copy.distributed_text_stats = distributed_text_stats;
-        break :blk copy;
-    };
+    const shard_req = distributedSearchShardRequest(req, distributed_text_stats);
 
     const plan = planQueryFanout(self.io_impl, group_ids.len, req);
     recordFanoutPlan(.query, plan);

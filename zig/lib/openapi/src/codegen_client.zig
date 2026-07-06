@@ -286,16 +286,21 @@ pub const ClientGenerator = struct {
         for (query_params) |p| {
             const field_name = try naming.zigFieldName(self.arena, p.name);
             if (p.required) {
+                const encoded_name = try encodedQueryParamValueName(self.arena, field_name);
+                try self.w.line("const {s} = try httpx.PercentEncoding.encode(self.allocator, params.{s});", .{ encoded_name, field_name });
+                try self.w.line("defer self.allocator.free({s});", .{encoded_name});
                 try self.w.line("try query_buf.appendSlice(self.allocator, &.{{sep}});", .{});
                 try self.w.line("try query_buf.appendSlice(self.allocator, \"{s}=\");", .{p.name});
-                try self.w.line("try query_buf.appendSlice(self.allocator, params.{s});", .{field_name});
+                try self.w.line("try query_buf.appendSlice(self.allocator, {s});", .{encoded_name});
                 try self.w.line("sep = '&';", .{});
             } else {
                 try self.w.line("if (params.{s}) |v| {{", .{field_name});
                 self.w.indent();
+                try self.w.line("const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);", .{});
+                try self.w.line("defer self.allocator.free(encoded_query_value);", .{});
                 try self.w.line("try query_buf.appendSlice(self.allocator, &.{{sep}});", .{});
                 try self.w.line("try query_buf.appendSlice(self.allocator, \"{s}=\");", .{p.name});
-                try self.w.line("try query_buf.appendSlice(self.allocator, v);", .{});
+                try self.w.line("try query_buf.appendSlice(self.allocator, encoded_query_value);", .{});
                 try self.w.line("sep = '&';", .{});
                 self.w.dedent();
                 try self.w.line("}}", .{});
@@ -382,6 +387,11 @@ fn encodedPathParamName(allocator: Allocator, name: []const u8) ![]u8 {
     return naming.zigFieldName(allocator, prefixed);
 }
 
+fn encodedQueryParamValueName(allocator: Allocator, field_name: []const u8) ![]u8 {
+    const prefixed = try std.fmt.allocPrint(allocator, "encoded_query_value_{s}", .{field_name});
+    return naming.zigFieldName(allocator, prefixed);
+}
+
 test "client generator smoke" {
     // Just verify the module compiles
     const alloc = std.testing.allocator;
@@ -432,4 +442,38 @@ test "client generator percent-encodes path parameters" {
     try std.testing.expect(std.mem.indexOf(u8, generated, "const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "const encoded_artifact_name = try httpx.PercentEncoding.encode(self.allocator, artifact_name);") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "self.base_url, encoded_table_name, encoded_key, encoded_artifact_name") != null);
+}
+
+test "client generator percent-encodes query parameters" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var query_params = [_]types.ParameterOrRef{
+        .{ .parameter = .{ .name = "resource", .in = .query, .required = true } },
+        .{ .parameter = .{ .name = "resourceType", .in = .query } },
+    };
+    var doc = types.OpenApiDoc{
+        .openapi = "3.0.3",
+        .info = .{ .title = "Test", .version = "1.0" },
+    };
+    try doc.paths.put(arena, "/db/v1/permissions", .{
+        .get = .{
+            .operation_id = "listPermissions",
+            .parameters = &query_params,
+        },
+    });
+
+    var resolver = Resolver.init(arena, &doc);
+    var w = SourceWriter.init(arena);
+    var type_gen = TypeGenerator.init(arena, &w, &resolver);
+    var generator = ClientGenerator.init(arena, &w, &resolver, &type_gen);
+    try generator.generate(&doc);
+
+    const generated = w.toSlice();
+    try std.testing.expect(std.mem.indexOf(u8, generated, "const encoded_query_value_resource = try httpx.PercentEncoding.encode(self.allocator, params.resource);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "try query_buf.appendSlice(self.allocator, encoded_query_value_resource);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "try query_buf.appendSlice(self.allocator, encoded_query_value);") != null);
 }
