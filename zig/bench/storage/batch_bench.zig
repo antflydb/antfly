@@ -53,6 +53,7 @@ const QueryShape = enum {
     range,
     equality,
     ordered_pagination,
+    mixed_candidate_sets,
 };
 
 const MatrixPreset = enum {
@@ -582,6 +583,7 @@ fn parseQueryShape(raw: []const u8) ?QueryShape {
     if (std.mem.eql(u8, raw, "range")) return .range;
     if (std.mem.eql(u8, raw, "equality")) return .equality;
     if (std.mem.eql(u8, raw, "ordered-pagination")) return .ordered_pagination;
+    if (std.mem.eql(u8, raw, "mixed-candidate-sets")) return .mixed_candidate_sets;
     return null;
 }
 
@@ -640,7 +642,7 @@ fn runMatrix(alloc: std.mem.Allocator, counting: *CountingAllocator, base_cfg: C
     }
 
     const predicate_thresholds = [_]usize{ 250, 900 };
-    const all_query_shapes = [_]QueryShape{ .range, .equality, .ordered_pagination };
+    const all_query_shapes = [_]QueryShape{ .range, .equality, .ordered_pagination, .mixed_candidate_sets };
     const selected_query_shapes = [_]QueryShape{base_cfg.query_shape};
     const query_shapes = if (base_cfg.matrix_all_query_shapes) all_query_shapes[0..] else selected_query_shapes[0..];
     const all_write_scenarios = [_]MatrixWriteScenario{ .insert, .overwrite_changed, .overwrite_unchanged, .delete, .membership_change, .identity_rewrite };
@@ -662,7 +664,7 @@ fn runMatrix(alloc: std.mem.Allocator, counting: *CountingAllocator, base_cfg: C
             if (base_cfg.matrix_all_constraint_probes) "none,unique,foreign_key" else @tagName(base_cfg.relational_constraint_probe),
             base_cfg.overwrite_passes,
             @tagName(base_cfg.overwrite_shape),
-            if (base_cfg.matrix_all_query_shapes) "range,equality,ordered_pagination" else @tagName(base_cfg.query_shape),
+            if (base_cfg.matrix_all_query_shapes) "range,equality,ordered_pagination,mixed_candidate_sets" else @tagName(base_cfg.query_shape),
             base_cfg.batch_size,
             if (base_cfg.query_repeats == 0) @as(usize, 3) else base_cfg.query_repeats,
             base_cfg.query_limit,
@@ -987,7 +989,7 @@ fn configureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, cfg: Config) !void
     switch (cfg.workload) {
         .documents => return,
         .relational_rows => {
-            const schema_json = try relationalSchemaJsonAlloc(alloc, cfg.relational_index_mode, cfg.relational_constraint_probe);
+            const schema_json = try relationalSchemaJsonAlloc(alloc, cfg.relational_index_mode, cfg.relational_constraint_probe, cfg.query_shape);
             defer alloc.free(schema_json);
             var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
             defer parsed_schema.deinit(alloc);
@@ -1213,6 +1215,24 @@ fn encodeDocumentJsonAlloc(alloc: std.mem.Allocator, doc_idx: usize, pass_idx: u
     defer alloc.free(body);
     const status = statusForDocPass(cfg, doc_idx, pass_idx);
     const amount_pass_idx: usize = if (cfg.mutation_mode == .membership_change) 0 else pass_idx;
+    if (cfg.query_shape == .mixed_candidate_sets) {
+        return try std.fmt.allocPrint(
+            alloc,
+            "{{\"id\":\"doc:{d:0>8}\",\"title\":\"doc-{d}\",\"status\":\"{s}\",\"amount\":{d},\"created_at\":{d},\"body\":\"{s}\",\"tags\":[\"{s}\",\"segment-{d}\"],\"attrs\":{{\"billing\":{{\"plan\":\"{s}\"}},\"cohort\":\"c{d}\"}}}}",
+            .{
+                doc_idx,
+                doc_idx,
+                status,
+                amountForDoc(doc_idx, amount_pass_idx),
+                createdAtForDoc(doc_idx),
+                body,
+                tagForDoc(doc_idx),
+                doc_idx % 16,
+                billingPlanForDoc(doc_idx),
+                doc_idx % 8,
+            },
+        );
+    }
     return try std.fmt.allocPrint(
         alloc,
         "{{\"id\":\"doc:{d:0>8}\",\"title\":\"doc-{d}\",\"status\":\"{s}\",\"amount\":{d},\"created_at\":{d},\"body\":\"{s}\"}}",
@@ -1224,6 +1244,13 @@ fn encodeIdentityRewriteDocumentJsonAlloc(alloc: std.mem.Allocator, doc_idx: usi
     const body = try generatedBodyTextAlloc(alloc, doc_idx, pass_idx, cfg);
     defer alloc.free(body);
     const status = statusForDocPass(cfg, doc_idx, pass_idx);
+    if (cfg.query_shape == .mixed_candidate_sets) {
+        return try std.fmt.allocPrint(
+            alloc,
+            "{{\"id\":\"doc-rewritten:{d:0>8}\",\"title\":\"doc-{d}\",\"status\":\"{s}\",\"amount\":{d},\"created_at\":{d},\"body\":\"{s}\",\"tags\":[\"{s}\",\"segment-{d}\"],\"attrs\":{{\"billing\":{{\"plan\":\"{s}\"}},\"cohort\":\"c{d}\"}}}}",
+            .{ doc_idx, doc_idx, status, amountForDoc(doc_idx, pass_idx), createdAtForDoc(doc_idx), body, tagForDoc(doc_idx), doc_idx % 16, billingPlanForDoc(doc_idx), doc_idx % 8 },
+        );
+    }
     return try std.fmt.allocPrint(
         alloc,
         "{{\"id\":\"doc-rewritten:{d:0>8}\",\"title\":\"doc-{d}\",\"status\":\"{s}\",\"amount\":{d},\"created_at\":{d},\"body\":\"{s}\"}}",
@@ -1328,6 +1355,19 @@ fn runQueryProbes(alloc: std.mem.Allocator, db: *db_mod.DB, cfg: Config) !QueryS
                 const ordered_predicates = [_]schema_mod.RelationalCheck{
                     .{ .name = "", .field = "status", .op = .eq, .value_json = "\"open\"" },
                 };
+                const mixed_predicates = [_]schema_mod.RelationalCheck{
+                    .{ .name = "", .field = "status", .op = .eq, .value_json = "\"open\"" },
+                    .{ .name = "", .field = "amount", .op = .gt, .value_json = amount_json },
+                };
+                const mixed_array_any = [_]db_mod.types.RelationalRowsArrayAnyPredicate{.{
+                    .field = "tags",
+                    .value_json = "\"vip\"",
+                }};
+                const mixed_json_path_eq = [_]db_mod.types.RelationalRowsJsonPathEqPredicate{.{
+                    .field = "attrs",
+                    .path = "billing.plan",
+                    .value_json = "\"pro\"",
+                }};
                 const order_by = [_]db_mod.types.RelationalRowsQueryOrder{.{
                     .field = "amount",
                     .direction = .asc,
@@ -1337,10 +1377,15 @@ fn runQueryProbes(alloc: std.mem.Allocator, db: *db_mod.DB, cfg: Config) !QueryS
                     .range => range_predicates[0..],
                     .equality => equality_predicates[0..],
                     .ordered_pagination => ordered_predicates[0..],
+                    .mixed_candidate_sets => mixed_predicates[0..],
                 };
                 const orders = if (cfg.query_shape == .ordered_pagination) order_by[0..] else &[_]db_mod.types.RelationalRowsQueryOrder{};
+                const array_any = if (cfg.query_shape == .mixed_candidate_sets) mixed_array_any[0..] else &[_]db_mod.types.RelationalRowsArrayAnyPredicate{};
+                const json_path_eq = if (cfg.query_shape == .mixed_candidate_sets) mixed_json_path_eq[0..] else &[_]db_mod.types.RelationalRowsJsonPathEqPredicate{};
                 var result = try db.queryRelationalRows(alloc, runtime_schema, .{
                     .predicates = predicates[0..],
+                    .array_any = array_any,
+                    .json_path_eq = json_path_eq,
                     .select = select[0..],
                     .select_all = false,
                     .order_by = orders,
@@ -1415,6 +1460,11 @@ fn runQueryProbes(alloc: std.mem.Allocator, db: *db_mod.DB, cfg: Config) !QueryS
                         "{{\"bool\":{{\"must\":[{{\"term\":{{\"status\":\"open\"}}}},{{\"numeric_range\":{{\"field\":\"amount\",\"min\":{d},\"max\":{d},\"inclusive_min\":true,\"inclusive_max\":true}}}}]}}}}",
                         .{ amount, amount },
                     ),
+                    .mixed_candidate_sets => try std.fmt.allocPrint(
+                        alloc,
+                        "{{\"bool\":{{\"must\":[{{\"term\":{{\"status\":\"open\"}}}},{{\"numeric_range\":{{\"field\":\"amount\",\"min\":{d}}}}},{{\"term\":{{\"tags\":\"vip\"}}}},{{\"term\":{{\"attrs.billing.plan\":\"pro\"}}}}]}}}}",
+                        .{amount},
+                    ),
                 };
                 defer alloc.free(filter_query_json);
                 var result = try db.search(alloc, .{
@@ -1455,6 +1505,16 @@ fn statusForDocPass(cfg: Config, doc_idx: usize, pass_idx: usize) []const u8 {
     return statusForDoc(doc_idx);
 }
 
+fn tagForDoc(doc_idx: usize) []const u8 {
+    if (doc_idx % 10 == 0) return "vip";
+    if (doc_idx % 3 == 0) return "warm";
+    return "cold";
+}
+
+fn billingPlanForDoc(doc_idx: usize) []const u8 {
+    return if (doc_idx % 6 == 0) "pro" else "free";
+}
+
 fn amountForDoc(doc_idx: usize, pass_idx: usize) usize {
     return (doc_idx * 17 + pass_idx * 31) % 1000;
 }
@@ -1467,8 +1527,8 @@ fn createdAtForDoc(doc_idx: usize) usize {
     return 1_700_000_000 + doc_idx;
 }
 
-fn relationalSchemaJsonAlloc(alloc: std.mem.Allocator, mode: RelationalIndexMode, constraint_probe: RelationalConstraintProbe) ![]u8 {
-    const base = relationalBaseSchemaJson(mode);
+fn relationalSchemaJsonAlloc(alloc: std.mem.Allocator, mode: RelationalIndexMode, constraint_probe: RelationalConstraintProbe, query_shape: QueryShape) ![]u8 {
+    const base = relationalBaseSchemaJson(mode, query_shape);
     if (constraint_probe == .none) return try alloc.dupe(u8, base);
     if (constraint_probe == .unique and relationalBaseSchemaHasRelationalIndexes(mode)) {
         return try std.fmt.allocPrint(alloc, "{s},{s}]{s}", .{
@@ -1503,7 +1563,8 @@ fn relationalConstraintProbeSchemaSuffix(probe: RelationalConstraintProbe) []con
     };
 }
 
-fn relationalBaseSchemaJson(mode: RelationalIndexMode) []const u8 {
+fn relationalBaseSchemaJson(mode: RelationalIndexMode, query_shape: QueryShape) []const u8 {
+    if (query_shape == .mixed_candidate_sets) return relationalMixedCandidateSetSchemaJson(mode);
     return switch (mode) {
         .none =>
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"body":{"type":"text"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -1519,6 +1580,26 @@ fn relationalBaseSchemaJson(mode: RelationalIndexMode) []const u8 {
         ,
         .partial_ordered_tuple =>
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"body":{"type":"text"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_partial_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"include_columns":["id","amount"],"where":{"all":[{"field":"status","op":"eq","value":"open"}]},"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_partial_idx"}]}
+        ,
+    };
+}
+
+fn relationalMixedCandidateSetSchemaJson(mode: RelationalIndexMode) []const u8 {
+    return switch (mode) {
+        .none =>
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"body":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ,
+        .single_column =>
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"body":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status"},{"name":"amount","owner_kind":"relational_column","owner_name":"amount","access_method":"scalar_column","columns":["amount"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:amount"},{"name":"tags","owner_kind":"relational_column","owner_name":"tags","access_method":"scalar_column","columns":["tags"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tags"},{"name":"attrs","owner_kind":"relational_column","owner_name":"attrs","access_method":"scalar_column","columns":["attrs"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:attrs"}]}
+        ,
+        .ordered_tuple =>
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"body":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"include_columns":["id","amount"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_idx"},{"name":"tags","owner_kind":"relational_column","owner_name":"tags","access_method":"scalar_column","columns":["tags"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tags"},{"name":"attrs","owner_kind":"relational_column","owner_name":"attrs","access_method":"scalar_column","columns":["attrs"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:attrs"}]}
+        ,
+        .partial_single_column =>
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"body":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"amount_partial_idx","owner_kind":"relational_column","owner_name":"amount","access_method":"scalar_column","columns":["amount"],"where":{"all":[{"field":"status","op":"eq","value":"open"}]},"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:amount_partial_idx"},{"name":"tags","owner_kind":"relational_column","owner_name":"tags","access_method":"scalar_column","columns":["tags"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tags"},{"name":"attrs","owner_kind":"relational_column","owner_name":"attrs","access_method":"scalar_column","columns":["attrs"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:attrs"}]}
+        ,
+        .partial_ordered_tuple =>
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"body":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_partial_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"include_columns":["id","amount"],"where":{"all":[{"field":"status","op":"eq","value":"open"}]},"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_partial_idx"},{"name":"tags","owner_kind":"relational_column","owner_name":"tags","access_method":"scalar_column","columns":["tags"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tags"},{"name":"attrs","owner_kind":"relational_column","owner_name":"attrs","access_method":"scalar_column","columns":["attrs"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:attrs"}]}
         ,
     };
 }

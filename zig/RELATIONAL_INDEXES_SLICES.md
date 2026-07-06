@@ -497,6 +497,7 @@ row/index baseline.
     unchanged-overwrite, delete, partial single-column, partial ordered-tuple,
     partial-index membership-change, relational identity-rewrite, range,
     equality, ordered-pagination,
+    mixed scalar/array/JSON candidate-set queries,
     insert-only, unique constraint probe, self-FK parent probe,
     low/high-selectivity, and exact/bounded/none-total dimensions to cover wider
     range-scan shapes and mixed text/algebraic/scalar filters. The full
