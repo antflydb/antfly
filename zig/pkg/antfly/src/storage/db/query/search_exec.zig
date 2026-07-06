@@ -57,6 +57,7 @@ const default_late_visibility_exact_candidate_budget: u32 = 100_000;
 const default_exact_native_filter_candidate_budget: u32 = 1024;
 const default_distributed_sort_shard_window_budget: u32 = 100_000;
 const default_sorted_segment_scan_budget: u64 = 100_000;
+const sorted_segment_deadline_check_interval: u64 = 1024;
 const default_match_all_primary_key_scan_batch_size: usize = 4096;
 var bench_query_profile_counter: std.atomic.Value(u64) = .init(0);
 const bench_query_profile_unknown = std.math.maxInt(u64);
@@ -7314,6 +7315,9 @@ fn nextSortedSegmentHeadAlloc(
         const local_doc_id: u32 = @intCast(iterator.next_doc);
         sortedSegmentIteratorAdvance(iterator, reverse);
         scanned_count.* +|= 1;
+        if (scanned_count.* == 1 or scanned_count.* % sorted_segment_deadline_check_interval == 0) {
+            try checkSearchRequestDeadline(req);
+        }
         if (profile) |p| {
             p.sorted_segment_scanned_count = scanned_count.*;
             p.sorted_segment_scan_budget = scan_budget;
@@ -8488,6 +8492,14 @@ test "pattern typed structured filters accept explicit path alias" {
     try std.testing.expectEqual(@as(f64, -122.5), bbox_query.geo_bbox.min_lon);
     try std.testing.expectEqual(@as(f64, 37.8), bbox_query.geo_bbox.max_lat);
     try std.testing.expectEqual(@as(f64, -122.3), bbox_query.geo_bbox.max_lon);
+
+    const parsed_wrapped_bbox = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"geo_bbox":{"path":"location","min_lat":-1.0,"min_lon":179.5,"max_lat":1.0,"max_lon":-179.5}}
+    , .{});
+    const wrapped_bbox_query = try patternFilterValueToSearchQuery(alloc, parsed_wrapped_bbox.value, .{}, null);
+    try std.testing.expect(wrapped_bbox_query == .geo_bbox);
+    try std.testing.expectEqual(@as(f64, 179.5), wrapped_bbox_query.geo_bbox.min_lon);
+    try std.testing.expectEqual(@as(f64, -179.5), wrapped_bbox_query.geo_bbox.max_lon);
 }
 
 test "pattern typed structured filters reject ambiguous field and path aliases" {
@@ -8804,7 +8816,6 @@ fn parseGeoBBoxQuery(value: std.json.Value) !search_mod.GeoBBoxQuery {
     const max_lat = try jsonRequiredLatitude(value.object.get("max_lat"));
     const max_lon = try jsonRequiredLongitude(value.object.get("max_lon"));
     if (min_lat > max_lat) return error.InvalidArgument;
-    if (min_lon > max_lon) return error.InvalidArgument;
     return .{
         .field = field,
         .min_lat = min_lat,
@@ -20347,6 +20358,103 @@ test "match_all sorted segment seek enforces scan budget" {
     try std.testing.expectEqualStrings("ft", diagnostic.field);
     try std.testing.expectEqualStrings("candidate_budget_exceeded", diagnostic.reason);
     try std.testing.expectEqualStrings("sorted_segment_scan_window", diagnostic.detail);
+}
+
+test "match_all sorted segment seek checks deadline while scanning" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-scan-deadline", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const segment = try buildTestSortedPriceSegmentAlloc(alloc, &.{
+        .{ .id = "doc:000", .price = 0.0, .ordinal = 1000 },
+        .{ .id = "doc:001", .price = 1.0, .ordinal = 1001 },
+    });
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = testSortedPriceSchema(),
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const order_by = [_]types.SortField{
+        .{ .field = "price" },
+        .{ .field = "_id" },
+    };
+    const req = types.SearchRequest{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 1,
+        .execution_deadline_ns = platform_time.monotonicNs(),
+    };
+    const sorted_plan = SortExecutionPlan{
+        .kind = .sorted_segment_seek,
+        .require_native = true,
+        .runtime_schema = text_entry.runtime_schema,
+        .index_sort_match = true,
+        .sorted_segment_executor_available = true,
+        .sorted_segment_bounds_available = true,
+    };
+    const snapshot = text_entry.persistent.snapshot();
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+    const native_loader = NativeSortValueLoader{
+        .ctx = @constCast(&native_sort_ctx),
+        .require_native = true,
+        .load = loadTextDocValueSortValue,
+    };
+    const executor = MatchAllExecutor{
+        .ctx = null,
+        .collect_candidates = undefined,
+        .text_index_entry = undefined,
+        .load_projected_document = undefined,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    };
+    const constraints = NativeDocIdConstraints{};
+    var iterators = [_]SortedSegmentIterator{.{
+        .segment_index = 0,
+        .doc_base = 0,
+        .next_doc = 0,
+    }};
+    var scanned_count: u64 = 0;
+
+    try std.testing.expectError(error.Timeout, nextSortedSegmentHeadAlloc(
+        alloc,
+        req,
+        sorted_plan,
+        snapshot,
+        0,
+        &iterators,
+        &constraints,
+        null,
+        executor,
+        native_loader,
+        null,
+        false,
+        &scanned_count,
+        std.math.maxInt(u64),
+    ));
+    try std.testing.expectEqual(@as(u64, 1), scanned_count);
 }
 
 test "match_all sorted segment seek rejects cursor when segment bounds are unavailable" {

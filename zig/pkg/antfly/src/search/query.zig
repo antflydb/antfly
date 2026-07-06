@@ -903,11 +903,10 @@ pub const GeoDistanceFilter = struct {
 
         const min_lat = @max(self.center.lat - lat_delta, -90.0);
         const max_lat = @min(self.center.lat + lat_delta, 90.0);
-        const min_lon = self.center.lon - lon_delta;
-        const max_lon = self.center.lon + lon_delta;
-        if (min_lon < -180.0 or max_lon > 180.0) return null;
+        const min_lon = if (lon_delta >= 180.0) -180.0 else normalizeLongitude(self.center.lon - lon_delta);
+        const max_lon = if (lon_delta >= 180.0) 180.0 else normalizeLongitude(self.center.lon + lon_delta);
 
-        return geoCandidateBitmapForBoxAlloc(alloc, seg, self.field, min_lat, min_lon, max_lat, max_lon);
+        return geoCandidateBitmapForBBoxAlloc(alloc, seg, self.field, min_lat, min_lon, max_lat, max_lon);
     }
 };
 
@@ -927,7 +926,7 @@ pub const GeoBBoxFilter = struct {
             return roaring.RoaringBitmap.init(alloc);
         if (reader.value_type != .geo_point) return roaring.RoaringBitmap.init(alloc);
 
-        var candidate_bm: ?roaring.RoaringBitmap = try geoCandidateBitmapForBoxAlloc(
+        var candidate_bm: ?roaring.RoaringBitmap = try geoCandidateBitmapForBBoxAlloc(
             alloc,
             seg,
             self.field,
@@ -947,7 +946,7 @@ pub const GeoBBoxFilter = struct {
                 const point = reader.getGeoPoint(doc_id) catch continue;
                 if (point) |p| {
                     if (p.lat >= self.min_lat and p.lat <= self.max_lat and
-                        p.lon >= self.min_lon and p.lon <= self.max_lon)
+                        geoLongitudeInRange(p.lon, self.min_lon, self.max_lon))
                     {
                         try result.add(doc_id);
                     }
@@ -960,7 +959,7 @@ pub const GeoBBoxFilter = struct {
             const point = reader.getGeoPoint(@intCast(doc_id)) catch continue;
             if (point) |p| {
                 if (p.lat >= self.min_lat and p.lat <= self.max_lat and
-                    p.lon >= self.min_lon and p.lon <= self.max_lon)
+                    geoLongitudeInRange(p.lon, self.min_lon, self.max_lon))
                 {
                     try result.add(@intCast(doc_id));
                 }
@@ -971,6 +970,30 @@ pub const GeoBBoxFilter = struct {
     }
 };
 
+const GeoLongitudeRange = struct {
+    min: f64,
+    max: f64,
+};
+
+const GeoLongitudeRanges = struct {
+    items: [2]GeoLongitudeRange,
+    len: usize,
+};
+
+fn geoCandidateBitmapForBBoxAlloc(
+    alloc: Allocator,
+    seg: *const index_mod.SegmentEntry,
+    field: []const u8,
+    min_lat: f64,
+    min_lon: f64,
+    max_lat: f64,
+    max_lon: f64,
+) FilterError!?roaring.RoaringBitmap {
+    const lon_ranges = geoSplitLongitudeRanges(min_lon, max_lon);
+    const precision = geoCandidatePrecisionForBBox(min_lat, max_lat, lon_ranges) orelse return null;
+    return try geoCandidateBitmapForRangesAlloc(alloc, seg, field, min_lat, max_lat, lon_ranges, precision);
+}
+
 fn geoCandidateBitmapForBoxAlloc(
     alloc: Allocator,
     seg: *const index_mod.SegmentEntry,
@@ -980,32 +1003,46 @@ fn geoCandidateBitmapForBoxAlloc(
     max_lat: f64,
     max_lon: f64,
 ) FilterError!?roaring.RoaringBitmap {
-    if (geoBoxCoverageExceedsCandidateCap(min_lat, min_lon, max_lat, max_lon)) return null;
-    const cells = try geo.coverBoundingBox(alloc, min_lat, min_lon, max_lat, max_lon, geo.index_geohash_precision);
-    defer alloc.free(cells);
-    if (cells.len > geo.max_filter_geohash_cells) return null;
-    return try geoCandidateBitmapForCellsAlloc(alloc, seg, field, cells);
+    return try geoCandidateBitmapForBBoxAlloc(alloc, seg, field, min_lat, min_lon, max_lat, max_lon);
 }
 
-fn geoBoxCoverageExceedsCandidateCap(min_lat: f64, min_lon: f64, max_lat: f64, max_lon: f64) bool {
-    if (min_lat > max_lat or min_lon > max_lon) return true;
-    const sample = geo.encode(.{ .lat = 0, .lon = 0 }, geo.index_geohash_precision);
-    const sample_bounds = geo.bounds(sample[0..geo.index_geohash_precision]);
-    const lat_step = (sample_bounds.lat_max - sample_bounds.lat_min) * 0.9;
-    const lon_step = (sample_bounds.lon_max - sample_bounds.lon_min) * 0.9;
-    if (lat_step <= 0 or lon_step <= 0) return true;
-
-    const lat_count = @ceil((max_lat - min_lat) / lat_step) + 2.0;
-    const lon_count = @ceil((max_lon - min_lon) / lon_step) + 2.0;
-    if (!std.math.isFinite(lat_count) or !std.math.isFinite(lon_count)) return true;
-    return lat_count * lon_count > @as(f64, @floatFromInt(geo.max_filter_geohash_cells));
+fn geoCandidatePrecisionForBBox(min_lat: f64, max_lat: f64, lon_ranges: GeoLongitudeRanges) ?u8 {
+    var precision = geo.max_index_geohash_precision;
+    while (true) {
+        if (geoEstimatedCellCountForBBox(min_lat, max_lat, lon_ranges, precision, geo.max_filter_geohash_cells)) |count| {
+            if (count <= geo.max_filter_geohash_cells) return precision;
+        }
+        if (precision == geo.min_index_geohash_precision) break;
+        precision -= 1;
+    }
+    return null;
 }
 
-fn geoCandidateBitmapForCellsAlloc(
+fn geoEstimatedCellCountForBBox(
+    min_lat: f64,
+    max_lat: f64,
+    lon_ranges: GeoLongitudeRanges,
+    precision: u8,
+    max_cells: usize,
+) ?usize {
+    if (min_lat > max_lat) return null;
+    var total: usize = 0;
+    for (lon_ranges.items[0..lon_ranges.len]) |range| {
+        const estimate = geo.estimateBoundingBoxCellCount(min_lat, range.min, max_lat, range.max, precision) orelse return null;
+        if (estimate > max_cells - @min(total, max_cells)) return max_cells + 1;
+        total += estimate;
+    }
+    return total;
+}
+
+fn geoCandidateBitmapForRangesAlloc(
     alloc: Allocator,
     seg: *const index_mod.SegmentEntry,
     field: []const u8,
-    cells: []const [12]u8,
+    min_lat: f64,
+    max_lat: f64,
+    lon_ranges: GeoLongitudeRanges,
+    precision: u8,
 ) FilterError!?roaring.RoaringBitmap {
     const inv_reader = (try seg.reader.invertedIndex(field)) orelse
         return roaring.RoaringBitmap.init(alloc);
@@ -1013,12 +1050,43 @@ fn geoCandidateBitmapForCellsAlloc(
     var result = roaring.RoaringBitmap.init(alloc);
     errdefer result.deinit();
 
-    for (cells) |cell| {
-        if (inv_reader.lookup(cell[0..geo.index_geohash_precision])) |lookup_result| {
-            try addLookupResultToBitmap(alloc, &result, lookup_result);
+    var remaining_cells = geo.max_filter_geohash_cells;
+    for (lon_ranges.items[0..lon_ranges.len]) |range| {
+        const cells = (try geo.coverBoundingBoxBudgeted(alloc, min_lat, range.min, max_lat, range.max, precision, remaining_cells)) orelse return null;
+        defer alloc.free(cells);
+        remaining_cells -= cells.len;
+        for (cells) |cell| {
+            if (inv_reader.lookup(cell[0..precision])) |lookup_result| {
+                try addLookupResultToBitmap(alloc, &result, lookup_result);
+            }
         }
     }
     return result;
+}
+
+fn geoSplitLongitudeRanges(min_lon: f64, max_lon: f64) GeoLongitudeRanges {
+    if (min_lon <= max_lon) {
+        return .{ .items = .{ .{ .min = min_lon, .max = max_lon }, undefined }, .len = 1 };
+    }
+    return .{
+        .items = .{
+            .{ .min = min_lon, .max = 180.0 },
+            .{ .min = -180.0, .max = max_lon },
+        },
+        .len = 2,
+    };
+}
+
+fn geoLongitudeInRange(lon: f64, min_lon: f64, max_lon: f64) bool {
+    if (min_lon <= max_lon) return lon >= min_lon and lon <= max_lon;
+    return lon >= min_lon or lon <= max_lon;
+}
+
+fn normalizeLongitude(value: f64) f64 {
+    var lon = value;
+    while (lon > 180.0) lon -= 360.0;
+    while (lon < -180.0) lon += 360.0;
+    return lon;
 }
 
 fn addLookupResultToBitmap(alloc: Allocator, result: *roaring.RoaringBitmap, lookup_result: inverted.LookupResult) FilterError!void {
@@ -1519,10 +1587,16 @@ fn buildGeoTestSegment(alloc: Allocator, points: []const typed_dv.GeoPoint) ![]u
     var inv_builder = inverted.InvertedIndexBuilder.init(alloc, .{});
     defer inv_builder.deinit();
     for (points, 0..) |point, doc_id| {
-        const geohash = geo.encode(.{ .lat = point.lat, .lon = point.lon }, geo.index_geohash_precision);
-        try inv_builder.addDocument(@intCast(doc_id), &.{
-            .{ .term = geohash[0..geo.index_geohash_precision], .freq = 1 },
-        });
+        var hashes: [geo.index_geohash_precision_count][12]u8 = undefined;
+        var hits: [geo.index_geohash_precision_count]inverted.InvertedIndexBuilder.TermHit = undefined;
+        var count: usize = 0;
+        var precision = geo.min_index_geohash_precision;
+        while (precision <= geo.max_index_geohash_precision) : (precision += 1) {
+            hashes[count] = geo.encode(.{ .lat = point.lat, .lon = point.lon }, precision);
+            hits[count] = .{ .term = hashes[count][0..precision], .freq = 1 };
+            count += 1;
+        }
+        try inv_builder.addDocument(@intCast(doc_id), hits[0..count]);
     }
     const inv_data = try inv_builder.build();
     defer alloc.free(inv_data);
@@ -1976,6 +2050,78 @@ test "geo bbox filter refines indexed geohash candidates" {
 
     try testing.expect(bm.contains(0));
     try testing.expect(!bm.contains(1));
+    try testing.expect(!bm.contains(2));
+}
+
+test "geo filter candidate precision adapts to selective boxes" {
+    const tiny_ranges = geoSplitLongitudeRanges(-122.4195, -122.4190);
+    const tiny_precision = geoCandidatePrecisionForBBox(37.7745, 37.7750, tiny_ranges) orelse return error.TestExpectedEqual;
+    try testing.expect(tiny_precision >= 8);
+
+    const regional_ranges = geoSplitLongitudeRanges(-123.0, -121.0);
+    const regional_precision = geoCandidatePrecisionForBBox(37.0, 38.0, regional_ranges) orelse return error.TestExpectedEqual;
+    try testing.expect(regional_precision < tiny_precision);
+}
+
+test "geo bbox filter supports antimeridian wrapped longitude ranges" {
+    const alloc = testing.allocator;
+
+    const seg_bytes = try buildGeoTestSegment(alloc, &.{
+        .{ .lat = 0.0, .lon = 179.8 },
+        .{ .lat = 0.0, .lon = -179.8 },
+        .{ .lat = 0.0, .lon = 0.0 },
+    });
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+
+    const snap = writer.snapshot();
+    const seg = &snap.segments[0];
+
+    const filter = Filter{ .geo_bbox = .{
+        .field = "location",
+        .min_lat = -1.0,
+        .min_lon = 179.5,
+        .max_lat = 1.0,
+        .max_lon = -179.5,
+    } };
+    var bm = try filter.execute(alloc, seg);
+    defer bm.deinit();
+
+    try testing.expect(bm.contains(0));
+    try testing.expect(bm.contains(1));
+    try testing.expect(!bm.contains(2));
+}
+
+test "geo distance filter uses indexed candidates across antimeridian" {
+    const alloc = testing.allocator;
+
+    const seg_bytes = try buildGeoTestSegment(alloc, &.{
+        .{ .lat = 0.0, .lon = 179.9 },
+        .{ .lat = 0.0, .lon = -179.9 },
+        .{ .lat = 0.0, .lon = 170.0 },
+    });
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+
+    const snap = writer.snapshot();
+    const seg = &snap.segments[0];
+
+    const filter = Filter{ .geo_distance = .{
+        .field = "location",
+        .center = .{ .lat = 0.0, .lon = 179.95 },
+        .radius_meters = 30_000,
+    } };
+    var bm = try filter.execute(alloc, seg);
+    defer bm.deinit();
+
+    try testing.expect(bm.contains(0));
+    try testing.expect(bm.contains(1));
     try testing.expect(!bm.contains(2));
 }
 

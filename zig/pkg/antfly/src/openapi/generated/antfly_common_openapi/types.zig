@@ -2,31 +2,26 @@
 // Package: antfly_common_openapi
 
 const std = @import("std");
-const antfly_audio_openapi = @import("antfly_audio_openapi");
-const antfly_chunking_openapi = @import("antfly_chunking_openapi");
-const antfly_embeddings_openapi = @import("antfly_embeddings_openapi");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
-const antfly_inference_config_openapi = @import("antfly_inference_config_openapi");
 const antfly_logging_openapi = @import("antfly_logging_openapi");
-const antfly_middleware_openapi = @import("antfly_middleware_openapi");
-const antfly_reranking_openapi = @import("antfly_reranking_openapi");
+const antfly_inference_config_openapi = @import("antfly_inference_config_openapi");
 const antfly_scraping_openapi = @import("antfly_scraping_openapi");
+const antfly_audio_openapi = @import("antfly_audio_openapi");
+const antfly_middleware_openapi = @import("antfly_middleware_openapi");
+const antfly_embeddings_openapi = @import("antfly_embeddings_openapi");
+const antfly_reranking_openapi = @import("antfly_reranking_openapi");
+const antfly_chunking_openapi = @import("antfly_chunking_openapi");
 
-pub const CdcConnectionConfig = struct {
-    /// CDC provider type. Initially postgres.
-    provider: []const u8,
-    /// Source DSN or secret reference. Never returned by inventory APIs.
-    dsn: ?[]const u8 = null,
-    /// Antfly table receiving changes from this CDC source.
-    table_name: ?[]const u8 = null,
-    /// Zero-based ordinal of the source within the table's CDC runtime.
-    source_ordinal: ?i64 = null,
-    /// Source-side table or stream name.
-    external_table: ?[]const u8 = null,
-    /// Provider replication cursor or slot name when applicable.
-    slot_name: ?[]const u8 = null,
-    /// Provider publication or stream grouping name when applicable.
-    publication_name: ?[]const u8 = null,
+/// A link in a chain that can reference a generator by name OR provide an inline config. Use `generator` (string) to reference a named generator from the `generators` map. Use `generator_config` (object) to provide an inline generator configuration. Only one of `generator` or `generator_config` should be specified.
+pub const NamedChainLink = struct {
+    /// Name of the generator from the generators map
+    generator: ?[]const u8 = null,
+    /// Inline generator configuration (alternative to referencing by name)
+    generator_config: ?antfly_generating_openapi.GeneratorConfig = null,
+    /// Retry configuration for this generator
+    retry: ?antfly_generating_openapi.RetryConfig = null,
+    /// When to try the next generator in chain
+    condition: ?antfly_generating_openapi.ChainCondition = null,
 };
 
 /// Broad physical category for a configured connection.
@@ -114,68 +109,6 @@ pub const InferenceConnectionConfig = struct {
     configured_model_types: ?[]const []const u8 = null,
 };
 
-pub const LocalStorageConfig = struct {
-    /// Root directory for all antfly data storage. Defaults to 'antflydb'.
-    base_dir: ?[]const u8 = null,
-};
-
-pub const MetadataInfo = struct {
-    /// Mapping from Metadata Node ID (hex string) to its URL used by store nodes for enrolling into the cluster
-    orchestration_urls: ?std.json.ArrayHashMap([]const u8) = null,
-};
-
-/// A link in a chain that can reference a generator by name OR provide an inline config. Use `generator` (string) to reference a named generator from the `generators` map. Use `generator_config` (object) to provide an inline generator configuration. Only one of `generator` or `generator_config` should be specified.
-pub const NamedChainLink = struct {
-    /// Name of the generator from the generators map
-    generator: ?[]const u8 = null,
-    /// Inline generator configuration (alternative to referencing by name)
-    generator_config: ?antfly_generating_openapi.GeneratorConfig = null,
-    /// Retry configuration for this generator
-    retry: ?antfly_generating_openapi.RetryConfig = null,
-    /// When to try the next generator in chain
-    condition: ?antfly_generating_openapi.ChainCondition = null,
-};
-
-pub const S3Info = struct {
-    /// S3 bucket name where SST files will be stored
-    bucket: []const u8,
-    /// Optional path prefix within the bucket (e.g., 'antfly/production/')
-    prefix: ?[]const u8 = null,
-};
-
-/// Storage backend type
-pub const StorageBackend = enum {
-    local,
-    s3,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .local => "local",
-            .s3 => "s3",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "local", .local },
-            .{ "s3", .s3 },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const TLSInfo = struct {
-    /// Path to TLS certificate file
-    cert: ?[]const u8 = null,
-    /// Path to TLS key file
-    key: ?[]const u8 = null,
-};
-
 pub const WebSearchConnectionConfig = struct {
     /// Provider-specific service flavor, such as agent_search for provider vertex.
     service: ?[]const u8 = null,
@@ -211,6 +144,73 @@ pub const WebSearchConnectionConfig = struct {
     include_domains: ?[]const []const u8 = null,
     /// Exclude results from these domains when provider supports it.
     exclude_domains: ?[]const []const u8 = null,
+};
+
+pub const CdcConnectionConfig = struct {
+    /// CDC provider type. Initially postgres.
+    provider: []const u8,
+    /// Source DSN or secret reference. Never returned by inventory APIs.
+    dsn: ?[]const u8 = null,
+    /// Antfly table receiving changes from this CDC source.
+    table_name: ?[]const u8 = null,
+    /// Zero-based ordinal of the source within the table's CDC runtime.
+    source_ordinal: ?i64 = null,
+    /// Source-side table or stream name.
+    external_table: ?[]const u8 = null,
+    /// Provider replication cursor or slot name when applicable.
+    slot_name: ?[]const u8 = null,
+    /// Provider publication or stream grouping name when applicable.
+    publication_name: ?[]const u8 = null,
+};
+
+pub const MetadataInfo = struct {
+    /// Mapping from Metadata Node ID (hex string) to its URL used by store nodes for enrolling into the cluster
+    orchestration_urls: ?std.json.ArrayHashMap([]const u8) = null,
+};
+
+pub const TLSInfo = struct {
+    /// Path to TLS certificate file
+    cert: ?[]const u8 = null,
+    /// Path to TLS key file
+    key: ?[]const u8 = null,
+};
+
+pub const LocalStorageConfig = struct {
+    /// Root directory for all antfly data storage. Defaults to 'antflydb'.
+    base_dir: ?[]const u8 = null,
+};
+
+pub const S3Info = struct {
+    /// S3 bucket name where SST files will be stored
+    bucket: []const u8,
+    /// Optional path prefix within the bucket (e.g., 'antfly/production/')
+    prefix: ?[]const u8 = null,
+};
+
+/// Storage backend type
+pub const StorageBackend = enum {
+    local,
+    s3,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .local => "local",
+            .s3 => "s3",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "local", .local },
+            .{ "s3", .s3 },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const ExternalIoConnectionConfig = struct {

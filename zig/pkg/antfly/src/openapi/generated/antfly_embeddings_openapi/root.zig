@@ -3,13 +3,13 @@
 
 pub const types = @import("types.zig");
 
-pub const AntflyEmbedderConfig = types.AntflyEmbedderConfig;
-pub const BedrockEmbedderConfig = types.BedrockEmbedderConfig;
-pub const CohereEmbedderConfig = types.CohereEmbedderConfig;
-pub const EmbedderConfig = types.EmbedderConfig;
 pub const EmbedderProvider = types.EmbedderProvider;
 pub const GoogleEmbedderConfig = types.GoogleEmbedderConfig;
+pub const VertexEmbedderConfig = types.VertexEmbedderConfig;
 pub const OllamaEmbedderConfig = types.OllamaEmbedderConfig;
 pub const OpenAIEmbedderConfig = types.OpenAIEmbedderConfig;
+pub const BedrockEmbedderConfig = types.BedrockEmbedderConfig;
+pub const CohereEmbedderConfig = types.CohereEmbedderConfig;
 pub const OpenRouterEmbedderConfig = types.OpenRouterEmbedderConfig;
-pub const VertexEmbedderConfig = types.VertexEmbedderConfig;
+pub const AntflyEmbedderConfig = types.AntflyEmbedderConfig;
+pub const EmbedderConfig = types.EmbedderConfig;
