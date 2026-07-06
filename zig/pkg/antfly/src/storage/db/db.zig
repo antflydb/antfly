@@ -3024,6 +3024,9 @@ pub const DB = struct {
             if (opts.open_mode != .status_only) {
                 db.hydrateAlgebraicObservationStatusBestEffort();
             }
+            if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
+                db.core.index_manager.cleanupInactiveRepairShadowRoots();
+            }
             if (opts.open_mode != .status_only) {
                 try db.rebaseManagedIndexAppliedSequencesIfNeeded();
             }
@@ -7318,51 +7321,198 @@ pub const DB = struct {
             return result;
         }
 
+        if (cfg.kind == .algebraic) return result;
+        const rebuilt = try self.rebuildIndexWithShadowReplacement(alloc, cfg);
+        result.reprocessed += rebuilt.reprocessed;
+        result.repaired += 1;
+        result.indexes_rebuilt += 1;
+        return result;
+    }
+
+    const ShadowIndexReplacementResult = struct {
+        reprocessed: u64 = 0,
+        applied_sequence: u64 = 0,
+    };
+
+    fn rebuildIndexWithShadowReplacement(
+        self: *DB,
+        alloc: Allocator,
+        cfg: types.IndexConfig,
+    ) !ShadowIndexReplacementResult {
+        const shadow_base = try std.fmt.allocPrint(alloc, "{s}/.repair-shadow-{d}", .{ self.core.path, monotonicTimeNs() });
+        var shadow_installed = false;
+        defer {
+            var io_impl = threadedIo();
+            defer io_impl.deinit();
+            if (!shadow_installed) std.Io.Dir.cwd().deleteTree(io_impl.io(), shadow_base) catch {};
+            alloc.free(shadow_base);
+        }
+        const shadow_indexes_path = try std.fmt.allocPrint(alloc, "{s}/indexes", .{shadow_base});
+        defer alloc.free(shadow_indexes_path);
+        try ensureDirPath(shadow_indexes_path);
+
+        const shadow_index_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ shadow_indexes_path, cfg.name });
+        defer alloc.free(shadow_index_path);
+        const shadow_checkpoint_path = try std.fmt.allocPrint(alloc, "{s}/applied-sequences", .{shadow_base});
+        defer alloc.free(shadow_checkpoint_path);
+
+        var shadow_manager = try index_manager_mod.IndexManager.initWithOptions(
+            alloc,
+            shadow_base,
+            self.index_backends,
+        );
+        var shadow_manager_open = true;
+        defer if (shadow_manager_open) shadow_manager.deinit();
+        shadow_manager.setAppliedSequenceCheckpointPath(shadow_checkpoint_path);
+        try shadow_manager.registerReplacementIndex(self.core.store, cfg);
+
+        var shadow_ctx = AsyncContext{
+            .alloc = alloc,
+            .io = self.backend_runtime.io(),
+            .store = self.core.store,
+            .applied_sequence_checkpoint_path = shadow_checkpoint_path,
+            .index_manager = &shadow_manager,
+            .apply_mutex = self.async_context.apply_mutex,
+            .dense_bulk_session_scope = .external,
+            .resolution_runtime = self.resolution_runtime,
+            .promotion_runtime = self.promotion_runtime,
+        };
+        defer shadow_ctx.deinit(alloc);
+
+        var build_apply_locked = false;
+        lockApply(self);
+        build_apply_locked = true;
+        errdefer if (build_apply_locked) self.core.unlockApply();
+        const build_floor_sequence = self.core.nextDerivedSequence();
+
+        const rebuilt: u64 = switch (cfg.kind) {
+            .dense_vector => @intCast(try rebuildDenseIndexForTargetCoverageContext(&shadow_ctx, cfg.name, 2048)),
+            .sparse_vector => @intCast(try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(&shadow_ctx, cfg.name, 2048)),
+            .graph => @intCast(try applySplitGraphArtifactsForIndexStreaming(
+                alloc,
+                self.core.store,
+                &shadow_manager,
+                cfg.name,
+                graph_repair_rebuild_batch_size,
+            )),
+            .full_text => try shadow_manager.resetFullTextIndexForArtifactRebuild(self.core.store, cfg.name),
+            .algebraic => return error.UnsupportedOperation,
+        };
+
         const index_ref = index_manager_mod.ManagedIndexRef{
             .name = cfg.name,
             .kind = cfg.kind,
         };
+        try self.saveShadowReplacementAppliedSequence(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, build_floor_sequence);
+        self.core.unlockApply();
+        build_apply_locked = false;
+        try self.catchUpShadowReplacementUntil(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, self.core.nextDerivedSequence());
+
         const use_dense_search_barrier = cfg.kind == .dense_vector;
         if (use_dense_search_barrier) self.beginIndexRepairBarrier();
         defer if (use_dense_search_barrier) self.endIndexRepairBarrier();
-        var index_apply_guard = try self.core.index_manager.lockManagedIndexApply(index_ref);
-        defer index_apply_guard.unlock();
 
-        const rebuilt = switch (cfg.kind) {
-            .dense_vector => blk: {
-                try self.core.index_manager.resetDenseIndexForArtifactRebuild(cfg.name);
-                const count = try rebuildDenseIndexForTargetCoverageContext(self.async_context, cfg.name, 2048);
-                try self.core.index_manager.syncIndexByName(cfg.name, true);
-                break :blk count;
-            },
-            .sparse_vector => blk: {
-                try self.core.index_manager.resetSparseIndexForArtifactRebuild(cfg.name);
-                const count = try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(self.async_context, cfg.name, 2048);
-                try self.core.index_manager.syncIndexByName(cfg.name, true);
-                break :blk count;
-            },
-            .graph => blk: {
-                try self.core.index_manager.resetGraphIndexForArtifactRebuild(cfg.name);
-                const count = try applySplitGraphArtifactsForIndexStreaming(
-                    alloc,
-                    self.core.store,
-                    self.core.index_manager,
-                    cfg.name,
-                    graph_repair_rebuild_batch_size,
-                );
-                try self.core.index_manager.syncIndexByName(cfg.name, true);
-                break :blk count;
-            },
-            .full_text => blk: {
-                const count = try self.core.index_manager.resetFullTextIndexForArtifactRebuild(self.core.store, cfg.name);
-                break :blk count;
-            },
-            .algebraic => return result,
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        const final_target = self.core.nextDerivedSequence();
+        try self.catchUpShadowReplacementUntil(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, final_target);
+
+        shadow_manager.deinit();
+        shadow_manager_open = false;
+        try self.core.index_manager.installBuiltReplacementIndex(self.core.store, cfg, shadow_index_path);
+        shadow_installed = true;
+        try self.core.saveAppliedSequence(cfg.name, final_target);
+        const prior_checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
+        try self.core.saveProjectionCheckpoint(cfg.name, .{
+            .applied_sequence = final_target,
+            .status = .clean,
+            .generation = prior_checkpoint.generation +| 1,
+            .config_hash = types.indexConfigHash(cfg),
+        });
+
+        return .{
+            .reprocessed = rebuilt,
+            .applied_sequence = final_target,
         };
-        result.reprocessed += rebuilt;
-        result.repaired += 1;
-        result.indexes_rebuilt += 1;
-        return result;
+    }
+
+    fn catchUpShadowReplacementUntil(
+        self: *DB,
+        alloc: Allocator,
+        shadow_manager: *index_manager_mod.IndexManager,
+        shadow_checkpoint_path: []const u8,
+        index_ref: index_manager_mod.ManagedIndexRef,
+        target_sequence: u64,
+    ) !void {
+        if (target_sequence == 0) return;
+        var batch_ctx = self.batchContext();
+        batch_ctx.index_manager = shadow_manager;
+        batch_ctx.applied_sequence_checkpoint_path = shadow_checkpoint_path;
+        batch_ctx.async_context = null;
+        batch_ctx.dense_bulk_session_scope = .external;
+
+        const applied = try apply_state.loadAppliedSequenceWithCheckpoint(
+            alloc,
+            self.core.store,
+            shadow_checkpoint_path,
+            index_ref.name,
+        );
+        if (applied >= target_sequence) return;
+        var replay_ctx = ReplayApplyContextBatch{
+            .batch = &batch_ctx,
+            .dense_bulk_session_scope = .external,
+        };
+        const catch_up_stats = try derived_worker.catchUpIndexWithOptions(
+            alloc,
+            self.core.replaySource(),
+            index_ref,
+            applied,
+            &replay_ctx,
+            applyDerivedBatchToIndexReplayContext,
+            .{
+                .resource_manager = shadow_manager.resource_manager,
+                .window_ctx = &replay_ctx,
+                .begin_window_fn = beginDerivedCatchUpWindowContext,
+                .finish_window_fn = finishDerivedCatchUpWindowContext,
+                .target_sequence = target_sequence,
+            },
+        );
+        const advanced = catch_up_stats.appliedSequenceAdvance(applied) orelse blk: {
+            if (catch_up_stats.shouldTryTargetAdvance(applied, target_sequence) and
+                try canAdvanceDerivedReplayTargetContext(&batch_ctx, index_ref, applied, target_sequence))
+            {
+                break :blk target_sequence;
+            }
+            break :blk applied;
+        };
+        if (advanced <= applied) return;
+        try self.saveShadowReplacementAppliedSequence(alloc, shadow_manager, shadow_checkpoint_path, index_ref, advanced);
+    }
+
+    fn saveShadowReplacementAppliedSequence(
+        self: *DB,
+        alloc: Allocator,
+        shadow_manager: *index_manager_mod.IndexManager,
+        shadow_checkpoint_path: []const u8,
+        index_ref: index_manager_mod.ManagedIndexRef,
+        sequence: u64,
+    ) !void {
+        try shadow_manager.checkpointLsmWalForManagedIndex(index_ref);
+        const update = apply_state.AppliedSequenceUpdate{
+            .index_name = index_ref.name,
+            .sequence = sequence,
+            .config_hash = if (shadow_manager.get(index_ref.name)) |value| types.indexConfigHash(value.*) else 0,
+        };
+        const updates = [_]apply_state.AppliedSequenceUpdate{update};
+        try saveDenseProjectionMetadataForAppliedSequenceUpdates(shadow_manager, &updates);
+        try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(shadow_manager, &updates);
+        try apply_state.saveAppliedSequenceUpdateWithCheckpoint(
+            alloc,
+            self.core.store,
+            shadow_checkpoint_path,
+            update,
+        );
     }
 
     fn indexRepairRequired(self: *DB, alloc: Allocator, index_name: []const u8) !bool {
@@ -38339,6 +38489,72 @@ test "db index repair rebuilds full text index from stored documents" {
     defer after.deinit();
     try std.testing.expectEqual(@as(u32, 1), after.total_hits);
     try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
+}
+
+test "db index repair shadow swap survives reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const text_cfg: types.IndexConfig = .{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(text_cfg);
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"body\":\"alpha durable\"}" },
+                .{ .key = "doc:b", .value = "{\"body\":\"beta durable\"}" },
+            },
+            .sync_level = .full_index,
+        });
+        try db.core.saveProjectionCheckpoint("ft_v1", .{
+            .applied_sequence = 0,
+            .status = .repair_required,
+            .config_hash = types.indexConfigHash(text_cfg),
+        });
+
+        var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
+            .target = .index,
+            .artifact_kind = .full_text,
+            .index_name = "ft_v1",
+            .limit = 1,
+        });
+        defer repair.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
+    }
+
+    const abandoned_shadow = try std.fmt.allocPrint(alloc, "{s}/.repair-shadow-abandoned/indexes/ft_v1", .{std.mem.span(path)});
+    defer alloc.free(abandoned_shadow);
+    try ensureDirPath(abandoned_shadow);
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reopened.close();
+
+        const checkpoint = try reopened.core.loadProjectionCheckpoint(alloc, "ft_v1");
+        try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
+
+        var after = try reopened.search(alloc, .{
+            .index_name = "ft_v1",
+            .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        });
+        defer after.deinit();
+        try std.testing.expectEqual(@as(u32, 1), after.total_hits);
+        try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, abandoned_shadow, .{}));
+    }
 }
 
 test "db repair issue list reports index repair candidates" {
