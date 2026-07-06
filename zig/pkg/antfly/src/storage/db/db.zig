@@ -15852,10 +15852,19 @@ fn encodeThinReplayRecordPayload(
 
     for (req.deletes) |key| {
         try appendUniqueReplayRecordKeyWithSet(alloc, &deleted_doc_keys, &deleted_doc_key_set, key);
+        try appendUniqueReplayRecordHint(alloc, &target_hints, .full_text);
+        try appendUniqueReplayRecordHint(alloc, &target_hints, .dense_vector);
+        try appendUniqueReplayRecordHint(alloc, &target_hints, .sparse_vector);
         try appendUniqueReplayRecordHint(alloc, &target_hints, .algebraic);
+        try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
     }
     for (deleted_artifact_keys) |key| {
         try appendUniqueReplayRecordKeyWithSet(alloc, &deleted_doc_keys, &deleted_doc_key_set, key);
+        try appendUniqueReplayRecordHint(alloc, &target_hints, .full_text);
+        try appendUniqueReplayRecordHint(alloc, &target_hints, .dense_vector);
+        try appendUniqueReplayRecordHint(alloc, &target_hints, .sparse_vector);
+        try appendUniqueReplayRecordHint(alloc, &target_hints, .algebraic);
+        try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
         if (internal_keys.isAssetArtifactKey(key) or internal_keys.isChunkArtifactRecordKey(key) or internal_keys.isGraphEdgeArtifactKey(key)) {
             try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, key);
             if (internal_keys.isChunkArtifactRecordKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .full_text);
@@ -32997,6 +33006,53 @@ test "db batch writes thin change journal record" {
     try std.testing.expectEqual(@as(usize, 0), record.record.changed_artifact_keys.len);
 }
 
+test "db batch delete replay record wakes managed index workers" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+    try db.batch(.{
+        .deletes = &.{"doc:a"},
+        .sync_level = .write,
+    });
+
+    const entries = try replay_stream_mod.iterateFrom(alloc, db.core.store, 1);
+    defer {
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    var record = try change_journal_mod.decodeRecord(alloc, entries[1].payload);
+    defer record.deinit();
+
+    try std.testing.expectEqual(@as(u64, 2), record.record.sequence);
+    try std.testing.expectEqual(@as(usize, 1), record.record.deleted_doc_keys.len);
+    try std.testing.expectEqualStrings("doc:a", record.record.deleted_doc_keys[0]);
+    try std.testing.expect(journalRecordHasHint(record.record, .full_text));
+    try std.testing.expect(journalRecordHasHint(record.record, .dense_vector));
+    try std.testing.expect(journalRecordHasHint(record.record, .sparse_vector));
+    try std.testing.expect(journalRecordHasHint(record.record, .algebraic));
+    try std.testing.expect(journalRecordHasHint(record.record, .graph));
+}
+
 test "db batch uses change journal as the replay authority" {
     const alloc = std.testing.allocator;
 
@@ -40525,6 +40581,121 @@ test "db runUntilIdle drains enrichment and derived indexing" {
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 }
 
+test "db write sync trailing dense no-op batches drain stale delete replay at idle" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "embedded-worker",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"semantic_content\",\"embedding_name\":\"semantic_idx\"}}",
+    });
+
+    for (1..4) |i| {
+        var key_buf: [32]u8 = undefined;
+        var value_buf: [128]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "text-{d}", .{i});
+        const value = try std.fmt.bufPrint(
+            &value_buf,
+            "{{\"content\":\"t{d}\",\"semantic_content\":\"unique payload {d}\"}}",
+            .{ i, i },
+        );
+        try db.batch(.{
+            .writes = &.{.{ .key = key, .value = value }},
+            .sync_level = .write,
+        });
+    }
+
+    for (1..4) |i| {
+        var key_buf: [32]u8 = undefined;
+        var value_buf: [128]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "plain-{d}", .{i});
+        const value = try std.fmt.bufPrint(&value_buf, "{{\"content\":\"plain {d}\"}}", .{i});
+        try db.batch(.{
+            .writes = &.{.{ .key = key, .value = value }},
+            .sync_level = .write,
+        });
+    }
+
+    var drained = false;
+    var attempts: usize = 0;
+    while (attempts < slow_test_wait_attempts) : (attempts += 1) {
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(usize, 1), stats.indexes.len);
+        const index = stats.indexes[0];
+        if (index.doc_count == 3 and
+            index.replay_applied_sequence >= index.replay_target_sequence and
+            !index.replay_catch_up_required and
+            index.catch_up_phase == .idle)
+        {
+            drained = true;
+            break;
+        }
+        sleepPollInterval();
+    }
+    try std.testing.expect(drained);
+
+    const query_vec = try deterministic.interface().embedDense(alloc, "semantic_idx", "unique payload 1", 3);
+    defer alloc.free(query_vec);
+    {
+        var result = try waitForDenseSearchResultWithAttempts(alloc, &db, .{
+            .index_name = "semantic_idx",
+            .dense = .{ .vector = query_vec, .k = 3 },
+            .limit = 3,
+        }, 1, slow_test_wait_attempts);
+        defer result.deinit();
+        try std.testing.expectEqualStrings("text-1", result.hits[0].id);
+    }
+
+    try db.batch(.{
+        .deletes = &.{"text-1"},
+        .sync_level = .write,
+    });
+
+    var delete_drained = false;
+    attempts = 0;
+    while (attempts < slow_test_wait_attempts) : (attempts += 1) {
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(usize, 1), stats.indexes.len);
+        const index = stats.indexes[0];
+        if (index.doc_count == 2 and
+            index.replay_applied_sequence >= index.replay_target_sequence and
+            !index.replay_catch_up_required and
+            index.catch_up_phase == .idle)
+        {
+            delete_drained = true;
+            break;
+        }
+        sleepPollInterval();
+    }
+    try std.testing.expect(delete_drained);
+
+    var after_delete = try db.search(alloc, .{
+        .index_name = "semantic_idx",
+        .dense = .{ .vector = query_vec, .k = 3 },
+        .limit = 3,
+    });
+    defer after_delete.deinit();
+    try std.testing.expectEqual(@as(u32, 2), after_delete.total_hits);
+    for (after_delete.hits) |hit| {
+        try std.testing.expect(!std.mem.eql(u8, hit.id, "text-1"));
+    }
+}
+
 test "db generated enrichment empty backfill advances enrichment checkpoint" {
     const alloc = std.testing.allocator;
 
@@ -46625,6 +46796,65 @@ test "db thin replay marks artifact-derived target hints" {
     try std.testing.expectEqualStrings(chunk_key, decoded.record.changed_artifact_keys[1]);
     try std.testing.expectEqualStrings(graph_key, decoded.record.changed_artifact_keys[2]);
     try std.testing.expect(journalRecordHasHint(decoded.record, .full_text));
+    try std.testing.expect(journalRecordHasHint(decoded.record, .graph));
+}
+
+test "db thin replay marks document deletes for managed index replay" {
+    const alloc = std.testing.allocator;
+
+    const payload = try encodeThinReplayRecordPayload(
+        alloc,
+        .{ .deletes = &.{"doc:gone"} },
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        45,
+        false,
+    );
+    defer alloc.free(payload);
+
+    var decoded = try change_journal_mod.decodeRecord(alloc, payload);
+    defer decoded.deinit();
+
+    try std.testing.expectEqual(@as(u64, 45), decoded.record.sequence);
+    try std.testing.expectEqual(@as(usize, 1), decoded.record.deleted_doc_keys.len);
+    try std.testing.expectEqualStrings("doc:gone", decoded.record.deleted_doc_keys[0]);
+    try std.testing.expect(journalRecordHasHint(decoded.record, .full_text));
+    try std.testing.expect(journalRecordHasHint(decoded.record, .dense_vector));
+    try std.testing.expect(journalRecordHasHint(decoded.record, .sparse_vector));
+    try std.testing.expect(journalRecordHasHint(decoded.record, .algebraic));
+    try std.testing.expect(journalRecordHasHint(decoded.record, .graph));
+}
+
+test "db thin replay marks artifact deletes for managed index replay" {
+    const alloc = std.testing.allocator;
+
+    const embedding_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:gone", "semantic_idx");
+    defer alloc.free(embedding_key);
+
+    const payload = try encodeThinReplayRecordPayload(
+        alloc,
+        .{},
+        &.{},
+        &.{embedding_key},
+        &.{},
+        &.{},
+        46,
+        false,
+    );
+    defer alloc.free(payload);
+
+    var decoded = try change_journal_mod.decodeRecord(alloc, payload);
+    defer decoded.deinit();
+
+    try std.testing.expectEqual(@as(u64, 46), decoded.record.sequence);
+    try std.testing.expectEqual(@as(usize, 1), decoded.record.deleted_doc_keys.len);
+    try std.testing.expectEqualStrings(embedding_key, decoded.record.deleted_doc_keys[0]);
+    try std.testing.expect(journalRecordHasHint(decoded.record, .full_text));
+    try std.testing.expect(journalRecordHasHint(decoded.record, .dense_vector));
+    try std.testing.expect(journalRecordHasHint(decoded.record, .sparse_vector));
+    try std.testing.expect(journalRecordHasHint(decoded.record, .algebraic));
     try std.testing.expect(journalRecordHasHint(decoded.record, .graph));
 }
 
