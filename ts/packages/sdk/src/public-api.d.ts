@@ -1188,7 +1188,13 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Cancel a table repair job */
+        /**
+         * Cancel a table repair job
+         * @description Cancels a queued table repair job. If a repair pass is already running,
+         *     the response returns the current running state; cancellation is applied
+         *     only at pass boundaries so the API never reports a committed in-flight
+         *     pass as cancelled.
+         */
         post: operations["cancelTableRepairJob"];
         delete?: never;
         options?: never;
@@ -3073,6 +3079,11 @@ export interface components {
              * @description Server-assigned durable repair job identifier.
              */
             job_id: number;
+            /**
+             * Format: uint64
+             * @description Monotonic execution attempt token for the current running pass.
+             */
+            attempt_id: number;
             /** @description Table being repaired. */
             table_name: string;
             /**

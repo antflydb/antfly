@@ -25,6 +25,7 @@ class TableRepairJob:
 
     Attributes:
         job_id (int): Server-assigned durable repair job identifier.
+        attempt_id (int): Monotonic execution attempt token for the current running pass.
         table_name (str): Table being repaired.
         phase (TableRepairJobPhase): Lifecycle phase of the repair job.
         repair_status (TableRepairJobRepairStatus): User-facing repair progress state. `debt_remaining` means the
@@ -43,6 +44,7 @@ class TableRepairJob:
     """
 
     job_id: int
+    attempt_id: int
     table_name: str
     phase: TableRepairJobPhase
     repair_status: TableRepairJobRepairStatus
@@ -61,6 +63,8 @@ class TableRepairJob:
 
     def to_dict(self) -> dict[str, Any]:
         job_id = self.job_id
+
+        attempt_id = self.attempt_id
 
         table_name = self.table_name
 
@@ -105,6 +109,7 @@ class TableRepairJob:
         field_dict.update(
             {
                 "job_id": job_id,
+                "attempt_id": attempt_id,
                 "table_name": table_name,
                 "phase": phase,
                 "repair_status": repair_status,
@@ -134,6 +139,8 @@ class TableRepairJob:
 
         d = dict(src_dict)
         job_id = d.pop("job_id")
+
+        attempt_id = d.pop("attempt_id")
 
         table_name = d.pop("table_name")
 
@@ -184,6 +191,7 @@ class TableRepairJob:
 
         table_repair_job = cls(
             job_id=job_id,
+            attempt_id=attempt_id,
             table_name=table_name,
             phase=phase,
             repair_status=repair_status,

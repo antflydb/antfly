@@ -73,6 +73,11 @@ def sync_detailed(
 ) -> Response[Error | TableRepairJob]:
     """Cancel a table repair job
 
+     Cancels a queued table repair job. If a repair pass is already running,
+    the response returns the current running state; cancellation is applied
+    only at pass boundaries so the API never reports a committed in-flight
+    pass as cancelled.
+
     Args:
         table_name (str):
         job_id (str):
@@ -105,6 +110,11 @@ def sync(
 ) -> Error | TableRepairJob | None:
     """Cancel a table repair job
 
+     Cancels a queued table repair job. If a repair pass is already running,
+    the response returns the current running state; cancellation is applied
+    only at pass boundaries so the API never reports a committed in-flight
+    pass as cancelled.
+
     Args:
         table_name (str):
         job_id (str):
@@ -131,6 +141,11 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
 ) -> Response[Error | TableRepairJob]:
     """Cancel a table repair job
+
+     Cancels a queued table repair job. If a repair pass is already running,
+    the response returns the current running state; cancellation is applied
+    only at pass boundaries so the API never reports a committed in-flight
+    pass as cancelled.
 
     Args:
         table_name (str):
@@ -161,6 +176,11 @@ async def asyncio(
     client: AuthenticatedClient,
 ) -> Error | TableRepairJob | None:
     """Cancel a table repair job
+
+     Cancels a queued table repair job. If a repair pass is already running,
+    the response returns the current running state; cancellation is applied
+    only at pass boundaries so the API never reports a committed in-flight
+    pass as cancelled.
 
     Args:
         table_name (str):

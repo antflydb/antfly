@@ -2329,6 +2329,7 @@ components:
       description: Durable table repair job state.
       required:
         - job_id
+        - attempt_id
         - table_name
         - phase
         - repair_status
@@ -2344,6 +2345,10 @@ components:
           type: integer
           format: uint64
           description: Server-assigned durable repair job identifier.
+        attempt_id:
+          type: integer
+          format: uint64
+          description: Monotonic execution attempt token for the current running pass.
         table_name:
           type: string
           description: Table being repaired.
@@ -8709,6 +8714,11 @@ paths:
           type: string
     post:
       summary: Cancel a table repair job
+      description: |
+        Cancels a queued table repair job. If a repair pass is already running,
+        the response returns the current running state; cancellation is applied
+        only at pass boundaries so the API never reports a committed in-flight
+        pass as cancelled.
       tags:
         - data_operations
       operationId: cancelTableRepairJob

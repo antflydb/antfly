@@ -38,6 +38,14 @@ test "repair job store starts and records a pass" {
     try std.testing.expect(begin.started);
     var parsed_running = try std.json.parseFromSlice(repair_jobs.JobState, alloc, begin.encoded, .{ .ignore_unknown_fields = true });
     defer parsed_running.deinit();
+    try std.testing.expectEqual(@as(u64, 1), parsed_running.value.attempt_id);
+
+    try store.heartbeatRunning(alloc, parsed_running.value.job_id, parsed_running.value.attempt_id);
+    const after_heartbeat = (try store.loadJobAlloc(alloc, parsed_running.value.job_id)).?;
+    defer alloc.free(after_heartbeat);
+    var parsed_after_heartbeat = try std.json.parseFromSlice(repair_jobs.JobState, alloc, after_heartbeat, .{ .ignore_unknown_fields = true });
+    defer parsed_after_heartbeat.deinit();
+    try std.testing.expectEqual(parsed_running.value.attempt_id, parsed_after_heartbeat.value.attempt_id);
 
     var pass: db_mod.types.ArtifactRepairResult = .{
         .scanned = 2,

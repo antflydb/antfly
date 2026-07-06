@@ -2093,6 +2093,8 @@ pub const TableRepairRunResponse = struct {
 pub const TableRepairJob = struct {
     /// Server-assigned durable repair job identifier.
     job_id: i64,
+    /// Monotonic execution attempt token for the current running pass.
+    attempt_id: i64,
     /// Table being repaired.
     table_name: []const u8,
     /// Lifecycle phase of the repair job.

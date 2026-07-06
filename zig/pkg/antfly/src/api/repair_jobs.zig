@@ -69,6 +69,7 @@ pub const StartRequest = struct {
 
 pub const JobState = struct {
     job_id: u64,
+    attempt_id: u64 = 0,
     table_name: []const u8,
     phase: []const u8,
     repair_status: []const u8,
@@ -139,6 +140,7 @@ pub const Store = struct {
         const limit = if (req.limit == 0) @as(u32, 100) else req.limit;
         const encoded = try encodeState(alloc, .{
             .job_id = reserved.job_id,
+            .attempt_id = 0,
             .table_name = table_name,
             .phase = phaseString(.queued),
             .repair_status = repairStatusForPhase(.queued, false, false),
@@ -195,6 +197,7 @@ pub const Store = struct {
 
         const encoded = try encodeState(alloc, .{
             .job_id = previous.job_id,
+            .attempt_id = previous.attempt_id,
             .table_name = previous.table_name,
             .phase = phaseString(phase),
             .repair_status = repairStatusForPhase(phase, previous.result.has_more, previous.result.debt_remaining),
@@ -259,6 +262,7 @@ pub const Store = struct {
 
         const encoded = try encodeState(alloc, .{
             .job_id = previous.job_id,
+            .attempt_id = previous.attempt_id,
             .table_name = previous.table_name,
             .phase = phaseString(phase),
             .repair_status = repairStatusForPhase(phase, pass.has_more, pass.debt_remaining),
@@ -302,6 +306,7 @@ pub const Store = struct {
 
         const encoded = try encodeState(alloc, .{
             .job_id = current.job_id,
+            .attempt_id = current.attempt_id +| 1,
             .table_name = current.table_name,
             .phase = phaseString(.running),
             .repair_status = repairStatusForPhase(.running, current.result.has_more, current.result.debt_remaining),
@@ -319,6 +324,45 @@ pub const Store = struct {
         errdefer alloc.free(encoded);
         try self.storeEncodedLocked(current.job_id, encoded, null);
         return .{ .encoded = encoded, .started = true };
+    }
+
+    pub fn heartbeatRunning(
+        self: *Store,
+        alloc: std.mem.Allocator,
+        job_id: u64,
+        attempt_id: u64,
+    ) !void {
+        const now_ms = nowMillis();
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        const current_encoded = (try self.loadJobLocked(job_id)) orelse return error.NotFound;
+        var parsed_current = try std.json.parseFromSlice(JobState, self.alloc, current_encoded, .{ .ignore_unknown_fields = true });
+        defer parsed_current.deinit();
+        const current = parsed_current.value;
+        if (!std.mem.eql(u8, current.phase, phaseString(.running))) return;
+        if (current.attempt_id != attempt_id) return;
+
+        const encoded = try encodeState(alloc, .{
+            .job_id = current.job_id,
+            .attempt_id = current.attempt_id,
+            .table_name = current.table_name,
+            .phase = current.phase,
+            .repair_status = current.repair_status,
+            .target = current.target,
+            .kind = current.kind,
+            .index = current.index,
+            .cursor = current.cursor,
+            .limit = current.limit,
+            .force = current.force,
+            .result = current.result,
+            .last_error = current.last_error,
+            .created_at_millis = current.created_at_millis,
+            .last_updated_at_millis = now_ms,
+            .expires_at_millis = now_ms + self.retentionMillis(),
+        });
+        defer alloc.free(encoded);
+        try self.storeEncodedLocked(current.job_id, encoded, null);
     }
 
     pub fn cleanupExpiredJobs(self: *Store) void {
@@ -439,7 +483,7 @@ const running_lease_timeout_ms: u64 = 300_000;
 fn jobStateTransitionTokenMatches(current: JobState, expected: JobState) bool {
     return current.job_id == expected.job_id and
         std.mem.eql(u8, current.phase, expected.phase) and
-        current.last_updated_at_millis == expected.last_updated_at_millis;
+        current.attempt_id == expected.attempt_id;
 }
 
 pub fn encodeState(alloc: std.mem.Allocator, state: JobState) ![]u8 {
@@ -529,6 +573,14 @@ test "table repair job records bounded pass and continuation" {
     try std.testing.expect(begin.started);
     var parsed_running = try std.json.parseFromSlice(JobState, alloc, begin.encoded, .{ .ignore_unknown_fields = true });
     defer parsed_running.deinit();
+    try std.testing.expectEqual(@as(u64, 1), parsed_running.value.attempt_id);
+
+    try store.heartbeatRunning(alloc, parsed_running.value.job_id, parsed_running.value.attempt_id);
+    const after_heartbeat = (try store.loadJobAlloc(alloc, parsed_running.value.job_id)).?;
+    defer alloc.free(after_heartbeat);
+    var parsed_after_heartbeat = try std.json.parseFromSlice(JobState, alloc, after_heartbeat, .{ .ignore_unknown_fields = true });
+    defer parsed_after_heartbeat.deinit();
+    try std.testing.expectEqual(parsed_running.value.attempt_id, parsed_after_heartbeat.value.attempt_id);
 
     var pass: db_mod.types.ArtifactRepairResult = .{
         .scanned = 2,

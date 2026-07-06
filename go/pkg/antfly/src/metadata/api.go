@@ -1606,6 +1606,34 @@ func (t *TableApi) RunTableRepair(w http.ResponseWriter, r *http.Request, tableN
 	errorResponse(w, "table repair is only available in the Zig runtime", http.StatusMethodNotAllowed)
 }
 
+func (t *TableApi) StartTableRepairJob(w http.ResponseWriter, r *http.Request, tableName string) {
+	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, tableName, usermgr.PermissionTypeAdmin) {
+		return
+	}
+	errorResponse(w, "table repair jobs are only available in the Zig runtime", http.StatusMethodNotAllowed)
+}
+
+func (t *TableApi) GetTableRepairJob(w http.ResponseWriter, r *http.Request, tableName string, jobId string) {
+	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, tableName, usermgr.PermissionTypeAdmin) {
+		return
+	}
+	errorResponse(w, "table repair jobs are only available in the Zig runtime", http.StatusMethodNotAllowed)
+}
+
+func (t *TableApi) AdvanceTableRepairJob(w http.ResponseWriter, r *http.Request, tableName string, jobId string) {
+	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, tableName, usermgr.PermissionTypeAdmin) {
+		return
+	}
+	errorResponse(w, "table repair jobs are only available in the Zig runtime", http.StatusMethodNotAllowed)
+}
+
+func (t *TableApi) CancelTableRepairJob(w http.ResponseWriter, r *http.Request, tableName string, jobId string) {
+	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, tableName, usermgr.PermissionTypeAdmin) {
+		return
+	}
+	errorResponse(w, "table repair jobs are only available in the Zig runtime", http.StatusMethodNotAllowed)
+}
+
 // authApiRoutes configures the public authentication API.
 func (ms *MetadataStore) authApiRoutes() *http.ServeMux {
 	mux := http.NewServeMux()

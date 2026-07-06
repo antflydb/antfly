@@ -2358,6 +2358,8 @@ pub fn build(b: *std.Build) void {
             "artifact reprocess job store starts and updates a job",
             "artifact reprocess job store recovers durable jobs and reseeds ids",
             "artifact reprocess job cleanup removes recovered durable expired jobs",
+            "repair job store starts and records a pass",
+            "table repair job records bounded pass and continuation",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
