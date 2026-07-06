@@ -1,0 +1,550 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+const std = @import("std");
+const docstore_mod = @import("../storage/docstore.zig");
+const db_mod = @import("../storage/db/mod.zig");
+const platform_time = @import("../platform/time.zig");
+
+pub const StoreConfig = struct {
+    repair_job_store_path: ?[]const u8 = null,
+    repair_job_retention_ms: ?u64 = null,
+};
+
+pub const OpenedStore = struct {
+    alloc: std.mem.Allocator,
+    path_z: [:0]u8,
+    docstore: *docstore_mod.DocStore,
+
+    pub fn open(alloc: std.mem.Allocator, path: []const u8) !OpenedStore {
+        const path_z = try alloc.dupeZ(u8, path);
+        errdefer alloc.free(path_z);
+        const docstore = try alloc.create(docstore_mod.DocStore);
+        errdefer alloc.destroy(docstore);
+        docstore.* = try docstore_mod.DocStore.open(alloc, path_z, .{});
+        errdefer docstore.close();
+        return .{
+            .alloc = alloc,
+            .path_z = path_z,
+            .docstore = docstore,
+        };
+    }
+
+    pub fn deinit(self: *OpenedStore) void {
+        self.docstore.close();
+        self.alloc.destroy(self.docstore);
+        self.alloc.free(self.path_z);
+        self.* = undefined;
+    }
+};
+
+pub const JobPhase = enum {
+    queued,
+    running,
+    succeeded,
+    failed,
+    cancelled,
+};
+
+pub const StartRequest = struct {
+    target: []const u8 = "artifact",
+    kind: ?db_mod.types.ArtifactRepairKind = null,
+    index: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
+    limit: u32 = 100,
+    force: bool = false,
+    advance: bool = true,
+};
+
+pub const JobState = struct {
+    job_id: u64,
+    table_name: []const u8,
+    phase: []const u8,
+    repair_status: []const u8,
+    target: []const u8,
+    kind: ?db_mod.types.ArtifactRepairKind = null,
+    index: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
+    limit: u32,
+    force: bool = false,
+    result: db_mod.types.ArtifactRepairResult = .{},
+    last_error: ?[]const u8 = null,
+    created_at_millis: u64,
+    last_updated_at_millis: u64,
+    expires_at_millis: u64,
+};
+
+pub const BeginAdvanceResult = struct {
+    encoded: []u8,
+    started: bool,
+};
+
+pub const Store = struct {
+    alloc: std.mem.Allocator,
+    cfg: StoreConfig,
+    opened_store: ?*OpenedStore = null,
+    mutex: std.atomic.Mutex = .unlocked,
+    jobs: std.AutoHashMapUnmanaged(u64, []u8) = .{},
+    next_job_id: u64 = 1,
+
+    pub fn init(alloc: std.mem.Allocator, cfg: StoreConfig) Store {
+        return .{
+            .alloc = alloc,
+            .cfg = cfg,
+        };
+    }
+
+    pub fn deinit(self: *Store) void {
+        var it = self.jobs.iterator();
+        while (it.next()) |entry| self.alloc.free(entry.value_ptr.*);
+        self.jobs.deinit(self.alloc);
+        if (self.opened_store) |store| {
+            store.deinit();
+            self.alloc.destroy(store);
+        }
+        self.* = undefined;
+    }
+
+    pub fn retentionMillis(self: *const Store) u64 {
+        return self.cfg.repair_job_retention_ms orelse 86_400_000;
+    }
+
+    pub fn attachOpenedStore(self: *Store, opened: *OpenedStore) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        self.opened_store = opened;
+        errdefer self.opened_store = null;
+        try self.recoverPersistedJobsLocked(opened);
+    }
+
+    pub fn startJob(
+        self: *Store,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: StartRequest,
+    ) ![]u8 {
+        const now_ms = nowMillis();
+        const reserved = self.reserveJobId();
+        const limit = if (req.limit == 0) @as(u32, 100) else req.limit;
+        const encoded = try encodeState(alloc, .{
+            .job_id = reserved.job_id,
+            .table_name = table_name,
+            .phase = phaseString(.queued),
+            .repair_status = repairStatusForPhase(.queued, false, false),
+            .target = req.target,
+            .kind = req.kind,
+            .index = req.index,
+            .cursor = req.cursor,
+            .limit = limit,
+            .force = req.force,
+            .result = .{ .limit = limit },
+            .created_at_millis = now_ms,
+            .last_updated_at_millis = now_ms,
+            .expires_at_millis = now_ms + self.retentionMillis(),
+        });
+        errdefer alloc.free(encoded);
+        try self.storeEncoded(reserved.job_id, encoded, reserved.next_job_id);
+        return encoded;
+    }
+
+    pub fn loadJobAlloc(self: *Store, alloc: std.mem.Allocator, job_id: u64) !?[]u8 {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.jobs.get(job_id)) |encoded| return try alloc.dupe(u8, encoded);
+        const opened = self.opened_store orelse return null;
+        const key = try jobKey(alloc, job_id);
+        defer alloc.free(key);
+        const body = opened.docstore.get(alloc, key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        errdefer alloc.free(body);
+        const cached = try self.alloc.dupe(u8, body);
+        errdefer self.alloc.free(cached);
+        try self.jobs.put(self.alloc, job_id, cached);
+        return body;
+    }
+
+    pub fn markPhase(
+        self: *Store,
+        alloc: std.mem.Allocator,
+        previous: JobState,
+        phase: JobPhase,
+        last_error: ?[]const u8,
+    ) ![]u8 {
+        const now_ms = nowMillis();
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const current_encoded = (try self.loadJobLocked(previous.job_id)) orelse return error.NotFound;
+        var parsed_current = try std.json.parseFromSlice(JobState, self.alloc, current_encoded, .{ .ignore_unknown_fields = true });
+        defer parsed_current.deinit();
+        if (!jobStateTransitionTokenMatches(parsed_current.value, previous)) {
+            return try alloc.dupe(u8, current_encoded);
+        }
+
+        const encoded = try encodeState(alloc, .{
+            .job_id = previous.job_id,
+            .table_name = previous.table_name,
+            .phase = phaseString(phase),
+            .repair_status = repairStatusForPhase(phase, previous.result.has_more, previous.result.debt_remaining),
+            .target = previous.target,
+            .kind = previous.kind,
+            .index = previous.index,
+            .cursor = previous.cursor,
+            .limit = previous.limit,
+            .force = previous.force,
+            .result = previous.result,
+            .last_error = last_error,
+            .created_at_millis = previous.created_at_millis,
+            .last_updated_at_millis = now_ms,
+            .expires_at_millis = now_ms + self.retentionMillis(),
+        });
+        errdefer alloc.free(encoded);
+        try self.storeEncodedLocked(previous.job_id, encoded, null);
+        return encoded;
+    }
+
+    pub fn recordPass(
+        self: *Store,
+        alloc: std.mem.Allocator,
+        previous: JobState,
+        pass: db_mod.types.ArtifactRepairResult,
+    ) ![]u8 {
+        var total = previous.result;
+        total.scanned +|= pass.scanned;
+        total.groups_scanned +|= pass.groups_scanned;
+        total.reprocessed +|= pass.reprocessed;
+        total.repaired +|= pass.repaired;
+        total.missing_source_docs +|= pass.missing_source_docs;
+        total.failed +|= pass.failed;
+        total.unsupported +|= pass.unsupported;
+        total.unresolved +|= pass.unresolved;
+        total.in_progress +|= pass.in_progress;
+        total.indexes_rebuilt +|= pass.indexes_rebuilt;
+        total.indexes_degraded +|= pass.indexes_degraded;
+        total.limit = pass.limit;
+        total.has_more = pass.has_more;
+        total.debt_remaining = pass.debt_remaining;
+        total.next_cursor = pass.next_cursor;
+
+        const retryable_in_progress = pass.in_progress != 0 and pass.failed == 0 and pass.unsupported == 0 and pass.missing_source_docs == 0;
+        const phase: JobPhase = if (pass.has_more or retryable_in_progress)
+            .queued
+        else if (pass.debt_remaining)
+            .failed
+        else
+            .succeeded;
+        const last_error: ?[]const u8 = if (phase == .failed) "repair_debt_remaining" else null;
+        const now_ms = nowMillis();
+
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const current_encoded = (try self.loadJobLocked(previous.job_id)) orelse return error.NotFound;
+        var parsed_current = try std.json.parseFromSlice(JobState, self.alloc, current_encoded, .{ .ignore_unknown_fields = true });
+        defer parsed_current.deinit();
+        if (!jobStateTransitionTokenMatches(parsed_current.value, previous)) {
+            return try alloc.dupe(u8, current_encoded);
+        }
+
+        const encoded = try encodeState(alloc, .{
+            .job_id = previous.job_id,
+            .table_name = previous.table_name,
+            .phase = phaseString(phase),
+            .repair_status = repairStatusForPhase(phase, pass.has_more, pass.debt_remaining),
+            .target = previous.target,
+            .kind = previous.kind,
+            .index = previous.index,
+            .cursor = pass.next_cursor,
+            .limit = previous.limit,
+            .force = previous.force,
+            .result = total,
+            .last_error = last_error,
+            .created_at_millis = previous.created_at_millis,
+            .last_updated_at_millis = now_ms,
+            .expires_at_millis = now_ms + self.retentionMillis(),
+        });
+        errdefer alloc.free(encoded);
+        try self.storeEncodedLocked(previous.job_id, encoded, null);
+        return encoded;
+    }
+
+    pub fn beginAdvance(self: *Store, alloc: std.mem.Allocator, expected: JobState) !BeginAdvanceResult {
+        const now_ms = nowMillis();
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        const current_encoded = (try self.loadJobLocked(expected.job_id)) orelse return error.NotFound;
+        var parsed_current = try std.json.parseFromSlice(JobState, self.alloc, current_encoded, .{ .ignore_unknown_fields = true });
+        defer parsed_current.deinit();
+        const current = parsed_current.value;
+        if (isTerminalPhase(current.phase)) {
+            return .{ .encoded = try alloc.dupe(u8, current_encoded), .started = false };
+        }
+        const is_running = std.mem.eql(u8, current.phase, phaseString(.running));
+        const running_expired = is_running and now_ms > current.last_updated_at_millis +| running_lease_timeout_ms;
+        if (is_running and !running_expired) {
+            return .{ .encoded = try alloc.dupe(u8, current_encoded), .started = false };
+        }
+        if (!is_running and !jobStateTransitionTokenMatches(current, expected)) {
+            return .{ .encoded = try alloc.dupe(u8, current_encoded), .started = false };
+        }
+
+        const encoded = try encodeState(alloc, .{
+            .job_id = current.job_id,
+            .table_name = current.table_name,
+            .phase = phaseString(.running),
+            .repair_status = repairStatusForPhase(.running, current.result.has_more, current.result.debt_remaining),
+            .target = current.target,
+            .kind = current.kind,
+            .index = current.index,
+            .cursor = current.cursor,
+            .limit = current.limit,
+            .force = current.force,
+            .result = current.result,
+            .created_at_millis = current.created_at_millis,
+            .last_updated_at_millis = now_ms,
+            .expires_at_millis = now_ms + self.retentionMillis(),
+        });
+        errdefer alloc.free(encoded);
+        try self.storeEncodedLocked(current.job_id, encoded, null);
+        return .{ .encoded = encoded, .started = true };
+    }
+
+    pub fn cleanupExpiredJobs(self: *Store) void {
+        const now_ms = nowMillis();
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        var expired = std.ArrayListUnmanaged(u64).empty;
+        defer expired.deinit(self.alloc);
+        var it = self.jobs.iterator();
+        while (it.next()) |entry| {
+            var parsed = std.json.parseFromSlice(JobState, self.alloc, entry.value_ptr.*, .{ .ignore_unknown_fields = true }) catch continue;
+            defer parsed.deinit();
+            if (parsed.value.expires_at_millis == 0 or parsed.value.expires_at_millis > now_ms) continue;
+            expired.append(self.alloc, entry.key_ptr.*) catch continue;
+        }
+        var durable_results: []docstore_mod.OwnedKVPair = &.{};
+        var durable_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer durable_delete_keys.deinit(self.alloc);
+        if (self.opened_store) |opened| {
+            durable_results = opened.docstore.scanPrefix(self.alloc, job_key_prefix) catch &.{};
+            for (durable_results) |kv| {
+                var parsed = std.json.parseFromSlice(JobState, self.alloc, kv.value, .{ .ignore_unknown_fields = true }) catch continue;
+                defer parsed.deinit();
+                if (parsed.value.expires_at_millis == 0 or parsed.value.expires_at_millis > now_ms) continue;
+                expired.append(self.alloc, parsed.value.job_id) catch continue;
+                durable_delete_keys.append(self.alloc, kv.key) catch continue;
+            }
+        }
+        defer if (durable_results.len > 0) docstore_mod.DocStore.freeResults(self.alloc, durable_results);
+        if (durable_delete_keys.items.len > 0) {
+            if (self.opened_store) |opened| opened.docstore.putBatch(&.{}, durable_delete_keys.items) catch {};
+        }
+        for (expired.items) |job_id| {
+            if (self.jobs.fetchRemove(job_id)) |removed| self.alloc.free(removed.value);
+        }
+    }
+
+    const ReservedJobId = struct {
+        job_id: u64,
+        next_job_id: u64,
+    };
+
+    fn reserveJobId(self: *Store) ReservedJobId {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const job_id = self.next_job_id;
+        self.next_job_id += 1;
+        return .{
+            .job_id = job_id,
+            .next_job_id = self.next_job_id,
+        };
+    }
+
+    fn storeEncoded(self: *Store, job_id: u64, encoded: []const u8, next_job_id: ?u64) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        try self.storeEncodedLocked(job_id, encoded, next_job_id);
+    }
+
+    fn storeEncodedLocked(self: *Store, job_id: u64, encoded: []const u8, next_job_id: ?u64) !void {
+        const owned = try self.alloc.dupe(u8, encoded);
+        errdefer self.alloc.free(owned);
+        if (self.opened_store) |opened| {
+            const key = try jobKey(self.alloc, job_id);
+            defer self.alloc.free(key);
+            if (next_job_id) |next| {
+                const next_raw = try encodeNextJobId(self.alloc, next);
+                defer self.alloc.free(next_raw);
+                const writes = [_]docstore_mod.KVPair{
+                    .{ .key = key, .value = encoded },
+                    .{ .key = next_job_id_key, .value = next_raw },
+                };
+                try opened.docstore.putBatch(&writes, &.{});
+            } else {
+                try opened.docstore.put(key, encoded);
+            }
+        }
+        if (try self.jobs.fetchPut(self.alloc, job_id, owned)) |old| self.alloc.free(old.value);
+    }
+
+    fn loadJobLocked(self: *Store, job_id: u64) !?[]const u8 {
+        if (self.jobs.get(job_id)) |encoded| return encoded;
+        const opened = self.opened_store orelse return null;
+        const key = try jobKey(self.alloc, job_id);
+        defer self.alloc.free(key);
+        const body = opened.docstore.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        errdefer self.alloc.free(body);
+        try self.jobs.put(self.alloc, job_id, body);
+        return body;
+    }
+
+    fn recoverPersistedJobsLocked(self: *Store, opened: *OpenedStore) !void {
+        var recovered_max_job_id: u64 = 0;
+        const results = try opened.docstore.scanPrefix(self.alloc, job_key_prefix);
+        defer docstore_mod.DocStore.freeResults(self.alloc, results);
+        for (results) |kv| {
+            var parsed = std.json.parseFromSlice(JobState, self.alloc, kv.value, .{ .ignore_unknown_fields = true }) catch continue;
+            defer parsed.deinit();
+            const cached = try self.alloc.dupe(u8, kv.value);
+            errdefer self.alloc.free(cached);
+            if (try self.jobs.fetchPut(self.alloc, parsed.value.job_id, cached)) |old| self.alloc.free(old.value);
+            recovered_max_job_id = @max(recovered_max_job_id, parsed.value.job_id);
+        }
+        var recovered_next_job_id = recovered_max_job_id +| 1;
+        if (loadPersistedNextJobId(self.alloc, opened.docstore)) |persisted_next| {
+            recovered_next_job_id = @max(recovered_next_job_id, persisted_next);
+        } else |_| {}
+        self.next_job_id = @max(self.next_job_id, recovered_next_job_id);
+        try persistNextJobId(opened.docstore, self.alloc, self.next_job_id);
+    }
+};
+
+const running_lease_timeout_ms: u64 = 300_000;
+
+fn jobStateTransitionTokenMatches(current: JobState, expected: JobState) bool {
+    return current.job_id == expected.job_id and
+        std.mem.eql(u8, current.phase, expected.phase) and
+        current.last_updated_at_millis == expected.last_updated_at_millis;
+}
+
+pub fn encodeState(alloc: std.mem.Allocator, state: JobState) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, state, .{ .emit_null_optional_fields = false });
+}
+
+pub fn phaseString(phase: JobPhase) []const u8 {
+    return switch (phase) {
+        .queued => "queued",
+        .running => "running",
+        .succeeded => "succeeded",
+        .failed => "failed",
+        .cancelled => "cancelled",
+    };
+}
+
+pub fn isTerminalPhase(phase: []const u8) bool {
+    return std.mem.eql(u8, phase, phaseString(.succeeded)) or
+        std.mem.eql(u8, phase, phaseString(.failed)) or
+        std.mem.eql(u8, phase, phaseString(.cancelled));
+}
+
+pub fn repairStatusForPhase(phase: JobPhase, has_more: bool, debt_remaining: bool) []const u8 {
+    return switch (phase) {
+        .succeeded => "complete",
+        .failed => if (debt_remaining) "debt_remaining" else "stopped",
+        .cancelled => "stopped",
+        .queued, .running => if (has_more or debt_remaining) "in_progress" else "in_progress",
+    };
+}
+
+pub fn nowMillis() u64 {
+    return @divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms);
+}
+
+fn lockAtomic(mutex: *std.atomic.Mutex) void {
+    while (mutex.tryLock() == false) {
+        std.atomic.spinLoopHint();
+    }
+}
+
+fn jobKey(alloc: std.mem.Allocator, job_id: u64) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}{d}", .{ job_key_prefix, job_id });
+}
+
+fn encodeNextJobId(alloc: std.mem.Allocator, next_job_id: u64) ![]u8 {
+    const out = try alloc.alloc(u8, @sizeOf(u64));
+    std.mem.writeInt(u64, out[0..8], next_job_id, .big);
+    return out;
+}
+
+fn decodeNextJobId(raw: []const u8) !u64 {
+    if (raw.len != @sizeOf(u64)) return error.InvalidRepairJobMetadata;
+    return std.mem.readInt(u64, raw[0..8], .big);
+}
+
+fn loadPersistedNextJobId(alloc: std.mem.Allocator, store: *docstore_mod.DocStore) !u64 {
+    const raw = store.get(alloc, next_job_id_key) catch |err| switch (err) {
+        error.NotFound => return error.NotFound,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    return try decodeNextJobId(raw);
+}
+
+fn persistNextJobId(store: *docstore_mod.DocStore, alloc: std.mem.Allocator, next_job_id: u64) !void {
+    const raw = try encodeNextJobId(alloc, next_job_id);
+    defer alloc.free(raw);
+    try store.put(next_job_id_key, raw);
+}
+
+const job_key_prefix = "__api_table_repair_jobs__:";
+const next_job_id_key = "__api_table_repair_jobs_meta__:next_job_id";
+
+test "table repair job records bounded pass and continuation" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc, .{});
+    defer store.deinit();
+
+    const started = try store.startJob(alloc, "docs", .{ .target = "artifact", .limit = 2 });
+    defer alloc.free(started);
+    var parsed_start = try std.json.parseFromSlice(JobState, alloc, started, .{ .ignore_unknown_fields = true });
+    defer parsed_start.deinit();
+
+    const begin = try store.beginAdvance(alloc, parsed_start.value);
+    defer alloc.free(begin.encoded);
+    try std.testing.expect(begin.started);
+    var parsed_running = try std.json.parseFromSlice(JobState, alloc, begin.encoded, .{ .ignore_unknown_fields = true });
+    defer parsed_running.deinit();
+
+    var pass: db_mod.types.ArtifactRepairResult = .{
+        .scanned = 2,
+        .repaired = 2,
+        .limit = 2,
+        .has_more = true,
+        .debt_remaining = true,
+        .next_cursor = try alloc.dupe(u8, "cursor-1"),
+    };
+    defer pass.deinit(alloc);
+
+    const updated = try store.recordPass(alloc, parsed_running.value, pass);
+    defer alloc.free(updated);
+    var parsed_update = try std.json.parseFromSlice(JobState, alloc, updated, .{ .ignore_unknown_fields = true });
+    defer parsed_update.deinit();
+    try std.testing.expectEqualStrings("queued", parsed_update.value.phase);
+    try std.testing.expectEqualStrings("cursor-1", parsed_update.value.cursor.?);
+    try std.testing.expectEqual(@as(u64, 2), parsed_update.value.result.repaired);
+}

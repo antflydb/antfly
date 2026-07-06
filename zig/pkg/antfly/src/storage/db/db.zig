@@ -554,6 +554,7 @@ const AsyncContext = struct {
     applied_sequence_checkpoint_path: ?[]const u8 = null,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    repair_sequence: u64 = 0,
     allow_graph_materialization: bool = true,
     require_graph_resolution_contract: bool = false,
     query_visibility_hook: ?QueryVisibilityHook = null,
@@ -7456,6 +7457,7 @@ pub const DB = struct {
                 var snapshot_open = true;
                 defer if (snapshot_open) snapshot_txn.abort();
                 build_floor_sequence = try self.core.store.lastReplaySequenceFromTxn(&snapshot_txn, 0);
+                shadow_ctx.repair_sequence = build_floor_sequence;
                 shadow_ctx.snapshot_read_txn = &snapshot_txn;
                 defer shadow_ctx.snapshot_read_txn = null;
                 const count: u64 = switch (cfg.kind) {
@@ -27380,7 +27382,28 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
             }
             if (!std.mem.eql(u8, parsed.index_name, state.index_name)) return .@"continue";
 
-            var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(state.ctx.alloc, value);
+            var decoded = enrichment_artifact_codec.decodeGraphEdgeAlloc(state.ctx.alloc, value) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    const artifact_name = try std.fmt.allocPrint(state.ctx.alloc, "{s}:{s}", .{ parsed.edge_type, parsed.target_doc_key });
+                    defer state.ctx.alloc.free(artifact_name);
+                    try recordArtifactRepairIssueContext(
+                        state.ctx,
+                        .graph,
+                        parsed.index_name,
+                        parsed.doc_key,
+                        "",
+                        "",
+                        "",
+                        artifact_name,
+                        key,
+                        null,
+                        state.ctx.repair_sequence,
+                        .corrupt_artifact,
+                    );
+                    return .@"continue";
+                },
+            };
             errdefer decoded.deinit(state.ctx.alloc);
             try state.writes.append(state.ctx.alloc, .{
                 .index_name = try state.ctx.alloc.dupe(u8, parsed.index_name),
@@ -39099,6 +39122,52 @@ test "db index repair reports remaining artifact debt after rebuild" {
     defer types.freeDBStats(alloc, stats);
     try std.testing.expect(stats.repair_degraded);
     try std.testing.expectEqual(@as(u64, 1), stats.repair_issue_count);
+}
+
+test "db graph index repair records corrupt artifact debt during shadow rebuild" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+
+    const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
+    defer alloc.free(artifact_key);
+    try db.core.store.put(artifact_key, "bad-graph-artifact");
+
+    var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .artifact_kind = .graph,
+        .index_name = "relations_graph",
+        .limit = 1,
+        .force = true,
+    });
+    defer repair.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), repair.scanned);
+    try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
+    try std.testing.expectEqual(@as(u64, 0), repair.repaired);
+    try std.testing.expectEqual(@as(u64, 1), repair.unresolved);
+    try std.testing.expect(repair.debt_remaining);
+
+    const issues = try db.listArtifactRepairIssues(alloc, .graph, "relations_graph", 10);
+    defer types.freeArtifactRepairIssues(alloc, issues);
+    try std.testing.expectEqual(@as(usize, 1), issues.len);
+    try std.testing.expectEqual(.corrupt_artifact, issues[0].reason);
+    try std.testing.expectEqualStrings("doc:a", issues[0].doc_key);
+    try std.testing.expectEqualStrings("mentions:doc:b", issues[0].artifact_name);
+
+    const raw_artifact = try db.core.store.get(alloc, artifact_key);
+    defer alloc.free(raw_artifact);
+    try std.testing.expectEqualStrings("bad-graph-artifact", raw_artifact);
 }
 
 test "db repair issue list reports algebraic index debt as unsupported" {

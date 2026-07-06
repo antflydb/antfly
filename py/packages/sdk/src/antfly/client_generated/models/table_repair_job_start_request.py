@@ -1,0 +1,136 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any, TypeVar
+
+from attrs import define as _attrs_define
+from attrs import field as _attrs_field
+
+from ..models.artifact_repair_kind import ArtifactRepairKind
+from ..models.repair_target import RepairTarget
+from ..types import UNSET, Unset
+
+T = TypeVar("T", bound="TableRepairJobStartRequest")
+
+
+@_attrs_define
+class TableRepairJobStartRequest:
+    """Starts a durable table repair job. The job advances in bounded passes using the same repair request shape as
+    runTableRepair.
+
+        Attributes:
+            target (RepairTarget | Unset): Repair subsystem to inspect or run.
+            kind (ArtifactRepairKind | Unset): Kind of stored artifact tracked by the repair queue.
+            index (str | Unset): Restrict repair attempts to one index name.
+            cursor (str | Unset): Opaque cursor returned by a prior repair response.
+            force (bool | Unset): Force a named index rebuild even when no repair debt is currently recorded. Only applies
+                to target=index. Default: False.
+            limit (int | Unset): Maximum artifact repair records to attempt per pass. For target=index, any positive value
+                permits one named index repair. Default: 100.
+            advance (bool | Unset): When true, the server immediately attempts the first bounded repair pass before
+                returning the job. Default: True.
+    """
+
+    target: RepairTarget | Unset = UNSET
+    kind: ArtifactRepairKind | Unset = UNSET
+    index: str | Unset = UNSET
+    cursor: str | Unset = UNSET
+    force: bool | Unset = False
+    limit: int | Unset = 100
+    advance: bool | Unset = True
+    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        target: str | Unset = UNSET
+        if not isinstance(self.target, Unset):
+            target = self.target.value
+
+        kind: str | Unset = UNSET
+        if not isinstance(self.kind, Unset):
+            kind = self.kind.value
+
+        index = self.index
+
+        cursor = self.cursor
+
+        force = self.force
+
+        limit = self.limit
+
+        advance = self.advance
+
+        field_dict: dict[str, Any] = {}
+        field_dict.update(self.additional_properties)
+        field_dict.update({})
+        if target is not UNSET:
+            field_dict["target"] = target
+        if kind is not UNSET:
+            field_dict["kind"] = kind
+        if index is not UNSET:
+            field_dict["index"] = index
+        if cursor is not UNSET:
+            field_dict["cursor"] = cursor
+        if force is not UNSET:
+            field_dict["force"] = force
+        if limit is not UNSET:
+            field_dict["limit"] = limit
+        if advance is not UNSET:
+            field_dict["advance"] = advance
+
+        return field_dict
+
+    @classmethod
+    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        d = dict(src_dict)
+        _target = d.pop("target", UNSET)
+        target: RepairTarget | Unset
+        if isinstance(_target, Unset):
+            target = UNSET
+        else:
+            target = RepairTarget(_target)
+
+        _kind = d.pop("kind", UNSET)
+        kind: ArtifactRepairKind | Unset
+        if isinstance(_kind, Unset):
+            kind = UNSET
+        else:
+            kind = ArtifactRepairKind(_kind)
+
+        index = d.pop("index", UNSET)
+
+        cursor = d.pop("cursor", UNSET)
+
+        force = d.pop("force", UNSET)
+
+        limit = d.pop("limit", UNSET)
+
+        advance = d.pop("advance", UNSET)
+
+        table_repair_job_start_request = cls(
+            target=target,
+            kind=kind,
+            index=index,
+            cursor=cursor,
+            force=force,
+            limit=limit,
+            advance=advance,
+        )
+
+        table_repair_job_start_request.additional_properties = d
+        return table_repair_job_start_request
+
+    @property
+    def additional_keys(self) -> list[str]:
+        return list(self.additional_properties.keys())
+
+    def __getitem__(self, key: str) -> Any:
+        return self.additional_properties[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self.additional_properties[key] = value
+
+    def __delitem__(self, key: str) -> None:
+        del self.additional_properties[key]
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.additional_properties

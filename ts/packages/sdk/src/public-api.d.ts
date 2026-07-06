@@ -1101,6 +1101,101 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/repair/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a durable table repair job
+         * @description Creates a durable table repair job for large or long-running repair work.
+         *     The job stores progress and accumulated counters across bounded advance
+         *     calls. Use this endpoint instead of synchronous `runTableRepair` when
+         *     repairing large indexes or when clients need retryable progress.
+         */
+        post: operations["startTableRepairJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/repair/jobs/{jobId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Repair job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        /** Get a table repair job */
+        get: operations["getTableRepairJob"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/repair/jobs/{jobId}/advance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Repair job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Advance a table repair job
+         * @description Runs at most one bounded repair pass for the job. Concurrent advances use the job lease and return the current running state.
+         */
+        post: operations["advanceTableRepairJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/repair/jobs/{jobId}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Repair job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cancel a table repair job */
+        post: operations["cancelTableRepairJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess": {
         parameters: {
             query?: never;
@@ -2944,6 +3039,74 @@ export interface components {
              */
             limit: number;
             result: components["schemas"]["TableRepairRunResult"];
+        };
+        /** @description Starts a durable table repair job. The job advances in bounded passes using the same repair request shape as runTableRepair. */
+        TableRepairJobStartRequest: {
+            /** @default artifact */
+            target?: components["schemas"]["RepairTarget"];
+            kind?: components["schemas"]["ArtifactRepairKind"];
+            /** @description Restrict repair attempts to one index name. */
+            index?: string;
+            /** @description Opaque cursor returned by a prior repair response. */
+            cursor?: string;
+            /**
+             * @description Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
+             * @default false
+             */
+            force?: boolean;
+            /**
+             * Format: uint32
+             * @description Maximum artifact repair records to attempt per pass. For target=index, any positive value permits one named index repair.
+             * @default 100
+             */
+            limit?: number;
+            /**
+             * @description When true, the server immediately attempts the first bounded repair pass before returning the job.
+             * @default true
+             */
+            advance?: boolean;
+        };
+        /** @description Durable table repair job state. */
+        TableRepairJob: {
+            /**
+             * Format: uint64
+             * @description Server-assigned durable repair job identifier.
+             */
+            job_id: number;
+            /** @description Table being repaired. */
+            table_name: string;
+            /**
+             * @description Lifecycle phase of the repair job.
+             * @enum {string}
+             */
+            phase: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+            /**
+             * @description User-facing repair progress state. `debt_remaining` means the bounded job stopped because unsupported or failed debt still requires operator action.
+             * @enum {string}
+             */
+            repair_status: "in_progress" | "complete" | "debt_remaining" | "stopped";
+            target: components["schemas"]["RepairTarget"];
+            kind?: components["schemas"]["ArtifactRepairKind"];
+            /** @description Index name when the job is restricted to one index. */
+            index?: string;
+            /** @description Opaque continuation cursor for the next bounded repair pass. */
+            cursor?: string | null;
+            /**
+             * Format: uint32
+             * @description Effective per-pass repair limit.
+             */
+            limit: number;
+            /** @description Whether the job forces a named index rebuild. */
+            force: boolean;
+            result: components["schemas"]["TableRepairRunResult"];
+            /** @description Last stable job-level error code. */
+            last_error?: string | null;
+            /** Format: uint64 */
+            created_at_millis: number;
+            /** Format: uint64 */
+            last_updated_at_millis: number;
+            /** Format: uint64 */
+            expires_at_millis: number;
         };
         DocumentArtifactReprocessResponse: {
             /**
@@ -12605,6 +12768,140 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    startTableRepairJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["TableRepairJobStartRequest"];
+            };
+        };
+        responses: {
+            /** @description Job completed during the initial advance. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            /** @description Repair job accepted or advanced but not terminal. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    getTableRepairJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Repair job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Repair job state. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    advanceTableRepairJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Repair job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Repair job reached a terminal phase. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            /** @description Repair job remains queued or running. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    cancelTableRepairJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Repair job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Repair job cancelled or already terminal. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
             500: components["responses"]["InternalServerError"];
         };
     };

@@ -2294,6 +2294,100 @@ components:
           description: Effective repair limit.
         result:
           $ref: "#/components/schemas/TableRepairRunResult"
+    TableRepairJobStartRequest:
+      type: object
+      description: Starts a durable table repair job. The job advances in bounded passes using the same repair request shape as runTableRepair.
+      properties:
+        target:
+          $ref: "#/components/schemas/RepairTarget"
+          default: artifact
+        kind:
+          $ref: "#/components/schemas/ArtifactRepairKind"
+        index:
+          type: string
+          description: Restrict repair attempts to one index name.
+        cursor:
+          type: string
+          description: Opaque cursor returned by a prior repair response.
+        force:
+          type: boolean
+          default: false
+          description: Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
+        limit:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 1000
+          default: 100
+          description: Maximum artifact repair records to attempt per pass. For target=index, any positive value permits one named index repair.
+        advance:
+          type: boolean
+          default: true
+          description: When true, the server immediately attempts the first bounded repair pass before returning the job.
+    TableRepairJob:
+      type: object
+      description: Durable table repair job state.
+      required:
+        - job_id
+        - table_name
+        - phase
+        - repair_status
+        - target
+        - limit
+        - force
+        - result
+        - created_at_millis
+        - last_updated_at_millis
+        - expires_at_millis
+      properties:
+        job_id:
+          type: integer
+          format: uint64
+          description: Server-assigned durable repair job identifier.
+        table_name:
+          type: string
+          description: Table being repaired.
+        phase:
+          type: string
+          enum: [queued, running, succeeded, failed, cancelled]
+          description: Lifecycle phase of the repair job.
+        repair_status:
+          type: string
+          enum: [in_progress, complete, debt_remaining, stopped]
+          description: User-facing repair progress state. `debt_remaining` means the bounded job stopped because unsupported or failed debt still requires operator action.
+        target:
+          $ref: "#/components/schemas/RepairTarget"
+        kind:
+          $ref: "#/components/schemas/ArtifactRepairKind"
+        index:
+          type: string
+          description: Index name when the job is restricted to one index.
+        cursor:
+          type: string
+          nullable: true
+          description: Opaque continuation cursor for the next bounded repair pass.
+        limit:
+          type: integer
+          format: uint32
+          description: Effective per-pass repair limit.
+        force:
+          type: boolean
+          description: Whether the job forces a named index rebuild.
+        result:
+          $ref: "#/components/schemas/TableRepairRunResult"
+        last_error:
+          type: string
+          nullable: true
+          description: Last stable job-level error code.
+        created_at_millis:
+          type: integer
+          format: uint64
+        last_updated_at_millis:
+          type: integer
+          format: uint64
+        expires_at_millis:
+          type: integer
+          format: uint64
     DocumentArtifactReprocessResponse:
       type: object
       required:
@@ -8478,6 +8572,157 @@ paths:
           $ref: "#/components/responses/NotFound"
         "405":
           $ref: "#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/repair/jobs:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+    post:
+      summary: Start a durable table repair job
+      description: |
+        Creates a durable table repair job for large or long-running repair work.
+        The job stores progress and accumulated counters across bounded advance
+        calls. Use this endpoint instead of synchronous `runTableRepair` when
+        repairing large indexes or when clients need retryable progress.
+      tags:
+        - data_operations
+      operationId: startTableRepairJob
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TableRepairJobStartRequest"
+      responses:
+        "200":
+          description: Job completed during the initial advance.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TableRepairJob"
+        "202":
+          description: Repair job accepted or advanced but not terminal.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TableRepairJob"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/repair/jobs/{jobId}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: jobId
+        in: path
+        required: true
+        description: Repair job identifier.
+        schema:
+          type: string
+    get:
+      summary: Get a table repair job
+      tags:
+        - data_operations
+      operationId: getTableRepairJob
+      responses:
+        "200":
+          description: Repair job state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TableRepairJob"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/repair/jobs/{jobId}/advance:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: jobId
+        in: path
+        required: true
+        description: Repair job identifier.
+        schema:
+          type: string
+    post:
+      summary: Advance a table repair job
+      description: Runs at most one bounded repair pass for the job. Concurrent
+        advances use the job lease and return the current running state.
+      tags:
+        - data_operations
+      operationId: advanceTableRepairJob
+      responses:
+        "200":
+          description: Repair job reached a terminal phase.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TableRepairJob"
+        "202":
+          description: Repair job remains queued or running.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TableRepairJob"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/repair/jobs/{jobId}/cancel:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: jobId
+        in: path
+        required: true
+        description: Repair job identifier.
+        schema:
+          type: string
+    post:
+      summary: Cancel a table repair job
+      tags:
+        - data_operations
+      operationId: cancelTableRepairJob
+      responses:
+        "200":
+          description: Repair job cancelled or already terminal.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TableRepairJob"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /tables/{tableName}/artifacts/{artifactName}/reprocess:

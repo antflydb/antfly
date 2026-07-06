@@ -322,6 +322,41 @@ pub fn parseRunTableRepairBody(allocator: std.mem.Allocator, body: []const u8) !
     return std.json.parseFromSlice(types.RepairRunRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Start a durable table repair job
+pub const StartTableRepairJobPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for startTableRepairJob.
+pub fn parseStartTableRepairJobBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TableRepairJobStartRequest) {
+    return std.json.parseFromSlice(types.TableRepairJobStartRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Get a table repair job
+pub const GetTableRepairJobPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Repair job identifier.
+    job_id: []const u8,
+};
+
+/// Advance a table repair job
+pub const AdvanceTableRepairJobPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Repair job identifier.
+    job_id: []const u8,
+};
+
+/// Cancel a table repair job
+pub const CancelTableRepairJobPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Repair job identifier.
+    job_id: []const u8,
+};
+
 /// Reprocess a derived document artifact across a table range
 pub const ReprocessDocumentArtifactRangePathParams = struct {
     /// Name of the table
@@ -697,6 +732,10 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/tables/{tableName}/artifacts", .operation_id = "listArtifactEnrichments" },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/issues", .operation_id = "listTableRepairIssues" },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/run", .operation_id = "runTableRepair" },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs", .operation_id = "startTableRepairJob" },
+    .{ .method = "GET", .path = "/tables/{tableName}/repair/jobs/{jobId}", .operation_id = "getTableRepairJob" },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs/{jobId}/advance", .operation_id = "advanceTableRepairJob" },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs/{jobId}/cancel", .operation_id = "cancelTableRepairJob" },
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifactRange" },
     .{ .method = "PUT", .path = "/tables/{tableName}/artifacts/{artifactName}/enrichment", .operation_id = "putArtifactEnrichment" },
     .{ .method = "DELETE", .path = "/tables/{tableName}/artifacts/{artifactName}/enrichment", .operation_id = "deleteArtifactEnrichment" },
@@ -781,6 +820,10 @@ pub const routes = [_]Route{
 //   fn listArtifactEnrichments(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn listTableRepairIssues(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn runTableRepair(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn startTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn getTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
+//   fn advanceTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
+//   fn cancelTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn reprocessDocumentArtifactRange(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn putArtifactEnrichment(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn deleteArtifactEnrichment(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response

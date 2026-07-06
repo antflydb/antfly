@@ -1968,6 +1968,22 @@ pub const RepairRunRequest = struct {
     limit: ?i64 = null,
 };
 
+/// Starts a durable table repair job. The job advances in bounded passes using the same repair request shape as runTableRepair.
+pub const TableRepairJobStartRequest = struct {
+    target: ?RepairTarget = null,
+    kind: ?ArtifactRepairKind = null,
+    /// Restrict repair attempts to one index name.
+    index: ?[]const u8 = null,
+    /// Opaque cursor returned by a prior repair response.
+    cursor: ?[]const u8 = null,
+    /// Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
+    force: ?bool = null,
+    /// Maximum artifact repair records to attempt per pass. For target=index, any positive value permits one named index repair.
+    limit: ?i64 = null,
+    /// When true, the server immediately attempts the first bounded repair pass before returning the job.
+    advance: ?bool = null,
+};
+
 /// Response for a bounded table repair pass.
 pub const TableRepairRunResponse = struct {
     /// Table whose repair queue was processed.
@@ -1976,6 +1992,34 @@ pub const TableRepairRunResponse = struct {
     /// Effective repair limit.
     limit: i64,
     result: TableRepairRunResult,
+};
+
+/// Durable table repair job state.
+pub const TableRepairJob = struct {
+    /// Server-assigned durable repair job identifier.
+    job_id: i64,
+    /// Table being repaired.
+    table_name: []const u8,
+    /// Lifecycle phase of the repair job.
+    phase: []const u8,
+    /// User-facing repair progress state. `debt_remaining` means the bounded job stopped because unsupported or failed debt still requires operator action.
+    repair_status: []const u8,
+    target: RepairTarget,
+    kind: ?ArtifactRepairKind = null,
+    /// Index name when the job is restricted to one index.
+    index: ?[]const u8 = null,
+    /// Opaque continuation cursor for the next bounded repair pass.
+    cursor: ?[]const u8 = null,
+    /// Effective per-pass repair limit.
+    limit: i64,
+    /// Whether the job forces a named index rebuild.
+    force: bool,
+    result: TableRepairRunResult,
+    /// Last stable job-level error code.
+    last_error: ?[]const u8 = null,
+    created_at_millis: i64,
+    last_updated_at_millis: i64,
+    expires_at_millis: i64,
 };
 
 /// Bounded request for reprocessing a derived artifact across source rows in key order.

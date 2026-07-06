@@ -529,6 +529,10 @@ from .table_migration import TableMigration
 from .table_migration_state import TableMigrationState
 from .table_repair_issue import TableRepairIssue
 from .table_repair_issue_list import TableRepairIssueList
+from .table_repair_job import TableRepairJob
+from .table_repair_job_phase import TableRepairJobPhase
+from .table_repair_job_repair_status import TableRepairJobRepairStatus
+from .table_repair_job_start_request import TableRepairJobStartRequest
 from .table_repair_run_response import TableRepairRunResponse
 from .table_repair_run_result import TableRepairRunResult
 from .table_restore_status import TableRestoreStatus
@@ -1124,6 +1128,10 @@ __all__ = (
     "TableMigrationState",
     "TableRepairIssue",
     "TableRepairIssueList",
+    "TableRepairJob",
+    "TableRepairJobPhase",
+    "TableRepairJobRepairStatus",
+    "TableRepairJobStartRequest",
     "TableRepairRunResponse",
     "TableRepairRunResult",
     "TableRestoreStatus",
