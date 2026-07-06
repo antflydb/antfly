@@ -1086,12 +1086,13 @@ export interface paths {
          * @description Synchronously attempts to repair queued table issues. `target=artifact` reprocesses
          *     supported artifact kinds and replays derived state; it is bounded by
          *     `limit` and returns an opaque continuation cursor when another artifact
-         *     repair page is available. `target=index` repairs one named index after
-         *     resetting its derived index storage; healthy indexes are skipped unless
-         *     `force=true` is supplied, and any positive `limit` permits that single
-         *     named index repair. The response reports unresolved debt separately, and
-         *     the endpoint requires table admin permission when authentication is
-         *     enabled.
+         *     repair page is available. `target=index` repairs one named index by
+         *     building a shadow replacement, catching it up to the current derived
+         *     replay sequence, and atomically swapping it into service; healthy
+         *     indexes are skipped unless `force=true` is supplied, and any positive
+         *     `limit` permits that single named index repair. The response reports
+         *     unresolved debt separately, and the endpoint requires table admin
+         *     permission when authentication is enabled.
          */
         post: operations["runTableRepair"];
         delete?: never;
