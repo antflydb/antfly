@@ -17745,9 +17745,13 @@ fn documentExtractionStateUnitDescriptorsAlloc(alloc: Allocator, state: []const 
         const key_value = item.object.get("key") orelse return error.InvalidDocumentExtractionState;
         const fingerprint_value = item.object.get("fingerprint") orelse return error.InvalidDocumentExtractionState;
         if (fingerprint_value != .string) return error.InvalidDocumentExtractionState;
+        const key = try documentExtractionStateByteSliceAlloc(alloc, key_value);
+        errdefer alloc.free(@constCast(key));
+        const fingerprint = try alloc.dupe(u8, fingerprint_value.string);
+        errdefer alloc.free(fingerprint);
         out[i] = .{
-            .key = try documentExtractionStateByteSliceAlloc(alloc, key_value),
-            .fingerprint = try alloc.dupe(u8, fingerprint_value.string),
+            .key = key,
+            .fingerprint = fingerprint,
         };
         initialized += 1;
     }
@@ -36287,6 +36291,20 @@ test "db async document extraction deletes artifacts with corrupt previous extra
         .content_type = "application/json",
         .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
     });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 16,
+        .chunk_overlap = 0,
+        .full_text_index = true,
+    });
+    try db.addIndex(.{
+        .name = "ft_document_chunks",
+        .kind = .full_text,
+        .config_json = "{\"chunk_name\":\"document_chunks_v1\"}",
+    });
 
     try db.batch(.{
         .writes = &.{.{
@@ -36301,11 +36319,22 @@ test "db async document extraction deletes artifacts with corrupt previous extra
     defer alloc.free(manifest_key);
     const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:async-delete", "document_units_v1", "document:000001");
     defer alloc.free(unit_key);
+    const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:async-delete", "document_chunks_v1", "document:000001", 0);
+    defer alloc.free(chunk_key);
     const state_key = try assetStateKeyAlloc(alloc, "doc:async-delete", "document_units_v1");
     defer alloc.free(state_key);
 
     const initial_unit_payload = try db.core.store.get(alloc, unit_key);
     alloc.free(initial_unit_payload);
+    const initial_chunk_payload = try db.core.store.get(alloc, chunk_key);
+    alloc.free(initial_chunk_payload);
+    var before_delete = try db.search(alloc, .{
+        .index_name = "ft_document_chunks",
+        .full_text = .{ .match = .{ .field = "text", .text = "alpha" } },
+        .return_mode = .chunk,
+    });
+    defer before_delete.deinit();
+    try std.testing.expect(before_delete.total_hits > 0);
     try db.core.store.put(state_key, "{");
 
     try db.batch(.{
@@ -36319,7 +36348,15 @@ test "db async document extraction deletes artifacts with corrupt previous extra
 
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, manifest_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, unit_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, chunk_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, state_key));
+    var after_delete = try db.search(alloc, .{
+        .index_name = "ft_document_chunks",
+        .full_text = .{ .match = .{ .field = "text", .text = "alpha" } },
+        .return_mode = .chunk,
+    });
+    defer after_delete.deinit();
+    try std.testing.expectEqual(@as(u32, 0), after_delete.total_hits);
 }
 
 test "db document extraction routes mixed files using source metadata fields" {

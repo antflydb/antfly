@@ -2311,6 +2311,7 @@ fn deleteDocumentExtractionForRuntime(
     try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, manifest_key));
     try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, state_key));
     try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, manifest_key);
+    try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, manifest_key);
 
     const existing_state = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
@@ -2323,10 +2324,12 @@ fn deleteDocumentExtractionForRuntime(
         for (previous_state.unit_keys) |previous_key| {
             try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
+            try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, previous_key);
         }
         for (previous_state.chunk_keys) |previous_key| {
             try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
+            try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, previous_key);
         }
     }
 
@@ -5846,9 +5849,13 @@ fn documentExtractionStateUnitDescriptorsAlloc(alloc: Allocator, state: []const 
         const key_value = item.object.get("key") orelse return error.InvalidDocumentExtractionState;
         const fingerprint_value = item.object.get("fingerprint") orelse return error.InvalidDocumentExtractionState;
         if (fingerprint_value != .string) return error.InvalidDocumentExtractionState;
+        const key = try documentExtractionStateByteSliceAlloc(alloc, key_value);
+        errdefer alloc.free(@constCast(key));
+        const fingerprint = try alloc.dupe(u8, fingerprint_value.string);
+        errdefer alloc.free(fingerprint);
         out[i] = .{
-            .key = try documentExtractionStateByteSliceAlloc(alloc, key_value),
-            .fingerprint = try alloc.dupe(u8, fingerprint_value.string),
+            .key = key,
+            .fingerprint = fingerprint,
         };
         initialized += 1;
     }
