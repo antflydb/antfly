@@ -550,6 +550,7 @@ const AsyncContext = struct {
     alloc: Allocator,
     io: ?std.Io = null,
     store: *docstore_mod.DocStore,
+    snapshot_read_txn: ?*docstore_mod.DocStore.Txn = null,
     applied_sequence_checkpoint_path: ?[]const u8 = null,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
@@ -7321,7 +7322,12 @@ pub const DB = struct {
             return result;
         }
 
-        if (cfg.kind == .algebraic) return result;
+        if (cfg.kind == .algebraic) {
+            result.unsupported += 1;
+            result.unresolved += 1;
+            result.debt_remaining = true;
+            return result;
+        }
         const rebuilt = try self.rebuildIndexWithShadowReplacement(alloc, cfg);
         result.reprocessed += rebuilt.reprocessed;
         result.repaired += 1;
@@ -7380,22 +7386,44 @@ pub const DB = struct {
         defer shadow_ctx.deinit(alloc);
 
         var build_apply_locked = false;
-        lockApply(self);
-        build_apply_locked = true;
-        errdefer if (build_apply_locked) self.core.unlockApply();
-        const build_floor_sequence = self.core.nextDerivedSequence();
-
+        var build_floor_sequence: u64 = 0;
         const rebuilt: u64 = switch (cfg.kind) {
-            .dense_vector => @intCast(try rebuildDenseIndexForTargetCoverageContext(&shadow_ctx, cfg.name, 2048)),
-            .sparse_vector => @intCast(try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(&shadow_ctx, cfg.name, 2048)),
-            .graph => @intCast(try applySplitGraphArtifactsForIndexStreaming(
-                alloc,
-                self.core.store,
-                &shadow_manager,
-                cfg.name,
-                graph_repair_rebuild_batch_size,
-            )),
-            .full_text => try shadow_manager.resetFullTextIndexForArtifactRebuild(self.core.store, cfg.name),
+            .dense_vector, .sparse_vector => rebuilt_blk: {
+                var snapshot_txn = try self.core.store.beginReadTxn();
+                var snapshot_open = true;
+                defer if (snapshot_open) snapshot_txn.abort();
+                build_floor_sequence = try self.core.store.lastReplaySequenceFromTxn(&snapshot_txn, 0);
+                shadow_ctx.snapshot_read_txn = &snapshot_txn;
+                defer shadow_ctx.snapshot_read_txn = null;
+                const count: u64 = switch (cfg.kind) {
+                    .dense_vector => @intCast(try rebuildDenseIndexForTargetCoverageContext(&shadow_ctx, cfg.name, 2048)),
+                    .sparse_vector => @intCast(try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(&shadow_ctx, cfg.name, 2048)),
+                    else => unreachable,
+                };
+                snapshot_txn.abort();
+                snapshot_open = false;
+                break :rebuilt_blk count;
+            },
+            .graph, .full_text => rebuilt_blk: {
+                lockApply(self);
+                build_apply_locked = true;
+                errdefer if (build_apply_locked) self.core.unlockApply();
+                build_floor_sequence = self.core.nextDerivedSequence();
+                const count: u64 = switch (cfg.kind) {
+                    .graph => @intCast(try applySplitGraphArtifactsForIndexStreaming(
+                        alloc,
+                        self.core.store,
+                        &shadow_manager,
+                        cfg.name,
+                        graph_repair_rebuild_batch_size,
+                    )),
+                    .full_text => try shadow_manager.resetFullTextIndexForArtifactRebuild(self.core.store, cfg.name),
+                    else => unreachable,
+                };
+                self.core.unlockApply();
+                build_apply_locked = false;
+                break :rebuilt_blk count;
+            },
             .algebraic => return error.UnsupportedOperation,
         };
 
@@ -7404,8 +7432,6 @@ pub const DB = struct {
             .kind = cfg.kind,
         };
         try self.saveShadowReplacementAppliedSequence(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, build_floor_sequence);
-        self.core.unlockApply();
-        build_apply_locked = false;
         try self.catchUpShadowReplacementUntil(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, self.core.nextDerivedSequence());
 
         const use_dense_search_barrier = cfg.kind == .dense_vector;
@@ -10323,6 +10349,8 @@ pub const DB = struct {
         for (writes.items) |write| {
             alloc.free(write.doc_key);
             if (write.artifact_key) |artifact_key| alloc.free(artifact_key);
+            if (write.indices.len > 0) alloc.free(write.indices);
+            if (write.values.len > 0) alloc.free(write.values);
         }
         writes.clearRetainingCapacity();
     }
@@ -27718,8 +27746,22 @@ fn denseArtifactTargetCountForIndexContext(ctx: *AsyncContext, index_name: []con
         .expected_name = expected_name,
         .expected_dims = expected_dims,
     };
-    try ctx.store.scanWithContext(lower, "", .{}, &state, ScanState.scanEntry);
+    try scanStoreForRebuildContext(ctx, lower, "", .{}, &state, ScanState.scanEntry);
     return state.count;
+}
+
+fn scanStoreForRebuildContext(
+    ctx: *AsyncContext,
+    lower: []const u8,
+    upper: []const u8,
+    options: docstore_mod.DocStore.ScanOptions,
+    scan_ctx: ?*anyopaque,
+    callback: docstore_mod.DocStore.ScanWithContextCallback,
+) !void {
+    if (ctx.snapshot_read_txn) |txn| {
+        return try ctx.store.scanReadTxnWithContext(txn, lower, upper, options, scan_ctx, callback);
+    }
+    return try ctx.store.scanWithContext(lower, upper, options, scan_ctx, callback);
 }
 
 fn densePrimaryVectorTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !u64 {
@@ -27752,7 +27794,7 @@ fn densePrimaryVectorTargetCountForIndexContext(ctx: *AsyncContext, index_name: 
         .field_name = field_name,
         .dims = dims,
     };
-    try ctx.store.scanWithContext(lower, "", .{}, &state, ScanState.scanEntry);
+    try scanStoreForRebuildContext(ctx, lower, "", .{}, &state, ScanState.scanEntry);
     return state.count;
 }
 
@@ -27845,7 +27887,7 @@ fn rebuildDenseIndexFromPrimaryVectorsContext(
     };
     defer state.deinit();
 
-    try ctx.store.scanWithContext(lower, "", .{}, &state, ScanState.scanEntry);
+    try scanStoreForRebuildContext(ctx, lower, "", .{}, &state, ScanState.scanEntry);
     if (state.writes.items.len > 0) try state.flush();
 
     try ctx.index_manager.finishDenseBulkIngestSessionByNameWithOptions(index_name, denseCatchUpFinishOptions());
@@ -27913,17 +27955,28 @@ fn rebuildDenseIndexFromStoredEmbeddingArtifactsContext(
             defer identity.deinit(state.ctx.alloc);
             if (!std.mem.eql(u8, identity.embedding_name, state.expected_name)) return .@"continue";
 
-            const dims = enrichment_artifact_codec.decodeDenseEmbeddingDims(value) catch |err| {
+            const vector = enrichment_artifact_codec.decodeDenseEmbeddingAlloc(state.ctx.alloc, value) catch |err| {
                 if (DB.isRecoverableEmbeddingArtifactError(err)) return .@"continue";
                 return err;
             };
-            if (dims != state.expected_dims) return .@"continue";
+            errdefer state.ctx.alloc.free(vector);
+            if (vector.len != state.expected_dims) {
+                state.ctx.alloc.free(vector);
+                return .@"continue";
+            }
+            const owned_index_name = try state.ctx.alloc.dupe(u8, state.index_name);
+            errdefer state.ctx.alloc.free(owned_index_name);
+            const doc_key = try state.ctx.alloc.dupe(u8, identity.doc_key);
+            errdefer state.ctx.alloc.free(doc_key);
+            const parent_doc_key = if (identity.parent_doc_key) |parent| try state.ctx.alloc.dupe(u8, parent) else null;
+            errdefer if (parent_doc_key) |parent| state.ctx.alloc.free(parent);
 
             try state.writes.append(state.ctx.alloc, .{
-                .index_name = try state.ctx.alloc.dupe(u8, state.index_name),
-                .doc_key = try state.ctx.alloc.dupe(u8, identity.doc_key),
-                .artifact_key = try state.ctx.alloc.dupe(u8, key),
-                .vector = &.{},
+                .index_name = owned_index_name,
+                .doc_key = doc_key,
+                .parent_doc_key = parent_doc_key,
+                .artifact_key = null,
+                .vector = vector,
             });
             state.rebuilt += 1;
 
@@ -27941,7 +27994,7 @@ fn rebuildDenseIndexFromStoredEmbeddingArtifactsContext(
     };
     defer state.deinit();
 
-    try ctx.store.scanWithContext(lower, "", .{}, &state, ScanState.scanEntry);
+    try scanStoreForRebuildContext(ctx, lower, "", .{}, &state, ScanState.scanEntry);
     if (state.writes.items.len > 0) try state.flush();
 
     try ctx.index_manager.finishDenseBulkIngestSessionByNameWithOptions(index_name, denseCatchUpFinishOptions());
@@ -28015,14 +28068,22 @@ fn rebuildSparseIndexFromStoredEmbeddingArtifactsContext(
                 if (DB.isRecoverableEmbeddingArtifactError(err)) return .@"continue";
                 return err;
             };
-            sparse.deinit(state.ctx.alloc);
+            errdefer sparse.deinit(state.ctx.alloc);
+            const doc_key = try state.ctx.alloc.dupe(u8, identity.doc_key);
+            errdefer state.ctx.alloc.free(doc_key);
+            const indices = sparse.indices;
+            sparse.indices = &.{};
+            errdefer state.ctx.alloc.free(indices);
+            const values = sparse.values;
+            sparse.values = &.{};
+            errdefer state.ctx.alloc.free(values);
 
             try state.writes.append(state.ctx.alloc, .{
                 .index_name = @constCast(state.index_name),
-                .doc_key = try state.ctx.alloc.dupe(u8, identity.doc_key),
-                .artifact_key = try state.ctx.alloc.dupe(u8, key),
-                .indices = &.{},
-                .values = &.{},
+                .doc_key = doc_key,
+                .artifact_key = null,
+                .indices = indices,
+                .values = values,
             });
             state.rebuilt += 1;
 
@@ -28039,7 +28100,7 @@ fn rebuildSparseIndexFromStoredEmbeddingArtifactsContext(
     };
     defer state.deinit();
 
-    try ctx.store.scanWithContext(lower, "", .{}, &state, ScanState.scanEntry);
+    try scanStoreForRebuildContext(ctx, lower, "", .{}, &state, ScanState.scanEntry);
     if (state.writes.items.len > 0) try state.flush();
     return state.rebuilt;
 }

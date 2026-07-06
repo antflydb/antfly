@@ -6,9 +6,9 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.artifact_repair_run_response import ArtifactRepairRunResponse
 from ...models.error import Error
 from ...models.repair_run_request import RepairRunRequest
+from ...models.table_repair_run_response import TableRepairRunResponse
 from ...types import UNSET, Response, Unset
 
 
@@ -37,9 +37,9 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> ArtifactRepairRunResponse | Error | None:
+) -> Error | TableRepairRunResponse | None:
     if response.status_code == 200:
-        response_200 = ArtifactRepairRunResponse.from_dict(response.json())
+        response_200 = TableRepairRunResponse.from_dict(response.json())
 
         return response_200
 
@@ -71,7 +71,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[ArtifactRepairRunResponse | Error]:
+) -> Response[Error | TableRepairRunResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -85,7 +85,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: RepairRunRequest | Unset = UNSET,
-) -> Response[ArtifactRepairRunResponse | Error]:
+) -> Response[Error | TableRepairRunResponse]:
     """Run a bounded table repair pass
 
      Synchronously attempts to repair queued table issues. `target=artifact` reprocesses
@@ -107,7 +107,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ArtifactRepairRunResponse | Error]
+        Response[Error | TableRepairRunResponse]
     """
 
     kwargs = _get_kwargs(
@@ -127,7 +127,7 @@ def sync(
     *,
     client: AuthenticatedClient,
     body: RepairRunRequest | Unset = UNSET,
-) -> ArtifactRepairRunResponse | Error | None:
+) -> Error | TableRepairRunResponse | None:
     """Run a bounded table repair pass
 
      Synchronously attempts to repair queued table issues. `target=artifact` reprocesses
@@ -149,7 +149,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ArtifactRepairRunResponse | Error
+        Error | TableRepairRunResponse
     """
 
     return sync_detailed(
@@ -164,7 +164,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: RepairRunRequest | Unset = UNSET,
-) -> Response[ArtifactRepairRunResponse | Error]:
+) -> Response[Error | TableRepairRunResponse]:
     """Run a bounded table repair pass
 
      Synchronously attempts to repair queued table issues. `target=artifact` reprocesses
@@ -186,7 +186,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ArtifactRepairRunResponse | Error]
+        Response[Error | TableRepairRunResponse]
     """
 
     kwargs = _get_kwargs(
@@ -204,7 +204,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: RepairRunRequest | Unset = UNSET,
-) -> ArtifactRepairRunResponse | Error | None:
+) -> Error | TableRepairRunResponse | None:
     """Run a bounded table repair pass
 
      Synchronously attempts to repair queued table issues. `target=artifact` reprocesses
@@ -226,7 +226,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ArtifactRepairRunResponse | Error
+        Error | TableRepairRunResponse
     """
 
     return (

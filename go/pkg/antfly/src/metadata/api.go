@@ -1592,7 +1592,7 @@ func (t *TableApi) UpdateSchema(w http.ResponseWriter, r *http.Request, tableNam
 	}
 }
 
-func (t *TableApi) ListArtifactRepairIssues(w http.ResponseWriter, r *http.Request, tableName string) {
+func (t *TableApi) ListTableRepairIssues(w http.ResponseWriter, r *http.Request, tableName string) {
 	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, tableName, usermgr.PermissionTypeAdmin) {
 		return
 	}

@@ -1054,7 +1054,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * List artifact repair issues
+         * List table repair issues
          * @description Lists durable repair debt for a table. This operator-facing endpoint
          *     returns exact document keys, artifact keys, index names, and repair
          *     errors, and therefore requires table admin permission when authentication
@@ -1062,7 +1062,7 @@ export interface paths {
          *     supports `target=artifact` for durable artifact queue entries and
          *     `target=index` for index repair candidates.
          */
-        post: operations["listArtifactRepairIssues"];
+        post: operations["listTableRepairIssues"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2748,8 +2748,8 @@ export interface components {
          * @enum {string}
          */
         RepairTarget: "artifact" | "index";
-        /** @description Durable repair debt for a derived artifact. This is an operator-facing record and includes exact source and artifact identifiers. */
-        ArtifactRepairIssue: {
+        /** @description Durable table repair debt. Artifact targets include exact source and artifact identifiers; index targets include the affected index and repair status. */
+        TableRepairIssue: {
             artifact_kind: components["schemas"]["ArtifactRepairKind"];
             /** @description Index whose replay or derived state observed the artifact problem. */
             index_name: string;
@@ -2799,7 +2799,7 @@ export interface components {
             last_error?: string;
         };
         /** @description Bounded page of table repair issues. */
-        ArtifactRepairIssueList: {
+        TableRepairIssueList: {
             /** @description Table whose repair queue was listed. */
             table: string;
             target: components["schemas"]["RepairTarget"];
@@ -2822,7 +2822,7 @@ export interface components {
             has_more: boolean;
             /** @description Opaque cursor for the next page when has_more is true. */
             next_cursor?: string | null;
-            issues: components["schemas"]["ArtifactRepairIssue"][];
+            issues: components["schemas"]["TableRepairIssue"][];
         };
         /** @description Bounded request to list table repair issues. */
         RepairIssueListRequest: {
@@ -2863,8 +2863,8 @@ export interface components {
              */
             limit?: number;
         };
-        /** @description Result of one bounded artifact repair pass. */
-        ArtifactRepairRunResult: {
+        /** @description Result of one bounded table repair pass. */
+        TableRepairRunResult: {
             /**
              * Format: uint64
              * @description Number of repair records attempted by this pass.
@@ -2897,7 +2897,7 @@ export interface components {
             failed: number;
             /**
              * Format: uint64
-             * @description Number of repair records skipped because no reprocessor exists for the artifact kind.
+             * @description Number of repair records skipped because no automated repair exists for the selected target.
              */
             unsupported: number;
             /**
@@ -2922,13 +2922,13 @@ export interface components {
             limit: number;
             /** @description Opaque cursor for the next artifact repair pass when has_more is true. Index repair currently repairs one named index per request and does not return a continuation cursor. */
             next_cursor?: string | null;
-            /** @description Whether another artifact scan page is available via next_cursor. */
+            /** @description Whether another repair scan page is available via next_cursor. */
             has_more: boolean;
             /** @description Whether repair debt remains after this bounded pass. If true and next_cursor is absent, rerun repair from the beginning after addressing failed or unsupported records. */
             debt_remaining: boolean;
         };
         /** @description Response for a bounded table repair pass. */
-        ArtifactRepairRunResponse: {
+        TableRepairRunResponse: {
             /** @description Table whose repair queue was processed. */
             table: string;
             target: components["schemas"]["RepairTarget"];
@@ -2937,7 +2937,7 @@ export interface components {
              * @description Effective repair limit.
              */
             limit: number;
-            result: components["schemas"]["ArtifactRepairRunResult"];
+            result: components["schemas"]["TableRepairRunResult"];
         };
         DocumentArtifactReprocessResponse: {
             /**
@@ -12540,7 +12540,7 @@ export interface operations {
             500: components["responses"]["InternalServerError"];
         };
     };
-    listArtifactRepairIssues: {
+    listTableRepairIssues: {
         parameters: {
             query?: never;
             header?: never;
@@ -12556,13 +12556,13 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Artifact repair issue page */
+            /** @description Table repair issue page */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ArtifactRepairIssueList"];
+                    "application/json": components["schemas"]["TableRepairIssueList"];
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -12593,7 +12593,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ArtifactRepairRunResponse"];
+                    "application/json": components["schemas"]["TableRepairRunResponse"];
                 };
             };
             400: components["responses"]["BadRequest"];

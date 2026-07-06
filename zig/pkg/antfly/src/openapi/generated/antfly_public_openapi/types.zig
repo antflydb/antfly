@@ -453,8 +453,8 @@ pub const RepairTarget = enum {
     }
 };
 
-/// Result of one bounded artifact repair pass.
-pub const ArtifactRepairRunResult = struct {
+/// Result of one bounded table repair pass.
+pub const TableRepairRunResult = struct {
     /// Number of repair records attempted by this pass.
     scanned: i64,
     /// Number of table groups touched by this bounded repair pass.
@@ -467,7 +467,7 @@ pub const ArtifactRepairRunResult = struct {
     missing_source_docs: i64,
     /// Number of supported repair attempts that failed.
     failed: i64,
-    /// Number of repair records skipped because no reprocessor exists for the artifact kind.
+    /// Number of repair records skipped because no automated repair exists for the selected target.
     unsupported: i64,
     /// Number of attempted repair records that remained queued after this pass.
     unresolved: i64,
@@ -479,7 +479,7 @@ pub const ArtifactRepairRunResult = struct {
     limit: i64,
     /// Opaque cursor for the next artifact repair pass when has_more is true. Index repair currently repairs one named index per request and does not return a continuation cursor.
     next_cursor: ?[]const u8 = null,
-    /// Whether another artifact scan page is available via next_cursor.
+    /// Whether another repair scan page is available via next_cursor.
     has_more: bool,
     /// Whether repair debt remains after this bounded pass. If true and next_cursor is absent, rerun repair from the beginning after addressing failed or unsupported records.
     debt_remaining: bool,
@@ -1995,8 +1995,8 @@ pub const DocumentArtifactManifest = struct {
     state_json: ?[]const u8 = null,
 };
 
-/// Durable repair debt for a derived artifact. This is an operator-facing record and includes exact source and artifact identifiers.
-pub const ArtifactRepairIssue = struct {
+/// Durable table repair debt. Artifact targets include exact source and artifact identifiers; index targets include the affected index and repair status.
+pub const TableRepairIssue = struct {
     artifact_kind: ArtifactRepairKind,
     /// Index whose replay or derived state observed the artifact problem.
     index_name: []const u8,
@@ -2059,13 +2059,13 @@ pub const RepairRunRequest = struct {
 };
 
 /// Response for a bounded table repair pass.
-pub const ArtifactRepairRunResponse = struct {
+pub const TableRepairRunResponse = struct {
     /// Table whose repair queue was processed.
     table: []const u8,
     target: RepairTarget,
     /// Effective repair limit.
     limit: i64,
-    result: ArtifactRepairRunResult,
+    result: TableRepairRunResult,
 };
 
 /// Bounded request for reprocessing a derived artifact across source rows in key order.
@@ -2583,7 +2583,7 @@ pub const DocumentArtifactManifestList = struct {
 };
 
 /// Bounded page of table repair issues.
-pub const ArtifactRepairIssueList = struct {
+pub const TableRepairIssueList = struct {
     /// Table whose repair queue was listed.
     table: []const u8,
     target: RepairTarget,
@@ -2597,7 +2597,7 @@ pub const ArtifactRepairIssueList = struct {
     has_more: bool,
     /// Opaque cursor for the next page when has_more is true.
     next_cursor: ?[]const u8 = null,
-    issues: []const ArtifactRepairIssue,
+    issues: []const TableRepairIssue,
 };
 
 pub const ClusterTopology = struct {

@@ -8,12 +8,12 @@ from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-T = TypeVar("T", bound="ArtifactRepairRunResult")
+T = TypeVar("T", bound="TableRepairRunResult")
 
 
 @_attrs_define
-class ArtifactRepairRunResult:
-    """Result of one bounded artifact repair pass.
+class TableRepairRunResult:
+    """Result of one bounded table repair pass.
 
     Attributes:
         scanned (int): Number of repair records attempted by this pass.
@@ -22,12 +22,12 @@ class ArtifactRepairRunResult:
         repaired (int): Number of repair records cleared because the artifact became readable.
         missing_source_docs (int): Number of repair records whose source document no longer exists.
         failed (int): Number of supported repair attempts that failed.
-        unsupported (int): Number of repair records skipped because no reprocessor exists for the artifact kind.
+        unsupported (int): Number of repair records skipped because no automated repair exists for the selected target.
         unresolved (int): Number of attempted repair records that remained queued after this pass.
         indexes_rebuilt (int): Number of indexes rebuilt by this pass when target is index.
         indexes_degraded (int): Number of selected indexes that were already degraded or quarantined before repair.
         limit (int): Effective repair limit.
-        has_more (bool): Whether another artifact scan page is available via next_cursor.
+        has_more (bool): Whether another repair scan page is available via next_cursor.
         debt_remaining (bool): Whether repair debt remains after this bounded pass. If true and next_cursor is absent,
             rerun repair from the beginning after addressing failed or unsupported records.
         next_cursor (None | str | Unset): Opaque cursor for the next artifact repair pass when has_more is true. Index
@@ -145,7 +145,7 @@ class ArtifactRepairRunResult:
 
         next_cursor = _parse_next_cursor(d.pop("next_cursor", UNSET))
 
-        artifact_repair_run_result = cls(
+        table_repair_run_result = cls(
             scanned=scanned,
             groups_scanned=groups_scanned,
             reprocessed=reprocessed,
@@ -162,8 +162,8 @@ class ArtifactRepairRunResult:
             next_cursor=next_cursor,
         )
 
-        artifact_repair_run_result.additional_properties = d
-        return artifact_repair_run_result
+        table_repair_run_result.additional_properties = d
+        return table_repair_run_result
 
     @property
     def additional_keys(self) -> list[str]:

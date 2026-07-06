@@ -34,12 +34,8 @@ from .anthropic_generator_config import AnthropicGeneratorConfig
 from .api_key import ApiKey
 from .api_key_row_filter_type_0 import ApiKeyRowFilterType0
 from .api_key_with_secret import ApiKeyWithSecret
-from .artifact_repair_issue import ArtifactRepairIssue
-from .artifact_repair_issue_list import ArtifactRepairIssueList
 from .artifact_repair_kind import ArtifactRepairKind
 from .artifact_repair_reason import ArtifactRepairReason
-from .artifact_repair_run_response import ArtifactRepairRunResponse
-from .artifact_repair_run_result import ArtifactRepairRunResult
 from .audio_chunk_options import AudioChunkOptions
 from .auth_subject import AuthSubject
 from .auth_subject_kind import AuthSubjectKind
@@ -531,6 +527,10 @@ from .table_backup_status import TableBackupStatus
 from .table_backup_status_status import TableBackupStatusStatus
 from .table_migration import TableMigration
 from .table_migration_state import TableMigrationState
+from .table_repair_issue import TableRepairIssue
+from .table_repair_issue_list import TableRepairIssueList
+from .table_repair_run_response import TableRepairRunResponse
+from .table_repair_run_result import TableRepairRunResult
 from .table_restore_status import TableRestoreStatus
 from .table_restore_status_status import TableRestoreStatusStatus
 from .table_schema import TableSchema
@@ -631,12 +631,8 @@ __all__ = (
     "ApiKey",
     "ApiKeyRowFilterType0",
     "ApiKeyWithSecret",
-    "ArtifactRepairIssue",
-    "ArtifactRepairIssueList",
     "ArtifactRepairKind",
     "ArtifactRepairReason",
-    "ArtifactRepairRunResponse",
-    "ArtifactRepairRunResult",
     "AudioChunkOptions",
     "AuthSubject",
     "AuthSubjectKind",
@@ -1126,6 +1122,10 @@ __all__ = (
     "TableBackupStatusStatus",
     "TableMigration",
     "TableMigrationState",
+    "TableRepairIssue",
+    "TableRepairIssueList",
+    "TableRepairRunResponse",
+    "TableRepairRunResult",
     "TableRestoreStatus",
     "TableRestoreStatusStatus",
     "TableSchema",

@@ -1092,6 +1092,16 @@ pub const DocStore = struct {
         return if (next <= 1) 0 else next - 1;
     }
 
+    pub fn lastReplaySequenceFromTxn(_: *DocStore, txn: *Txn, fallback_last: u64) !u64 {
+        const raw = txn.get(internal_keys.replay_meta_next_sequence_key[0..]) catch |err| switch (err) {
+            error.NotFound => return fallback_last,
+            else => return err,
+        };
+        if (raw.len != 8) return error.CorruptReplayMetadata;
+        const next = std.mem.readInt(u64, raw[0..8], .little);
+        return if (next <= 1) 0 else next - 1;
+    }
+
     pub fn latestReplaySequenceForHint(self: *DocStore, hint: change_journal_mod.TargetHint, fallback_last: u64) !u64 {
         return try self.latestReplaySequenceForOrdinal(replayHintOrdinal(hint), fallback_last);
     }
@@ -1610,7 +1620,19 @@ pub const DocStore = struct {
     ) !void {
         var txn = try self.beginReadTxn();
         defer txn.abort();
+        try self.scanReadTxnWithContext(&txn, lower, upper, options, ctx, callback);
+    }
 
+    pub fn scanReadTxnWithContext(
+        self: *DocStore,
+        txn: *Txn,
+        lower: []const u8,
+        upper: []const u8,
+        options: ScanOptions,
+        ctx: ?*anyopaque,
+        callback: ScanWithContextCallback,
+    ) !void {
+        _ = self;
         var cur = try txn.openCursor();
         defer cur.close();
         cur.setUpperBound(if (upper.len > 0) upper else null);

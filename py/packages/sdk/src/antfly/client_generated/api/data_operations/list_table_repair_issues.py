@@ -6,9 +6,9 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.artifact_repair_issue_list import ArtifactRepairIssueList
 from ...models.error import Error
 from ...models.repair_issue_list_request import RepairIssueListRequest
+from ...models.table_repair_issue_list import TableRepairIssueList
 from ...types import UNSET, Response, Unset
 
 
@@ -37,9 +37,9 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> ArtifactRepairIssueList | Error | None:
+) -> Error | TableRepairIssueList | None:
     if response.status_code == 200:
-        response_200 = ArtifactRepairIssueList.from_dict(response.json())
+        response_200 = TableRepairIssueList.from_dict(response.json())
 
         return response_200
 
@@ -71,7 +71,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[ArtifactRepairIssueList | Error]:
+) -> Response[Error | TableRepairIssueList]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -85,8 +85,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: RepairIssueListRequest | Unset = UNSET,
-) -> Response[ArtifactRepairIssueList | Error]:
-    """List artifact repair issues
+) -> Response[Error | TableRepairIssueList]:
+    """List table repair issues
 
      Lists durable repair debt for a table. This operator-facing endpoint
     returns exact document keys, artifact keys, index names, and repair
@@ -104,7 +104,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ArtifactRepairIssueList | Error]
+        Response[Error | TableRepairIssueList]
     """
 
     kwargs = _get_kwargs(
@@ -124,8 +124,8 @@ def sync(
     *,
     client: AuthenticatedClient,
     body: RepairIssueListRequest | Unset = UNSET,
-) -> ArtifactRepairIssueList | Error | None:
-    """List artifact repair issues
+) -> Error | TableRepairIssueList | None:
+    """List table repair issues
 
      Lists durable repair debt for a table. This operator-facing endpoint
     returns exact document keys, artifact keys, index names, and repair
@@ -143,7 +143,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ArtifactRepairIssueList | Error
+        Error | TableRepairIssueList
     """
 
     return sync_detailed(
@@ -158,8 +158,8 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: RepairIssueListRequest | Unset = UNSET,
-) -> Response[ArtifactRepairIssueList | Error]:
-    """List artifact repair issues
+) -> Response[Error | TableRepairIssueList]:
+    """List table repair issues
 
      Lists durable repair debt for a table. This operator-facing endpoint
     returns exact document keys, artifact keys, index names, and repair
@@ -177,7 +177,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ArtifactRepairIssueList | Error]
+        Response[Error | TableRepairIssueList]
     """
 
     kwargs = _get_kwargs(
@@ -195,8 +195,8 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: RepairIssueListRequest | Unset = UNSET,
-) -> ArtifactRepairIssueList | Error | None:
-    """List artifact repair issues
+) -> Error | TableRepairIssueList | None:
+    """List table repair issues
 
      Lists durable repair debt for a table. This operator-facing endpoint
     returns exact document keys, artifact keys, index names, and repair
@@ -214,7 +214,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ArtifactRepairIssueList | Error
+        Error | TableRepairIssueList
     """
 
     return (

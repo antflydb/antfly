@@ -2037,9 +2037,9 @@ components:
       enum:
         - artifact
         - index
-    ArtifactRepairIssue:
+    TableRepairIssue:
       type: object
-      description: Durable repair debt for a derived artifact. This is an operator-facing record and includes exact source and artifact identifiers.
+      description: Durable table repair debt. Artifact targets include exact source and artifact identifiers; index targets include the affected index and repair status.
       required:
         - artifact_kind
         - index_name
@@ -2107,7 +2107,7 @@ components:
         last_error:
           type: string
           description: Last stable repair error code, when a repair attempt failed.
-    ArtifactRepairIssueList:
+    TableRepairIssueList:
       type: object
       description: Bounded page of table repair issues.
       required:
@@ -2146,7 +2146,7 @@ components:
         issues:
           type: array
           items:
-            $ref: "#/components/schemas/ArtifactRepairIssue"
+            $ref: "#/components/schemas/TableRepairIssue"
     RepairIssueListRequest:
       type: object
       description: Bounded request to list table repair issues.
@@ -2195,9 +2195,9 @@ components:
           maximum: 1000
           default: 100
           description: Maximum artifact repair records to attempt. For target=index, any positive value permits one named index repair.
-    ArtifactRepairRunResult:
+    TableRepairRunResult:
       type: object
-      description: Result of one bounded artifact repair pass.
+      description: Result of one bounded table repair pass.
       required:
         - scanned
         - groups_scanned
@@ -2240,7 +2240,7 @@ components:
         unsupported:
           type: integer
           format: uint64
-          description: Number of repair records skipped because no reprocessor exists for the artifact kind.
+          description: Number of repair records skipped because no automated repair exists for the selected target.
         unresolved:
           type: integer
           format: uint64
@@ -2263,12 +2263,12 @@ components:
           description: Opaque cursor for the next artifact repair pass when has_more is true. Index repair currently repairs one named index per request and does not return a continuation cursor.
         has_more:
           type: boolean
-          description: Whether another artifact scan page is available via next_cursor.
+          description: Whether another repair scan page is available via next_cursor.
         debt_remaining:
           type: boolean
           description: Whether repair debt remains after this bounded pass. If true and next_cursor is
             absent, rerun repair from the beginning after addressing failed or unsupported records.
-    ArtifactRepairRunResponse:
+    TableRepairRunResponse:
       type: object
       description: Response for a bounded table repair pass.
       required:
@@ -2287,7 +2287,7 @@ components:
           format: uint32
           description: Effective repair limit.
         result:
-          $ref: "#/components/schemas/ArtifactRepairRunResult"
+          $ref: "#/components/schemas/TableRepairRunResult"
     DocumentArtifactReprocessResponse:
       type: object
       required:
@@ -8397,7 +8397,7 @@ paths:
         schema:
           type: string
     post:
-      summary: List artifact repair issues
+      summary: List table repair issues
       description: |
         Lists durable repair debt for a table. This operator-facing endpoint
         returns exact document keys, artifact keys, index names, and repair
@@ -8407,7 +8407,7 @@ paths:
         `target=index` for index repair candidates.
       tags:
         - data_operations
-      operationId: listArtifactRepairIssues
+      operationId: listTableRepairIssues
       requestBody:
         required: false
         content:
@@ -8416,11 +8416,11 @@ paths:
               $ref: "#/components/schemas/RepairIssueListRequest"
       responses:
         "200":
-          description: Artifact repair issue page
+          description: Table repair issue page
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ArtifactRepairIssueList"
+                $ref: "#/components/schemas/TableRepairIssueList"
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":
@@ -8464,7 +8464,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ArtifactRepairRunResponse"
+                $ref: "#/components/schemas/TableRepairRunResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":
