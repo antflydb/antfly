@@ -7611,13 +7611,13 @@ pub const ApiHttpServer = struct {
         if (runtime.threaded_jobs == null) return null;
         if (self.repair_job_owner_id == 0) return null;
 
-        var job_submitted = false;
+        var work_consumed = false;
         const owned_table_name = try self.alloc.dupe(u8, table_name);
-        errdefer if (!job_submitted) self.alloc.free(owned_table_name);
+        errdefer if (!work_consumed) self.alloc.free(owned_table_name);
         const owned_running_encoded = try self.alloc.dupe(u8, running_encoded);
-        errdefer if (!job_submitted) self.alloc.free(owned_running_encoded);
+        errdefer if (!work_consumed) self.alloc.free(owned_running_encoded);
         const work = try self.alloc.create(TableRepairJobPassWork);
-        errdefer if (!job_submitted) self.alloc.destroy(work);
+        errdefer if (!work_consumed) self.alloc.destroy(work);
         work.* = .{
             .server = self,
             .table_name = owned_table_name,
@@ -7631,8 +7631,8 @@ pub const ApiHttpServer = struct {
             .run = TableRepairJobPassWork.run,
             .deinit = TableRepairJobPassWork.deinit,
         }) catch |err| {
-            job_submitted = true;
             TableRepairJobPassWork.deinit(work);
+            work_consumed = true;
             const failed = try self.repair_job_store.markPhase(self.alloc, blk: {
                 var parsed = try std.json.parseFromSlice(repair_jobs.JobState, self.alloc, running_encoded, .{ .ignore_unknown_fields = true });
                 defer parsed.deinit();
@@ -7642,7 +7642,7 @@ pub const ApiHttpServer = struct {
             std.log.err("failed to submit table repair job table={s} job_id={d} err={}", .{ table_name, job_id, err });
             return try self.repair_job_store.loadJobAlloc(self.alloc, job_id) orelse try self.alloc.dupe(u8, failed);
         };
-        job_submitted = true;
+        work_consumed = true;
 
         return try self.repair_job_store.loadJobAlloc(self.alloc, job_id) orelse try self.alloc.dupe(u8, running_encoded);
     }
