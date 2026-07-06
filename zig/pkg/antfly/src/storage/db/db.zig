@@ -7337,6 +7337,7 @@ pub const DB = struct {
         defer self.endIndexRepairLease(cfg.name);
 
         var quarantined_retry_run = false;
+        var recreated_quarantined_root_for_rebuild = false;
         result.scanned += 1;
         const had_load_failure = self.core.index_manager.loadFailure(cfg.name) != null;
         if (had_load_failure) result.indexes_degraded += 1;
@@ -7353,6 +7354,7 @@ pub const DB = struct {
                         result.debt_remaining = true;
                         return result;
                     };
+                    recreated_quarantined_root_for_rebuild = true;
                 },
                 .algebraic => {
                     result.failed += 1;
@@ -7362,7 +7364,7 @@ pub const DB = struct {
                 },
             }
         }
-        if (had_load_failure and (cfg.kind == .full_text or cfg.kind == .algebraic) and !try self.indexRepairRequired(alloc, cfg.name)) {
+        if (had_load_failure and !recreated_quarantined_root_for_rebuild and (cfg.kind == .full_text or cfg.kind == .algebraic) and !try self.indexRepairRequired(alloc, cfg.name)) {
             result.repaired += 1;
             return result;
         }
@@ -7399,11 +7401,15 @@ pub const DB = struct {
         cfg: types.IndexConfig,
     ) !ShadowIndexReplacementResult {
         const shadow_base = try createUniqueRepairShadowBase(alloc, self.core.path);
+        try index_manager_mod.IndexManager.writeRepairShadowInProgressMarker(alloc, shadow_base);
         var shadow_installed = false;
         defer {
             var io_impl = threadedIo();
             defer io_impl.deinit();
-            if (!shadow_installed) std.Io.Dir.cwd().deleteTree(io_impl.io(), shadow_base) catch {};
+            if (!shadow_installed) {
+                index_manager_mod.IndexManager.clearRepairShadowInProgressMarker(alloc, shadow_base) catch {};
+                std.Io.Dir.cwd().deleteTree(io_impl.io(), shadow_base) catch {};
+            }
             alloc.free(shadow_base);
         }
         const shadow_indexes_path = try std.fmt.allocPrint(alloc, "{s}/indexes", .{shadow_base});
@@ -7494,6 +7500,9 @@ pub const DB = struct {
         shadow_manager_open = false;
         try self.core.index_manager.installBuiltReplacementIndex(self.core.store, cfg, shadow_index_path);
         shadow_installed = true;
+        index_manager_mod.IndexManager.clearRepairShadowInProgressMarker(alloc, shadow_base) catch |err| {
+            std.log.warn("failed to clear repair shadow in-progress marker index={s} err={s}", .{ cfg.name, @errorName(err) });
+        };
         try self.core.saveAppliedSequence(cfg.name, final_target);
         const prior_checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
         try self.core.saveProjectionCheckpoint(cfg.name, .{
@@ -38835,6 +38844,12 @@ test "db index repair shadow swap survives reopen" {
     const abandoned_shadow = try std.fmt.allocPrint(alloc, "{s}/.repair-shadow-abandoned/indexes/ft_v1", .{std.mem.span(path)});
     defer alloc.free(abandoned_shadow);
     try ensureDirPath(abandoned_shadow);
+    const in_progress_shadow_root = try std.fmt.allocPrint(alloc, "{s}/.repair-shadow-live-build", .{std.mem.span(path)});
+    defer alloc.free(in_progress_shadow_root);
+    const in_progress_shadow = try std.fmt.allocPrint(alloc, "{s}/indexes/ft_v1", .{in_progress_shadow_root});
+    defer alloc.free(in_progress_shadow);
+    try ensureDirPath(in_progress_shadow);
+    try index_manager_mod.IndexManager.writeRepairShadowInProgressMarker(alloc, in_progress_shadow_root);
 
     {
         var reopened = try DB.open(alloc, std.mem.span(path), .{
@@ -38854,6 +38869,7 @@ test "db index repair shadow swap survives reopen" {
         try std.testing.expectEqual(@as(u32, 1), after.total_hits);
         try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
         try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, abandoned_shadow, .{}));
+        try std.Io.Dir.cwd().access(std.testing.io, in_progress_shadow, .{});
         const stale_canonical_file = try std.fmt.allocPrint(alloc, "{s}/indexes/ft_v1/stale-before-repair", .{std.mem.span(path)});
         defer alloc.free(stale_canonical_file);
         try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, stale_canonical_file, .{}));
@@ -39146,6 +39162,77 @@ test "db index repair recovers quarantined index load before rebuild" {
         try std.testing.expect(db.core.index_manager.loadFailure("ft_v1") == null);
         try std.testing.expect(db.core.textIndexEntry("ft_v1") != null);
     }
+}
+
+test "db index repair rebuilds full text after quarantined root recreation" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    const path_slice = std.mem.span(path);
+
+    const text_cfg: types.IndexConfig = .{
+        .name = "ft_recreate",
+        .kind = .full_text,
+        .config_json = "{}",
+    };
+
+    {
+        var db = try DB.open(alloc, path_slice, .{});
+        defer db.close();
+
+        try db.addIndex(text_cfg);
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"body\":\"alpha durable\"}" },
+                .{ .key = "doc:b", .value = "{\"body\":\"beta durable\"}" },
+            },
+            .sync_level = .full_index,
+        });
+        try db.core.saveProjectionCheckpoint("ft_recreate", .{
+            .applied_sequence = db.core.nextDerivedSequence(),
+            .status = .clean,
+            .generation = 2,
+            .config_hash = types.indexConfigHash(text_cfg),
+        });
+    }
+
+    const index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/ft_recreate", .{path_slice});
+    defer alloc.free(index_path);
+    try std.testing.expect((try corruptNonEmptyFilesUnderDir(alloc, index_path)) > 0);
+
+    var reopened = try DB.open(alloc, path_slice, .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const recorded = reopened.core.index_manager.loadFailure("ft_recreate") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(recorded.len > 0);
+
+    var repair = try reopened.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .artifact_kind = .full_text,
+        .index_name = "ft_recreate",
+        .limit = 1,
+    });
+    defer repair.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), repair.scanned);
+    try std.testing.expectEqual(@as(u64, 1), repair.indexes_degraded);
+    try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
+    try std.testing.expectEqual(@as(u64, 1), repair.repaired);
+    try std.testing.expect(!repair.debt_remaining);
+    try std.testing.expect(reopened.core.index_manager.loadFailure("ft_recreate") == null);
+
+    var after = try reopened.search(alloc, .{
+        .index_name = "ft_recreate",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+    });
+    defer after.deinit();
+    try std.testing.expectEqual(@as(u32, 1), after.total_hits);
+    try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
 }
 
 test "db index repair streams graph artifact rebuild in batches" {

@@ -79,6 +79,8 @@ const text_field_analyzers_prefix = "\x00\x00__metadata__:text_field_analyzers:"
 const active_index_root_pointer_file = ".antfly-active-index-root";
 const active_index_root_pointer_magic = "antfly-active-index-root-v1\n";
 const repair_shadow_root_prefix = ".repair-shadow-";
+const repair_shadow_in_progress_file = ".antfly-repair-shadow-in-progress";
+const repair_shadow_in_progress_magic = "antfly-repair-shadow-in-progress-v1\n";
 var bench_hbc_tree_counter: platform.atomic.Value(u64) = .init(0);
 var hbc_coalesce_bulk_writes_cache: std.atomic.Value(u8) = .init(0);
 var hbc_bulk_ingest_bulk_build_min_items_cache: std.atomic.Value(usize) = .init(0);
@@ -3485,6 +3487,7 @@ pub const IndexManager = struct {
             if (active_roots.contains(entry.name)) continue;
             const path = std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ self.base_path, entry.name }) catch continue;
             defer self.alloc.free(path);
+            if (repairShadowRootInProgress(path)) continue;
             deleteIndexDirIfPresent(path);
         }
     }
@@ -6542,6 +6545,36 @@ pub const IndexManager = struct {
 
     fn activeIndexRootPointerPath(self: *const IndexManager, canonical_path: []const u8) ![]u8 {
         return std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ canonical_path, active_index_root_pointer_file });
+    }
+
+    pub fn writeRepairShadowInProgressMarker(alloc: Allocator, shadow_root_path: []const u8) !void {
+        if (builtin.os.tag == .freestanding) return;
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        try fs_paths.createDirPathPortable(io, shadow_root_path);
+        const marker_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ shadow_root_path, repair_shadow_in_progress_file });
+        defer alloc.free(marker_path);
+        const payload = if (platform.process.currentId()) |pid|
+            try std.fmt.allocPrint(alloc, "{s}pid={d}\n", .{ repair_shadow_in_progress_magic, pid })
+        else
+            try std.fmt.allocPrint(alloc, "{s}pid=unknown\n", .{repair_shadow_in_progress_magic});
+        defer alloc.free(payload);
+        try writeFileAtomicallyDurable(alloc, io, marker_path, payload);
+    }
+
+    pub fn clearRepairShadowInProgressMarker(alloc: Allocator, shadow_root_path: []const u8) !void {
+        if (builtin.os.tag == .freestanding) return;
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        const marker_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ shadow_root_path, repair_shadow_in_progress_file });
+        defer alloc.free(marker_path);
+        std.Io.Dir.cwd().deleteFile(io, marker_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        try fs_paths.syncDirPortable(io, shadow_root_path);
     }
 
     fn readActiveIndexRootPointer(self: *const IndexManager, canonical_path: []const u8, name: []const u8) !?[]u8 {
@@ -14045,6 +14078,30 @@ fn deleteIndexDirIfPresent(path: []const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+}
+
+fn repairShadowRootInProgress(path: []const u8) bool {
+    if (builtin.os.tag == .freestanding) return false;
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const marker_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ path, repair_shadow_in_progress_file }) catch return true;
+    defer std.heap.page_allocator.free(marker_path);
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, marker_path, std.heap.page_allocator, .limited(4096)) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return true,
+    };
+    defer std.heap.page_allocator.free(raw);
+    if (!std.mem.startsWith(u8, raw, repair_shadow_in_progress_magic)) return true;
+    const body = raw[repair_shadow_in_progress_magic.len..];
+    if (!std.mem.startsWith(u8, body, "pid=")) return true;
+    const end = std.mem.indexOfAny(u8, body["pid=".len..], "\r\n") orelse body["pid=".len..].len;
+    const pid_text = body["pid=".len..][0..end];
+    const pid = std.fmt.parseUnsigned(u32, pid_text, 10) catch return true;
+    if (platform.process.alive(pid)) return true;
+    std.log.warn("discarding stale repair shadow root for dead owner path={s} pid={d}", .{ path, pid });
+    return false;
 }
 
 fn writeFileAtomicallyDurable(alloc: Allocator, io: std.Io, path: []const u8, contents: []const u8) !void {
