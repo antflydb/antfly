@@ -7577,6 +7577,40 @@ pub const ApiHttpServer = struct {
         }
     };
 
+    const TableRepairCancelProbe = struct {
+        server: *ApiHttpServer,
+        job_id: u64,
+        attempt_id: u64,
+        cached_requested: std.atomic.Value(bool) = .init(false),
+        last_check_ns: std.atomic.Value(u64) = .init(0),
+
+        const check_interval_ns: u64 = 100 * std.time.ns_per_ms;
+
+        fn check(ptr: *anyopaque) bool {
+            const self: *TableRepairCancelProbe = @ptrCast(@alignCast(ptr));
+            if (self.cached_requested.load(.acquire)) return true;
+            const now_ns = platform_time.monotonicNs();
+            const last_ns = self.last_check_ns.load(.acquire);
+            if (last_ns != 0 and now_ns -| last_ns < check_interval_ns) return false;
+            self.last_check_ns.store(now_ns, .release);
+
+            const encoded = self.server.repair_job_store.loadJobAlloc(self.server.alloc, self.job_id) catch return false;
+            defer if (encoded) |buf| self.server.alloc.free(buf);
+            const body = encoded orelse {
+                self.cached_requested.store(true, .release);
+                return true;
+            };
+            var parsed = std.json.parseFromSlice(repair_jobs.JobState, self.server.alloc, body, .{ .ignore_unknown_fields = true }) catch return false;
+            defer parsed.deinit();
+            const state = parsed.value;
+            const requested = state.cancel_requested or
+                repair_jobs.isTerminalPhase(state.phase) or
+                state.attempt_id != self.attempt_id;
+            if (requested) self.cached_requested.store(true, .release);
+            return requested;
+        }
+    };
+
     fn submitTableRepairJobHeartbeat(self: *ApiHttpServer, job_id: u64, attempt_id: u64) !?*TableRepairJobHeartbeatWork {
         const runtime = self.cfg.backend_runtime orelse return null;
         if (runtime.threaded_jobs == null) return null;
@@ -7650,14 +7684,27 @@ pub const ApiHttpServer = struct {
         const target = std.meta.stringToEnum(db_mod.types.RepairTarget, running_state.target) orelse {
             return try self.repair_job_store.markPhase(self.alloc, running_state, .failed, "invalid repair target");
         };
-        var result = (source.repairArtifactIssues(self.alloc, table_name, .{
+        var cancel_probe = TableRepairCancelProbe{
+            .server = self,
+            .job_id = running_state.job_id,
+            .attempt_id = running_state.attempt_id,
+        };
+        var result = (source.repairArtifactIssuesControlled(self.alloc, table_name, .{
             .target = target,
             .artifact_kind = running_state.kind,
             .index_name = running_state.index,
             .limit = running_state.limit,
             .cursor = running_state.cursor,
             .force = running_state.force,
+        }, .{
+            .cancel_check = .{
+                .ptr = &cancel_probe,
+                .is_requested = TableRepairCancelProbe.check,
+            },
         }) catch |err| switch (err) {
+            error.Canceled => {
+                return try self.repair_job_store.markPhase(self.alloc, running_state, .cancelled, "cancel_requested");
+            },
             error.InvalidArgument => {
                 return try self.repair_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
             },
@@ -7744,9 +7791,13 @@ pub const ApiHttpServer = struct {
         if (artifact_reprocess_jobs.isTerminalPhase(parsed.value.phase)) {
             return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
         }
-        const cancelled = try self.artifact_reprocess_job_store.markPhase(self.alloc, parsed.value, .cancelled, null);
+        const cancelled = try self.artifact_reprocess_job_store.requestCancel(self.alloc, parsed.value);
         defer self.alloc.free(cancelled);
-        return try jsonBodyResponseWithStatus(self.alloc, 200, cancelled);
+        var parsed_cancelled = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, cancelled, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "invalid artifact reprocess job state");
+        };
+        defer parsed_cancelled.deinit();
+        return try jsonBodyResponseWithStatus(self.alloc, if (artifact_reprocess_jobs.isTerminalPhase(parsed_cancelled.value.phase)) 200 else 202, cancelled);
     }
 
     fn advanceDocumentArtifactReprocessJobState(self: *ApiHttpServer, table_name: []const u8, artifact_name: []const u8, state: artifact_reprocess_jobs.JobState) !http_common.HttpResponse {

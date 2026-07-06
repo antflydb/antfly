@@ -78,6 +78,12 @@ const resolver_catalog_key = "\x00\x00__metadata__:resolvers";
 const text_field_analyzers_prefix = "\x00\x00__metadata__:text_field_analyzers:";
 const active_index_root_pointer_file = ".antfly-active-index-root";
 const active_index_root_pointer_magic = "antfly-active-index-root-v1\n";
+
+fn checkRepairCancelled(cancel_check: ?types.RepairCancelCheck) !void {
+    if (cancel_check) |check| {
+        if (check.requested()) return error.Canceled;
+    }
+}
 const repair_shadow_root_prefix = ".repair-shadow-";
 const repair_shadow_in_progress_file = ".antfly-repair-shadow-in-progress";
 const repair_shadow_in_progress_magic = "antfly-repair-shadow-in-progress-v1\n";
@@ -1634,13 +1640,16 @@ pub const IndexManager = struct {
         store: *docstore_mod.DocStore,
         read_txn: *docstore_mod.DocStore.Txn,
         index_name: []const u8,
+        cancel_check: ?types.RepairCancelCheck,
     ) !u64 {
         const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
         const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
 
+        try checkRepairCancelled(cancel_check);
         try entry.persistent.resetAllForRebuild();
         try rebuild_state.update("");
-        try self.backfillTextIndexFromReadTxn(store, read_txn, entry, null);
+        try self.backfillTextIndexFromReadTxn(store, read_txn, entry, null, cancel_check);
+        try checkRepairCancelled(cancel_check);
         try entry.persistent.sync(true);
 
         return entry.persistent.snapshot().global_doc_count;
@@ -6377,6 +6386,7 @@ pub const IndexManager = struct {
         read_txn: *docstore_mod.DocStore.Txn,
         entry: *TextIndex,
         resume_from: ?[]const u8,
+        cancel_check: ?types.RepairCancelCheck,
     ) !void {
         const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
 
@@ -6408,7 +6418,9 @@ pub const IndexManager = struct {
                 docs_buf: *std.ArrayListUnmanaged(mapper.MapperDoc),
                 last_doc_key: []const u8,
                 flush_count: *usize,
+                check: ?types.RepairCancelCheck,
             ) !void {
+                try checkRepairCancelled(check);
                 var built = try mapper.buildTextSegmentsFromDocumentsWithMetadata(manager.alloc, docs_buf.items, text_entry.text_analysis, text_entry.runtime_schema, .{
                     .target_segment_bytes = default_text_segment_build_target_bytes,
                 });
@@ -6442,6 +6454,7 @@ pub const IndexManager = struct {
         var reached_end = false;
 
         while (!reached_end) {
+            try checkRepairCancelled(cancel_check);
             var page_last_seen_key: ?[]u8 = null;
             defer if (page_last_seen_key) |buf| self.alloc.free(buf);
 
@@ -6529,7 +6542,7 @@ pub const IndexManager = struct {
             }
 
             if (mapped_docs.items.len > 0) {
-                try flush_batch(self, store, entry, rebuild_state, &mapped_docs, batch_last_doc_key.?, &flushed_batches);
+                try flush_batch(self, store, entry, rebuild_state, &mapped_docs, batch_last_doc_key.?, &flushed_batches, cancel_check);
                 if (batch_last_doc_key) |old| self.alloc.free(old);
                 batch_last_doc_key = null;
             }

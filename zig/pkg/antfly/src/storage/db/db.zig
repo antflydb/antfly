@@ -571,6 +571,7 @@ const AsyncContext = struct {
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime = null,
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
     promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
+    repair_options: types.ArtifactRepairRunOptions = .{},
     applied_sequence_coalescer: AppliedSequenceCoalescer = .{},
     stats: AsyncContentionStats = .{},
 
@@ -584,6 +585,14 @@ const AsyncContext = struct {
         self.target_advance_repair_last_ns.deinit(alloc);
     }
 };
+
+fn checkArtifactRepairCancelled(options: types.ArtifactRepairRunOptions) !void {
+    if (options.cancelled()) return error.Canceled;
+}
+
+fn checkAsyncRepairCancelled(ctx: *const AsyncContext) !void {
+    try checkArtifactRepairCancelled(ctx.repair_options);
+}
 
 const DocSetPlanningRuntimeStats = struct {
     resolved_set_count: AtomicU64 = AtomicU64.init(0),
@@ -7208,7 +7217,17 @@ pub const DB = struct {
         alloc: Allocator,
         req: types.ArtifactRepairRunRequest,
     ) !types.ArtifactRepairResult {
-        if (req.target == .index) return try self.repairIndexIssuesWithRequest(alloc, req);
+        return try self.repairArtifactIssuesWithRequestOptions(alloc, req, .{});
+    }
+
+    pub fn repairArtifactIssuesWithRequestOptions(
+        self: *DB,
+        alloc: Allocator,
+        req: types.ArtifactRepairRunRequest,
+        options: types.ArtifactRepairRunOptions,
+    ) !types.ArtifactRepairResult {
+        try checkArtifactRepairCancelled(options);
+        if (req.target == .index) return try self.repairIndexIssuesWithRequest(alloc, req, options);
 
         const page = try self.listArtifactRepairIssuesPage(alloc, .{
             .artifact_kind = req.artifact_kind,
@@ -7230,6 +7249,11 @@ pub const DB = struct {
             result.next_cursor = try alloc.dupe(u8, cursor);
         }
         for (page.issues) |*issue| {
+            if (options.cancelled()) {
+                result.unresolved += 1;
+                result.debt_remaining = true;
+                return result;
+            }
             result.scanned += 1;
             issue.attempts += 1;
             issue.last_seen_ns = currentTimeNs();
@@ -7304,7 +7328,9 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         req: types.ArtifactRepairRunRequest,
+        options: types.ArtifactRepairRunOptions,
     ) !types.ArtifactRepairResult {
+        try checkArtifactRepairCancelled(options);
         const requested_index = req.index_name orelse return error.InvalidArgument;
         if (req.cursor != null and req.cursor.?.len != 0) return error.InvalidArgument;
         const limit = if (req.limit == 0) @as(u32, 100) else req.limit;
@@ -7376,7 +7402,12 @@ pub const DB = struct {
             result.debt_remaining = true;
             return result;
         }
-        const rebuilt = self.rebuildIndexWithShadowReplacement(alloc, cfg) catch |err| switch (err) {
+        const rebuilt = self.rebuildIndexWithShadowReplacement(alloc, cfg, options) catch |err| switch (err) {
+            error.Canceled => {
+                result.unresolved += 1;
+                result.debt_remaining = true;
+                return result;
+            },
             error.ShadowIndexCatchUpIncomplete => {
                 result.failed += 1;
                 result.unresolved += 1;
@@ -7405,7 +7436,9 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         cfg: types.IndexConfig,
+        options: types.ArtifactRepairRunOptions,
     ) !ShadowIndexReplacementResult {
+        try checkArtifactRepairCancelled(options);
         const shadow_base = try createUniqueRepairShadowBase(alloc, self.core.path);
         try index_manager_mod.IndexManager.writeRepairShadowInProgressMarker(alloc, shadow_base);
         var shadow_installed = false;
@@ -7447,12 +7480,14 @@ pub const DB = struct {
             .dense_bulk_session_scope = .external,
             .resolution_runtime = self.resolution_runtime,
             .promotion_runtime = self.promotion_runtime,
+            .repair_options = options,
         };
         defer shadow_ctx.deinit(alloc);
 
         var build_floor_sequence: u64 = 0;
         const rebuilt: u64 = switch (cfg.kind) {
             .dense_vector, .sparse_vector, .graph, .full_text => rebuilt_blk: {
+                try checkArtifactRepairCancelled(options);
                 var snapshot_txn = try self.core.store.beginReadTxn();
                 var snapshot_open = true;
                 defer if (snapshot_open) snapshot_txn.abort();
@@ -7472,6 +7507,7 @@ pub const DB = struct {
                         self.core.store,
                         &snapshot_txn,
                         cfg.name,
+                        options.cancel_check,
                     ),
                     else => unreachable,
                 };
@@ -7486,22 +7522,25 @@ pub const DB = struct {
             .name = cfg.name,
             .kind = cfg.kind,
         };
+        try checkArtifactRepairCancelled(options);
         try self.saveShadowReplacementAppliedSequence(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, build_floor_sequence);
         if (self.shadow_index_repair_hook) |hook| {
             try hook.after_snapshot_build(hook.ptr, self, cfg.name, build_floor_sequence);
         }
-        _ = try self.catchUpShadowReplacementUntil(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, self.core.nextDerivedSequence());
+        _ = try self.catchUpShadowReplacementUntil(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, self.core.nextDerivedSequence(), options);
 
         const use_dense_search_barrier = cfg.kind == .dense_vector;
         if (use_dense_search_barrier) self.beginIndexRepairBarrier();
         defer if (use_dense_search_barrier) self.endIndexRepairBarrier();
 
+        try checkArtifactRepairCancelled(options);
         lockApply(self);
         defer self.core.unlockApply();
 
         const final_target = self.core.nextDerivedSequence();
-        const reached_target = try self.catchUpShadowReplacementUntil(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, final_target);
+        const reached_target = try self.catchUpShadowReplacementUntil(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, final_target, options);
         if (reached_target < final_target) return error.ShadowIndexCatchUpIncomplete;
+        try checkArtifactRepairCancelled(options);
 
         shadow_manager.deinit();
         shadow_manager_open = false;
@@ -7540,6 +7579,7 @@ pub const DB = struct {
         shadow_checkpoint_path: []const u8,
         index_ref: index_manager_mod.ManagedIndexRef,
         target_sequence: u64,
+        options: types.ArtifactRepairRunOptions,
     ) !u64 {
         if (target_sequence == 0) return 0;
         var batch_ctx = self.batchContext();
@@ -7555,6 +7595,7 @@ pub const DB = struct {
             index_ref.name,
         );
         while (applied < target_sequence) {
+            try checkArtifactRepairCancelled(options);
             var replay_ctx = ReplayApplyContextBatch{
                 .batch = &batch_ctx,
                 .dense_bulk_session_scope = .external,
@@ -7586,6 +7627,7 @@ pub const DB = struct {
             try self.saveShadowReplacementAppliedSequence(alloc, shadow_manager, shadow_checkpoint_path, index_ref, advanced);
             applied = advanced;
         }
+        try checkArtifactRepairCancelled(options);
         return applied;
     }
 
@@ -27361,6 +27403,7 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
         }
 
         fn flush(state: *@This()) !void {
+            try checkAsyncRepairCancelled(state.ctx);
             if (state.writes.items.len == 0) return;
             if (comptime builtin.is_test) {
                 _ = test_graph_repair_stream_flushes.fetchAdd(1, .monotonic);
@@ -27373,6 +27416,7 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
         fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
             if (!internal_keys.isGraphEdgeArtifactKey(key)) return .@"continue";
+            try checkAsyncRepairCancelled(state.ctx);
             const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(state.ctx.alloc, key)) orelse return .@"continue";
             defer {
                 state.ctx.alloc.free(parsed.doc_key);
@@ -28030,6 +28074,7 @@ fn flushDensePrimaryVectorRebuildChunkContext(
 ) !void {
     defer freePrimaryVectorRebuildWrites(ctx.alloc, writes);
     if (writes.items.len == 0) return;
+    try checkAsyncRepairCancelled(ctx);
     try ctx.index_manager.indexDenseBatchByNameWithOptions(
         ctx.store,
         index_name,
@@ -28075,6 +28120,7 @@ fn rebuildDenseIndexFromPrimaryVectorsContext(
         fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
             if (!isPrimaryDocumentStoreKey(key)) return .@"continue";
+            try checkAsyncRepairCancelled(state.ctx);
             if (try mapper.extractDenseVectorField(state.ctx.alloc, value, state.field_name, state.dims)) |vector| {
                 state.ctx.alloc.free(vector);
             } else {
@@ -28119,6 +28165,7 @@ fn flushDenseArtifactRebuildChunkContext(
 ) !void {
     defer DB.freeDenseArtifactRebuildWrites(ctx.alloc, writes);
     if (writes.items.len == 0) return;
+    try checkAsyncRepairCancelled(ctx);
     try ctx.index_manager.applyDenseEmbeddingWritesByNameWithOptions(
         ctx.store,
         index_name,
@@ -28164,6 +28211,7 @@ fn rebuildDenseIndexFromStoredEmbeddingArtifactsContext(
         fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
             if (!internal_keys.isInternalUserKey(key)) return .@"continue";
+            try checkAsyncRepairCancelled(state.ctx);
 
             var identity = (artifact_ids.decodeEmbeddingArtifactIdentityAlloc(state.ctx.alloc, key) catch |err| switch (err) {
                 error.InvalidInternalUserKey => return .@"continue",
@@ -28252,6 +28300,7 @@ fn flushSparseArtifactRebuildChunkContext(
 ) !void {
     defer DB.freeSparseArtifactRebuildWrites(ctx.alloc, writes);
     if (writes.items.len == 0) return;
+    try checkAsyncRepairCancelled(ctx);
     try ctx.index_manager.applySparseEmbeddingWritesByNameWithOptions(
         ctx.store,
         index_name,
@@ -28290,6 +28339,7 @@ fn rebuildSparseIndexFromStoredEmbeddingArtifactsContext(
         fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
             if (!internal_keys.isInternalUserKey(key)) return .@"continue";
+            try checkAsyncRepairCancelled(state.ctx);
 
             const identity = (try internal_keys.parseEmbeddingArtifactKeyView(key)) orelse return .@"continue";
             if (!std.mem.eql(u8, identity.artifact_name, state.expected_name)) return .@"continue";

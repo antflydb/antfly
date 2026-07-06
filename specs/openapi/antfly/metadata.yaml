@@ -2564,6 +2564,7 @@ components:
       type: object
       required:
         - job_id
+        - attempt_id
         - table_name
         - artifact_name
         - phase
@@ -2578,6 +2579,7 @@ components:
         - pending_shards
         - failures
         - shard_cursors
+        - cancel_requested
         - created_at_millis
         - last_updated_at_millis
         - expires_at_millis
@@ -2586,6 +2588,10 @@ components:
           type: integer
           format: uint64
           description: Server-assigned durable repair job identifier.
+        attempt_id:
+          type: integer
+          format: uint64
+          description: Monotonic execution attempt token for the current running pass.
         table_name:
           type: string
           description: Table containing the source documents being repaired.
@@ -2651,18 +2657,21 @@ components:
           type: string
           nullable: true
           description: Last terminal or transient job error, when available.
+        cancel_requested:
+          type: boolean
+          description: Whether cancellation has been requested for a running pass. Running passes finish at a bounded reprocess boundary before the job transitions to cancelled.
         created_at_millis:
           type: integer
           format: uint64
-          description: Monotonic server timestamp when the job was created.
+          description: Unix epoch milliseconds when the job was created.
         last_updated_at_millis:
           type: integer
           format: uint64
-          description: Monotonic server timestamp when the job was last updated.
+          description: Unix epoch milliseconds when the job was last updated.
         expires_at_millis:
           type: integer
           format: uint64
-          description: Monotonic server timestamp after which the retained job status may be removed.
+          description: Unix epoch milliseconds after which the retained job status may be removed.
     ClusterDataNodeStatus:
       type: object
       required:
@@ -9027,12 +9036,23 @@ paths:
           type: string
     post:
       summary: Cancel a derived document artifact reprocess job
+      description: |
+        Cancels a queued document artifact reprocess job. If a reprocess pass is
+        already running, the response returns the current running state;
+        cancellation is applied only at pass boundaries so the API never reports
+        a committed in-flight pass as cancelled.
       tags:
         - data_operations
       operationId: cancelDocumentArtifactReprocessJob
       responses:
         "200":
-          description: Reprocess job was cancelled or already terminal
+          description: Reprocess job cancelled or already terminal.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentArtifactReprocessJob"
+        "202":
+          description: Cancellation requested; the current running pass has not yet reached a cancellation boundary.
           content:
             application/json:
               schema:

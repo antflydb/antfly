@@ -1362,7 +1362,13 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Cancel a derived document artifact reprocess job */
+        /**
+         * Cancel a derived document artifact reprocess job
+         * @description Cancels a queued document artifact reprocess job. If a reprocess pass is
+         *     already running, the response returns the current running state;
+         *     cancellation is applied only at pass boundaries so the API never reports
+         *     a committed in-flight pass as cancelled.
+         */
         post: operations["cancelDocumentArtifactReprocessJob"];
         delete?: never;
         options?: never;
@@ -3250,6 +3256,11 @@ export interface components {
              * @description Server-assigned durable repair job identifier.
              */
             job_id: number;
+            /**
+             * Format: uint64
+             * @description Monotonic execution attempt token for the current running pass.
+             */
+            attempt_id: number;
             /** @description Table containing the source documents being repaired. */
             table_name: string;
             /** @description Name of the derived artifact being repaired. */
@@ -3291,19 +3302,21 @@ export interface components {
             shard_cursors: components["schemas"]["DocumentArtifactReprocessShardCursor"][];
             /** @description Last terminal or transient job error, when available. */
             last_error?: string | null;
+            /** @description Whether cancellation has been requested for a running pass. Running passes finish at a bounded reprocess boundary before the job transitions to cancelled. */
+            cancel_requested: boolean;
             /**
              * Format: uint64
-             * @description Monotonic server timestamp when the job was created.
+             * @description Unix epoch milliseconds when the job was created.
              */
             created_at_millis: number;
             /**
              * Format: uint64
-             * @description Monotonic server timestamp when the job was last updated.
+             * @description Unix epoch milliseconds when the job was last updated.
              */
             last_updated_at_millis: number;
             /**
              * Format: uint64
-             * @description Monotonic server timestamp after which the retained job status may be removed.
+             * @description Unix epoch milliseconds after which the retained job status may be removed.
              */
             expires_at_millis: number;
         };
@@ -13155,8 +13168,17 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Reprocess job was cancelled or already terminal */
+            /** @description Reprocess job cancelled or already terminal. */
             200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentArtifactReprocessJob"];
+                };
+            };
+            /** @description Cancellation requested; the current running pass has not yet reached a cancellation boundary. */
+            202: {
                 headers: {
                     [name: string]: unknown;
                 };

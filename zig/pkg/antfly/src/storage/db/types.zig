@@ -1714,6 +1714,24 @@ pub const ArtifactRepairRunRequest = struct {
     force: bool = false,
 };
 
+pub const RepairCancelCheck = struct {
+    ptr: *anyopaque,
+    is_requested: *const fn (ptr: *anyopaque) bool,
+
+    pub fn requested(self: RepairCancelCheck) bool {
+        return self.is_requested(self.ptr);
+    }
+};
+
+pub const ArtifactRepairRunOptions = struct {
+    cancel_check: ?RepairCancelCheck = null,
+
+    pub fn cancelled(self: ArtifactRepairRunOptions) bool {
+        if (self.cancel_check) |check| return check.requested();
+        return false;
+    }
+};
+
 pub const ArtifactRepairResult = struct {
     scanned: u64 = 0,
     groups_scanned: u64 = 0,

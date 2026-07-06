@@ -2358,9 +2358,10 @@ pub fn build(b: *std.Build) void {
             "artifact reprocess job store starts and updates a job",
             "artifact reprocess job store recovers durable jobs and reseeds ids",
             "artifact reprocess job cleanup removes recovered durable expired jobs",
+            "artifact reprocess job store applies running cancellation at pass boundary",
             "repair job store starts and records a pass",
             "repair job store applies running cancellation at pass boundary",
-            "repair job store treats future running heartbeat as expired",
+            "repair job store does not expire future live running heartbeat",
             "table repair job records bounded pass and continuation",
         },
         .test_runner = .{

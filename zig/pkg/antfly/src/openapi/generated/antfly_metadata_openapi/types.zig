@@ -2070,6 +2070,8 @@ pub const DocumentArtifactTableReprocessResponse = struct {
 pub const DocumentArtifactReprocessJob = struct {
     /// Server-assigned durable repair job identifier.
     job_id: i64,
+    /// Monotonic execution attempt token for the current running pass.
+    attempt_id: i64,
     /// Table containing the source documents being repaired.
     table_name: []const u8,
     /// Name of the derived artifact being repaired.
@@ -2102,11 +2104,13 @@ pub const DocumentArtifactReprocessJob = struct {
     shard_cursors: []const DocumentArtifactReprocessShardCursor,
     /// Last terminal or transient job error, when available.
     last_error: ?[]const u8 = null,
-    /// Monotonic server timestamp when the job was created.
+    /// Whether cancellation has been requested for a running pass. Running passes finish at a bounded reprocess boundary before the job transitions to cancelled.
+    cancel_requested: bool,
+    /// Unix epoch milliseconds when the job was created.
     created_at_millis: i64,
-    /// Monotonic server timestamp when the job was last updated.
+    /// Unix epoch milliseconds when the job was last updated.
     last_updated_at_millis: i64,
-    /// Monotonic server timestamp after which the retained job status may be removed.
+    /// Unix epoch milliseconds after which the retained job status may be removed.
     expires_at_millis: i64,
 };
 
