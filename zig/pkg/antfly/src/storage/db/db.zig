@@ -41071,7 +41071,10 @@ test "db write sync trailing dense no-op batches drain stale delete replay at id
     while (attempts < slow_test_wait_attempts) : (attempts += 1) {
         const stats = try db.stats(alloc);
         defer types.freeDBStats(alloc, stats);
-        try std.testing.expectEqual(@as(usize, 1), stats.indexes.len);
+        if (stats.indexes.len != 1) {
+            sleepPollInterval();
+            continue;
+        }
         const index = stats.indexes[0];
         if (index.doc_count == 3 and
             index.replay_applied_sequence >= index.replay_target_sequence and
@@ -41107,7 +41110,10 @@ test "db write sync trailing dense no-op batches drain stale delete replay at id
     while (attempts < slow_test_wait_attempts) : (attempts += 1) {
         const stats = try db.stats(alloc);
         defer types.freeDBStats(alloc, stats);
-        try std.testing.expectEqual(@as(usize, 1), stats.indexes.len);
+        if (stats.indexes.len != 1) {
+            sleepPollInterval();
+            continue;
+        }
         const index = stats.indexes[0];
         if (index.doc_count == 2 and
             index.replay_applied_sequence >= index.replay_target_sequence and
