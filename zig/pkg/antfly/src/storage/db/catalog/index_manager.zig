@@ -1811,44 +1811,106 @@ pub const IndexManager = struct {
     /// (30s..10min). `remaining` is the quarantine count after this pass,
     /// read under the catalog lock so callers can stop polling at zero.
     pub fn retryFailedIndexLoads(self: *IndexManager, store: anytype, now_ns: u64, force: bool) !QuarantineRetryResult {
-        self.catalog_mutex.lockExclusive();
-        defer self.catalog_mutex.unlockExclusive();
-        if (self.failed_index_loads.count() == 0) return .{};
+        const RetryTask = struct {
+            name: []u8,
+            cfg: types.IndexConfig,
 
-        var due_names = std.ArrayListUnmanaged([]const u8).empty;
-        defer due_names.deinit(self.alloc);
-        var it = self.failed_index_loads.iterator();
-        while (it.next()) |entry| {
-            if (!force and now_ns < entry.value_ptr.next_retry_ns) continue;
-            // Keys are owned by the map and stable across the value updates
-            // below (no inserts/removes until the success path).
-            try due_names.append(self.alloc, entry.key_ptr.*);
+            fn deinit(task: *@This(), alloc: Allocator) void {
+                alloc.free(task.name);
+                task.cfg.deinit(alloc);
+                task.* = undefined;
+            }
+        };
+
+        var tasks = std.ArrayListUnmanaged(RetryTask).empty;
+        defer {
+            for (tasks.items) |*task| task.deinit(self.alloc);
+            tasks.deinit(self.alloc);
+        }
+        var stale_failed_names = std.ArrayListUnmanaged([]const u8).empty;
+        defer stale_failed_names.deinit(self.alloc);
+
+        {
+            self.catalog_mutex.lockExclusive();
+            defer self.catalog_mutex.unlockExclusive();
+            if (self.failed_index_loads.count() == 0) return .{};
+
+            var it = self.failed_index_loads.iterator();
+            while (it.next()) |entry| {
+                if (!force and now_ns < entry.value_ptr.next_retry_ns) continue;
+                const cfg = blk: {
+                    for (self.status_only_index_configs) |*candidate| {
+                        if (std.mem.eql(u8, candidate.name, entry.key_ptr.*)) break :blk candidate.*;
+                    }
+                    try stale_failed_names.append(self.alloc, entry.key_ptr.*);
+                    continue;
+                };
+                var task = RetryTask{
+                    .name = try self.alloc.dupe(u8, entry.key_ptr.*),
+                    .cfg = undefined,
+                };
+                var task_name_owned = true;
+                errdefer if (task_name_owned) self.alloc.free(task.name);
+                task.cfg = try types.IndexConfig.clone(self.alloc, cfg);
+                var task_cfg_owned = true;
+                errdefer if (task_cfg_owned) task.cfg.deinit(self.alloc);
+                try tasks.append(self.alloc, task);
+                task_name_owned = false;
+                task_cfg_owned = false;
+            }
+            for (stale_failed_names.items) |name| self.dropFailedIndexLoad(name);
         }
 
         var recovered: usize = 0;
-        for (due_names.items) |name| {
-            const cfg = blk: {
-                for (self.status_only_index_configs) |*candidate| {
-                    if (std.mem.eql(u8, candidate.name, name)) break :blk candidate.*;
-                }
-                // Config vanished (concurrent drop); clear the stale record.
-                self.dropFailedIndexLoad(name);
+        for (tasks.items) |*task| {
+            self.catalog_mutex.lockExclusive();
+            if (self.failed_index_loads.get(task.name) == null) {
+                self.catalog_mutex.unlockExclusive();
                 continue;
+            }
+            self.beginIndexLoadNoLock(task.name) catch |err| {
+                self.catalog_mutex.unlockExclusive();
+                return err;
             };
-            try self.beginIndexLoadNoLock(name);
-            var opened = self.openConfiguredIndexDetached(store, cfg, true, false) catch |err| {
-                self.completeIndexLoadNoLock(name);
-                const record = self.failed_index_loads.getPtr(name) orelse continue;
+            self.catalog_mutex.unlockExclusive();
+
+            var opened = self.openConfiguredIndexDetached(store, task.cfg, true, false) catch |err| {
+                self.catalog_mutex.lockExclusive();
+                defer self.catalog_mutex.unlockExclusive();
+                self.completeIndexLoadNoLock(task.name);
+                const record = self.failed_index_loads.getPtr(task.name) orelse continue;
                 record.err_name = @errorName(err);
                 record.retry_attempts +|= 1;
                 record.next_retry_ns = now_ns + quarantineRetryBackoffNs(record.retry_attempts);
                 std.log.warn("quarantined index retry failed name={s} attempt={d} err={s}", .{
-                    name,
+                    task.name,
                     record.retry_attempts,
                     @errorName(err),
                 });
                 continue;
             };
+
+            self.catalog_mutex.lockExclusive();
+            if (self.failed_index_loads.get(task.name) == null) {
+                self.completeIndexLoadNoLock(task.name);
+                self.catalog_mutex.unlockExclusive();
+                opened.deinit(self);
+                continue;
+            }
+            var remove_idx: ?usize = null;
+            for (self.status_only_index_configs, 0..) |old_cfg, i| {
+                if (std.mem.eql(u8, old_cfg.name, task.name)) {
+                    remove_idx = i;
+                    break;
+                }
+            }
+            if (remove_idx == null) {
+                self.completeIndexLoadNoLock(task.name);
+                self.dropFailedIndexLoad(task.name);
+                self.catalog_mutex.unlockExclusive();
+                opened.deinit(self);
+                continue;
+            }
             // Pre-allocate the shrunken status-only list so registration and
             // de-quarantine commit together once the open has succeeded.
             const old = self.status_only_index_configs;
@@ -1856,20 +1918,22 @@ pub const IndexManager = struct {
                 &.{}
             else
                 self.alloc.alloc(types.IndexConfig, old.len - 1) catch |err| {
-                    self.completeIndexLoadNoLock(name);
+                    self.completeIndexLoadNoLock(task.name);
+                    self.catalog_mutex.unlockExclusive();
                     opened.deinit(self);
                     return err;
                 };
             self.appendOpenedIndex(opened) catch |err| {
                 if (replacement.len > 0) self.alloc.free(replacement);
-                self.completeIndexLoadNoLock(name);
+                self.completeIndexLoadNoLock(task.name);
+                self.catalog_mutex.unlockExclusive();
                 opened.deinit(self);
                 return err;
             };
-            self.completeIndexLoadNoLock(name);
+            self.completeIndexLoadNoLock(task.name);
             var wi: usize = 0;
-            for (old) |old_cfg| {
-                if (std.mem.eql(u8, old_cfg.name, name)) {
+            for (old, 0..) |old_cfg, i| {
+                if (i == remove_idx.?) {
                     var removed = old_cfg;
                     removed.deinit(self.alloc);
                     continue;
@@ -1880,10 +1944,14 @@ pub const IndexManager = struct {
             if (old.len > 0) self.alloc.free(old);
             self.status_only_index_configs = replacement;
             // Log before dropFailedIndexLoad frees the `name` key buffer.
-            std.log.info("quarantined index recovered name={s} kind={s}", .{ name, @tagName(cfg.kind) });
-            self.dropFailedIndexLoad(name);
+            std.log.info("quarantined index recovered name={s} kind={s}", .{ task.name, @tagName(task.cfg.kind) });
+            self.dropFailedIndexLoad(task.name);
+            self.catalog_mutex.unlockExclusive();
             recovered += 1;
         }
+
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
         return .{ .recovered = recovered, .remaining = self.failed_index_loads.count() };
     }
 
@@ -5990,9 +6058,6 @@ pub const IndexManager = struct {
         const upper = try internal_keys.documentRangeUpperAlloc(self.alloc, if (self.byte_range.end.len > 0) self.byte_range.end else "");
         defer if (upper) |buf| self.alloc.free(buf);
 
-        var identity_txn = try runtime_store.store.beginProbe();
-        defer identity_txn.abort();
-
         var mapped_docs = std.ArrayListUnmanaged(mapper.MapperDoc).empty;
         defer {
             for (mapped_docs.items) |doc| {
@@ -6004,8 +6069,8 @@ pub const IndexManager = struct {
 
         var flushed_batches: usize = 0;
         var saw_visible_doc = false;
-        var max_flushed_key: ?[]const u8 = null;
-        defer if (max_flushed_key) |buf| self.alloc.free(buf);
+        var batch_last_doc_key: ?[]const u8 = null;
+        defer if (batch_last_doc_key) |buf| self.alloc.free(buf);
 
         const flush_batch = struct {
             fn run(
@@ -6044,83 +6109,108 @@ pub const IndexManager = struct {
             }
         }.run;
 
-        const ScanState = struct {
-            manager: *IndexManager,
-            store: *docstore_mod.DocStore,
-            text_entry: *TextIndex,
-            rebuild_state: backfill_state_mod.RebuildState,
-            identity_txn: *@TypeOf(identity_txn),
-            resume_from: ?[]const u8,
-            mapped_docs: *std.ArrayListUnmanaged(mapper.MapperDoc),
-            max_flushed_key: *?[]const u8,
-            flushed_batches: *usize,
-            saw_visible_doc: *bool,
+        var scan_lower_buf: ?[]u8 = if (resume_from) |buf| try self.alloc.dupe(u8, buf) else null;
+        defer if (scan_lower_buf) |buf| self.alloc.free(buf);
+        const scan_budget_per_page = @max(text_backfill_batch_size * 32, 256);
+        var reached_end = false;
 
-            fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!backend_scan.ScanAction {
-                const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
-                if (isMetadataKey(key)) return .@"continue";
-                if (!state.manager.keyInRange(key)) return .@"continue";
-                if (!try textIndexShouldConsumeDoc(state.manager, state.text_entry, key)) return .@"continue";
-                if (state.resume_from) |resume_key| {
-                    if (resume_key.len > 0 and std.mem.order(u8, key, resume_key) != .gt) return .@"continue";
+        while (!reached_end) {
+            var identity_txn = try runtime_store.store.beginProbe();
+            var identity_txn_open = true;
+            errdefer if (identity_txn_open) identity_txn.abort();
+            var page_last_seen_key: ?[]u8 = null;
+            defer if (page_last_seen_key) |buf| self.alloc.free(buf);
+
+            const ScanState = struct {
+                manager: *IndexManager,
+                text_entry: *TextIndex,
+                identity_txn: *@TypeOf(identity_txn),
+                lower_exclusive: ?[]const u8,
+                mapped_docs: *std.ArrayListUnmanaged(mapper.MapperDoc),
+                batch_last_doc_key: *?[]const u8,
+                page_last_seen_key: *?[]u8,
+                saw_visible_doc: *bool,
+                scan_budget: usize,
+                scanned: usize = 0,
+                stopped_early: bool = false,
+
+                fn rememberKey(state: *@This(), key: []const u8) !void {
+                    if (state.page_last_seen_key.*) |old| state.manager.alloc.free(old);
+                    state.page_last_seen_key.* = try state.manager.alloc.dupe(u8, key);
                 }
 
-                state.saw_visible_doc.* = true;
-                const doc_id = if (internal_keys.isPrimaryDocumentKey(key))
-                    (try internal_keys.decodePrimaryDocumentKeyAlloc(state.manager.alloc, key)) orelse return .@"continue"
-                else
-                    try state.manager.alloc.dupe(u8, key);
-                var doc_id_owned = true;
-                errdefer if (doc_id_owned) state.manager.alloc.free(doc_id);
-                const doc_value = try state.manager.alloc.dupe(u8, value);
-                var doc_value_owned = true;
-                errdefer if (doc_value_owned) state.manager.alloc.free(doc_value);
+                fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!backend_scan.ScanAction {
+                    const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
+                    if (state.lower_exclusive) |exclusive| {
+                        if (std.mem.order(u8, key, exclusive) != .gt) return .@"continue";
+                    }
+                    try state.rememberKey(key);
+                    state.scanned += 1;
+                    if (isMetadataKey(key) or !state.manager.keyInRange(key) or !try textIndexShouldConsumeDoc(state.manager, state.text_entry, key)) {
+                        if (state.scanned >= state.scan_budget) {
+                            state.stopped_early = true;
+                            return .stop;
+                        }
+                        return .@"continue";
+                    }
 
-                try state.mapped_docs.append(state.manager.alloc, .{
-                    .key = doc_id,
-                    .value = doc_value,
-                    .doc_ordinal = try doc_identity.lookupOrdinalTxn(state.manager.alloc, state.identity_txn, doc_id),
-                });
-                doc_id_owned = false;
-                doc_value_owned = false;
+                    state.saw_visible_doc.* = true;
+                    const doc_id = if (internal_keys.isPrimaryDocumentKey(key))
+                        (try internal_keys.decodePrimaryDocumentKeyAlloc(state.manager.alloc, key)) orelse return .@"continue"
+                    else
+                        try state.manager.alloc.dupe(u8, key);
+                    var doc_id_owned = true;
+                    errdefer if (doc_id_owned) state.manager.alloc.free(doc_id);
+                    const doc_value = try state.manager.alloc.dupe(u8, value);
+                    var doc_value_owned = true;
+                    errdefer if (doc_value_owned) state.manager.alloc.free(doc_value);
 
-                if (state.max_flushed_key.* == null or std.mem.order(u8, key, state.max_flushed_key.*.?) == .gt) {
-                    if (state.max_flushed_key.*) |old| state.manager.alloc.free(old);
-                    state.max_flushed_key.* = try state.manager.alloc.dupe(u8, key);
+                    try state.mapped_docs.append(state.manager.alloc, .{
+                        .key = doc_id,
+                        .value = doc_value,
+                        .doc_ordinal = try doc_identity.lookupOrdinalTxn(state.manager.alloc, state.identity_txn, doc_id),
+                    });
+                    doc_id_owned = false;
+                    doc_value_owned = false;
+
+                    if (state.batch_last_doc_key.*) |old| state.manager.alloc.free(old);
+                    state.batch_last_doc_key.* = try state.manager.alloc.dupe(u8, key);
+
+                    const backfill_batch_size = if (@import("builtin").is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
+                    if (state.mapped_docs.items.len >= backfill_batch_size or state.scanned >= state.scan_budget) {
+                        state.stopped_early = true;
+                        return .stop;
+                    }
+                    return .@"continue";
                 }
+            };
 
-                const backfill_batch_size = if (@import("builtin").is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
-                if (state.mapped_docs.items.len >= backfill_batch_size) {
-                    try flush_batch(
-                        state.manager,
-                        state.store,
-                        state.text_entry,
-                        state.rebuild_state,
-                        state.mapped_docs,
-                        state.max_flushed_key.*.?,
-                        state.flushed_batches,
-                    );
-                }
-                return .@"continue";
+            var scan_state = ScanState{
+                .manager = self,
+                .text_entry = entry,
+                .identity_txn = &identity_txn,
+                .lower_exclusive = scan_lower_buf,
+                .mapped_docs = &mapped_docs,
+                .batch_last_doc_key = &batch_last_doc_key,
+                .page_last_seen_key = &page_last_seen_key,
+                .saw_visible_doc = &saw_visible_doc,
+                .scan_budget = scan_budget_per_page,
+            };
+            try backend_scan.scanWithContext(&runtime_store.store, if (scan_lower_buf) |buf| buf else lower, if (upper) |buf| buf else "", .{}, &scan_state, ScanState.scanEntry);
+            identity_txn.abort();
+            identity_txn_open = false;
+            reached_end = !scan_state.stopped_early or page_last_seen_key == null;
+
+            if (page_last_seen_key) |seen| {
+                if (scan_lower_buf) |old| self.alloc.free(old);
+                scan_lower_buf = try self.alloc.dupe(u8, seen);
             }
-        };
 
-        var scan_state = ScanState{
-            .manager = self,
-            .store = store,
-            .text_entry = entry,
-            .rebuild_state = rebuild_state,
-            .identity_txn = &identity_txn,
-            .resume_from = resume_from,
-            .mapped_docs = &mapped_docs,
-            .max_flushed_key = &max_flushed_key,
-            .flushed_batches = &flushed_batches,
-            .saw_visible_doc = &saw_visible_doc,
-        };
-        try backend_scan.scanWithContext(&runtime_store.store, lower, if (upper) |buf| buf else "", .{}, &scan_state, ScanState.scanEntry);
-
-        if (mapped_docs.items.len > 0) {
-            try flush_batch(self, store, entry, rebuild_state, &mapped_docs, max_flushed_key.?, &flushed_batches);
+            if (mapped_docs.items.len > 0) {
+                try flush_batch(self, store, entry, rebuild_state, &mapped_docs, batch_last_doc_key.?, &flushed_batches);
+                if (batch_last_doc_key) |old| self.alloc.free(old);
+                batch_last_doc_key = null;
+            }
         }
 
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();

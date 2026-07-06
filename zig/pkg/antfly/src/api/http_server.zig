@@ -7361,7 +7361,7 @@ pub const ApiHttpServer = struct {
             .result = result,
         }, .{ .emit_null_optional_fields = false });
         defer self.alloc.free(response_body);
-        return try jsonBodyResponseWithStatus(self.alloc, 202, response_body);
+        return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
     }
 
     pub fn handlePublicStartDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, body: []const u8) !http_common.HttpResponse {

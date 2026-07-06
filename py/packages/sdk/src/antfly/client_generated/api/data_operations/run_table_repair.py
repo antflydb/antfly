@@ -38,10 +38,10 @@ def _get_kwargs(
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
 ) -> ArtifactRepairRunResponse | Error | None:
-    if response.status_code == 202:
-        response_202 = ArtifactRepairRunResponse.from_dict(response.json())
+    if response.status_code == 200:
+        response_200 = ArtifactRepairRunResponse.from_dict(response.json())
 
-        return response_202
+        return response_200
 
     if response.status_code == 400:
         response_400 = Error.from_dict(response.json())
@@ -88,7 +88,7 @@ def sync_detailed(
 ) -> Response[ArtifactRepairRunResponse | Error]:
     """Run a bounded table repair pass
 
-     Attempts to repair queued table issues. `target=artifact` reprocesses
+     Synchronously attempts to repair queued table issues. `target=artifact` reprocesses
     supported artifact kinds and replays derived state; it is bounded by
     `limit` and returns an opaque continuation cursor when another artifact
     repair page is available. `target=index` repairs one named index after
@@ -130,7 +130,7 @@ def sync(
 ) -> ArtifactRepairRunResponse | Error | None:
     """Run a bounded table repair pass
 
-     Attempts to repair queued table issues. `target=artifact` reprocesses
+     Synchronously attempts to repair queued table issues. `target=artifact` reprocesses
     supported artifact kinds and replays derived state; it is bounded by
     `limit` and returns an opaque continuation cursor when another artifact
     repair page is available. `target=index` repairs one named index after
@@ -167,7 +167,7 @@ async def asyncio_detailed(
 ) -> Response[ArtifactRepairRunResponse | Error]:
     """Run a bounded table repair pass
 
-     Attempts to repair queued table issues. `target=artifact` reprocesses
+     Synchronously attempts to repair queued table issues. `target=artifact` reprocesses
     supported artifact kinds and replays derived state; it is bounded by
     `limit` and returns an opaque continuation cursor when another artifact
     repair page is available. `target=index` repairs one named index after
@@ -207,7 +207,7 @@ async def asyncio(
 ) -> ArtifactRepairRunResponse | Error | None:
     """Run a bounded table repair pass
 
-     Attempts to repair queued table issues. `target=artifact` reprocesses
+     Synchronously attempts to repair queued table issues. `target=artifact` reprocesses
     supported artifact kinds and replays derived state; it is bounded by
     `limit` and returns an opaque continuation cursor when another artifact
     repair page is available. `target=index` repairs one named index after

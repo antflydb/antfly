@@ -1083,7 +1083,7 @@ export interface paths {
         put?: never;
         /**
          * Run a bounded table repair pass
-         * @description Attempts to repair queued table issues. `target=artifact` reprocesses
+         * @description Synchronously attempts to repair queued table issues. `target=artifact` reprocesses
          *     supported artifact kinds and replays derived state; it is bounded by
          *     `limit` and returns an opaque continuation cursor when another artifact
          *     repair page is available. `target=index` repairs one named index after
@@ -12587,8 +12587,8 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Bounded table repair pass was accepted */
-            202: {
+            /** @description Bounded table repair pass completed */
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
