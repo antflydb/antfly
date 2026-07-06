@@ -1061,6 +1061,26 @@ const SegmentSortValue = union(enum) {
     }
 };
 
+const SegmentSortValueTag = enum {
+    u64_val,
+    i64_val,
+    f64_val,
+    bool_val,
+    bytes_val,
+    id,
+};
+
+fn segmentSortValueTag(value: SegmentSortValue) SegmentSortValueTag {
+    return switch (value) {
+        .u64_val => .u64_val,
+        .i64_val => .i64_val,
+        .f64_val => .f64_val,
+        .bool_val => .bool_val,
+        .bytes_val => .bytes_val,
+        .id => .id,
+    };
+}
+
 const SortedMergeRecord = struct {
     ref: MergeDocRef,
     keys: []SegmentSortValue,
@@ -1776,6 +1796,7 @@ fn buildSortedMergePlanAlloc(
         }
     }
 
+    try validateSortedMergeKeyDomainsAlloc(alloc, records.items, index_sort.len);
     std.sort.pdq(SortedMergeRecord, records.items, index_sort, sortedMergeRecordLessThan);
     for (records.items, 0..) |record, out_doc_id| {
         doc_maps[record.ref.input_idx][record.ref.doc_id] = @intCast(out_doc_id);
@@ -1785,6 +1806,28 @@ fn buildSortedMergePlanAlloc(
         .records = try records.toOwnedSlice(alloc),
         .doc_maps = doc_maps,
     };
+}
+
+fn validateSortedMergeKeyDomainsAlloc(
+    alloc: Allocator,
+    records: []const SortedMergeRecord,
+    key_count: usize,
+) !void {
+    const expected = try alloc.alloc(?SegmentSortValueTag, key_count);
+    defer alloc.free(expected);
+    @memset(expected, null);
+
+    for (records) |record| {
+        if (record.keys.len != key_count) return error.InvalidSegment;
+        for (record.keys, 0..) |key, i| {
+            const tag = segmentSortValueTag(key);
+            if (expected[i]) |existing| {
+                if (existing != tag) return error.InvalidSegment;
+            } else {
+                expected[i] = tag;
+            }
+        }
+    }
 }
 
 fn validateInputIndexSortMetadata(
@@ -2963,6 +3006,60 @@ test "segment sorted merge rejects non-finite f64 index sort values" {
     };
     try std.testing.expectError(error.InvalidSegment, mergeSegmentInputsWithOptions(alloc, &.{
         .{ .reader = &reader },
+    }, .{ .index_sort = &sort_fields }));
+}
+
+test "segment sorted merge rejects mixed index sort doc value domains" {
+    const alloc = std.testing.allocator;
+
+    var u64_writer = typed_dv.TypedDocValuesWriter.init(alloc, .u64_val, 1024);
+    defer u64_writer.deinit();
+    try u64_writer.add(0, .{ .u64_val = 2 });
+    const u64_data = try u64_writer.build();
+    defer alloc.free(u64_data);
+
+    var sw1 = SegmentWriter.init(alloc);
+    defer sw1.deinit();
+    const price1 = try sw1.addField("price");
+    try sw1.addSection(price1, .typed_doc_values, u64_data);
+    try sw1.addStoredDoc("doc:b", "{\"price\":2}");
+    try sw1.addIndexSortMetadata(&.{
+        .{ .field = "price", .desc = false },
+        .{ .field = "_id", .desc = false },
+    });
+    const seg1 = try sw1.build();
+    defer alloc.free(seg1);
+
+    var i64_writer = typed_dv.TypedDocValuesWriter.init(alloc, .i64_val, 1024);
+    defer i64_writer.deinit();
+    try i64_writer.add(0, .{ .i64_val = 1 });
+    const i64_data = try i64_writer.build();
+    defer alloc.free(i64_data);
+
+    var sw2 = SegmentWriter.init(alloc);
+    defer sw2.deinit();
+    const price2 = try sw2.addField("price");
+    try sw2.addSection(price2, .typed_doc_values, i64_data);
+    try sw2.addStoredDoc("doc:a", "{\"price\":1}");
+    try sw2.addIndexSortMetadata(&.{
+        .{ .field = "price", .desc = false },
+        .{ .field = "_id", .desc = false },
+    });
+    const seg2 = try sw2.build();
+    defer alloc.free(seg2);
+
+    var reader1 = try SegmentReader.init(alloc, seg1);
+    defer reader1.deinit();
+    var reader2 = try SegmentReader.init(alloc, seg2);
+    defer reader2.deinit();
+
+    const sort_fields = [_]SegmentIndexSortField{
+        .{ .field = "price", .desc = false },
+        .{ .field = "_id", .desc = false },
+    };
+    try std.testing.expectError(error.InvalidSegment, mergeSegmentInputsWithOptions(alloc, &.{
+        .{ .reader = &reader1 },
+        .{ .reader = &reader2 },
     }, .{ .index_sort = &sort_fields }));
 }
 

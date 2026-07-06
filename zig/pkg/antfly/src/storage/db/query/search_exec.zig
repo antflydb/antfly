@@ -10322,7 +10322,7 @@ fn typedDocValuesCoverLiveDocsAlloc(
 }
 
 fn sortFieldMapping(schema: runtime_schema_mod.TableSchema, field: []const u8) ?runtime_schema_mod.FieldMapping {
-    return runtime_schema_mod.resolveFieldType(schema, field);
+    return runtime_schema_mod.resolveDeclaredFieldType(schema, field);
 }
 
 const NativeSortPlanRejectionReason = enum {

@@ -364,7 +364,7 @@ fn mappedIndexSortFieldIsScalar(field_type: runtime_schema.AntflyType) bool {
 
 fn validateIndexSortField(schema: runtime_schema.TableSchema, field: runtime_schema.IndexSortField) !void {
     if (sortFieldIsReservedId(field.field)) return;
-    const mapping = runtime_schema.resolveFieldType(schema, field.field) orelse return error.UnsupportedQueryRequest;
+    const mapping = runtime_schema.resolveDeclaredFieldType(schema, field.field) orelse return error.UnsupportedQueryRequest;
     if (!mappedIndexSortFieldIsScalar(mapping.field_type)) return error.UnsupportedQueryRequest;
     if (!mapping.doc_values or !mapping.sortable) return error.UnsupportedQueryRequest;
 }
@@ -3571,6 +3571,57 @@ test "document mapper flushes schema index_sort segments in physical sort order"
     try std.testing.expectEqual(typed_dv.ValueType.i64_val, values.value_type);
     try std.testing.expectEqual(@as(?i64, 1), try values.getI64(0));
     try std.testing.expectEqual(@as(?i64, 2), try values.getI64(1));
+}
+
+test "document mapper accepts match-mapping-type dynamic template index_sort field" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const templates = [_]runtime_schema.DynamicTemplate{
+        .{
+            .name = "dates",
+            .path_match = "created_at",
+            .match_mapping_type = "date",
+            .mapping = .{
+                .field_type = .datetime,
+                .doc_values = true,
+                .sortable = true,
+                .analyzer = "keyword",
+            },
+        },
+    };
+    const index_sort = [_]runtime_schema.IndexSortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id", .desc = false },
+    };
+    const schema: runtime_schema.TableSchema = .{
+        .dynamic_templates = &templates,
+        .index_sort = &index_sort,
+    };
+
+    var result = try buildTextSegmentFromDocumentsWithMetadata(alloc, &.{
+        .{ .key = "doc:old", .value = "{\"created_at\":\"2026-01-01T00:00:00Z\"}" },
+        .{ .key = "doc:new", .value = "{\"created_at\":\"2026-01-02T00:00:00Z\"}" },
+    }, text_analysis, schema);
+    defer result.deinit(alloc);
+
+    const segment = result.segment orelse return error.TestExpectedEqual;
+    var reader = try segment_mod.SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+    try std.testing.expectEqualStrings("doc:new", reader.storedDoc(0).?.id);
+    try std.testing.expectEqualStrings("doc:old", reader.storedDoc(1).?.id);
+
+    const fields = (try reader.indexSortFieldsAlloc(alloc)) orelse return error.TestExpectedEqual;
+    defer segment_mod.freeIndexSortFields(alloc, fields);
+    try std.testing.expectEqual(@as(usize, 2), fields.len);
+    try std.testing.expectEqualStrings("created_at", fields[0].field);
+    try std.testing.expect(fields[0].desc);
+    try std.testing.expectEqualStrings("_id", fields[1].field);
+    try std.testing.expect(!fields[1].desc);
+
+    const section = reader.getSection("created_at", .typed_doc_values) orelse return error.TestExpectedEqual;
+    var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
+    try std.testing.expectEqual(typed_dv.ValueType.u64_val, values.value_type);
+    try std.testing.expect((try values.getU64(0)).? > (try values.getU64(1)).?);
 }
 
 test "document mapper rejects mixed native value types for index_sort field" {

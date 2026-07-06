@@ -718,6 +718,17 @@ pub fn resolveFieldType(schema: TableSchema, field_name: []const u8) ?FieldMappi
     return resolveFieldTypeForValue(schema, field_name, null);
 }
 
+/// Resolve a declared mapping for a concrete field path without requiring a
+/// sample value for `match_mapping_type`. Use this only for schema/config
+/// validation paths that still require physical coverage before queryability.
+pub fn resolveDeclaredFieldType(schema: TableSchema, path: []const u8) ?FieldMapping {
+    const field_name = fieldNameFromPath(path);
+    for (schema.dynamic_templates) |tmpl| {
+        if (dynamicTemplateMatchesDeclaredPath(tmpl, path, field_name)) return tmpl.mapping;
+    }
+    return null;
+}
+
 /// Resolve the field type for a field/path using dynamic templates and an
 /// optional runtime value for `match_mapping_type` matching.
 pub fn resolveFieldTypeForValue(schema: TableSchema, path: []const u8, value: ?std.json.Value) ?FieldMapping {
@@ -1039,6 +1050,26 @@ fn dynamicTemplateMatches(
     if (tmpl.match_mapping_type) |expected| {
         const actual = if (value) |v| inferDynamicTemplateMatchType(v) else null;
         if (actual == null or !std.mem.eql(u8, expected, actual.?)) return false;
+    }
+    return true;
+}
+
+fn dynamicTemplateMatchesDeclaredPath(
+    tmpl: DynamicTemplate,
+    path: []const u8,
+    field_name: []const u8,
+) bool {
+    if (tmpl.match_pattern) |pattern| {
+        if (!globMatch(pattern, field_name)) return false;
+    }
+    if (tmpl.unmatch_pattern) |pattern| {
+        if (globMatch(pattern, field_name)) return false;
+    }
+    if (tmpl.path_match) |pattern| {
+        if (!globMatch(pattern, path)) return false;
+    }
+    if (tmpl.path_unmatch) |pattern| {
+        if (globMatch(pattern, path)) return false;
     }
     return true;
 }
@@ -1831,6 +1862,15 @@ test "dynamic template selector and mapping-option resolution" {
     try std.testing.expect(resolveFieldTypeForValue(schema, "meta.skip_created_at", .{ .string = "2026-01-03T00:00:00Z" }) == null);
     try std.testing.expect(resolveFieldTypeForValue(schema, "meta.private.created_at", .{ .string = "2026-01-03T00:00:00Z" }) == null);
     try std.testing.expect(resolveFieldTypeForValue(schema, "meta.created_at", .{ .string = "not-a-date" }) == null);
+    try std.testing.expect(resolveFieldType(schema, "meta.created_at") == null);
+
+    const declared_created = resolveDeclaredFieldType(schema, "meta.created_at");
+    try std.testing.expect(declared_created != null);
+    try std.testing.expectEqual(AntflyType.datetime, declared_created.?.field_type);
+    try std.testing.expect(declared_created.?.doc_values);
+    try std.testing.expect(declared_created.?.sortable);
+    try std.testing.expect(resolveDeclaredFieldType(schema, "meta.skip_created_at") == null);
+    try std.testing.expect(resolveDeclaredFieldType(schema, "meta.private.created_at") == null);
 
     const tag = resolveFieldTypeForValue(schema, "meta.tags.primary", .{ .string = "alpha" });
     try std.testing.expect(tag != null);
