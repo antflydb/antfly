@@ -17069,8 +17069,7 @@ fn loadDocumentExtractionPreviousState(
             return parsed;
         } else |err| switch (err) {
             error.OutOfMemory => return err,
-            error.InvalidDocumentExtractionState, error.SyntaxError => {},
-            else => return err,
+            else => {},
         }
     }
     var recovered = try scanDocumentExtractionPreviousStateFromStore(alloc, db, doc_key, artifact_name);
@@ -36258,6 +36257,63 @@ test "db async document extraction accounts resource manager working set" {
     try std.testing.expectEqual(@as(u64, 0), stats.used_bytes);
 }
 
+test "db async document extraction deletes artifacts with corrupt previous extraction state" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .enable_without_producers = true,
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:async-delete",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"}",
+        }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:async-delete", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:async-delete", "document_units_v1", "document:000001");
+    defer alloc.free(unit_key);
+    const state_key = try assetStateKeyAlloc(alloc, "doc:async-delete", "document_units_v1");
+    defer alloc.free(state_key);
+
+    const initial_unit_payload = try db.core.store.get(alloc, unit_key);
+    alloc.free(initial_unit_payload);
+    try db.core.store.put(state_key, "{");
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:async-delete",
+            .value = "{\"url\":\"\"}",
+        }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, manifest_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, unit_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, state_key));
+}
+
 test "db document extraction routes mixed files using source metadata fields" {
     const alloc = std.testing.allocator;
 
@@ -39488,6 +39544,23 @@ test "db document extraction update recovers corrupt previous extraction state" 
     const recovered_chunk_keys = try documentExtractionStateChunkKeysAlloc(alloc, recovered_state);
     defer freeOwnedConstKeySlice(alloc, recovered_chunk_keys);
     try std.testing.expect(recovered_chunk_keys.len > 0);
+
+    try db.core.store.put(state_key, "{");
+
+    const url_v3 = try testLargeHtmlDataUrlAlloc(alloc, "v3", "corruptthirdtoken", 80);
+    defer alloc.free(url_v3);
+    const doc_v3 = try testSourceDocumentJsonAlloc(alloc, url_v3, "sha-v3");
+    defer alloc.free(doc_v3);
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:corrupt", .value = doc_v3 }},
+        .sync_level = .full_index,
+    });
+
+    const recovered_truncated_state = try db.core.store.get(alloc, state_key);
+    defer alloc.free(recovered_truncated_state);
+    const recovered_truncated_chunk_keys = try documentExtractionStateChunkKeysAlloc(alloc, recovered_truncated_state);
+    defer freeOwnedConstKeySlice(alloc, recovered_truncated_chunk_keys);
+    try std.testing.expect(recovered_truncated_chunk_keys.len > 0);
 }
 
 test "db extractEnrichments exposes cleaned writes and special fields" {
