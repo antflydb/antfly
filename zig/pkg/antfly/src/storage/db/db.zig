@@ -1957,6 +1957,7 @@ fn logSparseWriteProfileDelta(index_name: []const u8, delta: sparse_mod.WritePro
 
 var temp_path_nonce: u64 = 0;
 var split_replay_artifact_nonce: u64 = 0;
+var repair_shadow_nonce = AtomicU64.init(0);
 
 fn threadedIo() if (builtin.os.tag == .freestanding) void else std.Io.Threaded {
     if (builtin.os.tag == .freestanding) return;
@@ -7397,7 +7398,7 @@ pub const DB = struct {
         alloc: Allocator,
         cfg: types.IndexConfig,
     ) !ShadowIndexReplacementResult {
-        const shadow_base = try std.fmt.allocPrint(alloc, "{s}/.repair-shadow-{d}", .{ self.core.path, monotonicTimeNs() });
+        const shadow_base = try createUniqueRepairShadowBase(alloc, self.core.path);
         var shadow_installed = false;
         defer {
             var io_impl = threadedIo();
@@ -27661,6 +27662,33 @@ fn ensureDirPath(path: []const u8) !void {
     try fs_paths.createDirPathPortable(io_impl.io(), path);
 }
 
+fn createUniqueRepairShadowBase(alloc: Allocator, base_path: []const u8) ![]u8 {
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    try fs_paths.createDirPathPortable(io, base_path);
+
+    for (0..64) |_| {
+        const candidate = try std.fmt.allocPrint(alloc, "{s}/.repair-shadow-{d}-{x}", .{
+            base_path,
+            monotonicTimeNs(),
+            repair_shadow_nonce.fetchAdd(1, .monotonic),
+        });
+        errdefer alloc.free(candidate);
+        std.Io.Dir.cwd().createDir(io, candidate, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                alloc.free(candidate);
+                continue;
+            },
+            else => return err,
+        };
+        errdefer std.Io.Dir.cwd().deleteTree(io, candidate) catch {};
+        try fs_paths.syncDirPortable(io, base_path);
+        return candidate;
+    }
+    return error.PathAlreadyExists;
+}
+
 fn resetPath(path: []const u8) !void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
@@ -38830,6 +38858,32 @@ test "db index repair shadow swap survives reopen" {
         defer alloc.free(stale_canonical_file);
         try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, stale_canonical_file, .{}));
     }
+}
+
+test "db index repair shadow roots are allocated uniquely" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const first = try createUniqueRepairShadowBase(alloc, std.mem.span(path));
+    defer alloc.free(first);
+    const second = try createUniqueRepairShadowBase(alloc, std.mem.span(path));
+    defer alloc.free(second);
+    const third = try createUniqueRepairShadowBase(alloc, std.mem.span(path));
+    defer alloc.free(third);
+
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    try std.testing.expect(!std.mem.eql(u8, first, third));
+    try std.testing.expect(!std.mem.eql(u8, second, third));
+    try std.testing.expect(std.mem.indexOf(u8, first, "/.repair-shadow-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "/.repair-shadow-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, third, "/.repair-shadow-") != null);
+
+    try std.Io.Dir.cwd().access(std.testing.io, first, .{});
+    try std.Io.Dir.cwd().access(std.testing.io, second, .{});
+    try std.Io.Dir.cwd().access(std.testing.io, third, .{});
 }
 
 test "db index repair shadow swap preserves post snapshot mutations" {
