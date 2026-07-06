@@ -82,6 +82,8 @@ pub const TemplateFieldMapping = struct {
     doc_values: ?bool = null,
     /// Whether this doc-valued scalar field can be used in order_by
     sortable: ?bool = null,
+    /// Missing/null sort policy for this mapped field. The current production policy rejects missing or null native sort values so sorted cursors remain replayable JSON scalar tuples.
+    missing_null_policy: ?[]const u8 = null,
 };
 
 /// A rule for mapping dynamically detected fields. Templates are checked in order and the first matching template's mapping is used.

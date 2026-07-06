@@ -7,6 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.antfly_type_2 import AntflyType2
+from ..models.template_field_mapping_missing_null_policy import TemplateFieldMappingMissingNullPolicy
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="TemplateFieldMapping")
@@ -25,6 +26,11 @@ class TemplateFieldMapping:
         include_in_all (bool | Unset): Whether to include in the _all field for cross-field search Default: False.
         doc_values (bool | Unset): Whether to enable doc values for sorting/faceting Default: False.
         sortable (bool | Unset): Whether this doc-valued scalar field can be used in order_by Default: False.
+        missing_null_policy (TemplateFieldMappingMissingNullPolicy | Unset): Missing/null sort policy for this mapped
+            field. The current production
+            policy rejects missing or null native sort values so sorted cursors
+            remain replayable JSON scalar tuples.
+             Default: TemplateFieldMappingMissingNullPolicy.MISSING_REJECTED.
     """
 
     type_: AntflyType2 | Unset = UNSET
@@ -34,6 +40,9 @@ class TemplateFieldMapping:
     include_in_all: bool | Unset = False
     doc_values: bool | Unset = False
     sortable: bool | Unset = False
+    missing_null_policy: TemplateFieldMappingMissingNullPolicy | Unset = (
+        TemplateFieldMappingMissingNullPolicy.MISSING_REJECTED
+    )
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -53,6 +62,10 @@ class TemplateFieldMapping:
 
         sortable = self.sortable
 
+        missing_null_policy: str | Unset = UNSET
+        if not isinstance(self.missing_null_policy, Unset):
+            missing_null_policy = self.missing_null_policy.value
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -70,6 +83,8 @@ class TemplateFieldMapping:
             field_dict["doc_values"] = doc_values
         if sortable is not UNSET:
             field_dict["sortable"] = sortable
+        if missing_null_policy is not UNSET:
+            field_dict["missing_null_policy"] = missing_null_policy
 
         return field_dict
 
@@ -95,6 +110,13 @@ class TemplateFieldMapping:
 
         sortable = d.pop("sortable", UNSET)
 
+        _missing_null_policy = d.pop("missing_null_policy", UNSET)
+        missing_null_policy: TemplateFieldMappingMissingNullPolicy | Unset
+        if isinstance(_missing_null_policy, Unset):
+            missing_null_policy = UNSET
+        else:
+            missing_null_policy = TemplateFieldMappingMissingNullPolicy(_missing_null_policy)
+
         template_field_mapping = cls(
             type_=type_,
             analyzer=analyzer,
@@ -103,6 +125,7 @@ class TemplateFieldMapping:
             include_in_all=include_in_all,
             doc_values=doc_values,
             sortable=sortable,
+            missing_null_policy=missing_null_policy,
         )
 
         template_field_mapping.additional_properties = d

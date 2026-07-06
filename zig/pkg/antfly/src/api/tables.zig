@@ -976,14 +976,14 @@ fn generatedFieldCapabilitiesAlloc(
     defer runtime_schema_mod.freeFieldCapabilities(alloc, schema_capabilities);
 
     var out = std.ArrayListUnmanaged(metadata_openapi.FieldCapability).empty;
-    errdefer out.deinit(alloc);
+    errdefer freeGeneratedFieldCapabilitiesFromList(alloc, &out);
     for (schema_capabilities) |capability| {
-        try appendGeneratedFieldCapability(alloc, &out, generatedFieldCapability(capability));
+        try appendGeneratedFieldCapability(alloc, &out, try generatedFieldCapabilityAlloc(alloc, capability));
     }
 
     for (observedDynamicFieldCapabilitySetsFromStatus(storage_status)) |set| {
         for (set.field_capabilities) |capability| {
-            try appendGeneratedFieldCapability(alloc, &out, generatedFieldCapability(capability));
+            try appendGeneratedFieldCapability(alloc, &out, try generatedFieldCapabilityAlloc(alloc, capability));
         }
     }
 
@@ -995,20 +995,55 @@ fn appendGeneratedFieldCapability(
     out: *std.ArrayListUnmanaged(metadata_openapi.FieldCapability),
     capability: metadata_openapi.FieldCapability,
 ) !void {
-    for (out.items) |existing| {
-        if (generatedFieldCapabilitiesEquivalent(existing, capability)) return;
+    const owned = capability;
+    errdefer freeGeneratedFieldCapability(alloc, owned);
+    for (out.items) |*existing| {
+        if (!generatedFieldCapabilityAggregationKeyEqual(existing.*, owned)) continue;
+        try mergeGeneratedFieldCapability(alloc, existing, owned);
+        freeGeneratedFieldCapability(alloc, owned);
+        return;
     }
-    try out.append(alloc, capability);
+    try out.append(alloc, owned);
 }
 
-fn generatedFieldCapabilitiesEquivalent(
+fn generatedFieldCapabilityAggregationKeyEqual(
     left: metadata_openapi.FieldCapability,
     right: metadata_openapi.FieldCapability,
 ) bool {
     return optionalStringEql(left.field, right.field) and
         optionalStringEql(left.name, right.name) and
+        optionalStringEql(left.path_pattern, right.path_pattern) and
+        optionalStringEql(left.field_pattern, right.field_pattern) and
+        optionalStringEql(left.match_mapping_type, right.match_mapping_type) and
+        optionalStringEql(left.emitted_name, right.emitted_name) and
+        optionalStringEql(left.document_schema, right.document_schema) and
+        left.type == right.type and
         std.mem.eql(u8, left.provenance, right.provenance) and
-        left.type == right.type;
+        optionalStringEql(left.analyzer, right.analyzer);
+}
+
+fn mergeGeneratedFieldCapability(
+    alloc: std.mem.Allocator,
+    existing: *metadata_openapi.FieldCapability,
+    incoming: metadata_openapi.FieldCapability,
+) !void {
+    existing.searchable = existing.searchable and incoming.searchable;
+    existing.filterable = existing.filterable and incoming.filterable;
+    existing.aggregatable = existing.aggregatable and incoming.aggregatable;
+    existing.doc_values = existing.doc_values and incoming.doc_values;
+    existing.sortable = existing.sortable and incoming.sortable;
+    try replaceOwnedStringIfDifferent(alloc, &existing.doc_value_coverage, runtime_schema_mod.conservativeDocValueCoverage(existing.doc_value_coverage, incoming.doc_value_coverage));
+    try replaceOwnedStringIfDifferent(alloc, &existing.queryability_state, runtime_schema_mod.conservativeQueryabilityState(existing.queryability_state, incoming.queryability_state));
+    if (!std.mem.eql(u8, existing.missing_null_policy, incoming.missing_null_policy)) {
+        try replaceOwnedStringIfDifferent(alloc, &existing.missing_null_policy, "mixed");
+    }
+    if (existing.index_sort_position != incoming.index_sort_position or
+        !optionalStringEql(existing.index_sort_order, incoming.index_sort_order))
+    {
+        existing.index_sort_position = null;
+        if (existing.index_sort_order) |order| alloc.free(@constCast(order));
+        existing.index_sort_order = null;
+    }
 }
 
 fn optionalStringEql(left: ?[]const u8, right: ?[]const u8) bool {
@@ -1016,29 +1051,79 @@ fn optionalStringEql(left: ?[]const u8, right: ?[]const u8) bool {
     return std.mem.eql(u8, left.?, right.?);
 }
 
-fn generatedFieldCapability(capability: runtime_schema_mod.FieldCapability) metadata_openapi.FieldCapability {
-    return .{
-        .name = capability.name,
-        .field = capability.field,
-        .path_pattern = capability.path_pattern,
-        .field_pattern = capability.field_pattern,
-        .match_mapping_type = capability.match_mapping_type,
-        .emitted_name = capability.emitted_name,
-        .document_schema = capability.document_schema,
+fn generatedFieldCapabilityAlloc(alloc: std.mem.Allocator, capability: runtime_schema_mod.FieldCapability) !metadata_openapi.FieldCapability {
+    var owned = metadata_openapi.FieldCapability{
         .type = generatedAntflyType(capability.field_type),
         .searchable = capability.searchable,
         .filterable = capability.filterable,
         .aggregatable = capability.aggregatable,
         .doc_values = capability.doc_values,
         .sortable = capability.sortable,
-        .doc_value_coverage = capability.doc_value_coverage,
-        .provenance = capability.provenance,
-        .missing_null_policy = capability.missing_null_policy,
-        .queryability_state = capability.queryability_state,
-        .analyzer = capability.analyzer,
+        .doc_value_coverage = "",
+        .provenance = "",
+        .missing_null_policy = "",
+        .queryability_state = "",
         .index_sort_position = if (capability.index_sort) |membership| @intCast(membership.position) else null,
-        .index_sort_order = if (capability.index_sort) |membership| if (membership.desc) "desc" else "asc" else null,
     };
+    errdefer freeGeneratedFieldCapability(alloc, owned);
+
+    owned.name = try dupeOptionalString(alloc, capability.name);
+    owned.field = try dupeOptionalString(alloc, capability.field);
+    owned.path_pattern = try dupeOptionalString(alloc, capability.path_pattern);
+    owned.field_pattern = try dupeOptionalString(alloc, capability.field_pattern);
+    owned.match_mapping_type = try dupeOptionalString(alloc, capability.match_mapping_type);
+    owned.emitted_name = try dupeOptionalString(alloc, capability.emitted_name);
+    owned.document_schema = try dupeOptionalString(alloc, capability.document_schema);
+    owned.doc_value_coverage = try alloc.dupe(u8, capability.doc_value_coverage);
+    owned.provenance = try alloc.dupe(u8, capability.provenance);
+    owned.missing_null_policy = try alloc.dupe(u8, capability.missing_null_policy);
+    owned.queryability_state = try alloc.dupe(u8, capability.queryability_state);
+    owned.analyzer = try dupeOptionalString(alloc, capability.analyzer);
+    owned.index_sort_order = if (capability.index_sort) |membership| try alloc.dupe(u8, if (membership.desc) "desc" else "asc") else null;
+    return owned;
+}
+
+fn dupeOptionalString(alloc: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
+    return if (value) |text| try alloc.dupe(u8, text) else null;
+}
+
+fn replaceOwnedStringIfDifferent(alloc: std.mem.Allocator, target: *[]const u8, value: []const u8) !void {
+    if (std.mem.eql(u8, target.*, value)) return;
+    const owned = try alloc.dupe(u8, value);
+    alloc.free(@constCast(target.*));
+    target.* = owned;
+}
+
+fn freeGeneratedFieldCapabilitiesFromList(
+    alloc: std.mem.Allocator,
+    capabilities: *std.ArrayListUnmanaged(metadata_openapi.FieldCapability),
+) void {
+    for (capabilities.items) |capability| freeGeneratedFieldCapability(alloc, capability);
+    capabilities.deinit(alloc);
+}
+
+fn freeGeneratedFieldCapabilities(
+    alloc: std.mem.Allocator,
+    capabilities: []const metadata_openapi.FieldCapability,
+) void {
+    for (capabilities) |capability| freeGeneratedFieldCapability(alloc, capability);
+    if (capabilities.len > 0) alloc.free(@constCast(capabilities));
+}
+
+fn freeGeneratedFieldCapability(alloc: std.mem.Allocator, capability: metadata_openapi.FieldCapability) void {
+    if (capability.name) |value| alloc.free(@constCast(value));
+    if (capability.field) |value| alloc.free(@constCast(value));
+    if (capability.path_pattern) |value| alloc.free(@constCast(value));
+    if (capability.field_pattern) |value| alloc.free(@constCast(value));
+    if (capability.match_mapping_type) |value| alloc.free(@constCast(value));
+    if (capability.emitted_name) |value| alloc.free(@constCast(value));
+    if (capability.document_schema) |value| alloc.free(@constCast(value));
+    if (capability.doc_value_coverage.len > 0) alloc.free(@constCast(capability.doc_value_coverage));
+    if (capability.provenance.len > 0) alloc.free(@constCast(capability.provenance));
+    if (capability.missing_null_policy.len > 0) alloc.free(@constCast(capability.missing_null_policy));
+    if (capability.queryability_state.len > 0) alloc.free(@constCast(capability.queryability_state));
+    if (capability.analyzer) |value| alloc.free(@constCast(value));
+    if (capability.index_sort_order) |value| alloc.free(@constCast(value));
 }
 
 fn generatedAntflyType(value: runtime_schema_mod.AntflyType) metadata_openapi.AntflyType {
@@ -1983,6 +2068,8 @@ fn appendRuntimeSchemaObject(
         try out.appendSlice(alloc, if (tmpl.mapping.doc_values) "true" else "false");
         try out.appendSlice(alloc, ",\"sortable\":");
         try out.appendSlice(alloc, if (tmpl.mapping.sortable) "true" else "false");
+        try out.appendSlice(alloc, ",\"missing_null_policy\":");
+        try appendJsonString(alloc, out, runtime_schema_mod.missingNullPolicyName(tmpl.mapping.missing_null_policy));
         try out.appendSlice(alloc, ",\"include_in_all\":");
         try out.appendSlice(alloc, if (tmpl.mapping.include_in_all) "true" else "false");
         try out.appendSlice(alloc, ",\"analyzer\":");
@@ -2648,6 +2735,61 @@ test "metadata.table status encoder canonicalizes embeddings indexes without inl
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"semantic_kg\":{\"name\":\"semantic_kg\",\"type\":\"embeddings\"") != null);
 }
 
+fn testFieldCapabilityByIdentifier(root: std.json.Value, identifier: []const u8) ?std.json.Value {
+    const capabilities = root.object.get("field_capabilities") orelse return null;
+    if (capabilities != .array) return null;
+    for (capabilities.array.items) |capability| {
+        if (capability != .object) continue;
+        if (capability.object.get("field")) |field| {
+            if (field == .string and std.mem.eql(u8, field.string, identifier)) return capability;
+        }
+        if (capability.object.get("name")) |name| {
+            if (name == .string and std.mem.eql(u8, name.string, identifier)) return capability;
+        }
+    }
+    return null;
+}
+
+fn testGeneratedCapabilityByIdentifier(capabilities: []const metadata_openapi.FieldCapability, identifier: []const u8) ?metadata_openapi.FieldCapability {
+    for (capabilities) |capability| {
+        if (capability.field) |field| {
+            if (std.mem.eql(u8, field, identifier)) return capability;
+        }
+        if (capability.name) |name| {
+            if (std.mem.eql(u8, name, identifier)) return capability;
+        }
+    }
+    return null;
+}
+
+test "metadata.table generated field capabilities include schema dynamic templates" {
+    const schema_json =
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"created","path_match":"created_at","mapping":{"type":"datetime","doc_values":true,"sortable":true}}],"index_sort":[{"field":"created_at","order":"desc"}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"string","x-antfly-types":["text"]}}}}}}
+    ;
+    const table = metadata_table_manager.TableRecord{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = schema_json,
+        .indexes_json = "{}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    const capabilities = (try generatedFieldCapabilitiesAlloc(std.testing.allocator, &table, null)) orelse return error.TestUnexpectedResult;
+    defer freeGeneratedFieldCapabilities(std.testing.allocator, capabilities);
+
+    const created = testGeneratedCapabilityByIdentifier(capabilities, "created") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("created_at", created.path_pattern.?);
+    try std.testing.expectEqual(metadata_openapi.AntflyType.datetime, created.type);
+    try std.testing.expect(created.doc_values);
+    try std.testing.expect(created.sortable);
+    try std.testing.expectEqualStrings("missing_rejected", created.missing_null_policy);
+    try std.testing.expectEqualStrings("schema_declared", created.doc_value_coverage);
+    try std.testing.expectEqualStrings("dynamic_template", created.provenance);
+    try std.testing.expectEqual(@as(?i64, 0), created.index_sort_position);
+    try std.testing.expectEqualStrings("desc", created.index_sort_order.?);
+}
+
 test "metadata.table status exposes stable field capabilities" {
     const schema_json =
         \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"created","path_match":"created_at","mapping":{"type":"datetime","doc_values":true,"sortable":true}}],"index_sort":[{"field":"created_at","order":"desc"}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"string","x-antfly-types":["text"]}}}}}}
@@ -2664,13 +2806,25 @@ test "metadata.table status exposes stable field capabilities" {
 
     const encoded = (try encodeSingleTableStatus(std.testing.allocator, &snapshot, "docs")).?;
     defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field_capabilities\":[{\"field\":\"_id\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field\":\"created_at\",\"path_pattern\":\"created_at\",\"type\":\"datetime\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"doc_values\":true,\"sortable\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"doc_value_coverage\":\"schema_declared\",\"provenance\":\"dynamic_template\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"index_sort_position\":0,\"index_sort_order\":\"desc\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field\":\"title\",\"emitted_name\":\"title\",\"document_schema\":\"doc\",\"type\":\"text\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"queryability_state\":\"text_search_only\"") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+
+    const id_capability = testFieldCapabilityByIdentifier(parsed.value, "_id") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(id_capability.object.get("sortable").?.bool);
+
+    const created = testFieldCapabilityByIdentifier(parsed.value, "created") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("created_at", created.object.get("path_pattern").?.string);
+    try std.testing.expectEqualStrings("datetime", created.object.get("type").?.string);
+    try std.testing.expect(created.object.get("doc_values").?.bool);
+    try std.testing.expect(created.object.get("sortable").?.bool);
+    try std.testing.expectEqualStrings("missing_rejected", created.object.get("missing_null_policy").?.string);
+    try std.testing.expectEqualStrings("schema_declared", created.object.get("doc_value_coverage").?.string);
+    try std.testing.expectEqualStrings("dynamic_template", created.object.get("provenance").?.string);
+    try std.testing.expectEqual(@as(i64, 0), created.object.get("index_sort_position").?.integer);
+    try std.testing.expectEqualStrings("desc", created.object.get("index_sort_order").?.string);
+
+    try std.testing.expectEqualStrings("not_null", id_capability.object.get("missing_null_policy").?.string);
+    try std.testing.expectEqualStrings("queryable", id_capability.object.get("queryability_state").?.string);
 }
 
 test "metadata.table status includes observed dynamic field capabilities" {
@@ -2694,7 +2848,7 @@ test "metadata.table status includes observed dynamic field capabilities" {
         }),
     };
     var observed_sets = [_]table_reads.ObservedDynamicFieldCapabilitySet{.{
-        .index_name = "full_text_index_v0",
+        .index_name = @constCast("full_text_index_v0"),
         .field_capabilities = observed_capabilities[0..],
     }};
     const storage_statuses = [_]TableStorageStatus{.{
@@ -2708,6 +2862,53 @@ test "metadata.table status includes observed dynamic field capabilities" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field\":\"meta.status\",\"type\":\"keyword\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"doc_value_coverage\":\"observed_declared\",\"provenance\":\"observed_dynamic\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"queryability_state\":\"declared\"") != null);
+}
+
+test "metadata.table status merges observed capabilities conservatively" {
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .indexes_json = "{}", .replication_sources_json = "[]", .placement_role = "data" }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null }})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    var covered = runtime_schema_mod.observedDynamicFieldCapability(null, "price", .{
+        .field_type = .numeric,
+        .do_index = true,
+        .doc_values = true,
+        .sortable = true,
+    });
+    covered.doc_value_coverage = "covered";
+    covered.queryability_state = "queryable";
+    const declared = runtime_schema_mod.observedDynamicFieldCapability(null, "price", .{
+        .field_type = .numeric,
+        .do_index = true,
+        .doc_values = true,
+        .sortable = true,
+    });
+    var observed_capabilities = [_]runtime_schema_mod.FieldCapability{ covered, declared };
+    var observed_sets = [_]table_reads.ObservedDynamicFieldCapabilitySet{.{
+        .index_name = @constCast("full_text_index_v0"),
+        .field_capabilities = observed_capabilities[0..],
+    }};
+    const storage_statuses = [_]TableStorageStatus{.{
+        .table_name = "docs",
+        .empty = false,
+        .observed_dynamic_field_capability_sets = observed_sets[0..],
+    }};
+
+    const encoded = (try encodeSingleTableStatusWithStorageStatuses(std.testing.allocator, &snapshot, "docs", storage_statuses[0..])).?;
+    defer std.testing.allocator.free(encoded);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    const price = testFieldCapabilityByIdentifier(parsed.value, "price") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("numeric", price.object.get("type").?.string);
+    try std.testing.expectEqualStrings("observed_declared", price.object.get("doc_value_coverage").?.string);
+    try std.testing.expectEqualStrings("observed_dynamic", price.object.get("provenance").?.string);
+    try std.testing.expectEqualStrings("declared", price.object.get("queryability_state").?.string);
 }
 
 test "metadata.table status encoder projects inline enrichment configs as names" {
@@ -2783,6 +2984,7 @@ test "metadata.table debug encoder emits runtime schemas and index bindings" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"schema_slot\":\"active\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"analyzer\":\"french\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"sortable\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"missing_null_policy\":\"missing_rejected\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"index_sort\":[{\"field\":\"created_at\",\"order\":\"desc\"},{\"field\":\"_id\",\"order\":\"asc\"}]") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field_capabilities\":[{\"field\":\"_id\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field\":\"created_at\",\"path_pattern\":\"created_at\"") != null);

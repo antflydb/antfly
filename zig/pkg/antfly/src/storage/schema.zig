@@ -69,12 +69,28 @@ pub const AntflyType = enum(u8) {
     search_as_you_type = 11,
 };
 
+pub const MissingNullPolicy = enum(u8) {
+    missing_rejected = 0,
+};
+
+pub fn missingNullPolicyName(policy: MissingNullPolicy) []const u8 {
+    return switch (policy) {
+        .missing_rejected => "missing_rejected",
+    };
+}
+
+pub fn parseMissingNullPolicy(value: []const u8) ?MissingNullPolicy {
+    if (std.mem.eql(u8, value, "missing_rejected")) return .missing_rejected;
+    return null;
+}
+
 pub const FieldMapping = struct {
     field_type: AntflyType = .text,
     do_index: bool = true,
     store: bool = true,
     doc_values: bool = false,
     sortable: bool = false,
+    missing_null_policy: MissingNullPolicy = .missing_rejected,
     include_in_all: bool = false,
     analyzer: []const u8 = "standard",
 };
@@ -151,7 +167,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 10); // format version
+    try appendU32(&buf, alloc, 11); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -172,6 +188,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         try buf.append(alloc, if (tmpl.mapping.store) 1 else 0);
         try buf.append(alloc, if (tmpl.mapping.doc_values) 1 else 0);
         try buf.append(alloc, if (tmpl.mapping.sortable) 1 else 0);
+        try buf.append(alloc, @intFromEnum(tmpl.mapping.missing_null_policy));
         try buf.append(alloc, if (tmpl.mapping.include_in_all) 1 else 0);
         try appendStr(&buf, alloc, tmpl.mapping.analyzer);
     }
@@ -223,7 +240,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 10) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 11) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -291,6 +308,14 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             pos += 1;
             break :blk value;
         } else defaultSortableForMapping(field_type, doc_values);
+        const missing_null_policy: MissingNullPolicy = if (fmt_version >= 11) blk: {
+            const value: MissingNullPolicy = switch (data[pos]) {
+                0 => .missing_rejected,
+                else => return error.InvalidSchema,
+            };
+            pos += 1;
+            break :blk value;
+        } else .missing_rejected;
         const include_in_all = data[pos] == 1;
         pos += 1;
         const analyzer = try alloc.dupe(u8, readStr(data, &pos));
@@ -308,6 +333,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
                 .store = store_val,
                 .doc_values = doc_values,
                 .sortable = sortable,
+                .missing_null_policy = missing_null_policy,
                 .include_in_all = include_in_all,
                 .analyzer = analyzer,
             },
@@ -734,6 +760,33 @@ pub fn mappingQueryabilityStateName(mapping: FieldMapping) []const u8 {
     return "unsupported";
 }
 
+pub fn conservativeDocValueCoverage(left: []const u8, right: []const u8) []const u8 {
+    return if (docValueCoverageRank(left) <= docValueCoverageRank(right)) left else right;
+}
+
+fn docValueCoverageRank(value: []const u8) u8 {
+    if (std.mem.eql(u8, value, "identity_metadata")) return 5;
+    if (std.mem.eql(u8, value, "covered")) return 4;
+    if (std.mem.eql(u8, value, "schema_declared")) return 3;
+    if (std.mem.eql(u8, value, "observed_declared")) return 2;
+    if (std.mem.eql(u8, value, "not_declared")) return 1;
+    return 0;
+}
+
+pub fn conservativeQueryabilityState(left: []const u8, right: []const u8) []const u8 {
+    return if (queryabilityStateRank(left) <= queryabilityStateRank(right)) left else right;
+}
+
+fn queryabilityStateRank(value: []const u8) u8 {
+    if (std.mem.eql(u8, value, "queryable")) return 6;
+    if (std.mem.eql(u8, value, "declared")) return 5;
+    if (std.mem.eql(u8, value, "text_search_only")) return 4;
+    if (std.mem.eql(u8, value, "missing_doc_values")) return 3;
+    if (std.mem.eql(u8, value, "non_sortable")) return 2;
+    if (std.mem.eql(u8, value, "non_scalar")) return 1;
+    return 0;
+}
+
 pub const IndexSortMembership = struct {
     position: usize,
     desc: bool,
@@ -804,7 +857,7 @@ pub fn dynamicTemplateFieldCapability(schema: TableSchema, tmpl: DynamicTemplate
         .sortable = mappingIsSortable(mapping),
         .doc_value_coverage = if (mapping.doc_values) "schema_declared" else "not_declared",
         .provenance = "dynamic_template",
-        .missing_null_policy = "missing_rejected",
+        .missing_null_policy = missingNullPolicyName(mapping.missing_null_policy),
         .queryability_state = mappingQueryabilityStateName(mapping),
         .analyzer = mapping.analyzer,
         .index_sort = if (exact_path) |field| indexSortMembership(schema, field) else null,
@@ -842,7 +895,7 @@ pub fn observedDynamicFieldCapability(schema: ?TableSchema, field: []const u8, m
         .sortable = mappingIsSortable(mapping),
         .doc_value_coverage = if (mapping.doc_values) "observed_declared" else "not_declared",
         .provenance = "observed_dynamic",
-        .missing_null_policy = "missing_rejected",
+        .missing_null_policy = missingNullPolicyName(mapping.missing_null_policy),
         .queryability_state = mappingQueryabilityStateName(mapping),
         .analyzer = mapping.analyzer,
         .index_sort = if (schema) |runtime_schema| indexSortMembership(runtime_schema, field) else null,
@@ -1224,6 +1277,7 @@ test "schema serialize/deserialize round-trip" {
                     .store = false,
                     .doc_values = true,
                     .sortable = true,
+                    .missing_null_policy = .missing_rejected,
                     .include_in_all = false,
                     .analyzer = "keyword",
                 },
@@ -1309,6 +1363,7 @@ test "schema serialize/deserialize round-trip" {
     try std.testing.expect(!loaded.dynamic_templates[0].mapping.do_index);
     try std.testing.expect(loaded.dynamic_templates[0].mapping.doc_values);
     try std.testing.expect(loaded.dynamic_templates[0].mapping.sortable);
+    try std.testing.expectEqual(MissingNullPolicy.missing_rejected, loaded.dynamic_templates[0].mapping.missing_null_policy);
     try std.testing.expectEqual(@as(usize, 1), loaded.full_text_documents.len);
     try std.testing.expectEqualStrings("my_type", loaded.full_text_documents[0].name);
     try std.testing.expectEqual(@as(usize, 4), loaded.full_text_documents[0].fields.len);

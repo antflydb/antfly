@@ -7,6 +7,7 @@ pub const Client = client.Client;
 pub const ApiResponse = client.ApiResponse;
 
 pub const Error = types.Error;
+pub const ExactSortError = types.ExactSortError;
 pub const SortDirection = types.SortDirection;
 pub const SortField = types.SortField;
 pub const ClusterHealth = types.ClusterHealth;

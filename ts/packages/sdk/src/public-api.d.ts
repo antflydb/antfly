@@ -2317,6 +2317,50 @@ export interface components {
             /** @example An error message */
             error: string;
         };
+        ExactSortError: {
+            /**
+             * @description Stable error class.
+             * @example unsupported_exact_sort
+             */
+            error: string;
+            /**
+             * @description Human-readable error summary.
+             * @example exact sort is unsupported for this query
+             */
+            message: string;
+            /**
+             * @description Stable machine-readable rejection reason.
+             * @example missing_doc_values_coverage
+             */
+            reason: string;
+            /**
+             * @description Stable exact-sort rejection reason.
+             * @example missing_doc_values_coverage
+             */
+            sort_rejection_reason: string;
+            /**
+             * @description Stable budget rejection reason when the rejection was budget-driven.
+             * @example text_field_sort_candidate_window
+             */
+            budget_rejection_reason?: string;
+            /**
+             * @description More specific exact-sort rejection detail.
+             * @example missing_doc_values_section
+             */
+            sort_rejection_detail: string;
+            /**
+             * @description Sort field associated with the rejection when safe to expose.
+             * @example created_at
+             */
+            sort_rejection_field: string;
+            /**
+             * Format: int32
+             * @example 422
+             */
+            status: number;
+        } & {
+            [key: string]: unknown;
+        };
         /** @description Sort direction for a single field. true = descending, false = ascending. */
         SortDirection: boolean;
         /** @description A single sort field with direction. */
@@ -7688,6 +7732,14 @@ export interface components {
              * @default false
              */
             sortable?: boolean;
+            /**
+             * @description Missing/null sort policy for this mapped field. The current production
+             *     policy rejects missing or null native sort values so sorted cursors
+             *     remain replayable JSON scalar tuples.
+             * @default missing_rejected
+             * @enum {string}
+             */
+            missing_null_policy?: "missing_rejected";
         };
         /**
          * @description A rule for mapping dynamically detected fields. Templates are checked in order
@@ -11108,6 +11160,15 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description Exact sort cannot be executed through a supported native plan */
+        UnsupportedExactSort: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ExactSortError"];
+            };
+        };
         /** @description Internal server error */
         InternalServerError: {
             headers: {
@@ -11876,6 +11937,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            422: components["responses"]["UnsupportedExactSort"];
             /** @description Internal server error */
             500: {
                 headers: {
@@ -12159,6 +12221,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            422: components["responses"]["UnsupportedExactSort"];
             500: components["responses"]["InternalServerError"];
         };
     };

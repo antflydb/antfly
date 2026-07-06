@@ -476,6 +476,7 @@ pub const TypedDocValuesReader = struct {
         const num_docs = std.mem.readInt(u32, chunk_data[0..4], .little);
         const values_start = try fixedValueSpanStart(chunk_data, num_docs, 8);
         const result = try self.alloc.alloc(f64, num_docs);
+        errdefer self.alloc.free(result);
         for (0..num_docs) |i| {
             const off = values_start + i * 8;
             result[i] = try decodeSerializableF64(chunk_data[off..][0..8].*);
@@ -492,6 +493,7 @@ pub const TypedDocValuesReader = struct {
         const num_docs = std.mem.readInt(u32, chunk_data[0..4], .little);
         const values_start = try fixedValueSpanStart(chunk_data, num_docs, 16);
         const result = try self.alloc.alloc(GeoPoint, num_docs);
+        errdefer self.alloc.free(result);
         for (0..num_docs) |i| {
             const off = values_start + i * 16;
             result[i] = .{

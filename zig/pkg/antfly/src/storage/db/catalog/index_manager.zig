@@ -12759,6 +12759,7 @@ fn mergeObservedTextFieldAnalyzers(
             .store = item.store,
             .doc_values = item.doc_values,
             .sortable = item.sortable,
+            .missing_null_policy = item.missing_null_policy,
             .include_in_all = item.include_in_all,
         });
     }
@@ -12775,6 +12776,7 @@ fn mergeObservedTextFieldAnalyzers(
             .store = item.store,
             .doc_values = item.doc_values,
             .sortable = item.sortable,
+            .missing_null_policy = item.missing_null_policy,
             .include_in_all = item.include_in_all,
         };
     }
@@ -12801,6 +12803,7 @@ fn observedFieldAnalyzerMappingEquals(left: mapper.ObservedFieldAnalyzer, right:
         left.store == right.store and
         left.doc_values == right.doc_values and
         left.sortable == right.sortable and
+        left.missing_null_policy == right.missing_null_policy and
         left.include_in_all == right.include_in_all and
         std.mem.eql(u8, left.analyzer_name, right.analyzer_name);
 }
@@ -13857,7 +13860,7 @@ fn serializeObservedTextFieldAnalyzers(alloc: Allocator, observed: []const mappe
     errdefer out.deinit(alloc);
 
     try out.appendSlice(alloc, "ATFA");
-    try appendU32(&out, alloc, 2);
+    try appendU32(&out, alloc, 3);
     try appendU32(&out, alloc, @intCast(observed.len));
     for (observed) |item| {
         try appendStr(&out, alloc, item.field_name);
@@ -13867,6 +13870,7 @@ fn serializeObservedTextFieldAnalyzers(alloc: Allocator, observed: []const mappe
         try out.append(alloc, if (item.store) 1 else 0);
         try out.append(alloc, if (item.doc_values) 1 else 0);
         try out.append(alloc, if (item.sortable) 1 else 0);
+        try out.append(alloc, @intFromEnum(item.missing_null_policy));
         try out.append(alloc, if (item.include_in_all) 1 else 0);
     }
 
@@ -13880,7 +13884,7 @@ fn deserializeObservedTextFieldAnalyzers(alloc: Allocator, data: []const u8) ![]
 
     var pos: usize = 4;
     const version = try readU32(data, &pos);
-    if (version != 1 and version != 2) return error.UnsupportedIndexCatalogVersion;
+    if (version != 1 and version != 2 and version != 3) return error.UnsupportedIndexCatalogVersion;
 
     const count = try readU32(data, &pos);
     const observed = try alloc.alloc(mapper.ObservedFieldAnalyzer, count);
@@ -13900,7 +13904,8 @@ fn deserializeObservedTextFieldAnalyzers(alloc: Allocator, data: []const u8) ![]
             const analyzer_name = try alloc.dupe(u8, try readStr(data, &pos));
             errdefer alloc.free(analyzer_name);
             const mapping = if (version >= 2) mapping_blk: {
-                if (pos + 6 > data.len) return error.InvalidIndexCatalog;
+                const mapping_len: usize = if (version >= 3) 7 else 6;
+                if (pos + mapping_len > data.len) return error.InvalidIndexCatalog;
                 const field_type: schema_mod.AntflyType = @enumFromInt(data[pos]);
                 pos += 1;
                 const do_index = data[pos] != 0;
@@ -13911,6 +13916,14 @@ fn deserializeObservedTextFieldAnalyzers(alloc: Allocator, data: []const u8) ![]
                 pos += 1;
                 const sortable = data[pos] != 0;
                 pos += 1;
+                const missing_null_policy: schema_mod.MissingNullPolicy = if (version >= 3) blk_policy: {
+                    const value: schema_mod.MissingNullPolicy = switch (data[pos]) {
+                        0 => .missing_rejected,
+                        else => return error.InvalidIndexCatalog,
+                    };
+                    pos += 1;
+                    break :blk_policy value;
+                } else .missing_rejected;
                 const include_in_all = data[pos] != 0;
                 pos += 1;
                 break :mapping_blk schema_mod.FieldMapping{
@@ -13919,6 +13932,7 @@ fn deserializeObservedTextFieldAnalyzers(alloc: Allocator, data: []const u8) ![]
                     .store = store,
                     .doc_values = doc_values,
                     .sortable = sortable,
+                    .missing_null_policy = missing_null_policy,
                     .include_in_all = include_in_all,
                     .analyzer = analyzer_name,
                 };
@@ -13928,6 +13942,7 @@ fn deserializeObservedTextFieldAnalyzers(alloc: Allocator, data: []const u8) ![]
                 .store = false,
                 .doc_values = false,
                 .sortable = false,
+                .missing_null_policy = .missing_rejected,
                 .include_in_all = false,
                 .analyzer = analyzer_name,
             };
@@ -13939,6 +13954,7 @@ fn deserializeObservedTextFieldAnalyzers(alloc: Allocator, data: []const u8) ![]
                 .store = mapping.store,
                 .doc_values = mapping.doc_values,
                 .sortable = mapping.sortable,
+                .missing_null_policy = mapping.missing_null_policy,
                 .include_in_all = mapping.include_in_all,
             };
         };
@@ -16252,6 +16268,7 @@ test "observed full text analyzer metadata persists mapping decisions" {
             .store = true,
             .doc_values = true,
             .sortable = true,
+            .missing_null_policy = .missing_rejected,
             .include_in_all = false,
         },
         .{
@@ -16262,6 +16279,7 @@ test "observed full text analyzer metadata persists mapping decisions" {
             .store = false,
             .doc_values = false,
             .sortable = false,
+            .missing_null_policy = .missing_rejected,
             .include_in_all = true,
         },
     };
@@ -16279,6 +16297,7 @@ test "observed full text analyzer metadata persists mapping decisions" {
     try std.testing.expect(decoded[0].store);
     try std.testing.expect(decoded[0].doc_values);
     try std.testing.expect(decoded[0].sortable);
+    try std.testing.expectEqual(schema_mod.MissingNullPolicy.missing_rejected, decoded[0].missing_null_policy);
     try std.testing.expect(!decoded[0].include_in_all);
 
     try std.testing.expectEqualStrings("meta.body", decoded[1].field_name);
@@ -16288,6 +16307,7 @@ test "observed full text analyzer metadata persists mapping decisions" {
     try std.testing.expect(!decoded[1].store);
     try std.testing.expect(!decoded[1].doc_values);
     try std.testing.expect(!decoded[1].sortable);
+    try std.testing.expectEqual(schema_mod.MissingNullPolicy.missing_rejected, decoded[1].missing_null_policy);
     try std.testing.expect(decoded[1].include_in_all);
 }
 
@@ -16315,6 +16335,7 @@ test "observed full text analyzer metadata reads legacy analyzer-only format" {
     try std.testing.expect(!decoded[0].store);
     try std.testing.expect(!decoded[0].doc_values);
     try std.testing.expect(!decoded[0].sortable);
+    try std.testing.expectEqual(schema_mod.MissingNullPolicy.missing_rejected, decoded[0].missing_null_policy);
     try std.testing.expect(!decoded[0].include_in_all);
 
     try std.testing.expectEqualStrings("meta.body", decoded[1].field_name);

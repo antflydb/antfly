@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const schema_regex = @import("antfly_regex");
+const storage_schema = @import("../storage/schema.zig");
 
 pub const TableSchema = struct {
     version: u32 = 0,
@@ -319,6 +320,7 @@ pub const DynamicTemplate = struct {
     store: ?bool = null,
     doc_values: ?bool = null,
     sortable: ?bool = null,
+    missing_null_policy: ?[]const u8 = null,
     include_in_all: ?bool = null,
 
     pub fn deinit(self: *DynamicTemplate, alloc: std.mem.Allocator) void {
@@ -330,6 +332,7 @@ pub const DynamicTemplate = struct {
         if (self.match_mapping_type) |match_mapping_type| alloc.free(match_mapping_type);
         if (self.field_type) |field_type| alloc.free(field_type);
         if (self.analyzer) |analyzer| alloc.free(analyzer);
+        if (self.missing_null_policy) |missing_null_policy| alloc.free(missing_null_policy);
         self.* = undefined;
     }
 };
@@ -1354,6 +1357,10 @@ fn validateDynamicTemplate(value: std.json.Value) !void {
     if (mapping.object.get("store")) |store| if (store != .null and store != .bool) return error.InvalidSchemaUpdateRequest;
     if (mapping.object.get("doc_values")) |doc_values| if (doc_values != .null and doc_values != .bool) return error.InvalidSchemaUpdateRequest;
     if (mapping.object.get("sortable")) |sortable| if (sortable != .null and sortable != .bool) return error.InvalidSchemaUpdateRequest;
+    if (mapping.object.get("missing_null_policy")) |policy| {
+        if (policy != .null and policy != .string) return error.InvalidSchemaUpdateRequest;
+        if (policy == .string and storage_schema.parseMissingNullPolicy(policy.string) == null) return error.InvalidSchemaUpdateRequest;
+    }
     if (mapping.object.get("include_in_all")) |include_in_all| if (include_in_all != .null and include_in_all != .bool) return error.InvalidSchemaUpdateRequest;
     if (mapping.object.get("sortable")) |sortable| {
         if (sortable == .bool and sortable.bool) {
@@ -2424,6 +2431,10 @@ fn parseDynamicTemplate(alloc: std.mem.Allocator, default_name: []const u8, valu
             .bool => |enabled| enabled,
             else => null,
         } else null,
+        .missing_null_policy = if (mapping.get("missing_null_policy")) |policy| switch (policy) {
+            .string => |policy_value| try alloc.dupe(u8, policy_value),
+            else => null,
+        } else null,
         .include_in_all = if (mapping.get("include_in_all")) |include_in_all| switch (include_in_all) {
             .bool => |enabled| enabled,
             else => null,
@@ -3487,7 +3498,7 @@ test "parse schema and validate document writes" {
 test "parse dynamic template contract and validate selectors" {
     var parsed = try parseSchema(
         std.testing.allocator,
-        "{\"default_type\":\"doc\",\"enforce_types\":true,\"dynamic_templates\":[{\"name\":\"dates\",\"match\":\"*_at\",\"unmatch\":\"skip_*\",\"path_match\":\"meta.*\",\"path_unmatch\":\"meta.private.*\",\"match_mapping_type\":\"date\",\"mapping\":{\"type\":\"datetime\",\"analyzer\":\"keyword\",\"index\":false,\"store\":false,\"doc_values\":true,\"sortable\":true,\"include_in_all\":false}}],\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}}}}}}",
+        "{\"default_type\":\"doc\",\"enforce_types\":true,\"dynamic_templates\":[{\"name\":\"dates\",\"match\":\"*_at\",\"unmatch\":\"skip_*\",\"path_match\":\"meta.*\",\"path_unmatch\":\"meta.private.*\",\"match_mapping_type\":\"date\",\"mapping\":{\"type\":\"datetime\",\"analyzer\":\"keyword\",\"index\":false,\"store\":false,\"doc_values\":true,\"sortable\":true,\"missing_null_policy\":\"missing_rejected\",\"include_in_all\":false}}],\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}}}}}}",
     );
     defer parsed.deinit(std.testing.allocator);
 
@@ -3504,6 +3515,7 @@ test "parse dynamic template contract and validate selectors" {
     try std.testing.expectEqual(false, parsed.dynamic_templates[0].store.?);
     try std.testing.expectEqual(true, parsed.dynamic_templates[0].doc_values.?);
     try std.testing.expectEqual(true, parsed.dynamic_templates[0].sortable.?);
+    try std.testing.expectEqualStrings("missing_rejected", parsed.dynamic_templates[0].missing_null_policy.?);
     try std.testing.expectEqual(false, parsed.dynamic_templates[0].include_in_all.?);
 
     try validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"title\":\"alpha\",\"meta.created_at\":\"2026-01-03T00:00:00Z\"}" }});
@@ -3537,6 +3549,13 @@ test "parse rejects non-scalar or non-doc-valued sortable dynamic templates" {
         parseSchema(
             std.testing.allocator,
             "{\"dynamic_templates\":[{\"name\":\"rank\",\"path_match\":\"rank\",\"mapping\":{\"type\":\"numeric\",\"doc_values\":false,\"sortable\":true}}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"dynamic_templates\":[{\"name\":\"rank\",\"path_match\":\"rank\",\"mapping\":{\"type\":\"numeric\",\"doc_values\":true,\"sortable\":true,\"missing_null_policy\":\"missing_last\"}}]}",
         ),
     );
 }

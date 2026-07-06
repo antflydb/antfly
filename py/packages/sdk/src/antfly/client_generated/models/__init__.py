@@ -171,6 +171,7 @@ from .evaluator_score import EvaluatorScore
 from .evaluator_score_metadata import EvaluatorScoreMetadata
 from .exa_search_config import ExaSearchConfig
 from .exa_search_config_search_type import ExaSearchConfigSearchType
+from .exact_sort_error import ExactSortError
 from .extension_error import ExtensionError
 from .extension_member import ExtensionMember
 from .extension_object_decl import ExtensionObjectDecl
@@ -546,6 +547,7 @@ from .table_statistics_field_stats import TableStatisticsFieldStats
 from .tavily_search_config import TavilySearchConfig
 from .tavily_search_config_search_depth import TavilySearchConfigSearchDepth
 from .template_field_mapping import TemplateFieldMapping
+from .template_field_mapping_missing_null_policy import TemplateFieldMappingMissingNullPolicy
 from .term_query import TermQuery
 from .term_range_query import TermRangeQuery
 from .text_chunk_options import TextChunkOptions
@@ -770,6 +772,7 @@ __all__ = (
     "EvaluatorName",
     "EvaluatorScore",
     "EvaluatorScoreMetadata",
+    "ExactSortError",
     "ExaSearchConfig",
     "ExaSearchConfigSearchType",
     "ExtensionError",
@@ -1147,6 +1150,7 @@ __all__ = (
     "TavilySearchConfig",
     "TavilySearchConfigSearchDepth",
     "TemplateFieldMapping",
+    "TemplateFieldMappingMissingNullPolicy",
     "TermQuery",
     "TermRangeQuery",
     "TextChunkOptions",

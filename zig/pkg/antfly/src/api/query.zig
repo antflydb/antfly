@@ -1050,6 +1050,17 @@ test "query parser rejects semantic search offsets" {
     ));
 }
 
+test "query parser records approximate source diagnostic for semantic exact sort" {
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
+        \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"order_by":[{"field":"created_at","desc":true}],"limit":4}
+    ));
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
+}
+
 test "query encoder emits antfly-style response envelope" {
     const alloc = std.testing.allocator;
     var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
@@ -1473,6 +1484,37 @@ test "query merge applies distributed typed sort ordering and cursor paging" {
     try std.testing.expectEqual(@as(usize, 2), before_page.hits.len);
     try std.testing.expectEqualStrings("doc:c", before_page.hits[0].id);
     try std.testing.expectEqualStrings("doc:d", before_page.hits[1].id);
+}
+
+test "query merge sort profile does not inherit stale rejection diagnostic" {
+    const alloc = std.testing.allocator;
+    const order_by = [_]db_mod.types.SortField{
+        .{ .field = "rank" },
+        .{ .field = "_id" },
+    };
+
+    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    left_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:a", 1);
+    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    right_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:b", 2);
+
+    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 1 };
+    defer left.deinit();
+    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
+    defer right.deinit();
+
+    db_mod.recordSortRejectionDiagnostic("stale_field", "stale_reason", "stale_detail");
+    var merged = try mergeSearchResults(alloc, .{
+        .order_by = &order_by,
+        .profile = true,
+    }, &.{ left, right }, 0, 2);
+    defer merged.deinit();
+
+    const sort_profile = merged.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("distributed_k_way_merge", sort_profile.plan);
+    try std.testing.expectEqualStrings("", sort_profile.sort_rejection_reason);
+    try std.testing.expectEqualStrings("", sort_profile.sort_rejection_detail);
+    try std.testing.expectEqualStrings("", sort_profile.sort_rejection_field.slice());
 }
 
 test "query merge applies runtime schema to distributed date cursors" {

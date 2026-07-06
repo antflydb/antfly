@@ -76,6 +76,10 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
                 .store = template.store orelse false,
                 .doc_values = doc_values,
                 .sortable = template.sortable orelse storage_schema.defaultSortableForMapping(field_type, doc_values),
+                .missing_null_policy = if (template.missing_null_policy) |policy|
+                    storage_schema.parseMissingNullPolicy(policy) orelse return error.InvalidSchemaUpdateRequest
+                else
+                    .missing_rejected,
                 .include_in_all = template.include_in_all orelse false,
                 .analyzer = try alloc.dupe(u8, template.analyzer orelse defaultDynamicTemplateAnalyzer(field_type)),
             },
@@ -739,7 +743,7 @@ test "runtime schema derives sortable capability from scalar doc values" {
     var parsed = try parseValidatedTableSchema(alloc,
         \\{
         \\  "dynamic_templates": [
-        \\    {"name":"dates","path_match":"created_at","mapping":{"type":"datetime","doc_values":true}},
+        \\    {"name":"dates","path_match":"created_at","mapping":{"type":"datetime","doc_values":true,"missing_null_policy":"missing_rejected"}},
         \\    {"name":"body","path_match":"body","mapping":{"type":"text","doc_values":true}},
         \\    {"name":"rank","path_match":"rank","mapping":{"type":"numeric","doc_values":true,"sortable":false}}
         \\  ]
@@ -753,6 +757,7 @@ test "runtime schema derives sortable capability from scalar doc values" {
     try std.testing.expectEqual(@as(usize, 3), runtime.dynamic_templates.len);
     try std.testing.expect(runtime.dynamic_templates[0].mapping.doc_values);
     try std.testing.expect(runtime.dynamic_templates[0].mapping.sortable);
+    try std.testing.expectEqual(storage_schema.MissingNullPolicy.missing_rejected, runtime.dynamic_templates[0].mapping.missing_null_policy);
     try std.testing.expect(runtime.dynamic_templates[1].mapping.doc_values);
     try std.testing.expect(!runtime.dynamic_templates[1].mapping.sortable);
     try std.testing.expect(runtime.dynamic_templates[2].mapping.doc_values);

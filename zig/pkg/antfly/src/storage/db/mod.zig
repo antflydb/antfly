@@ -123,6 +123,10 @@ pub fn deriveRuntimePreflightEstimates(summary: *RuntimePreflightSummary) void {
     query_search.deriveEstimateFields(summary);
 }
 
+pub fn searchRequestHasScoreBearingTextSource(req: types.SearchRequest) bool {
+    return query_search.searchRequestHasScoreBearingTextSource(req);
+}
+
 pub fn resetLastSortRejectionDiagnostic() void {
     query_search.resetLastSortRejectionDiagnostic();
 }
@@ -133,6 +137,10 @@ pub fn takeLastSortRejectionDiagnostic() ?SortRejectionDiagnostic {
 
 pub fn peekLastSortRejectionDiagnostic() ?SortRejectionDiagnostic {
     return query_search.peekLastSortRejectionDiagnostic();
+}
+
+pub fn recordSortRejectionDiagnostic(field: []const u8, reason: []const u8, detail: []const u8) void {
+    query_search.recordSortRejectionDiagnostic(field, reason, detail);
 }
 
 pub const testing = if (builtin.is_test) struct {

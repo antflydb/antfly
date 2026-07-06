@@ -144,3 +144,11 @@ components:
           type: boolean
           default: false
           description: Whether this doc-valued scalar field can be used in order_by
+        missing_null_policy:
+          type: string
+          enum: [missing_rejected]
+          default: missing_rejected
+          description: |
+            Missing/null sort policy for this mapped field. The current production
+            policy rejects missing or null native sort values so sorted cursors
+            remain replayable JSON scalar tuples.

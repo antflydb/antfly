@@ -107,6 +107,7 @@ pub const ObservedFieldAnalyzer = struct {
     store: bool = false,
     doc_values: bool = false,
     sortable: bool = false,
+    missing_null_policy: runtime_schema.MissingNullPolicy = .missing_rejected,
     include_in_all: bool = false,
 
     pub fn mapping(self: ObservedFieldAnalyzer) runtime_schema.FieldMapping {
@@ -116,6 +117,7 @@ pub const ObservedFieldAnalyzer = struct {
             .store = self.store,
             .doc_values = self.doc_values,
             .sortable = self.sortable,
+            .missing_null_policy = self.missing_null_policy,
             .include_in_all = self.include_in_all,
             .analyzer = self.analyzer_name,
         };
@@ -631,6 +633,7 @@ fn cloneObservedFieldAnalyzers(
             .store = item.store,
             .doc_values = item.doc_values,
             .sortable = item.sortable,
+            .missing_null_policy = item.missing_null_policy,
             .include_in_all = item.include_in_all,
         };
         initialized += 1;
@@ -1908,6 +1911,7 @@ fn appendObservedFieldAnalyzer(
         .store = mapping.store,
         .doc_values = mapping.doc_values,
         .sortable = mapping.sortable,
+        .missing_null_policy = mapping.missing_null_policy,
         .include_in_all = mapping.include_in_all,
     });
 }
@@ -1918,6 +1922,7 @@ fn observedMappingEquals(left: runtime_schema.FieldMapping, right: runtime_schem
         left.store == right.store and
         left.doc_values == right.doc_values and
         left.sortable == right.sortable and
+        left.missing_null_policy == right.missing_null_policy and
         left.include_in_all == right.include_in_all and
         std.mem.eql(u8, left.analyzer, right.analyzer);
 }

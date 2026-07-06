@@ -1752,6 +1752,7 @@ fn applyCommonSearchRequestOptions(
         request.search_before != null;
     const has_result_page_transforms = request.reranker != null;
     if (req.count_only and (has_result_page_options or has_result_page_transforms)) {
+        if (has_result_page_options) return unsupportedExactSort("*", "unsupported_exact_sort", "count_only_ordered_page");
         return error.UnsupportedQueryRequest;
     }
     if (request.profile) |profile| req.profile = profile;
@@ -1778,12 +1779,22 @@ fn applyCommonSearchRequestOptions(
 
     const has_semantic = request.semantic_search != null or request.embeddings != null;
     if (has_semantic and req.offset > 0) return error.UnsupportedQueryRequest;
-    if (has_semantic and req.order_by.len > 0) return error.UnsupportedQueryRequest;
-    if (req.order_by.len > 0 and req.offset > 0 and (req.search_after.len > 0 or req.search_before.len > 0)) return error.UnsupportedQueryRequest;
-    if (req.search_after.len > 0 and req.search_before.len > 0) return error.UnsupportedQueryRequest;
-    if ((req.search_after.len > 0 or req.search_before.len > 0) and req.order_by.len == 0) return error.UnsupportedQueryRequest;
-    if (req.search_after.len > 0 and req.search_after.len != req.order_by.len) return error.UnsupportedQueryRequest;
-    if (req.search_before.len > 0 and req.search_before.len != req.order_by.len) return error.UnsupportedQueryRequest;
+    if (has_semantic and req.order_by.len > 0) return unsupportedExactSort("*", "approximate_candidate_source", "approximate_candidate_source");
+    if (req.order_by.len > 0 and req.offset > 0 and (req.search_after.len > 0 or req.search_before.len > 0)) {
+        return unsupportedExactSort("*", "invalid_cursor_arity", "invalid_cursor_arity");
+    }
+    if (req.search_after.len > 0 and req.search_before.len > 0) {
+        return unsupportedExactSort("*", "invalid_cursor_arity", "invalid_cursor_arity");
+    }
+    if ((req.search_after.len > 0 or req.search_before.len > 0) and req.order_by.len == 0) {
+        return unsupportedExactSort("*", "invalid_cursor_arity", "invalid_cursor_arity");
+    }
+    if (req.search_after.len > 0 and req.search_after.len != req.order_by.len) {
+        return unsupportedExactSort("*", "invalid_cursor_arity", "invalid_cursor_arity");
+    }
+    if (req.search_before.len > 0 and req.search_before.len != req.order_by.len) {
+        return unsupportedExactSort("*", "invalid_cursor_arity", "invalid_cursor_arity");
+    }
     try validatePublicSortCursorTuple(req.*);
     if (request.embedding_template != null and request.semantic_search == null) return error.UnsupportedQueryRequest;
     if (request.embedding_template != null and request.embeddings != null) return error.UnsupportedQueryRequest;
@@ -1793,10 +1804,25 @@ fn validatePublicSortCursorTuple(req: db_mod.types.SearchRequest) !void {
     const cursor = if (req.search_after.len > 0) req.search_after else req.search_before;
     if (cursor.len == 0) return;
     for (cursor, 0..) |value, i| {
-        if (!openApiSortValueIsCursorReplayable(value)) return error.InvalidQueryRequest;
-        if (std.mem.eql(u8, req.order_by[i].field, "_score") and !openApiSortValueIsNumeric(value)) return error.InvalidQueryRequest;
-        if (std.mem.eql(u8, req.order_by[i].field, "_id") and value != .string) return error.InvalidQueryRequest;
+        const field = req.order_by[i].field;
+        if (!openApiSortValueIsCursorReplayable(value)) return invalidExactSortCursor(field, "invalid_cursor_type", "invalid_cursor_type");
+        if (std.mem.eql(u8, field, "_score") and !openApiSortValueIsNumeric(value)) return invalidExactSortCursor(field, "invalid_cursor_type", "invalid_cursor_type");
+        if (std.mem.eql(u8, field, "_id") and value != .string) return invalidExactSortCursor(field, "invalid_cursor_type", "invalid_cursor_type");
     }
+}
+
+fn recordUnsupportedExactSortDiagnostic(field: []const u8, reason: []const u8, detail: []const u8) void {
+    db_mod.recordSortRejectionDiagnostic(field, reason, detail);
+}
+
+fn unsupportedExactSort(field: []const u8, reason: []const u8, detail: []const u8) error{UnsupportedQueryRequest} {
+    recordUnsupportedExactSortDiagnostic(field, reason, detail);
+    return error.UnsupportedQueryRequest;
+}
+
+fn invalidExactSortCursor(field: []const u8, reason: []const u8, detail: []const u8) error{InvalidQueryRequest} {
+    recordUnsupportedExactSortDiagnostic(field, reason, detail);
+    return error.InvalidQueryRequest;
 }
 
 fn cloneSortFieldsWithStableTiebreaker(
@@ -1962,6 +1988,7 @@ pub fn parseQueryRequest(
     normalized_query.filter_query_json = "";
     req.exclusion_query_json = normalized_query.exclusion_query_json;
     normalized_query.exclusion_query_json = "";
+    try validateScoreSortHasScoreBearingTextSource(req);
     try parseInternalFilterQueryJsonAlloc(alloc, body, &req);
     req.doc_filter_bindings = try parsePublicDocFilterBindingsAlloc(alloc, body, req.limit);
 
@@ -1998,6 +2025,28 @@ pub fn preflightGraphSearchesAlloc(
     defer freeNamedGraphQueries(alloc, graph_queries);
 }
 
+pub fn queryRequestHasScoreBearingTextSourceAlloc(
+    alloc: std.mem.Allocator,
+    request: metadata_openapi.QueryRequest,
+) !bool {
+    var preflight_req = try buildPreflightSearchRequestAlloc(alloc, request);
+    defer preflight_req.deinit(alloc);
+    return db_mod.searchRequestHasScoreBearingTextSource(preflight_req.req);
+}
+
+fn searchRequestHasScoreSort(req: db_mod.types.SearchRequest) bool {
+    for (req.order_by) |field| {
+        if (std.mem.eql(u8, field.field, "_score")) return true;
+    }
+    return false;
+}
+
+fn validateScoreSortHasScoreBearingTextSource(req: db_mod.types.SearchRequest) !void {
+    if (searchRequestHasScoreSort(req) and !db_mod.searchRequestHasScoreBearingTextSource(req)) {
+        return unsupportedExactSort("_score", "non_score_bearing_source", "non_score_bearing_source");
+    }
+}
+
 fn buildPreflightSearchRequestAlloc(
     alloc: std.mem.Allocator,
     request: metadata_openapi.QueryRequest,
@@ -2007,8 +2056,8 @@ fn buildPreflightSearchRequestAlloc(
 
     try applyCommonSearchRequestOptions(alloc, request, &req);
 
-    if (request.search_after != null and request.search_before != null) return error.UnsupportedQueryRequest;
-    if ((request.search_after != null or request.search_before != null) and request.order_by == null) return error.UnsupportedQueryRequest;
+    if (request.search_after != null and request.search_before != null) return unsupportedExactSort("*", "invalid_cursor_arity", "invalid_cursor_arity");
+    if ((request.search_after != null or request.search_before != null) and request.order_by == null) return unsupportedExactSort("*", "invalid_cursor_arity", "invalid_cursor_arity");
 
     const fields = try applySearchRequestFields(alloc, request.fields, &req);
     errdefer freeClonedFields(alloc, fields);
@@ -2040,6 +2089,7 @@ fn buildPreflightSearchRequestAlloc(
     if (request.expand_strategy) |expand_strategy| {
         req.expand_strategy = try parseExpandStrategy(expand_strategy);
     }
+    try validateScoreSortHasScoreBearingTextSource(req);
 
     return .{
         .fields = fields,
@@ -2376,16 +2426,27 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
 fn validateOpenApiHitSortTuple(req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit) !void {
     if (req.order_by.len == 0) return;
     const expected_len = sortProfileEffectiveOrderLen(req);
-    if (hit.sort_values.len != expected_len) return error.InvalidQueryRequest;
+    if (hit.sort_values.len != expected_len) {
+        return invalidOutboundSortTuple("*", "sort_tuple_arity");
+    }
     for (0..expected_len) |i| {
         const field = sortProfileEffectiveOrderField(req, i);
         const value = hit.sort_values[i];
-        if (!openApiSortValueIsCursorReplayable(value)) return error.InvalidQueryRequest;
-        if (std.mem.eql(u8, field.field, "_score") and !openApiSortValueIsNumeric(value)) return error.InvalidQueryRequest;
+        if (!openApiSortValueIsCursorReplayable(value)) return invalidOutboundSortTuple(field.field, "invalid_cursor_type");
+        if (std.mem.eql(u8, field.field, "_score") and !openApiSortValueIsNumeric(value)) {
+            return invalidOutboundSortTuple(field.field, "non_numeric_score");
+        }
         if (std.mem.eql(u8, field.field, "_id")) {
-            if (value != .string or !std.mem.eql(u8, value.string, hit.id)) return error.InvalidQueryRequest;
+            if (value != .string or !std.mem.eql(u8, value.string, hit.id)) {
+                return invalidOutboundSortTuple(field.field, "id_tiebreaker_mismatch");
+            }
         }
     }
+}
+
+fn invalidOutboundSortTuple(field: []const u8, detail: []const u8) error{InvalidQueryRequest} {
+    recordUnsupportedExactSortDiagnostic(field, "invalid_sort_tuple", detail);
+    return error.InvalidQueryRequest;
 }
 
 fn openApiSortValueIsCursorReplayable(value: std.json.Value) bool {
@@ -2725,6 +2786,7 @@ test "api query contract serializes sort profile diagnostics" {
             .cursor_support = "segment_seek",
             .source_load = "projected_source_after_page",
             .distributed_behavior = "shard_local_only",
+            .selection_reason = "index_sort_sorted_segment_seek",
             .require_native = true,
             .native_loader = true,
             .index_sort_match = true,
@@ -2786,6 +2848,7 @@ test "api query contract serializes sort profile diagnostics" {
     try std.testing.expectEqualStrings("segment_seek", sort.get("cursor_support").?.string);
     try std.testing.expectEqualStrings("projected_source_after_page", sort.get("source_load").?.string);
     try std.testing.expectEqualStrings("shard_local_only", sort.get("distributed_behavior").?.string);
+    try std.testing.expectEqualStrings("index_sort_sorted_segment_seek", sort.get("selection_reason").?.string);
     try std.testing.expect(sort.get("require_native").?.bool);
     try std.testing.expect(sort.get("native_loader").?.bool);
     try std.testing.expect(sort.get("index_sort_match").?.bool);
@@ -2857,9 +2920,14 @@ test "api query contract rejects ordered hits without complete sort tuple" {
         .id = try alloc.dupe(u8, "doc:a"),
         .score = 0.9,
     };
+    db_mod.resetLastSortRejectionDiagnostic();
     try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
         .order_by = &order_by,
     }, .{}, missing));
+    var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
+    try std.testing.expectEqualStrings("sort_tuple_arity", diagnostic.detail);
 
     var incomplete = db_mod.types.SearchResult{
         .alloc = alloc,
@@ -2874,9 +2942,14 @@ test "api query contract rejects ordered hits without complete sort tuple" {
         .score = 0.9,
         .sort_values = sort_values,
     };
+    db_mod.resetLastSortRejectionDiagnostic();
     try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
         .order_by = &order_by,
     }, .{}, incomplete));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
+    try std.testing.expectEqualStrings("sort_tuple_arity", diagnostic.detail);
 }
 
 test "api query contract rejects ordered hits with non replayable sort tuple" {
@@ -2898,9 +2971,14 @@ test "api query contract rejects ordered hits with non replayable sort tuple" {
         .score = 0.9,
         .sort_values = nested_sort_values,
     };
+    db_mod.resetLastSortRejectionDiagnostic();
     try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
         .order_by = &order_by,
     }, .{}, nested));
+    var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("created_at", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
 
     var null_sort = db_mod.types.SearchResult{
         .alloc = alloc,
@@ -2916,9 +2994,14 @@ test "api query contract rejects ordered hits with non replayable sort tuple" {
         .score = 0.9,
         .sort_values = null_sort_values,
     };
+    db_mod.resetLastSortRejectionDiagnostic();
     try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
         .order_by = &order_by,
     }, .{}, null_sort));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("created_at", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
 
     var non_finite = db_mod.types.SearchResult{
         .alloc = alloc,
@@ -2934,9 +3017,14 @@ test "api query contract rejects ordered hits with non replayable sort tuple" {
         .score = 0.9,
         .sort_values = non_finite_sort_values,
     };
+    db_mod.resetLastSortRejectionDiagnostic();
     try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
         .order_by = &order_by,
     }, .{}, non_finite));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("created_at", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
 
     const score_order_by = [_]db_mod.types.SortField{.{ .field = "_score", .desc = true }};
     var non_numeric_score = db_mod.types.SearchResult{
@@ -2953,9 +3041,14 @@ test "api query contract rejects ordered hits with non replayable sort tuple" {
         .score = 0.9,
         .sort_values = non_numeric_score_sort_values,
     };
+    db_mod.resetLastSortRejectionDiagnostic();
     try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
         .order_by = &score_order_by,
     }, .{}, non_numeric_score));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
+    try std.testing.expectEqualStrings("non_numeric_score", diagnostic.detail);
 
     var id_mismatch = db_mod.types.SearchResult{
         .alloc = alloc,
@@ -2971,9 +3064,14 @@ test "api query contract rejects ordered hits with non replayable sort tuple" {
         .score = 0.9,
         .sort_values = mismatched_sort_values,
     };
+    db_mod.resetLastSortRejectionDiagnostic();
     try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
         .order_by = &order_by,
     }, .{}, id_mismatch));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_id", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
+    try std.testing.expectEqualStrings("id_tiebreaker_mismatch", diagnostic.detail);
 }
 
 test "api query contract serializes derived hierarchy ancestry" {
@@ -4064,6 +4162,7 @@ fn buildSortProfileValue(
     try sort.put(alloc, "cursor_support", .{ .string = profile.cursor_support });
     try sort.put(alloc, "source_load", .{ .string = profile.source_load });
     try sort.put(alloc, "distributed_behavior", .{ .string = profile.distributed_behavior });
+    try sort.put(alloc, "selection_reason", .{ .string = profile.selection_reason });
     try sort.put(alloc, "require_native", .{ .bool = profile.require_native });
     try sort.put(alloc, "native_loader", .{ .bool = profile.native_loader });
     try sort.put(alloc, "index_sort_match", .{ .bool = profile.index_sort_match });
@@ -6849,7 +6948,12 @@ test "api query contract rejects count with stored sort" {
         \\}
     ;
 
+    db_mod.resetLastSortRejectionDiagnostic();
     try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("count_only_ordered_page", diagnostic.detail);
 }
 
 test "api query contract rejects count with search_after cursor" {
@@ -6863,7 +6967,12 @@ test "api query contract rejects count with search_after cursor" {
         \\}
     ;
 
+    db_mod.resetLastSortRejectionDiagnostic();
     try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("count_only_ordered_page", diagnostic.detail);
 }
 
 test "api query contract rejects count with search_before cursor" {
@@ -6877,7 +6986,12 @@ test "api query contract rejects count with search_before cursor" {
         \\}
     ;
 
+    db_mod.resetLastSortRejectionDiagnostic();
     try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("count_only_ordered_page", diagnostic.detail);
 }
 
 test "api query contract preflight rejects cursor pagination without sort" {
@@ -6889,7 +7003,41 @@ test "api query contract preflight rejects cursor pagination without sort" {
     , .{});
     defer parsed.deinit();
 
+    db_mod.resetLastSortRejectionDiagnostic();
     try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed.value));
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.detail);
+}
+
+test "api query contract preflight rejects score sort without score-bearing source" {
+    var parsed_match_all = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
+        \\{
+        \\  "full_text_search": {"match_all": {}},
+        \\  "order_by": [{"field":"_score","desc":true}]
+        \\}
+    , .{});
+    defer parsed_match_all.deinit();
+
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed_match_all.value));
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", diagnostic.field);
+    try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.reason);
+    try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.detail);
+
+    var parsed_match = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "order_by": [{"field":"_score","desc":true}]
+        \\}
+    , .{});
+    defer parsed_match.deinit();
+
+    var summary = try preflightQueryRequestAlloc(std.testing.allocator, parsed_match.value);
+    defer summary.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 1), summary.base_result_set_count);
 }
 
 test "api query contract appends stable id sort tiebreaker for cursors" {
@@ -6926,12 +7074,34 @@ test "api query contract rejects cursor width that omits stable id tiebreaker" {
         \\}
     ;
 
+    db_mod.resetLastSortRejectionDiagnostic();
     try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.detail);
+}
+
+test "api query contract records cursor arity diagnostic without sort" {
+    const alloc = std.testing.allocator;
+
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs",
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "search_after": ["2026-01-01", "doc-9"]
+        \\}
+    ));
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.detail);
 }
 
 test "api query contract rejects non replayable search_after cursor values" {
     const alloc = std.testing.allocator;
 
+    db_mod.resetLastSortRejectionDiagnostic();
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
         \\{
         \\  "full_text_search": {"match":"raft","field":"body"},
@@ -6939,6 +7109,10 @@ test "api query contract rejects non replayable search_after cursor values" {
         \\  "search_after": [null, "doc-9"]
         \\}
     ));
+    var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("created_at", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
 
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
         \\{
@@ -6948,6 +7122,7 @@ test "api query contract rejects non replayable search_after cursor values" {
         \\}
     ));
 
+    db_mod.resetLastSortRejectionDiagnostic();
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
         \\{
         \\  "full_text_search": {"match":"raft","field":"body"},
@@ -6955,6 +7130,35 @@ test "api query contract rejects non replayable search_after cursor values" {
         \\  "search_after": ["high", "doc-9"]
         \\}
     ));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+}
+
+test "api query contract rejects score sort without score-bearing text source" {
+    const alloc = std.testing.allocator;
+
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs",
+        \\{
+        \\  "full_text_search": {"match_all": {}},
+        \\  "order_by": [{"field":"_score","desc":true}]
+        \\}
+    ));
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", diagnostic.field);
+    try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.reason);
+    try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.detail);
+
+    var parsed = try parseQueryRequest(alloc, null, "docs",
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "order_by": [{"field":"_score","desc":true}]
+        \\}
+    );
+    defer parsed.deinit(alloc);
+    try std.testing.expect(db_mod.searchRequestHasScoreBearingTextSource(parsed.req));
 }
 
 test "api query contract rejects non replayable search_before cursor values" {

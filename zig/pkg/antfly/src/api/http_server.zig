@@ -40,6 +40,7 @@ const raft_host = @import("../raft/host.zig");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const storage_schema = @import("../storage/schema.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const table_catalog = @import("table_catalog.zig");
 const tables_api = @import("tables.zig");
@@ -4467,6 +4468,31 @@ pub const ApiHttpServer = struct {
         try tables_api.routeQueryRequestToActiveReadIndex(self.alloc, table, query_req);
     }
 
+    fn validatePublicQuerySortCapabilities(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        query_req: db_mod.types.SearchRequest,
+    ) !void {
+        if (query_req.order_by.len == 0) return;
+
+        var snapshot = (try self.source.adminSnapshot()) orelse return;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        const schema_json = if (table.read_schema_json.len > 0)
+            table.read_schema_json
+        else
+            tables_api.effectiveSchemaJson(table.schema_json);
+
+        var parsed_schema = try tables_api.parseValidatedTableSchema(self.alloc, schema_json);
+        defer parsed_schema.deinit(self.alloc);
+        const runtime_schema = try schema_mod.deriveRuntimeTableSchema(self.alloc, parsed_schema);
+        defer storage_schema.freeSchema(self.alloc, runtime_schema);
+
+        const observed_dynamic_capability_sets = try self.bestEffortObservedDynamicFieldCapabilitySets(table_name);
+        defer self.freeObservedDynamicFieldCapabilitySets(observed_dynamic_capability_sets);
+        try validatePublicQuerySortCapabilitiesAgainstRuntime(query_req, runtime_schema, observed_dynamic_capability_sets);
+    }
+
     pub fn validateTableWritesAgainstSchema(self: *ApiHttpServer, table_name: []const u8, writes: anytype) !void {
         if (writes.len == 0) return;
         var snapshot = (try self.source.adminSnapshot()) orelse return;
@@ -4700,12 +4726,18 @@ pub const ApiHttpServer = struct {
         var snapshot = (try self.source.adminSnapshot()) orelse return error.TableNotFound;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-        const schema_fields = try self.loadQueryBuilderSchemaFieldsFromJson(table.schema_json);
+        const schema_json = if (table.read_schema_json.len > 0) table.read_schema_json else table.schema_json;
+        const schema_fields = try self.loadQueryBuilderSchemaFieldsFromJson(schema_json);
         errdefer freeOwnedStrings(self.alloc, schema_fields);
+        const observed_dynamic_capability_sets = try self.bestEffortObservedDynamicFieldCapabilitySets(table_name);
+        defer self.freeObservedDynamicFieldCapabilitySets(observed_dynamic_capability_sets);
+        const field_capabilities = try self.loadQueryBuilderFieldCapabilitiesFromJson(schema_json, observed_dynamic_capability_sets);
+        errdefer freeQueryBuilderFieldCapabilities(self.alloc, field_capabilities);
         const index_context = try self.loadQueryBuilderIndexContextFromJson(table.indexes_json);
         errdefer freeQueryBuilderIndexContext(self.alloc, index_context);
         return .{
             .schema_fields = schema_fields,
+            .field_capabilities = field_capabilities,
             .full_text_index_metadata = index_context.full_text_index_metadata,
             .embedding_index_metadata = index_context.embedding_index_metadata,
             .graph_index_metadata = index_context.graph_index_metadata,
@@ -4739,6 +4771,54 @@ pub const ApiHttpServer = struct {
         }
 
         return try fields.toOwnedSlice(self.alloc);
+    }
+
+    fn loadQueryBuilderFieldCapabilitiesFromJson(
+        self: *ApiHttpServer,
+        schema_json: []const u8,
+        observed_dynamic_capability_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
+    ) ![]const query_builder_agent.QueryBuilderFieldCapability {
+        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_impl.deinit();
+        const arena = arena_impl.allocator();
+
+        var out = std.ArrayListUnmanaged(query_builder_agent.QueryBuilderFieldCapability).empty;
+        errdefer {
+            freeQueryBuilderFieldCapabilitiesItems(self.alloc, out.items);
+            out.deinit(self.alloc);
+        }
+        if (schema_json.len > 0) {
+            const parsed_schema = try tables_api.parseValidatedTableSchema(arena, schema_json);
+            const runtime_schema = try schema_mod.deriveRuntimeTableSchema(arena, parsed_schema);
+            const capabilities = try storage_schema.fieldCapabilitiesAlloc(arena, runtime_schema);
+            for (capabilities) |capability| {
+                const field = capability.field orelse continue;
+                try appendQueryBuilderFieldCapability(self.alloc, &out, .{
+                    .field = field,
+                    .field_type = capability.field_type,
+                    .doc_values = capability.doc_values,
+                    .sortable = capability.sortable,
+                    .doc_value_coverage = capability.doc_value_coverage,
+                    .queryability_state = capability.queryability_state,
+                    .provenance = capability.provenance,
+                });
+            }
+        }
+        for (observed_dynamic_capability_sets) |set| {
+            for (set.field_capabilities) |capability| {
+                const field = capability.field orelse continue;
+                try appendQueryBuilderFieldCapability(self.alloc, &out, .{
+                    .field = field,
+                    .field_type = capability.field_type,
+                    .doc_values = capability.doc_values,
+                    .sortable = capability.sortable,
+                    .doc_value_coverage = capability.doc_value_coverage,
+                    .queryability_state = capability.queryability_state,
+                    .provenance = capability.provenance,
+                });
+            }
+        }
+        return try out.toOwnedSlice(self.alloc);
     }
 
     fn loadQueryBuilderIndexContextFromJson(self: *ApiHttpServer, indexes_json: []const u8) !QueryBuilderIndexContext {
@@ -5793,7 +5873,8 @@ pub const ApiHttpServer = struct {
                 body,
                 row_filter_json,
             ) catch |err| switch (err) {
-                error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
+                error.InvalidQueryRequest => return error.InvalidQueryRequest,
+                error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
                 error.UnsupportedExactSort => return error.UnsupportedExactSort,
                 error.TableNotFound => return error.TableNotFound,
                 error.ModelNotFound => return error.ModelNotFound,
@@ -5814,7 +5895,8 @@ pub const ApiHttpServer = struct {
         defer contract_req.deinit();
 
         if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity) catch |err| switch (err) {
-            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
+            error.InvalidQueryRequest => return error.InvalidQueryRequest,
+            error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
@@ -5852,7 +5934,8 @@ pub const ApiHttpServer = struct {
             body,
             row_filter_json,
         ) catch |err| switch (err) {
-            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
+            error.InvalidQueryRequest => return error.InvalidQueryRequest,
+            error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.TableNotFound => return error.NotFound,
             error.ModelNotFound => return error.ModelNotFound,
@@ -6216,6 +6299,11 @@ pub const ApiHttpServer = struct {
             error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return error.InvalidQueryRequest,
             else => return err,
         };
+        self.validatePublicQuerySortCapabilities(table_name, query_req.req) catch |err| switch (err) {
+            error.TableNotFound => return error.TableNotFound,
+            error.InvalidSchemaUpdateRequest => return error.InvalidQueryRequest,
+            else => return err,
+        };
         if (row_filter_json) |value| {
             injectRowFilterIntoSearchRequest(alloc, &query_req.req, value) catch return error.InvalidQueryRequest;
         }
@@ -6288,6 +6376,7 @@ pub const ApiHttpServer = struct {
         var owned = try query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), table_name, query_body);
         errdefer owned.deinit(alloc);
         try self.maybeRouteQueryToReadSchema(table_name, &owned.req);
+        try self.validatePublicQuerySortCapabilities(table_name, owned.req);
         return owned;
     }
 
@@ -7008,7 +7097,7 @@ pub const ApiHttpServer = struct {
             row_filter_json,
             authenticated_identity,
         ) catch |err| switch (err) {
-            error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
+            error.InvalidQueryRequest => return try invalidPublicQueryRequestResponse(self.alloc),
             error.UnsupportedExactSort => return try unsupportedExactSortResponse(self.alloc),
             error.UnsupportedQueryRequest => return try unsupportedPublicQueryResponse(self.alloc, body),
             error.QueryCandidateBudgetExceeded => return try queryCandidateBudgetExceededResponse(self.alloc),
@@ -7073,7 +7162,7 @@ pub const ApiHttpServer = struct {
                 row_filter_json,
                 authenticated_identity,
             ) catch |err| switch (err) {
-                error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
+                error.InvalidQueryRequest => return try invalidPublicQueryRequestResponse(self.alloc),
                 error.UnsupportedExactSort => return try unsupportedExactSortResponse(self.alloc),
                 error.UnsupportedQueryRequest => return try unsupportedPublicQueryResponse(self.alloc, line),
                 error.QueryCandidateBudgetExceeded => return try queryCandidateBudgetExceededResponse(self.alloc),
@@ -7586,12 +7675,241 @@ fn freeQueryBuilderIndexContext(alloc: std.mem.Allocator, context: QueryBuilderI
 
 pub fn freeQueryBuilderTableContext(alloc: std.mem.Allocator, context: query_builder_agent.QueryBuilderTableContext) void {
     freeOwnedStrings(alloc, context.schema_fields);
+    freeQueryBuilderFieldCapabilities(alloc, context.field_capabilities);
     freeOwnedStrings(alloc, context.full_text_indexes);
     freeOwnedStrings(alloc, context.semantic_indexes);
     freeOwnedStrings(alloc, context.graph_indexes);
     freeQueryBuilderFullTextIndexMetadata(alloc, context.full_text_index_metadata);
     freeQueryBuilderEmbeddingIndexMetadata(alloc, context.embedding_index_metadata);
     freeQueryBuilderGraphIndexMetadata(alloc, context.graph_index_metadata);
+}
+
+fn validatePublicQuerySortCapabilitiesAgainstRuntime(
+    query_req: db_mod.types.SearchRequest,
+    runtime_schema: storage_schema.TableSchema,
+    observed_dynamic_capability_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
+) !void {
+    if (query_req.order_by.len == 0) return;
+    const cursor = if (query_req.search_after.len > 0) query_req.search_after else query_req.search_before;
+    for (query_req.order_by, 0..) |field, i| {
+        if (std.mem.eql(u8, field.field, "_id")) continue;
+        if (std.mem.eql(u8, field.field, "_score")) continue;
+
+        if (storage_schema.resolveFieldType(runtime_schema, field.field)) |mapping| {
+            try validatePublicMappedSortField(field.field, mapping);
+            if (try validatePublicSortCapabilityEvidence(
+                observed_dynamic_capability_sets,
+                query_req.primary_text_index_name orelse query_req.index_name,
+                field.field,
+                mapping.field_type,
+            ) == null) {
+                try validatePublicMappedSortCoverage(field.field, mapping);
+            }
+            if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, mapping.field_type, cursor[i]);
+            continue;
+        }
+
+        if (try validatePublicSortCapabilityEvidence(
+            observed_dynamic_capability_sets,
+            query_req.primary_text_index_name orelse query_req.index_name,
+            field.field,
+            null,
+        )) |field_type| {
+            if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, field_type, cursor[i]);
+            continue;
+        }
+
+        recordPublicSortCapabilityRejection(field.field, "unmapped_sort_field", "unmapped_field");
+        return error.UnsupportedExactSort;
+    }
+}
+
+fn validatePublicMappedSortField(field: []const u8, mapping: storage_schema.FieldMapping) !void {
+    if (!storage_schema.fieldTypeIsSortableScalar(mapping.field_type)) {
+        recordPublicSortCapabilityRejection(field, "non_sortable_sort_field", "non_scalar_field");
+        return error.UnsupportedExactSort;
+    }
+    if (!mapping.sortable) {
+        recordPublicSortCapabilityRejection(field, "non_sortable_sort_field", "non_sortable_field");
+        return error.UnsupportedExactSort;
+    }
+    if (!mapping.doc_values) {
+        recordPublicSortCapabilityRejection(field, "missing_doc_values_coverage", "missing_doc_values_capability");
+        return error.UnsupportedExactSort;
+    }
+}
+
+fn validatePublicObservedSortField(capability: storage_schema.FieldCapability, expected_type: ?storage_schema.AntflyType) !storage_schema.AntflyType {
+    const field = capability.field orelse "*";
+    if (expected_type) |field_type| {
+        if (capability.field_type != field_type) {
+            recordPublicSortCapabilityRejection(field, "non_sortable_sort_field", "mixed_field_type");
+            return error.UnsupportedExactSort;
+        }
+    }
+    if (!storage_schema.fieldTypeIsSortableScalar(capability.field_type)) {
+        recordPublicSortCapabilityRejection(field, "non_sortable_sort_field", "non_scalar_field");
+        return error.UnsupportedExactSort;
+    }
+    if (!capability.sortable) {
+        recordPublicSortCapabilityRejection(field, "non_sortable_sort_field", "non_sortable_field");
+        return error.UnsupportedExactSort;
+    }
+    if (!capability.doc_values) {
+        recordPublicSortCapabilityRejection(field, "missing_doc_values_coverage", "missing_doc_values_capability");
+        return error.UnsupportedExactSort;
+    }
+    if (!std.mem.eql(u8, capability.doc_value_coverage, "covered") or
+        !std.mem.eql(u8, capability.queryability_state, "queryable"))
+    {
+        const detail = if (!std.mem.eql(u8, capability.doc_value_coverage, "covered"))
+            capability.doc_value_coverage
+        else
+            capability.queryability_state;
+        recordPublicSortCapabilityRejection(field, "missing_doc_values_coverage", detail);
+        return error.UnsupportedExactSort;
+    }
+    return capability.field_type;
+}
+
+fn validatePublicMappedSortCoverage(field: []const u8, mapping: storage_schema.FieldMapping) !void {
+    const coverage = if (mapping.doc_values) "schema_declared" else "not_declared";
+    const queryability = storage_schema.mappingQueryabilityStateName(mapping);
+    const detail = if (!std.mem.eql(u8, coverage, "covered")) coverage else queryability;
+    recordPublicSortCapabilityRejection(field, "missing_doc_values_coverage", detail);
+    return error.UnsupportedExactSort;
+}
+
+fn validatePublicMappedSortCursor(field: []const u8, field_type: storage_schema.AntflyType, value: std.json.Value) !void {
+    const valid = switch (field_type) {
+        .keyword, .link => value == .string,
+        .numeric => publicSortCursorValueIsNumeric(value),
+        .datetime => publicSortCursorValueIsDateLike(value),
+        .boolean => value == .bool,
+        else => false,
+    };
+    if (!valid) {
+        recordPublicSortCapabilityRejection(field, "invalid_cursor_type", "invalid_cursor_type");
+        return error.InvalidQueryRequest;
+    }
+}
+
+fn publicSortCursorValueIsNumeric(value: std.json.Value) bool {
+    return switch (value) {
+        .integer => true,
+        .float => |number| std.math.isFinite(number),
+        .number_string => |text| publicJsonNumberStringIsFinite(text),
+        else => false,
+    };
+}
+
+fn publicSortCursorValueIsDateLike(value: std.json.Value) bool {
+    return switch (value) {
+        .string => |text| storage_schema.parseDateTimeToNs(text) != null,
+        .integer => |number| number >= 0,
+        .number_string => |text| blk: {
+            _ = std.fmt.parseUnsigned(u64, text, 10) catch break :blk false;
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+fn publicJsonNumberStringIsFinite(text: []const u8) bool {
+    if (std.fmt.parseInt(i64, text, 10)) |_| return true else |_| {}
+    if (std.fmt.parseInt(u64, text, 10)) |_| return true else |_| {}
+    const value = std.fmt.parseFloat(f64, text) catch return false;
+    return std.math.isFinite(value);
+}
+
+fn validatePublicSortCapabilityEvidence(
+    observed_dynamic_capability_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
+    preferred_index_name: ?[]const u8,
+    field: []const u8,
+    expected_type: ?storage_schema.AntflyType,
+) !?storage_schema.AntflyType {
+    var matched_preferred = false;
+    var preferred_type: ?storage_schema.AntflyType = null;
+    for (observed_dynamic_capability_sets) |set| {
+        const preferred = if (preferred_index_name) |name| std.mem.eql(u8, set.index_name, name) else true;
+        if (!preferred) continue;
+        for (set.field_capabilities) |capability| {
+            const capability_field = capability.field orelse continue;
+            if (!std.mem.eql(u8, capability_field, field)) continue;
+            const effective_expected = expected_type orelse preferred_type;
+            preferred_type = try validatePublicObservedSortField(capability, effective_expected);
+            matched_preferred = true;
+        }
+    }
+    if (matched_preferred) return preferred_type;
+
+    var matched_fallback = false;
+    var fallback_type: ?storage_schema.AntflyType = null;
+    for (observed_dynamic_capability_sets) |set| {
+        for (set.field_capabilities) |capability| {
+            const capability_field = capability.field orelse continue;
+            if (!std.mem.eql(u8, capability_field, field)) continue;
+            const effective_expected = expected_type orelse fallback_type;
+            fallback_type = try validatePublicObservedSortField(capability, effective_expected);
+            matched_fallback = true;
+        }
+    }
+    return if (matched_fallback) fallback_type else null;
+}
+
+fn recordPublicSortCapabilityRejection(field: []const u8, reason: []const u8, detail: []const u8) void {
+    db_mod.recordSortRejectionDiagnostic(field, reason, detail);
+}
+
+fn freeQueryBuilderFieldCapabilities(
+    alloc: std.mem.Allocator,
+    capabilities: []const query_builder_agent.QueryBuilderFieldCapability,
+) void {
+    freeQueryBuilderFieldCapabilitiesItems(alloc, capabilities);
+    if (capabilities.len > 0) alloc.free(@constCast(capabilities));
+}
+
+fn freeQueryBuilderFieldCapabilitiesItems(
+    alloc: std.mem.Allocator,
+    capabilities: []const query_builder_agent.QueryBuilderFieldCapability,
+) void {
+    for (capabilities) |capability| freeQueryBuilderFieldCapability(alloc, capability);
+}
+
+fn freeQueryBuilderFieldCapability(
+    alloc: std.mem.Allocator,
+    capability: query_builder_agent.QueryBuilderFieldCapability,
+) void {
+    alloc.free(@constCast(capability.field));
+    alloc.free(@constCast(capability.doc_value_coverage));
+    alloc.free(@constCast(capability.queryability_state));
+    alloc.free(@constCast(capability.provenance));
+}
+
+fn appendQueryBuilderFieldCapability(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(query_builder_agent.QueryBuilderFieldCapability),
+    capability: query_builder_agent.QueryBuilderFieldCapability,
+) !void {
+    const owned_field = try alloc.dupe(u8, capability.field);
+    errdefer alloc.free(owned_field);
+    const owned_coverage = try alloc.dupe(u8, capability.doc_value_coverage);
+    errdefer alloc.free(owned_coverage);
+    const owned_queryability = try alloc.dupe(u8, capability.queryability_state);
+    errdefer alloc.free(owned_queryability);
+    const owned_provenance = try alloc.dupe(u8, capability.provenance);
+    errdefer alloc.free(owned_provenance);
+    const item = query_builder_agent.QueryBuilderFieldCapability{
+        .field = owned_field,
+        .field_type = capability.field_type,
+        .doc_values = capability.doc_values,
+        .sortable = capability.sortable,
+        .doc_value_coverage = owned_coverage,
+        .queryability_state = owned_queryability,
+        .provenance = owned_provenance,
+    };
+    errdefer freeQueryBuilderFieldCapability(alloc, item);
+    try out.append(alloc, item);
 }
 
 fn freeQueryBuilderFullTextIndexMetadata(
@@ -8653,12 +8971,19 @@ fn jsonResponse(alloc: std.mem.Allocator, value: anytype) !http_common.HttpRespo
 }
 
 fn queryCandidateBudgetExceededResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse db_mod.SortRejectionDiagnostic{
+        .reason = "candidate_budget_exceeded",
+        .detail = "candidate_budget_exceeded",
+    };
     return try jsonResponseWithStatus(alloc, 422, .{
         .status = 422,
         .@"error" = "query_candidate_budget_exceeded",
         .message = "query candidate budget exceeded",
-        .reason = "candidate_budget_exceeded",
-        .budget_rejection_reason = "candidate_budget_exceeded",
+        .reason = diagnostic.reason,
+        .budget_rejection_reason = diagnostic.detail,
+        .sort_rejection_reason = diagnostic.reason,
+        .sort_rejection_detail = diagnostic.detail,
+        .sort_rejection_field = diagnostic.field,
     });
 }
 
@@ -8667,6 +8992,18 @@ fn unsupportedPublicQueryResponse(alloc: std.mem.Allocator, body: []const u8) !h
         return try unsupportedExactSortResponse(alloc);
     }
     return try textResponse(alloc, 422, "unsupported query request");
+}
+
+fn invalidPublicQueryRequestResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
+    if (db_mod.peekLastSortRejectionDiagnostic() != null) {
+        return try unsupportedExactSortResponse(alloc);
+    }
+    return try textResponse(alloc, 400, "invalid query request");
+}
+
+fn unsupportedPublicTableQueryDispatchError(alloc: std.mem.Allocator, body: []const u8) error{ InvalidQueryRequest, UnsupportedExactSort } {
+    if (queryBodyHasSortPageControls(alloc, body)) return error.UnsupportedExactSort;
+    return error.InvalidQueryRequest;
 }
 
 fn unsupportedExactSortResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
@@ -10050,6 +10387,12 @@ test "api http server serves status" {
 
 test "api http query budget rejection response exposes stable sort reason" {
     const alloc = std.testing.allocator;
+    db_mod.resetLastSortRejectionDiagnostic();
+    db_mod.testing.recordSortRejectionDiagnostic(
+        "full_text_index_v0",
+        "candidate_budget_exceeded",
+        "text_field_sort_candidate_window",
+    );
     var resp = try queryCandidateBudgetExceededResponse(alloc);
     defer resp.deinit(alloc);
 
@@ -10062,6 +10405,9 @@ test "api http query budget rejection response exposes stable sort reason" {
         message: []const u8,
         reason: []const u8,
         budget_rejection_reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
     }, alloc, resp.body, .{});
     defer parsed.deinit();
 
@@ -10069,7 +10415,10 @@ test "api http query budget rejection response exposes stable sort reason" {
     try std.testing.expectEqualStrings("query_candidate_budget_exceeded", parsed.value.@"error");
     try std.testing.expectEqualStrings("query candidate budget exceeded", parsed.value.message);
     try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.reason);
-    try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.budget_rejection_reason);
+    try std.testing.expectEqualStrings("text_field_sort_candidate_window", parsed.value.budget_rejection_reason);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("text_field_sort_candidate_window", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("full_text_index_v0", parsed.value.sort_rejection_field);
 }
 
 test "api http unsupported sorted query response exposes stable sort reason" {
@@ -10134,6 +10483,40 @@ test "api http unsupported sorted query response surfaces exact sort diagnostics
     try std.testing.expectEqualStrings("created_at", parsed.value.sort_rejection_field);
 }
 
+test "api http invalid query with sort diagnostic returns exact sort response" {
+    const alloc = std.testing.allocator;
+    db_mod.resetLastSortRejectionDiagnostic();
+    db_mod.testing.recordSortRejectionDiagnostic(
+        "_score",
+        "invalid_sort_tuple",
+        "non_numeric_score",
+    );
+    var resp = try invalidPublicQueryRequestResponse(alloc);
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        message: []const u8,
+        reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+    }, alloc, resp.body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
+    try std.testing.expectEqualStrings("exact sort is unsupported for this query", parsed.value.message);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.reason);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("non_numeric_score", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("_score", parsed.value.sort_rejection_field);
+}
+
 test "api http unsupported unsorted query response remains generic" {
     const alloc = std.testing.allocator;
     db_mod.resetLastSortRejectionDiagnostic();
@@ -10143,6 +10526,154 @@ test "api http unsupported unsorted query response remains generic" {
     try std.testing.expectEqual(@as(u16, 422), resp.status);
     try std.testing.expectEqualStrings("text/plain", resp.content_type.?);
     try std.testing.expectEqualStrings("unsupported query request", resp.body);
+}
+
+test "api http public table dispatch preserves unsupported sorted query as exact sort" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(error.UnsupportedExactSort, unsupportedPublicTableQueryDispatchError(
+        alloc,
+        "{\"order_by\":[{\"field\":\"created_at\"}]}",
+    ));
+    try std.testing.expectEqual(error.UnsupportedExactSort, unsupportedPublicTableQueryDispatchError(
+        alloc,
+        "{\"search_after\":[\"2026-01-01T00:00:00Z\",\"doc:1\"]}",
+    ));
+    try std.testing.expectEqual(error.InvalidQueryRequest, unsupportedPublicTableQueryDispatchError(
+        alloc,
+        "{\"join\":{}}",
+    ));
+}
+
+test "api http public sort capability gate validates mapped sortable fields" {
+    const templates = [_]storage_schema.DynamicTemplate{
+        .{
+            .name = "created_at",
+            .path_match = "created_at",
+            .mapping = .{
+                .field_type = .datetime,
+                .doc_values = true,
+                .sortable = true,
+                .analyzer = "keyword",
+            },
+        },
+        .{
+            .name = "body",
+            .path_match = "body",
+            .mapping = .{
+                .field_type = .text,
+                .doc_values = false,
+                .sortable = false,
+                .analyzer = "standard",
+            },
+        },
+    };
+    const runtime_schema = storage_schema.TableSchema{ .dynamic_templates = &templates };
+    var covered_created = storage_schema.observedDynamicFieldCapability(null, "created_at", .{
+        .field_type = .datetime,
+        .doc_values = true,
+        .sortable = true,
+        .analyzer = "keyword",
+    });
+    covered_created.doc_value_coverage = "covered";
+    covered_created.queryability_state = "queryable";
+    const covered_created_set = table_reads.ObservedDynamicFieldCapabilitySet{
+        .index_name = @constCast("full_text_index_v0"),
+        .field_capabilities = @constCast((&[_]storage_schema.FieldCapability{covered_created})[0..]),
+    };
+
+    const created_order = [_]db_mod.types.SortField{.{ .field = "created_at", .desc = true }};
+    try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &created_order,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{covered_created_set});
+    const created_effective_order = [_]db_mod.types.SortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id", .desc = false },
+    };
+    const valid_date_cursor = [_]std.json.Value{ .{ .string = "2026-01-01T00:00:00Z" }, .{ .string = "doc:1" } };
+    try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &created_effective_order,
+        .search_after = &valid_date_cursor,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{covered_created_set});
+
+    const invalid_date_cursor = [_]std.json.Value{ .{ .string = "not-a-date" }, .{ .string = "doc:1" } };
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &created_effective_order,
+        .search_after = &invalid_date_cursor,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{covered_created_set}));
+    var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("created_at", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{ .order_by = &created_order }, runtime_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("created_at", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", diagnostic.reason);
+    try std.testing.expectEqualStrings("schema_declared", diagnostic.detail);
+
+    const body_order = [_]db_mod.types.SortField{.{ .field = "body" }};
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{ .order_by = &body_order }, runtime_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("body", diagnostic.field);
+    try std.testing.expectEqualStrings("non_sortable_sort_field", diagnostic.reason);
+    try std.testing.expectEqualStrings("non_scalar_field", diagnostic.detail);
+}
+
+test "api http public sort capability gate fails closed for uncovered observed dynamic fields" {
+    const runtime_schema = storage_schema.TableSchema{};
+    var covered = storage_schema.observedDynamicFieldCapability(null, "price", .{
+        .field_type = .numeric,
+        .doc_values = true,
+        .sortable = true,
+        .analyzer = "keyword",
+    });
+    covered.doc_value_coverage = "covered";
+    covered.queryability_state = "queryable";
+    const covered_set = table_reads.ObservedDynamicFieldCapabilitySet{
+        .index_name = @constCast("full_text_index_v0"),
+        .field_capabilities = @constCast((&[_]storage_schema.FieldCapability{covered})[0..]),
+    };
+    const price_order = [_]db_mod.types.SortField{.{ .field = "price" }};
+    try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &price_order,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{covered_set});
+
+    const declared = storage_schema.observedDynamicFieldCapability(null, "price", .{
+        .field_type = .numeric,
+        .doc_values = true,
+        .sortable = true,
+        .analyzer = "keyword",
+    });
+    const declared_set = table_reads.ObservedDynamicFieldCapabilitySet{
+        .index_name = @constCast("full_text_index_v0"),
+        .field_capabilities = @constCast((&[_]storage_schema.FieldCapability{declared})[0..]),
+    };
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &price_order,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{declared_set}));
+    var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("price", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", diagnostic.reason);
+    try std.testing.expectEqualStrings("observed_declared", diagnostic.detail);
+
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &price_order,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{ covered_set, declared_set }));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("price", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", diagnostic.reason);
+    try std.testing.expectEqualStrings("observed_declared", diagnostic.detail);
 }
 
 test "api http server serves extension catalog reads" {

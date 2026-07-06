@@ -2060,7 +2060,7 @@ pub const BoundTableReadSource = struct {
     ) !?[]ObservedDynamicFieldCapabilitySet {
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table_name)) return null;
-        return self.db.observedDynamicFieldCapabilitySetsAlloc(alloc);
+        return try self.db.observedDynamicFieldCapabilitySetsAlloc(alloc);
     }
 
     fn localRuntimeStatuses(
@@ -3054,7 +3054,7 @@ fn mergeObservedDynamicFieldCapabilitySet(
     for (merged.items) |*existing| {
         if (!std.mem.eql(u8, existing.index_name, incoming.index_name)) continue;
         for (incoming.field_capabilities) |capability| {
-            if (containsEquivalentFieldCapability(existing.field_capabilities, capability)) continue;
+            if (mergeObservedFieldCapabilityIntoSet(existing.field_capabilities, capability)) continue;
             const cloned = try storage_schema.cloneFieldCapabilityAlloc(alloc, capability);
             const old_len = existing.field_capabilities.len;
             const expanded = alloc.realloc(existing.field_capabilities, old_len + 1) catch |err| {
@@ -3078,17 +3078,19 @@ fn mergeObservedDynamicFieldCapabilitySet(
     }
 }
 
-fn containsEquivalentFieldCapability(
-    capabilities: []const storage_schema.FieldCapability,
+fn mergeObservedFieldCapabilityIntoSet(
+    capabilities: []storage_schema.FieldCapability,
     needle: storage_schema.FieldCapability,
 ) bool {
-    for (capabilities) |capability| {
-        if (fieldCapabilitiesEquivalent(capability, needle)) return true;
+    for (capabilities) |*capability| {
+        if (!fieldCapabilityAggregationKeyEqual(capability.*, needle)) continue;
+        mergeObservedFieldCapability(capability, needle);
+        return true;
     }
     return false;
 }
 
-fn fieldCapabilitiesEquivalent(left: storage_schema.FieldCapability, right: storage_schema.FieldCapability) bool {
+fn fieldCapabilityAggregationKeyEqual(left: storage_schema.FieldCapability, right: storage_schema.FieldCapability) bool {
     return optionalStringsEqual(left.name, right.name) and
         optionalStringsEqual(left.field, right.field) and
         optionalStringsEqual(left.path_pattern, right.path_pattern) and
@@ -3097,17 +3099,27 @@ fn fieldCapabilitiesEquivalent(left: storage_schema.FieldCapability, right: stor
         optionalStringsEqual(left.emitted_name, right.emitted_name) and
         optionalStringsEqual(left.document_schema, right.document_schema) and
         left.field_type == right.field_type and
-        left.searchable == right.searchable and
-        left.filterable == right.filterable and
-        left.aggregatable == right.aggregatable and
-        left.doc_values == right.doc_values and
-        left.sortable == right.sortable and
-        std.mem.eql(u8, left.doc_value_coverage, right.doc_value_coverage) and
         std.mem.eql(u8, left.provenance, right.provenance) and
-        std.mem.eql(u8, left.missing_null_policy, right.missing_null_policy) and
-        std.mem.eql(u8, left.queryability_state, right.queryability_state) and
-        optionalStringsEqual(left.analyzer, right.analyzer) and
-        indexSortMembershipEqual(left.index_sort, right.index_sort);
+        optionalStringsEqual(left.analyzer, right.analyzer);
+}
+
+fn mergeObservedFieldCapability(
+    existing: *storage_schema.FieldCapability,
+    incoming: storage_schema.FieldCapability,
+) void {
+    existing.searchable = existing.searchable and incoming.searchable;
+    existing.filterable = existing.filterable and incoming.filterable;
+    existing.aggregatable = existing.aggregatable and incoming.aggregatable;
+    existing.doc_values = existing.doc_values and incoming.doc_values;
+    existing.sortable = existing.sortable and incoming.sortable;
+    existing.doc_value_coverage = storage_schema.conservativeDocValueCoverage(existing.doc_value_coverage, incoming.doc_value_coverage);
+    existing.queryability_state = storage_schema.conservativeQueryabilityState(existing.queryability_state, incoming.queryability_state);
+    if (!std.mem.eql(u8, existing.missing_null_policy, incoming.missing_null_policy)) {
+        existing.missing_null_policy = "mixed";
+    }
+    if (!indexSortMembershipEqual(existing.index_sort, incoming.index_sort)) {
+        existing.index_sort = null;
+    }
 }
 
 fn optionalStringsEqual(left: ?[]const u8, right: ?[]const u8) bool {
@@ -3118,6 +3130,49 @@ fn optionalStringsEqual(left: ?[]const u8, right: ?[]const u8) bool {
 fn indexSortMembershipEqual(left: ?storage_schema.IndexSortMembership, right: ?storage_schema.IndexSortMembership) bool {
     if (left == null or right == null) return left == null and right == null;
     return left.?.position == right.?.position and left.?.desc == right.?.desc;
+}
+
+test "provisioned observed dynamic capability merge is conservative across groups" {
+    const alloc = std.testing.allocator;
+
+    var covered = storage_schema.observedDynamicFieldCapability(null, "price", .{
+        .field_type = .numeric,
+        .do_index = true,
+        .doc_values = true,
+        .sortable = true,
+    });
+    covered.doc_value_coverage = "covered";
+    covered.queryability_state = "queryable";
+
+    const declared = storage_schema.observedDynamicFieldCapability(null, "price", .{
+        .field_type = .numeric,
+        .do_index = true,
+        .doc_values = true,
+        .sortable = true,
+    });
+
+    const first_set = ObservedDynamicFieldCapabilitySet{
+        .index_name = @constCast("full_text_index_v0"),
+        .field_capabilities = @constCast((&[_]storage_schema.FieldCapability{covered})[0..]),
+    };
+    const second_set = ObservedDynamicFieldCapabilitySet{
+        .index_name = @constCast("full_text_index_v0"),
+        .field_capabilities = @constCast((&[_]storage_schema.FieldCapability{declared})[0..]),
+    };
+
+    var merged = std.ArrayListUnmanaged(ObservedDynamicFieldCapabilitySet).empty;
+    defer freeObservedDynamicFieldCapabilitySetsFromList(alloc, &merged);
+
+    try mergeObservedDynamicFieldCapabilitySet(alloc, &merged, first_set);
+    try mergeObservedDynamicFieldCapabilitySet(alloc, &merged, second_set);
+
+    try std.testing.expectEqual(@as(usize, 1), merged.items.len);
+    try std.testing.expectEqual(@as(usize, 1), merged.items[0].field_capabilities.len);
+    const capability = merged.items[0].field_capabilities[0];
+    try std.testing.expectEqualStrings("price", capability.field.?);
+    try std.testing.expect(capability.sortable);
+    try std.testing.expectEqualStrings("observed_declared", capability.doc_value_coverage);
+    try std.testing.expectEqualStrings("declared", capability.queryability_state);
 }
 
 pub const HostedProvisionedTableReadSource = struct {

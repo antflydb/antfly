@@ -3037,6 +3037,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '422':
+          $ref: '#/components/responses/UnsupportedExactSort'
         '500':
           description: Internal server error
           content:
@@ -3510,6 +3512,8 @@ paths:
                 $ref: '#/components/schemas/QueryResponses'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '422':
+          $ref: '#/components/responses/UnsupportedExactSort'
         '404':
           $ref: '#/components/responses/NotFound'
         '500':
@@ -6607,6 +6611,50 @@ components:
           example: An error message
       required:
         - error
+    ExactSortError:
+      type: object
+      additionalProperties: true
+      required:
+        - error
+        - message
+        - reason
+        - sort_rejection_reason
+        - sort_rejection_detail
+        - sort_rejection_field
+        - status
+      properties:
+        error:
+          type: string
+          description: Stable error class.
+          example: unsupported_exact_sort
+        message:
+          type: string
+          description: Human-readable error summary.
+          example: exact sort is unsupported for this query
+        reason:
+          type: string
+          description: Stable machine-readable rejection reason.
+          example: missing_doc_values_coverage
+        sort_rejection_reason:
+          type: string
+          description: Stable exact-sort rejection reason.
+          example: missing_doc_values_coverage
+        budget_rejection_reason:
+          type: string
+          description: Stable budget rejection reason when the rejection was budget-driven.
+          example: text_field_sort_candidate_window
+        sort_rejection_detail:
+          type: string
+          description: More specific exact-sort rejection detail.
+          example: missing_doc_values_section
+        sort_rejection_field:
+          type: string
+          description: Sort field associated with the rejection when safe to expose.
+          example: created_at
+        status:
+          type: integer
+          format: int32
+          example: 422
     SortDirection:
       type: boolean
       description: Sort direction for a single field. true = descending, false = ascending.
@@ -14527,6 +14575,17 @@ components:
           type: boolean
           default: false
           description: Whether this doc-valued scalar field can be used in order_by
+        missing_null_policy:
+          type: string
+          enum:
+            - missing_rejected
+          default: missing_rejected
+          description: >
+            Missing/null sort policy for this mapped field. The current production
+
+            policy rejects missing or null native sort values so sorted cursors
+
+            remain replayable JSON scalar tuples.
     DynamicTemplate:
       type: object
       description: >
@@ -20018,6 +20077,12 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    UnsupportedExactSort:
+      description: Exact sort cannot be executed through a supported native plan
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ExactSortError'
     InternalServerError:
       description: Internal server error
       content:

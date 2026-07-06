@@ -1451,6 +1451,7 @@ pub const SortProfile = struct {
     cursor_support: []const u8 = "",
     source_load: []const u8 = "",
     distributed_behavior: []const u8 = "",
+    selection_reason: []const u8 = "",
     require_native: bool = false,
     native_loader: bool = false,
     index_sort_match: bool = false,

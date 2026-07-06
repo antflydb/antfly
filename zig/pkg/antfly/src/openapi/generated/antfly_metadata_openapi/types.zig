@@ -12,6 +12,24 @@ const antfly_reranking_openapi = @import("antfly_reranking_openapi");
 
 pub const Error = antfly_usermgr_openapi.Error;
 
+pub const ExactSortError = struct {
+    /// Stable error class.
+    @"error": []const u8,
+    /// Human-readable error summary.
+    message: []const u8,
+    /// Stable machine-readable rejection reason.
+    reason: []const u8,
+    /// Stable exact-sort rejection reason.
+    sort_rejection_reason: []const u8,
+    /// Stable budget rejection reason when the rejection was budget-driven.
+    budget_rejection_reason: ?[]const u8 = null,
+    /// More specific exact-sort rejection detail.
+    sort_rejection_detail: []const u8,
+    /// Sort field associated with the rejection when safe to expose.
+    sort_rejection_field: []const u8,
+    status: i32,
+};
+
 pub const SortDirection = antfly_indexes_openapi.SortDirection;
 
 pub const SortField = antfly_indexes_openapi.SortField;

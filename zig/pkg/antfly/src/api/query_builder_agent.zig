@@ -19,6 +19,7 @@ const indexes_openapi = @import("antfly_indexes_openapi");
 const generating = @import("antfly_generating");
 const platform_time = @import("../platform/time.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const storage_schema = @import("../storage/schema.zig");
 const query_contract = @import("query_contract.zig");
 
 const AgentQuestion = metadata_openapi.AgentQuestion;
@@ -57,6 +58,7 @@ pub fn buildQueryBuilderResponse(
 
 pub const QueryBuilderTableContext = struct {
     schema_fields: []const []const u8 = &.{},
+    field_capabilities: []const QueryBuilderFieldCapability = &.{},
     full_text_indexes: []const []const u8 = &.{},
     semantic_indexes: []const []const u8 = &.{},
     graph_indexes: []const []const u8 = &.{},
@@ -65,6 +67,16 @@ pub const QueryBuilderTableContext = struct {
     graph_index_metadata: []const QueryBuilderGraphIndex = &.{},
     plan_validator: ?QueryBuilderPlanValidator = null,
     runtime_query_request_validator: ?QueryBuilderRuntimeQueryRequestValidator = null,
+};
+
+pub const QueryBuilderFieldCapability = struct {
+    field: []const u8,
+    field_type: ?storage_schema.AntflyType = null,
+    doc_values: bool = false,
+    sortable: bool = false,
+    doc_value_coverage: []const u8 = "",
+    queryability_state: []const u8 = "",
+    provenance: []const u8 = "",
 };
 
 pub const QueryBuilderCollectedContext = struct {
@@ -652,15 +664,6 @@ fn preflightQueryRequestAgainstContext(
     if (query_request.full_text_search != null and !metadataContextHasFullTextIndex(context)) {
         try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "missing_full_text_index", "query_request.full_text_search", "query_request.full_text_search requires a table full-text index");
     }
-    if (query_request.order_by != null and !metadataContextHasFullTextIndex(context)) {
-        try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "missing_full_text_index", "query_request.order_by", "query_request.order_by requires a table full-text index");
-    }
-    if (query_request.offset != null and !metadataContextHasFullTextIndex(context)) {
-        try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "missing_full_text_index", "query_request.offset", "query_request.offset requires a table full-text index");
-    }
-    if ((query_request.search_after != null or query_request.search_before != null) and !metadataContextHasFullTextIndex(context)) {
-        try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "missing_full_text_index", "query_request.search_after", "query_request cursor pagination requires a table full-text index");
-    }
     if (query_request.full_text_search) |full_text_search| {
         if (try metadataValidateBleveFieldsAgainstContext(alloc, context, full_text_search, "query_request.full_text_search")) |feedback| {
             defer alloc.free(feedback);
@@ -708,13 +711,17 @@ fn preflightQueryRequestAgainstContext(
     }
     if (query_request.order_by) |sort_fields| {
         for (sort_fields) |sort_field| {
-            if (!metadataContextAllowsField(context, sort_field.field)) {
+            if (!metadataSortFieldIsReserved(sort_field.field) and !metadataContextAllowsField(context, sort_field.field)) {
                 const feedback = try std.fmt.allocPrint(alloc, "query_request.order_by references unknown field '{s}'", .{sort_field.field});
                 defer alloc.free(feedback);
                 try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "unknown_sort_field", "query_request.order_by", feedback);
             }
-            if (!metadataFullTextIndexesAllowField(context, sort_field.field)) {
-                const feedback = try std.fmt.allocPrint(alloc, "query_request.order_by references field '{s}' that is not covered by table full-text indexes", .{sort_field.field});
+            if (try metadataScoreSortFeedback(alloc, query_request, sort_field.field)) |feedback| {
+                defer alloc.free(feedback);
+                try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "invalid_sort_field", "query_request.order_by", feedback);
+                continue;
+            }
+            if (try metadataSortFieldFeedback(alloc, context, sort_field.field)) |feedback| {
                 defer alloc.free(feedback);
                 try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "invalid_sort_field", "query_request.order_by", feedback);
             }
@@ -1387,11 +1394,154 @@ fn metadataPreflightGraphSearchesAgainstExecutorParser(
 }
 
 fn metadataContextAllowsField(context: *const QueryBuilderTableContext, field: []const u8) bool {
+    if (metadataFieldCapability(context, field) != null) return true;
     return context.schema_fields.len == 0 or queryBuilderFieldInSlice(context.schema_fields, field);
 }
 
 fn metadataContextHasFullTextIndex(context: *const QueryBuilderTableContext) bool {
     return context.full_text_index_metadata.len > 0;
+}
+
+fn metadataFieldCapability(context: *const QueryBuilderTableContext, field: []const u8) ?QueryBuilderFieldCapability {
+    for (context.field_capabilities) |capability| {
+        if (std.mem.eql(u8, capability.field, field)) return capability;
+    }
+    return null;
+}
+
+fn metadataSortFieldIsReserved(field: []const u8) bool {
+    return std.mem.eql(u8, field, "_id") or std.mem.eql(u8, field, "_score");
+}
+
+fn metadataScoreSortFeedback(
+    alloc: std.mem.Allocator,
+    query_request: metadata_openapi.QueryRequest,
+    field: []const u8,
+) !?[]const u8 {
+    if (!std.mem.eql(u8, field, "_score")) return null;
+    if (query_request.semantic_search != null or query_request.embeddings != null) {
+        return try alloc.dupe(u8, "query_request.order_by references _score with an approximate semantic candidate source; omit order_by for native score order");
+    }
+    if (query_request.full_text_search != null) {
+        const score_bearing = query_contract.queryRequestHasScoreBearingTextSourceAlloc(alloc, query_request) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => false,
+        };
+        if (score_bearing) return null;
+        return try alloc.dupe(u8, "query_request.order_by references _score with a non-score-bearing full_text_search");
+    }
+    return try alloc.dupe(u8, "query_request.order_by references _score without a score-bearing full_text_search");
+}
+
+fn metadataSortFieldFeedback(
+    alloc: std.mem.Allocator,
+    context: *const QueryBuilderTableContext,
+    field: []const u8,
+) !?[]const u8 {
+    if (metadataSortFieldIsReserved(field)) return null;
+
+    if (context.field_capabilities.len == 0) {
+        if (!metadataFullTextIndexesAllowField(context, field)) {
+            return try std.fmt.allocPrint(alloc, "query_request.order_by references field '{s}' that is not covered by table metadata", .{field});
+        }
+        return null;
+    }
+
+    var saw_observed = false;
+    var saw_observed_non_sortable = false;
+    var saw_observed_missing_doc_values = false;
+    var saw_observed_not_queryable = false;
+    var saw_observed_mixed_type = false;
+    var observed_field_type: ?storage_schema.AntflyType = null;
+    var observed_not_queryable_reason: []const u8 = "";
+    for (context.field_capabilities) |capability| {
+        if (!std.mem.eql(u8, capability.field, field)) continue;
+        if (!std.mem.eql(u8, capability.provenance, "observed_dynamic")) continue;
+        saw_observed = true;
+        if (capability.field_type) |field_type| {
+            if (observed_field_type) |expected_type| {
+                if (field_type != expected_type) saw_observed_mixed_type = true;
+            } else {
+                observed_field_type = field_type;
+            }
+        }
+        if (!capability.sortable) {
+            saw_observed_non_sortable = true;
+            continue;
+        }
+        if (!capability.doc_values) {
+            saw_observed_missing_doc_values = true;
+            continue;
+        }
+        if (metadataCapabilityNotQueryableForSort(capability)) |reason| {
+            saw_observed_not_queryable = true;
+            observed_not_queryable_reason = reason;
+            continue;
+        }
+    }
+    if (saw_observed) {
+        if (saw_observed_non_sortable) {
+            return try std.fmt.allocPrint(alloc, "query_request.order_by references non-sortable field '{s}'", .{field});
+        }
+        if (saw_observed_missing_doc_values) {
+            return try std.fmt.allocPrint(alloc, "query_request.order_by references field '{s}' without doc_values", .{field});
+        }
+        if (saw_observed_not_queryable) {
+            return try std.fmt.allocPrint(alloc, "query_request.order_by references field '{s}' that is not queryable for exact sort ({s})", .{ field, observed_not_queryable_reason });
+        }
+        if (saw_observed_mixed_type) {
+            return try std.fmt.allocPrint(alloc, "query_request.order_by references field '{s}' with mixed observed dynamic field types", .{field});
+        }
+        return null;
+    }
+
+    var saw_field = false;
+    var saw_non_sortable = false;
+    var saw_missing_doc_values = false;
+    var saw_not_queryable = false;
+    var not_queryable_reason: []const u8 = "";
+    for (context.field_capabilities) |capability| {
+        if (!std.mem.eql(u8, capability.field, field)) continue;
+        saw_field = true;
+        if (!capability.sortable) {
+            saw_non_sortable = true;
+            continue;
+        }
+        if (!capability.doc_values) {
+            saw_missing_doc_values = true;
+            continue;
+        }
+        if (metadataCapabilityNotQueryableForSort(capability)) |reason| {
+            saw_not_queryable = true;
+            not_queryable_reason = reason;
+            continue;
+        }
+        return null;
+    }
+
+    if (!saw_field) {
+        return try std.fmt.allocPrint(alloc, "query_request.order_by references unmapped sort field '{s}'", .{field});
+    }
+    if (saw_non_sortable) {
+        return try std.fmt.allocPrint(alloc, "query_request.order_by references non-sortable field '{s}'", .{field});
+    }
+    if (saw_missing_doc_values) {
+        return try std.fmt.allocPrint(alloc, "query_request.order_by references field '{s}' without doc_values", .{field});
+    }
+    if (saw_not_queryable) {
+        return try std.fmt.allocPrint(alloc, "query_request.order_by references field '{s}' that is not queryable for exact sort ({s})", .{ field, not_queryable_reason });
+    }
+    return try std.fmt.allocPrint(alloc, "query_request.order_by references field '{s}' that is not queryable for exact sort", .{field});
+}
+
+fn metadataCapabilityNotQueryableForSort(capability: QueryBuilderFieldCapability) ?[]const u8 {
+    if (!std.mem.eql(u8, capability.doc_value_coverage, "covered")) {
+        return if (capability.doc_value_coverage.len > 0) capability.doc_value_coverage else "unknown_doc_value_coverage";
+    }
+    if (!std.mem.eql(u8, capability.queryability_state, "queryable")) {
+        return if (capability.queryability_state.len > 0) capability.queryability_state else "unknown_queryability_state";
+    }
+    return null;
 }
 
 fn metadataFullTextIndexesAllowField(context: *const QueryBuilderTableContext, field: []const u8) bool {
@@ -6225,6 +6375,278 @@ test "query builder preflight reports metadata diagnostics" {
     try std.testing.expectEqualStrings("missing_full_text_index", preflight.diagnostics[0].code);
     try std.testing.expectEqualStrings("query_request.full_text_search", preflight.diagnostics[0].path);
     try std.testing.expect(std.mem.indexOf(u8, preflight.diagnostics[0].message, "full-text index") != null);
+}
+
+test "query builder preflight accepts queryable mapped sort field outside full text indexes" {
+    const capabilities = [_]QueryBuilderFieldCapability{
+        .{
+            .field = "_id",
+            .field_type = .keyword,
+            .sortable = true,
+            .doc_value_coverage = "identity_metadata",
+            .queryability_state = "queryable",
+        },
+        .{
+            .field = "created_at",
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .doc_value_coverage = "covered",
+            .queryability_state = "queryable",
+        },
+        .{
+            .field = "body",
+            .doc_value_coverage = "not_declared",
+            .queryability_state = "text_search_only",
+        },
+    };
+    var collected = collectQueryBuilderContext(.{
+        .schema_fields = &.{ "body", "created_at" },
+        .field_capabilities = &capabilities,
+        .full_text_index_metadata = &.{.{ .name = "search_idx", .fields = &.{"body"} }},
+    });
+    const order_by = [_]metadata_openapi.SortField{.{ .field = "created_at", .desc = true }};
+    var preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
+        .intent = "newest docs",
+    }, .{
+        .order_by = &order_by,
+    }, null, "query_builder", .{});
+    defer preflight.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), preflight.diagnostics.len);
+}
+
+test "query builder preflight rejects declared sort field before doc values are covered" {
+    const capabilities = [_]QueryBuilderFieldCapability{
+        .{
+            .field = "created_at",
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .doc_value_coverage = "schema_declared",
+            .queryability_state = "declared",
+        },
+    };
+    var collected = collectQueryBuilderContext(.{
+        .schema_fields = &.{"created_at"},
+        .field_capabilities = &capabilities,
+    });
+    const order_by = [_]metadata_openapi.SortField{.{ .field = "created_at", .desc = true }};
+    var preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
+        .intent = "newest docs",
+    }, .{
+        .order_by = &order_by,
+    }, null, "query_builder", .{});
+    defer preflight.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), preflight.diagnostics.len);
+    try std.testing.expectEqual(QueryPreflightDiagnosticSeverity.@"error", preflight.diagnostics[0].severity);
+    try std.testing.expectEqualStrings("invalid_sort_field", preflight.diagnostics[0].code);
+    try std.testing.expectEqualStrings("query_request.order_by", preflight.diagnostics[0].path);
+    try std.testing.expect(std.mem.indexOf(u8, preflight.diagnostics[0].message, "not queryable for exact sort (schema_declared)") != null);
+}
+
+test "query builder preflight accepts observed dynamic sortable field" {
+    const capabilities = [_]QueryBuilderFieldCapability{
+        .{
+            .field = "metadata.published_at",
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .doc_value_coverage = "covered",
+            .queryability_state = "queryable",
+            .provenance = "observed_dynamic",
+        },
+    };
+    var collected = collectQueryBuilderContext(.{
+        .schema_fields = &.{"body"},
+        .field_capabilities = &capabilities,
+        .full_text_index_metadata = &.{.{ .name = "search_idx", .fields = &.{"body"} }},
+    });
+    const order_by = [_]metadata_openapi.SortField{.{ .field = "metadata.published_at", .desc = true }};
+    var preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
+        .intent = "newest published docs",
+    }, .{
+        .order_by = &order_by,
+    }, null, "query_builder", .{});
+    defer preflight.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), preflight.diagnostics.len);
+}
+
+test "query builder preflight validates score sort source" {
+    var parsed_query = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"match\":\"raft\",\"field\":\"body\"}", .{});
+    defer parsed_query.deinit();
+    var parsed_match_all = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"match_all\":{}}", .{});
+    defer parsed_match_all.deinit();
+
+    var collected = collectQueryBuilderContext(.{
+        .schema_fields = &.{"body"},
+        .full_text_index_metadata = &.{.{ .name = "search_idx", .fields = &.{"body"} }},
+    });
+    const score_order = [_]metadata_openapi.SortField{.{ .field = "_score", .desc = true }};
+    var valid_preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
+        .intent = "highest scoring docs",
+    }, .{
+        .full_text_search = parsed_query.value,
+        .order_by = &score_order,
+    }, null, "query_builder", .{});
+    defer valid_preflight.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), valid_preflight.diagnostics.len);
+
+    var invalid_preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
+        .intent = "highest scoring docs",
+    }, .{
+        .order_by = &score_order,
+    }, null, "query_builder", .{});
+    defer invalid_preflight.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), invalid_preflight.diagnostics.len);
+    try std.testing.expectEqual(QueryPreflightDiagnosticSeverity.@"error", invalid_preflight.diagnostics[0].severity);
+    try std.testing.expectEqualStrings("invalid_sort_field", invalid_preflight.diagnostics[0].code);
+    try std.testing.expectEqualStrings("query_request.order_by", invalid_preflight.diagnostics[0].path);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_preflight.diagnostics[0].message, "without a score-bearing full_text_search") != null);
+
+    var filter_shaped_preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
+        .intent = "highest scoring docs",
+    }, .{
+        .full_text_search = parsed_match_all.value,
+        .order_by = &score_order,
+    }, null, "query_builder", .{});
+    defer filter_shaped_preflight.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), filter_shaped_preflight.diagnostics.len);
+    try std.testing.expectEqual(QueryPreflightDiagnosticSeverity.@"error", filter_shaped_preflight.diagnostics[0].severity);
+    try std.testing.expectEqualStrings("invalid_sort_field", filter_shaped_preflight.diagnostics[0].code);
+    try std.testing.expectEqualStrings("query_request.order_by", filter_shaped_preflight.diagnostics[0].path);
+    try std.testing.expect(std.mem.indexOf(u8, filter_shaped_preflight.diagnostics[0].message, "non-score-bearing full_text_search") != null);
+
+    var semantic_preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
+        .intent = "semantic score docs",
+    }, .{
+        .semantic_search = "raft",
+        .indexes = &.{"body_embedding"},
+        .order_by = &score_order,
+    }, null, "query_builder", .{});
+    defer semantic_preflight.deinit(std.testing.allocator);
+    try std.testing.expect(semantic_preflight.diagnostics.len >= 1);
+    var found_semantic_score_sort_diagnostic = false;
+    for (semantic_preflight.diagnostics) |diagnostic| {
+        if (std.mem.indexOf(u8, diagnostic.message, "approximate semantic candidate source") != null) {
+            found_semantic_score_sort_diagnostic = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_semantic_score_sort_diagnostic);
+}
+
+test "query builder preflight rejects mixed observed dynamic sort coverage" {
+    const capabilities = [_]QueryBuilderFieldCapability{
+        .{
+            .field = "metadata.published_at",
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .doc_value_coverage = "covered",
+            .queryability_state = "queryable",
+            .provenance = "observed_dynamic",
+        },
+        .{
+            .field = "metadata.published_at",
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .doc_value_coverage = "observed_declared",
+            .queryability_state = "declared",
+            .provenance = "observed_dynamic",
+        },
+    };
+    var collected = collectQueryBuilderContext(.{
+        .schema_fields = &.{"body"},
+        .field_capabilities = &capabilities,
+        .full_text_index_metadata = &.{.{ .name = "search_idx", .fields = &.{"body"} }},
+    });
+    const order_by = [_]metadata_openapi.SortField{.{ .field = "metadata.published_at", .desc = true }};
+    var preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
+        .intent = "newest published docs",
+    }, .{
+        .order_by = &order_by,
+    }, null, "query_builder", .{});
+    defer preflight.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), preflight.diagnostics.len);
+    try std.testing.expectEqual(QueryPreflightDiagnosticSeverity.@"error", preflight.diagnostics[0].severity);
+    try std.testing.expectEqualStrings("invalid_sort_field", preflight.diagnostics[0].code);
+    try std.testing.expectEqualStrings("query_request.order_by", preflight.diagnostics[0].path);
+    try std.testing.expect(std.mem.indexOf(u8, preflight.diagnostics[0].message, "not queryable for exact sort (observed_declared)") != null);
+}
+
+test "query builder preflight rejects mixed observed dynamic sort field types" {
+    const capabilities = [_]QueryBuilderFieldCapability{
+        .{
+            .field = "metadata.rank",
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .doc_value_coverage = "covered",
+            .queryability_state = "queryable",
+            .provenance = "observed_dynamic",
+        },
+        .{
+            .field = "metadata.rank",
+            .field_type = .keyword,
+            .doc_values = true,
+            .sortable = true,
+            .doc_value_coverage = "covered",
+            .queryability_state = "queryable",
+            .provenance = "observed_dynamic",
+        },
+    };
+    var collected = collectQueryBuilderContext(.{
+        .schema_fields = &.{"body"},
+        .field_capabilities = &capabilities,
+        .full_text_index_metadata = &.{.{ .name = "search_idx", .fields = &.{"body"} }},
+    });
+    const order_by = [_]metadata_openapi.SortField{.{ .field = "metadata.rank" }};
+    var preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
+        .intent = "ranked docs",
+    }, .{
+        .order_by = &order_by,
+    }, null, "query_builder", .{});
+    defer preflight.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), preflight.diagnostics.len);
+    try std.testing.expectEqual(QueryPreflightDiagnosticSeverity.@"error", preflight.diagnostics[0].severity);
+    try std.testing.expectEqualStrings("invalid_sort_field", preflight.diagnostics[0].code);
+    try std.testing.expectEqualStrings("query_request.order_by", preflight.diagnostics[0].path);
+    try std.testing.expect(std.mem.indexOf(u8, preflight.diagnostics[0].message, "mixed observed dynamic field types") != null);
+}
+
+test "query builder preflight rejects non-sortable mapped field" {
+    const capabilities = [_]QueryBuilderFieldCapability{
+        .{
+            .field = "body",
+            .field_type = .text,
+            .doc_value_coverage = "not_declared",
+            .queryability_state = "text_search_only",
+        },
+    };
+    var collected = collectQueryBuilderContext(.{
+        .schema_fields = &.{"body"},
+        .field_capabilities = &capabilities,
+        .full_text_index_metadata = &.{.{ .name = "search_idx", .fields = &.{"body"} }},
+    });
+    const order_by = [_]metadata_openapi.SortField{.{ .field = "body", .desc = false }};
+    var preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
+        .intent = "sort by body",
+    }, .{
+        .order_by = &order_by,
+    }, null, "query_builder", .{});
+    defer preflight.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), preflight.diagnostics.len);
+    try std.testing.expectEqual(QueryPreflightDiagnosticSeverity.@"error", preflight.diagnostics[0].severity);
+    try std.testing.expectEqualStrings("invalid_sort_field", preflight.diagnostics[0].code);
+    try std.testing.expectEqualStrings("query_request.order_by", preflight.diagnostics[0].path);
+    try std.testing.expect(std.mem.indexOf(u8, preflight.diagnostics[0].message, "non-sortable field 'body'") != null);
 }
 
 test "query builder preflight plan mode summarizes bound indexes and result refs" {
