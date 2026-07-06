@@ -799,8 +799,18 @@ fn appendFullTextField(
 
 fn effectiveAntflyTypes(property: impl.DocumentProperty, item: ?impl.DocumentProperty) []const []const u8 {
     if (property.antfly_types.len > 0) return property.antfly_types;
+    if (property.antfly_field) |mapping| {
+        if (mapping.field_type) |field_type| {
+            if (inferAntflyType(field_type)) |inferred| return inferred;
+        }
+    }
     if (item) |item_property| {
         if (item_property.antfly_types.len > 0) return item_property.antfly_types;
+        if (item_property.antfly_field) |mapping| {
+            if (mapping.field_type) |field_type| {
+                if (inferAntflyType(field_type)) |inferred| return inferred;
+            }
+        }
         if (item_property.field_type) |field_type| {
             if (inferAntflyType(field_type)) |inferred| return inferred;
         }
@@ -812,8 +822,16 @@ fn effectiveAntflyTypes(property: impl.DocumentProperty, item: ?impl.DocumentPro
 }
 
 fn effectiveAntflyAnalyzer(property: impl.DocumentProperty, item: ?impl.DocumentProperty) ?[]const u8 {
+    if (property.antfly_field) |mapping| {
+        if (mapping.analyzer) |analyzer| return analyzer;
+    }
     if (property.analyzer) |analyzer| return analyzer;
-    if (item) |item_property| return item_property.analyzer;
+    if (item) |item_property| {
+        if (item_property.antfly_field) |mapping| {
+            if (mapping.analyzer) |analyzer| return analyzer;
+        }
+        return item_property.analyzer;
+    }
     return null;
 }
 

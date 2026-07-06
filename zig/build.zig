@@ -6563,6 +6563,38 @@ pub fn build(b: *std.Build) void {
     build_public_query_guardrail_step.dependOn(&public_query_guardrail.step);
     const public_query_guardrail_step = b.step("public-query-guardrail", "Benchmark the public /db/v1/tables/<table>/query path against direct DB search and health responsiveness");
     public_query_guardrail_step.dependOn(&run_public_query_guardrail.step);
+    const public_query_sort_guardrail_step = b.step("public-query-sort-guardrail", "Run CI-sized public exact-sort benchmark guardrails over match-all, full-text, and selective filters");
+    const public_query_sort_guardrail_shapes = [_][]const u8{
+        "exact-sort-match-all",
+        "exact-sort-full-text",
+        "exact-sort-filter",
+    };
+    for (public_query_sort_guardrail_shapes) |shape| {
+        const run_public_query_sort_guardrail = b.addRunArtifact(public_query_guardrail);
+        run_public_query_sort_guardrail.addArgs(&.{
+            "--mode",
+            "handler",
+            "--query-shape",
+            shape,
+            "--docs",
+            "512",
+            "--dims",
+            "32",
+            "--queries",
+            "4",
+            "--repeats",
+            "2",
+            "--k",
+            "20",
+            "--batch-size",
+            "128",
+            "--search-threads",
+            "2",
+            "--sync-level",
+            "write",
+        });
+        public_query_sort_guardrail_step.dependOn(&run_public_query_sort_guardrail.step);
+    }
 
     const raft_apply_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/raft_apply_bench.zig"),

@@ -11096,6 +11096,7 @@ pub const DB = struct {
         try self.prepareDenseArtifactRebuildPlan(plan);
         const ResumePersistCtx = struct {
             db: *DB,
+            alloc: Allocator,
             targets: []DenseArtifactRebuildTarget,
 
             fn run(ctx: *anyopaque, last_key: []const u8) !void {
@@ -11105,19 +11106,20 @@ pub const DB = struct {
                         if (std.mem.order(u8, last_key, resume_from) != .gt) continue;
                     }
                     const entry = &persist.db.core.index_manager.dense_indexes.items[target.dense_index_idx];
-                    const rebuild_root_path = try persist.db.denseIndexRebuildStatePathAlloc(persist.db.alloc, entry.config.name);
-                    defer persist.db.alloc.free(rebuild_root_path);
+                    const rebuild_root_path = try persist.db.denseIndexRebuildStatePathAlloc(persist.alloc, entry.config.name);
+                    defer persist.alloc.free(rebuild_root_path);
                     const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
                     try rebuild_state.update(last_key);
-                    const owned_key = try persist.db.alloc.dupe(u8, last_key);
-                    errdefer persist.db.alloc.free(owned_key);
-                    if (target.resume_from) |resume_from| persist.db.alloc.free(resume_from);
+                    const owned_key = try persist.alloc.dupe(u8, last_key);
+                    errdefer persist.alloc.free(owned_key);
+                    if (target.resume_from) |resume_from| persist.alloc.free(resume_from);
                     target.resume_from = owned_key;
                 }
             }
         };
         var persist_ctx = ResumePersistCtx{
             .db = self,
+            .alloc = alloc,
             .targets = plan.targets,
         };
         const rebuilt = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
@@ -13322,11 +13324,28 @@ pub const DB = struct {
         else
             AlgebraicDocFilterRequest{ .req = req };
         defer algebraic_filter.deinit();
-        try self.proveTextQueryAccessPaths(algebraic_filter.req.index_name, text_query);
-        const metric_name = self.textQueryMetricIndexName(algebraic_filter.req);
+        var execution_req = algebraic_filter.req;
+        var resolved_text_filter = try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, execution_req, .{
+            .ctx = self,
+            .text_index_entry = textIndexEntryCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .live_filter_doc_set = liveFilterDocSetCallback,
+            .all_docs_visible = allDocsVisibleCallback,
+            .project_ordinals_to_doc_ids = false,
+            .identity_read_generation = execution_req.identity_read_generation,
+        });
+        defer if (resolved_text_filter) |*filter| filter.deinit(alloc);
+        if (resolved_text_filter) |*filter| {
+            execution_req.resolved_text_doc_filter = filter;
+            execution_req.filter_query_json = "";
+            execution_req.exclusion_query_json = "";
+        }
+        try self.proveTextQueryAccessPaths(execution_req.index_name, text_query);
+        const metric_name = self.textQueryMetricIndexName(execution_req);
         const start_ns = platform_time.monotonicNs();
         errdefer observeSearchFailureMetric(metric_name, .search, platform_time.monotonicNs() -| start_ns);
-        const result = try db_query_search.searchTextQuery(alloc, algebraic_filter.req, text_query, .{
+        const result = try db_query_search.searchTextQuery(alloc, execution_req, text_query, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .text_index_is_chunk_backed = textIndexIsChunkBackedCallback,
@@ -50241,6 +50260,56 @@ test "db dense artifact rebuild progress counts source artifacts across multiple
     }
     try std.testing.expectEqual(@as(?u64, doc_count), dense_a_count);
     try std.testing.expectEqual(@as(?u64, doc_count), dense_b_count);
+}
+
+test "db dense artifact rebuild keeps resume keys owned by caller allocator" {
+    const alloc = std.testing.allocator;
+    const rebuild_alloc = std.heap.page_allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(stored_key);
+        try db.core.store.putBatch(&.{
+            .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
+        }, &.{});
+
+        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dense_idx");
+        defer alloc.free(artifact_key);
+        try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0, 0 });
+    }
+
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const dense_index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
+    defer alloc.free(dense_index_path);
+    try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const rebuilt = try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(rebuild_alloc);
+    try std.testing.expectEqual(@as(usize, 1), rebuilt);
+    try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
 }
 
 test "db chunk-backed dense artifact rebuild stays pending until all chunk artifacts are rebuilt" {

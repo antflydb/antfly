@@ -32,13 +32,13 @@ const std_http_listener = antfly.common.http.std_http_listener;
 const table_name = "docs";
 const index_name = "dense_idx";
 const sparse_index_name = "sparse_idx";
-const text_index_name = "full_text_index_v0";
+const text_index_name = "full_text_index_v1";
 const algebraic_index_name = "algebraic_idx";
 const graph_index_name = "graph_idx";
 const native_endian = builtin.target.cpu.arch.endian();
 
 const benchmark_schema_json =
-    \\{"version":1,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"title":{"type":"text"},"body":{"type":"text"},"category":{"type":"keyword"},"status":{"type":"keyword"},"tenant":{"type":"keyword"},"score":{"type":"number"}}}}}}
+    \\{"version":1,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"title":{"type":"text"},"body":{"type":"text"},"category":{"type":"string","x-antfly-field":{"type":"keyword","sortable":true}},"status":{"type":"string","x-antfly-field":{"type":"keyword","sortable":true}},"tenant":{"type":"string","x-antfly-field":{"type":"keyword","sortable":true}},"score":{"type":"number","x-antfly-field":{"type":"number","sortable":true}}}}}}}
 ;
 
 const benchmark_algebraic_config_json =
@@ -68,6 +68,9 @@ const QueryShape = enum {
     hybrid_filter,
     hybrid_filter_exclude,
     hybrid_filter_exclude_project,
+    exact_sort_match_all,
+    exact_sort_full_text,
+    exact_sort_filter,
 
     fn parse(raw: []const u8) ?QueryShape {
         if (std.mem.eql(u8, raw, "dense")) return .dense;
@@ -81,6 +84,9 @@ const QueryShape = enum {
         if (std.mem.eql(u8, raw, "hybrid-filter")) return .hybrid_filter;
         if (std.mem.eql(u8, raw, "hybrid-filter-exclude")) return .hybrid_filter_exclude;
         if (std.mem.eql(u8, raw, "hybrid-filter-exclude-project")) return .hybrid_filter_exclude_project;
+        if (std.mem.eql(u8, raw, "exact-sort-match-all")) return .exact_sort_match_all;
+        if (std.mem.eql(u8, raw, "exact-sort-full-text")) return .exact_sort_full_text;
+        if (std.mem.eql(u8, raw, "exact-sort-filter")) return .exact_sort_filter;
         return null;
     }
 
@@ -97,19 +103,22 @@ const QueryShape = enum {
             .hybrid_filter => "hybrid-filter",
             .hybrid_filter_exclude => "hybrid-filter-exclude",
             .hybrid_filter_exclude_project => "hybrid-filter-exclude-project",
+            .exact_sort_match_all => "exact-sort-match-all",
+            .exact_sort_full_text => "exact-sort-full-text",
+            .exact_sort_filter => "exact-sort-filter",
         };
     }
 
     fn usesFullText(self: QueryShape) bool {
         return switch (self) {
-            .dense, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter => false,
-            .full_text, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project => true,
+            .dense, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .exact_sort_match_all, .exact_sort_filter => false,
+            .full_text, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_full_text => true,
         };
     }
 
     fn usesDense(self: QueryShape) bool {
         return switch (self) {
-            .full_text, .sparse_filter, .graph_expand => false,
+            .full_text, .sparse_filter, .graph_expand, .exact_sort_match_all, .exact_sort_full_text, .exact_sort_filter => false,
             .dense, .dense_filter, .algebraic_filter, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project => true,
         };
     }
@@ -124,25 +133,36 @@ const QueryShape = enum {
 
     fn usesFilter(self: QueryShape) bool {
         return switch (self) {
-            .dense, .full_text, .graph_expand, .hybrid => false,
+            .dense, .full_text, .graph_expand, .hybrid, .exact_sort_match_all, .exact_sort_full_text => false,
             .dense_filter, .sparse_filter, .algebraic_filter, .hybrid_composed => true,
-            .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project => true,
+            .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_filter => true,
         };
     }
 
     fn usesExclusion(self: QueryShape) bool {
         return switch (self) {
-            .dense, .full_text, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .hybrid_composed, .hybrid, .hybrid_filter => false,
+            .dense, .full_text, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .hybrid_composed, .hybrid, .hybrid_filter, .exact_sort_match_all, .exact_sort_full_text, .exact_sort_filter => false,
             .hybrid_filter_exclude, .hybrid_filter_exclude_project => true,
         };
     }
 
     fn needsDefaultFullTextIndex(self: QueryShape) bool {
-        return self.usesFullText() or self.usesFilter() or self.usesExclusion();
+        return self.usesFullText() or self.usesFilter() or self.usesExclusion() or self.usesExactSort();
     }
 
     fn projectsFields(self: QueryShape) bool {
         return self == .hybrid_filter_exclude_project;
+    }
+
+    fn usesExactSort(self: QueryShape) bool {
+        return switch (self) {
+            .exact_sort_match_all, .exact_sort_full_text, .exact_sort_filter => true,
+            else => false,
+        };
+    }
+
+    fn requiresSchema(self: QueryShape) bool {
+        return self.usesExactSort() or self == .algebraic_filter;
     }
 };
 
@@ -402,6 +422,16 @@ const QueryBenchStats = struct {
     profile_inline_metadata_hits: u64 = 0,
     profile_fetched_metadata_hits: u64 = 0,
     profile_lookup_doc_key_hits: u64 = 0,
+    profile_sort_response_count: u64 = 0,
+    profile_sort_native_doc_values_count: u64 = 0,
+    profile_sort_source_isolated_count: u64 = 0,
+    profile_sort_candidate_count: u64 = 0,
+    profile_sort_selected_count: u64 = 0,
+    profile_sort_cursor_rejected_count: u64 = 0,
+    profile_sort_native_doc_value_hit_count: u64 = 0,
+    profile_sort_native_doc_value_miss_count: u64 = 0,
+    profile_sort_stored_json_load_count: u64 = 0,
+    profile_sort_projected_source_load_count: u64 = 0,
     queries: u64 = 0,
     failures: u64 = 0,
 
@@ -491,7 +521,7 @@ const QueryResponseWire = struct {
         profile: ?Profile = null,
 
         const Hits = struct {
-            total: u32 = 0,
+            total: std.json.Value = .null,
             hits: ?[]const Hit = null,
 
             const Hit = struct {
@@ -501,6 +531,23 @@ const QueryResponseWire = struct {
 
         const Profile = struct {
             dense_search: ?DenseSearch = null,
+            sort: ?Sort = null,
+
+            const Sort = struct {
+                plan: []const u8 = "",
+                exactness: []const u8 = "",
+                source: []const u8 = "",
+                source_load: []const u8 = "",
+                selection_reason: []const u8 = "",
+                native_doc_values_coverage: []const u8 = "",
+                candidate_count: u64 = 0,
+                selected_count: u64 = 0,
+                cursor_rejected_count: u64 = 0,
+                native_doc_value_hit_count: u64 = 0,
+                native_doc_value_miss_count: u64 = 0,
+                stored_json_load_count: u64 = 0,
+                projected_source_load_count: u64 = 0,
+            };
 
             const DenseSearch = struct {
                 const DebugHit = struct {
@@ -581,7 +628,7 @@ const FakeStatusSource = struct {
                 .table_id = 1,
                 .name = table_name,
                 .description = "public query guardrail",
-                .schema_json = if (cfg.with_schema or cfg.query_shape == .algebraic_filter) benchmark_schema_json else "",
+                .schema_json = if (cfg.with_schema or cfg.query_shape.requiresSchema()) benchmark_schema_json else "",
                 .read_schema_json = "",
                 .indexes_json = indexes_json,
                 .replication_sources_json = "[]",
@@ -997,9 +1044,15 @@ fn runHandlerBench(
     defer server.deinit();
 
     std.debug.print("public-query guardrail stage=db-search\n", .{});
-    const db_stats = try benchDbSearch(alloc, &db, query_bodies, cfg);
+    const db_stats: QueryBenchStats = if (cfg.query_shape.usesExactSort() and cfg.query_shape.usesFilter())
+        .{}
+    else
+        try benchDbSearch(alloc, &db, query_bodies, cfg);
     std.debug.print("public-query guardrail stage=handler-pipeline\n", .{});
-    const handler_pipeline = try benchHandlerPipeline(alloc, &server, read_source.source(), query_bodies, cfg);
+    const handler_pipeline: HandlerPipelineStats = if (cfg.query_shape.usesExactSort() and cfg.query_shape.usesFilter())
+        .{}
+    else
+        try benchHandlerPipeline(alloc, &server, read_source.source(), query_bodies, cfg);
     std.debug.print("public-query guardrail stage=direct-handler\n", .{});
     const handler_stats = try benchDirectHandler(alloc, server.executor(), query_bodies, cfg);
     const profile_stats = if (handler_stats.profile_dense_search_count == 0 and db_stats.profile_dense_search_count > 0)
@@ -1007,9 +1060,13 @@ fn runHandlerBench(
     else
         handler_stats;
     try enforceSymbolicProfileGuardrail(cfg, profile_stats);
+    try enforceExactSortGuardrail(cfg, handler_stats);
     try enforceSymbolicResultFillGuardrail(cfg, handler_stats);
     std.debug.print("public-query guardrail stage=handler-concurrent\n", .{});
-    const handler_concurrent = try benchConcurrentDirectHandler(alloc, server.executor(), query_bodies, cfg);
+    const handler_concurrent: ConcurrentStats = if (cfg.query_shape.usesExactSort())
+        .{}
+    else
+        try benchConcurrentDirectHandler(alloc, server.executor(), query_bodies, cfg);
 
     const avg_db_ns = db_stats.avgNs();
     const avg_handler_ns = handler_stats.avgNs();
@@ -1094,6 +1151,7 @@ fn runHandlerBench(
             if (profile_stats.queries == 0) 0 else @as(f64, @floatFromInt(profile_stats.profile_hbc_full_rerank_due_to_threshold)) / @as(f64, @floatFromInt(profile_stats.queries)),
         },
     );
+    printPublicQuerySortProfile(cfg, handler_stats);
     printPublicQuerySymbolicFilterProfile(cfg, profile_stats);
     std.debug.print(
         "public_query_rerank_boundary avg_left_distance={d:.6} avg_left_error={d:.6} avg_left_lower={d:.6} avg_left_upper={d:.6} avg_right_distance={d:.6} avg_right_error={d:.6} avg_right_lower={d:.6} avg_right_upper={d:.6} avg_distance_gap={d:.6} avg_interval_gap={d:.6} max_left_error={d:.6} max_right_error={d:.6} boundary_pair_rate={d:.4}\n",
@@ -1192,9 +1250,15 @@ fn runLocalBench(
     defer alloc.free(metrics_uri);
 
     std.debug.print("public-query guardrail stage=db-search\n", .{});
-    const db_stats = try benchDbSearch(alloc, &db, query_bodies, cfg);
+    const db_stats: QueryBenchStats = if (cfg.query_shape.usesExactSort() and cfg.query_shape.usesFilter())
+        .{}
+    else
+        try benchDbSearch(alloc, &db, query_bodies, cfg);
     std.debug.print("public-query guardrail stage=handler-pipeline\n", .{});
-    const handler_pipeline = try benchHandlerPipeline(alloc, &server, read_source.source(), query_bodies, cfg);
+    const handler_pipeline: HandlerPipelineStats = if (cfg.query_shape.usesExactSort() and cfg.query_shape.usesFilter())
+        .{}
+    else
+        try benchHandlerPipeline(alloc, &server, read_source.source(), query_bodies, cfg);
     std.debug.print("public-query guardrail stage=direct-handler\n", .{});
     const handler_stats = try benchDirectHandler(alloc, server.executor(), query_bodies, cfg);
     std.debug.print("public-query guardrail stage=http-query\n", .{});
@@ -1204,9 +1268,13 @@ fn runLocalBench(
     else
         http_stats;
     try enforceSymbolicProfileGuardrail(cfg, profile_stats);
+    try enforceExactSortGuardrail(cfg, http_stats);
     try enforceSymbolicResultFillGuardrail(cfg, http_stats);
     std.debug.print("public-query guardrail stage=handler-concurrent\n", .{});
-    const handler_concurrent = try benchConcurrentDirectHandler(alloc, server.executor(), query_bodies, cfg);
+    const handler_concurrent: ConcurrentStats = if (cfg.query_shape.usesExactSort())
+        .{}
+    else
+        try benchConcurrentDirectHandler(alloc, server.executor(), query_bodies, cfg);
     std.debug.print("public-query guardrail stage=http-concurrent\n", .{});
     const concurrent = try benchConcurrentHttpWithPolling(alloc, io, base_uri, query_bodies, health_uri, metrics_uri, null, cfg, null);
 
@@ -1298,6 +1366,7 @@ fn runLocalBench(
             if (profile_stats.queries == 0) 0 else @as(f64, @floatFromInt(profile_stats.profile_hbc_full_rerank_due_to_threshold)) / @as(f64, @floatFromInt(profile_stats.queries)),
         },
     );
+    printPublicQuerySortProfile(cfg, http_stats);
     printPublicQuerySymbolicFilterProfile(cfg, profile_stats);
     std.debug.print(
         "public_query_rerank_boundary avg_left_distance={d:.6} avg_left_error={d:.6} avg_left_lower={d:.6} avg_left_upper={d:.6} avg_right_distance={d:.6} avg_right_error={d:.6} avg_right_lower={d:.6} avg_right_upper={d:.6} avg_distance_gap={d:.6} avg_interval_gap={d:.6} max_left_error={d:.6} max_right_error={d:.6} boundary_pair_rate={d:.4}\n",
@@ -1505,7 +1574,7 @@ fn openAndSeedDb(
     var db = try db_mod.DB.open(alloc, path, .{});
     errdefer db.close();
 
-    if (cfg.with_schema or cfg.query_shape == .algebraic_filter) {
+    if (cfg.with_schema or cfg.query_shape.requiresSchema()) {
         var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, benchmark_schema_json);
         defer parsed_schema.deinit(alloc);
         const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
@@ -1711,8 +1780,9 @@ fn benchDirectHandler(
             defer resp.deinit(alloc);
             const elapsed = elapsedSince(started);
             if (resp.status != 200) {
-                std.debug.print("public-query guardrail direct-handler status={d} body={s}\n", .{
+                std.debug.print("public-query guardrail direct-handler status={d} request={s} body={s}\n", .{
                     resp.status,
+                    body,
                     resp.body,
                 });
                 return error.UnexpectedHttpStatus;
@@ -1739,7 +1809,7 @@ const ProfiledDenseBenchQuery = struct {
 fn profiledDenseBenchQuery(req: db_mod.types.SearchRequest, query_shape: QueryShape) ?ProfiledDenseBenchQuery {
     switch (query_shape) {
         .dense, .dense_filter, .algebraic_filter => {},
-        .full_text, .sparse_filter, .graph_expand, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project => return null,
+        .full_text, .sparse_filter, .graph_expand, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_match_all, .exact_sort_full_text, .exact_sort_filter => return null,
     }
     if (req.sparse != null or req.sparse_queries.len > 0) return null;
     if (req.graph_queries.len > 0) return null;
@@ -1788,7 +1858,13 @@ fn benchHandlerPipeline(
             const source_elapsed = elapsedSince(source_start);
             stats.source_query_ns += source_elapsed;
 
-            var parsed = try std.json.parseFromSlice(QueryResponseWire, alloc, resp.json, .{ .ignore_unknown_fields = true });
+            var parsed = std.json.parseFromSlice(QueryResponseWire, alloc, resp.json, .{ .ignore_unknown_fields = true }) catch |err| {
+                std.debug.print(
+                    "public-query guardrail handler-pipeline parse error={s} body={s}\n",
+                    .{ @errorName(err), resp.json },
+                );
+                return err;
+            };
             defer parsed.deinit();
             if (parsed.value.responses.len == 0) return error.InvalidQueryResponse;
             if (parsed.value.responses[0].profile) |profile| {
@@ -1991,6 +2067,22 @@ fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, 
     if (graphResultHasNodes(raw_body)) stats.response_hit_count += 1;
     if (first.profile) |profile| {
         stats.profile_response_count += 1;
+        if (profile.sort) |sort| {
+            stats.profile_sort_response_count += 1;
+            if (std.mem.eql(u8, sort.plan, "native_doc_values_top_n")) stats.profile_sort_native_doc_values_count += 1;
+            if (std.mem.eql(u8, sort.source_load, "source_free") or
+                std.mem.eql(u8, sort.source_load, "projected_source_after_page"))
+            {
+                stats.profile_sort_source_isolated_count += 1;
+            }
+            stats.profile_sort_candidate_count += sort.candidate_count;
+            stats.profile_sort_selected_count += sort.selected_count;
+            stats.profile_sort_cursor_rejected_count += sort.cursor_rejected_count;
+            stats.profile_sort_native_doc_value_hit_count += sort.native_doc_value_hit_count;
+            stats.profile_sort_native_doc_value_miss_count += sort.native_doc_value_miss_count;
+            stats.profile_sort_stored_json_load_count += sort.stored_json_load_count;
+            stats.profile_sort_projected_source_load_count += sort.projected_source_load_count;
+        }
         if (profile.dense_search) |dense| {
             stats.profile_dense_search_count += 1;
             stats.profile_total_ns += dense.total_ns;
@@ -2056,6 +2148,54 @@ fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, 
                 return error.EmptyQueryResult;
             }
         }
+    }
+}
+
+fn enforceExactSortGuardrail(cfg: Config, stats: QueryBenchStats) !void {
+    if (!cfg.query_shape.usesExactSort()) return;
+
+    const expected_queries: u64 = @intCast(cfg.queries * cfg.repeats);
+    if (stats.queries != expected_queries) {
+        std.debug.print(
+            "public-query guardrail failed: exact sort query_count={d} expected={d}\n",
+            .{ stats.queries, expected_queries },
+        );
+        return error.ExactSortGuardrailFailed;
+    }
+    if (stats.profile_response_count != stats.queries or stats.profile_sort_response_count != stats.queries) {
+        std.debug.print(
+            "public-query guardrail failed: exact sort missing profiles profile_count={d} sort_profile_count={d} queries={d}\n",
+            .{ stats.profile_response_count, stats.profile_sort_response_count, stats.queries },
+        );
+        return error.ExactSortGuardrailFailed;
+    }
+    if (stats.profile_sort_native_doc_values_count != stats.queries) {
+        std.debug.print(
+            "public-query guardrail failed: exact sort did not use native_doc_values_top_n for every query native_count={d} queries={d}\n",
+            .{ stats.profile_sort_native_doc_values_count, stats.queries },
+        );
+        return error.ExactSortGuardrailFailed;
+    }
+    if (stats.profile_sort_source_isolated_count != stats.queries) {
+        std.debug.print(
+            "public-query guardrail failed: exact sort used source before page selection source_isolated_count={d} queries={d}\n",
+            .{ stats.profile_sort_source_isolated_count, stats.queries },
+        );
+        return error.ExactSortGuardrailFailed;
+    }
+    if (stats.profile_sort_stored_json_load_count != 0 or stats.profile_sort_projected_source_load_count > stats.profile_sort_selected_count) {
+        std.debug.print(
+            "public-query guardrail failed: exact sort loaded source before page selection stored_json_loads={d} projected_source_loads={d} selected={d}\n",
+            .{ stats.profile_sort_stored_json_load_count, stats.profile_sort_projected_source_load_count, stats.profile_sort_selected_count },
+        );
+        return error.ExactSortGuardrailFailed;
+    }
+    if (stats.profile_sort_native_doc_value_hit_count == 0 or stats.profile_sort_selected_count == 0) {
+        std.debug.print(
+            "public-query guardrail failed: exact sort missing native hits selected={d} native_doc_value_hits={d}\n",
+            .{ stats.profile_sort_selected_count, stats.profile_sort_native_doc_value_hit_count },
+        );
+        return error.ExactSortGuardrailFailed;
     }
 }
 
@@ -2350,6 +2490,7 @@ fn runSwarmBench(
     std.debug.print("public-query guardrail stage=http-query\n", .{});
     const http_stats = try benchHttpQuery(alloc, base_uri, query_bodies, cfg);
     try enforceSymbolicProfileGuardrail(cfg, http_stats);
+    try enforceExactSortGuardrail(cfg, http_stats);
     try enforceSymbolicResultFillGuardrail(cfg, http_stats);
     std.debug.print("public-query guardrail stage=http-concurrent\n", .{});
     const concurrent = try benchConcurrentHttpWithPolling(alloc, io, base_uri, query_bodies, health_uri, metrics_uri, index_status_uri, cfg, child.id);
@@ -2445,6 +2586,7 @@ fn runSwarmBench(
             if (http_stats.queries == 0) 0 else @as(f64, @floatFromInt(http_stats.profile_hbc_full_rerank_due_to_threshold)) / @as(f64, @floatFromInt(http_stats.queries)),
         },
     );
+    printPublicQuerySortProfile(cfg, http_stats);
     printPublicQuerySymbolicFilterProfile(cfg, http_stats);
     std.debug.print(
         "public_query_rerank_boundary avg_left_distance={d:.6} avg_left_error={d:.6} avg_left_lower={d:.6} avg_left_upper={d:.6} avg_right_distance={d:.6} avg_right_error={d:.6} avg_right_lower={d:.6} avg_right_upper={d:.6} avg_distance_gap={d:.6} avg_interval_gap={d:.6} max_left_error={d:.6} max_right_error={d:.6} boundary_pair_rate={d:.4}\n",
@@ -2652,7 +2794,7 @@ fn seedSwarm(
     defer executor.deinit();
     var client = api.ApiHttpClient.init(alloc, executor.executor());
 
-    const create_table_body = if (cfg.with_schema or cfg.query_shape == .algebraic_filter)
+    const create_table_body = if (cfg.with_schema or cfg.query_shape.requiresSchema())
         try std.fmt.allocPrint(alloc, "{{\"num_shards\":1,\"description\":\"public query swarm guardrail\",\"schema\":{s}}}", .{benchmark_schema_json})
     else
         try std.fmt.allocPrint(alloc, "{{\"num_shards\":1,\"description\":\"public query swarm guardrail\"}}", .{});
@@ -3311,7 +3453,7 @@ fn waitForQueryIndexesReady(
     cfg: Config,
 ) !VisibilitySnapshot {
     const dense = try waitForDenseIndexReady(alloc, base_uri, expected_docs, timeout_ms);
-    if (!cfg.query_shape.usesFullText()) return dense;
+    if (!cfg.query_shape.needsDefaultFullTextIndex()) return dense;
 
     var executor = std_http_executor.StdHttpExecutor.init(alloc, .{});
     defer executor.deinit();
@@ -3388,6 +3530,11 @@ fn encodeQueryJson(alloc: std.mem.Allocator, vector: []const f32, source_doc_idx
         try out.appendSlice(alloc, "\"]},\"params\":{\"edge_types\":[\"cites\"]}}}");
         wrote_field = true;
     }
+    if (cfg.query_shape == .exact_sort_match_all) {
+        if (wrote_field) try out.append(alloc, ',');
+        try out.appendSlice(alloc, "\"query\":{\"match_all\":{}}");
+        wrote_field = true;
+    }
     if (cfg.query_shape.usesFilter()) {
         if (wrote_field) try out.append(alloc, ',');
         try appendMetadataFilterQuery(&out, alloc, source_doc_idx);
@@ -3406,6 +3553,9 @@ fn encodeQueryJson(alloc: std.mem.Allocator, vector: []const f32, source_doc_idx
     }
     try out.appendSlice(alloc, "\"limit\":");
     try out.print(alloc, "{d}", .{cfg.k});
+    if (cfg.query_shape.usesExactSort()) {
+        try out.appendSlice(alloc, ",\"order_by\":[{\"field\":\"score\",\"desc\":true}]");
+    }
     if (cfg.server_kind == .zig) {
         try out.appendSlice(alloc, ",\"profile\":true");
     }
@@ -3434,7 +3584,7 @@ fn appendQueryIndexes(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator
         try out.appendSlice(alloc, "\"" ++ sparse_index_name ++ "\"");
         wrote = true;
     }
-    if (!wrote and cfg.query_shape.usesFullText()) {
+    if (!wrote and cfg.query_shape.needsDefaultFullTextIndex()) {
         try out.appendSlice(alloc, "\"" ++ text_index_name ++ "\"");
         wrote = true;
     }
@@ -3535,6 +3685,46 @@ fn printPublicQuerySymbolicFilterProfile(cfg: Config, stats: QueryBenchStats) vo
     );
 }
 
+fn printPublicQuerySortProfile(cfg: Config, stats: QueryBenchStats) void {
+    if (!cfg.query_shape.usesExactSort() and stats.profile_sort_response_count == 0) return;
+    std.debug.print(
+        "public_query_sort_profile query_shape={s} exact_sort={} profile_response_rate={d:.4} sort_profile_rate={d:.4} native_doc_values_rate={d:.4} source_isolated_rate={d:.4} candidates={d:.2} selected={d:.2} cursor_rejected={d:.2} native_doc_value_hits={d:.2} native_doc_value_misses={d:.2} stored_json_loads={d:.2} projected_source_loads={d:.2}\n",
+        .{
+            cfg.query_shape.text(),
+            cfg.query_shape.usesExactSort(),
+            stats.profileResponseRate(),
+            rate(stats.profile_sort_response_count, stats.queries),
+            rate(stats.profile_sort_native_doc_values_count, stats.queries),
+            rate(stats.profile_sort_source_isolated_count, stats.queries),
+            avgPerQuery(stats, stats.profile_sort_candidate_count),
+            avgPerQuery(stats, stats.profile_sort_selected_count),
+            avgPerQuery(stats, stats.profile_sort_cursor_rejected_count),
+            avgPerQuery(stats, stats.profile_sort_native_doc_value_hit_count),
+            avgPerQuery(stats, stats.profile_sort_native_doc_value_miss_count),
+            avgPerQuery(stats, stats.profile_sort_stored_json_load_count),
+            avgPerQuery(stats, stats.profile_sort_projected_source_load_count),
+        },
+    );
+    std.debug.print(
+        "{{\"event\":\"public_query_sort_profile\",\"query_shape\":\"{s}\",\"exact_sort\":{},\"profile_response_rate\":{d:.6},\"sort_profile_rate\":{d:.6},\"native_doc_values_rate\":{d:.6},\"source_isolated_rate\":{d:.6},\"candidate_count_avg\":{d:.3},\"selected_count_avg\":{d:.3},\"cursor_rejected_avg\":{d:.3},\"native_doc_value_hits_avg\":{d:.3},\"native_doc_value_misses_avg\":{d:.3},\"stored_json_loads_avg\":{d:.3},\"projected_source_loads_avg\":{d:.3}}}\n",
+        .{
+            cfg.query_shape.text(),
+            cfg.query_shape.usesExactSort(),
+            stats.profileResponseRate(),
+            rate(stats.profile_sort_response_count, stats.queries),
+            rate(stats.profile_sort_native_doc_values_count, stats.queries),
+            rate(stats.profile_sort_source_isolated_count, stats.queries),
+            avgPerQuery(stats, stats.profile_sort_candidate_count),
+            avgPerQuery(stats, stats.profile_sort_selected_count),
+            avgPerQuery(stats, stats.profile_sort_cursor_rejected_count),
+            avgPerQuery(stats, stats.profile_sort_native_doc_value_hit_count),
+            avgPerQuery(stats, stats.profile_sort_native_doc_value_miss_count),
+            avgPerQuery(stats, stats.profile_sort_stored_json_load_count),
+            avgPerQuery(stats, stats.profile_sort_projected_source_load_count),
+        },
+    );
+}
+
 fn printPublicQueryGuardrailSummaryJson(
     mode: []const u8,
     server: []const u8,
@@ -3587,7 +3777,7 @@ fn printPublicQueryGuardrailSummaryJson(
         },
     );
     std.debug.print(
-        ",\"load_rss_peak_bytes\":{d},\"search_rss_peak_bytes\":{d},\"hbc_total_bytes\":{d},\"hbc_accounted_bytes\":{d},\"lsm_cache_bytes\":{d},\"full_text_pending_bytes\":{d},\"replay_window_bytes\":{d},\"approx_candidates_avg\":{d:.3},\"rerank_candidates_avg\":{d:.3},\"reranked_vectors_avg\":{d:.3},\"top_k_count_avg\":{d:.3},\"profile_response_rate\":{d:.6},\"dense_profile_rate\":{d:.6},\"returned_hits_avg\":{d:.3}}}\n",
+        ",\"load_rss_peak_bytes\":{d},\"search_rss_peak_bytes\":{d},\"hbc_total_bytes\":{d},\"hbc_accounted_bytes\":{d},\"lsm_cache_bytes\":{d},\"full_text_pending_bytes\":{d},\"replay_window_bytes\":{d},\"approx_candidates_avg\":{d:.3},\"rerank_candidates_avg\":{d:.3},\"reranked_vectors_avg\":{d:.3},\"top_k_count_avg\":{d:.3},\"profile_response_rate\":{d:.6},\"dense_profile_rate\":{d:.6},\"sort_profile_rate\":{d:.6},\"sort_native_doc_values_rate\":{d:.6},\"sort_source_isolated_rate\":{d:.6},\"sort_candidates_avg\":{d:.3},\"sort_selected_avg\":{d:.3},\"sort_native_doc_value_hits_avg\":{d:.3},\"sort_stored_json_loads_avg\":{d:.3},\"returned_hits_avg\":{d:.3}}}\n",
         .{
             load_rss_peak_bytes,
             search_rss_peak_bytes,
@@ -3602,6 +3792,13 @@ fn printPublicQueryGuardrailSummaryJson(
             avgPerQuery(profile_stats, profile_stats.profile_hbc_top_k_count),
             profile_stats.profileResponseRate(),
             profile_stats.denseProfileRate(),
+            rate(http_stats.profile_sort_response_count, http_stats.queries),
+            rate(http_stats.profile_sort_native_doc_values_count, http_stats.queries),
+            rate(http_stats.profile_sort_source_isolated_count, http_stats.queries),
+            avgPerQuery(http_stats, http_stats.profile_sort_candidate_count),
+            avgPerQuery(http_stats, http_stats.profile_sort_selected_count),
+            avgPerQuery(http_stats, http_stats.profile_sort_native_doc_value_hit_count),
+            avgPerQuery(http_stats, http_stats.profile_sort_stored_json_load_count),
             avgPerQuery(http_stats, http_stats.response_hit_count),
         },
     );
@@ -3610,6 +3807,11 @@ fn printPublicQueryGuardrailSummaryJson(
 fn avgPerQuery(stats: QueryBenchStats, value: u64) f64 {
     const query_count = if (stats.queries == 0) 1 else stats.queries;
     return @as(f64, @floatFromInt(value)) / @as(f64, @floatFromInt(query_count));
+}
+
+fn rate(value: u64, total: u64) f64 {
+    if (total == 0) return 0;
+    return @as(f64, @floatFromInt(value)) / @as(f64, @floatFromInt(total));
 }
 
 const ExpectedSymbolicMatchStats = struct {
