@@ -7366,7 +7366,15 @@ pub const DB = struct {
             result.debt_remaining = true;
             return result;
         }
-        const rebuilt = try self.rebuildIndexWithShadowReplacement(alloc, cfg);
+        const rebuilt = self.rebuildIndexWithShadowReplacement(alloc, cfg) catch |err| switch (err) {
+            error.ShadowIndexCatchUpIncomplete => {
+                result.failed += 1;
+                result.unresolved += 1;
+                result.debt_remaining = true;
+                return result;
+            },
+            else => return err,
+        };
         result.reprocessed += rebuilt.reprocessed;
         result.repaired += 1;
         result.indexes_rebuilt += 1;
@@ -7459,7 +7467,7 @@ pub const DB = struct {
             .kind = cfg.kind,
         };
         try self.saveShadowReplacementAppliedSequence(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, build_floor_sequence);
-        try self.catchUpShadowReplacementUntil(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, self.core.nextDerivedSequence());
+        _ = try self.catchUpShadowReplacementUntil(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, self.core.nextDerivedSequence());
 
         const use_dense_search_barrier = cfg.kind == .dense_vector;
         if (use_dense_search_barrier) self.beginIndexRepairBarrier();
@@ -7469,7 +7477,8 @@ pub const DB = struct {
         defer self.core.unlockApply();
 
         const final_target = self.core.nextDerivedSequence();
-        try self.catchUpShadowReplacementUntil(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, final_target);
+        const reached_target = try self.catchUpShadowReplacementUntil(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, final_target);
+        if (reached_target < final_target) return error.ShadowIndexCatchUpIncomplete;
 
         shadow_manager.deinit();
         shadow_manager_open = false;
@@ -7497,50 +7506,53 @@ pub const DB = struct {
         shadow_checkpoint_path: []const u8,
         index_ref: index_manager_mod.ManagedIndexRef,
         target_sequence: u64,
-    ) !void {
-        if (target_sequence == 0) return;
+    ) !u64 {
+        if (target_sequence == 0) return 0;
         var batch_ctx = self.batchContext();
         batch_ctx.index_manager = shadow_manager;
         batch_ctx.applied_sequence_checkpoint_path = shadow_checkpoint_path;
         batch_ctx.async_context = null;
         batch_ctx.dense_bulk_session_scope = .external;
 
-        const applied = try apply_state.loadAppliedSequenceWithCheckpoint(
+        var applied = try apply_state.loadAppliedSequenceWithCheckpoint(
             alloc,
             self.core.store,
             shadow_checkpoint_path,
             index_ref.name,
         );
-        if (applied >= target_sequence) return;
-        var replay_ctx = ReplayApplyContextBatch{
-            .batch = &batch_ctx,
-            .dense_bulk_session_scope = .external,
-        };
-        const catch_up_stats = try derived_worker.catchUpIndexWithOptions(
-            alloc,
-            self.core.replaySource(),
-            index_ref,
-            applied,
-            &replay_ctx,
-            applyDerivedBatchToIndexReplayContext,
-            .{
-                .resource_manager = shadow_manager.resource_manager,
-                .window_ctx = &replay_ctx,
-                .begin_window_fn = beginDerivedCatchUpWindowContext,
-                .finish_window_fn = finishDerivedCatchUpWindowContext,
-                .target_sequence = target_sequence,
-            },
-        );
-        const advanced = catch_up_stats.appliedSequenceAdvance(applied) orelse blk: {
-            if (catch_up_stats.shouldTryTargetAdvance(applied, target_sequence) and
-                try canAdvanceDerivedReplayTargetContext(&batch_ctx, index_ref, applied, target_sequence))
-            {
-                break :blk target_sequence;
-            }
-            break :blk applied;
-        };
-        if (advanced <= applied) return;
-        try self.saveShadowReplacementAppliedSequence(alloc, shadow_manager, shadow_checkpoint_path, index_ref, advanced);
+        while (applied < target_sequence) {
+            var replay_ctx = ReplayApplyContextBatch{
+                .batch = &batch_ctx,
+                .dense_bulk_session_scope = .external,
+            };
+            const catch_up_stats = try derived_worker.catchUpIndexWithOptions(
+                alloc,
+                self.core.replaySource(),
+                index_ref,
+                applied,
+                &replay_ctx,
+                applyDerivedBatchToIndexReplayContext,
+                .{
+                    .resource_manager = shadow_manager.resource_manager,
+                    .window_ctx = &replay_ctx,
+                    .begin_window_fn = beginDerivedCatchUpWindowContext,
+                    .finish_window_fn = finishDerivedCatchUpWindowContext,
+                    .target_sequence = target_sequence,
+                },
+            );
+            const advanced = catch_up_stats.appliedSequenceAdvance(applied) orelse blk: {
+                if (catch_up_stats.shouldTryTargetAdvance(applied, target_sequence) and
+                    try canAdvanceDerivedReplayTargetContext(&batch_ctx, index_ref, applied, target_sequence))
+                {
+                    break :blk target_sequence;
+                }
+                break :blk applied;
+            };
+            if (advanced <= applied) return applied;
+            try self.saveShadowReplacementAppliedSequence(alloc, shadow_manager, shadow_checkpoint_path, index_ref, advanced);
+            applied = advanced;
+        }
+        return applied;
     }
 
     fn saveShadowReplacementAppliedSequence(
@@ -28073,25 +28085,38 @@ fn rebuildDenseIndexFromStoredEmbeddingArtifactsContext(
                 if (DB.isRecoverableEmbeddingArtifactError(err)) return .@"continue";
                 return err;
             };
-            errdefer state.ctx.alloc.free(vector);
+            var vector_owned = true;
+            errdefer if (vector_owned) state.ctx.alloc.free(vector);
             if (vector.len != state.expected_dims) {
                 state.ctx.alloc.free(vector);
+                vector_owned = false;
                 return .@"continue";
             }
             const owned_index_name = try state.ctx.alloc.dupe(u8, state.index_name);
-            errdefer state.ctx.alloc.free(owned_index_name);
+            var owned_index_name_owned = true;
+            errdefer if (owned_index_name_owned) state.ctx.alloc.free(owned_index_name);
             const doc_key = try state.ctx.alloc.dupe(u8, identity.doc_key);
-            errdefer state.ctx.alloc.free(doc_key);
+            var doc_key_owned = true;
+            errdefer if (doc_key_owned) state.ctx.alloc.free(doc_key);
             const parent_doc_key = if (identity.parent_doc_key) |parent| try state.ctx.alloc.dupe(u8, parent) else null;
-            errdefer if (parent_doc_key) |parent| state.ctx.alloc.free(parent);
+            var parent_doc_key_owned = true;
+            errdefer if (parent_doc_key_owned) if (parent_doc_key) |parent| state.ctx.alloc.free(parent);
+            const artifact_key = try state.ctx.alloc.dupe(u8, key);
+            var artifact_key_owned = true;
+            errdefer if (artifact_key_owned) state.ctx.alloc.free(artifact_key);
 
             try state.writes.append(state.ctx.alloc, .{
                 .index_name = owned_index_name,
                 .doc_key = doc_key,
                 .parent_doc_key = parent_doc_key,
-                .artifact_key = null,
+                .artifact_key = artifact_key,
                 .vector = vector,
             });
+            owned_index_name_owned = false;
+            doc_key_owned = false;
+            parent_doc_key_owned = false;
+            artifact_key_owned = false;
+            vector_owned = false;
             state.rebuilt += 1;
 
             if (state.writes.items.len >= state.rebuild_chunk_size) try state.flush();
