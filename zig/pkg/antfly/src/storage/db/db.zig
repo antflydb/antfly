@@ -32551,6 +32551,90 @@ test "db exact sort resolves mapped boolean metadata filters from typed doc valu
     try std.testing.expect(sort_profile.native_doc_value_hit_count >= 2);
 }
 
+test "db exact sort resolves mapped geo metadata filters from typed doc values" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"body":{"type":"string","x-antfly-field":{"type":"text"}},"location":{"type":"object","x-antfly-field":{"type":"geo_point"}},"score":{"type":"number","x-antfly-field":{"type":"number","sortable":true}}}}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha\",\"location\":{\"lat\":37.7749,\"lon\":-122.4194},\"score\":30}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"beta\",\"location\":{\"lat\":37.7750,\"lon\":-122.4195},\"score\":20}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"gamma\",\"location\":{\"lat\":40.7128,\"lon\":-74.0060},\"score\":50}" },
+            .{ .key = "doc:d", .value = "{\"body\":\"delta\",\"location\":{\"lat\":37.8044,\"lon\":-122.2712},\"score\":40}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const order = [_]types.SortField{.{ .field = "score", .desc = true }};
+    var distance = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .primary_text_index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .filter_query_json = "{\"geo_distance\":{\"path\":\"location\",\"lat\":37.7749,\"lon\":-122.4194,\"radius_meters\":2000}}",
+        .order_by = &order,
+        .limit = 10,
+        .include_stored = false,
+        .profile = true,
+    });
+    defer distance.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), distance.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), distance.hits.len);
+    try std.testing.expectEqualStrings("doc:a", distance.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", distance.hits[1].id);
+    const distance_profile = distance.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", distance_profile.plan);
+    try std.testing.expectEqualStrings("source_free", distance_profile.source_load);
+    try std.testing.expectEqual(@as(u64, 2), distance_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), distance_profile.stored_json_load_count);
+    try std.testing.expect(distance_profile.native_doc_value_hit_count >= 2);
+
+    var bbox = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .primary_text_index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .filter_query_json = "{\"geo_bbox\":{\"path\":\"location\",\"min_lat\":37.70,\"min_lon\":-122.50,\"max_lat\":37.80,\"max_lon\":-122.30}}",
+        .order_by = &order,
+        .limit = 10,
+        .include_stored = false,
+        .profile = true,
+    });
+    defer bbox.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), bbox.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), bbox.hits.len);
+    try std.testing.expectEqualStrings("doc:a", bbox.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", bbox.hits[1].id);
+    const bbox_profile = bbox.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", bbox_profile.plan);
+    try std.testing.expectEqualStrings("source_free", bbox_profile.source_load);
+    try std.testing.expectEqual(@as(u64, 2), bbox_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), bbox_profile.stored_json_load_count);
+    try std.testing.expect(bbox_profile.native_doc_value_hit_count >= 2);
+}
+
 test "db non chunked search paths apply broad live doc filter" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;

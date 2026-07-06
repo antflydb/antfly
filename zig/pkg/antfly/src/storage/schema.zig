@@ -752,11 +752,22 @@ pub fn fieldTypeIsSortableScalar(field_type: AntflyType) bool {
 }
 
 pub fn mappingIsFilterable(mapping: FieldMapping) bool {
-    return fieldTypeIsSortableScalar(mapping.field_type) and (mapping.do_index or mapping.doc_values);
+    return switch (mapping.field_type) {
+        .geopoint => mapping.doc_values,
+        else => fieldTypeIsSortableScalar(mapping.field_type) and (mapping.do_index or mapping.doc_values),
+    };
 }
 
 pub fn mappingIsAggregatable(mapping: FieldMapping) bool {
     return fieldTypeIsSortableScalar(mapping.field_type) and mapping.doc_values;
+}
+
+pub fn mappingHasNativeDocValues(mapping: FieldMapping) bool {
+    if (!mapping.doc_values) return false;
+    return switch (mapping.field_type) {
+        .keyword, .numeric, .boolean, .datetime, .link, .geopoint => true,
+        else => false,
+    };
 }
 
 pub fn mappingIsSortable(mapping: FieldMapping) bool {
@@ -765,6 +776,10 @@ pub fn mappingIsSortable(mapping: FieldMapping) bool {
 
 pub fn mappingQueryabilityStateName(mapping: FieldMapping) []const u8 {
     if (mappingIsSortable(mapping)) return "declared";
+    if (mapping.field_type == .geopoint) {
+        if (mapping.doc_values) return "declared";
+        return "missing_doc_values";
+    }
     if (!fieldTypeIsSortableScalar(mapping.field_type)) return "non_scalar";
     if (!mapping.doc_values) return "missing_doc_values";
     if (!mapping.sortable) return "non_sortable";
@@ -1624,18 +1639,41 @@ test "runtime schema field capability helpers classify mapped sortability" {
         .sortable = false,
         .analyzer = "keyword",
     };
+    const geo = FieldMapping{
+        .field_type = .geopoint,
+        .do_index = true,
+        .doc_values = true,
+        .sortable = false,
+        .analyzer = "standard",
+    };
+    const geo_missing_doc_values = FieldMapping{
+        .field_type = .geopoint,
+        .do_index = true,
+        .doc_values = false,
+        .sortable = false,
+        .analyzer = "standard",
+    };
 
     try std.testing.expect(fieldTypeIsSortableScalar(.keyword));
     try std.testing.expect(fieldTypeIsSortableScalar(.datetime));
     try std.testing.expect(!fieldTypeIsSortableScalar(.text));
+    try std.testing.expect(!fieldTypeIsSortableScalar(.geopoint));
     try std.testing.expect(mappingIsFilterable(keyword));
+    try std.testing.expect(mappingIsFilterable(geo));
+    try std.testing.expect(!mappingIsFilterable(geo_missing_doc_values));
     try std.testing.expect(mappingIsAggregatable(keyword));
     try std.testing.expect(mappingIsSortable(keyword));
     try std.testing.expect(!mappingIsSortable(text));
+    try std.testing.expect(!mappingIsSortable(geo));
     try std.testing.expect(!mappingIsAggregatable(text));
+    try std.testing.expect(mappingHasNativeDocValues(keyword));
+    try std.testing.expect(mappingHasNativeDocValues(geo));
+    try std.testing.expect(!mappingHasNativeDocValues(geo_missing_doc_values));
     try std.testing.expectEqualStrings("declared", mappingQueryabilityStateName(keyword));
+    try std.testing.expectEqualStrings("declared", mappingQueryabilityStateName(geo));
     try std.testing.expectEqualStrings("non_scalar", mappingQueryabilityStateName(text));
     try std.testing.expectEqualStrings("missing_doc_values", mappingQueryabilityStateName(missing_doc_values));
+    try std.testing.expectEqualStrings("missing_doc_values", mappingQueryabilityStateName(geo_missing_doc_values));
     try std.testing.expectEqualStrings("non_sortable", mappingQueryabilityStateName(non_sortable));
 }
 

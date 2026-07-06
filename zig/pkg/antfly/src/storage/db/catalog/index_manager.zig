@@ -3998,7 +3998,7 @@ pub const IndexManager = struct {
         name: ?[]const u8,
     ) ![]schema_mod.FieldCapability {
         const entry = self.textIndexEntry(name) orelse return &.{};
-        const declared_capability_count = declaredRuntimeSortableFieldCapabilityCount(entry);
+        const declared_capability_count = declaredRuntimeNativeDocValueFieldCapabilityCount(entry);
         const capability_count = entry.observed_field_analyzers.len + declared_capability_count;
         if (capability_count == 0) return &.{};
 
@@ -4014,7 +4014,7 @@ pub const IndexManager = struct {
             if (coverage == .covered) {
                 capability.doc_value_coverage = "covered";
                 capability.queryability_state = "queryable";
-            } else if (schema_mod.mappingIsSortable(item.mapping())) {
+            } else if (schema_mod.mappingHasNativeDocValues(item.mapping())) {
                 capability.doc_value_coverage = typed_dv_coverage.statusName(coverage);
                 capability.queryability_state = "missing_doc_values";
             }
@@ -4027,7 +4027,7 @@ pub const IndexManager = struct {
         if (entry.runtime_schema) |schema| {
             for (schema.dynamic_templates) |template| {
                 const field = schema_mod.exactDynamicTemplatePath(template) orelse continue;
-                if (!schema_mod.mappingIsSortable(template.mapping)) continue;
+                if (!schema_mod.mappingHasNativeDocValues(template.mapping)) continue;
                 var capability = schema_mod.dynamicTemplateFieldCapability(schema, template);
                 const coverage = try observedDynamicFieldTypedDocValueCoverageStatus(alloc, entry, field, template.mapping);
                 if (coverage == .covered) {
@@ -4045,12 +4045,12 @@ pub const IndexManager = struct {
         return capabilities;
     }
 
-    fn declaredRuntimeSortableFieldCapabilityCount(entry: *TextIndex) usize {
+    fn declaredRuntimeNativeDocValueFieldCapabilityCount(entry: *TextIndex) usize {
         const schema = entry.runtime_schema orelse return 0;
         var capability_count: usize = 0;
         for (schema.dynamic_templates) |template| {
             if (schema_mod.exactDynamicTemplatePath(template) == null) continue;
-            if (!schema_mod.mappingIsSortable(template.mapping)) continue;
+            if (!schema_mod.mappingHasNativeDocValues(template.mapping)) continue;
             capability_count += 1;
         }
         return capability_count;
@@ -4062,7 +4062,7 @@ pub const IndexManager = struct {
         field: []const u8,
         mapping: schema_mod.FieldMapping,
     ) !typed_dv_coverage.Status {
-        if (!schema_mod.mappingIsSortable(mapping)) return .missing_doc_values_section;
+        if (!schema_mod.mappingHasNativeDocValues(mapping)) return .missing_doc_values_section;
         const snapshot = entry.persistent.snapshot();
         if (snapshot.global_doc_count == 0) return .covered;
 
@@ -4086,6 +4086,7 @@ pub const IndexManager = struct {
             },
             .boolean => value_type == .bool_val,
             .keyword, .link => value_type == .bytes_val,
+            .geopoint => value_type == .geo_point,
             else => false,
         };
     }
@@ -4096,7 +4097,7 @@ pub const IndexManager = struct {
     ) ![]ObservedDynamicFieldCapabilitySet {
         var set_count: usize = 0;
         for (self.text_indexes.items) |*entry| {
-            if (entry.observed_field_analyzers.len > 0 or declaredRuntimeSortableFieldCapabilityCount(entry) > 0) set_count += 1;
+            if (entry.observed_field_analyzers.len > 0 or declaredRuntimeNativeDocValueFieldCapabilityCount(entry) > 0) set_count += 1;
         }
         if (set_count == 0) return &.{};
 
@@ -4108,7 +4109,7 @@ pub const IndexManager = struct {
         }
 
         for (self.text_indexes.items) |*entry| {
-            if (entry.observed_field_analyzers.len == 0 and declaredRuntimeSortableFieldCapabilityCount(entry) == 0) continue;
+            if (entry.observed_field_analyzers.len == 0 and declaredRuntimeNativeDocValueFieldCapabilityCount(entry) == 0) continue;
             sets[initialized] = blk: {
                 const index_name = try alloc.dupe(u8, entry.config.name);
                 errdefer alloc.free(index_name);
@@ -16675,6 +16676,81 @@ test "declared runtime sortable field capability reports covered queryable state
     try std.testing.expect(capabilities[0].sortable);
     try std.testing.expectEqualStrings("covered", capabilities[0].doc_value_coverage);
     try std.testing.expectEqualStrings("dynamic_template", capabilities[0].provenance);
+    try std.testing.expectEqualStrings("queryable", capabilities[0].queryability_state);
+}
+
+test "declared runtime geo field capability reports covered filterable state" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    try manager.addAllNoBackfill(&store, &.{
+        .{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        },
+    });
+    const entry = manager.textIndexEntry("ft_v1").?;
+    const templates = try alloc.alloc(schema_mod.DynamicTemplate, 1);
+    templates[0] = .{
+        .name = try alloc.dupe(u8, "location"),
+        .path_match = try alloc.dupe(u8, "location"),
+        .mapping = .{
+            .field_type = .geopoint,
+            .do_index = true,
+            .doc_values = true,
+            .sortable = false,
+            .analyzer = try alloc.dupe(u8, "standard"),
+        },
+    };
+    entry.runtime_schema = .{
+        .default_type = try alloc.dupe(u8, "_default"),
+        .ttl_field = try alloc.dupe(u8, "_timestamp"),
+        .dynamic_templates = templates,
+    };
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .geo_point, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .geo_point = .{ .lat = 37.7749, .lon = -122.4194 } });
+    try dv_writer.add(1, .{ .geo_point = .{ .lat = 37.7750, .lon = -122.4195 } });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const location_idx = try seg_writer.addField("location");
+    try seg_writer.addSection(location_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"location\":{\"lat\":37.7749,\"lon\":-122.4194}}");
+    try seg_writer.addStoredDoc("doc:b", "{\"location\":{\"lat\":37.7750,\"lon\":-122.4195}}");
+    const segment = try seg_writer.build();
+    defer alloc.free(segment);
+    try entry.persistent.indexSegment(segment);
+
+    const capabilities = try manager.observedDynamicFieldCapabilitiesAlloc(alloc, "ft_v1");
+    defer schema_mod.freeOwnedFieldCapabilities(alloc, capabilities);
+    try std.testing.expectEqual(@as(usize, 1), capabilities.len);
+    try std.testing.expectEqualStrings("location", capabilities[0].name.?);
+    try std.testing.expectEqualStrings("location", capabilities[0].field.?);
+    try std.testing.expectEqual(schema_mod.AntflyType.geopoint, capabilities[0].field_type);
+    try std.testing.expect(capabilities[0].searchable);
+    try std.testing.expect(capabilities[0].filterable);
+    try std.testing.expect(!capabilities[0].aggregatable);
+    try std.testing.expect(capabilities[0].doc_values);
+    try std.testing.expect(!capabilities[0].sortable);
+    try std.testing.expectEqualStrings("covered", capabilities[0].doc_value_coverage);
     try std.testing.expectEqualStrings("queryable", capabilities[0].queryability_state);
 }
 

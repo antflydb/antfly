@@ -10913,6 +10913,17 @@ test "api http public sort capability gate validates mapped sortable fields" {
                 .analyzer = "standard",
             },
         },
+        .{
+            .name = "location",
+            .path_match = "location",
+            .mapping = .{
+                .field_type = .geopoint,
+                .do_index = true,
+                .doc_values = true,
+                .sortable = false,
+                .analyzer = "standard",
+            },
+        },
     };
     const runtime_schema = storage_schema.TableSchema{ .dynamic_templates = &templates };
     var covered_created = storage_schema.observedDynamicFieldCapability(null, "created_at", .{
@@ -11070,6 +11081,14 @@ test "api http public sort capability gate validates mapped sortable fields" {
     try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{ .order_by = &body_order }, runtime_schema, &.{}));
     diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("body", diagnostic.field);
+    try std.testing.expectEqualStrings("non_sortable_sort_field", diagnostic.reason);
+    try std.testing.expectEqualStrings("non_scalar_field", diagnostic.detail);
+
+    const location_order = [_]db_mod.types.SortField{.{ .field = "location" }};
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{ .order_by = &location_order }, runtime_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("location", diagnostic.field);
     try std.testing.expectEqualStrings("non_sortable_sort_field", diagnostic.reason);
     try std.testing.expectEqualStrings("non_scalar_field", diagnostic.detail);
 }

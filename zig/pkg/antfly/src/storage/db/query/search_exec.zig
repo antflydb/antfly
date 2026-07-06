@@ -7837,11 +7837,11 @@ fn searchQueryCanUseSnapshot(
         .numeric_range => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .numeric),
         .date_range => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .datetime),
         .bool_field => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .boolean),
-        .geo_distance => |item| try snapshot.hasInvertedField(item.field),
-        .geo_bbox => |item| try snapshot.hasInvertedField(item.field),
+        .geo_distance => |item| try searchQueryCanUseMappedGeoDocValues(snapshot, item.field, runtime_schema),
+        .geo_bbox => |item| try searchQueryCanUseMappedGeoDocValues(snapshot, item.field, runtime_schema),
         .term_range => |item| try snapshot.hasInvertedField(item.field),
         .ip_range => |item| try snapshot.hasInvertedField(item.field),
-        .geo_shape => |item| try snapshot.hasInvertedField(item.field),
+        .geo_shape => |item| try searchQueryCanUseMappedGeoDocValues(snapshot, item.field, runtime_schema),
         .prefix => |item| try snapshot.hasInvertedField(item.field),
         .wildcard => |item| try snapshot.hasInvertedField(item.field),
         .regexp => |item| try snapshot.hasInvertedField(item.field),
@@ -7871,6 +7871,18 @@ fn searchQueryCanUseMappedDocValues(
     if (mapping.field_type != expected_type) return false;
     if (!runtime_schema_mod.mappingIsAggregatable(mapping)) return false;
     return try snapshotTypedDocValuesCoverageForMapping(snapshot, field, mapping) == .covered;
+}
+
+fn searchQueryCanUseMappedGeoDocValues(
+    snapshot: *const index_mod.IndexSnapshot,
+    field: []const u8,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) !bool {
+    const schema = runtime_schema orelse return false;
+    const mapping = runtime_schema_mod.resolveDeclaredFieldType(schema, field) orelse return false;
+    if (mapping.field_type != .geopoint) return false;
+    if (!mapping.doc_values) return false;
+    return try snapshotGeoPointDocValuesCoverage(snapshot, field) == .covered;
 }
 
 fn queryFieldUsesKeywordAnalyzer(
@@ -8354,6 +8366,101 @@ test "pattern date range filter lowers public date and timestamp bounds" {
     try std.testing.expectEqual(@as(u64, 1767571200000000000), ns_query.date_range.end_ns.?);
 }
 
+test "pattern typed structured filters accept explicit path alias" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed_numeric = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"numeric_range":{"path":"score","min":10,"max":20,"inclusive_min":false,"inclusive_max":true}}
+    , .{});
+    const numeric_query = try patternFilterValueToSearchQuery(alloc, parsed_numeric.value, .{}, null);
+    try std.testing.expect(numeric_query == .numeric_range);
+    try std.testing.expectEqualStrings("score", numeric_query.numeric_range.field);
+    try std.testing.expectEqual(@as(?f64, 10), numeric_query.numeric_range.min);
+    try std.testing.expectEqual(@as(?f64, 20), numeric_query.numeric_range.max);
+    try std.testing.expect(!numeric_query.numeric_range.inclusive_min);
+    try std.testing.expect(numeric_query.numeric_range.inclusive_max);
+
+    const parsed_bool = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"bool_field":{"path":"published","value":true}}
+    , .{});
+    const bool_query = try patternFilterValueToSearchQuery(alloc, parsed_bool.value, .{}, null);
+    try std.testing.expect(bool_query == .bool_field);
+    try std.testing.expectEqualStrings("published", bool_query.bool_field.field);
+    try std.testing.expect(bool_query.bool_field.value);
+
+    const parsed_term = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"term_range":{"path":"category","min":"a","max":"m","inclusive_min":true,"inclusive_max":false}}
+    , .{});
+    const term_query = try patternFilterValueToSearchQuery(alloc, parsed_term.value, .{}, null);
+    try std.testing.expect(term_query == .term_range);
+    try std.testing.expectEqualStrings("category", term_query.term_range.field);
+    try std.testing.expectEqualStrings("a", term_query.term_range.min.?);
+    try std.testing.expectEqualStrings("m", term_query.term_range.max.?);
+
+    const parsed_ip = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"ip_range":{"path":"client_ip","cidr":"10.0.0.0/8"}}
+    , .{});
+    const ip_query = try patternFilterValueToSearchQuery(alloc, parsed_ip.value, .{}, null);
+    try std.testing.expect(ip_query == .ip_range);
+    try std.testing.expectEqualStrings("client_ip", ip_query.ip_range.field);
+    try std.testing.expectEqualStrings("10.0.0.0/8", ip_query.ip_range.cidr);
+
+    const parsed_distance = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"geo_distance":{"path":"location","lat":37.7749,"lon":-122.4194,"radius_meters":1000}}
+    , .{});
+    const distance_query = try patternFilterValueToSearchQuery(alloc, parsed_distance.value, .{}, null);
+    try std.testing.expect(distance_query == .geo_distance);
+    try std.testing.expectEqualStrings("location", distance_query.geo_distance.field);
+    try std.testing.expectEqual(@as(f64, 37.7749), distance_query.geo_distance.center.lat);
+    try std.testing.expectEqual(@as(f64, -122.4194), distance_query.geo_distance.center.lon);
+    try std.testing.expectEqual(@as(f64, 1000), distance_query.geo_distance.radius_meters);
+
+    const parsed_bbox = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"geo_bbox":{"path":"location","min_lat":37.7,"min_lon":-122.5,"max_lat":37.8,"max_lon":-122.3}}
+    , .{});
+    const bbox_query = try patternFilterValueToSearchQuery(alloc, parsed_bbox.value, .{}, null);
+    try std.testing.expect(bbox_query == .geo_bbox);
+    try std.testing.expectEqualStrings("location", bbox_query.geo_bbox.field);
+    try std.testing.expectEqual(@as(f64, 37.7), bbox_query.geo_bbox.min_lat);
+    try std.testing.expectEqual(@as(f64, -122.5), bbox_query.geo_bbox.min_lon);
+    try std.testing.expectEqual(@as(f64, 37.8), bbox_query.geo_bbox.max_lat);
+    try std.testing.expectEqual(@as(f64, -122.3), bbox_query.geo_bbox.max_lon);
+}
+
+test "pattern typed structured filters reject ambiguous field and path aliases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"numeric_range":{"field":"score","path":"rank","min":10}}
+    , .{});
+    try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, parsed.value, .{}, null));
+}
+
+test "pattern geo structured filters reject invalid coordinates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const invalid_distance = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"geo_distance":{"path":"location","lat":91.0,"lon":-122.4194,"radius_meters":1000}}
+    , .{});
+    try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, invalid_distance.value, .{}, null));
+
+    const invalid_radius = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"geo_distance":{"path":"location","lat":37.7749,"lon":-122.4194,"radius_meters":-1}}
+    , .{});
+    try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, invalid_radius.value, .{}, null));
+
+    const invalid_bbox = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"geo_bbox":{"path":"location","min_lat":38.0,"min_lon":-122.5,"max_lat":37.8,"max_lon":-122.3}}
+    , .{});
+    try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, invalid_bbox.value, .{}, null));
+}
+
 test "pattern standard range filter lowers through runtime scalar mappings" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -8520,7 +8627,7 @@ fn setJsonRangeBound(found: *?JsonRangeBound, value: std.json.Value, inclusive: 
 
 fn parseNumericRangeQuery(value: std.json.Value) !search_mod.NumericRangeQuery {
     if (value != .object) return error.InvalidArgument;
-    const field = jsonString(value.object.get("field") orelse return error.InvalidArgument) orelse return error.InvalidArgument;
+    const field = try requiredFieldOrPath(value.object);
     return .{
         .field = field,
         .min = jsonOptionalF64(value.object.get("min")),
@@ -8532,7 +8639,7 @@ fn parseNumericRangeQuery(value: std.json.Value) !search_mod.NumericRangeQuery {
 
 fn parseDateRangeQuery(value: std.json.Value) !search_mod.DateRangeQuery {
     if (value != .object) return error.InvalidArgument;
-    const field = jsonString(value.object.get("field") orelse value.object.get("path") orelse return error.InvalidArgument) orelse return error.InvalidArgument;
+    const field = try requiredFieldOrPath(value.object);
     const start_ns = if (value.object.get("start_ns") != null)
         try jsonOptionalU64(value.object.get("start_ns"))
     else
@@ -8553,14 +8660,14 @@ fn parseDateRangeQuery(value: std.json.Value) !search_mod.DateRangeQuery {
 
 fn parseBoolFieldQuery(value: std.json.Value) !search_mod.BoolFieldQuery {
     if (value != .object) return error.InvalidArgument;
-    const field = jsonString(value.object.get("field") orelse return error.InvalidArgument) orelse return error.InvalidArgument;
+    const field = try requiredFieldOrPath(value.object);
     const bool_value = jsonOptionalBool(value.object.get("value")) orelse return error.InvalidArgument;
     return .{ .field = field, .value = bool_value };
 }
 
 fn parseTermRangeQuery(value: std.json.Value) !search_mod.TermRangeQuery {
     if (value != .object) return error.InvalidArgument;
-    const field = jsonString(value.object.get("field") orelse return error.InvalidArgument) orelse return error.InvalidArgument;
+    const field = try requiredFieldOrPath(value.object);
     return .{
         .field = field,
         .min = jsonString(value.object.get("min") orelse .null),
@@ -8572,30 +8679,71 @@ fn parseTermRangeQuery(value: std.json.Value) !search_mod.TermRangeQuery {
 
 fn parseIpRangeQuery(value: std.json.Value) !search_mod.IPRangeQuery {
     if (value != .object) return error.InvalidArgument;
-    const field = jsonString(value.object.get("field") orelse return error.InvalidArgument) orelse return error.InvalidArgument;
+    const field = try requiredFieldOrPath(value.object);
     const cidr = jsonString(value.object.get("cidr") orelse return error.InvalidArgument) orelse return error.InvalidArgument;
     return .{ .field = field, .cidr = cidr };
 }
 
 fn parseGeoDistanceQuery(value: std.json.Value) !search_mod.GeoDistanceQuery {
     if (value != .object) return error.InvalidArgument;
-    const field = jsonString(value.object.get("field") orelse return error.InvalidArgument) orelse return error.InvalidArgument;
-    const lon = jsonOptionalF64(value.object.get("lon")) orelse return error.InvalidArgument;
-    const lat = jsonOptionalF64(value.object.get("lat")) orelse return error.InvalidArgument;
-    const radius_meters = jsonOptionalF64(value.object.get("radius_meters")) orelse return error.InvalidArgument;
+    const field = try requiredFieldOrPath(value.object);
+    const lon = try jsonRequiredLongitude(value.object.get("lon"));
+    const lat = try jsonRequiredLatitude(value.object.get("lat"));
+    const radius_meters = try jsonRequiredNonNegativeFiniteF64(value.object.get("radius_meters"));
     return .{ .field = field, .center = .{ .lon = lon, .lat = lat }, .radius_meters = radius_meters };
 }
 
 fn parseGeoBBoxQuery(value: std.json.Value) !search_mod.GeoBBoxQuery {
     if (value != .object) return error.InvalidArgument;
-    const field = jsonString(value.object.get("field") orelse return error.InvalidArgument) orelse return error.InvalidArgument;
+    const field = try requiredFieldOrPath(value.object);
+    const min_lat = try jsonRequiredLatitude(value.object.get("min_lat"));
+    const min_lon = try jsonRequiredLongitude(value.object.get("min_lon"));
+    const max_lat = try jsonRequiredLatitude(value.object.get("max_lat"));
+    const max_lon = try jsonRequiredLongitude(value.object.get("max_lon"));
+    if (min_lat > max_lat) return error.InvalidArgument;
     return .{
         .field = field,
-        .min_lat = jsonOptionalF64(value.object.get("min_lat")) orelse return error.InvalidArgument,
-        .min_lon = jsonOptionalF64(value.object.get("min_lon")) orelse return error.InvalidArgument,
-        .max_lat = jsonOptionalF64(value.object.get("max_lat")) orelse return error.InvalidArgument,
-        .max_lon = jsonOptionalF64(value.object.get("max_lon")) orelse return error.InvalidArgument,
+        .min_lat = min_lat,
+        .min_lon = min_lon,
+        .max_lat = max_lat,
+        .max_lon = max_lon,
     };
+}
+
+fn requiredFieldOrPath(object: anytype) ![]const u8 {
+    const field_value = object.get("field");
+    const path_value = object.get("path");
+    if (field_value != null and path_value != null) {
+        const field = jsonString(field_value.?) orelse return error.InvalidArgument;
+        const path = jsonString(path_value.?) orelse return error.InvalidArgument;
+        if (!std.mem.eql(u8, field, path)) return error.InvalidArgument;
+        return field;
+    }
+    return jsonString(field_value orelse path_value orelse return error.InvalidArgument) orelse return error.InvalidArgument;
+}
+
+fn jsonRequiredLatitude(value: ?std.json.Value) !f64 {
+    const parsed = try jsonRequiredFiniteF64(value);
+    if (parsed < -90.0 or parsed > 90.0) return error.InvalidArgument;
+    return parsed;
+}
+
+fn jsonRequiredLongitude(value: ?std.json.Value) !f64 {
+    const parsed = try jsonRequiredFiniteF64(value);
+    if (parsed < -180.0 or parsed > 180.0) return error.InvalidArgument;
+    return parsed;
+}
+
+fn jsonRequiredNonNegativeFiniteF64(value: ?std.json.Value) !f64 {
+    const parsed = try jsonRequiredFiniteF64(value);
+    if (parsed < 0) return error.InvalidArgument;
+    return parsed;
+}
+
+fn jsonRequiredFiniteF64(value: ?std.json.Value) !f64 {
+    const parsed = jsonOptionalF64(value) orelse return error.InvalidArgument;
+    if (!std.math.isFinite(parsed)) return error.InvalidArgument;
+    return parsed;
 }
 
 fn jsonString(value: std.json.Value) ?[]const u8 {
@@ -11851,6 +11999,21 @@ fn snapshotTypedDocValuesCoverageForMapping(
     mapping: runtime_schema_mod.FieldMapping,
 ) !TypedDocValuesCoverageStatus {
     return (try snapshotTypedDocValuesCoverageDetailsForMapping(snapshot, field, mapping)).status;
+}
+
+fn snapshotGeoPointDocValuesCoverage(
+    snapshot: *const index_mod.IndexSnapshot,
+    field: []const u8,
+) !TypedDocValuesCoverageStatus {
+    for (snapshot.segments) |*segment| {
+        if (segment.liveDocCount() == 0) continue;
+        const section_data = segment.reader.getSection(field, .typed_doc_values) orelse return .missing_doc_values_section;
+        const reader = typed_dv.TypedDocValuesReader.init(snapshot.alloc, section_data) catch return .malformed_doc_values_section;
+        if (reader.value_type != .geo_point) return .doc_values_kind_mismatch;
+        const live_status = try typed_dv_coverage.readerCoversLiveDocsAlloc(snapshot.alloc, segment, &reader);
+        if (live_status != .covered) return live_status;
+    }
+    return .covered;
 }
 
 fn sortFieldMapping(schema: runtime_schema_mod.TableSchema, field: []const u8) ?runtime_schema_mod.FieldMapping {

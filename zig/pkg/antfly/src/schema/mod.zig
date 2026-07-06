@@ -106,6 +106,7 @@ fn freeRuntimeDynamicTemplateItems(alloc: std.mem.Allocator, templates: []storag
 fn runtimeDynamicTemplateFromParsed(alloc: std.mem.Allocator, template: impl.DynamicTemplate) !storage_schema.DynamicTemplate {
     const field_type = parseRuntimeFieldType(template.field_type orelse "text");
     const sortable = template.sortable orelse false;
+    const do_index = template.do_index orelse true;
     return .{
         .name = try alloc.dupe(u8, template.name),
         .match_pattern = if (template.match_pattern) |value| try alloc.dupe(u8, value) else null,
@@ -115,9 +116,9 @@ fn runtimeDynamicTemplateFromParsed(alloc: std.mem.Allocator, template: impl.Dyn
         .match_mapping_type = if (template.match_mapping_type) |value| try alloc.dupe(u8, value) else null,
         .mapping = .{
             .field_type = field_type,
-            .do_index = template.do_index orelse true,
+            .do_index = do_index,
             .store = template.store orelse false,
-            .doc_values = sortable,
+            .doc_values = runtimeMappingUsesDocValues(field_type, sortable, do_index),
             .sortable = sortable,
             .missing_null_policy = if (template.missing_null_policy) |policy|
                 storage_schema.parseMissingNullPolicy(policy) orelse return error.InvalidSchemaUpdateRequest
@@ -197,14 +198,15 @@ fn runtimeDocumentFieldTemplateFromParsed(
 ) !storage_schema.DynamicTemplate {
     const field_type = parseRuntimeFieldType(mapping.field_type orelse "text");
     const sortable = mapping.sortable orelse false;
+    const do_index = mapping.do_index orelse true;
     return .{
         .name = try alloc.dupe(u8, path),
         .path_match = try alloc.dupe(u8, path),
         .mapping = .{
             .field_type = field_type,
-            .do_index = mapping.do_index orelse true,
+            .do_index = do_index,
             .store = mapping.store orelse false,
-            .doc_values = sortable,
+            .doc_values = runtimeMappingUsesDocValues(field_type, sortable, do_index),
             .sortable = sortable,
             .missing_null_policy = if (mapping.missing_null_policy) |policy|
                 storage_schema.parseMissingNullPolicy(policy) orelse return error.InvalidSchemaUpdateRequest
@@ -230,12 +232,24 @@ fn parseRuntimeFieldType(field_type: []const u8) storage_schema.AntflyType {
         std.mem.eql(u8, field_type, "date") or
         std.mem.eql(u8, field_type, "timestamp"))
         return .datetime;
-    if (std.mem.eql(u8, field_type, "geopoint")) return .geopoint;
-    if (std.mem.eql(u8, field_type, "geoshape")) return .geoshape;
+    if (std.mem.eql(u8, field_type, "geopoint") or std.mem.eql(u8, field_type, "geo_point")) return .geopoint;
+    if (std.mem.eql(u8, field_type, "geoshape") or std.mem.eql(u8, field_type, "geo_shape")) return .geoshape;
     if (std.mem.eql(u8, field_type, "blob")) return .blob;
     if (std.mem.eql(u8, field_type, "html")) return .html;
     if (std.mem.eql(u8, field_type, "search_as_you_type")) return .search_as_you_type;
     return .text;
+}
+
+fn runtimeMappingUsesDocValues(
+    field_type: storage_schema.AntflyType,
+    sortable: bool,
+    do_index: bool,
+) bool {
+    if (sortable) return true;
+    return switch (field_type) {
+        .geopoint => do_index,
+        else => false,
+    };
 }
 
 fn defaultDynamicTemplateAnalyzer(field_type: storage_schema.AntflyType) []const u8 {
@@ -896,7 +910,9 @@ test "runtime schema derives internal doc values from sortable scalar mappings" 
         \\  "dynamic_templates": [
         \\    {"name":"dates","path_match":"created_at","mapping":{"type":"datetime","sortable":true,"missing_null_policy":"missing_rejected"}},
         \\    {"name":"body","path_match":"body","mapping":{"type":"text"}},
-        \\    {"name":"rank","path_match":"rank","mapping":{"type":"numeric","sortable":false}}
+        \\    {"name":"rank","path_match":"rank","mapping":{"type":"numeric","sortable":false}},
+        \\    {"name":"points","path_match":"location","mapping":{"type":"geo_point","index":true}},
+        \\    {"name":"unindexed_points","path_match":"hidden_location","mapping":{"type":"geopoint","index":false}}
         \\  ]
         \\}
     );
@@ -905,7 +921,7 @@ test "runtime schema derives internal doc values from sortable scalar mappings" 
     const runtime = try deriveRuntimeTableSchema(alloc, parsed);
     defer storage_schema.freeSchema(alloc, runtime);
 
-    try std.testing.expectEqual(@as(usize, 3), runtime.dynamic_templates.len);
+    try std.testing.expectEqual(@as(usize, 5), runtime.dynamic_templates.len);
     try std.testing.expect(runtime.dynamic_templates[0].mapping.doc_values);
     try std.testing.expect(runtime.dynamic_templates[0].mapping.sortable);
     try std.testing.expectEqual(storage_schema.MissingNullPolicy.missing_rejected, runtime.dynamic_templates[0].mapping.missing_null_policy);
@@ -913,6 +929,12 @@ test "runtime schema derives internal doc values from sortable scalar mappings" 
     try std.testing.expect(!runtime.dynamic_templates[1].mapping.sortable);
     try std.testing.expect(!runtime.dynamic_templates[2].mapping.doc_values);
     try std.testing.expect(!runtime.dynamic_templates[2].mapping.sortable);
+    try std.testing.expectEqual(storage_schema.AntflyType.geopoint, runtime.dynamic_templates[3].mapping.field_type);
+    try std.testing.expect(runtime.dynamic_templates[3].mapping.doc_values);
+    try std.testing.expect(!runtime.dynamic_templates[3].mapping.sortable);
+    try std.testing.expectEqual(storage_schema.AntflyType.geopoint, runtime.dynamic_templates[4].mapping.field_type);
+    try std.testing.expect(!runtime.dynamic_templates[4].mapping.doc_values);
+    try std.testing.expect(!runtime.dynamic_templates[4].mapping.sortable);
 }
 
 test "runtime schema lowers document field mappings to exact declared fields" {
@@ -947,6 +969,10 @@ test "runtime schema lowers document field mappings to exact declared fields" {
         \\          "status": {
         \\            "type": "string",
         \\            "x-antfly-field": {"type":"keyword","sortable":true}
+        \\          },
+        \\          "location": {
+        \\            "type": "object",
+        \\            "x-antfly-field": {"type":"geo_point"}
         \\          }
         \\        }
         \\      }
@@ -959,7 +985,7 @@ test "runtime schema lowers document field mappings to exact declared fields" {
     const runtime = try deriveRuntimeTableSchema(alloc, parsed);
     defer storage_schema.freeSchema(alloc, runtime);
 
-    try std.testing.expectEqual(@as(usize, 5), runtime.dynamic_templates.len);
+    try std.testing.expectEqual(@as(usize, 6), runtime.dynamic_templates.len);
     try std.testing.expectEqualStrings("created_at", runtime.dynamic_templates[0].name);
     try std.testing.expectEqualStrings("created_at", runtime.dynamic_templates[0].path_match.?);
     try std.testing.expectEqual(storage_schema.AntflyType.datetime, runtime.dynamic_templates[0].mapping.field_type);
@@ -990,6 +1016,11 @@ test "runtime schema lowers document field mappings to exact declared fields" {
     try std.testing.expectEqual(storage_schema.AntflyType.keyword, status_mapping.field_type);
     try std.testing.expect(status_mapping.doc_values);
     try std.testing.expect(status_mapping.sortable);
+
+    const location_mapping = storage_schema.resolveDeclaredFieldType(runtime, "location") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.AntflyType.geopoint, location_mapping.field_type);
+    try std.testing.expect(location_mapping.doc_values);
+    try std.testing.expect(!location_mapping.sortable);
     try std.testing.expectEqual(@as(usize, 1), runtime.full_text_documents.len);
     const status_field = findFullTextField(runtime.full_text_documents[0].fields, "status") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("status", status_field.path);
@@ -1009,6 +1040,16 @@ test "runtime schema lowers document field mappings to exact declared fields" {
     try std.testing.expect(keyword_capability.doc_values);
     try std.testing.expect(keyword_capability.sortable);
     try std.testing.expectEqualStrings("schema_declared", keyword_capability.doc_value_coverage);
+
+    const location_capability = findFieldCapability(capabilities, "location") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.AntflyType.geopoint, location_capability.field_type);
+    try std.testing.expect(location_capability.searchable);
+    try std.testing.expect(location_capability.filterable);
+    try std.testing.expect(!location_capability.aggregatable);
+    try std.testing.expect(location_capability.doc_values);
+    try std.testing.expect(!location_capability.sortable);
+    try std.testing.expectEqualStrings("schema_declared", location_capability.doc_value_coverage);
+    try std.testing.expectEqualStrings("declared", location_capability.queryability_state);
 }
 
 test "runtime schema derives and validates index sort metadata" {

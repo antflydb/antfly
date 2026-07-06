@@ -2972,6 +2972,62 @@ test "metadata.table status promotes schema capability when runtime coverage is 
     try std.testing.expectEqualStrings("queryable", created.object.get("queryability_state").?.string);
 }
 
+test "metadata.table status promotes schema geo capability when runtime coverage is complete" {
+    const schema_json =
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"location","path_match":"location","mapping":{"type":"geopoint","index":true}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"location":{"type":"object","x-antfly-field":{"type":"geopoint"}}}}}}}
+    ;
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .schema_json = schema_json, .indexes_json = "{}", .replication_sources_json = "[]", .placement_role = "data" }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null }})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const template = runtime_schema_mod.DynamicTemplate{
+        .name = "location",
+        .path_match = "location",
+        .mapping = .{
+            .field_type = .geopoint,
+            .do_index = true,
+            .doc_values = true,
+            .sortable = false,
+            .analyzer = "standard",
+        },
+    };
+    const runtime_schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &.{template} };
+    var covered = runtime_schema_mod.dynamicTemplateFieldCapability(runtime_schema, template);
+    covered.doc_value_coverage = "covered";
+    covered.queryability_state = "queryable";
+    var runtime_capabilities = [_]runtime_schema_mod.FieldCapability{covered};
+    var observed_sets = [_]table_reads.ObservedDynamicFieldCapabilitySet{.{
+        .index_name = @constCast("full_text_index_v0"),
+        .field_capabilities = runtime_capabilities[0..],
+    }};
+    const storage_statuses = [_]TableStorageStatus{.{
+        .table_name = "docs",
+        .empty = false,
+        .observed_dynamic_field_capability_sets = observed_sets[0..],
+    }};
+
+    const encoded = (try encodeSingleTableStatusWithStorageStatuses(std.testing.allocator, &snapshot, "docs", storage_statuses[0..])).?;
+    defer std.testing.allocator.free(encoded);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    const location = testFieldCapabilityByIdentifier(parsed.value, "location") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("geopoint", location.object.get("type").?.string);
+    try std.testing.expect(location.object.get("searchable").?.bool);
+    try std.testing.expect(location.object.get("filterable").?.bool);
+    try std.testing.expect(!location.object.get("aggregatable").?.bool);
+    try std.testing.expect(location.object.get("doc_values").?.bool);
+    try std.testing.expect(!location.object.get("sortable").?.bool);
+    try std.testing.expectEqualStrings("covered", location.object.get("doc_value_coverage").?.string);
+    try std.testing.expectEqualStrings("dynamic_template", location.object.get("provenance").?.string);
+    try std.testing.expectEqualStrings("queryable", location.object.get("queryability_state").?.string);
+}
+
 test "metadata.table status does not promote mismatched index sort runtime capability" {
     const schema_json =
         \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"created","path_match":"created_at","mapping":{"type":"datetime","sortable":true}}],"index_sort":[{"field":"created_at","order":"desc"}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"created_at":{"type":"string","format":"date-time"}}}}}}

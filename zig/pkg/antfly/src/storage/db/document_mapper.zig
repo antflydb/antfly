@@ -1862,8 +1862,41 @@ fn typedDocValueForMappedFieldAlloc(
             .bool => |boolean| .{ .bool_val = boolean },
             else => null,
         },
+        .geopoint => blk: {
+            const point = jsonValueToMappedGeoPoint(value) orelse break :blk null;
+            break :blk .{ .geo_point = point };
+        },
         else => null,
     };
+}
+
+fn jsonValueToMappedGeoPoint(value: std.json.Value) ?typed_dv.GeoPoint {
+    if (value != .object) return null;
+    const lat_value = value.object.get("lat") orelse return null;
+    const lon_value = value.object.get("lon") orelse return null;
+    const lat = jsonValueToFiniteF64(lat_value) orelse return null;
+    const lon = jsonValueToFiniteF64(lon_value) orelse return null;
+    if (!mappedGeoLatitudeValid(lat) or !mappedGeoLongitudeValid(lon)) return null;
+    return .{ .lat = lat, .lon = lon };
+}
+
+fn jsonValueToFiniteF64(value: std.json.Value) ?f64 {
+    const number = switch (value) {
+        .integer => |integer| @as(f64, @floatFromInt(integer)),
+        .float => |float| float,
+        .number_string => |number_string| std.fmt.parseFloat(f64, number_string) catch return null,
+        else => return null,
+    };
+    if (!std.math.isFinite(number)) return null;
+    return number;
+}
+
+fn mappedGeoLatitudeValid(value: f64) bool {
+    return value >= -90.0 and value <= 90.0;
+}
+
+fn mappedGeoLongitudeValid(value: f64) bool {
+    return value >= -180.0 and value <= 180.0;
 }
 
 fn typedValueType(value: typed_dv.TypedValue) typed_dv.ValueType {
@@ -3641,6 +3674,58 @@ test "document mapper omits non-finite numeric doc values" {
     try std.testing.expect((try typedDocValueForMappedFieldAlloc(alloc, mapping, .{ .number_string = "inf" })) == null);
     try std.testing.expect((try typedDocValueForMappedFieldAlloc(alloc, mapping, .{ .number_string = "-inf" })) == null);
     try std.testing.expect((try typedDocValueForMappedFieldAlloc(alloc, mapping, .{ .number_string = "10.5" })) != null);
+}
+
+test "document mapper emits schema geo point typed doc values" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const templates = [_]runtime_schema.DynamicTemplate{
+        .{
+            .name = "location",
+            .path_match = "location",
+            .mapping = .{
+                .field_type = .geopoint,
+                .doc_values = true,
+            },
+        },
+    };
+    const schema: runtime_schema.TableSchema = .{
+        .dynamic_templates = &templates,
+    };
+
+    const segment = (try buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:1", .value = "{\"location\":{\"lat\":37.7749,\"lon\":-122.4194}}" },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    const section = reader.getSection("location", .typed_doc_values) orelse return error.TestExpectedEqual;
+    var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
+    try std.testing.expectEqual(typed_dv.ValueType.geo_point, values.value_type);
+    const point = (try values.getGeoPoint(0)) orelse return error.TestExpectedEqual;
+    try std.testing.expectApproxEqAbs(@as(f64, 37.7749), point.lat, 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f64, -122.4194), point.lon, 0.00001);
+
+    const mapping = runtime_schema.FieldMapping{
+        .field_type = .geopoint,
+        .doc_values = true,
+    };
+    try std.testing.expect((try typedDocValueForMappedFieldAlloc(alloc, mapping, .{ .object = std.json.ObjectMap.empty })) == null);
+    try std.testing.expect((try typedDocValueForMappedFieldAlloc(alloc, mapping, .{ .number_string = "nan" })) == null);
+
+    var invalid_lat = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"lat":91.0,"lon":10.0}
+    , .{});
+    defer invalid_lat.deinit();
+    try std.testing.expect((try typedDocValueForMappedFieldAlloc(alloc, mapping, invalid_lat.value)) == null);
+
+    var invalid_lon = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"lat":10.0,"lon":181.0}
+    , .{});
+    defer invalid_lon.deinit();
+    try std.testing.expect((try typedDocValueForMappedFieldAlloc(alloc, mapping, invalid_lon.value)) == null);
 }
 
 test "document mapper emits Go-style dynamic-template search_as_you_type field" {
