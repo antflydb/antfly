@@ -1779,7 +1779,7 @@ fn applyCommonSearchRequestOptions(
 
     const has_semantic = request.semantic_search != null or request.embeddings != null;
     if (has_semantic and req.offset > 0) return error.UnsupportedQueryRequest;
-    if (has_semantic and req.order_by.len > 0 and !sortOrderIsScoreOnly(req.order_by)) {
+    if (has_semantic and req.order_by.len > 0) {
         return unsupportedExactSort(approximateSemanticSortField(req.order_by), "approximate_candidate_source", "approximate_candidate_source");
     }
     if (req.order_by.len > 0 and req.offset > 0 and (req.search_after.len > 0 or req.search_before.len > 0)) {
@@ -2050,19 +2050,6 @@ fn searchRequestHasScoreSort(req: db_mod.types.SearchRequest) bool {
         if (std.mem.eql(u8, field.field, "_score")) return true;
     }
     return false;
-}
-
-fn sortOrderIsScoreOnly(order_by: []const db_mod.types.SortField) bool {
-    var saw_score = false;
-    for (order_by) |field| {
-        if (std.mem.eql(u8, field.field, "_score")) {
-            saw_score = true;
-            continue;
-        }
-        if (std.mem.eql(u8, field.field, "_id")) continue;
-        return false;
-    }
-    return saw_score;
 }
 
 fn approximateSemanticSortField(order_by: []const db_mod.types.SortField) []const u8 {

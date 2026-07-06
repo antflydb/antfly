@@ -7744,14 +7744,10 @@ fn validatePublicScoreSortSource(query_req: db_mod.types.SearchRequest) !void {
 fn validatePublicApproximateSortSource(query_req: db_mod.types.SearchRequest) !void {
     if (!db_query_search.searchRequestHasScoreBearingVectorSource(query_req)) return;
     for (query_req.order_by) |field| {
-        if (std.mem.eql(u8, field.field, "_score") or std.mem.eql(u8, field.field, "_id")) continue;
         recordPublicSortCapabilityRejection(field.field, "approximate_candidate_source", "approximate_candidate_source");
         return error.UnsupportedQueryRequest;
     }
-    for (query_req.order_by) |field| {
-        if (std.mem.eql(u8, field.field, "_score")) return;
-    }
-    recordPublicSortCapabilityRejection("_id", "approximate_candidate_source", "approximate_candidate_source");
+    recordPublicSortCapabilityRejection("*", "approximate_candidate_source", "approximate_candidate_source");
     return error.UnsupportedQueryRequest;
 }
 
@@ -10698,10 +10694,14 @@ test "api http public sort capability gate validates score-bearing source" {
     }, runtime_schema, &.{});
 
     const vector = [_]f32{ 0.1, 0.2 };
-    try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
         .order_by = &score_order,
         .dense = .{ .vector = &vector, .k = 10 },
-    }, runtime_schema, &.{});
+    }, runtime_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", diagnostic.field);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
 
     const id_order = [_]db_mod.types.SortField{.{ .field = "_id", .desc = false }};
     db_mod.resetLastSortRejectionDiagnostic();

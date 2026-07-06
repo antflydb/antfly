@@ -3773,7 +3773,7 @@ pub fn build(b: *std.Build) void {
             "query merge rejects score ordered hits without finite scores",
             "query merge orders non score bearing hits by id without requiring scores",
             "query parser records approximate source diagnostic for semantic exact sort",
-            "query parser allows semantic score sort with stable id tiebreaker",
+            "query parser rejects semantic score sort as approximate source",
             "query encoder does not expose internal doc ordinals",
             "query builder preflight validates score sort source",
             "api query contract serializes sort profile diagnostics",

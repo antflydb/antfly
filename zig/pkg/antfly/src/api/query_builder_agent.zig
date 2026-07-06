@@ -1419,6 +1419,9 @@ fn metadataScoreSortFeedback(
     field: []const u8,
 ) !?[]const u8 {
     if (!std.mem.eql(u8, field, "_score")) return null;
+    if (query_request.semantic_search != null or query_request.embeddings != null) {
+        return try alloc.dupe(u8, "query_request.order_by references _score with an approximate semantic candidate source");
+    }
     const score_bearing = query_contract.queryRequestHasScoreBearingSourceAlloc(alloc, query_request) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => false,
@@ -6542,7 +6545,7 @@ test "query builder preflight validates score sort source" {
             break;
         }
     }
-    try std.testing.expect(!found_semantic_score_sort_diagnostic);
+    try std.testing.expect(found_semantic_score_sort_diagnostic);
 }
 
 test "query builder preflight rejects mixed observed dynamic sort coverage" {

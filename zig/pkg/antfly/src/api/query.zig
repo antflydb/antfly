@@ -1061,20 +1061,16 @@ test "query parser records approximate source diagnostic for semantic exact sort
     try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
 }
 
-test "query parser allows semantic score sort with stable id tiebreaker" {
+test "query parser rejects semantic score sort as approximate source" {
     const alloc = std.testing.allocator;
-    var parsed = try parseQueryRequest(alloc, FakeSemanticResolver.iface(), "docs",
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, FakeSemanticResolver.iface(), "docs",
         \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"order_by":[{"field":"_score","desc":true}],"limit":4}
-    );
-    defer parsed.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), parsed.req.dense_queries.len);
-    try std.testing.expectEqual(@as(usize, 2), parsed.req.order_by.len);
-    try std.testing.expectEqualStrings("_score", parsed.req.order_by[0].field);
-    try std.testing.expect(parsed.req.order_by[0].desc);
-    try std.testing.expectEqualStrings("_id", parsed.req.order_by[1].field);
-    try std.testing.expect(!parsed.req.order_by[1].desc);
-    try std.testing.expect(db_mod.searchRequestHasScoreBearingSource(parsed.req));
+    ));
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", diagnostic.field);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
 }
 
 test "query encoder emits antfly-style response envelope" {
