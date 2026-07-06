@@ -35,6 +35,7 @@ pub const EmbeddingArtifactIdentity = struct {
     doc_key: []u8,
     parent_doc_key: ?[]u8 = null,
     source_artifact_name: ?[]u8 = null,
+    unit_id: ?[]u8 = null,
     chunk_id: ?u32 = null,
 
     pub fn deinit(self: *EmbeddingArtifactIdentity, alloc: Allocator) void {
@@ -42,6 +43,7 @@ pub const EmbeddingArtifactIdentity = struct {
         alloc.free(self.doc_key);
         if (self.parent_doc_key) |parent_doc_key| alloc.free(parent_doc_key);
         if (self.source_artifact_name) |source_artifact_name| alloc.free(source_artifact_name);
+        if (self.unit_id) |unit_id| alloc.free(unit_id);
         self.* = undefined;
     }
 };
@@ -96,7 +98,7 @@ pub fn decodeEmbeddingArtifactIdentityAlloc(alloc: Allocator, key: []const u8) !
         if (try decodeChunkArtifactSourceAlloc(alloc, base_key)) |source| {
             identity.source_artifact_name = source.name;
             identity.chunk_id = source.chunk_id;
-            if (source.unit_id) |unit_id| alloc.free(unit_id);
+            identity.unit_id = source.unit_id;
         }
 
         return identity;
@@ -115,6 +117,7 @@ pub fn decodeEmbeddingArtifactIdentityAlloc(alloc: Allocator, key: []const u8) !
     if (artifact_ref.source) |source| {
         identity.source_artifact_name = try alloc.dupe(u8, source.name);
         identity.chunk_id = source.chunk_id;
+        identity.unit_id = if (source.unit_id) |unit_id| try alloc.dupe(u8, unit_id) else null;
         switch (source.kind) {
             .chunk => {
                 const chunk_id = source.chunk_id orelse return error.InvalidInternalUserKey;

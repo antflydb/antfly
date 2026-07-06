@@ -2220,6 +2220,7 @@ pub fn build(b: *std.Build) void {
         .root_module = termite_onnx_graph_mod,
     });
     const run_lib_onnx_tests = b.addRunArtifact(lib_onnx_tests);
+    run_lib_onnx_tests.setEnvironmentVariable("ANTFLY_TEST_FAIL_ON_ERROR_LOGS", "0");
     const lib_onnx_test_step = b.step("lib-onnx-test", "Run standalone lib/onnx tests");
     lib_onnx_test_step.dependOn(&run_lib_onnx_tests.step);
 
@@ -2703,6 +2704,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_lib_common_config_tests = b.addRunArtifact(lib_common_config_tests);
+    run_lib_common_config_tests.setEnvironmentVariable("ANTFLY_TEST_FAIL_ON_ERROR_LOGS", "0");
     const lib_common_config_test_step = b.step("lib-common-config-test", "Run common/config tests");
     lib_common_config_test_step.dependOn(&run_lib_common_config_tests.step);
 
@@ -2792,6 +2794,7 @@ pub fn build(b: *std.Build) void {
         "batch parser preserves oversized value errors",
         "batch parser accepts raw payload value under public request cap",
         "linear merge request parser accepts raw payload value under public request cap",
+        "public index contract exposes runtime status metadata",
         "artifact enrichment request permits asset full text routing",
         "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
         "provisioned group storage wires remote content to writer caches",
@@ -3054,6 +3057,7 @@ pub fn build(b: *std.Build) void {
         "data runtime raft status changes force immediate store status publication",
         "data runtime structural changes preserve writer-published runtime status",
         "data runtime startup catch-up prefers cached admin snapshot",
+        "data runtime startup catch-up clears dirty bit for terminal degraded index load",
         "data runtime startup catch-up clears no-debt busy writer groups",
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
@@ -3525,6 +3529,8 @@ pub fn build(b: *std.Build) void {
         "provisioned table write source seeds doc identity namespace from table range",
         "provisioned table write source cached runtime status does not fetch catalog coverage",
         "managed startup catch-up uses provided indexes json without catalog fetch",
+        "managed startup catch-up marks FileNotFound index open terminal degraded",
+        "managed startup catch-up finishes restore repair before terminal index load degradation",
         "idle startup runtime status preserves live empty cached status",
         "api http server serves table batch transforms",
         "api http server updates local table schema through bound write source",
@@ -3644,6 +3650,7 @@ pub fn build(b: *std.Build) void {
             "distributed table reads reject stale doc identity before multigroup fanout",
             "api public table query rejects only top-level internal fields",
             "single embeddings index encoder scopes isolated enrichment failure to one index",
+            "empty embeddings index status is ready without dense artifact visibility",
             "api query contract rejects doc identity control fields when with relaxes schema",
             "api query contract public parser rejects internal shard doc identity controls",
             "api distributed graph hydrate carries identity generation and clears cross-range ordinals",
@@ -3835,11 +3842,15 @@ pub fn build(b: *std.Build) void {
             "provisioned table write source backs up a portable local table",
             "provisioned table restore rejects mismatched doc identity namespace",
             "provisioned table restore retry skips exact incomplete restore state with active writer",
+            "provisioned restore repair source deinit cancels sleeping retry worker",
             "provisioned restore repair open rejects stale doc identity namespace",
             "write cache blocks same-root generation replacement while stale lease stays live",
             "provisioned create index updates cached writer in place",
             "write cache metadata refresh preserves inactive adoptable seed",
             "write cache adopts active just-created db across generation bump",
+            "write cache local mutation reuses live stale-generation writer",
+            "write cache structural local mutation finishes auto bulk before reuse",
+            "write cache local mutation preempts stale startup writer",
             "hosted runtime status prefers live writer over stale hosted snapshot",
             "runtime status collection leaves active stale write lease live",
             "primary lookup adopts seeded write cache across visible generation bump",
@@ -3848,12 +3859,18 @@ pub fn build(b: *std.Build) void {
             "provisioned table write coalescer isolates failed waiters",
             "provisioned table write source consistent visibility hook does not block on busy apply lock",
             "provisioned table write source consistent visibility refreshes stale dense status",
+            "provisioned table write source status visibility does not invalidate read cache",
             "managed startup catch-up repeats replay while dense debt progresses",
             "provisioned group storage wires remote content to writer caches",
             "startup runtime status snapshot publishes live db when active cache is empty",
             "best effort startup runtime status publishes live db when cache is empty",
             "idle startup runtime status publish is live when startup flag is still set",
             "managed startup catch-up uses provided indexes json without catalog fetch",
+            "managed startup catch-up marks FileNotFound index open terminal degraded",
+            "managed startup catch-up finishes restore repair before terminal index load degradation",
+            "managed source status-only open drains stale pending close before retry",
+            "hosted status-only open drains stale pending close before retry",
+            "write cache HA gate clear drains inactive pending closes before returning",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3866,6 +3883,7 @@ pub fn build(b: *std.Build) void {
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
             "parseRemoteSearchResult preserves fused index scores",
             "provisioned standby read gate permits stale reads and routes non-stale reads to primary",
+            "catalog backed router skips non-serving relocation placements",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

@@ -1566,6 +1566,8 @@ pub const DocStore = struct {
     pub const ScanOptions = struct {
         /// Return true to skip this key (callback not invoked).
         skip_fn: ?*const fn (key: []const u8) bool = null,
+        /// When set, scan starts at the first key strictly greater than lower.
+        lower_exclusive: bool = false,
     };
 
     pub const ScanAction = enum { @"continue", stop };
@@ -1623,9 +1625,11 @@ pub const DocStore = struct {
         if (upper.len > 0 and std.mem.order(u8, first.key, upper) != .lt) return;
 
         // Process first entry
-        if (options.skip_fn == null or !options.skip_fn.?(first.key)) {
-            const action = try callback(ctx, first.key, first.value);
-            if (action == .stop) return;
+        if (!options.lower_exclusive or lower.len == 0 or !std.mem.eql(u8, first.key, lower)) {
+            if (options.skip_fn == null or !options.skip_fn.?(first.key)) {
+                const action = try callback(ctx, first.key, first.value);
+                if (action == .stop) return;
+            }
         }
 
         // Iterate remaining

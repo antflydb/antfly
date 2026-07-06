@@ -469,6 +469,7 @@ fn runtimeStatusWorthPreserving(status: LocalTableRuntimeStatus) bool {
 
 fn statusStatsHaveRuntimeFacts(stats: db_mod.types.DBStats) bool {
     if (stats.doc_count > 0) return true;
+    if (stats.repair_degraded or stats.repair_issue_count != 0) return true;
     if (docIdentityStatsHaveRuntimeFacts(stats.doc_identity)) return true;
     if (docSetPlanningStatsHaveRuntimeFacts(stats.doc_set_planning)) return true;
     if (stats.async_indexing.startup.active or stats.async_indexing.dense_catch_up.active) return true;
@@ -476,6 +477,7 @@ fn statusStatsHaveRuntimeFacts(stats: db_mod.types.DBStats) bool {
     if (stats.text_merge.pending_segments > 0 or stats.text_merge.in_flight_merges > 0 or stats.text_merge.completed_merges > 0 or stats.text_merge.failed_merges > 0) return true;
     for (stats.indexes) |index| {
         if (indexHasArtifactVisibilityFacts(index)) return true;
+        if (index.repair_degraded or index.repair_issue_count != 0) return true;
         if (index.backfill_active or index.catch_up_active or index.replay_catch_up_required) return true;
         // A target-only replay/catch-up marker can be synthesized from topology
         // and accepted sequence. It is not enough to prove that a live runtime
@@ -957,6 +959,10 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .root_node = item.root_node,
             .backfill_active = item.backfill_active,
             .backfill_progress = item.backfill_progress,
+            .repair_degraded = item.repair_degraded,
+            .repair_issue_count = item.repair_issue_count,
+            .repair_summary_ready = item.repair_summary_ready,
+            .repair_issue_count_estimated = item.repair_issue_count_estimated,
             .replay_applied_sequence = item.replay_applied_sequence,
             .replay_target_sequence = item.replay_target_sequence,
             .replay_catch_up_required = item.replay_catch_up_required,
@@ -1034,6 +1040,10 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         .doc_count = stats.doc_count,
         .index_count = stats.index_count,
         .indexes = indexes,
+        .repair_degraded = stats.repair_degraded,
+        .repair_issue_count = stats.repair_issue_count,
+        .repair_summary_ready = stats.repair_summary_ready,
+        .repair_issue_count_estimated = stats.repair_issue_count_estimated,
         .doc_identity = stats.doc_identity,
         .doc_set_planning = stats.doc_set_planning,
         .enrichment = stats.enrichment,
@@ -1782,6 +1792,22 @@ test "cached identity and doc set telemetry are runtime facts" {
 
     try std.testing.expect(statusHasRuntimeFacts(identity_status));
     try std.testing.expect(statusHasRuntimeFacts(planning_status));
+}
+
+test "cached repair telemetry is runtime facts" {
+    const status = LocalTableRuntimeStatus{
+        .group_id = 9,
+        .metadata = .{
+            .source = .cached_snapshot,
+            .freshness = .stale,
+        },
+        .stats = .{
+            .repair_degraded = true,
+            .repair_issue_count = 1,
+        },
+    };
+
+    try std.testing.expect(statusHasRuntimeFacts(status));
 }
 
 test "table runtime snapshot cache preserves generic artifact visibility on sequence-only refresh" {

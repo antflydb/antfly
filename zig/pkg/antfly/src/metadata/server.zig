@@ -400,7 +400,7 @@ fn metadataDataBearingStoreRouterNodeStatus(ptr: *anyopaque, node_id: u64, group
     defer snapshot.deinit(svc, svc.alloc);
     const store = storeForNode(snapshot.stores, node_id) orelse return .absent;
     if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) return .absent;
-    if (!nodeHasGroupPlacement(snapshot.placements, group_id, node_id)) return .absent;
+    if (!nodeHasReadableGroupPlacement(snapshot.placements, group_id, node_id)) return .absent;
     if (!storeHasGroupData(store, group_id)) return .absent;
     return .active;
 }
@@ -463,7 +463,7 @@ fn metadataStoreRouterNodeBaseUriForGroup(ptr: *anyopaque, alloc: std.mem.Alloca
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     var snapshot = try loadMetadataRoutingSnapshot(svc, svc.alloc);
     defer snapshot.deinit(svc, svc.alloc);
-    if (!nodeHasGroupPlacement(snapshot.placements, group_id, node_id)) return null;
+    if (!nodeHasReadableGroupPlacement(snapshot.placements, group_id, node_id)) return null;
     const store = storeForNode(snapshot.stores, node_id) orelse return null;
     if (store.api_url.len == 0) return null;
     return try alloc.dupe(u8, store.api_url);
@@ -541,7 +541,7 @@ fn dataBearingStoreCandidate(
     group_id: u64,
 ) ?DataBearingStoreCandidate {
     if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) return null;
-    if (!nodeHasGroupPlacement(placements, group_id, store.node_id)) return null;
+    if (!nodeHasReadableGroupPlacement(placements, group_id, store.node_id)) return null;
 
     var candidate = DataBearingStoreCandidate{
         .node_id = store.node_id,
@@ -578,6 +578,14 @@ fn dataBearingStoreCandidateLessThan(a: DataBearingStoreCandidate, b: DataBearin
 fn nodeHasGroupPlacement(placements: []const raft_reconciler.PlacementIntent, group_id: u64, node_id: u64) bool {
     for (placements) |intent| {
         if (intent.record.group_id == group_id and intent.record.local_node_id == node_id) return true;
+    }
+    return false;
+}
+
+fn nodeHasReadableGroupPlacement(placements: []const raft_reconciler.PlacementIntent, group_id: u64, node_id: u64) bool {
+    for (placements) |intent| {
+        if (intent.record.group_id != group_id or intent.record.local_node_id != node_id) continue;
+        return raft_reconciler.placementReadableWithPeers(placements, intent);
     }
     return false;
 }

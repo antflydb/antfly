@@ -132,8 +132,11 @@ fn hbcRuntimeBatchMode(in_bulk_session: bool, lsm_direct_bulk_ingest_enabled: ?b
 // ============================================================================
 
 const meta_key = vectorindex_hbc.meta_key;
+const bulk_publish_state_key = "__bulk_publish_state";
+const bulk_publish_state_value = "incomplete";
 const hbc_index_version = vectorindex_hbc.hbc_index_version;
 const IndexMetadata = vectorindex_hbc.IndexMetadata;
+pub const ProjectionCheckpointMetadata = vectorindex_hbc.ProjectionCheckpointMetadata;
 
 // ============================================================================
 // Node representation
@@ -1552,7 +1555,9 @@ pub const HBCIndex = struct {
 
     pub fn beginBulkIngestSession(self: *HBCIndex) !void {
         switch (self.env_owner) {
-            .lsm => |handle| try handle.backend.beginBulkIngestSession(),
+            .lsm => |handle| handle.backend.beginBulkIngestSession() catch |err| {
+                return err;
+            },
             .lmdb => {},
         }
         if (self.bulk_ingest_session_depth == 0) {
@@ -1564,6 +1569,16 @@ pub const HBCIndex = struct {
             self.observeApplyWorkspaceBytes();
         }
         self.bulk_ingest_session_depth += 1;
+        if (self.bulk_ingest_session_depth == 1) {
+            self.persistBulkPublishState() catch |err| {
+                self.bulk_ingest_session_depth -= 1;
+                switch (self.env_owner) {
+                    .lsm => |handle| handle.backend.abortBulkIngestSession(),
+                    .lmdb => {},
+                }
+                return err;
+            };
+        }
     }
 
     pub fn finishBulkIngestSessionWithOptions(self: *HBCIndex, options: backend_types.BulkIngestFinishOptions) !void {
@@ -1607,6 +1622,7 @@ pub const HBCIndex = struct {
                 try self.publishDeferredNodeKeysForBulkFinishTxn(&batch);
                 try self.publishDeferredQuantizedNodesForBulkFinishTxn(&batch);
                 try self.flushMetadataNow(&batch);
+                if (!has_more_deferred_splits) try self.clearBulkPublishStateTxn(&batch);
                 const commit_start = nowNs();
                 self.beginPublishedSearchStateRefresh();
                 errdefer self.abortPublishedSearchStateRefresh();
@@ -1641,7 +1657,12 @@ pub const HBCIndex = struct {
             finish_options.flush = true;
         }
         switch (self.env_owner) {
-            .lsm => |handle| try handle.backend.finishBulkIngestSessionWithOptions(finish_options),
+            .lsm => |handle| handle.backend.finishBulkIngestSessionWithOptions(finish_options) catch |err| {
+                if (finishing_outermost) {
+                    self.persistBulkPublishState() catch {};
+                }
+                return err;
+            },
             .lmdb => {},
         }
         if (self.bulk_ingest_session_depth > 0) self.bulk_ingest_session_depth -= 1;
@@ -1659,6 +1680,7 @@ pub const HBCIndex = struct {
         }
         self.bulk_ingest_session_depth -= 1;
         if (self.bulk_ingest_session_depth == 0) {
+            self.clearBulkPublishStateBestEffort();
             self.releaseDeferredBulkWorkspaceCapacity();
         }
     }
@@ -1721,6 +1743,12 @@ pub const HBCIndex = struct {
                 };
                 break :meta_blk IndexMetadata.decode(existing);
             };
+            if (txn.get(.meta, bulk_publish_state_key)) |_| {
+                return error.IncompleteBulkPublish;
+            } else |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            }
 
             try txn.commit();
             txn_active = false;
@@ -3516,6 +3544,45 @@ pub const HBCIndex = struct {
         try self.putNamespaced(txn, .meta, meta_key, self.metadata.encode(&buf));
     }
 
+    pub fn projectionCheckpointMetadata(self: *const HBCIndex) ProjectionCheckpointMetadata {
+        return self.metadata.projectionCheckpoint();
+    }
+
+    pub fn saveProjectionCheckpointMetadata(self: *HBCIndex, checkpoint: ProjectionCheckpointMetadata) !void {
+        var txn = try self.beginRuntimeBatchTxnOptions(.{});
+        var active = true;
+        errdefer if (active) txn.abort();
+        self.metadata.setProjectionCheckpoint(checkpoint);
+        try self.flushMetadataNow(&txn);
+        try txn.commit();
+        active = false;
+    }
+
+    fn persistBulkPublishState(self: *HBCIndex) !void {
+        var txn = try self.beginRuntimeBatchTxnOptions(.{});
+        var active = true;
+        errdefer if (active) txn.abort();
+        try self.putNamespaced(&txn, .meta, bulk_publish_state_key, bulk_publish_state_value);
+        try txn.commit();
+        active = false;
+    }
+
+    fn clearBulkPublishStateTxn(self: *HBCIndex, txn: anytype) !void {
+        self.deleteNamespaced(txn, .meta, bulk_publish_state_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    fn clearBulkPublishStateBestEffort(self: *HBCIndex) void {
+        var txn = self.store.beginWrite() catch return;
+        var active = true;
+        defer if (active) txn.abort();
+        self.clearBulkPublishStateTxn(&txn) catch return;
+        txn.commit() catch return;
+        active = false;
+    }
+
     pub fn flushMetadata(self: *HBCIndex, txn: anytype) !void {
         if (self.bulk_ingest_session_depth > 0) return;
         try self.flushMetadataNow(txn);
@@ -4044,7 +4111,7 @@ pub const HBCIndex = struct {
             if (gop.found_existing) continue;
 
             var node = try self.loadNodeFromStorage(&txn, node_id);
-            defer node.deinit(alloc);
+            defer node.deinit(self.alloc);
 
             if (node.is_leaf) {
                 if (node.members.len == 0) return error.Corrupted;

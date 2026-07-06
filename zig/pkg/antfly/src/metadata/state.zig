@@ -598,6 +598,7 @@ pub fn mergeHealthyGroupStatuses(
         if (!std.mem.eql(u8, store.health_class, "healthy")) continue;
 
         for (store.group_statuses) |group_status| {
+            if (placement_intents.len > 0 and !storeHasPlacement(placement_intents, group_status.group_id, store.node_id)) continue;
             const entry = try indexes.getOrPut(alloc, group_status.group_id);
             if (!entry.found_existing) {
                 entry.value_ptr.* = states.items.len;
@@ -1958,6 +1959,82 @@ test "metadata state tracks authoritative voter count when healthy peers agree" 
     defer freeMergedGroupStatuses(std.testing.allocator, merged);
 
     try std.testing.expectEqual(@as(usize, 1), merged.len);
+    try std.testing.expect(merged[0].voter_count_known);
+    try std.testing.expectEqual(@as(u16, 2), merged[0].voter_count);
+    try std.testing.expectEqual(@as(u16, 2), merged[0].healthy_voter_reports);
+}
+
+test "metadata state ignores group status from stores without current placement" {
+    const placement_intents = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 7204, .replica_id = 1, .local_node_id = 2, .bootstrap_mode = .persisted }, .store_id = 22, .peer_node_ids = &.{ 2, 3 } },
+        .{ .record = .{ .group_id = 7204, .replica_id = 2, .local_node_id = 3, .bootstrap_mode = .persisted }, .store_id = 33, .peer_node_ids = &.{ 2, 3 } },
+    };
+    const stores = [_]metadata_table_manager.StoreRecord{
+        .{
+            .store_id = 11,
+            .node_id = 1,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{
+                .{
+                    .group_id = 7204,
+                    .doc_count = 99,
+                    .disk_bytes = 990,
+                    .empty = false,
+                    .updated_at_millis = 300,
+                    .local_leader = true,
+                    .local_voter = true,
+                    .voter_count = 3,
+                },
+            })[0..]),
+        },
+        .{
+            .store_id = 22,
+            .node_id = 2,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{
+                .{
+                    .group_id = 7204,
+                    .doc_count = 10,
+                    .disk_bytes = 100,
+                    .empty = false,
+                    .updated_at_millis = 200,
+                    .local_leader = true,
+                    .local_voter = true,
+                    .voter_count = 2,
+                },
+            })[0..]),
+        },
+        .{
+            .store_id = 33,
+            .node_id = 3,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{
+                .{
+                    .group_id = 7204,
+                    .doc_count = 10,
+                    .disk_bytes = 100,
+                    .empty = false,
+                    .updated_at_millis = 199,
+                    .local_voter = true,
+                    .voter_count = 2,
+                },
+            })[0..]),
+        },
+    };
+
+    const merged = try mergeHealthyGroupStatuses(std.testing.allocator, &.{}, &.{}, &placement_intents, &.{}, &stores, &.{}, &.{}, &.{}, &.{});
+    defer freeMergedGroupStatuses(std.testing.allocator, merged);
+
+    try std.testing.expectEqual(@as(usize, 1), merged.len);
+    try std.testing.expect(merged[0].leader_known);
+    try std.testing.expectEqual(@as(u64, 22), merged[0].leader_store_id);
+    try std.testing.expectEqual(@as(u64, 10), merged[0].doc_count);
     try std.testing.expect(merged[0].voter_count_known);
     try std.testing.expectEqual(@as(u16, 2), merged[0].voter_count);
     try std.testing.expectEqual(@as(u16, 2), merged[0].healthy_voter_reports);

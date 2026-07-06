@@ -994,6 +994,10 @@ const AggregatedIndexStatus = struct {
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
     enrichment_failed: bool = false,
+    repair_degraded: bool = false,
+    repair_issue_count: u64 = 0,
+    repair_summary_ready: bool = true,
+    repair_issue_count_estimated: bool = false,
     table_doc_count: u64 = 0,
     doc_count: u64 = 0,
     term_count: u64 = 0,
@@ -1133,6 +1137,10 @@ fn aggregateIndexStatus(
         aggregate.replay_target_sequence += item.replay_target_sequence;
         if (item.replay_catch_up_required) aggregate.replay_catch_up_required = true;
         if (item.enrichment_failed) aggregate.enrichment_failed = true;
+        if (item.repair_degraded) aggregate.repair_degraded = true;
+        aggregate.repair_issue_count += item.repair_issue_count;
+        if (!item.repair_summary_ready) aggregate.repair_summary_ready = false;
+        if (item.repair_issue_count_estimated) aggregate.repair_issue_count_estimated = true;
         aggregate.catch_up_applied_sequence += item.catch_up_applied_sequence;
         aggregate.catch_up_target_sequence += item.catch_up_target_sequence;
         if (item.catch_up_active) aggregate.catch_up_active = true;
@@ -1197,6 +1205,7 @@ fn aggregateIndexStatus(
     if (!found and expected_group_ids.len == 0) return null;
     if (active_count > 0) aggregate.backfill_progress = active_progress_sum / @as(f64, @floatFromInt(active_count));
     normalizeReadyFullTextAggregate(&aggregate);
+    normalizeReadyEmbeddingsAggregate(&aggregate);
     return aggregate;
 }
 
@@ -1209,6 +1218,26 @@ fn normalizeReadyFullTextAggregate(aggregate: *AggregatedIndexStatus) void {
 
     aggregate.replay_catch_up_required = false;
     aggregate.catch_up_active = false;
+    aggregate.backfill_active = false;
+    aggregate.backfill_progress = 1.0;
+}
+
+fn normalizeReadyEmbeddingsAggregate(aggregate: *AggregatedIndexStatus) void {
+    const kind = aggregate.kind orelse return;
+    if (kind != .dense_vector and kind != .sparse_vector) return;
+    if (aggregate.reported_group_count == 0 or aggregate.missing_group_count > 0 or aggregate.remote_unknown_group_count > 0) return;
+    if (aggregate.load_error != null or aggregate.repair_degraded or aggregate.enrichment_failed) return;
+    const enrichment_blocked = aggregate.enrichment.enabled and (aggregate.enrichment.retrying or aggregate.enrichment.worker_failed);
+    if (enrichment_blocked) return;
+    if (aggregate.catch_up_active or aggregate.catch_up_target_sequence > aggregate.catch_up_applied_sequence) return;
+    if (!embeddingsArtifactPublishComplete(aggregate.*, kind == .sparse_vector, aggregate.table_doc_count)) return;
+    if (aggregate.table_doc_count > 0 and aggregate.doc_count < aggregate.table_doc_count) return;
+
+    aggregate.replay_applied_sequence = @max(aggregate.replay_applied_sequence, aggregate.replay_target_sequence);
+    aggregate.catch_up_applied_sequence = @max(aggregate.catch_up_applied_sequence, aggregate.catch_up_target_sequence);
+    aggregate.replay_catch_up_required = false;
+    aggregate.catch_up_active = false;
+    aggregate.catch_up_phase = .idle;
     aggregate.backfill_active = false;
     aggregate.backfill_progress = 1.0;
 }
@@ -1420,7 +1449,7 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, require_table_cove
         stats.enabled and (stats.worker_failed or stats.retrying or stats.applied_sequence < stats.target_sequence)
     else
         false;
-    const artifact_visible = embeddingsArtifactVisible(item, sparse);
+    const artifact_visible = embeddingsArtifactPublishComplete(item, sparse, table_doc_count);
     if (replay_ready and !artifact_visible and view.replay_target_sequence > 0) {
         view.backfill_active = true;
         view.backfill_progress = 0.0;
@@ -1450,7 +1479,6 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, require_table_cove
 fn aggregateRuntimeCoverageIncomplete(item: anytype) bool {
     const Item = @TypeOf(item);
     if (@hasField(Item, "missing_group_count") and item.missing_group_count > 0) return true;
-    if (@hasField(Item, "stale_group_count") and item.stale_group_count > 0) return true;
     if (@hasField(Item, "remote_unknown_group_count") and item.remote_unknown_group_count > 0) return true;
     return false;
 }
@@ -1458,6 +1486,11 @@ fn aggregateRuntimeCoverageIncomplete(item: anytype) bool {
 fn embeddingsArtifactVisible(item: anytype, sparse: bool) bool {
     if (sparse) return item.doc_count > 0;
     return item.doc_count > 0 and (item.node_count > 0 or item.root_node > 0);
+}
+
+fn embeddingsArtifactPublishComplete(item: anytype, sparse: bool, table_doc_count: u64) bool {
+    if (table_doc_count == 0 and item.doc_count == 0) return true;
+    return embeddingsArtifactVisible(item, sparse);
 }
 
 fn backfillState(index_type: ApiIndexType, active: bool, enrichment_failed: bool, replay_applied_sequence: u64, replay_target_sequence: u64, enrichment: ?db_mod.types.EnrichmentStats) []const u8 {
@@ -1490,6 +1523,16 @@ fn appendEnrichmentRuntimeStatus(alloc: std.mem.Allocator, out: *std.ArrayListUn
     try appendIntValue(alloc, out, stats.applied_sequence);
     try out.appendSlice(alloc, ",\"pending_sequence_count\":");
     try appendIntValue(alloc, out, stats.target_sequence -| stats.applied_sequence);
+    try out.appendSlice(alloc, ",\"projection_checkpoint_status\":");
+    try appendJsonString(alloc, out, stats.projection_checkpoint_status);
+    try out.appendSlice(alloc, ",\"projection_checkpoint_applied_sequence\":");
+    try appendIntValue(alloc, out, stats.projection_checkpoint_applied_sequence);
+    try out.appendSlice(alloc, ",\"projection_checkpoint_generation\":");
+    try appendIntValue(alloc, out, stats.projection_checkpoint_generation);
+    try out.appendSlice(alloc, ",\"projection_checkpoint_config_hash\":");
+    try appendIntValue(alloc, out, stats.projection_checkpoint_config_hash);
+    try out.appendSlice(alloc, ",\"checkpoint_replay_tail_sequence_count\":");
+    try appendIntValue(alloc, out, stats.checkpoint_replay_tail_sequence_count);
     try out.appendSlice(alloc, ",\"processed_requests\":");
     try appendIntValue(alloc, out, stats.processed_requests);
     try out.appendSlice(alloc, ",\"error_count\":");
@@ -1664,7 +1707,7 @@ fn appendSingleIndexRuntimeStatus(
     try out.appendSlice(alloc, ",\"node_count\":");
     try appendIntValue(alloc, out, item.node_count);
     if (index_type == .embeddings) {
-        const artifact_publish_pending = replay_target_sequence > 0 and !embeddingsArtifactVisible(item, embeddings_sparse);
+        const artifact_publish_pending = replay_target_sequence > 0 and !embeddingsArtifactPublishComplete(item, embeddings_sparse, table_doc_count);
         try out.appendSlice(alloc, ",\"query_visible_doc_count\":");
         try appendIntValue(alloc, out, item.doc_count);
         try out.appendSlice(alloc, ",\"published_doc_count\":");
@@ -1719,6 +1762,38 @@ fn appendSingleIndexRuntimeStatus(
     try appendIntValue(alloc, out, replay_target_sequence);
     try out.appendSlice(alloc, ",\"replay_catch_up_required\":");
     try out.appendSlice(alloc, if (replay_catch_up_required) "true" else "false");
+    if (@hasField(@TypeOf(item), "projection_checkpoint_status")) {
+        try out.appendSlice(alloc, ",\"projection_checkpoint_status\":");
+        try appendJsonString(alloc, out, item.projection_checkpoint_status);
+        try out.appendSlice(alloc, ",\"projection_checkpoint_applied_sequence\":");
+        try appendIntValue(alloc, out, item.projection_checkpoint_applied_sequence);
+        try out.appendSlice(alloc, ",\"projection_checkpoint_generation\":");
+        try appendIntValue(alloc, out, item.projection_checkpoint_generation);
+        try out.appendSlice(alloc, ",\"projection_checkpoint_config_hash\":");
+        try appendIntValue(alloc, out, item.projection_checkpoint_config_hash);
+        try out.appendSlice(alloc, ",\"checkpoint_replay_tail_sequence_count\":");
+        try appendIntValue(alloc, out, item.checkpoint_replay_tail_sequence_count);
+    }
+    if (@hasField(@TypeOf(item), "repair_degraded")) {
+        try out.appendSlice(alloc, ",\"repair_degraded\":");
+        try out.appendSlice(alloc, if (item.repair_degraded) "true" else "false");
+    }
+    if (@hasField(@TypeOf(item), "repair_issue_count")) {
+        try out.appendSlice(alloc, ",\"repair_issue_count\":");
+        try appendIntValue(alloc, out, item.repair_issue_count);
+    }
+    if (@hasField(@TypeOf(item), "repair_summary_ready")) {
+        try out.appendSlice(alloc, ",\"repair_summary_ready\":");
+        try out.appendSlice(alloc, if (item.repair_summary_ready) "true" else "false");
+    }
+    if (@hasField(@TypeOf(item), "repair_issue_count_estimated")) {
+        try out.appendSlice(alloc, ",\"repair_issue_count_estimated\":");
+        try out.appendSlice(alloc, if (item.repair_issue_count_estimated) "true" else "false");
+    }
+    if (@hasField(@TypeOf(item), "repair_scan_issue_count")) {
+        try out.appendSlice(alloc, ",\"repair_scan_issue_count\":");
+        try appendIntValue(alloc, out, item.repair_scan_issue_count);
+    }
     try out.appendSlice(alloc, ",\"runtime_present\":");
     try out.appendSlice(alloc, if (runtime_present) "true" else "false");
     const runtime_fresh = if (@hasField(@TypeOf(item), "runtime_fresh"))
@@ -3066,6 +3141,72 @@ test "index encoders aggregate preserved synthetic shard counters" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"shard_status\":{\"7\":{") != null);
 }
 
+test "single embeddings index encoder treats stale enrichment tail as ready when coverage is complete" {
+    const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
+    defer std.testing.allocator.free(indexes);
+    indexes[0] = .{
+        .name = try std.testing.allocator.dupe(u8, "semantic_idx"),
+        .kind = .dense_vector,
+        .doc_count = 3,
+        .node_count = 1,
+        .root_node = 1,
+        .backfill_active = true,
+        .backfill_progress = 0.667,
+        .replay_applied_sequence = 2,
+        .replay_target_sequence = 3,
+        .replay_catch_up_required = true,
+        .catch_up_applied_sequence = 2,
+        .catch_up_target_sequence = 3,
+    };
+    defer std.testing.allocator.free(indexes[0].name);
+
+    const local_items = try std.testing.allocator.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+    defer std.testing.allocator.free(local_items);
+    local_items[0] = .{
+        .group_id = 7,
+        .metadata = .{
+            .source = .synthetic_config,
+            .freshness = .stale,
+        },
+        .stats = .{
+            .doc_count = 3,
+            .index_count = 1,
+            .indexes = indexes,
+            .enrichment = .{
+                .enabled = true,
+                .target_sequence = 3,
+                .applied_sequence = 2,
+                .retryable_error_count = 8,
+            },
+        },
+    };
+    var local_status = runtime_status.LocalTableRuntimeStatuses{ .items = local_items };
+
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3}}",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "semantic_idx", &local_status)).?;
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"runtime_fresh\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"stale_groups\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"pending_sequence_count\":1") != null);
+}
+
 test "index encoders report missing and stale topology groups without probing databases" {
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
@@ -3873,7 +4014,7 @@ test "embeddings index replay completion without artifact visibility is not read
             .freshness = .fresh,
         },
         .stats = .{
-            .doc_count = 0,
+            .doc_count = 12,
             .index_count = 1,
             .indexes = indexes,
         },
@@ -3904,6 +4045,69 @@ test "embeddings index replay completion without artifact visibility is not read
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":4000") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":4000") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":false") != null);
+}
+
+test "empty embeddings index status is ready without dense artifact visibility" {
+    const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
+    defer std.testing.allocator.free(indexes);
+    indexes[0] = .{
+        .name = try std.testing.allocator.dupe(u8, "semantic_idx"),
+        .kind = .dense_vector,
+        .doc_count = 0,
+        .node_count = 0,
+        .root_node = 0,
+        .replay_applied_sequence = 1,
+        .replay_target_sequence = 1,
+        .replay_catch_up_required = false,
+        .backfill_active = true,
+        .backfill_progress = 0.0,
+    };
+    defer std.testing.allocator.free(indexes[0].name);
+
+    const local_items = try std.testing.allocator.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+    defer std.testing.allocator.free(local_items);
+    local_items[0] = .{
+        .group_id = 7,
+        .metadata = .{
+            .source = .background_refresh,
+            .freshness = .fresh,
+        },
+        .stats = .{
+            .doc_count = 0,
+            .index_count = 1,
+            .indexes = indexes,
+            .enrichment = .{
+                .enabled = true,
+                .applied_sequence = 1,
+                .target_sequence = 1,
+            },
+        },
+    };
+    var local_status = runtime_status.LocalTableRuntimeStatuses{ .items = local_items };
+
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3}}",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "semantic_idx", &local_status)).?;
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"dense_publish_pending\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":1") != null);
 }
 
 test "single embeddings index encoder keeps partial backfill active while indexed docs lag table docs" {

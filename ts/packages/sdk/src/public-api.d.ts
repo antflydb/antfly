@@ -1041,6 +1041,65 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/repair/issues": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * List artifact repair issues
+         * @description Lists durable repair debt for a table. This operator-facing endpoint
+         *     returns exact document keys, artifact keys, index names, and repair
+         *     errors, and therefore requires table admin permission when authentication
+         *     is enabled. Request filters are supplied in the JSON body. This release
+         *     supports `target=artifact` for durable artifact queue entries and
+         *     `target=index` for index repair candidates.
+         */
+        post: operations["listArtifactRepairIssues"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/repair/run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run a bounded table repair pass
+         * @description Attempts to repair queued table issues. `target=artifact` reprocesses
+         *     supported artifact kinds and replays derived state; it is bounded by
+         *     `limit` and returns an opaque continuation cursor when another artifact
+         *     repair page is available. `target=index` repairs one named index after
+         *     resetting its derived index storage; healthy indexes are skipped unless
+         *     `force=true` is supplied, and any positive `limit` permits that single
+         *     named index repair. The response reports unresolved debt separately, and
+         *     the endpoint requires table admin permission when authentication is
+         *     enabled.
+         */
+        post: operations["runTableRepair"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess": {
         parameters: {
             query?: never;
@@ -2673,6 +2732,212 @@ export interface components {
             /** @description Table containing the configured artifact enrichments. */
             table_name: string;
             artifacts: components["schemas"]["EnrichmentConfig"][];
+        };
+        /**
+         * @description Kind of stored artifact tracked by the repair queue.
+         * @enum {string}
+         */
+        ArtifactRepairKind: "embedding" | "asset" | "chunk" | "graph" | "full_text";
+        /**
+         * @description Reason an artifact was added to the repair queue.
+         * @enum {string}
+         */
+        ArtifactRepairReason: "missing_artifact" | "corrupt_artifact" | "unreadable_artifact";
+        /**
+         * @description Repair subsystem to inspect or run.
+         * @enum {string}
+         */
+        RepairTarget: "artifact" | "index";
+        /** @description Durable repair debt for a derived artifact. This is an operator-facing record and includes exact source and artifact identifiers. */
+        ArtifactRepairIssue: {
+            artifact_kind: components["schemas"]["ArtifactRepairKind"];
+            /** @description Index whose replay or derived state observed the artifact problem. */
+            index_name: string;
+            /** @description Source or derived document key whose artifact is missing or unreadable. */
+            doc_key: string;
+            /** @description Parent source document key for chunk-derived artifacts. */
+            parent_doc_key?: string;
+            /** @description Unit identifier for unit-scoped artifacts, when applicable. */
+            unit_id?: string;
+            /** @description Source artifact stream used to produce this artifact, when applicable. */
+            source_artifact_name?: string;
+            /** @description Derived artifact name that must be reprocessed or made readable. */
+            artifact_name: string;
+            /** @description Hex-encoded internal artifact storage key, when known. */
+            artifact_key?: string;
+            /**
+             * Format: uint32
+             * @description Chunk ordinal for chunk-derived artifacts.
+             */
+            chunk_id?: number | null;
+            /** @description Whether this artifact kind currently has an automated repair reprocessor. */
+            repairable: boolean;
+            /** @description Stable reason code when repairable is false. */
+            unsupported_reason?: string;
+            /**
+             * Format: uint64
+             * @description Derived replay sequence that observed the issue.
+             */
+            sequence: number;
+            reason: components["schemas"]["ArtifactRepairReason"];
+            /**
+             * Format: uint64
+             * @description Number of repair attempts made for this issue.
+             */
+            attempts: number;
+            /**
+             * Format: uint64
+             * @description Monotonic timestamp when this issue was first recorded.
+             */
+            first_seen_ns: number;
+            /**
+             * Format: uint64
+             * @description Monotonic timestamp when this issue was last observed or attempted.
+             */
+            last_seen_ns: number;
+            /** @description Last stable repair error code, when a repair attempt failed. */
+            last_error?: string;
+        };
+        /** @description Bounded page of table repair issues. */
+        ArtifactRepairIssueList: {
+            /** @description Table whose repair queue was listed. */
+            table: string;
+            target: components["schemas"]["RepairTarget"];
+            /**
+             * Format: uint32
+             * @description Effective page limit.
+             */
+            limit: number;
+            /**
+             * Format: uint64
+             * @description Number of repair records scanned while building this page.
+             */
+            scanned: number;
+            /**
+             * Format: uint64
+             * @description Number of table groups touched while building this page.
+             */
+            groups_scanned: number;
+            /** @description Whether another page is available. */
+            has_more: boolean;
+            /** @description Opaque cursor for the next page when has_more is true. */
+            next_cursor?: string | null;
+            issues: components["schemas"]["ArtifactRepairIssue"][];
+        };
+        /** @description Bounded request to list table repair issues. */
+        RepairIssueListRequest: {
+            /**
+             * @description Repair subsystem to list. `artifact` lists durable artifact queue records; `index` lists index repair candidates derived from index status and artifact debt.
+             * @default artifact
+             */
+            target?: components["schemas"]["RepairTarget"];
+            kind?: components["schemas"]["ArtifactRepairKind"];
+            /** @description Restrict results to one index name. */
+            index?: string;
+            /** @description Opaque cursor returned by a prior response. */
+            cursor?: string;
+            /**
+             * Format: uint32
+             * @description Maximum repair records to return.
+             * @default 50
+             */
+            limit?: number;
+        };
+        /** @description Bounded request to run a table repair pass. */
+        RepairRunRequest: {
+            target?: components["schemas"]["RepairTarget"];
+            kind?: components["schemas"]["ArtifactRepairKind"];
+            /** @description Restrict repair attempts to one index name. */
+            index?: string;
+            /** @description Opaque cursor returned by a prior repair response. */
+            cursor?: string;
+            /**
+             * @description Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
+             * @default false
+             */
+            force?: boolean;
+            /**
+             * Format: uint32
+             * @description Maximum artifact repair records to attempt. For target=index, any positive value permits one named index repair.
+             * @default 100
+             */
+            limit?: number;
+        };
+        /** @description Result of one bounded artifact repair pass. */
+        ArtifactRepairRunResult: {
+            /**
+             * Format: uint64
+             * @description Number of repair records attempted by this pass.
+             */
+            scanned: number;
+            /**
+             * Format: uint64
+             * @description Number of table groups touched by this bounded repair pass.
+             */
+            groups_scanned: number;
+            /**
+             * Format: uint64
+             * @description Number of artifacts whose source was reprocessed.
+             */
+            reprocessed: number;
+            /**
+             * Format: uint64
+             * @description Number of repair records cleared because the artifact became readable.
+             */
+            repaired: number;
+            /**
+             * Format: uint64
+             * @description Number of repair records whose source document no longer exists.
+             */
+            missing_source_docs: number;
+            /**
+             * Format: uint64
+             * @description Number of supported repair attempts that failed.
+             */
+            failed: number;
+            /**
+             * Format: uint64
+             * @description Number of repair records skipped because no reprocessor exists for the artifact kind.
+             */
+            unsupported: number;
+            /**
+             * Format: uint64
+             * @description Number of attempted repair records that remained queued after this pass.
+             */
+            unresolved: number;
+            /**
+             * Format: uint64
+             * @description Number of indexes rebuilt by this pass when target is index.
+             */
+            indexes_rebuilt: number;
+            /**
+             * Format: uint64
+             * @description Number of selected indexes that were already degraded or quarantined before repair.
+             */
+            indexes_degraded: number;
+            /**
+             * Format: uint32
+             * @description Effective repair limit.
+             */
+            limit: number;
+            /** @description Opaque cursor for the next artifact repair pass when has_more is true. Index repair currently repairs one named index per request and does not return a continuation cursor. */
+            next_cursor?: string | null;
+            /** @description Whether another artifact scan page is available via next_cursor. */
+            has_more: boolean;
+            /** @description Whether repair debt remains after this bounded pass. If true and next_cursor is absent, rerun repair from the beginning after addressing failed or unsupported records. */
+            debt_remaining: boolean;
+        };
+        /** @description Response for a bounded table repair pass. */
+        ArtifactRepairRunResponse: {
+            /** @description Table whose repair queue was processed. */
+            table: string;
+            target: components["schemas"]["RepairTarget"];
+            /**
+             * Format: uint32
+             * @description Effective repair limit.
+             */
+            limit: number;
+            result: components["schemas"]["ArtifactRepairRunResult"];
         };
         DocumentArtifactReprocessResponse: {
             /**
@@ -7816,6 +8081,33 @@ export interface components {
              * @description Number of documents indexed during current rebuild
              */
             backfill_items_processed?: number;
+            /** @description Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required. */
+            projection_checkpoint_status?: string;
+            /**
+             * Format: uint64
+             * @description Highest derived-log sequence covered by the durable projection checkpoint.
+             */
+            projection_checkpoint_applied_sequence?: number;
+            /**
+             * Format: uint64
+             * @description Projection generation associated with the durable checkpoint.
+             */
+            projection_checkpoint_generation?: number;
+            /**
+             * Format: uint64
+             * @description Projection configuration identity associated with the durable checkpoint.
+             */
+            projection_checkpoint_config_hash?: number;
+            /**
+             * Format: uint64
+             * @description Number of derived-log sequences after the durable checkpoint that still need replay.
+             */
+            checkpoint_replay_tail_sequence_count?: number;
+            /**
+             * Format: uint64
+             * @description Repair issues found by explicit repair-scan accounting for this projection.
+             */
+            repair_scan_issue_count?: number;
         };
         /** @description Statistics for an embeddings index (dense or sparse) */
         EmbeddingsIndexStats: {
@@ -7863,6 +8155,33 @@ export interface components {
              * @description Total items processed during backfill
              */
             backfill_items_processed?: number;
+            /** @description Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required. */
+            projection_checkpoint_status?: string;
+            /**
+             * Format: uint64
+             * @description Highest derived-log sequence covered by the durable projection checkpoint.
+             */
+            projection_checkpoint_applied_sequence?: number;
+            /**
+             * Format: uint64
+             * @description Projection generation associated with the durable checkpoint.
+             */
+            projection_checkpoint_generation?: number;
+            /**
+             * Format: uint64
+             * @description Projection configuration identity associated with the durable checkpoint.
+             */
+            projection_checkpoint_config_hash?: number;
+            /**
+             * Format: uint64
+             * @description Number of derived-log sequences after the durable checkpoint that still need replay.
+             */
+            checkpoint_replay_tail_sequence_count?: number;
+            /**
+             * Format: uint64
+             * @description Repair issues found by explicit repair-scan accounting for this projection.
+             */
+            repair_scan_issue_count?: number;
         };
         /** @description Statistics for graph index */
         GraphIndexStats: {
@@ -7894,6 +8213,33 @@ export interface components {
              * @description Number of edges indexed during current rebuild
              */
             backfill_items_processed?: number;
+            /** @description Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required. */
+            projection_checkpoint_status?: string;
+            /**
+             * Format: uint64
+             * @description Highest derived-log sequence covered by the durable projection checkpoint.
+             */
+            projection_checkpoint_applied_sequence?: number;
+            /**
+             * Format: uint64
+             * @description Projection generation associated with the durable checkpoint.
+             */
+            projection_checkpoint_generation?: number;
+            /**
+             * Format: uint64
+             * @description Projection configuration identity associated with the durable checkpoint.
+             */
+            projection_checkpoint_config_hash?: number;
+            /**
+             * Format: uint64
+             * @description Number of derived-log sequences after the durable checkpoint that still need replay.
+             */
+            checkpoint_replay_tail_sequence_count?: number;
+            /**
+             * Format: uint64
+             * @description Repair issues found by explicit repair-scan accounting for this projection.
+             */
+            repair_scan_issue_count?: number;
             /** @description Algebraic graph execution health for bounded semiring traversal. */
             algebraic_graph?: {
                 traversal?: {
@@ -7988,6 +8334,33 @@ export interface components {
             active_progress_rows_processed?: number;
             /** Format: uint64 */
             active_progress_target_rows?: number;
+            /** @description Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required. */
+            projection_checkpoint_status?: string;
+            /**
+             * Format: uint64
+             * @description Highest derived-log sequence covered by the durable projection checkpoint.
+             */
+            projection_checkpoint_applied_sequence?: number;
+            /**
+             * Format: uint64
+             * @description Projection generation associated with the durable checkpoint.
+             */
+            projection_checkpoint_generation?: number;
+            /**
+             * Format: uint64
+             * @description Projection configuration identity associated with the durable checkpoint.
+             */
+            projection_checkpoint_config_hash?: number;
+            /**
+             * Format: uint64
+             * @description Number of derived-log sequences after the durable checkpoint that still need replay.
+             */
+            checkpoint_replay_tail_sequence_count?: number;
+            /**
+             * Format: uint64
+             * @description Repair issues found by explicit repair-scan accounting for this projection.
+             */
+            repair_scan_issue_count?: number;
         };
         /** @description Statistics for an index */
         IndexStats: components["schemas"]["FullTextIndexStats"] | components["schemas"]["EmbeddingsIndexStats"] | components["schemas"]["GraphIndexStats"] | components["schemas"]["AlgebraicIndexStats"];
@@ -12164,6 +12537,68 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    listArtifactRepairIssues: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["RepairIssueListRequest"];
+            };
+        };
+        responses: {
+            /** @description Artifact repair issue page */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ArtifactRepairIssueList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    runTableRepair: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["RepairRunRequest"];
+            };
+        };
+        responses: {
+            /** @description Bounded table repair pass was accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ArtifactRepairRunResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
             500: components["responses"]["InternalServerError"];
         };
     };
