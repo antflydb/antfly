@@ -1531,8 +1531,11 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid create table request");
         };
-        var create_req = table_contract.parseCreateTableRequest(alloc, body_data) catch {
+        var create_req = table_contract.parseCreateTableRequest(alloc, body_data) catch |err| {
             _ = ctx.status(400);
+            if (err == error.InvalidCreateTableSchemaRequest) {
+                return ctx.text(table_contract.createTableRequestErrorMessage(body_data));
+            }
             return ctx.text("invalid create table request");
         };
         defer create_req.deinit(alloc);

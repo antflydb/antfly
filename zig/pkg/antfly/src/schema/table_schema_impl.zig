@@ -1344,7 +1344,6 @@ fn validateDynamicTemplate(value: std.json.Value) !void {
 
     if (object.get("name")) |name| if (name != .null and name != .string) return error.InvalidSchemaUpdateRequest;
     if (object.get("match")) |match| if (match != .null and match != .string) return error.InvalidSchemaUpdateRequest;
-    if (object.get("match_pattern")) |match_pattern| if (match_pattern != .null and match_pattern != .string) return error.InvalidSchemaUpdateRequest;
     if (object.get("unmatch")) |unmatch| if (unmatch != .null and unmatch != .string) return error.InvalidSchemaUpdateRequest;
     if (object.get("path_match")) |path_match| if (path_match != .null and path_match != .string) return error.InvalidSchemaUpdateRequest;
     if (object.get("path_unmatch")) |path_unmatch| if (path_unmatch != .null and path_unmatch != .string) return error.InvalidSchemaUpdateRequest;
@@ -1368,7 +1367,6 @@ fn validateDynamicTemplate(value: std.json.Value) !void {
 fn isKnownDynamicTemplateKey(key: []const u8) bool {
     return std.mem.eql(u8, key, "name") or
         std.mem.eql(u8, key, "match") or
-        std.mem.eql(u8, key, "match_pattern") or
         std.mem.eql(u8, key, "unmatch") or
         std.mem.eql(u8, key, "path_match") or
         std.mem.eql(u8, key, "path_unmatch") or
@@ -2436,9 +2434,6 @@ fn parseDynamicTemplate(alloc: std.mem.Allocator, default_name: []const u8, valu
     var parsed = try parseFieldMappingSpec(alloc, default_name, mapping, false);
     errdefer parsed.deinit(alloc);
     parsed.match_pattern = if (object.get("match")) |match| switch (match) {
-        .string => |pattern| try alloc.dupe(u8, pattern),
-        else => null,
-    } else if (object.get("match_pattern")) |match_pattern| switch (match_pattern) {
         .string => |pattern| try alloc.dupe(u8, pattern),
         else => null,
     } else null;
@@ -3713,6 +3708,13 @@ test "parse accepts sortable without public doc values and rejects unsupported s
         parseSchema(
             std.testing.allocator,
             "{\"dynamic_templates\":[{\"name\":\"rank\",\"path_match\":\"rank\",\"unknown\":true,\"mapping\":{\"type\":\"numeric\",\"sortable\":true}}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"dynamic_templates\":[{\"name\":\"rank\",\"match_pattern\":\"rank_*\",\"mapping\":{\"type\":\"numeric\",\"sortable\":true}}]}",
         ),
     );
     try std.testing.expectError(

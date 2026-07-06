@@ -63,12 +63,12 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
             const raw_schema = try stringifyJsonAlloc(alloc, schema_value);
             defer alloc.free(raw_schema);
             const validated_schema = tables_api.parseSchemaUpdateRequest(alloc, raw_schema) catch |err| switch (err) {
-                error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableRequest,
+                error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableSchemaRequest,
                 else => return err,
             };
             defer alloc.free(validated_schema);
             req.schema_json = tables_api.normalizeSchemaVersion(alloc, validated_schema, 0) catch |err| switch (err) {
-                error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableRequest,
+                error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableSchemaRequest,
                 else => return err,
             };
         }
@@ -185,6 +185,13 @@ pub fn schemaUpdateRequestErrorMessage(body: []const u8) []const u8 {
         return "invalid schema update request: doc_values is internal; use sortable: true on scalar mappings";
     }
     return "invalid schema update request";
+}
+
+pub fn createTableRequestErrorMessage(body: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, body, "\"doc_values\"") != null) {
+        return "invalid create table request: schema doc_values is internal; use sortable: true on scalar mappings";
+    }
+    return "invalid create table request";
 }
 
 pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, index_name: []const u8, body: []const u8) ![]u8 {
@@ -573,8 +580,12 @@ test "table contract rejects malformed schema payloads" {
         parseSchemaUpdateRequest(std.testing.allocator, "{\"document_schemas\":{\"doc\":{}}}"),
     );
     try std.testing.expectError(
-        error.InvalidCreateTableRequest,
+        error.InvalidCreateTableSchemaRequest,
         parseCreateTableRequest(std.testing.allocator, "{\"schema\":{\"ttl_duration_ns\":-1}}"),
+    );
+    try std.testing.expectError(
+        error.InvalidCreateTableSchemaRequest,
+        parseCreateTableRequest(std.testing.allocator, "{\"schema\":{\"dynamic_templates\":[{\"name\":\"rank\",\"path_match\":\"rank\",\"mapping\":{\"type\":\"numeric\",\"doc_values\":true}}]}}"),
     );
 }
 
@@ -762,5 +773,13 @@ test "table contract schema update error message explains public sortable replac
     try std.testing.expectEqualStrings(
         "invalid schema update request",
         schemaUpdateRequestErrorMessage("{\"dynamic_templates\":[{\"mapping\":{\"type\":\"keyword\",\"sortable\":true}}]}"),
+    );
+    try std.testing.expectEqualStrings(
+        "invalid create table request: schema doc_values is internal; use sortable: true on scalar mappings",
+        createTableRequestErrorMessage("{\"schema\":{\"dynamic_templates\":[{\"mapping\":{\"type\":\"keyword\",\"doc_values\":true}}]}}"),
+    );
+    try std.testing.expectEqualStrings(
+        "invalid create table request",
+        createTableRequestErrorMessage("{\"schema\":{\"dynamic_templates\":[{\"mapping\":{\"type\":\"keyword\",\"sortable\":true}}]}}"),
     );
 }

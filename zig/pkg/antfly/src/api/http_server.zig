@@ -4052,6 +4052,9 @@ pub const ApiHttpServer = struct {
                 defer self.alloc.free(table_name);
                 var create_req = table_contract.parseCreateTableRequest(self.alloc, req.body) catch |err| {
                     std.log.err("create table parse failed: {} body_len={d}", .{ err, req.body.len });
+                    if (err == error.InvalidCreateTableSchemaRequest) {
+                        return try textResponse(self.alloc, 400, table_contract.createTableRequestErrorMessage(req.body));
+                    }
                     return try textResponse(self.alloc, 400, "invalid create table request");
                 };
                 defer create_req.deinit(self.alloc);
