@@ -2413,7 +2413,8 @@ export interface components {
              *     `text_exact_late_visibility_totals`,
              *     `text_field_sort_candidate_window`,
              *     `match_all_candidate_collect_limit`,
-             *     `match_all_exact_candidate_window`, and
+             *     `match_all_exact_candidate_window`,
+             *     `sorted_segment_scan_window`, and
              *     `distributed_merge_shard_window`.
              * @example text_field_sort_candidate_window
              */
@@ -5956,6 +5957,16 @@ export interface components {
             sorted_segment_bounds_available?: boolean;
             /**
              * Format: int64
+             * @description Physical sorted-segment documents scanned before deleted-doc, cursor, membership, and filter checks.
+             */
+            sorted_segment_scanned_count?: number;
+            /**
+             * Format: int64
+             * @description Maximum physical sorted-segment documents allowed before the sorted_segment_scan_window budget rejection.
+             */
+            sorted_segment_scan_budget?: number;
+            /**
+             * Format: int64
              * @description Candidate documents considered by sort execution.
              */
             candidate_count?: number;
@@ -6064,7 +6075,8 @@ export interface components {
              *     `text_exact_late_visibility_totals`,
              *     `text_field_sort_candidate_window`,
              *     `match_all_candidate_collect_limit`,
-             *     `match_all_exact_candidate_window`, and
+             *     `match_all_exact_candidate_window`,
+             *     `sorted_segment_scan_window`, and
              *     `distributed_merge_shard_window`.
              */
             budget_rejection_reason?: string;

@@ -92,6 +92,8 @@ test "public openapi contract module is generated and wired" {
     try std.testing.expect(@hasField(generated.SortProfile, "index_sort_match"));
     try std.testing.expect(@hasField(generated.SortProfile, "sorted_segment_executor_available"));
     try std.testing.expect(@hasField(generated.SortProfile, "sorted_segment_bounds_available"));
+    try std.testing.expect(@hasField(generated.SortProfile, "sorted_segment_scanned_count"));
+    try std.testing.expect(@hasField(generated.SortProfile, "sorted_segment_scan_budget"));
     try std.testing.expect(@hasField(generated.SortProfile, "candidate_count"));
     try std.testing.expect(@hasField(generated.SortProfile, "cursor_rejected_count"));
     try std.testing.expect(@hasField(generated.SortProfile, "admitted_count"));

@@ -4,6 +4,28 @@
 const std = @import("std");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
 
+/// Options for evaluation behavior
+pub const EvalOptions = struct {
+    /// K value for @K metrics (precision@k, recall@k, ndcg@k)
+    k: ?i64 = null,
+    /// Score threshold for pass/fail determination
+    pass_threshold: ?f32 = null,
+    /// Timeout for evaluation in seconds
+    timeout_seconds: ?i64 = null,
+};
+
+/// Aggregate statistics across all evaluators
+pub const EvalSummary = struct {
+    /// Average score across all evaluators
+    average_score: ?f32 = null,
+    /// Number of evaluators that passed
+    passed: ?i64 = null,
+    /// Number of evaluators that failed
+    failed: ?i64 = null,
+    /// Total number of evaluators run
+    total: ?i64 = null,
+};
+
 /// Available evaluator types: **Retrieval metrics** (require ground_truth.relevant_ids): - recall: Recall@k - fraction of relevant docs retrieved - precision: Precision@k - fraction of retrieved docs that are relevant - ndcg: Normalized Discounted Cumulative Gain - mrr: Mean Reciprocal Rank - map: Mean Average Precision **LLM-as-judge metrics** (require judge config): - relevance: Is output relevant to query? (works on retrieval-only too) - faithfulness: Is output grounded in context? - completeness: Does output fully address query? - coherence: Is output well-structured? - safety: Is output safe/appropriate? - helpfulness: Is output useful? - correctness: Is output factually correct? (uses expectations) - citation_quality: Are citations accurate?
 pub const EvaluatorName = enum {
     recall,
@@ -63,24 +85,6 @@ pub const EvaluatorName = enum {
     }
 };
 
-/// Ground truth data for evaluation
-pub const GroundTruth = struct {
-    /// Document IDs known to be relevant (for retrieval metrics)
-    relevant_ids: ?[]const []const u8 = null,
-    /// Context for evaluators about what to expect in the response. Provides guidance for LLM judges (e.g., "Should mention pricing tiers").
-    expectations: ?[]const u8 = null,
-};
-
-/// Options for evaluation behavior
-pub const EvalOptions = struct {
-    /// K value for @K metrics (precision@k, recall@k, ndcg@k)
-    k: ?i64 = null,
-    /// Score threshold for pass/fail determination
-    pass_threshold: ?f32 = null,
-    /// Timeout for evaluation in seconds
-    timeout_seconds: ?i64 = null,
-};
-
 /// Result from a single evaluator
 pub const EvaluatorScore = struct {
     /// Numeric score (0-1)
@@ -93,16 +97,20 @@ pub const EvaluatorScore = struct {
     metadata: ?std.json.Value = null,
 };
 
-/// Aggregate statistics across all evaluators
-pub const EvalSummary = struct {
-    /// Average score across all evaluators
-    average_score: ?f32 = null,
-    /// Number of evaluators that passed
-    passed: ?i64 = null,
-    /// Number of evaluators that failed
-    failed: ?i64 = null,
-    /// Total number of evaluators run
-    total: ?i64 = null,
+/// Ground truth data for evaluation
+pub const GroundTruth = struct {
+    /// Document IDs known to be relevant (for retrieval metrics)
+    relevant_ids: ?[]const []const u8 = null,
+    /// Context for evaluators about what to expect in the response. Provides guidance for LLM judges (e.g., "Should mention pricing tiers").
+    expectations: ?[]const u8 = null,
+};
+
+/// Scores organized by category
+pub const EvalScores = struct {
+    /// Retrieval metric scores (recall, precision, ndcg, etc.)
+    retrieval: ?std.json.ArrayHashMap(EvaluatorScore) = null,
+    /// Generation quality scores (faithfulness, relevance, etc.)
+    generation: ?std.json.ArrayHashMap(EvaluatorScore) = null,
 };
 
 /// Configuration for inline evaluation of query results. Add to RetrievalAgentRequest, QueryRequest, or other evaluation-capable request schemas.
@@ -135,14 +143,6 @@ pub const EvalRequest = struct {
     context: ?[]const std.json.Value = null,
     /// IDs of retrieved documents (for retrieval metrics)
     retrieved_ids: ?[]const []const u8 = null,
-};
-
-/// Scores organized by category
-pub const EvalScores = struct {
-    /// Retrieval metric scores (recall, precision, ndcg, etc.)
-    retrieval: ?std.json.ArrayHashMap(EvaluatorScore) = null,
-    /// Generation quality scores (faithfulness, relevance, etc.)
-    generation: ?std.json.ArrayHashMap(EvaluatorScore) = null,
 };
 
 /// Complete evaluation result

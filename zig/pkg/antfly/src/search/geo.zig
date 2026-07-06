@@ -24,6 +24,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const math = std.math;
 
+pub const index_geohash_precision: u8 = 5;
+pub const max_filter_geohash_cells: usize = 4096;
+
 pub const GeoPoint = struct {
     lat: f64,
     lon: f64,

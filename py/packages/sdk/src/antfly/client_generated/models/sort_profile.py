@@ -46,6 +46,10 @@ class SortProfile:
             sorted_segment_executor_available (bool | Unset): Whether sorted-segment execution was available for this
                 request.
             sorted_segment_bounds_available (bool | Unset): Whether sorted-segment bounds were available for cursor seeks.
+            sorted_segment_scanned_count (int | Unset): Physical sorted-segment documents scanned before deleted-doc,
+                cursor, membership, and filter checks.
+            sorted_segment_scan_budget (int | Unset): Maximum physical sorted-segment documents allowed before the
+                sorted_segment_scan_window budget rejection.
             candidate_count (int | Unset): Candidate documents considered by sort execution.
             cursor_rejected_count (int | Unset): Candidates rejected by cursor comparison.
             admitted_count (int | Unset): Candidate hits admitted to the sort window.
@@ -73,7 +77,8 @@ class SortProfile:
                 `text_exact_late_visibility_totals`,
                 `text_field_sort_candidate_window`,
                 `match_all_candidate_collect_limit`,
-                `match_all_exact_candidate_window`, and
+                `match_all_exact_candidate_window`,
+                `sorted_segment_scan_window`, and
                 `distributed_merge_shard_window`.
             sort_rejection_reason (str | Unset): Stable exact-sort rejection reason. Known values include
                 `unmapped_sort_field`, `non_sortable_sort_field`,
@@ -141,6 +146,8 @@ class SortProfile:
     index_sort_match: bool | Unset = UNSET
     sorted_segment_executor_available: bool | Unset = UNSET
     sorted_segment_bounds_available: bool | Unset = UNSET
+    sorted_segment_scanned_count: int | Unset = UNSET
+    sorted_segment_scan_budget: int | Unset = UNSET
     candidate_count: int | Unset = UNSET
     cursor_rejected_count: int | Unset = UNSET
     admitted_count: int | Unset = UNSET
@@ -205,6 +212,10 @@ class SortProfile:
         sorted_segment_executor_available = self.sorted_segment_executor_available
 
         sorted_segment_bounds_available = self.sorted_segment_bounds_available
+
+        sorted_segment_scanned_count = self.sorted_segment_scanned_count
+
+        sorted_segment_scan_budget = self.sorted_segment_scan_budget
 
         candidate_count = self.candidate_count
 
@@ -291,6 +302,10 @@ class SortProfile:
             field_dict["sorted_segment_executor_available"] = sorted_segment_executor_available
         if sorted_segment_bounds_available is not UNSET:
             field_dict["sorted_segment_bounds_available"] = sorted_segment_bounds_available
+        if sorted_segment_scanned_count is not UNSET:
+            field_dict["sorted_segment_scanned_count"] = sorted_segment_scanned_count
+        if sorted_segment_scan_budget is not UNSET:
+            field_dict["sorted_segment_scan_budget"] = sorted_segment_scan_budget
         if candidate_count is not UNSET:
             field_dict["candidate_count"] = candidate_count
         if cursor_rejected_count is not UNSET:
@@ -388,6 +403,10 @@ class SortProfile:
 
         sorted_segment_bounds_available = d.pop("sorted_segment_bounds_available", UNSET)
 
+        sorted_segment_scanned_count = d.pop("sorted_segment_scanned_count", UNSET)
+
+        sorted_segment_scan_budget = d.pop("sorted_segment_scan_budget", UNSET)
+
         candidate_count = d.pop("candidate_count", UNSET)
 
         cursor_rejected_count = d.pop("cursor_rejected_count", UNSET)
@@ -455,6 +474,8 @@ class SortProfile:
             index_sort_match=index_sort_match,
             sorted_segment_executor_available=sorted_segment_executor_available,
             sorted_segment_bounds_available=sorted_segment_bounds_available,
+            sorted_segment_scanned_count=sorted_segment_scanned_count,
+            sorted_segment_scan_budget=sorted_segment_scan_budget,
             candidate_count=candidate_count,
             cursor_rejected_count=cursor_rejected_count,
             admitted_count=admitted_count,

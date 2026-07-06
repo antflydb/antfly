@@ -55,6 +55,10 @@ pub const testing = if (builtin.is_test) struct {
     pub fn bodyHasPublicDocFilterBindings(alloc: std.mem.Allocator, body: []const u8) !bool {
         return queryBodyHasPublicDocFilterBindings(alloc, body);
     }
+
+    pub fn expectSortProfileDiagnosticsSerialization() !void {
+        return expectSortProfileDiagnosticsSerializationForTest();
+    }
 } else struct {};
 
 pub fn totalHitsRelationString(relation: db_mod.types.TotalHitsRelation) []const u8 {
@@ -2806,7 +2810,7 @@ test "api query contract serializes fused index scores" {
     try std.testing.expectEqual(@as(f64, 0.25), object.get("semantic_idx").?.float);
 }
 
-test "api query contract serializes sort profile diagnostics" {
+fn expectSortProfileDiagnosticsSerializationForTest() !void {
     const alloc = std.testing.allocator;
 
     var result = db_mod.types.SearchResult{
@@ -2828,6 +2832,8 @@ test "api query contract serializes sort profile diagnostics" {
             .index_sort_match = true,
             .sorted_segment_executor_available = true,
             .sorted_segment_bounds_available = true,
+            .sorted_segment_scanned_count = 13,
+            .sorted_segment_scan_budget = 100,
             .candidate_count = 7,
             .cursor_rejected_count = 1,
             .admitted_count = 5,
@@ -2894,6 +2900,8 @@ test "api query contract serializes sort profile diagnostics" {
     try std.testing.expect(sort.get("index_sort_match").?.bool);
     try std.testing.expect(sort.get("sorted_segment_executor_available").?.bool);
     try std.testing.expect(sort.get("sorted_segment_bounds_available").?.bool);
+    try std.testing.expectEqual(@as(i64, 13), sort.get("sorted_segment_scanned_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 100), sort.get("sorted_segment_scan_budget").?.integer);
     try std.testing.expectEqual(@as(i64, 7), sort.get("candidate_count").?.integer);
     try std.testing.expectEqual(@as(i64, 1), sort.get("cursor_rejected_count").?.integer);
     try std.testing.expectEqual(@as(i64, 17), sort.get("native_doc_value_hit_count").?.integer);
@@ -2910,6 +2918,10 @@ test "api query contract serializes sort profile diagnostics" {
     try std.testing.expectEqualStrings("missing_doc_values_coverage", sort.get("sort_rejection_reason").?.string);
     try std.testing.expectEqualStrings("missing_doc_values_section", sort.get("sort_rejection_detail").?.string);
     try std.testing.expectEqualStrings("created_at", sort.get("sort_rejection_field").?.string);
+}
+
+test "api query contract serializes sort profile diagnostics" {
+    try expectSortProfileDiagnosticsSerializationForTest();
 }
 
 test "api query contract serializes ordered hit sort tuple" {
@@ -4294,6 +4306,8 @@ fn buildSortProfileValue(
     try sort.put(alloc, "index_sort_match", .{ .bool = profile.index_sort_match });
     try sort.put(alloc, "sorted_segment_executor_available", .{ .bool = profile.sorted_segment_executor_available });
     try sort.put(alloc, "sorted_segment_bounds_available", .{ .bool = profile.sorted_segment_bounds_available });
+    try sort.put(alloc, "sorted_segment_scanned_count", try buildProfileUnsignedValue(alloc, profile.sorted_segment_scanned_count));
+    try sort.put(alloc, "sorted_segment_scan_budget", try buildProfileUnsignedValue(alloc, profile.sorted_segment_scan_budget));
     try sort.put(alloc, "candidate_count", try buildProfileUnsignedValue(alloc, profile.candidate_count));
     try sort.put(alloc, "cursor_rejected_count", try buildProfileUnsignedValue(alloc, profile.cursor_rejected_count));
     try sort.put(alloc, "admitted_count", try buildProfileUnsignedValue(alloc, profile.admitted_count));

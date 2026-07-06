@@ -90,6 +90,10 @@ test "public openapi documents stable exact sort diagnostics" {
     try openapi_contract.expectPublicOpenApiDocumentsStableExactSortDiagnostics();
 }
 
+test "api query contract serializes sort profile diagnostics" {
+    try query_contract.testing.expectSortProfileDiagnosticsSerialization();
+}
+
 test "linear merge request parser accepts raw payload value under public request cap" {
     const alloc = std.testing.allocator;
     const payload = try alloc.alloc(u8, 6 * 1024 * 1024);

@@ -56,6 +56,7 @@ const default_balanced_search_effort: f32 = 0.5;
 const default_late_visibility_exact_candidate_budget: u32 = 100_000;
 const default_exact_native_filter_candidate_budget: u32 = 1024;
 const default_distributed_sort_shard_window_budget: u32 = 100_000;
+const default_sorted_segment_scan_budget: u64 = 100_000;
 const default_match_all_primary_key_scan_batch_size: usize = 4096;
 var bench_query_profile_counter: std.atomic.Value(u64) = .init(0);
 const bench_query_profile_unknown = std.math.maxInt(u64);
@@ -2661,6 +2662,17 @@ fn distributedSortShardWindowBudget() u32 {
     return distributedSortShardWindowBudgetFromRaw(getenv("ANTFLY_DISTRIBUTED_SORT_SHARD_WINDOW_BUDGET"));
 }
 
+fn sortedSegmentScanBudgetFromRaw(raw: ?[]const u8) u64 {
+    const value = raw orelse return default_sorted_segment_scan_budget;
+    if (value.len == 0) return default_sorted_segment_scan_budget;
+    const parsed = std.fmt.parseUnsigned(u64, value, 10) catch return default_sorted_segment_scan_budget;
+    return if (parsed == 0) std.math.maxInt(u64) else parsed;
+}
+
+fn sortedSegmentScanBudget() u64 {
+    return sortedSegmentScanBudgetFromRaw(getenv("ANTFLY_SORTED_SEGMENT_SCAN_BUDGET"));
+}
+
 fn boundedU32(count: anytype) u32 {
     return @intCast(@min(count, @as(@TypeOf(count), std.math.maxInt(u32))));
 }
@@ -2681,6 +2693,7 @@ const ExactSortBudgetRejectionReason = enum {
     match_all_candidate_collect_limit,
     match_all_exact_candidate_window,
     distributed_merge_shard_window,
+    sorted_segment_scan_window,
 };
 
 fn exactSortBudgetRejectionReasonName(reason: ExactSortBudgetRejectionReason) []const u8 {
@@ -2690,6 +2703,7 @@ fn exactSortBudgetRejectionReasonName(reason: ExactSortBudgetRejectionReason) []
         .match_all_candidate_collect_limit => "match_all_candidate_collect_limit",
         .match_all_exact_candidate_window => "match_all_exact_candidate_window",
         .distributed_merge_shard_window => "distributed_merge_shard_window",
+        .sorted_segment_scan_window => "sorted_segment_scan_window",
     };
 }
 
@@ -2793,6 +2807,12 @@ test "distributed sort shard window budget parses disabled and fallback values" 
     try std.testing.expectEqual(default_distributed_sort_shard_window_budget, distributedSortShardWindowBudgetFromRaw("bad"));
     try std.testing.expectEqual(@as(u32, 42), distributedSortShardWindowBudgetFromRaw("42"));
     try std.testing.expectEqual(std.math.maxInt(u32), distributedSortShardWindowBudgetFromRaw("0"));
+
+    try std.testing.expectEqual(default_sorted_segment_scan_budget, sortedSegmentScanBudgetFromRaw(null));
+    try std.testing.expectEqual(default_sorted_segment_scan_budget, sortedSegmentScanBudgetFromRaw(""));
+    try std.testing.expectEqual(default_sorted_segment_scan_budget, sortedSegmentScanBudgetFromRaw("bad"));
+    try std.testing.expectEqual(@as(u64, 42), sortedSegmentScanBudgetFromRaw("42"));
+    try std.testing.expectEqual(std.math.maxInt(u64), sortedSegmentScanBudgetFromRaw("0"));
 }
 
 test "text late visibility exact candidate budget rejects oversized exact windows" {
@@ -3210,6 +3230,8 @@ const SortCollectorProfile = struct {
     stored_json_load_count: u64 = 0,
     final_sort_ns: u64 = 0,
     total_ns: u64 = 0,
+    sorted_segment_scanned_count: u64 = 0,
+    sorted_segment_scan_budget: u64 = 0,
     window_capacity: usize = 0,
     window_len: usize = 0,
     collector_heap_peak: usize = 0,
@@ -3302,6 +3324,8 @@ fn sortResultProfile(
         .index_sort_match = plan.index_sort_match,
         .sorted_segment_executor_available = plan.sorted_segment_executor_available,
         .sorted_segment_bounds_available = plan.sorted_segment_bounds_available,
+        .sorted_segment_scanned_count = profile.sorted_segment_scanned_count,
+        .sorted_segment_scan_budget = profile.sorted_segment_scan_budget,
         .candidate_count = profile.candidate_count,
         .cursor_rejected_count = profile.cursor_rejected_count,
         .admitted_count = profile.admitted_count,
@@ -7281,12 +7305,31 @@ fn nextSortedSegmentHeadAlloc(
     native_loader: NativeSortValueLoader,
     profile: ?*SortCollectorProfile,
     reverse: bool,
+    scanned_count: *u64,
+    scan_budget: u64,
 ) !?SortedSegmentHead {
     const iterator = &iterators[iterator_index];
     const segment = &snapshot.segments[iterator.segment_index];
     while (!sortedSegmentIteratorDone(snapshot, iterator.*, reverse)) {
         const local_doc_id: u32 = @intCast(iterator.next_doc);
         sortedSegmentIteratorAdvance(iterator, reverse);
+        scanned_count.* +|= 1;
+        if (profile) |p| {
+            p.sorted_segment_scanned_count = scanned_count.*;
+            p.sorted_segment_scan_budget = scan_budget;
+        }
+        if (scanned_count.* > scan_budget) {
+            logExactSortBudgetRejection(
+                "sorted_segment",
+                .sorted_segment_scan_window,
+                req.index_name,
+                boundedU32(scanned_count.*),
+                boundedU32(scan_budget),
+                plan,
+            );
+            if (profile) |p| p.budget_rejection_reason = exactSortBudgetRejectionReasonName(.sorted_segment_scan_window);
+            return error.QueryCandidateBudgetExceeded;
+        }
         if (local_doc_id >= segment.reader.doc_count) continue;
         if (sortedSegmentLocalDocDeleted(segment, local_doc_id)) continue;
         if (membership) |m| {
@@ -7385,7 +7428,12 @@ fn sortAndPageMatchAllSortedSegmentsAlloc(
     const collect_sort_profile = bench_query_profile or effective_req.profile;
     const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
     var profile = SortCollectorProfile{};
-    if (collect_sort_profile) profile.window_capacity = sortWindowCapacity(effective_req);
+    const scan_budget = sortedSegmentScanBudget();
+    var scanned_count: u64 = 0;
+    if (collect_sort_profile) {
+        profile.window_capacity = sortWindowCapacity(effective_req);
+        profile.sorted_segment_scan_budget = scan_budget;
+    }
 
     var iterators = std.ArrayListUnmanaged(SortedSegmentIterator).empty;
     defer iterators.deinit(alloc);
@@ -7434,6 +7482,8 @@ fn sortAndPageMatchAllSortedSegmentsAlloc(
             native_loader,
             if (collect_sort_profile) &profile else null,
             reverse,
+            &scanned_count,
+            scan_budget,
         )) |head| {
             try heap.push(alloc, head);
             observeSortCollectorHeap(if (collect_sort_profile) &profile else null, heap.items.len);
@@ -7486,6 +7536,8 @@ fn sortAndPageMatchAllSortedSegmentsAlloc(
             native_loader,
             if (collect_sort_profile) &profile else null,
             reverse,
+            &scanned_count,
+            scan_budget,
         )) |next| {
             try heap.push(alloc, next);
             observeSortCollectorHeap(if (collect_sort_profile) &profile else null, heap.items.len);
@@ -7561,6 +7613,15 @@ fn logBenchSortCollectorProfile(
             plan.sorted_segment_bounds_available,
         },
     );
+    if (profile.sorted_segment_scanned_count > 0 or profile.sorted_segment_scan_budget > 0) {
+        std.log.info(
+            "antfly_bench_sort_sorted_segment scanned={d} scan_budget={d}",
+            .{
+                profile.sorted_segment_scanned_count,
+                profile.sorted_segment_scan_budget,
+            },
+        );
+    }
     std.log.info(
         "antfly_bench_sort_collector_plan native_doc_values_coverage={s} index_sort_coverage={s} index_sort_match={} sorted_segment_executor_available={} sorted_segment_bounds_available={}",
         .{
@@ -8440,6 +8501,42 @@ test "pattern typed structured filters reject ambiguous field and path aliases" 
     try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, parsed.value, .{}, null));
 }
 
+test "pattern typed structured filters reject malformed and unbounded ranges" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const malformed_numeric = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"numeric_range":{"path":"score","min":"bad"}}
+    , .{});
+    try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, malformed_numeric.value, .{}, null));
+
+    const unbounded_numeric = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"numeric_range":{"path":"score"}}
+    , .{});
+    try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, unbounded_numeric.value, .{}, null));
+
+    const malformed_numeric_flag = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"numeric_range":{"path":"score","min":10,"inclusive_min":"yes"}}
+    , .{});
+    try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, malformed_numeric_flag.value, .{}, null));
+
+    const malformed_term = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"term_range":{"path":"category","min":10}}
+    , .{});
+    try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, malformed_term.value, .{}, null));
+
+    const unbounded_term = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"term_range":{"path":"category"}}
+    , .{});
+    try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, unbounded_term.value, .{}, null));
+
+    const malformed_date_flag = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"date_range":{"path":"created_at","start_ns":1767398400000000000,"inclusive_start":"yes"}}
+    , .{});
+    try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, malformed_date_flag.value, .{}, null));
+}
+
 test "pattern geo structured filters reject invalid coordinates" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -8628,12 +8725,15 @@ fn setJsonRangeBound(found: *?JsonRangeBound, value: std.json.Value, inclusive: 
 fn parseNumericRangeQuery(value: std.json.Value) !search_mod.NumericRangeQuery {
     if (value != .object) return error.InvalidArgument;
     const field = try requiredFieldOrPath(value.object);
+    const min = try jsonOptionalF64StrictNullable(value.object.get("min"));
+    const max = try jsonOptionalF64StrictNullable(value.object.get("max"));
+    if (min == null and max == null) return error.InvalidArgument;
     return .{
         .field = field,
-        .min = jsonOptionalF64(value.object.get("min")),
-        .max = jsonOptionalF64(value.object.get("max")),
-        .inclusive_min = jsonOptionalBool(value.object.get("inclusive_min")) orelse true,
-        .inclusive_max = jsonOptionalBool(value.object.get("inclusive_max")) orelse false,
+        .min = min,
+        .max = max,
+        .inclusive_min = (try jsonOptionalBoolStrict(value.object.get("inclusive_min"))) orelse true,
+        .inclusive_max = (try jsonOptionalBoolStrict(value.object.get("inclusive_max"))) orelse false,
     };
 }
 
@@ -8653,27 +8753,30 @@ fn parseDateRangeQuery(value: std.json.Value) !search_mod.DateRangeQuery {
         .field = field,
         .start_ns = start_ns,
         .end_ns = end_ns,
-        .inclusive_start = jsonOptionalBool(value.object.get("inclusive_start")) orelse true,
-        .inclusive_end = jsonOptionalBool(value.object.get("inclusive_end")) orelse false,
+        .inclusive_start = (try jsonOptionalBoolStrict(value.object.get("inclusive_start"))) orelse true,
+        .inclusive_end = (try jsonOptionalBoolStrict(value.object.get("inclusive_end"))) orelse false,
     };
 }
 
 fn parseBoolFieldQuery(value: std.json.Value) !search_mod.BoolFieldQuery {
     if (value != .object) return error.InvalidArgument;
     const field = try requiredFieldOrPath(value.object);
-    const bool_value = jsonOptionalBool(value.object.get("value")) orelse return error.InvalidArgument;
+    const bool_value = (try jsonOptionalBoolStrict(value.object.get("value"))) orelse return error.InvalidArgument;
     return .{ .field = field, .value = bool_value };
 }
 
 fn parseTermRangeQuery(value: std.json.Value) !search_mod.TermRangeQuery {
     if (value != .object) return error.InvalidArgument;
     const field = try requiredFieldOrPath(value.object);
+    const min = try jsonOptionalStringStrictNullable(value.object.get("min"));
+    const max = try jsonOptionalStringStrictNullable(value.object.get("max"));
+    if (min == null and max == null) return error.InvalidArgument;
     return .{
         .field = field,
-        .min = jsonString(value.object.get("min") orelse .null),
-        .max = jsonString(value.object.get("max") orelse .null),
-        .inclusive_min = jsonOptionalBool(value.object.get("inclusive_min")) orelse true,
-        .inclusive_max = jsonOptionalBool(value.object.get("inclusive_max")) orelse false,
+        .min = min,
+        .max = max,
+        .inclusive_min = (try jsonOptionalBoolStrict(value.object.get("inclusive_min"))) orelse true,
+        .inclusive_max = (try jsonOptionalBoolStrict(value.object.get("inclusive_max"))) orelse false,
     };
 }
 
@@ -8701,6 +8804,7 @@ fn parseGeoBBoxQuery(value: std.json.Value) !search_mod.GeoBBoxQuery {
     const max_lat = try jsonRequiredLatitude(value.object.get("max_lat"));
     const max_lon = try jsonRequiredLongitude(value.object.get("max_lon"));
     if (min_lat > max_lat) return error.InvalidArgument;
+    if (min_lon > max_lon) return error.InvalidArgument;
     return .{
         .field = field,
         .min_lat = min_lat,
@@ -8788,12 +8892,20 @@ fn jsonOptionalF64Strict(value: std.json.Value) !?f64 {
     return parsed;
 }
 
+fn jsonOptionalF64StrictNullable(value: ?std.json.Value) !?f64 {
+    return try jsonOptionalF64Strict(value orelse return null);
+}
+
 fn jsonOptionalStringStrict(value: std.json.Value) !?[]const u8 {
     return switch (value) {
         .string => |text| text,
         .null => null,
         else => error.InvalidArgument,
     };
+}
+
+fn jsonOptionalStringStrictNullable(value: ?std.json.Value) !?[]const u8 {
+    return try jsonOptionalStringStrict(value orelse return null);
 }
 
 fn jsonOptionalBoolStrict(value: ?std.json.Value) !?bool {
@@ -20139,6 +20251,102 @@ test "match_all sorted segment seek uses cursor seek within each segment" {
 
     try std.testing.expectEqual(@as(usize, 0), empty_page.hits.len);
     try std.testing.expectEqual(@as(usize, 0), counter.count);
+}
+
+test "match_all sorted segment seek enforces scan budget" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-scan-budget", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    const docs = try alloc.alloc(TestSortedPriceDoc, 4);
+    defer {
+        for (docs) |doc| alloc.free(@constCast(doc.id));
+        alloc.free(docs);
+    }
+    for (docs, 0..) |*doc, i| {
+        doc.* = .{
+            .id = try std.fmt.allocPrint(alloc, "doc:{d:0>3}", .{i}),
+            .price = @floatFromInt(i),
+            .ordinal = @intCast(1000 + i),
+        };
+    }
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const segment = try buildTestSortedPriceSegmentAlloc(alloc, docs);
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = testSortedPriceSchema(),
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const order_by = [_]types.SortField{
+        .{ .field = "price" },
+        .{ .field = "_id" },
+    };
+    const sorted_plan = SortExecutionPlan{
+        .kind = .sorted_segment_seek,
+        .require_native = true,
+        .runtime_schema = text_entry.runtime_schema,
+        .index_sort_match = true,
+        .sorted_segment_executor_available = true,
+        .sorted_segment_bounds_available = true,
+    };
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = text_entry.persistent.snapshot() };
+    const native_loader = NativeSortValueLoader{
+        .ctx = @constCast(&native_sort_ctx),
+        .require_native = true,
+        .load = loadTextDocValueSortValue,
+    };
+    const executor = MatchAllExecutor{
+        .ctx = null,
+        .collect_candidates = undefined,
+        .text_index_entry = undefined,
+        .load_projected_document = undefined,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    };
+    const constraints = NativeDocIdConstraints{};
+
+    const c = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const budget_env = "ANTFLY_SORTED_SEGMENT_SCAN_BUDGET";
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(budget_env, "1", 1));
+    defer _ = c.unsetenv(budget_env);
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    }, executor, &constraints, &text_entry, sorted_plan, native_loader, null));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("ft", diagnostic.field);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", diagnostic.reason);
+    try std.testing.expectEqualStrings("sorted_segment_scan_window", diagnostic.detail);
 }
 
 test "match_all sorted segment seek rejects cursor when segment bounds are unavailable" {

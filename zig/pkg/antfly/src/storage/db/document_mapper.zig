@@ -20,6 +20,7 @@ const introducer_mod = @import("../../introducer.zig");
 const segment_mod = @import("../../segment.zig");
 const typed_dv = @import("../../section/typed_doc_values.zig");
 const analysis_mod = @import("../../search/analysis.zig");
+const geo_mod = @import("../../search/geo.zig");
 const schema_api = @import("../../schema/mod.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const runtime_schema = @import("../schema.zig");
@@ -1923,6 +1924,15 @@ fn collectDynamicSchemaTextFields(
 ) !void {
     switch (value) {
         .object => |object| {
+            if (path.len > 0 and !containsStringSlice(explicit_paths, path)) {
+                if (resolveDynamicGeoPointMapping(schema, path, value)) |mapping| {
+                    try appendMappedGeoPointTextField(alloc, fields, path, value, mapping, text_analysis);
+                    if (observed_field_analyzers) |collector| {
+                        try appendObservedFieldAnalyzer(alloc, collector, path, mapping);
+                    }
+                    return;
+                }
+            }
             var it = object.iterator();
             while (it.next()) |entry| {
                 if (entry.key_ptr.*.len > 0 and entry.key_ptr.*[0] == '_') continue;
@@ -2053,6 +2063,18 @@ fn resolveDynamicTextMapping(schema: runtime_schema.TableSchema, path: []const u
     return null;
 }
 
+fn resolveDynamicGeoPointMapping(schema: runtime_schema.TableSchema, path: []const u8, value: std.json.Value) ?runtime_schema.FieldMapping {
+    if (runtime_schema.resolveFieldTypeForValue(schema, path, value)) |mapping| {
+        if (mapping.field_type == .geopoint) return mapping;
+    }
+
+    const field_name = fieldNameFromPath(path);
+    if (runtime_schema.resolveFieldTypeForValue(schema, field_name, value)) |mapping| {
+        if (mapping.field_type == .geopoint) return mapping;
+    }
+    return null;
+}
+
 fn pathFallsUnderOpenDynamicPath(document_schema: runtime_schema.FullTextDocument, path: []const u8) bool {
     return pathFallsUnderAnyDynamicPath(document_schema.open_dynamic_paths, path);
 }
@@ -2069,6 +2091,21 @@ fn pathFallsUnderAnyDynamicPath(paths: []const []const u8, path: []const u8) boo
         if (path.len > open_path.len and path[open_path.len] == '.') return true;
     }
     return false;
+}
+
+fn appendMappedGeoPointTextField(
+    alloc: Allocator,
+    fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
+    path: []const u8,
+    value: std.json.Value,
+    mapping: runtime_schema.FieldMapping,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+) !void {
+    if (!mapping.do_index or mapping.field_type != .geopoint) return;
+    const point = jsonValueToMappedGeoPoint(value) orelse return;
+    const geohash = geo_mod.encode(.{ .lat = point.lat, .lon = point.lon }, geo_mod.index_geohash_precision);
+    const term = try alloc.dupe(u8, geohash[0..geo_mod.index_geohash_precision]);
+    try appendNamedTextField(alloc, fields, path, term, "keyword", false, text_analysis);
 }
 
 fn appendMappedTextField(
@@ -3707,6 +3744,19 @@ test "document mapper emits schema geo point typed doc values" {
     const point = (try values.getGeoPoint(0)) orelse return error.TestExpectedEqual;
     try std.testing.expectApproxEqAbs(@as(f64, 37.7749), point.lat, 0.00001);
     try std.testing.expectApproxEqAbs(@as(f64, -122.4194), point.lon, 0.00001);
+
+    const inv_reader = (try reader.invertedIndex("location")) orelse return error.TestExpectedEqual;
+    const geohash = geo_mod.encode(.{ .lat = 37.7749, .lon = -122.4194 }, geo_mod.index_geohash_precision);
+    const lookup = inv_reader.lookup(geohash[0..geo_mod.index_geohash_precision]) orelse return error.TestExpectedEqual;
+    switch (lookup) {
+        .one_hit => |hit| try std.testing.expectEqual(@as(u32, 0), hit.doc_num),
+        .postings => |postings| {
+            var bitmap = try postings.docBitmap(alloc);
+            defer bitmap.deinit();
+            try std.testing.expectEqual(@as(usize, 1), bitmap.cardinality());
+            try std.testing.expect(bitmap.contains(0));
+        },
+    }
 
     const mapping = runtime_schema.FieldMapping{
         .field_type = .geopoint,

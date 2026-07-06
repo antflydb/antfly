@@ -6779,7 +6779,9 @@ components:
 
             `match_all_candidate_collect_limit`,
 
-            `match_all_exact_candidate_window`, and
+            `match_all_exact_candidate_window`,
+
+            `sorted_segment_scan_window`, and
 
             `distributed_merge_shard_window`.
           example: text_field_sort_candidate_window
@@ -12184,6 +12186,16 @@ components:
         sorted_segment_bounds_available:
           type: boolean
           description: Whether sorted-segment bounds were available for cursor seeks.
+        sorted_segment_scanned_count:
+          type: integer
+          format: int64
+          description: Physical sorted-segment documents scanned before deleted-doc, cursor, membership,
+            and filter checks.
+        sorted_segment_scan_budget:
+          type: integer
+          format: int64
+          description: Maximum physical sorted-segment documents allowed before the sorted_segment_scan_window
+            budget rejection.
         candidate_count:
           type: integer
           format: int64
@@ -12279,7 +12291,9 @@ components:
 
             `match_all_candidate_collect_limit`,
 
-            `match_all_exact_candidate_window`, and
+            `match_all_exact_candidate_window`,
+
+            `sorted_segment_scan_window`, and
 
             `distributed_merge_shard_window`.
         sort_rejection_reason:

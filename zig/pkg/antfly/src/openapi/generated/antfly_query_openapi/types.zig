@@ -20,56 +20,8 @@ pub const GeoShape = struct {
     coordinates: []const std.json.Value,
 };
 
-pub const TermQuery = struct {
-    term: []const u8,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const MultiMatchBody = struct {
-    query: []const u8,
-    fields: []const []const u8,
-    type: []const u8,
-    boost: ?Boost = null,
-};
-
-pub const PrefixQuery = struct {
-    prefix: []const u8,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const RegexpQuery = struct {
-    regexp: []const u8,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const WildcardQuery = struct {
-    wildcard: []const u8,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const QueryStringQuery = struct {
-    query: []const u8,
-    boost: ?Boost = null,
-};
-
-pub const NumericRangeQuery = struct {
-    min: ?f64 = null,
-    max: ?f64 = null,
-    inclusive_min: ?bool = null,
-    inclusive_max: ?bool = null,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const TermRangeQuery = struct {
-    min: ?[]const u8 = null,
-    max: ?[]const u8 = null,
-    inclusive_min: ?bool = null,
-    inclusive_max: ?bool = null,
+pub const BoolFieldQuery = struct {
+    bool: bool,
     field: ?[]const u8 = null,
     boost: ?Boost = null,
 };
@@ -84,30 +36,8 @@ pub const DateRangeStringQuery = struct {
     datetime_parser: ?[]const u8 = null,
 };
 
-pub const MatchAllQuery = struct {
-    match_all: std.json.Value,
-    boost: ?Boost = null,
-};
-
-pub const MatchNoneQuery = struct {
-    match_none: std.json.Value,
-    boost: ?Boost = null,
-};
-
 pub const DocIdQuery = struct {
     ids: []const []const u8,
-    boost: ?Boost = null,
-};
-
-pub const BoolFieldQuery = struct {
-    bool: bool,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const IPRangeQuery = struct {
-    cidr: []const u8,
-    field: ?[]const u8 = null,
     boost: ?Boost = null,
 };
 
@@ -128,14 +58,82 @@ pub const GeoDistanceQuery = struct {
     boost: ?Boost = null,
 };
 
-pub const MatchQuery = struct {
-    match: []const u8,
+pub const IPRangeQuery = struct {
+    cidr: []const u8,
     field: ?[]const u8 = null,
-    analyzer: ?[]const u8 = null,
     boost: ?Boost = null,
+};
+
+pub const MatchAllQuery = struct {
+    match_all: std.json.Value,
+    boost: ?Boost = null,
+};
+
+pub const MatchNoneQuery = struct {
+    match_none: std.json.Value,
+    boost: ?Boost = null,
+};
+
+pub const MultiMatchBody = struct {
+    query: []const u8,
+    fields: []const []const u8,
+    type: []const u8,
+    boost: ?Boost = null,
+};
+
+pub const NumericRangeQuery = struct {
+    min: ?f64 = null,
+    max: ?f64 = null,
+    inclusive_min: ?bool = null,
+    inclusive_max: ?bool = null,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const PrefixQuery = struct {
+    prefix: []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const QueryStringQuery = struct {
+    query: []const u8,
+    boost: ?Boost = null,
+};
+
+pub const RegexpQuery = struct {
+    regexp: []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const TermQuery = struct {
+    term: []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const TermRangeQuery = struct {
+    min: ?[]const u8 = null,
+    max: ?[]const u8 = null,
+    inclusive_min: ?bool = null,
+    inclusive_max: ?bool = null,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const WildcardQuery = struct {
+    wildcard: []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const FuzzyQuery = struct {
+    term: []const u8,
     prefix_length: ?i32 = null,
     fuzziness: ?Fuzziness = null,
-    operator: ?[]const u8 = null,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
 };
 
 pub const MatchPhraseQuery = struct {
@@ -146,11 +144,14 @@ pub const MatchPhraseQuery = struct {
     fuzziness: ?Fuzziness = null,
 };
 
-pub const PhraseQuery = struct {
-    terms: []const []const u8,
+pub const MatchQuery = struct {
+    match: []const u8,
     field: ?[]const u8 = null,
+    analyzer: ?[]const u8 = null,
     boost: ?Boost = null,
+    prefix_length: ?i32 = null,
     fuzziness: ?Fuzziness = null,
+    operator: ?[]const u8 = null,
 };
 
 pub const MultiPhraseQuery = struct {
@@ -160,12 +161,11 @@ pub const MultiPhraseQuery = struct {
     fuzziness: ?Fuzziness = null,
 };
 
-pub const FuzzyQuery = struct {
-    term: []const u8,
-    prefix_length: ?i32 = null,
-    fuzziness: ?Fuzziness = null,
+pub const PhraseQuery = struct {
+    terms: []const []const u8,
     field: ?[]const u8 = null,
     boost: ?Boost = null,
+    fuzziness: ?Fuzziness = null,
 };
 
 pub const GeoBoundingPolygonQuery = struct {

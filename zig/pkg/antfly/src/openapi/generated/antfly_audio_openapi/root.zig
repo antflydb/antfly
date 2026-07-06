@@ -3,22 +3,22 @@
 
 pub const types = @import("types.zig");
 
-pub const TTSProvider = types.TTSProvider;
-pub const STTProvider = types.STTProvider;
+pub const AntflySTTConfig = types.AntflySTTConfig;
 pub const AudioFormat = types.AudioFormat;
-pub const OpenAITTSConfig = types.OpenAITTSConfig;
-pub const VertexTTSConfig = types.VertexTTSConfig;
 pub const ElevenLabsTTSConfig = types.ElevenLabsTTSConfig;
 pub const OpenAISTTConfig = types.OpenAISTTConfig;
-pub const VertexSTTConfig = types.VertexSTTConfig;
-pub const AntflySTTConfig = types.AntflySTTConfig;
-pub const TTSConfig = types.TTSConfig;
+pub const OpenAITTSConfig = types.OpenAITTSConfig;
 pub const STTConfig = types.STTConfig;
-pub const TTSRequest = types.TTSRequest;
-pub const TTSResponse = types.TTSResponse;
+pub const STTProvider = types.STTProvider;
 pub const STTRequest = types.STTRequest;
 pub const STTResponse = types.STTResponse;
-pub const TranscriptSegment = types.TranscriptSegment;
-pub const WordTimestamp = types.WordTimestamp;
 pub const Speaker = types.Speaker;
+pub const TTSConfig = types.TTSConfig;
+pub const TTSProvider = types.TTSProvider;
+pub const TTSRequest = types.TTSRequest;
+pub const TTSResponse = types.TTSResponse;
+pub const TranscriptSegment = types.TranscriptSegment;
+pub const VertexSTTConfig = types.VertexSTTConfig;
+pub const VertexTTSConfig = types.VertexTTSConfig;
 pub const Voice = types.Voice;
+pub const WordTimestamp = types.WordTimestamp;

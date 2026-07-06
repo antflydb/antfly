@@ -75,7 +75,8 @@ class ExactSortError:
             `text_exact_late_visibility_totals`,
             `text_field_sort_candidate_window`,
             `match_all_candidate_collect_limit`,
-            `match_all_exact_candidate_window`, and
+            `match_all_exact_candidate_window`,
+            `sorted_segment_scan_window`, and
             `distributed_merge_shard_window`.
              Example: text_field_sort_candidate_window.
     """

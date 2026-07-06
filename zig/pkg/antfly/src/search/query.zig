@@ -51,6 +51,8 @@ pub const FilterError = error{
     InvalidSegment,
 };
 
+const geo_filter_earth_radius_meters: f64 = 6371008.8;
+
 /// A filter that produces a bitmap of matching document IDs.
 pub const Filter = union(enum) {
     term: TermFilter,
@@ -857,9 +859,27 @@ pub const GeoDistanceFilter = struct {
 
         const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch
             return roaring.RoaringBitmap.init(alloc);
+        if (reader.value_type != .geo_point) return roaring.RoaringBitmap.init(alloc);
+
+        var candidate_bm: ?roaring.RoaringBitmap = try self.candidateBitmapAlloc(alloc, seg);
+        defer if (candidate_bm) |*bm| bm.deinit();
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
+
+        if (candidate_bm) |*candidates| {
+            var it = candidates.iterator();
+            while (it.next()) |doc_id| {
+                const point = reader.getGeoPoint(doc_id) catch continue;
+                if (point) |p| {
+                    const gp = geo.GeoPoint{ .lat = p.lat, .lon = p.lon };
+                    if (geo.haversineDistance(self.center, gp) <= self.radius_meters) {
+                        try result.add(doc_id);
+                    }
+                }
+            }
+            return result;
+        }
 
         for (0..seg.reader.doc_count) |doc_id| {
             const point = reader.getGeoPoint(@intCast(doc_id)) catch continue;
@@ -872,6 +892,22 @@ pub const GeoDistanceFilter = struct {
         }
 
         return result;
+    }
+
+    fn candidateBitmapAlloc(self: GeoDistanceFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!?roaring.RoaringBitmap {
+        const lat_delta = (self.radius_meters / geo_filter_earth_radius_meters) * (180.0 / std.math.pi);
+        const cos_lat = @cos(self.center.lat * std.math.pi / 180.0);
+        if (!std.math.isFinite(lat_delta) or @abs(cos_lat) < 0.000001) return null;
+        const lon_delta = lat_delta / cos_lat;
+        if (!std.math.isFinite(lon_delta)) return null;
+
+        const min_lat = @max(self.center.lat - lat_delta, -90.0);
+        const max_lat = @min(self.center.lat + lat_delta, 90.0);
+        const min_lon = self.center.lon - lon_delta;
+        const max_lon = self.center.lon + lon_delta;
+        if (min_lon < -180.0 or max_lon > 180.0) return null;
+
+        return geoCandidateBitmapForBoxAlloc(alloc, seg, self.field, min_lat, min_lon, max_lat, max_lon);
     }
 };
 
@@ -889,9 +925,36 @@ pub const GeoBBoxFilter = struct {
 
         const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch
             return roaring.RoaringBitmap.init(alloc);
+        if (reader.value_type != .geo_point) return roaring.RoaringBitmap.init(alloc);
+
+        var candidate_bm: ?roaring.RoaringBitmap = try geoCandidateBitmapForBoxAlloc(
+            alloc,
+            seg,
+            self.field,
+            self.min_lat,
+            self.min_lon,
+            self.max_lat,
+            self.max_lon,
+        );
+        defer if (candidate_bm) |*bm| bm.deinit();
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
+
+        if (candidate_bm) |*candidates| {
+            var it = candidates.iterator();
+            while (it.next()) |doc_id| {
+                const point = reader.getGeoPoint(doc_id) catch continue;
+                if (point) |p| {
+                    if (p.lat >= self.min_lat and p.lat <= self.max_lat and
+                        p.lon >= self.min_lon and p.lon <= self.max_lon)
+                    {
+                        try result.add(doc_id);
+                    }
+                }
+            }
+            return result;
+        }
 
         for (0..seg.reader.doc_count) |doc_id| {
             const point = reader.getGeoPoint(@intCast(doc_id)) catch continue;
@@ -907,6 +970,67 @@ pub const GeoBBoxFilter = struct {
         return result;
     }
 };
+
+fn geoCandidateBitmapForBoxAlloc(
+    alloc: Allocator,
+    seg: *const index_mod.SegmentEntry,
+    field: []const u8,
+    min_lat: f64,
+    min_lon: f64,
+    max_lat: f64,
+    max_lon: f64,
+) FilterError!?roaring.RoaringBitmap {
+    if (geoBoxCoverageExceedsCandidateCap(min_lat, min_lon, max_lat, max_lon)) return null;
+    const cells = try geo.coverBoundingBox(alloc, min_lat, min_lon, max_lat, max_lon, geo.index_geohash_precision);
+    defer alloc.free(cells);
+    if (cells.len > geo.max_filter_geohash_cells) return null;
+    return try geoCandidateBitmapForCellsAlloc(alloc, seg, field, cells);
+}
+
+fn geoBoxCoverageExceedsCandidateCap(min_lat: f64, min_lon: f64, max_lat: f64, max_lon: f64) bool {
+    if (min_lat > max_lat or min_lon > max_lon) return true;
+    const sample = geo.encode(.{ .lat = 0, .lon = 0 }, geo.index_geohash_precision);
+    const sample_bounds = geo.bounds(sample[0..geo.index_geohash_precision]);
+    const lat_step = (sample_bounds.lat_max - sample_bounds.lat_min) * 0.9;
+    const lon_step = (sample_bounds.lon_max - sample_bounds.lon_min) * 0.9;
+    if (lat_step <= 0 or lon_step <= 0) return true;
+
+    const lat_count = @ceil((max_lat - min_lat) / lat_step) + 2.0;
+    const lon_count = @ceil((max_lon - min_lon) / lon_step) + 2.0;
+    if (!std.math.isFinite(lat_count) or !std.math.isFinite(lon_count)) return true;
+    return lat_count * lon_count > @as(f64, @floatFromInt(geo.max_filter_geohash_cells));
+}
+
+fn geoCandidateBitmapForCellsAlloc(
+    alloc: Allocator,
+    seg: *const index_mod.SegmentEntry,
+    field: []const u8,
+    cells: []const [12]u8,
+) FilterError!?roaring.RoaringBitmap {
+    const inv_reader = (try seg.reader.invertedIndex(field)) orelse
+        return roaring.RoaringBitmap.init(alloc);
+
+    var result = roaring.RoaringBitmap.init(alloc);
+    errdefer result.deinit();
+
+    for (cells) |cell| {
+        if (inv_reader.lookup(cell[0..geo.index_geohash_precision])) |lookup_result| {
+            try addLookupResultToBitmap(alloc, &result, lookup_result);
+        }
+    }
+    return result;
+}
+
+fn addLookupResultToBitmap(alloc: Allocator, result: *roaring.RoaringBitmap, lookup_result: inverted.LookupResult) FilterError!void {
+    switch (lookup_result) {
+        .postings => |p| {
+            var bm = try p.docBitmap(alloc);
+            defer bm.deinit();
+            try result.orWith(&bm);
+        },
+        .one_hit => |h| try result.add(h.doc_num),
+    }
+}
 
 /// Multi-phrase filter: like PhraseFilter but allows alternative terms at each position.
 /// e.g., [["hello","hi"], ["world","earth"]] matches "hello world" or "hi earth" etc.
@@ -1383,6 +1507,41 @@ fn buildTestSegmentWithTerms(alloc: Allocator, docs: []const struct { terms: []c
     return seg_writer.build();
 }
 
+fn buildGeoTestSegment(alloc: Allocator, points: []const typed_dv.GeoPoint) ![]u8 {
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .geo_point, 128);
+    defer dv_writer.deinit();
+    for (points, 0..) |point, doc_id| {
+        try dv_writer.add(@intCast(doc_id), .{ .geo_point = point });
+    }
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var inv_builder = inverted.InvertedIndexBuilder.init(alloc, .{});
+    defer inv_builder.deinit();
+    for (points, 0..) |point, doc_id| {
+        const geohash = geo.encode(.{ .lat = point.lat, .lon = point.lon }, geo.index_geohash_precision);
+        try inv_builder.addDocument(@intCast(doc_id), &.{
+            .{ .term = geohash[0..geo.index_geohash_precision], .freq = 1 },
+        });
+    }
+    const inv_data = try inv_builder.build();
+    defer alloc.free(inv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const field_idx = try seg_writer.addField("location");
+    try seg_writer.addSection(field_idx, .typed_doc_values, dv_data);
+    try seg_writer.addSection(field_idx, .inverted_text, inv_data);
+
+    for (points, 0..) |_, i| {
+        var id_buf: [16]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{i}) catch unreachable;
+        try seg_writer.addStoredDoc(id_str, "{}");
+    }
+
+    return seg_writer.build();
+}
+
 test "term filter finds matching docs" {
     const alloc = testing.allocator;
 
@@ -1754,30 +1913,11 @@ test "range filter on typed doc values" {
 test "geo distance filter" {
     const alloc = testing.allocator;
 
-    var seg_writer = segment_mod.SegmentWriter.init(alloc);
-    defer seg_writer.deinit();
-
-    // Create typed doc values for "location" field with geo points
-    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .geo_point, 128);
-    defer dv_writer.deinit();
-    // San Francisco
-    try dv_writer.add(0, .{ .geo_point = .{ .lat = 37.7749, .lon = -122.4194 } });
-    // New York
-    try dv_writer.add(1, .{ .geo_point = .{ .lat = 40.7128, .lon = -74.0060 } });
-    // Oakland (near SF)
-    try dv_writer.add(2, .{ .geo_point = .{ .lat = 37.8044, .lon = -122.2712 } });
-
-    const dv_data = try dv_writer.build();
-    defer alloc.free(dv_data);
-
-    const field_idx = try seg_writer.addField("location");
-    try seg_writer.addSection(field_idx, .typed_doc_values, dv_data);
-
-    try seg_writer.addStoredDoc("sf", "{}");
-    try seg_writer.addStoredDoc("nyc", "{}");
-    try seg_writer.addStoredDoc("oak", "{}");
-
-    const seg_bytes = try seg_writer.build();
+    const seg_bytes = try buildGeoTestSegment(alloc, &.{
+        .{ .lat = 37.7749, .lon = -122.4194 }, // San Francisco
+        .{ .lat = 40.7128, .lon = -74.0060 }, // New York
+        .{ .lat = 37.8044, .lon = -122.2712 }, // Oakland
+    });
     defer alloc.free(seg_bytes);
 
     var writer = try index_mod.IndexWriter.init(alloc);
@@ -1799,6 +1939,44 @@ test "geo distance filter" {
     try testing.expect(bm.contains(0)); // SF
     try testing.expect(!bm.contains(1)); // NYC is far
     try testing.expect(bm.contains(2)); // Oakland is close
+}
+
+test "geo bbox filter refines indexed geohash candidates" {
+    const alloc = testing.allocator;
+
+    const seg_bytes = try buildGeoTestSegment(alloc, &.{
+        .{ .lat = 37.7749, .lon = -122.4194 }, // inside
+        .{ .lat = 40.7128, .lon = -74.0060 }, // outside
+        .{ .lat = 37.8044, .lon = -122.2712 }, // outside exact bbox
+    });
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+
+    const snap = writer.snapshot();
+    const seg = &snap.segments[0];
+
+    var candidates = (try geoCandidateBitmapForBoxAlloc(alloc, seg, "location", 37.70, -122.50, 37.80, -122.30)) orelse
+        return error.TestExpectedEqual;
+    defer candidates.deinit();
+    try testing.expect(candidates.contains(0));
+    try testing.expect(!candidates.contains(1));
+
+    const filter = Filter{ .geo_bbox = .{
+        .field = "location",
+        .min_lat = 37.70,
+        .min_lon = -122.50,
+        .max_lat = 37.80,
+        .max_lon = -122.30,
+    } };
+    var bm = try filter.execute(alloc, seg);
+    defer bm.deinit();
+
+    try testing.expect(bm.contains(0));
+    try testing.expect(!bm.contains(1));
+    try testing.expect(!bm.contains(2));
 }
 
 test "phrase filter exact adjacency" {
